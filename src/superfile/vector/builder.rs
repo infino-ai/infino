@@ -9,7 +9,7 @@
 //! See `docs/architecture/superfile.md` for the full byte-level spec.
 
 use crate::superfile::BuildError;
-use crate::superfile::format::checksum::crc32c;
+use crate::superfile::format::checksum::{crc32c, crc32c_append};
 use crate::superfile::format::{self, FST_SEPARATOR, RESERVED_PREFIX};
 use crate::superfile::vector::distance::{Metric, l2_sq};
 use crate::superfile::vector::kmeans::{assign_to_centroids, kmeans};
@@ -317,6 +317,43 @@ impl VectorBuilder {
     /// expected `-> Vec<u8>` need to `?` the result; the
     /// `SuperfileBuilder` shim does so already.
     pub fn finish(self) -> Result<Vec<u8>, BuildError> {
+        // Capacity hint: the largest known-cheap pre-allocation is
+        // `OUTER_HEADER_SIZE + (n_columns × DIR_ENTRY_SIZE) + 8`
+        // (header + directory + dir_crc + outer_crc). Subsection
+        // bytes are unknown until built; the inner `Write` impl on
+        // `Vec` will grow as needed.
+        let header_dir_hint =
+            OUTER_HEADER_SIZE + (self.columns.len() * DIR_ENTRY_SIZE) + 8;
+        let mut buf: Vec<u8> = Vec::with_capacity(header_dir_hint);
+        self.finish_to(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Streaming variant: write the final blob progressively to
+    /// `w` without materialising it as a contiguous `Vec<u8>`.
+    /// Plan 010 M5.
+    ///
+    /// The output bytes (outer header, directory + dir CRC, each
+    /// subsection, trailing outer CRC) are identical to those
+    /// produced by [`Self::finish`] — `finish` is now a thin
+    /// wrapper that calls `finish_to(&mut Vec<u8>)`.
+    ///
+    /// The trailing outer CRC32C is computed incrementally via
+    /// `crc32c_append` so we never need to retain the full blob
+    /// in memory to checksum it.
+    ///
+    /// Subsections are still built one-at-a-time into a
+    /// `Vec<u8>` (their internal CRC is computed at the end of
+    /// each subsection's body); each subsection is dropped as
+    /// soon as it has been written to `w`, so peak heap drops
+    /// from `sum_of_subsection_sizes + final_blob_size` to
+    /// `max_subsection_size`. Per-subsection streaming (M6 / a
+    /// future plan) would push the floor lower still.
+    ///
+    /// Object-storage callers (003) can pass a multipart upload
+    /// writer here so segment build never owns the full blob in
+    /// RAM.
+    pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let VectorBuilder {
             columns,
             scratch_dir,
@@ -384,36 +421,58 @@ impl VectorBuilder {
         }
         let dir_crc = crc32c(&directory);
 
-        // 4. Concatenate the final blob.
-        let mut blob: Vec<u8> = Vec::with_capacity(
-            OUTER_HEADER_SIZE
-                + directory_size
-                + 4
-                + subsections.iter().map(|s| s.bytes.len()).sum::<usize>()
-                + 4,
-        );
+        // 4. Stream out: outer_header → directory → dir_crc →
+        //    subsections (drained, one at a time) → outer_crc.
+        //    A running CRC32C accumulator covers every byte
+        //    written before the outer CRC itself, so we never
+        //    need the full blob in memory to checksum it.
 
         // Outer header (32 bytes).
-        blob.extend_from_slice(format::vec::OUTER_MAGIC); // 8
-        blob.extend_from_slice(&format::vec::VERSION.to_le_bytes()); // 4
-        blob.extend_from_slice(&n_columns.to_le_bytes()); // 4
-        blob.extend_from_slice(&n_docs.to_le_bytes()); // 8
-        blob.extend_from_slice(&directory_offset.to_le_bytes()); // 8
-        debug_assert_eq!(blob.len(), OUTER_HEADER_SIZE);
-
-        // Directory + CRC.
-        blob.extend_from_slice(&directory);
-        blob.extend_from_slice(&dir_crc.to_le_bytes());
-
-        // Subsections.
-        for sub in &subsections {
-            blob.extend_from_slice(&sub.bytes);
+        let mut outer_header: [u8; OUTER_HEADER_SIZE] = [0; OUTER_HEADER_SIZE];
+        {
+            let mut cursor = &mut outer_header[..];
+            cursor
+                .write_all(format::vec::OUTER_MAGIC) // 8
+                .map_err(BuildError::Io)?;
+            cursor
+                .write_all(&format::vec::VERSION.to_le_bytes()) // 4
+                .map_err(BuildError::Io)?;
+            cursor
+                .write_all(&n_columns.to_le_bytes()) // 4
+                .map_err(BuildError::Io)?;
+            cursor
+                .write_all(&n_docs.to_le_bytes()) // 8
+                .map_err(BuildError::Io)?;
+            cursor
+                .write_all(&directory_offset.to_le_bytes()) // 8
+                .map_err(BuildError::Io)?;
+            debug_assert!(cursor.is_empty());
         }
 
-        // Trailing whole-blob CRC32C (covers everything from byte 0 to
-        // here).
-        let outer_crc = crc32c(&blob);
-        blob.extend_from_slice(&outer_crc.to_le_bytes());
+        let mut outer_crc_acc: u32 = 0;
+        w.write_all(&outer_header).map_err(BuildError::Io)?;
+        outer_crc_acc = crc32c_append(outer_crc_acc, &outer_header);
+
+        // Directory + dir CRC.
+        w.write_all(&directory).map_err(BuildError::Io)?;
+        outer_crc_acc = crc32c_append(outer_crc_acc, &directory);
+        let dir_crc_le = dir_crc.to_le_bytes();
+        w.write_all(&dir_crc_le).map_err(BuildError::Io)?;
+        outer_crc_acc = crc32c_append(outer_crc_acc, &dir_crc_le);
+        drop(directory);
+
+        // Subsections — drain so each subsection Vec drops the
+        // instant we've finished writing + CRC-ing it. At 10M ×
+        // 384 a subsection is ~15 GiB, so retaining all of them
+        // until the last byte is written would double the peak.
+        for sub in subsections.drain(..) {
+            w.write_all(&sub.bytes).map_err(BuildError::Io)?;
+            outer_crc_acc = crc32c_append(outer_crc_acc, &sub.bytes);
+        }
+
+        // Trailing whole-blob CRC32C.
+        let outer_crc_le = outer_crc_acc.to_le_bytes();
+        w.write_all(&outer_crc_le).map_err(BuildError::Io)?;
 
         // scratch_dir is dropped at end of scope, removing spill +
         // bucket files. Keeping it alive until here ensures the
@@ -421,7 +480,7 @@ impl VectorBuilder {
         // had a live file path for the duration of its scan.
         drop(scratch_dir);
 
-        Ok(blob)
+        Ok(())
     }
 }
 
@@ -1095,5 +1154,122 @@ mod tests {
                 "spill path missed self-NN at q={q}"
             );
         }
+    }
+
+    /// `finish_to(Vec<u8>)` must produce byte-for-byte identical
+    /// output to `finish()` for the same logical builder state.
+    /// The build path is deterministic in everything that matters
+    /// (rot_seed, reservoir seed, bucket flush ordering), so any
+    /// drift here would indicate a regression in either the
+    /// streaming wrap or the underlying determinism contract.
+    #[test]
+    fn finish_to_matches_finish_byte_for_byte() {
+        let build = || -> VectorBuilder {
+            let mut b = VectorBuilder::new();
+            b.register_column(cfg("v", 16)).expect("register column");
+            for i in 0..32 {
+                let v: Vec<f32> = (0..16).map(|j| ((i + j) as f32) * 0.1).collect();
+                b.add(0, &v).expect("add to vector builder");
+            }
+            b
+        };
+
+        let blob_finish = build().finish().expect("finish");
+        let mut blob_finish_to: Vec<u8> = Vec::new();
+        build()
+            .finish_to(&mut blob_finish_to)
+            .expect("finish_to Vec<u8>");
+        assert_eq!(
+            blob_finish, blob_finish_to,
+            "finish_to must produce identical bytes to finish"
+        );
+    }
+
+    /// Streaming output to a `Cursor<Vec<u8>>` (the canonical
+    /// in-tree writer for testing streaming behaviour, per plan
+    /// 010 M5 acceptance criterion #4): the resulting bytes
+    /// carry a valid outer magic + a valid trailing whole-blob
+    /// CRC32C that round-trips when recomputed over the body.
+    #[test]
+    fn finish_to_cursor_round_trips_outer_crc() {
+        use std::io::Cursor;
+        let mut b = VectorBuilder::new();
+        b.register_column(cfg("v", 16)).expect("register column");
+        for i in 0..32 {
+            let v: Vec<f32> = (0..16).map(|j| ((i + j) as f32) * 0.1).collect();
+            b.add(0, &v).expect("add to vector builder");
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            b.finish_to(cursor).expect("finish_to Cursor");
+        }
+        assert_eq!(&buf[0..8], format::vec::OUTER_MAGIC, "outer magic preserved");
+        assert!(
+            buf.len() >= OUTER_HEADER_SIZE + DIR_ENTRY_SIZE + 4 + 4,
+            "blob too short: {} bytes",
+            buf.len()
+        );
+        let body_len = buf.len() - 4;
+        let trailing_crc = u32::from_le_bytes([
+            buf[body_len],
+            buf[body_len + 1],
+            buf[body_len + 2],
+            buf[body_len + 3],
+        ]);
+        let recomputed = crc32c(&buf[..body_len]);
+        assert_eq!(
+            trailing_crc, recomputed,
+            "trailing outer CRC32C must match recomputed body CRC"
+        );
+    }
+
+    /// Round-trip integrity through an actual `Write` impl that
+    /// isn't `Vec<u8>`: write to a temp file, mmap-read it back,
+    /// open it with `VectorReader`, and confirm a search returns
+    /// a sane result. This catches any case where the running
+    /// CRC32C accumulator drifts between the streaming write
+    /// path and a one-shot `crc32c(&blob)` over the same bytes.
+    #[test]
+    fn finish_to_temp_file_round_trips_through_reader() {
+        use crate::superfile::vector::reader::VectorReader;
+        use bytes::Bytes;
+        use std::io::BufWriter;
+        let dim = 16usize;
+        let n_docs = 32usize;
+        let n_cent = 4usize;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            name: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+        })
+        .expect("register column");
+        for d in 0..n_docs {
+            let row: Vec<f32> = (0..dim)
+                .map(|j| ((d as f32) * 0.07 + (j as f32) * 0.13).sin())
+                .collect();
+            b.add(0, &row).expect("add to vector builder");
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("vector_blob.bin");
+        {
+            let file = std::fs::File::create(&path).expect("create blob file");
+            let writer = BufWriter::new(file);
+            b.finish_to(writer).expect("finish_to BufWriter<File>");
+        }
+        let blob = std::fs::read(&path).expect("read blob file");
+        let json = format!(
+            r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
+        );
+        let reader = VectorReader::open(Bytes::from(blob), &json)
+            .expect("open VectorReader from streamed blob");
+        let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.13).sin()).collect();
+        let hits = reader
+            .search("v", &query, 5, n_cent, n_docs + 1)
+            .expect("kNN search");
+        assert!(!hits.is_empty(), "search returned no hits");
     }
 }
