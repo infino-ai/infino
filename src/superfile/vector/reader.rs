@@ -10,6 +10,7 @@
 
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
+use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
 use crate::superfile::vector::distance::{Metric, distance_bytes};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rotation::RandomRotation;
@@ -20,6 +21,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
@@ -89,11 +91,103 @@ impl Default for OpenOptions {
     }
 }
 
-/// Multi-column vector blob reader. `Send + Sync`; concurrent searches
-/// share the underlying `Bytes`.
+/// Backing for a [`VectorReader`]. Plan 011 M1.
+///
+/// Two variants today, plumbed through every byte-fetch point:
+///
+/// - `InMemory(Bytes)`: the legacy path — caller materialised
+///   the full subsection before opening. Every byte fetch is a
+///   zero-copy `Bytes::slice` against the buffer. The sync
+///   `search()` path always works.
+/// - `Lazy(Arc<dyn LazyByteSource>)`: a range-fetching source
+///   (mmap, S3 range GET, broadcast subscription). M1 wires
+///   the enum and the access pattern; M2 lands `open_lazy` and
+///   the lazy-friendly `open_with` shape. Sync `search()`
+///   returns [`VectorError::NeedsAsyncEntry`] on this variant
+///   (M3) unless the caller pre-populated the relevant ranges.
+///
+/// `Source: Clone` so `Arc`-shared instances can be handed to
+/// multiple readers / supertable segments without forking the
+/// underlying state. Lazy variant clones the `Arc`; in-memory
+/// clones the `Bytes` (refcount bump).
+#[derive(Clone)]
+pub enum Source {
+    InMemory(Bytes),
+    Lazy(Arc<dyn LazyByteSource>),
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
+            Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Source {
+    /// Total backing size in bytes — matches what a single
+    /// `get_range(0..len())` would cover.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InMemory(b) => b.len(),
+            Self::Lazy(s) => s.size() as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sync best-effort fetch. Always succeeds on
+    /// `Source::InMemory` (zero-copy `Bytes::slice`); on
+    /// `Source::Lazy` returns `Some` only if the range is
+    /// already resident in the source's in-process cache.
+    ///
+    /// Returns `None` for out-of-bounds ranges so callers can
+    /// distinguish "not available sync" from a hard error;
+    /// callers that need a typed error should fall through to
+    /// [`Self::get_range`].
+    pub fn try_get_range_sync(&self, range: Range<usize>) -> Option<Bytes> {
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        match self {
+            Self::InMemory(b) => {
+                if range.end > b.len() {
+                    return None;
+                }
+                Some(b.slice(range))
+            }
+            Self::Lazy(s) => s.try_get_range_sync(start, len),
+        }
+    }
+
+    /// Async fetch — always succeeds for in-bounds ranges.
+    /// On `Source::InMemory` resolves immediately (zero-copy
+    /// `Bytes::slice` wrapped in an already-ready future).
+    pub async fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
+        match self {
+            Self::InMemory(b) => {
+                if range.end > b.len() {
+                    return Err(LazyByteSourceError::OutOfBounds {
+                        start: range.start as u64,
+                        len: range.len() as u64,
+                        size: b.len() as u64,
+                    });
+                }
+                Ok(b.slice(range))
+            }
+            Self::Lazy(s) => s.range(range.start as u64, range.len() as u64).await,
+        }
+    }
+}
+
+/// Multi-column vector blob reader. `Send + Sync`; concurrent
+/// searches share the underlying [`Source`] (refcount-shared via
+/// `Bytes` / `Arc<dyn LazyByteSource>`).
 #[derive(Debug)]
 pub struct VectorReader {
-    blob: Bytes,
+    source: Source,
     n_docs: u64,
     columns: Vec<ColumnReader>,
     column_id_by_name: HashMap<String, u32>,
@@ -120,41 +214,56 @@ impl VectorReader {
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, VectorError> {
-        if blob.len() < OUTER_HEADER_SIZE + 4 {
+        // M1: every byte fetch routes through `Source::try_get_range_sync`
+        // so a future lazy variant can intercept the same call sites
+        // without a second rewrite. `InMemory` returns zero-copy
+        // `Bytes::slice` views; refcount bumps only.
+        let source = Source::InMemory(blob);
+
+        if source.len() < OUTER_HEADER_SIZE + 4 {
             return Err(VectorError::Read(ReadError::MissingKv(
                 "vector blob header",
             )));
         }
 
-        if &blob[0..8] != format::vec::OUTER_MAGIC {
+        // Pull the fixed-size outer header in one fetch — five small
+        // reads collapse into one `Bytes::slice`.
+        let header = fetch_sync(&source, 0..OUTER_HEADER_SIZE, "outer header")?;
+        if &header[0..8] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
                 expected: format::vec::OUTER_MAGIC,
-                actual: blob[0..8].to_vec(),
+                actual: header[0..8].to_vec(),
             }));
         }
 
-        let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
+        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         if version != format::vec::VERSION {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
             ))));
         }
 
-        let n_columns = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
-        let n_docs = read_u64_le(&blob[16..24]);
-        let dir_offset = read_u64_le(&blob[24..32]) as usize;
+        let n_columns =
+            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        let n_docs = read_u64_le(&header[16..24]);
+        let dir_offset = read_u64_le(&header[24..32]) as usize;
 
         // Verify directory CRC.
         let dir_size = n_columns * DIR_ENTRY_SIZE;
-        if dir_offset + dir_size + 4 > blob.len() {
+        if dir_offset + dir_size + 4 > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "vector directory runs past blob".into(),
             )));
         }
-        let dir_bytes = &blob[dir_offset..dir_offset + dir_size];
-        let dir_crc_expected = read_u32_le(&blob[dir_offset + dir_size..dir_offset + dir_size + 4]);
-        let dir_crc_actual = crc32c(dir_bytes);
+        let dir_bytes = fetch_sync(&source, dir_offset..dir_offset + dir_size, "directory")?;
+        let dir_crc_bytes = fetch_sync(
+            &source,
+            dir_offset + dir_size..dir_offset + dir_size + 4,
+            "directory crc",
+        )?;
+        let dir_crc_expected = read_u32_le(&dir_crc_bytes);
+        let dir_crc_actual = crc32c(&dir_bytes);
         if dir_crc_expected != dir_crc_actual {
             return Err(VectorError::Read(ReadError::ChecksumMismatch {
                 section: "vector/directory",
@@ -163,7 +272,7 @@ impl VectorReader {
         }
 
         if opts.verify_crc {
-            verify_vector_crcs(&blob, dir_bytes, n_columns)?;
+            verify_vector_crcs(&source, &dir_bytes, n_columns)?;
         }
 
         // Parse JSON.
@@ -248,12 +357,12 @@ impl VectorReader {
             // Validate subsection bounds + magic. Subsection CRCs are
             // verified above in the parallel CRC pre-pass when requested.
             let sub_end = subsection_off + subsection_len;
-            if sub_end > blob.len() {
+            if sub_end > source.len() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} runs past blob"
                 ))));
             }
-            let sub = &blob[subsection_off..sub_end];
+            let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
             if sub.len() < SUB_HEADER_SIZE + 4 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} too short"
@@ -393,7 +502,7 @@ impl VectorReader {
         }
 
         Ok(VectorReader {
-            blob,
+            source,
             n_docs,
             columns,
             column_id_by_name,
@@ -413,7 +522,11 @@ impl VectorReader {
     pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
-        let sub = &self.blob[col.subsection_range.clone()];
+        // M1: byte access routed through `Source::try_get_range_sync`
+        // — zero-copy on `InMemory`, M2/M3 wires the lazy path.
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
         let off = col.summary_off;
         let dim = col.dim;
         let centroid: Vec<f32> = (0..dim)
@@ -451,7 +564,23 @@ impl VectorReader {
             return Ok(Vec::new());
         }
 
-        let sub = &self.blob[col.subsection_range.clone()];
+        // M1: subsection bytes obtained via `Source::try_get_range_sync`
+        // — zero-copy on `InMemory` (the only Source path on the
+        // current sync `search` contract). M3 lands the async
+        // counterpart + a `NeedsAsyncEntry` fast-fail on the
+        // lazy / unpopulated path. On out-of-bounds the source
+        // returns `None`; surface that as a typed read error
+        // rather than panicking on the implicit bounds check.
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())
+            .ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "vector source missing subsection bytes for column '{}' \
+                     (range {:?})",
+                    col.name, col.subsection_range
+                )))
+            })?;
 
         // 1. Score query vs every centroid (cheap; n_cent is small).
         //
@@ -537,7 +666,20 @@ impl VectorReader {
         // and falls back to a per-chunk LE decode otherwise. Same
         // zero-copy pattern as the centroid probe above; no
         // per-candidate heap allocation.
-        let sub = &self.blob[col.subsection_range.clone()];
+        //
+        // Re-fetch the subsection slice via the Source. On
+        // `InMemory` this is a refcount-only `Bytes::slice`;
+        // on a future warm `Lazy`, the same range is served
+        // from the in-process cache populated by step 3 / 4.
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())
+            .ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "vector source dropped subsection bytes mid-search for column '{}'",
+                    col.name
+                )))
+            })?;
         let dim_bytes = col.dim * 4;
         let mut reranked: Vec<(u32, f32)> = shortlist
             .iter()
@@ -568,21 +710,31 @@ fn read_u64_le(b: &[u8]) -> u64 {
 }
 
 #[inline]
-fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Result<(), VectorError> {
-    struct CrcJob<'a> {
+fn verify_vector_crcs(
+    source: &Source,
+    dir_bytes: &[u8],
+    n_columns: usize,
+) -> Result<(), VectorError> {
+    // `Bytes` instead of `&'a [u8]` so the par_iter doesn't need a
+    // lifetime parameter — each job owns a refcount-shared view into
+    // the source, which is itself shared via the outer `Source` for
+    // the duration of `open_with`.
+    struct CrcJob {
         idx: i32,
-        bytes: &'a [u8],
+        bytes: Bytes,
         expected: u32,
     }
 
-    let mut jobs: Vec<CrcJob<'_>> = Vec::with_capacity(n_columns + 1);
+    let mut jobs: Vec<CrcJob> = Vec::with_capacity(n_columns + 1);
 
-    let outer_total = blob.len();
+    let outer_total = source.len();
     let outer_crc_pos = outer_total - 4;
+    let outer_body = fetch_sync(source, 0..outer_crc_pos, "outer body")?;
+    let outer_crc_bytes = fetch_sync(source, outer_crc_pos..outer_total, "outer crc")?;
     jobs.push(CrcJob {
         idx: -1,
-        bytes: &blob[..outer_crc_pos],
-        expected: read_u32_le(&blob[outer_crc_pos..outer_total]),
+        bytes: outer_body,
+        expected: read_u32_le(&outer_crc_bytes),
     });
 
     for i in 0..n_columns {
@@ -590,22 +742,26 @@ fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Resul
         let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
         let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
         let sub_end = subsection_off + subsection_len;
-        if sub_end > blob.len() {
+        if sub_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "subsection {i} runs past blob"
             ))));
         }
-        let sub = &blob[subsection_off..sub_end];
+        let sub = fetch_sync(source, subsection_off..sub_end, "subsection")?;
         if sub.len() < SUB_HEADER_SIZE + 4 {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "subsection {i} too short"
             ))));
         }
         let sub_crc_pos = sub.len() - 4;
+        // `Bytes::slice` is zero-copy — no second `try_get_range_sync`
+        // round-trip needed since we already hold the subsection.
+        let sub_body = sub.slice(0..sub_crc_pos);
+        let sub_crc_bytes = sub.slice(sub_crc_pos..sub.len());
         jobs.push(CrcJob {
             idx: i as i32,
-            bytes: &sub[..sub_crc_pos],
-            expected: read_u32_le(&sub[sub_crc_pos..]),
+            bytes: sub_body,
+            expected: read_u32_le(&sub_crc_bytes),
         });
     }
 
@@ -614,7 +770,7 @@ fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Resul
     // and let the checksum module's CLMUL implementation handle each
     // byte stream quickly.
     let mismatch = jobs.par_iter().find_map_any(|job| {
-        if crc32c(job.bytes) != job.expected {
+        if crc32c(&job.bytes) != job.expected {
             Some(job.idx)
         } else {
             None
@@ -635,6 +791,26 @@ fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Resul
     }
 
     Ok(())
+}
+
+/// Best-effort sync byte fetch with a typed error. Used throughout
+/// `open_with` so every byte access goes through the `Source`
+/// abstraction — the lazy variant (M2) will plumb the eager-prefetch
+/// path through the same call sites without a second rewrite.
+///
+/// Failure mode here means the range is out-of-bounds or not
+/// present in the sync cache. M1 only opens `Source::InMemory`, where
+/// any in-bounds range succeeds zero-copy; this only fires on a
+/// malformed blob today.
+#[inline]
+fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, VectorError> {
+    let start = range.start;
+    let end = range.end;
+    source.try_get_range_sync(range).ok_or_else(|| {
+        VectorError::Read(ReadError::MalformedVersion(format!(
+            "vector {what} range {start}..{end} past blob"
+        )))
+    })
 }
 
 #[cfg(test)]
@@ -824,6 +1000,93 @@ mod tests {
         assert_eq!(centroid.len(), 16);
         assert!(radius >= 0.0);
         assert!(r.summary("nonexistent").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 011 M1 — Source enum sanity tests
+    // -----------------------------------------------------------------
+    //
+    // M1 only adds the enum + reroutes runtime byte access through
+    // it; the public open path still takes a `Bytes` (M2 introduces
+    // `open_lazy`). These tests directly exercise the `Source`
+    // contract so any future refactor that breaks the InMemory
+    // zero-copy invariant or mis-implements the Lazy wrapper fails
+    // here rather than at the wider Lance oracle gate.
+
+    #[test]
+    fn source_in_memory_try_get_range_sync_zero_copy() {
+        let payload = Bytes::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let src = Source::InMemory(payload.clone());
+        let slice = src
+            .try_get_range_sync(3..7)
+            .expect("in-bounds InMemory sync must succeed");
+        assert_eq!(slice.as_ref(), &payload[3..7]);
+        // Zero-copy invariant: returned Bytes points into the
+        // same allocation as the source.
+        let expected_ptr = unsafe { payload.as_ptr().add(3) };
+        assert_eq!(slice.as_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn source_in_memory_try_get_range_sync_out_of_bounds_returns_none() {
+        let src = Source::InMemory(Bytes::from(vec![0u8; 4]));
+        assert!(src.try_get_range_sync(0..100).is_none());
+        assert!(src.try_get_range_sync(8..10).is_none());
+    }
+
+    #[tokio::test]
+    async fn source_in_memory_get_range_round_trips_through_async() {
+        let payload = Bytes::from(vec![100u8, 101, 102, 103, 104, 105]);
+        let src = Source::InMemory(payload.clone());
+        let got = src
+            .get_range(1..5)
+            .await
+            .expect("InMemory async always succeeds");
+        assert_eq!(got.as_ref(), &payload[1..5]);
+    }
+
+    #[test]
+    fn source_lazy_try_get_range_sync_falls_through_to_trait_default_or_impl() {
+        // Wrap an in-memory blob in the trait-shaped
+        // `BytesLazyByteSource`, then in `Source::Lazy`. The lazy
+        // adapter's `try_get_range_sync` impl returns `Some` for
+        // in-bounds ranges; we exercise the full enum dispatch
+        // path here so the Lazy arm of `Source::try_get_range_sync`
+        // doesn't drift apart from the InMemory arm.
+        use crate::superfile::lazy_source::BytesLazyByteSource;
+        let payload = Bytes::from(vec![7u8, 8, 9, 10, 11, 12, 13, 14]);
+        let lazy: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let src = Source::Lazy(lazy);
+        let slice = src
+            .try_get_range_sync(2..6)
+            .expect("BytesLazyByteSource always serves sync");
+        assert_eq!(slice.as_ref(), &payload[2..6]);
+    }
+
+    #[tokio::test]
+    async fn source_lazy_get_range_dispatches_to_trait_range() {
+        use crate::superfile::lazy_source::BytesLazyByteSource;
+        let payload = Bytes::from(vec![21u8, 22, 23, 24, 25, 26, 27]);
+        let lazy: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let src = Source::Lazy(lazy);
+        let got = src.get_range(1..5).await.expect("async range");
+        assert_eq!(got.as_ref(), &payload[1..5]);
+    }
+
+    /// `Source::Clone` lets readers share the underlying
+    /// state cheaply (refcount bump). Clones must observe
+    /// identical bytes — no fork between paths.
+    #[test]
+    fn source_clone_observes_identical_bytes() {
+        let payload = Bytes::from(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let a = Source::InMemory(payload.clone());
+        let b = a.clone();
+        let sa = a.try_get_range_sync(2..6).expect("sa");
+        let sb = b.try_get_range_sync(2..6).expect("sb");
+        assert_eq!(sa.as_ref(), sb.as_ref());
+        assert_eq!(sa.as_ptr(), sb.as_ptr());
     }
 
     #[test]
