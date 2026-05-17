@@ -2465,8 +2465,14 @@ mod tests {
         let (blob, _json) = build_mixed_df_blob();
         // Re-parse the blob enough to reach the FST bytes.
         let header_size = 48usize;
-        let fst_off = u64::from_le_bytes(blob[24..32].try_into().unwrap()) as usize;
-        let postings_off = u64::from_le_bytes(blob[32..40].try_into().unwrap()) as usize;
+        let fst_off = u64::from_le_bytes(
+            blob[24..32].try_into().expect("fst_off slice is 8 bytes"),
+        ) as usize;
+        let postings_off = u64::from_le_bytes(
+            blob[32..40]
+                .try_into()
+                .expect("postings_off slice is 8 bytes"),
+        ) as usize;
         // FST bytes occupy [fst_off, postings_off - 4) (last 4 = FST CRC).
         let fst_bytes = &blob[fst_off..postings_off - 4];
         let dict = crate::superfile::fts::dict::DictReader::open(fst_bytes).expect("open dict");
@@ -2581,12 +2587,28 @@ mod tests {
         let blob_pfor = b_pfor.finish();
 
         // Extract postings-region sizes from the headers.
-        let postings_off_i = u64::from_le_bytes(blob_inline[32..40].try_into().unwrap()) as usize;
-        let dir_off_i = u64::from_le_bytes(blob_inline[40..48].try_into().unwrap()) as usize;
+        let postings_off_i = u64::from_le_bytes(
+            blob_inline[32..40]
+                .try_into()
+                .expect("postings_off_i slice is 8 bytes"),
+        ) as usize;
+        let dir_off_i = u64::from_le_bytes(
+            blob_inline[40..48]
+                .try_into()
+                .expect("dir_off_i slice is 8 bytes"),
+        ) as usize;
         let postings_size_inline = dir_off_i - postings_off_i;
 
-        let postings_off_p = u64::from_le_bytes(blob_pfor[32..40].try_into().unwrap()) as usize;
-        let dir_off_p = u64::from_le_bytes(blob_pfor[40..48].try_into().unwrap()) as usize;
+        let postings_off_p = u64::from_le_bytes(
+            blob_pfor[32..40]
+                .try_into()
+                .expect("postings_off_p slice is 8 bytes"),
+        ) as usize;
+        let dir_off_p = u64::from_le_bytes(
+            blob_pfor[40..48]
+                .try_into()
+                .expect("dir_off_p slice is 8 bytes"),
+        ) as usize;
         let postings_size_pfor = dir_off_p - postings_off_p;
 
         // Inline-only blob's postings region holds just the trailing
