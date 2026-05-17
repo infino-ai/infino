@@ -13,5 +13,6 @@ pub mod distance;
 pub mod kmeans;
 pub mod quant;
 pub mod reader;
+pub mod reservoir;
 pub mod rotation;
 pub mod spill;

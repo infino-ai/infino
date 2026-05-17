@@ -12,8 +12,9 @@ use crate::superfile::BuildError;
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self, FST_SEPARATOR, RESERVED_PREFIX};
 use crate::superfile::vector::distance::{Metric, l2_sq};
-use crate::superfile::vector::kmeans::kmeans_with_assignments;
+use crate::superfile::vector::kmeans::{assign_to_centroids, kmeans};
 use crate::superfile::vector::quant::BitQuantizer;
+use crate::superfile::vector::reservoir::{Reservoir, default_kmeans_sample_size};
 use crate::superfile::vector::rotation::RandomRotation;
 use rayon::prelude::*;
 
@@ -50,8 +51,21 @@ pub struct VectorConfig {
 struct ColumnState {
     config: VectorConfig,
     /// Contiguous: `dim * n_docs` f32s, push-order matches doc_id order.
+    /// Held for assignment + RaBitQ encode + cluster-contiguous layout
+    /// during `finish()`. 010 M2 leaves this in place; 010 M3 replaces
+    /// it with a (`pre_spill_buffer`, optional disk spill) pair so
+    /// peak resident memory becomes a function of
+    /// `(reservoir, spill_threshold)` instead of `(n_docs, dim)`.
     vectors: Vec<f32>,
     n_docs: u32,
+    /// Reservoir-sampled k-means training set. Bounded at
+    /// `default_kmeans_sample_size(n_cent)` rows regardless of
+    /// `n_docs`; once `n_docs > sample_size` further `add()` calls
+    /// only touch the reservoir with probability `sample_size /
+    /// n_docs` (Vitter Algorithm L). Trained against by k-means in
+    /// `finish()`; the resulting centroids are then used to assign
+    /// the full corpus.
+    reservoir: Reservoir,
 }
 
 /// Multi-column vector blob builder.
@@ -91,12 +105,52 @@ impl VectorBuilder {
             return Err(BuildError::DuplicateColumnName(config.name));
         }
         let column_id = self.columns.len() as u32;
+        let sample_size = default_kmeans_sample_size(config.n_cent);
+        // Seed the reservoir RNG from `rot_seed ^ 0x5a5a` so it
+        // stays deterministic with the column config but uses a
+        // distinct stream from `RandomRotation` (which seeds from
+        // `rot_seed` directly) and `kmeans` (which seeds from
+        // `rot_seed + 7`). Three disjoint streams, three
+        // deterministic seeds, one knob on the user's end.
+        let reservoir_seed = config.rot_seed ^ 0x5a5a_5a5a_5a5a_5a5a;
+        let reservoir = Reservoir::new(sample_size, config.dim, reservoir_seed);
         self.columns.push(ColumnState {
             config,
             vectors: Vec::new(),
             n_docs: 0,
+            reservoir,
         });
         Ok(column_id)
+    }
+
+    /// Override the k-means training sample size for a column. Must
+    /// be called before the first `add()` for the column — calling it
+    /// later silently discards already-observed reservoir state and
+    /// only future `add()` calls feed into the new reservoir.
+    ///
+    /// The default sample size is `default_kmeans_sample_size(n_cent)`
+    /// (`100K-500K` depending on `n_cent`). This override exists for
+    /// (a) the M2 sample-size sweep on synthetic recall corpora and
+    /// (b) future advanced callers that want to dial sample size to
+    /// match a recall vs. memory trade-off they've profiled.
+    ///
+    /// Returns an error if `column_id` is out of range.
+    pub fn set_kmeans_sample_size(
+        &mut self,
+        column_id: u32,
+        sample_size: usize,
+    ) -> Result<(), BuildError> {
+        let idx = column_id as usize;
+        if idx >= self.columns.len() {
+            return Err(BuildError::FtsColumnTypeInvalid {
+                column: format!("(unregistered vector column_id {column_id})"),
+                actual: "n/a".to_string(),
+            });
+        }
+        let col = &mut self.columns[idx];
+        let reservoir_seed = col.config.rot_seed ^ 0x5a5a_5a5a_5a5a_5a5a;
+        col.reservoir = Reservoir::new(sample_size, col.config.dim, reservoir_seed);
+        Ok(())
     }
 
     /// Append one vector to the named column. Caller must invoke once
@@ -118,6 +172,7 @@ impl VectorBuilder {
                 actual: format!("vec.len()={} != dim={}", vec.len(), col.config.dim),
             });
         }
+        col.reservoir.update(vec);
         col.vectors.extend_from_slice(vec);
         col.n_docs += 1;
         Ok(())
@@ -140,7 +195,12 @@ impl VectorBuilder {
         //    centroids + cluster index + codes + full + doc_ids + CRC.
         let mut subsections: Vec<SubsectionBytes> = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
-            subsections.push(build_subsection(&col.config, &col.vectors, col.n_docs));
+            subsections.push(build_subsection(
+                &col.config,
+                col.reservoir.sample(),
+                &col.vectors,
+                col.n_docs,
+            ));
         }
 
         // 2. Layout: outer_header(32) + directory(n_columns * 64) +
@@ -230,20 +290,53 @@ struct SubsectionBytes {
 ///   [Doc IDs]                     — n_docs × u32 (local_doc_id in cluster order)
 ///   [Trailing CRC32C]             — u32 over all bytes above
 /// ```
-fn build_subsection(cfg: &VectorConfig, vectors: &[f32], n_docs_input: u32) -> SubsectionBytes {
+fn build_subsection(
+    cfg: &VectorConfig,
+    sample: &[f32],
+    vectors: &[f32],
+    n_docs_input: u32,
+) -> SubsectionBytes {
     let dim = cfg.dim;
     let n_docs = n_docs_input as usize;
-    // n_cent must be in [1, n_docs] for k-means to be well-defined.
-    let n_cent = cfg.n_cent.max(1).min(n_docs.max(1));
+    let sample_rows = sample.len() / dim;
+    // n_cent must be in [1, min(n_docs, sample_rows)]. Both bounds
+    // are required: n_cent > n_docs makes the IVF degenerate; n_cent
+    // > sample_rows would crash k-means since `k > n` in the trainer
+    // is rejected at the assertion in `kmeans()`. In the steady-state
+    // case (n_docs > sample_size), the sample_rows bound is the
+    // active one and equals `default_kmeans_sample_size(cfg.n_cent)`,
+    // which is `≥ 100K ≥ any sane n_cent`.
+    let n_cent = cfg
+        .n_cent
+        .max(1)
+        .min(n_docs.max(1))
+        .min(sample_rows.max(1));
 
-    // 1. K-means centroids + final-iter assignments. Returning the
-    //    assignments from k-means lets us skip an otherwise-redundant
-    //    second full assignment pass (~2.4 s at 1M × 384, ~16% of
-    //    finish() time).
-    let (centroids, kmeans_assignments) = if n_docs == 0 {
-        (vec![0.0f32; n_cent * dim], Vec::new())
+    // 1. K-means on the reservoir sample (010 M2). The sample is a
+    //    uniform random draw from the full corpus bounded at
+    //    `default_kmeans_sample_size(n_cent)` rows, so memory scales
+    //    with `(n_cent, dim)` instead of `(n_docs, dim)`. Recall
+    //    against an oracle is the gate; 010 M2 has tests at multiple
+    //    sample_size points to confirm there's no degradation past
+    //    the default.
+    let centroids = if sample_rows == 0 || n_docs == 0 {
+        vec![0.0f32; n_cent * dim]
     } else {
-        kmeans_with_assignments(vectors, dim, n_cent, 5, cfg.rot_seed)
+        kmeans(sample, dim, n_cent, 5, cfg.rot_seed)
+    };
+
+    // 2. Assign the full corpus against the reservoir-trained
+    //    centroids. The pre-M2 path piggy-backed assignments off
+    //    k-means' final iteration to save a pass, but that pass
+    //    was over the same corpus k-means trained on. Now training
+    //    is on a strict subset; the corpus needs its own assign.
+    //    Roughly 2.4 s at 1M × 384 on CPU.
+    let kmeans_assignments: Vec<u32> = if n_docs == 0 {
+        Vec::new()
+    } else {
+        let mut a = vec![0u32; n_docs];
+        assign_to_centroids(vectors, &centroids, dim, n_cent, &mut a);
+        a
     };
 
     // 2. Summary centroid (mean of centroids) + summary radius (max

@@ -154,6 +154,73 @@ pub fn kmeans_with_assignments(
     (centroids, assignments)
 }
 
+/// Assign each row of `vectors` to its argmin centroid under L2²,
+/// writing the result into `assignments`. Rayon-parallel over docs;
+/// per-pair distance via [`l2_sq`]. Wraps the same per-doc loop as
+/// one iteration of [`kmeans_with_assignments`]'s inner loop, but
+/// exposed as a standalone entry point so the reservoir-trained
+/// k-means in [`crate::superfile::vector::reservoir`] can fan the
+/// trained centroids back out across the full corpus after
+/// training touched only a sample.
+///
+/// # Panics
+///
+/// - `vectors.len() % dim != 0`
+/// - `assignments.len() != vectors.len() / dim`
+/// - `centroids.len() != k * dim`
+/// - `k == 0` or `dim == 0`
+pub fn assign_to_centroids(
+    vectors: &[f32],
+    centroids: &[f32],
+    dim: usize,
+    k: usize,
+    assignments: &mut [u32],
+) {
+    assert!(dim > 0, "assign_to_centroids: dim must be > 0");
+    assert!(k > 0, "assign_to_centroids: k must be > 0");
+    assert_eq!(
+        vectors.len() % dim,
+        0,
+        "assign_to_centroids: vectors len {} not multiple of dim {dim}",
+        vectors.len()
+    );
+    assert_eq!(
+        centroids.len(),
+        k * dim,
+        "assign_to_centroids: centroids len {} != k*dim {}",
+        centroids.len(),
+        k * dim
+    );
+    let n = vectors.len() / dim;
+    assert_eq!(
+        assignments.len(),
+        n,
+        "assign_to_centroids: assignments len {} != n_docs {n}",
+        assignments.len()
+    );
+    if n == 0 {
+        return;
+    }
+    let new_assignments: Vec<u32> = (0..n)
+        .into_par_iter()
+        .map(|d| {
+            let v = &vectors[d * dim..(d + 1) * dim];
+            let mut best = 0u32;
+            let mut best_d = f32::INFINITY;
+            for c in 0..k {
+                let cv = &centroids[c * dim..(c + 1) * dim];
+                let dist = l2_sq(v, cv);
+                if dist < best_d {
+                    best_d = dist;
+                    best = c as u32;
+                }
+            }
+            best
+        })
+        .collect();
+    assignments.copy_from_slice(&new_assignments);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
