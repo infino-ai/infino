@@ -167,6 +167,12 @@ fs4 = { version = "0.13", features = ["tokio"] }
 # adopting a built-in Twitter/Discord variant.
 ferroid = { version = "2", features = ["std", "alloc", "snowflake", "basic"] }
 
+# Scratch tempdir + spill file management for the streaming
+# `VectorBuilder` (plan 010 M3). Promoted from dev-dependencies
+# because builder.rs holds an `Arc<TempDir>` per builder to
+# back per-centroid bucket files and per-column input spills.
+tempfile = "3"
+
 [dev-dependencies]
 # Self-reference with the `test-helpers` feature enabled so
 # integration tests + benches see `infino::test_helpers`.

@@ -44,7 +44,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         b.add(1, &v_img).expect("add to vector builder");
     }
 
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish vector builder");
     let json = r#"[
         {"name":"text_emb","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"},
         {"name":"image_emb","dim":24,"n_cent":4,"rot_seed":22,"metric":"l2sq"}
@@ -174,7 +174,7 @@ fn end_to_end_planted_clusters_recovered() {
     }
     assert_eq!(next_doc_id, 60);
 
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish vector builder");
     let json = r#"[{"name":"v","dim":16,"n_cent":3,"rot_seed":42,"metric":"l2sq"}]"#;
     let r = VectorReader::open(Bytes::from(bytes), json).expect("open VectorReader");
 

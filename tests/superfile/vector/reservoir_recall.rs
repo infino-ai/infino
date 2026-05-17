@@ -104,7 +104,7 @@ fn build_reader_with_sample_size(
         b.add(0, &corpus_flat[i * dim..(i + 1) * dim])
             .expect("add to vector builder");
     }
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish vector builder");
     let json = format!(
         r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
     );
@@ -198,7 +198,7 @@ fn recall_with_default_reservoir_equivalent_to_pre_m2() {
         b.add(0, &flat[i * dim..(i + 1) * dim])
             .expect("add to vector builder");
     }
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish vector builder");
     let json = format!(
         r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
     );

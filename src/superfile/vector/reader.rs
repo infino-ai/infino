@@ -609,7 +609,7 @@ mod tests {
                 .collect();
             b.add(0, &v).expect("add to vector builder");
         }
-        let bytes = b.finish();
+        let bytes = b.finish().expect("finish vector builder");
         let metric_s = match metric {
             Metric::L2Sq => "l2sq",
             Metric::Cosine => "cosine",
@@ -707,7 +707,7 @@ mod tests {
             b.add(0, &v).expect("add to vector builder");
             all_vecs.push(v);
         }
-        let bytes = b.finish();
+        let bytes = b.finish().expect("finish vector builder");
         let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let r = VectorReader::open(Bytes::from(bytes), json).expect("open VectorReader");
 

@@ -94,7 +94,7 @@ fn build_reader(
     for v in corpus {
         b.add(0, v).expect("add to vector builder");
     }
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish vector builder");
     let metric_str = match metric {
         Metric::L2Sq => "l2sq",
         Metric::Cosine => "cosine",

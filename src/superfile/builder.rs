@@ -437,11 +437,10 @@ impl SuperfileBuilder {
             .take()
             .map(FtsBuilder::finish)
             .unwrap_or_default();
-        let vec_blob: Vec<u8> = self
-            .vec_builder
-            .take()
-            .map(VectorBuilder::finish)
-            .unwrap_or_default();
+        let vec_blob: Vec<u8> = match self.vec_builder.take() {
+            Some(vb) => vb.finish()?,
+            None => Vec::new(),
+        };
 
         // Assemble inf.* KV metadata.
         let mut kvs: Vec<(String, String)> = vec![
