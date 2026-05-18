@@ -2164,4 +2164,238 @@ mod tests {
              (total delta {delta_mib:.3} MiB over {n_cols} column(s))."
         );
     }
+
+    // -----------------------------------------------------------------
+    // Plan 011 — supertable-scale memory ceiling
+    // -----------------------------------------------------------------
+    //
+    // The single-segment `mem_ceiling_lazy_open_*` tests above pin the
+    // per-reader bound. These multi-segment variants pin the
+    // *supertable-shaped* bound: open N segments concurrently — same
+    // shape `Supertable::commit` produces (N = N_SEGMENTS_BENCH × num_cpus
+    // because `split_buffer_into_row_shards` shards each commit's
+    // buffer into one segment per writer-pool thread) — and assert the
+    // total anon RSS delta scales as `N × O(centroids + rotation +
+    // small)`, not as `N × subsection_size`.
+    //
+    // What this proves (and what it doesn't):
+    //
+    // - PROVES: a supertable opened with the production disk-cache
+    //   path (`Source::InMemory(Bytes::from_owner(mmap))` per segment —
+    //   see `supertable::reader_cache::disk::insert`) keeps anon
+    //   RSS bounded across an arbitrary number of segments, with no
+    //   per-doc anon term. Equivalent here because
+    //   `Bytes::from_owner` is zero-copy over the mmap, and the
+    //   lazy-open path doesn't touch `doc_ids[]` /
+    //   doc_to_pos / full[] at open time.
+    //
+    // - DOES NOT PROVE: the in-process `InMemoryReaderCache` path
+    //   (`Bytes::from(Vec)` per segment — see
+    //   `supertable::reader_cache::in_memory::insert`) has the same
+    //   bound. That path holds each segment's bytes in anon by
+    //   construction (no mmap involved). The in-memory cache is the
+    //   test/bench path; production attaches a `StorageProvider` and
+    //   routes through the disk cache. A separate test for the
+    //   in-memory cache path isn't a 011 deliverable — that path's
+    //   anon cost is its declared contract.
+    //
+    // The bench's 10M × 4-commit × num_cpus-thread shape produces
+    // exactly the topology these tests exercise. The smoke variant
+    // mirrors the bench's *layout* at a tiny corpus size (4 segments
+    // × 50 k docs × 64 dim) so every PR catches regressions
+    // (~5 s build). The `#[ignore]`'d plan-spec variant uses the
+    // bench's actual per-segment shape (16 segments × 625 k docs ×
+    // 384 dim × n_cent_per_segment matching the bench's
+    // `n_cent_total / 4`) and runs only when called out.
+
+    /// Open `N` segment files (built by `build_corpus_to_file`) via
+    /// `Source::Lazy(BytesLazyByteSource over Arc<Mmap>)` and return
+    /// the total RSS delta attributable to those opens. Anchors
+    /// `(readers, mmaps)` past the after-RSS read.
+    fn measure_lazy_multi_segment_open_rss_delta(
+        corpus_paths: &[std::path::PathBuf],
+        jsons: &[String],
+    ) -> (usize, usize, usize) {
+        assert_eq!(corpus_paths.len(), jsons.len(), "paths/jsons must align");
+        let n_segments = corpus_paths.len();
+
+        // Pre-build (mmap, lazy source) pairs *before* the `before`
+        // snapshot so the syscalls don't contaminate the delta — we
+        // only want the open path's allocations in the measurement.
+        let mut lazies: Vec<(StdArc<memmap2::Mmap>, StdArc<dyn LazyByteSource>)> =
+            Vec::with_capacity(n_segments);
+        for path in corpus_paths {
+            let file = std::fs::File::open(path).expect("reopen corpus readonly");
+            let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+            let mmap_arc = StdArc::new(mmap);
+            let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
+            let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
+            lazies.push((mmap_arc, lazy));
+        }
+
+        let before = memory_stats::memory_stats()
+            .expect("memory_stats supported")
+            .physical_mem;
+
+        let mut readers: Vec<VectorReader> = Vec::with_capacity(n_segments);
+        let mut n_cols_total = 0usize;
+        for ((_, lazy), json) in lazies.iter().zip(jsons.iter()) {
+            let reader = VectorReader::open_with_source(
+                Source::Lazy(StdArc::clone(lazy)),
+                json,
+                OpenOptions {
+                    verify_crc: false,
+                    prefetch_eager: false,
+                },
+            )
+            .expect("lazy open");
+            n_cols_total += reader.columns.len();
+            readers.push(reader);
+        }
+
+        let after = memory_stats::memory_stats()
+            .expect("memory_stats supported")
+            .physical_mem;
+
+        let delta = after.saturating_sub(before);
+
+        // Keep both alive past the RSS reads — dropping any reader
+        // (or mmap) before reading `after` would silently shrink the
+        // measured delta.
+        std::hint::black_box((&readers, &lazies));
+        drop(readers);
+        drop(lazies);
+
+        (delta, n_cols_total, n_segments)
+    }
+
+    /// **Plan 011 supertable-scale memory ceiling (smoke).**
+    ///
+    /// Mirrors the bench's 4-commit × num_cpus-thread shape at a
+    /// tiny corpus size. Builds 4 segment files (each 50 k × 64
+    /// dim × n_cent=64 — same shape as
+    /// `mem_ceiling_lazy_open_smoke`), opens all 4 lazy, and
+    /// asserts the total anon RSS delta is ≤ 10 MiB. With
+    /// per-segment ceiling of 10 MiB / column from the single-
+    /// segment smoke and a 4× multiplier in the worst case
+    /// (centroids + rotation matrix per segment), 10 MiB total
+    /// gives plenty of headroom while still failing loud if a
+    /// regression makes per-segment opens allocate per-doc.
+    ///
+    /// Runs in the default `cargo test --lib` suite (~3–5 s
+    /// total) so every PR validates the supertable-shape bound.
+    #[test]
+    fn mem_ceiling_lazy_multi_segment_open_smoke() {
+        const N_SEGMENTS: usize = 4;
+        const N_DOCS_PER_SEG: u32 = 50_000;
+        const DIM: usize = 64;
+        const N_CENT: usize = 64;
+
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
+        for _ in 0..N_SEGMENTS {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT);
+            paths.push(tmp.path().to_path_buf());
+            jsons.push(json);
+            tmps.push(tmp); // keep the tempfile alive until end
+        }
+
+        let (delta_bytes, n_cols_total, n_segments) =
+            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_seg_mib = delta_mib / n_segments as f64;
+
+        eprintln!(
+            "mem_ceiling_lazy_multi_segment_open_smoke ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT}): RSS delta = {delta_mib:.3} MiB over {n_segments} \
+             segment(s) ({n_cols_total} column(s) total) = {per_seg_mib:.3} MiB/segment"
+        );
+
+        assert!(
+            delta_mib <= 10.0,
+            "supertable-shape lazy open RSS delta {delta_mib:.3} MiB exceeds 10 MiB ceiling \
+             at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM} — regression hint: each segment may \
+             be touching its doc_ids/full[]/codes region at open"
+        );
+
+        drop(tmps);
+    }
+
+    /// **Plan 011 supertable-scale memory ceiling (plan-spec).**
+    ///
+    /// Mirrors the bench's actual 10M × 4-commit ×
+    /// 4-thread-writer-pool topology: 16 segments × 625 k docs ×
+    /// 384 dim × `n_cent_per_segment = n_cent(10M) / 4` (the
+    /// bench's `corpus::n_cent(10M)` returns 1024, so this is
+    /// 256). Each segment file is ~960 MiB on disk; the test
+    /// writes ~15 GiB total to the tempdir. Build time is
+    /// dominated by the 16 sequential streaming builds at
+    /// ~10 s each in release ≈ 3 min total.
+    ///
+    /// `#[ignore]`-gated. Run explicitly:
+    ///
+    /// ```bash
+    /// cargo test --release -p infino --lib \
+    ///     mem_ceiling_lazy_supertable_scale_under_50mib -- --ignored --nocapture
+    /// ```
+    ///
+    /// Bound: 50 MiB total anon over the 16 segments. The
+    /// per-segment open materialises:
+    /// - rotation matrix: `dim² × 4 = 576 KiB` at dim=384
+    /// - centroids buffer (in lazy source page cache, not anon):
+    ///   `n_cent × dim × 4 = 384 KiB` at the smoke shape
+    /// - per-column header / cluster_idx slices (KiB-range)
+    ///
+    /// Add a 2× safety margin for allocator overhead +
+    /// reader-struct fields, multiply by 16 segments → ~20 MiB
+    /// theoretical, 50 MiB ceiling for headroom. A regression
+    /// that re-introduces eager subsection materialisation
+    /// would blow this to ~15 GiB (the full corpus) and fail
+    /// loud here rather than at the production 100 M OOM.
+    #[test]
+    #[ignore]
+    fn mem_ceiling_lazy_supertable_scale_under_50mib() {
+        const N_SEGMENTS: usize = 16;
+        const N_DOCS_PER_SEG: u32 = 625_000;
+        const DIM: usize = 384;
+        const N_CENT_PER_SEG: usize = 256;
+
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
+        for i in 0..N_SEGMENTS {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            eprintln!(
+                "  building segment {i:2}/{N_SEGMENTS} \
+                 ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
+            );
+            let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT_PER_SEG);
+            paths.push(tmp.path().to_path_buf());
+            jsons.push(json);
+            tmps.push(tmp);
+        }
+
+        let (delta_bytes, n_cols_total, n_segments) =
+            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_seg_mib = delta_mib / n_segments as f64;
+
+        eprintln!(
+            "mem_ceiling_lazy_supertable_scale_under_50mib ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT_PER_SEG}): RSS delta = {delta_mib:.3} MiB over \
+             {n_segments} segment(s) ({n_cols_total} column(s) total) = \
+             {per_seg_mib:.3} MiB/segment"
+        );
+
+        assert!(
+            delta_mib <= 50.0,
+            "supertable-scale (10M-bench shape) lazy open RSS delta {delta_mib:.3} MiB \
+             exceeds 50 MiB ceiling at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. \
+             Eager re-introduction would push this past 15 GiB."
+        );
+
+        drop(tmps);
+    }
 }
