@@ -535,13 +535,6 @@ pub fn build_vector_index(
 
 /// Open a built vector blob as a reader. Encodes the directory JSON
 /// inline so callers don't reinvent it.
-///
-/// Bench harness: opens with `prefetch_eager: true` so the pre-011
-/// hot-first-search semantics are preserved — criterion measurements
-/// of `first_search_*` etc. compare against the documented numbers
-/// in `benches/vector/README.md` without picking up the lazy-build
-/// cost on the first iteration. The lazy path is benched separately
-/// via `open_lazy_vs_eager` once 011 M5 lands.
 pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> VectorReader {
     let metric_str = match metric {
         Metric::L2Sq => "l2sq",
@@ -551,15 +544,8 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
     let json = format!(
         r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
     );
-    VectorReader::open_with(
-        Bytes::from(blob),
-        &json,
-        OpenOptions {
-            verify_crc: true,
-            prefetch_eager: true,
-        },
-    )
-    .expect("open VectorReader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open VectorReader")
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.

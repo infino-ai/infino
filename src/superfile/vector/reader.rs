@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
@@ -58,27 +58,6 @@ pub struct ColumnReader {
     codes_off: usize,
     full_off: usize,
     doc_ids_off: usize,
-    /// `local_doc_id → cluster-position` lookup table.
-    ///
-    /// **Unused on the search path post-011 M3.b.** The rerank
-    /// step now carries `pos = off + i` inline in the shortlist
-    /// tuple, computed at code-scoring time at no extra cost
-    /// (the value was already in scope; the old code threw it
-    /// away and looked it up here at rerank time). Still built
-    /// eagerly at open when [`OpenOptions::prefetch_eager`] is
-    /// on (today's bench-harness default; preserved for
-    /// backward-compatibility of any external consumer that
-    /// reads the table directly). Left empty otherwise. The
-    /// 4 MB / 1M-doc / column allocation is now opt-in, not
-    /// the default.
-    ///
-    /// TODO(011 follow-up): remove this field and
-    /// `OpenOptions::prefetch_eager` once no external consumer
-    /// reads the table. The eager-build path becomes a no-op
-    /// after that; bench harnesses can drop their
-    /// `prefetch_eager: true` setting in the same commit.
-    #[allow(dead_code)]
-    doc_to_pos: OnceLock<Vec<u32>>,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -88,13 +67,12 @@ pub struct ColumnReader {
 }
 
 /// Per-open knobs for [`VectorReader::open_with`]. `Default` is the
-/// safe + lazy choice (CRC verification on, no eager prefetch). The
-/// argumentless [`VectorReader::open`] takes the default.
+/// safe choice (CRC verification on). The argumentless
+/// [`VectorReader::open`] takes the default.
 ///
 /// Plan 011 consolidates open-time knobs here. Today: `verify_crc`
-/// (CRC pre-pass) and `prefetch_eager` (eager `doc_to_pos` build).
-/// Plan 013 may add object-storage-native knobs (e.g. `range_fetch_
-/// concurrency`) under the same struct.
+/// only. Plan 013 may add object-storage-native knobs (e.g.
+/// `range_fetch_concurrency`) under the same struct.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Verify the per-subsection CRC during open. Each subsection is
@@ -105,33 +83,11 @@ pub struct OpenOptions {
     /// addressed object store, checksummed filesystem) to skip
     /// the scan.
     pub verify_crc: bool,
-    /// If `true`, build the per-column `doc_to_pos` lookup table at
-    /// open time by scanning each column's `doc_ids` region (today's
-    /// pre-011 behaviour). Costs ~2-3 ms at 1M × 384 + the resident
-    /// `n_docs × 4` bytes per column (4 MB at 1M, 40 MB at 10M).
-    ///
-    /// If `false` (default), `doc_to_pos` is left empty at open and
-    /// built lazily on the first `search()` that reaches the rerank
-    /// stage on that column — via [`std::sync::OnceLock::set`] under
-    /// concurrent searches, so two simultaneous first-rerank queries
-    /// may each build the table; one wins, the other drops their
-    /// copy. The build itself uses [`Source::try_get_range_sync`],
-    /// so on `Source::InMemory` it's a zero-copy walk over the
-    /// already-resident bytes.
-    ///
-    /// Bench harnesses + tests that want today's "first-search is
-    /// hot" semantics flip this to `true`. The supertable reader
-    /// path leaves it `false` (the lazy default) — first query pays
-    /// the build cost, every subsequent one is unchanged.
-    pub prefetch_eager: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
-        Self {
-            verify_crc: true,
-            prefetch_eager: false,
-        }
+        Self { verify_crc: true }
     }
 }
 
@@ -223,8 +179,8 @@ impl Source {
     /// on `InMemory`; same on `BytesLazyByteSource` / mmap-
     /// backed sources). This covers every production caller
     /// today and every hot-path read at default open
-    /// (`prefetch_eager: false` + `Source::Lazy(BytesLazyByteSource
-    /// over Bytes::from_owner(mmap))`).
+    /// (`Source::Lazy(BytesLazyByteSource over
+    /// Bytes::from_owner(mmap))`).
     ///
     /// Cold path (`Source::Lazy` and `try_get_range_sync`
     /// returned `None`): bridge to the source's `async fn
@@ -549,12 +505,9 @@ impl VectorReader {
             let doc_ids_off = full_off + full_size;
 
             // Bounds-check the cluster_idx + doc_ids regions without
-            // reading them. Plan 011 M2: the per-cluster walk that
-            // builds `doc_to_pos` is gated on `opts.prefetch_eager`
-            // — without it, open never touches the `doc_ids` region
-            // (the table is built lazily on first rerank). The whole-
-            // region bounds checks below are pure offset math, so
-            // they're cheap and run unconditionally.
+            // reading them. Plan 011 M3.b carries `pos = off + i`
+            // inline in the shortlist, so search never touches the
+            // `doc_ids` region; open only needs the offset math.
             let cluster_idx_size = (n_cent as usize) * 8;
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
@@ -569,24 +522,6 @@ impl VectorReader {
                     "column '{}' doc_ids region runs past subsection",
                     cfg.name
                 ))));
-            }
-
-            let doc_to_pos: OnceLock<Vec<u32>> = OnceLock::new();
-            if opts.prefetch_eager {
-                // Eager path: walk every cluster's doc_ids slice now
-                // and seed the OnceLock. Matches today's pre-011
-                // behaviour for callers (bench harnesses, eager
-                // tests) that want first-search to be hot.
-                let table = build_doc_to_pos(
-                    &sub,
-                    n_cent,
-                    cluster_idx_off,
-                    doc_ids_off,
-                    col_n_docs,
-                    sub_crc_pos,
-                    &cfg.name,
-                )?;
-                let _ = doc_to_pos.set(table);
             }
 
             // Soft cross-check: cfg.metric matches blob's metric.
@@ -620,7 +555,6 @@ impl VectorReader {
                 codes_off,
                 full_off,
                 doc_ids_off,
-                doc_to_pos,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
@@ -689,17 +623,15 @@ impl VectorReader {
     /// - 1 fat range covering the rerank batch in `full[]` from
     ///   `min(pos)` to `max(pos) + 1`
     ///
-    /// At `nprobe = 8`: 2 + 16 + 1 = **19 ranges**. The
-    /// `doc_to_pos` lookup table is bypassed entirely — the
-    /// rerank `pos` is captured inline in the shortlist tuple
-    /// at code-scoring time (each candidate's position is `off +
-    /// i` where `(off, cnt)` is the cluster's entry and `i` is
-    /// the in-cluster index, the same value
-    /// [`build_doc_to_pos`] would store. The lookup table buys
-    /// nothing on the search path and costs a 4 MB / 1M-doc
-    /// allocation plus a per-candidate memory dependency.) See
-    /// `claude_plans/011_lazy_reader_loads.md` § Search path for
-    /// the contract.
+    /// At `nprobe = 8`: 2 + 16 + 1 = **19 ranges**. Rerank `pos`
+    /// is captured inline in the shortlist tuple at code-scoring
+    /// time (each candidate's position is `off + i` where
+    /// `(off, cnt)` is the cluster's entry and `i` is the
+    /// in-cluster index), so there is no `doc_to_pos` lookup
+    /// table at all — that 4 MB / 1M-doc allocation was deleted
+    /// in plan 011 M4 once the audit confirmed zero external
+    /// readers. See `claude_plans/011_lazy_reader_loads.md`
+    /// § Search path for the contract.
     pub fn search(
         &self,
         column: &str,
@@ -748,8 +680,7 @@ impl VectorReader {
 
         // 5. Per-cluster fetches (codes + doc_ids) and shortlist
         //    build. Shortlist tuple is (doc_id, estimate, pos);
-        //    pos = off + i is captured inline (no doc_to_pos
-        //    lookup on this path).
+        //    pos = off + i is captured inline.
         let cb = col.quant.code_bytes();
         let mut shortlist: Vec<(u32, f32, u32)> = Vec::new();
         for &(c, _) in &centroid_scores {
@@ -874,9 +805,8 @@ fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) ->
 /// Score one cluster's 1-bit codes against the rotated query and
 /// append `(doc_id, estimate, pos_in_full)` tuples to `shortlist`.
 /// `pos = off + i` is the candidate's index in the column's
-/// `full[]` array (same value [`build_doc_to_pos`] would store) —
-/// captured here at no extra cost so the rerank step doesn't need
-/// the `doc_to_pos` lookup table at all.
+/// `full[]` array — captured here at no extra cost so the rerank
+/// step doesn't need any lookup table.
 #[inline]
 fn score_cluster_codes(
     cluster_codes: &[u8],
@@ -1073,59 +1003,6 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
             "vector {what} range {start}..{end} past blob"
         )))
     })
-}
-
-/// Walk a column's `cluster_idx + doc_ids` regions and produce the
-/// `local_doc_id → cluster-position` lookup table that powers the
-/// rerank fetch.
-///
-/// Pulled out of the per-column open loop in plan 011 M2 so it can
-/// also run lazily on first rerank. `sub` is the subsection bytes
-/// (relative offsets); `sub_crc_pos` is the trailing-CRC boundary
-/// inside that slice (`sub.len() - 4`). Per-cluster `doc_ids` slice
-/// bounds are checked here — the per-cluster check used to live in
-/// the open loop; with the open loop now skipping this walk in the
-/// lazy path, the bounds check moves with it.
-fn build_doc_to_pos(
-    sub: &[u8],
-    n_cent: u32,
-    cluster_idx_off: usize,
-    doc_ids_off: usize,
-    n_docs: u32,
-    sub_crc_pos: usize,
-    column_name: &str,
-) -> Result<Vec<u32>, VectorError> {
-    let mut doc_to_pos = vec![u32::MAX; n_docs as usize];
-    for c in 0..n_cent as usize {
-        let idx_start = cluster_idx_off + c * 8;
-        let off = u32::from_le_bytes([
-            sub[idx_start],
-            sub[idx_start + 1],
-            sub[idx_start + 2],
-            sub[idx_start + 3],
-        ]);
-        let cnt = u32::from_le_bytes([
-            sub[idx_start + 4],
-            sub[idx_start + 5],
-            sub[idx_start + 6],
-            sub[idx_start + 7],
-        ]);
-        let did_start = doc_ids_off + (off as usize) * 4;
-        let did_end = did_start + (cnt as usize) * 4;
-        if did_end > sub_crc_pos {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "column '{column_name}' doc_ids slice {did_start}..{did_end} past subsection"
-            ))));
-        }
-        for i in 0..cnt as usize {
-            let s = did_start + i * 4;
-            let d = u32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]]);
-            if (d as usize) < doc_to_pos.len() {
-                doc_to_pos[d as usize] = off + i as u32;
-            }
-        }
-    }
-    Ok(doc_to_pos)
 }
 
 #[cfg(test)]
@@ -1423,22 +1300,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Plan 011 M2 — lazy `doc_to_pos` + `OpenOptions::prefetch_eager`
+    // Plan 011 M3.b / M4 — lazy open + inline-`pos` search
     // -----------------------------------------------------------------
     //
-    // These tests pin the M2 contract: `open_with` no longer touches
-    // the `doc_ids` region when `prefetch_eager: false` (default),
-    // the table populates on first rerank via `OnceLock`, and the
-    // search results are bit-for-bit identical to the eager path.
-    // The memory-ceiling guarantee is asserted as a structural
-    // post-condition: `doc_to_pos.get() == None` immediately after
-    // a lazy open, `Some(vec.len() == n_docs)` after the first
-    // rerank.
+    // Open touches only the structural-decode regions (directory,
+    // sub-header, summary, centroids, cluster_idx). Search carries
+    // `pos = off + i` inline in the shortlist tuple — there is no
+    // `doc_to_pos` lookup table to populate (deleted in M4 after
+    // the audit confirmed zero external readers). The structural
+    // memory-ceiling tests below ride on these invariants.
 
-    /// Build the same shape used by the search-correctness tests
-    /// elsewhere in this module, with a non-trivial `n_docs` so
-    /// the `doc_to_pos` allocation is observable (≥ n_cent so
-    /// the cluster walk has work to do).
+    /// Search-shape corpus used by the M3.b inline-pos tests and the
+    /// M3 sync-search / counting-source tests. Picks a non-trivial
+    /// `n_docs ≥ n_cent` so each cluster has multiple candidates.
     fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
         let dim = 16usize;
         let n_cent = 4usize;
@@ -1466,184 +1340,18 @@ mod tests {
         (Bytes::from(bytes), json, all)
     }
 
-    /// Default open uses `prefetch_eager: false` — the per-column
-    /// `OnceLock<Vec<u32>>` must be empty right after open. This
-    /// is the memory-ceiling pre-state: zero bytes allocated for
-    /// `doc_to_pos` until a rerank touches it.
+    /// Plan 011 M3.b self-query smoke: lazy default open must
+    /// recover the planted self-vector at top-1, confirming the
+    /// inline-`pos` rerank path returns the correct results on
+    /// the search-shape corpus that every M3/M4 test uses.
     #[test]
-    fn open_lazy_default_leaves_doc_to_pos_empty() {
-        let (blob, json, _) = build_search_corpus();
-        let r = VectorReader::open(blob, &json).expect("open");
-        for col in &r.columns {
-            assert!(
-                col.doc_to_pos.get().is_none(),
-                "lazy open must leave doc_to_pos empty for column '{}', \
-                 got Some({} entries)",
-                col.name,
-                col.doc_to_pos.get().map(|v| v.len()).unwrap_or(0)
-            );
-        }
-    }
-
-    /// `prefetch_eager: true` runs the cluster walk at open time
-    /// (today's pre-011 semantics). The `OnceLock` is populated
-    /// before any `search()` is called, with exactly `n_docs`
-    /// entries per column.
-    #[test]
-    fn open_eager_populates_doc_to_pos_at_open() {
-        let (blob, json, _) = build_search_corpus();
-        let r = VectorReader::open_with(
-            blob,
-            &json,
-            OpenOptions {
-                verify_crc: true,
-                prefetch_eager: true,
-            },
-        )
-        .expect("open");
-        for col in &r.columns {
-            let table = col.doc_to_pos.get().unwrap_or_else(|| {
-                panic!(
-                    "eager open must populate doc_to_pos for column '{}', got None",
-                    col.name
-                )
-            });
-            assert_eq!(
-                table.len(),
-                col.n_docs as usize,
-                "doc_to_pos length for column '{}' should equal n_docs",
-                col.name
-            );
-        }
-    }
-
-    /// Plan 011 M3.b: the lazy default `search()` carries
-    /// `pos = off + i` inline in the shortlist tuple and never
-    /// touches `doc_to_pos`. After the first search, the
-    /// `OnceLock` must remain empty — proving the search path
-    /// does not allocate the 4 MB / 1M-doc lookup table. The
-    /// self-query still recovers self.
-    #[test]
-    fn first_search_on_lazy_path_does_not_touch_doc_to_pos() {
+    fn lazy_default_search_recovers_self_query() {
         let (blob, json, all) = build_search_corpus();
         let r = VectorReader::open(blob, &json).expect("open");
-
-        let col = &r.columns[0];
-        assert!(
-            col.doc_to_pos.get().is_none(),
-            "pre-state: doc_to_pos must start empty"
-        );
-
         let hits = r
             .search("embedding", &all[17], 5, 4, 5)
             .expect("search must succeed on lazy InMemory");
         assert_eq!(hits[0].0, 17, "self-query must recover self");
-
-        assert!(
-            r.columns[0].doc_to_pos.get().is_none(),
-            "post-state: doc_to_pos must remain empty — M3.b uses inline pos, \
-             not the lookup table"
-        );
-    }
-
-    /// Bit-for-bit parity between `prefetch_eager: true` and
-    /// `prefetch_eager: false` paths. The lazy build runs the
-    /// exact same `build_doc_to_pos` function as the eager open;
-    /// any drift would surface as different search results on
-    /// identical input.
-    #[test]
-    fn lazy_vs_eager_search_results_bit_for_bit_identical() {
-        let (blob, json, all) = build_search_corpus();
-
-        let r_eager = VectorReader::open_with(
-            blob.clone(),
-            &json,
-            OpenOptions {
-                verify_crc: true,
-                prefetch_eager: true,
-            },
-        )
-        .expect("eager open");
-        let r_lazy = VectorReader::open_with(
-            blob,
-            &json,
-            OpenOptions {
-                verify_crc: true,
-                prefetch_eager: false,
-            },
-        )
-        .expect("lazy open");
-
-        for &q_idx in &[0usize, 17, 31, 63] {
-            let hits_eager = r_eager
-                .search("embedding", &all[q_idx], 5, 4, 5)
-                .expect("eager search");
-            let hits_lazy = r_lazy
-                .search("embedding", &all[q_idx], 5, 4, 5)
-                .expect("lazy search");
-            assert_eq!(
-                hits_eager, hits_lazy,
-                "eager vs lazy results must match for query {q_idx}"
-            );
-        }
-    }
-
-    /// Plan 011 M3.b: many back-to-back searches on the lazy
-    /// default path must keep `doc_to_pos` empty. No search ever
-    /// allocates the lookup table. Run the same query 8 times
-    /// and assert the `OnceLock` stays `None`.
-    #[test]
-    fn repeated_search_on_lazy_path_never_populates_doc_to_pos() {
-        let (blob, json, all) = build_search_corpus();
-        let r = VectorReader::open(blob, &json).expect("open");
-
-        for &q_idx in &[3usize, 40, 5, 17, 31, 63, 0, 22] {
-            let _ = r.search("embedding", &all[q_idx], 5, 4, 5).expect("search");
-            assert!(
-                r.columns[0].doc_to_pos.get().is_none(),
-                "search must never populate doc_to_pos (query {q_idx})"
-            );
-        }
-    }
-
-    /// Plan 011 M3.b memory-ceiling proxy: per column, on the
-    /// lazy default open, the `doc_to_pos` allocation stays at
-    /// exactly 0 bytes through any number of searches — the
-    /// search path uses inline `pos` and never touches the
-    /// lookup table. `prefetch_eager: true` is the only path
-    /// that populates the table (covered by
-    /// `open_eager_populates_doc_to_pos_at_open`).
-    #[test]
-    fn doc_to_pos_stays_zero_bytes_on_lazy_default() {
-        let (blob, json, all) = build_search_corpus();
-
-        let r_lazy = VectorReader::open(blob, &json).expect("lazy open");
-        assert_eq!(
-            r_lazy.columns[0]
-                .doc_to_pos
-                .get()
-                .map(|v| v.capacity())
-                .unwrap_or(0),
-            0,
-            "lazy open: zero bytes for doc_to_pos"
-        );
-
-        let _ = r_lazy
-            .search("embedding", &all[0], 5, 4, 5)
-            .expect("first search");
-        let _ = r_lazy
-            .search("embedding", &all[17], 5, 4, 5)
-            .expect("second search");
-
-        assert_eq!(
-            r_lazy.columns[0]
-                .doc_to_pos
-                .get()
-                .map(|v| v.capacity())
-                .unwrap_or(0),
-            0,
-            "post-search: doc_to_pos must still be zero bytes (search uses inline pos)"
-        );
     }
 
     // -----------------------------------------------------------------
@@ -1751,9 +1459,9 @@ mod tests {
 
     /// Sync `search()` on a `Source::Lazy` whose `try_get_range_sync`
     /// always succeeds (warm cache) behaves identically to the
-    /// `Source::InMemory` path. Recall this is the "supertable
-    /// opens with `prefetch_eager = false`" steady-state today
-    /// (the reader_cache is in-process, so every range is resident).
+    /// `Source::InMemory` path. This is the steady-state shape the
+    /// supertable reader sees today (the reader_cache is in-process,
+    /// so every range is resident).
     #[test]
     fn search_on_lazy_source_with_warm_sync_cache_matches_in_memory() {
         let (blob, json, all) = build_search_corpus();
@@ -1852,9 +1560,9 @@ mod tests {
     /// `search()` request".
     ///
     /// A regression that smuggles in extra range fetches — e.g.
-    /// reintroducing the whole-subsection fallback, or pulling
-    /// `doc_to_pos` over the wire — surfaces here rather than at
-    /// the production S3 harness in 013.
+    /// reintroducing the whole-subsection fallback, or pulling the
+    /// full `doc_ids` region over the wire at open — surfaces here
+    /// rather than at the production S3 harness in 013.
     #[test]
     fn search_cold_first_search_range_count_per_cluster() {
         let (blob, json, all) = build_search_corpus();
@@ -1937,16 +1645,16 @@ mod tests {
     // independent of `n_docs`. Acceptance criterion #2 spells it
     // out: opening a `Source::Lazy` over a mmap-backed
     // `BytesLazyByteSource` at 1M × 384 with
-    // `OpenOptions { verify_crc: false, prefetch_eager: false }`
-    // must leave the process RSS delta ≤ 10 MB per opened column.
+    // `OpenOptions { verify_crc: false }` must leave the process
+    // RSS delta ≤ 10 MB per opened column.
     //
     // Why mmap specifically: this is exactly how the disk cache
     // (003 M5) feeds bytes into `SuperfileReader` —
     // `Bytes::from_owner(Arc<Mmap>)`. The kernel never faults the
-    // bulk codes/full/doc_ids pages on the lazy default path
-    // because nothing in `open_with_source` accesses them: the
-    // CRC scan is gated on `verify_crc`, the `doc_to_pos` cluster
-    // walk is gated on `prefetch_eager`, and the structural-decode
+    // bulk codes/full/doc_ids pages on the default path because
+    // nothing in `open_with_source` accesses them: the CRC scan
+    // is gated on `verify_crc`, search uses inline `pos` (M3.b)
+    // so no `doc_ids` walk happens, and the structural-decode
     // bytes (outer header + dir + sub_header) are a handful of
     // pages. The resident allocation is dominated by the rotation
     // matrix (≈ 590 KB at dim=384) and small column metadata —
@@ -2054,10 +1762,7 @@ mod tests {
         let reader = VectorReader::open_with_source(
             Source::Lazy(lazy),
             json,
-            OpenOptions {
-                verify_crc: false,
-                prefetch_eager: false,
-            },
+            OpenOptions { verify_crc: false },
         )
         .expect("lazy open");
 
@@ -2091,9 +1796,9 @@ mod tests {
     ///
     /// A regression that re-introduces eager subsection
     /// materialization (the pre-011 behaviour) or that scans
-    /// `doc_ids` at open without `prefetch_eager` will push
-    /// per-column RSS past the 10 MB ceiling and fail here
-    /// rather than at the 100 M production OOM.
+    /// `doc_ids` at open will push per-column RSS past the
+    /// 10 MB ceiling and fail here rather than at the 100 M
+    /// production OOM.
     #[test]
     #[ignore]
     fn mem_ceiling_lazy_open_under_10mib() {
@@ -2186,8 +1891,9 @@ mod tests {
     //   RSS bounded across an arbitrary number of segments, with no
     //   per-doc anon term. Equivalent here because
     //   `Bytes::from_owner` is zero-copy over the mmap, and the
-    //   lazy-open path doesn't touch `doc_ids[]` /
-    //   doc_to_pos / full[] at open time.
+    //   lazy-open path doesn't touch `doc_ids[]` / `full[]` at
+    //   open time (M3.b's inline `pos` removes the only reason
+    //   open ever touched `doc_ids[]`).
     //
     // - DOES NOT PROVE: the in-process `InMemoryReaderCache` path
     //   (`Bytes::from(Vec)` per segment — see
@@ -2243,10 +1949,7 @@ mod tests {
             let reader = VectorReader::open_with_source(
                 Source::Lazy(StdArc::clone(lazy)),
                 json,
-                OpenOptions {
-                    verify_crc: false,
-                    prefetch_eager: false,
-                },
+                OpenOptions { verify_crc: false },
             )
             .expect("lazy open");
             n_cols_total += reader.columns.len();
@@ -2394,6 +2097,94 @@ mod tests {
             "supertable-scale (10M-bench shape) lazy open RSS delta {delta_mib:.3} MiB \
              exceeds 50 MiB ceiling at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. \
              Eager re-introduction would push this past 15 GiB."
+        );
+
+        drop(tmps);
+    }
+
+    /// **Plan 011 M4 — many-segments stress test (100M
+    /// aspiration shape).**
+    ///
+    /// The honest scale test for "100M docs across a supertable"
+    /// can't materialise 100M production-shape segments on a
+    /// developer box (the per-segment 625k × 384 shape used in
+    /// the bench produces ~960 MiB on disk × 160 segments = 150
+    /// GiB of corpus). Instead, this test pins the *structural*
+    /// memory bound by varying the high-cardinality axis (segment
+    /// count) at a thin per-segment shape: **100 segments × 50 k
+    /// docs × 128 dim × 128 n_cent**.
+    ///
+    /// What this proves:
+    ///
+    /// - Per-segment open allocation is `O(n_cent × dim × 4 +
+    ///   rotation + small)` — no `n_docs` term. At this shape:
+    ///   centroids 64 KiB + rotation matrix 64 KiB + column
+    ///   metadata ≪ 1 MiB per segment. Total expected RSS delta
+    ///   ≪ 200 MiB across 100 segments; 400 MiB ceiling for
+    ///   allocator overhead + reader-struct fields.
+    ///
+    /// - The deletion of `doc_to_pos` (M4) made segment-count
+    ///   the only scaling dimension. A regression that reintroduced
+    ///   any per-doc resident state — e.g. a returning lookup
+    ///   table at `n_docs × 4` bytes per column — would here
+    ///   allocate 100 × 50 k × 4 = 20 MiB anon just for tables
+    ///   (small but growing); at the bench's 100 segments × 625 k
+    ///   the same regression is 250 MiB.
+    ///
+    /// Each segment file is ~25 MiB on disk; the test writes
+    /// ~2.5 GiB total to the tempdir. Build time is dominated by
+    /// the 100 sequential streaming builds (~1.5 s each in
+    /// release ≈ 2.5 min total).
+    ///
+    /// `#[ignore]`-gated. Run explicitly:
+    ///
+    /// ```bash
+    /// cargo test --release -p infino --lib \
+    ///     mem_ceiling_lazy_many_segments_under_400mib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn mem_ceiling_lazy_many_segments_under_400mib() {
+        const N_SEGMENTS: usize = 100;
+        const N_DOCS_PER_SEG: u32 = 50_000;
+        const DIM: usize = 128;
+        const N_CENT_PER_SEG: usize = 128;
+
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
+        for i in 0..N_SEGMENTS {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            if i % 10 == 0 {
+                eprintln!(
+                    "  building segment {i:3}/{N_SEGMENTS} \
+                     ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
+                );
+            }
+            let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT_PER_SEG);
+            paths.push(tmp.path().to_path_buf());
+            jsons.push(json);
+            tmps.push(tmp);
+        }
+
+        let (delta_bytes, n_cols_total, n_segments) =
+            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_seg_mib = delta_mib / n_segments as f64;
+
+        eprintln!(
+            "mem_ceiling_lazy_many_segments_under_400mib ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT_PER_SEG}): RSS delta = {delta_mib:.3} MiB over \
+             {n_segments} segment(s) ({n_cols_total} column(s) total) = \
+             {per_seg_mib:.3} MiB/segment"
+        );
+
+        assert!(
+            delta_mib <= 400.0,
+            "many-segments lazy open RSS delta {delta_mib:.3} MiB exceeds 400 MiB ceiling \
+             at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. A regression that reintroduced \
+             any per-doc resident state would push this much higher; M4's deletion of \
+             doc_to_pos is what keeps the bound structural."
         );
 
         drop(tmps);
