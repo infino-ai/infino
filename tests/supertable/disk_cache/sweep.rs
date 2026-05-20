@@ -89,6 +89,35 @@ fn cache_with_threshold(
     (dir, store)
 }
 
+/// Poll `sweep_once()` until it advises at least one entry, or
+/// until `timeout_ms` elapses.
+///
+/// The hybrid cold-fetch path inserts an in-memory entry first
+/// and a background task later swaps it for the mmap-backed
+/// entry. Under heavy parallel test load the swap may take well
+/// over 50 ms — long enough that a fixed sleep races the
+/// finalizer. Polling decouples the assertion from scheduler
+/// jitter while still failing loudly if the entry is never
+/// finalized (real regression).
+///
+/// `sweep_once()` only increments `n_madvise_calls` when it
+/// actually advises an entry, so iterations that return 0 do
+/// not perturb the cache stats — the final
+/// `n_madvise_calls == 1` invariant still holds.
+async fn sweep_once_after_finalize(cache: &Arc<DiskCacheStore>, timeout_ms: u64) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let n = cache.sweep_once();
+        if n > 0 {
+            return n;
+        }
+        if std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 // ============================================================
 // Tests.
 // ============================================================
@@ -108,14 +137,12 @@ async fn sweep_once_advises_mmapped_entries_when_threshold_is_zero() {
 
     let (_d, cache) = cache_with_threshold(local, 0, 0);
     let _reader = cache.reader(&uri).await.expect("cold");
-    // Wait for the M7 background finalizer to swap the
-    // in-memory entry for the mmap-backed one — the sweep
-    // only acts on mmap'd entries.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // threshold=0 still means the sweep thread doesn't start
-    // automatically. Drive it explicitly.
-    let n_advised = cache.sweep_once();
+    // Poll until the background finalizer has swapped the
+    // in-memory entry for the mmap-backed one — sweep only
+    // acts on mmap'd entries. threshold=0 means the sweep
+    // thread doesn't start automatically; drive it explicitly.
+    let n_advised = sweep_once_after_finalize(&cache, 2_000).await;
     assert_eq!(
         n_advised, 1,
         "threshold=0 ⇒ every mmap'd entry advised; got {n_advised}"
@@ -140,10 +167,11 @@ async fn data_remains_correct_after_madv_dontneed() {
 
     let (_d, cache) = cache_with_threshold(local, 0, 0);
     let _r = cache.reader(&uri).await.expect("cold");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Sweep — pages should now be advised as DontNeed.
-    let n_advised = cache.sweep_once();
+    // Poll for finalize → sweep; pages should now be advised
+    // as DontNeed once the mmap-backed entry replaces the
+    // in-memory one.
+    let n_advised = sweep_once_after_finalize(&cache, 2_000).await;
     assert!(n_advised >= 1, "sweep should advise at least one entry");
 
     // Acquire a fresh reader handle from the cache. The mmap
@@ -223,10 +251,9 @@ async fn in_memory_entries_not_yet_mmapped_are_skipped() {
         "sweep advised more than expected; got {n_immediate}"
     );
 
-    // Now wait for the finalizer + sweep again. The entry is
+    // Now poll for the finalizer + sweep again. The entry is
     // mmap-backed; threshold=0 ⇒ advised.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let n_after_finalize = cache.sweep_once();
+    let n_after_finalize = sweep_once_after_finalize(&cache, 2_000).await;
     assert_eq!(
         n_after_finalize, 1,
         "after finalize, the mmap'd entry must be advised; got {n_after_finalize}"
