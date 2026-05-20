@@ -630,22 +630,47 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_id_column_not_uint64() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("doc_id", DataType::Int64, false),
-            Field::new("title", DataType::LargeUtf8, false),
-        ]));
-        let opts = BuilderOptions::new(
-            schema,
-            "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-            }],
-            vec![],
-            Some(default_tokenizer()),
-        );
-        let err = SuperfileBuilder::new(opts).expect_err("expected error");
-        assert!(matches!(err, BuildError::IdColumnWrongType(_, _)));
+    fn new_rejects_id_column_not_decimal128_38_0() {
+        // Every type listed here should be rejected with
+        // `BuildError::IdColumnWrongType`. Coverage spans:
+        //   - UInt64: the historical id type before the supertable
+        //     layer's 128-bit Snowflake forced Decimal128. Most
+        //     likely real-world miss for a caller migrating from an
+        //     older fixture.
+        //   - Int64: the previous regression case; kept so this
+        //     test still subsumes what the old one covered.
+        //   - Decimal128(38, 1) and Decimal128(37, 0): right type
+        //     family, wrong scale / precision. These are the cases
+        //     a caller *trying* to comply but typo'ing the
+        //     parameters would hit — exactly where the rule's
+        //     strictness matters.
+        let cases = [
+            DataType::UInt64,
+            DataType::Int64,
+            DataType::Decimal128(38, 1),
+            DataType::Decimal128(37, 0),
+        ];
+        for ty in cases {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("doc_id", ty.clone(), false),
+                Field::new("title", DataType::LargeUtf8, false),
+            ]));
+            let opts = BuilderOptions::new(
+                schema,
+                "doc_id",
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![],
+                Some(default_tokenizer()),
+            );
+            let err = SuperfileBuilder::new(opts)
+                .expect_err(&format!("expected rejection for {ty:?}"));
+            assert!(
+                matches!(err, BuildError::IdColumnWrongType(_, _)),
+                "wrong error variant for {ty:?}: {err:?}",
+            );
+        }
     }
 
     #[test]
