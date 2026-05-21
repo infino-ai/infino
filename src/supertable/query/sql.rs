@@ -168,10 +168,7 @@ fn build_mem_table(
     let superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = match manifest.list.as_ref() {
         Some(list) => {
             let kept: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-            crate::supertable::query::hierarchical_iter::load_and_flatten(
-                manifest.as_ref(),
-                &kept,
-            )?
+            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)?
         }
         None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
             manifest.as_ref(),
@@ -221,7 +218,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::{FtsConfig, VectorConfig};
-    
+
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::{Supertable, SupertableOptions};
 

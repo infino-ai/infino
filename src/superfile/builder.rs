@@ -664,8 +664,8 @@ mod tests {
                 vec![],
                 Some(default_tokenizer()),
             );
-            let err = SuperfileBuilder::new(opts)
-                .expect_err(&format!("expected rejection for {ty:?}"));
+            let err =
+                SuperfileBuilder::new(opts).expect_err(&format!("expected rejection for {ty:?}"));
             assert!(
                 matches!(err, BuildError::IdColumnWrongType(_, _)),
                 "wrong error variant for {ty:?}: {err:?}",
@@ -796,8 +796,11 @@ mod tests {
             DataType::UInt64,
             false,
         )]));
-        let bad = RecordBatch::try_new(other, vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))])
-            .expect("build RecordBatch");
+        let bad = RecordBatch::try_new(
+            other,
+            vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
+        )
+        .expect("build RecordBatch");
         let err = b.add_batch(&bad, &[]).expect_err("expected error");
         assert!(matches!(err, BuildError::BatchSchemaMismatch));
     }

@@ -58,11 +58,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
 use infino::supertable::{OpenError, Supertable};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
 const ENV_KILL_POINT: &str = "INFINO_M12_CRASH_KILL_POINT";
@@ -130,11 +130,7 @@ impl StorageProvider for CrashStorage {
     async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
         self.inner.get(uri).await
     }
-    async fn get_range(
-        &self,
-        uri: &str,
-        range: Range<u64>,
-    ) -> Result<Bytes, StorageError> {
+    async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         self.inner.get_range(uri, range).await
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
@@ -165,8 +161,6 @@ impl StorageProvider for CrashStorage {
     }
 }
 
-
-
 /// Translate a kill point name into (trigger_path_prefix,
 /// trigger_after_nth_match, n_commits). The child uses this
 /// to configure `CrashStorage` and decide how many successful
@@ -193,8 +187,7 @@ fn kill_point_config(kp: &str) -> (&'static str, usize, usize) {
 fn run_crash_child(dir: PathBuf, kill_point: &str) -> ! {
     let (prefix, nth, n_commits) = kill_point_config(kill_point);
 
-    let local =
-        LocalFsStorageProvider::new(&dir).expect("local fs provider");
+    let local = LocalFsStorageProvider::new(&dir).expect("local fs provider");
     let wrapped = Arc::new(CrashStorage::new(local, prefix, nth, kill_point));
     let storage: Arc<dyn StorageProvider> = wrapped;
 
@@ -360,10 +353,7 @@ async fn crash_post_list_on_second_commit_yields_v1() {
     if dispatch_child_if_set().is_some() {
         return;
     }
-    let dir = spawn_crash_child(
-        "crash_post_list_on_second_commit_yields_v1",
-        KP_LIST_SECOND,
-    );
+    let dir = spawn_crash_child("crash_post_list_on_second_commit_yields_v1", KP_LIST_SECOND);
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));

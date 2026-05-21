@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::superfile::error::BuildError as SuperfileBuildError;
 use crate::storage::StorageError;
+use crate::superfile::error::BuildError as SuperfileBuildError;
 
 /// Errors raised when constructing or operating against a
 /// `SupertableOptions` / `SupertableWriter`.

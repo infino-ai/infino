@@ -39,17 +39,17 @@ pub mod writer;
 /// existing call-site paths.
 pub use crate::storage;
 
+pub use crate::storage::{
+    LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError, StorageProvider,
+};
 pub use error::{BuildError, CommitError, OpenError, QueryError};
-pub use lazy_source::StorageRangeSource;
 pub use handle::{Supertable, SupertableReader};
+pub use lazy_source::StorageRangeSource;
 pub use manifest::{
     FtsSummary, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsTable, SuperfileEntry,
     SuperfileList, SuperfileUri, VectorSummary,
 };
 pub use options::SupertableOptions;
-pub use stats::SupertableStats;
-pub use crate::storage::{
-    LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError, StorageProvider,
-};
 pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
+pub use stats::SupertableStats;
 pub use writer::SupertableWriter;

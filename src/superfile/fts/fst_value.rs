@@ -48,7 +48,9 @@ impl FstValue {
     #[inline]
     pub(crate) fn unpack(packed: u64) -> Self {
         if packed & 1 == 0 {
-            Self::Pfor { metadata_offset: packed >> DOC_ID_SHIFT }
+            Self::Pfor {
+                metadata_offset: packed >> DOC_ID_SHIFT,
+            }
         } else {
             let doc_id = (packed >> DOC_ID_SHIFT) as u32;
             let tf = ((packed >> TF_SHIFT) as u32) & INLINE_TF_MAX;
@@ -88,13 +90,23 @@ mod tests {
         for &offset in &[0u64, 1, 20, 1 << 20, (1 << 34) - 1, 1 << 34] {
             let packed = FstValue::pack_pfor(offset);
             assert_eq!(packed & 1, 0, "PFOR form must have low bit clear");
-            assert_eq!(FstValue::unpack(packed), FstValue::Pfor { metadata_offset: offset });
+            assert_eq!(
+                FstValue::unpack(packed),
+                FstValue::Pfor {
+                    metadata_offset: offset
+                }
+            );
         }
     }
 
     #[test]
     fn inline_round_trip() {
-        let cases = [(0u32, 0u32), (1, 1), (500_000, 7), (u32::MAX, INLINE_TF_MAX)];
+        let cases = [
+            (0u32, 0u32),
+            (1, 1),
+            (500_000, 7),
+            (u32::MAX, INLINE_TF_MAX),
+        ];
         for &(doc_id, tf) in &cases {
             let packed = FstValue::pack_inline(doc_id, tf);
             assert_eq!(packed & 1, 1, "inline form must have low bit set");

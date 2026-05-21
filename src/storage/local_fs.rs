@@ -99,7 +99,11 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
 impl StorageProvider for LocalFsStorageProvider {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
         let path = Self::path(uri)?;
-        let meta = self.store.head(&path).await.map_err(|e| translate(uri, e))?;
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|e| translate(uri, e))?;
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -190,10 +194,12 @@ impl StorageProvider for LocalFsStorageProvider {
                         uri: uri.into(),
                         source: Box::new(e),
                     })?;
-                lock_file.lock_exclusive().map_err(|e| StorageError::Permanent {
-                    uri: uri.into(),
-                    source: Box::new(e),
-                })?;
+                lock_file
+                    .lock_exclusive()
+                    .map_err(|e| StorageError::Permanent {
+                        uri: uri.into(),
+                        source: Box::new(e),
+                    })?;
                 // Lock held below until `lock_file` drops at
                 // end of branch (or early-return). Holding it
                 // across `.await` points blocks the
@@ -202,7 +208,11 @@ impl StorageProvider for LocalFsStorageProvider {
                 // bounded.
 
                 let result: Result<(), StorageError> = async {
-                    let current = self.store.head(&path).await.map_err(|e| translate(uri, e))?;
+                    let current = self
+                        .store
+                        .head(&path)
+                        .await
+                        .map_err(|e| translate(uri, e))?;
                     let current_etag = current.e_tag.as_deref().unwrap_or("");
                     if current_etag != expected {
                         return Err(StorageError::PreconditionFailed { uri: uri.into() });
@@ -289,7 +299,9 @@ mod tests {
     async fn head_returns_accurate_size() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(&[0xABu8; 1024]);
-        p.put_atomic("data/seg-head.sf", payload).await.expect("put");
+        p.put_atomic("data/seg-head.sf", payload)
+            .await
+            .expect("put");
 
         let meta = p.head("data/seg-head.sf").await.expect("head");
         assert_eq!(meta.size, 1024);
@@ -415,10 +427,7 @@ mod tests {
     #[tokio::test]
     async fn missing_object_returns_not_found() {
         let (_dir, p) = provider();
-        let err = p
-            .head("data/no-such.sf")
-            .await
-            .expect_err("head missing");
+        let err = p.head("data/no-such.sf").await.expect_err("head missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
         let err = p.get("data/no-such.sf").await.expect_err("get missing");
@@ -457,7 +466,12 @@ mod tests {
         p.put_atomic("ptr/current", Bytes::from_static(b"v1"))
             .await
             .expect("initial");
-        let etag = p.head("ptr/current").await.expect("head").etag.expect("etag");
+        let etag = p
+            .head("ptr/current")
+            .await
+            .expect("head")
+            .etag
+            .expect("etag");
         p.put_if_match("ptr/current", Bytes::from_static(b"v2"), Some(&etag))
             .await
             .expect("conditional update");

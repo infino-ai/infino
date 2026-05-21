@@ -391,8 +391,8 @@ fn emit_search_markdown() {
 
     body.push('\n');
     body.push_str(
-        "**infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):\n\n",
-    );
+    "**infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):\n\n",
+  );
     body.push_str("| Metric | Value |\n");
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");

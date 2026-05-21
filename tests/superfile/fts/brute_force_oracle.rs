@@ -295,8 +295,5 @@ fn oracle_long_doc_vs_short_doc_dl_norm() {
         .collect();
     let infino_top2: HashSet<u64> = infino_hits.into_iter().take(2).collect();
     let oracle_top2: HashSet<u64> = oracle_hits.into_iter().take(2).collect();
-    assert_eq!(
-        infino_top2, oracle_top2,
-        "framework top-2 sets disagree"
-    );
+    assert_eq!(infino_top2, oracle_top2, "framework top-2 sets disagree");
 }

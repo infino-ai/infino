@@ -24,13 +24,10 @@
 
 use std::sync::Arc;
 
-
-use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
+use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
-
-
 
 /// Two independent handles racing to commit. The OCC retry
 /// loop must ensure both commits eventually succeed and the
@@ -89,9 +86,10 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
     // Fresh open against the same storage sees the union.
     drop(st_a);
     drop(st_b);
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     assert_eq!(consumer.manifest_id(), 2);
     assert_eq!(
         consumer.reader().n_superfiles(),
@@ -145,9 +143,10 @@ async fn three_handles_concurrent_commits_all_succeed() {
     drop(st_a);
     drop(st_b);
     drop(st_c);
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     assert_eq!(
         consumer.manifest_id(),
         3,
@@ -264,8 +263,7 @@ async fn sequential_commits_across_handles_no_retry_needed() {
     assert_eq!(st_b.manifest_id(), 1, "B opens at A's last manifest_id");
     {
         let mut w = st_b.writer().expect("writer B");
-        w.append(&build_title_batch(&["second"]))
-            .expect("append B");
+        w.append(&build_title_batch(&["second"])).expect("append B");
         w.commit().expect("commit B");
     }
     assert_eq!(st_b.manifest_id(), 2);
@@ -296,7 +294,9 @@ async fn max_commit_retries_is_plumbed_through_options() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_max_commit_retries(42);
+        let opts = default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_max_commit_retries(42);
         assert_eq!(opts.max_commit_retries, 42);
     }
 
@@ -308,10 +308,14 @@ async fn max_commit_retries_is_plumbed_through_options() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st_a = Supertable::create(
-        default_supertable_options().with_storage(Arc::clone(&storage)).with_max_commit_retries(20),
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_max_commit_retries(20),
     );
     let st_b = Supertable::create(
-        default_supertable_options().with_storage(Arc::clone(&storage)).with_max_commit_retries(20),
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_max_commit_retries(20),
     );
 
     let t_a = tokio::task::spawn_blocking({
@@ -336,8 +340,9 @@ async fn max_commit_retries_is_plumbed_through_options() {
 
     drop(st_a);
     drop(st_b);
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     assert_eq!(consumer.manifest_id(), 2);
 }

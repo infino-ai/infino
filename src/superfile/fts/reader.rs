@@ -134,11 +134,7 @@ impl FtsReader {
     /// `OpenOptions { verify_crc: false }` to skip the
     /// four per-section CRC scans on trusted-storage cold
     /// opens.
-    pub fn open_with(
-        blob: Bytes,
-        columns_json: &str,
-        opts: OpenOptions,
-    ) -> Result<Self, FtsError> {
+    pub fn open_with(blob: Bytes, columns_json: &str, opts: OpenOptions) -> Result<Self, FtsError> {
         if blob.len() < 48 {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
@@ -265,7 +261,8 @@ impl FtsReader {
                 dir_bytes[entry_off + 2],
                 dir_bytes[entry_off + 3],
             ]);
-            let doc_lengths_offset = read_u64_le(&dir_bytes[entry_off + 4..entry_off + 12]) as usize;
+            let doc_lengths_offset =
+                read_u64_le(&dir_bytes[entry_off + 4..entry_off + 12]) as usize;
             let avgdl_x1000 = read_u32_le(&dir_bytes[entry_off + 12..entry_off + 16]) as u64;
 
             // Verify column_id matches the JSON's positional column_id.
@@ -303,7 +300,9 @@ impl FtsReader {
             if avgdl > 0.0 {
                 let inv_avgdl = 1.0_f32 / avgdl;
                 for d in 0..(n_docs as usize) {
-                    let dl = read_u32_le(&blob[doc_lengths_offset + d * 4..doc_lengths_offset + d * 4 + 4]) as f32;
+                    let dl = read_u32_le(
+                        &blob[doc_lengths_offset + d * 4..doc_lengths_offset + d * 4 + 4],
+                    ) as f32;
                     let norm = 1.0 - crate::superfile::fts::bm25::B
                         + crate::superfile::fts::bm25::B * dl * inv_avgdl;
                     dl_norm_k1.push(crate::superfile::fts::bm25::K1 * norm);
@@ -661,11 +660,8 @@ impl FtsReader {
                 let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
                 let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
-                let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                    idf_x_k1p1,
-                    tf,
-                    dl_norm_k1,
-                );
+                let score =
+                    crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 return Ok(vec![(doc_id, score)]);
             }
             FstValue::Pfor { metadata_offset } => metadata_offset as usize,
@@ -2033,9 +2029,8 @@ impl TermCursor {
     fn new_inline(doc_id: u32, tf: u32, n_docs: u64, dl_norm_k1: f32) -> Self {
         let idf = crate::superfile::fts::bm25::idf(n_docs, 1);
         let idf_x_k1p1 = idf * (crate::superfile::fts::bm25::K1 + 1.0);
-        let block_max_bm25 = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-            idf_x_k1p1, tf, dl_norm_k1,
-        );
+        let block_max_bm25 =
+            crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
         let blocks = vec![BlockMeta {
             last_doc_id: doc_id,
@@ -2323,11 +2318,26 @@ mod tests {
         b.register_column("body".into()).expect("register column");
         // 20 docs sprinkled with mixed term combinations.
         let docs = [
-            "alpha", "beta", "gamma", "alpha beta", "alpha gamma",
-            "beta gamma", "alpha beta gamma", "delta", "epsilon", "alpha delta",
-            "beta epsilon", "gamma delta", "alpha beta delta", "alpha epsilon gamma",
-            "delta epsilon", "alpha alpha alpha", "beta beta beta", "gamma gamma",
-            "alpha beta gamma delta epsilon", "epsilon",
+            "alpha",
+            "beta",
+            "gamma",
+            "alpha beta",
+            "alpha gamma",
+            "beta gamma",
+            "alpha beta gamma",
+            "delta",
+            "epsilon",
+            "alpha delta",
+            "beta epsilon",
+            "gamma delta",
+            "alpha beta delta",
+            "alpha epsilon gamma",
+            "delta epsilon",
+            "alpha alpha alpha",
+            "beta beta beta",
+            "gamma gamma",
+            "alpha beta gamma delta epsilon",
+            "epsilon",
         ];
         for (i, text) in docs.iter().enumerate() {
             b.add_doc(0, i as u32, text).expect("add doc");
@@ -2560,7 +2570,9 @@ mod tests {
         let tok = Arc::new(AsciiLowerTokenizer);
 
         let mut b_inline = FtsBuilder::new(tok.clone());
-        b_inline.register_column("body".into()).expect("register column");
+        b_inline
+            .register_column("body".into())
+            .expect("register column");
         for i in 0..20 {
             b_inline
                 .add_doc(0, i, &format!("uniq{i:03}"))
@@ -2569,7 +2581,9 @@ mod tests {
         let blob_inline = b_inline.finish();
 
         let mut b_pfor = FtsBuilder::new(tok);
-        b_pfor.register_column("body".into()).expect("register column");
+        b_pfor
+            .register_column("body".into())
+            .expect("register column");
         // Same 20 terms but all appearing in every doc → df = 20 → PFOR.
         for i in 0..20 {
             let text = (0..20)

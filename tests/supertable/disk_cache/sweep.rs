@@ -24,12 +24,10 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
 use infino::superfile::fts::reader::BoolMode;
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use infino::supertable::SuperfileUri;
-use infino::supertable::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-};
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
+use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use tempfile::TempDir;
 
 // ============================================================
@@ -57,8 +55,7 @@ fn build_test_bytes() -> Bytes {
         "charlie delta",
         "echo special foxtrot",
     ]);
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
     b.add_batch(&batch, &[]).expect("add_batch");
     Bytes::from(b.finish().expect("finish"))
 }
@@ -99,9 +96,8 @@ async fn sweep_once_advises_mmapped_entries_when_threshold_is_zero() {
     // microseconds since last access). The sweep returns
     // n_advised == n entries.
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
@@ -131,9 +127,8 @@ async fn data_remains_correct_after_madv_dontneed() {
     // bit-identical. Verify via an FTS query that survives a
     // sweep.
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
@@ -165,9 +160,8 @@ async fn recent_access_skipped_by_sweep_when_threshold_nonzero() {
     // threshold=3600s; the entry was just accessed → idle <
     // threshold → sweep skips it.
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
@@ -202,9 +196,8 @@ async fn in_memory_entries_not_yet_mmapped_are_skipped() {
     // perfectly time this, so instead we test the post-
     // finalize state has the expected n_advised count.
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
@@ -242,9 +235,8 @@ async fn threshold_zero_disables_background_sweep_thread() {
     // stays 0 over an interval that would otherwise have
     // included a sweep tick.
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;

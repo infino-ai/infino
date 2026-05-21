@@ -283,12 +283,7 @@ mod tests {
     fn env_overrides_default() {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK; cleanup at end.
-        unsafe {
-            std::env::set_var(
-                "INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB",
-                "2048",
-            )
-        };
+        unsafe { std::env::set_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB", "2048") };
         let cfg = Config::load().expect("load with env override");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 2048);
         unsafe { std::env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };

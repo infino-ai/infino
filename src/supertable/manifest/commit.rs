@@ -42,10 +42,10 @@ use std::sync::Arc;
 
 use futures::future;
 
+use crate::storage::{StorageError, StorageProvider};
 use crate::supertable::error::CommitError;
 use crate::supertable::manifest::list::{self as list_mod, ManifestList};
 use crate::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
-use crate::storage::{StorageError, StorageProvider};
 
 /// Pointer-file location under the supertable root. The only
 /// path that ever gets atomically renamed; everything else is
@@ -71,7 +71,10 @@ pub fn list_uri(manifest_id: u64) -> String {
 /// bytes resolve to the same URI — the load-bearing property
 /// for cross-version part reuse.
 pub fn part_uri(content_hash: &ContentHash) -> String {
-    format!("{MANIFEST_PARTS_DIR}/part-{}.avro.zst", content_hash.to_hex())
+    format!(
+        "{MANIFEST_PARTS_DIR}/part-{}.avro.zst",
+        content_hash.to_hex()
+    )
 }
 
 /// In-memory pointer file. Lives at [`POINTER_PATH`]; its
@@ -119,9 +122,11 @@ impl PointerFile {
                 .ok_or_else(|| CommitError::PointerParse(format!("no '=' in line: {line:?}")))?;
             match key {
                 "manifest_id" => {
-                    manifest_id = Some(value.parse::<u64>().map_err(|e| {
-                        CommitError::PointerParse(format!("manifest_id: {e}"))
-                    })?);
+                    manifest_id = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|e| CommitError::PointerParse(format!("manifest_id: {e}")))?,
+                    );
                 }
                 "manifest_list_uri" => {
                     manifest_list_uri = Some(value.to_string());
@@ -140,8 +145,8 @@ impl PointerFile {
                     }
                     let mut bytes = [0u8; 32];
                     for i in 0..32 {
-                        bytes[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
-                            .map_err(|_| {
+                        bytes[i] =
+                            u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
                                 CommitError::PointerParse(format!("content_hash hex: {hex}"))
                             })?;
                     }
@@ -155,15 +160,12 @@ impl PointerFile {
         }
 
         Ok(Self {
-            manifest_id: manifest_id.ok_or_else(|| {
-                CommitError::PointerParse("missing manifest_id".into())
-            })?,
-            manifest_list_uri: manifest_list_uri.ok_or_else(|| {
-                CommitError::PointerParse("missing manifest_list_uri".into())
-            })?,
-            content_hash: content_hash.ok_or_else(|| {
-                CommitError::PointerParse("missing content_hash".into())
-            })?,
+            manifest_id: manifest_id
+                .ok_or_else(|| CommitError::PointerParse("missing manifest_id".into()))?,
+            manifest_list_uri: manifest_list_uri
+                .ok_or_else(|| CommitError::PointerParse("missing manifest_list_uri".into()))?,
+            content_hash: content_hash
+                .ok_or_else(|| CommitError::PointerParse("missing content_hash".into()))?,
         })
     }
 }
@@ -260,9 +262,7 @@ pub async fn write_manifest_list(
     let content_hash = ContentHash::of(&json);
     let uri = list_uri(list.manifest_id);
     let size = json.len() as u64;
-    storage
-        .put_atomic(&uri, bytes::Bytes::from(json))
-        .await?;
+    storage.put_atomic(&uri, bytes::Bytes::from(json)).await?;
     Ok(ListWriteResult {
         uri,
         content_hash,
@@ -289,13 +289,15 @@ pub async fn write_pointer(
     let bytes = bytes::Bytes::from(pointer.to_bytes());
     let result = match expected_prev_etag {
         None => storage.put_atomic(POINTER_PATH, bytes).await,
-        Some(_) => storage.put_if_match(POINTER_PATH, bytes, expected_prev_etag).await,
+        Some(_) => {
+            storage
+                .put_if_match(POINTER_PATH, bytes, expected_prev_etag)
+                .await
+        }
     };
     match result {
         Ok(()) => Ok(()),
-        Err(StorageError::PreconditionFailed { .. }) => {
-            Err(CommitError::WriteContentionExhausted)
-        }
+        Err(StorageError::PreconditionFailed { .. }) => Err(CommitError::WriteContentionExhausted),
         Err(e) => Err(e.into()),
     }
 }

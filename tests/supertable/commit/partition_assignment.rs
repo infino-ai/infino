@@ -44,16 +44,13 @@
 
 use std::sync::Arc;
 
-
 use infino::superfile::builder::FtsConfig;
 use infino::superfile::fts::tokenize::Tokenizer;
-use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
+use infino::supertable::Supertable;
 use infino::supertable::manifest::list::PartitionStrategy;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::Supertable;
+use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
 use tempfile::TempDir;
-
-
 
 #[test]
 fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a() {
@@ -132,7 +129,9 @@ fn target_superfiles_per_partition_triggers_part_split() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_target_superfiles_per_partition(2);
+    let opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_target_superfiles_per_partition(2);
     let st = Supertable::create(opts);
 
     for _i in 0..3 {
@@ -169,12 +168,12 @@ fn hash_strategy_with_multiple_buckets_errors_without_partition_hint() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_partition_strategy(
-        PartitionStrategy::Hash {
+    let opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_partition_strategy(PartitionStrategy::Hash {
             column: "doc_id".into(),
             n_buckets: 4,
-        },
-    );
+        });
     let st = Supertable::create(opts);
 
     let mut w = st.writer().expect("writer");
@@ -201,17 +200,19 @@ fn time_range_strategy_on_unsupported_column_type_errors_cleanly() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_partition_strategy(
-        PartitionStrategy::TimeRange {
+    let opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_partition_strategy(PartitionStrategy::TimeRange {
             column: "_id".into(),
             granularity_secs: 86_400,
-        },
-    );
+        });
     let st = Supertable::create(opts);
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha"])).expect("append");
-    let err = w.commit().expect_err("commit must fail on unsupported column type");
+    let err = w
+        .commit()
+        .expect_err("commit must fail on unsupported column type");
     let s = format!("{err}");
     assert!(
         s.contains("unsupported type") || s.contains("expected Int64 or Timestamp"),
@@ -273,12 +274,17 @@ fn time_range_assigns_int64_segments_to_bucket_zero() {
     {
         let mut w = st.writer().expect("writer");
         w.append(&batch).expect("append");
-        w.commit().expect("TimeRange commit must succeed for a single-bucket batch");
+        w.commit()
+            .expect("TimeRange commit must succeed for a single-bucket batch");
     }
     let r = st.reader();
     let m = r.manifest();
     let list = m.list.as_ref().expect("list");
-    assert_eq!(list.parts.len(), 1, "single-bucket commit produces one part");
+    assert_eq!(
+        list.parts.len(),
+        1,
+        "single-bucket commit produces one part"
+    );
     // TimeRange partition_key is 8 bytes LE bucket index.
     assert_eq!(list.parts[0].partition_key.len(), 8);
     let bucket = u64::from_le_bytes(

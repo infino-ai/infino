@@ -241,7 +241,10 @@ mod tests {
                     ts > prev_ts || prev_ts == 0,
                     "ts must be non-decreasing: prev_ts={prev_ts} ts={ts}"
                 );
-                assert_eq!(seq, 0, "new-ms seq must be 0; got {seq} after ts={prev_ts} → {ts}");
+                assert_eq!(
+                    seq, 0,
+                    "new-ms seq must be 0; got {seq} after ts={prev_ts} → {ts}"
+                );
             }
             prev_ts = ts;
             prev_seq = seq;

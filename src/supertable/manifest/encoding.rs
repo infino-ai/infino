@@ -124,7 +124,8 @@ pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
         arrays.push(mx.clone());
     }
     let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), arrays).expect("schema/array match by construction");
+    let batch =
+        RecordBatch::try_new(schema.clone(), arrays).expect("schema/array match by construction");
 
     let mut out = Vec::new();
     {
@@ -139,8 +140,8 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError
     if bytes.is_empty() {
         return Ok(ScalarStatsTable::new());
     }
-    let reader =
-        StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
     let batches: Vec<RecordBatch> = reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
@@ -214,8 +215,8 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummary, DecodeError> {
     let mut c = Cursor::new(bytes);
     let bloom_len = read_u32(&mut c, "bloom_len")? as usize;
     let bloom_bytes = read_n(&mut c, bloom_len, "bloom_bytes")?;
-    let term_bloom = Bloom::from_bytes(&bloom_bytes)
-        .ok_or(DecodeError::InvalidBloomLayout(bloom_len))?;
+    let term_bloom =
+        Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?;
     let n_terms_distinct = read_u32(&mut c, "n_terms_distinct")?;
     let min_len = read_u32(&mut c, "min_term_len")? as usize;
     let min_term = read_n(&mut c, min_len, "min_term")?;
@@ -330,7 +331,9 @@ pub fn encode_vector_summary_map(map: &HashMap<String, VectorSummary>) -> Vec<u8
     out
 }
 
-pub fn decode_vector_summary_map(bytes: &[u8]) -> Result<HashMap<String, VectorSummary>, DecodeError> {
+pub fn decode_vector_summary_map(
+    bytes: &[u8],
+) -> Result<HashMap<String, VectorSummary>, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n = read_u32(&mut c, "vec_map_n")? as usize;
     let mut out = HashMap::with_capacity(n);
@@ -355,11 +358,7 @@ fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeErro
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-fn read_n(
-    c: &mut Cursor<&[u8]>,
-    n: usize,
-    what: &'static str,
-) -> Result<Vec<u8>, DecodeError> {
+fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
     let pos = c.position() as usize;
     let buf = *c.get_ref();
     if pos + n > buf.len() {

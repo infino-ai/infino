@@ -106,7 +106,11 @@ pub fn fts_bloom_skip(
 ///
 /// An empty `prefix` (every term matches) short-circuits to
 /// all-keep.
-pub fn fts_prefix_skip(superfiles: &[Arc<SuperfileEntry>], column: &str, prefix: &[u8]) -> Vec<bool> {
+pub fn fts_prefix_skip(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    prefix: &[u8],
+) -> Vec<bool> {
     if prefix.is_empty() {
         return vec![true; superfiles.len()];
     }
@@ -186,7 +190,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::superfile::builder::{FtsConfig, VectorConfig};
-    
+
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::SupertableOptions;
     use crate::supertable::manifest::{
@@ -293,7 +297,10 @@ mod tests {
         Arc::new(e)
     }
 
-    fn manifest_with(opts: Arc<SupertableOptions>, superfiles: Vec<Arc<SuperfileEntry>>) -> Manifest {
+    fn manifest_with(
+        opts: Arc<SupertableOptions>,
+        superfiles: Vec<Arc<SuperfileEntry>>,
+    ) -> Manifest {
         // M2c: build via `with_appended` so the new outer
         // Manifest's metadata fields (list, parts, loader) get
         // initialized correctly. Equivalent to the old direct-

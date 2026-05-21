@@ -38,10 +38,12 @@ use bytes::Bytes;
 use infino::superfile::SuperfileReader;
 use infino::superfile::builder::FtsConfig;
 use infino::superfile::fts::tokenize::Tokenizer;
-use infino::test_helpers::{build_title_batch, schema_id_title, default_tokenizer};
 use infino::supertable::manifest::SuperfileUri;
-use infino::supertable::reader_cache::{InMemoryReaderCache, SuperfileReaderCache, ReaderCacheError};
+use infino::supertable::reader_cache::{
+    InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache,
+};
 use infino::supertable::{Supertable, SupertableOptions};
+use infino::test_helpers::{build_title_batch, default_tokenizer, schema_id_title};
 
 /// Decorator over an `InMemoryReaderCache` that counts
 /// per-URI `reader` calls. Wraps without behavior change.
@@ -100,7 +102,6 @@ impl SuperfileReaderCache for CountingStore {
     }
 }
 
-
 fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -122,7 +123,6 @@ fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
     .with_store(store)
 }
 
-
 #[test]
 fn bm25_exact_term_skip_opens_only_matching_segment() {
     let store = Arc::new(CountingStore::new());
@@ -132,20 +132,23 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
     // only; the other three superfiles share generic terms only.
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&[
-            "lookup nimblefox special token",
-            "ordinary common everyday text",
-        ],
-    ))
+        "lookup nimblefox special token",
+        "ordinary common everyday text",
+    ]))
     .expect("append");
     w.commit().expect("commit");
 
-    w.append(&build_title_batch(&["another generic page", "more filler text"],
-    ))
+    w.append(&build_title_batch(&[
+        "another generic page",
+        "more filler text",
+    ]))
     .expect("append");
     w.commit().expect("commit");
 
-    w.append(&build_title_batch(&["yet another normal title", "wrapping up the corpus"],
-    ))
+    w.append(&build_title_batch(&[
+        "yet another normal title",
+        "wrapping up the corpus",
+    ]))
     .expect("append");
     w.commit().expect("commit");
 
@@ -251,8 +254,10 @@ fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
     // Three superfiles — none contains the rare query term.
     let mut w = st.writer().expect("writer");
     for _i in 0..3u64 {
-        w.append(&build_title_batch(&["ordinary term filler", "another mundane title"],
-        ))
+        w.append(&build_title_batch(&[
+            "ordinary term filler",
+            "another mundane title",
+        ]))
         .expect("append");
         w.commit().expect("commit");
     }
@@ -290,8 +295,11 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
     w.append(&build_title_batch(&["alpha beta gamma", "doc with beta"]))
         .expect("append");
     w.commit().expect("commit");
-    w.append(&build_title_batch(&["alpha only here", "no betas whatever"]))
-        .expect("append");
+    w.append(&build_title_batch(&[
+        "alpha only here",
+        "no betas whatever",
+    ]))
+    .expect("append");
     w.commit().expect("commit");
     drop(w);
 

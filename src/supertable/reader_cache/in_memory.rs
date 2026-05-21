@@ -31,7 +31,7 @@ use bytes::Bytes;
 use crate::superfile::SuperfileReader;
 use crate::supertable::manifest::SuperfileUri;
 
-use super::{SuperfileReaderCache, ReaderCacheError};
+use super::{ReaderCacheError, SuperfileReaderCache};
 
 /// Per-URI entry. Holds the raw bytes alongside the parsed reader
 /// so `resident_bytes()` can attribute storage back to specific
@@ -178,7 +178,9 @@ mod tests {
         let bytes = minimal_superfile_bytes();
         let uri = fresh_uri();
 
-        store.insert(uri, bytes.clone()).expect("insert should succeed");
+        store
+            .insert(uri, bytes.clone())
+            .expect("insert should succeed");
 
         let r = store.reader(&uri).expect("reader should find uri");
         assert_eq!(r.n_docs(), 3, "minimal superfile carries 3 docs");
@@ -249,8 +251,12 @@ mod tests {
         let store = InMemoryReaderCache::new();
         let bytes_a = minimal_superfile_bytes();
         let bytes_b = minimal_superfile_bytes();
-        store.insert(fresh_uri(), bytes_a.clone()).expect("insert a");
-        store.insert(fresh_uri(), bytes_b.clone()).expect("insert b");
+        store
+            .insert(fresh_uri(), bytes_a.clone())
+            .expect("insert a");
+        store
+            .insert(fresh_uri(), bytes_b.clone())
+            .expect("insert b");
         assert_eq!(store.n_superfiles(), 2);
         assert_eq!(store.resident_bytes(), bytes_a.len() + bytes_b.len());
     }
@@ -263,7 +269,9 @@ mod tests {
         // same underlying SuperfileReader.
         let store = InMemoryReaderCache::new();
         let uri = fresh_uri();
-        store.insert(uri, minimal_superfile_bytes()).expect("insert");
+        store
+            .insert(uri, minimal_superfile_bytes())
+            .expect("insert");
         let a = store.reader(&uri).expect("a");
         let b = store.reader(&uri).expect("b");
         assert!(Arc::ptr_eq(&a, &b));

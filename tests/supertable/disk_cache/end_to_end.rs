@@ -30,18 +30,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-
-use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino::supertable::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
+use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
-
-
-fn make_cache(storage: Arc<dyn StorageProvider>, cache_root: &std::path::Path) -> Arc<DiskCacheStore> {
+fn make_cache(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &std::path::Path,
+) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
         disk_budget_bytes: 1 << 30, // 1 GiB — plenty for tests
@@ -58,26 +56,22 @@ fn make_cache(storage: Arc<dyn StorageProvider>, cache_root: &std::path::Path) -
     // commit notes: Arc<SuperfileReader> keeps the
     // Arc<Mmap> alive even after the cache evicts the
     // entry, so in-flight queries finish correctly).
-    let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> =
-        Arc::new(HashSet::new);
+    let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     DiskCacheStore::new(storage, cfg, pinned_fn).expect("cache")
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_process_consumer_routes_reads_through_disk_cache() {
     let storage_dir = TempDir::new().expect("storage tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
 
     // ---- Producer: commit + drop. -----------------------------
     // Producer doesn't need a cache for this test — we're
     // validating the consumer's read path.
     {
-        let producer = Supertable::create(
-            default_supertable_options().with_storage(Arc::clone(&storage)),
-        );
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -87,7 +81,9 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     // ---- Consumer: open with disk cache attached. -------------
     let consumer_cache_dir = TempDir::new().expect("cache tempdir");
     let cache = make_cache(Arc::clone(&storage), consumer_cache_dir.path());
-    let consumer_opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache));
+    let consumer_opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_disk_cache(Arc::clone(&cache));
     let consumer = Supertable::open(consumer_opts).await.expect("open");
     assert_eq!(consumer.manifest_id(), 1);
 
@@ -145,12 +141,15 @@ async fn producer_with_cache_reads_through_cache_path() {
     // hits the warm cache.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
-    let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+    let producer = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    );
     let mut w = producer.writer().expect("writer");
     w.append(&build_title_batch(&["alpha"])).expect("append");
     w.commit().expect("commit");
@@ -183,12 +182,15 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
     // round-trip through storage.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    );
 
     // Pre-commit: cache empty.
     assert_eq!(cache.stats().n_entries, 0);
@@ -240,12 +242,15 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
     // but the cache itself never panics or double-inserts.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    );
 
     for _i in 0..3 {
         let mut w = st.writer().expect("writer");
@@ -268,12 +273,15 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
     // Post-commit: contains the published segment's URI.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    );
 
     // Before any commit: empty segment list → empty pinned
     // set.
@@ -283,7 +291,8 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
     // Commit one segment.
     {
         let mut w = st.writer().expect("writer");
-        w.append(&build_title_batch(&["pinned alpha"])).expect("append");
+        w.append(&build_title_batch(&["pinned alpha"]))
+            .expect("append");
         w.commit().expect("commit");
     }
 
@@ -311,22 +320,27 @@ async fn manifest_segments_are_auto_pinned_by_supertable_open() {
     // too — important because the cross-process consumer
     // wires the cache + supertable in open, not in create.
     let storage_dir = TempDir::new().expect("storage tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
 
     // Producer (no cache attached): commit + drop.
     {
-        let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
         let mut w = producer.writer().expect("writer");
-        w.append(&build_title_batch(&["from producer"])).expect("append");
+        w.append(&build_title_batch(&["from producer"]))
+            .expect("append");
         w.commit().expect("commit");
     }
 
     // Consumer with cache.
     let cache_dir = TempDir::new().expect("cache tempdir");
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)))
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
     .await
     .expect("open");
 
@@ -353,13 +367,16 @@ fn pinned_fn_releases_via_weak_when_supertable_drops() {
     // holding inner alive" property.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
     {
-        let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        );
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["temp"])).expect("append");
         w.commit().expect("commit");
@@ -384,15 +401,16 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
     // budget, it doesn't.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
     // Budget of 1 byte → every commit's mmap exceeds it
     // → sweep fires.
     let st = Supertable::create(
-        default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache))
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache))
             .with_memory_budget(1),
     );
 
@@ -408,7 +426,8 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
     assert!(
         after > before,
         "post-commit sweep must have called madvise; n_madvise_calls {} → {}",
-        before, after
+        before,
+        after
     );
 
     // Confirm the budget + mmap_resident shows up in stats.
@@ -425,12 +444,15 @@ fn memory_budget_unset_does_not_force_sweep() {
     // trigger it.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
 
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    );
 
     let before = cache.stats().n_madvise_calls;
 

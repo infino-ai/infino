@@ -182,8 +182,10 @@ impl CacheEvictionPolicy for LruPolicy {
         // Filter pinned, sort by ascending last_access_us
         // (oldest first), take until cumulative size ≥
         // bytes_needed.
-        let mut eligible: Vec<&EvictionCandidate> =
-            candidates.iter().filter(|c| !pinned.contains(&c.uri)).collect();
+        let mut eligible: Vec<&EvictionCandidate> = candidates
+            .iter()
+            .filter(|c| !pinned.contains(&c.uri))
+            .collect();
         eligible.sort_by_key(|c| c.last_access_us);
         let mut victims = Vec::new();
         let mut freed = 0u64;

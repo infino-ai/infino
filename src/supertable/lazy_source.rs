@@ -16,8 +16,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::superfile::{LazyByteSource, LazyByteSourceError};
 use crate::storage::{StorageError, StorageProvider};
+use crate::superfile::{LazyByteSource, LazyByteSourceError};
 
 /// `LazyByteSource` over a `StorageProvider::get_range`.
 ///

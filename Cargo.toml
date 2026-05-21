@@ -223,10 +223,22 @@ path = "tests/supertable/main.rs"
 
 # Bench bundles. One criterion binary per topic (FTS, vector), each
 # wrapping superfile + supertable sub-groups so the topic ships as
-# a single `[[bench]]` stanza.
+# a single `[[bench]]` stanza. Additionally, fts is split into
+# fts-superfile and fts-supertable to avoid unnecessary setup overhead
+# when running only one benchmark type.
 [[bench]]
 name = "fts"
 path = "benches/fts/main.rs"
+harness = false
+
+[[bench]]
+name = "fts-superfile"
+path = "benches/fts/main_superfile.rs"
+harness = false
+
+[[bench]]
+name = "fts-supertable"
+path = "benches/fts/main_supertable.rs"
 harness = false
 
 [[bench]]

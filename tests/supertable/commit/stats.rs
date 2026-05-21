@@ -25,14 +25,10 @@
 
 use std::sync::Arc;
 
-
-use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
+use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
-
-
-
 
 #[test]
 fn fresh_supertable_returns_empty_stats() {
@@ -83,10 +79,10 @@ fn stats_track_commits_on_in_process_supertable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stats_show_manifest_parts_when_storage_attached() {
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
-    let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let producer =
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
     {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["initial"])).expect("append");
@@ -112,9 +108,10 @@ async fn stats_show_manifest_parts_when_storage_attached() {
 
     // Open-side: Supertable::open eager-fetches all parts, so
     // n_manifest_parts_loaded should equal n_manifest_parts.
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     let consumer_stats = consumer.stats();
     assert_eq!(consumer_stats.manifest_id, 1);
     assert_eq!(consumer_stats.n_manifest_parts, Some(1));
@@ -196,17 +193,16 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     // before any activity, so downstream consumers can
     // sample them on a timer without worrying about
     // initialization order.
-    use std::collections::HashSet;
     use infino::supertable::SuperfileUri;
     use infino::supertable::reader_cache::{
         ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
     };
+    use std::collections::HashSet;
 
     let storage_dir = TempDir::new().expect("storage dir");
     let cache_dir = TempDir::new().expect("cache dir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cfg = DiskCacheConfig {
         cache_root: cache_dir.path().to_path_buf(),
         disk_budget_bytes: 1 << 30,
@@ -218,19 +214,16 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
     };
-    let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> =
-        Arc::new(HashSet::new);
+    let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(HashSet::new);
     let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
 
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache));
+    let opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_disk_cache(Arc::clone(&cache));
     let st = Supertable::create(opts);
 
     let s = st.stats();
-    assert_eq!(
-        s.n_cold_fetches,
-        Some(0),
-        "fresh cache: zero cold fetches"
-    );
+    assert_eq!(s.n_cold_fetches, Some(0), "fresh cache: zero cold fetches");
     assert_eq!(s.n_cache_evictions, Some(0));
     assert_eq!(s.n_cache_madvise_calls, Some(0));
     assert_eq!(s.n_cache_entries, Some(0));
@@ -260,8 +253,7 @@ fn rss_growth_under_in_process_commits_is_observable() {
         let mut w = st.writer().expect("writer");
         let titles: Vec<String> = (0..1000).map(|i| format!("doc_{c}_{i}")).collect();
         let titles_refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
-        w.append(&build_title_batch(&titles_refs))
-            .expect("append");
+        w.append(&build_title_batch(&titles_refs)).expect("append");
         w.commit().expect("commit");
     }
 

@@ -124,7 +124,9 @@ impl BruteForceBm25 {
             let dl = doc.dl as f32;
             let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
             for term in terms {
-                let Some(&tf) = doc.tf.get(term) else { continue };
+                let Some(&tf) = doc.tf.get(term) else {
+                    continue;
+                };
                 let df = *self.df.get(term).unwrap_or(&0) as f32;
                 if df == 0.0 {
                     continue;

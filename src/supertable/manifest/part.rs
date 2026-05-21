@@ -201,19 +201,28 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
             let vector_bytes = encode_vector_summary_map(&seg.vector_summary);
 
             AvroValue::Record(vec![
-                ("superfile_id".into(), AvroValue::String(seg.superfile_id.to_string())),
+                (
+                    "superfile_id".into(),
+                    AvroValue::String(seg.superfile_id.to_string()),
+                ),
                 ("uri".into(), AvroValue::String(seg.uri.0.to_string())),
                 ("n_docs".into(), AvroValue::Long(seg.n_docs as i64)),
-                ("id_min".into(), AvroValue::Fixed(16, seg.id_min.to_be_bytes().to_vec())),
-                ("id_max".into(), AvroValue::Fixed(16, seg.id_max.to_be_bytes().to_vec())),
-                ("partition_key".into(), AvroValue::Bytes(seg.partition_key.clone())),
+                (
+                    "id_min".into(),
+                    AvroValue::Fixed(16, seg.id_min.to_be_bytes().to_vec()),
+                ),
+                (
+                    "id_max".into(),
+                    AvroValue::Fixed(16, seg.id_max.to_be_bytes().to_vec()),
+                ),
+                (
+                    "partition_key".into(),
+                    AvroValue::Bytes(seg.partition_key.clone()),
+                ),
                 (
                     "partition_hint".into(),
                     match seg.partition_hint {
-                        Some(b) => AvroValue::Union(
-                            1,
-                            Box::new(AvroValue::Int(b as i32)),
-                        ),
+                        Some(b) => AvroValue::Union(1, Box::new(AvroValue::Int(b as i32))),
                         None => AvroValue::Union(0, Box::new(AvroValue::Null)),
                     },
                 ),
@@ -229,7 +238,10 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
             "format_version".into(),
             AvroValue::String(part.format_version.clone()),
         ),
-        ("part_id".into(), AvroValue::String(part.part_id.0.to_string())),
+        (
+            "part_id".into(),
+            AvroValue::String(part.part_id.0.to_string()),
+        ),
         ("superfiles".into(), AvroValue::Array(segment_records)),
     ]);
 
@@ -244,7 +256,8 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
 /// the constant [`FORMAT_VERSION`]; minor differences are
 /// accepted).
 pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
-    let avro_bytes = zstd::stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+    let avro_bytes =
+        zstd::stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
     // Schemaless datum decode — mirrors `to_avro_datum` in
     // `encode`. The schema is in-source (compiled in), so the
     // reader doesn't need a wire-side schema.
@@ -254,7 +267,11 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
 
     let fields = match value {
         AvroValue::Record(r) => r,
-        _ => return Err(PartParseError::SchemaMismatch("top-level not a record".into())),
+        _ => {
+            return Err(PartParseError::SchemaMismatch(
+                "top-level not a record".into(),
+            ));
+        }
     };
     let mut map: HashMap<String, AvroValue> = fields.into_iter().collect();
 
@@ -266,7 +283,9 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
         Uuid::parse_str(&part_id_str).map_err(|e| PartParseError::BadSuperfileId(e.to_string()))?,
     );
 
-    let segments_val = map.remove("superfiles").ok_or(PartParseError::MissingField("superfiles"))?;
+    let segments_val = map
+        .remove("superfiles")
+        .ok_or(PartParseError::MissingField("superfiles"))?;
     let segs = match segments_val {
         AvroValue::Array(a) => a,
         _ => return Err(PartParseError::WrongFieldType("superfiles")),
@@ -286,7 +305,11 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
 fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let fields = match v {
         AvroValue::Record(r) => r,
-        _ => return Err(PartParseError::SchemaMismatch("segment not a record".into())),
+        _ => {
+            return Err(PartParseError::SchemaMismatch(
+                "segment not a record".into(),
+            ));
+        }
     };
     let mut map: HashMap<String, AvroValue> = fields.into_iter().collect();
 
@@ -628,8 +651,7 @@ mod tests {
 
     #[test]
     fn multi_segment_with_full_summaries_roundtrip() {
-        let superfiles: Vec<Arc<SuperfileEntry>> =
-            (0..5).map(|_| make_rich_segment()).collect();
+        let superfiles: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| make_rich_segment()).collect();
         let part = fresh_part(superfiles);
         let bytes = encode(&part, 3);
         let decoded = decode(&bytes).expect("decode rich");

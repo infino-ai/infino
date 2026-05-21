@@ -204,9 +204,7 @@ pub struct SupertableOptions {
     /// At [`Supertable::open`] time, this field is read from
     /// the persisted manifest list — config changes after
     /// creation have no effect.
-    pub partition_strategy: Option<
-        crate::supertable::manifest::list::PartitionStrategy,
-    >,
+    pub partition_strategy: Option<crate::supertable::manifest::list::PartitionStrategy>,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
     /// the next commit's superfiles for that partition go into
@@ -486,10 +484,7 @@ impl SupertableOptions {
     /// Rejects names that already appear in the user schema
     /// (same check as construction) by returning
     /// [`BuildError::IdColumnReserved`].
-    pub fn with_id_column(
-        mut self,
-        name: impl Into<String>,
-    ) -> Result<Self, BuildError> {
+    pub fn with_id_column(mut self, name: impl Into<String>) -> Result<Self, BuildError> {
         let name = name.into();
         if self.schema.fields().iter().any(|f| f.name() == &name) {
             return Err(BuildError::IdColumnReserved(name));
@@ -532,10 +527,7 @@ impl SupertableOptions {
     ///
     /// Reads still go through `store` unless a `disk_cache`
     /// is also attached.
-    pub fn with_storage(
-        mut self,
-        storage: Arc<dyn crate::storage::StorageProvider>,
-    ) -> Self {
+    pub fn with_storage(mut self, storage: Arc<dyn crate::storage::StorageProvider>) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -810,7 +802,6 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    
     use crate::superfile::vector::distance::Metric;
 
     fn fixed_list_f32(dim: usize) -> DataType {
@@ -851,13 +842,8 @@ mod tests {
     #[test]
     fn valid_options_with_fts_and_vector_succeeds() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options should succeed");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options should succeed");
         assert_eq!(opts.id_column, "_id");
         assert_eq!(opts.fts_columns.len(), 1);
         assert_eq!(opts.vector_columns.len(), 1);
@@ -891,11 +877,7 @@ mod tests {
     #[test]
     fn fts_column_wrong_type_rejected() {
         // `body` is Utf8 not LargeUtf8 — must reject.
-        let s = Arc::new(Schema::new(vec![Field::new(
-            "body",
-            DataType::Utf8,
-            false,
-        )]));
+        let s = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
         let err = SupertableOptions::new(s, vec![fc("body")], vec![], Some(tok()))
             .expect_err("expected error");
         assert!(
@@ -1001,13 +983,9 @@ mod tests {
         ]));
         // Duplicate `emb` between two vector_columns entries —
         // hits the cross-list dedup check.
-        let err = SupertableOptions::new(
-            s.clone(),
-            vec![],
-            vec![vc("emb", 16), vc("emb", 16)],
-            None,
-        )
-        .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s.clone(), vec![], vec![vc("emb", 16), vc("emb", 16)], None)
+                .expect_err("expected error");
         assert!(matches!(err, BuildError::DuplicateLogicalName(n) if n == "emb"));
     }
 
@@ -1042,8 +1020,8 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![fc("title")], vec![], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![fc("title")], vec![], None).expect_err("expected error");
         assert!(matches!(err, BuildError::MissingTokenizer));
     }
 
@@ -1056,20 +1034,14 @@ mod tests {
         )]));
         // No FTS, no vectors, no tokenizer — the supertable becomes
         // a thin wrapper over scalar Parquet data. Must succeed.
-        SupertableOptions::new(s, vec![], vec![], None)
-            .expect("empty fts + vector should succeed");
+        SupertableOptions::new(s, vec![], vec![], None).expect("empty fts + vector should succeed");
     }
 
     #[test]
     fn scalar_schema_drops_vector_columns_and_prepends_id() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options");
         let scalar = opts.scalar_schema();
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
@@ -1098,13 +1070,8 @@ mod tests {
     #[test]
     fn effective_schema_prepends_id_keeps_vector_columns() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options");
         let eff = opts.effective_schema();
         let names: Vec<_> = eff.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title", "emb"]);
@@ -1130,15 +1097,10 @@ mod tests {
     #[test]
     fn with_id_column_overrides_default() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_id_column("row_id")
-        .expect("override accepted");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options")
+            .with_id_column("row_id")
+            .expect("override accepted");
         assert_eq!(opts.id_column, "row_id");
         // effective_schema now uses the new name.
         let eff = opts.effective_schema();
@@ -1148,13 +1110,8 @@ mod tests {
     #[test]
     fn with_id_column_rejects_name_that_collides_with_user_schema() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options");
         let err = opts.with_id_column("title").expect_err("collision");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "title"));
     }
@@ -1174,15 +1131,10 @@ supertable:
             .expect("parse config");
 
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .apply_config(&cfg)
-        .expect("apply_config");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options")
+            .apply_config(&cfg)
+            .expect("apply_config");
 
         assert_eq!(opts.commit_threshold_size_mb, 7);
         assert_eq!(opts.reader_pool.current_num_threads(), 3);
@@ -1196,15 +1148,10 @@ supertable:
         let cfg = crate::config::Config::defaults().expect("embedded default");
 
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .apply_config(&cfg)
-        .expect("apply_config");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options")
+            .apply_config(&cfg)
+            .expect("apply_config");
 
         let reader_default = num_cpus::get().max(1);
         let writer_default = num_cpus::get().div_ceil(2).max(1);
@@ -1217,13 +1164,8 @@ supertable:
     #[test]
     fn debug_format_doesnt_explode() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            s,
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options");
         let s = format!("{:?}", opts);
         assert!(s.contains("SupertableOptions"));
         assert!(s.contains("_id"));

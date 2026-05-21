@@ -30,15 +30,13 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use infino::supertable::SuperfileUri;
 use infino::supertable::reader_cache::disk::DiskCacheError;
-use infino::supertable::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-};
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
+use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use tempfile::TempDir;
 
 // ============================================================
@@ -125,8 +123,7 @@ fn build_test_bytes() -> Bytes {
     let mut b = SuperfileBuilder::new(opts).expect("builder");
     let ids = decimal128_ids(vec![1u64, 2, 3]);
     let titles = LargeStringArray::from(vec!["alpha bravo", "charlie delta", "echo foxtrot"]);
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
     b.add_batch(&batch, &[]).expect("add_batch");
     Bytes::from(b.finish().expect("finish"))
 }
@@ -170,9 +167,8 @@ async fn hybrid_mode_is_default() {
 #[tokio::test]
 async fn hybrid_reader_returns_working_superfile_reader() {
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
@@ -191,9 +187,8 @@ async fn hybrid_bandwidth_per_cold_miss_equals_segment_size() {
     // the same range responses serve both foreground and
     // cache fill; no re-fetching.
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let segment_size = bytes.len();
     let uri = SuperfileUri::new_v4();
@@ -223,9 +218,8 @@ async fn hybrid_bandwidth_per_cold_miss_equals_segment_size() {
 #[tokio::test]
 async fn hybrid_warm_hit_issues_zero_range_fetches() {
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
@@ -252,9 +246,8 @@ async fn hybrid_warm_hit_issues_zero_range_fetches() {
 #[tokio::test]
 async fn hybrid_concurrent_readers_coalesce_to_one_fetch_fan_out() {
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let segment_size = bytes.len();
     let uri = SuperfileUri::new_v4();
@@ -294,15 +287,17 @@ async fn range_only_mode_bypasses_disk_cache() {
     // `StorageRangeSource` + `SuperfileReader::open_lazy`
     // directly).
     let store_dir = TempDir::new().expect("storage");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
 
     let (_d, cache) = fresh_cache(local, ColdFetchMode::RangeOnly);
-    let err = cache.reader(&uri).await.expect_err("range-only must reject");
+    let err = cache
+        .reader(&uri)
+        .await
+        .expect_err("range-only must reject");
     assert!(
         matches!(err, DiskCacheError::SuperfileOpen(_)),
         "expected typed reject, got {err:?}"
