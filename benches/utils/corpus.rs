@@ -29,19 +29,19 @@ use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use memmap2::Mmap;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 use tempfile::TempDir;
 
+use infino::superfile::SuperfileReader;
 use infino::superfile::builder::{
     BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
 };
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{normalize, Metric};
+use infino::superfile::vector::distance::{Metric, normalize};
 use infino::superfile::vector::reader::VectorReader;
-use infino::superfile::SuperfileReader;
 use infino::test_helpers::default_tokenizer;
 
 // ─── Scale constants ──────────────────────────────────────────────────

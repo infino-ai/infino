@@ -27,8 +27,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // in the markdown table instead.
 use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::reader::VectorReader;
-use infino_bench_utils::corpus::{self, Calibrated, DIM};
-use infino_bench_utils::{markdown, rss};
+use crate::corpus::{self, Calibrated, DIM};
+use crate::{markdown, rss};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -80,27 +80,13 @@ fn vectors() -> &'static [f32] {
 
 fn queries_correctness() -> &'static [Vec<f32>] {
     QUERIES_CORRECTNESS.get_or_init(|| {
-        corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CORRECTNESS_QUERIES,
-            17,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CORRECTNESS_QUERIES, 17, true, 0.05)
     })
 }
 
 fn queries_calibration() -> &'static [Vec<f32>] {
     QUERIES_CALIBRATION.get_or_init(|| {
-        corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CALIBRATION_QUERIES,
-            99,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CALIBRATION_QUERIES, 99, true, 0.05)
     })
 }
 
@@ -179,8 +165,7 @@ fn calibrations() -> &'static Calibrations {
         );
         let mut inf: [Option<Calibrated>; 3] = [None; 3];
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            inf[i] =
-                corpus::calibrate_infino(&reader, qs, gt, target, PROBES, REFINES, 21, TOP_K);
+            inf[i] = corpus::calibrate_infino(&reader, qs, gt, target, PROBES, REFINES, 21, TOP_K);
             eprintln!("  recall ≥ {target:.2} | infino: {:?}", inf[i]);
         }
         Calibrations { infino: inf }

@@ -25,13 +25,13 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group};
 use infino::superfile::builder::FtsConfig;
 use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
-use infino_bench_utils::{corpus, markdown, rss};
+use crate::{corpus, markdown, rss};
 use rayon::ThreadPool;
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -281,7 +281,7 @@ mod group_name {
 }
 
 fn emit_ingest_markdown() {
-    use markdown::{fmt_throughput, fmt_time, read_mean_ns, MarkdownSection};
+    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
 
     let group = group_name::SUPERTABLE_FTS_BUILD;
     let ns = read_mean_ns(group, "infino_auto_writer_pool");
@@ -314,7 +314,7 @@ fn emit_ingest_markdown() {
 }
 
 fn emit_search_markdown() {
-    use markdown::{fmt_time, read_mean_ns, MarkdownSection};
+    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
     let group = group_name::SUPERTABLE_FTS_SEARCH;
     let mut body = String::new();

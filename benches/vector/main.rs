@@ -16,7 +16,6 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector     # rewrite README sections
 //! ```
 
-mod superfile;
-mod supertable;
+use infino_bench_utils::{vector_superfile, vector_supertable};
 
-criterion::criterion_main!(superfile::benches, supertable::benches);
+criterion::criterion_main!(vector_superfile::benches, vector_supertable::benches);

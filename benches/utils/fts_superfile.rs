@@ -24,11 +24,11 @@
 //! timing kicks in.
 
 use bytes::Bytes;
-use criterion::{criterion_group, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group};
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::fts::reader::{BoolMode, FtsReader, OrAlgo};
 use infino::test_helpers::default_tokenizer;
-use infino_bench_utils::{corpus, markdown, rss};
+use crate::{corpus, markdown, rss};
 use rayon::prelude::*;
 use std::hint::black_box;
 use std::sync::OnceLock;

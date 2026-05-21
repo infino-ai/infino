@@ -9,11 +9,6 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts-superfile
 //! ```
 
-// Cargo bench binaries don't share sub-modules through the file system the
-// way `main.rs` does, so reach the shared `superfile.rs` body via `#[path]`.
-// Helpers (corpus, markdown, rss) come from the `infino-bench-utils` crate
-// — see `benches/utils/`.
-#[path = "superfile.rs"]
-mod superfile;
+use infino_bench_utils::fts_superfile;
 
-criterion::criterion_main!(superfile::benches);
+criterion::criterion_main!(fts_superfile::benches);

@@ -18,7 +18,6 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts       # rewrite README sections
 //! ```
 
-mod superfile;
-mod supertable;
+use infino_bench_utils::{fts_superfile, fts_supertable};
 
-criterion::criterion_main!(superfile::benches, supertable::benches);
+criterion::criterion_main!(fts_superfile::benches, fts_supertable::benches);

@@ -25,11 +25,11 @@ use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, Throughput, criterion_group};
 use infino::superfile::builder::VectorConfig;
 use infino::superfile::vector::distance::Metric;
-use infino::supertable::query::vector::VectorSearchOptions;
 use infino::supertable::query::SuperfileHit;
+use infino::supertable::query::vector::VectorSearchOptions;
 use infino::supertable::{Supertable, SupertableOptions};
-use infino_bench_utils::corpus::{self, Calibrated, DIM};
-use infino_bench_utils::{markdown, rss};
+use crate::corpus::{self, Calibrated, DIM};
+use crate::{markdown, rss};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -79,27 +79,13 @@ fn vectors() -> &'static [f32] {
 
 fn queries_correctness() -> &'static [Vec<f32>] {
     QUERIES_CORRECTNESS.get_or_init(|| {
-        corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CORRECTNESS_QUERIES,
-            17,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CORRECTNESS_QUERIES, 17, true, 0.05)
     })
 }
 
 fn queries_calibration() -> &'static [Vec<f32>] {
     QUERIES_CALIBRATION.get_or_init(|| {
-        corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CALIBRATION_QUERIES,
-            99,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CALIBRATION_QUERIES, 99, true, 0.05)
     })
 }
 
@@ -417,7 +403,7 @@ mod group_name {
 }
 
 fn emit_ingest_markdown() {
-    use markdown::{fmt_throughput, fmt_time, read_mean_ns, MarkdownSection};
+    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
 
     let group = group_name::SUPERTABLE_VEC_BUILD;
     let bench = format!("supertable_{N_DOCS}docs_{N_SEGMENTS}superfiles");
@@ -444,7 +430,7 @@ fn emit_ingest_markdown() {
 }
 
 fn emit_search_markdown() {
-    use markdown::{fmt_time, read_mean_ns, MarkdownSection};
+    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
     let cal = calibrations();
     let group = group_name::SUPERTABLE_VEC_SEARCH;
