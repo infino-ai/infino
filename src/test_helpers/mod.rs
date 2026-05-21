@@ -25,6 +25,7 @@
 //! [`brute_force_bm25`] is the textbook BM25 reference impl
 //! used as the FTS correctness oracle.
 
+pub mod bench_corpus;
 pub mod brute_force_bm25;
 
 use std::sync::Arc;

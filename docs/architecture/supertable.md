@@ -40,7 +40,7 @@ format (Parquet body + embedded BM25 + vector blobs).
   - [Skip pruning](#skip-pruning)
   - [Dual-pool concurrency](#dual-pool-concurrency)
   - [SQL surface via DataFusion](#sql-surface-via-datafusion)
-- [Performance: head-to-head vs reference engines](#performance-head-to-head-vs-reference-engines)
+- [Performance](#performance)
 - [Test strategy](#test-strategy)
 - [Known limitations](#known-limitations)
 - [Phase 2 plans](#phase-2-plans)

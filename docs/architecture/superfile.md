@@ -49,7 +49,7 @@ integration — are deliberately deferred and noted in
   - [Ingestion durability and `commit()`](#ingestion-durability-and-commit)
     - [The five options considered](#the-five-options-considered)
     - [Multi-threaded ingestion](#multi-threaded-ingestion)
-- [Performance: head-to-head vs reference engines](#performance-head-to-head-vs-reference-engines)
+- [Performance](#performance)
 - [Test strategy](#test-strategy)
 - [Known limitations](#known-limitations)
 - [Phase 2 plans](#phase-2-plans)

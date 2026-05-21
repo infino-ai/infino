@@ -227,3 +227,16 @@ path = "tests/superfile/main.rs"
 name = "supertable"
 path = "tests/supertable/main.rs"
 
+# Bench bundles. One criterion binary per topic (FTS, vector), each
+# wrapping superfile + supertable sub-groups so the topic ships as
+# a single `[[bench]]` stanza.
+[[bench]]
+name = "fts"
+path = "benches/fts/main.rs"
+harness = false
+
+[[bench]]
+name = "vector"
+path = "benches/vector/main.rs"
+harness = false
+
