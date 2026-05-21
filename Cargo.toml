@@ -17,10 +17,9 @@ path = "src/lib.rs"
 # Decimal128 id columns, default tokenizers, default vector
 # configs. Used by integration tests, benches, and (via
 # `cfg(test)`) unit tests so all three contexts share one
-# source of truth for boilerplate-heavy fixtures. NOT part
-# of infino's stable API; signatures may change between any
-# two versions. The `dev-dependencies` self-reference below
-# auto-enables this for test + bench builds.
+# source of truth for boilerplate-heavy fixtures. The
+# `dev-dependencies` self-reference below auto-enables this for
+# test + bench builds.
 test-helpers = []
 
 [lints.rust]
@@ -173,6 +172,7 @@ ferroid = { version = "2", features = ["std", "alloc", "snowflake", "basic"] }
 # Unit tests (inside src/) reach the module via `crate::
 # test_helpers` under `cfg(test)`, independent of this dep.
 infino = { path = ".", features = ["test-helpers"] }
+infino-bench-utils = { path = "benches/utils" }
 
 tempfile = "3"
 proptest = "1"
