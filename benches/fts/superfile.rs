@@ -197,6 +197,7 @@ fn bench_infino(
     name: &str,
     r: &FtsReader,
     terms: &'static [&'static str],
+    mode: BoolMode,
 ) {
     c.bench_function(format!("{name}_infino_top10"), |b| {
         b.iter(|| {
@@ -205,7 +206,7 @@ fn bench_infino(
                     black_box("title"),
                     black_box(terms),
                     black_box(10),
-                    BoolMode::Or,
+                    mode,
                 )
                 .expect("infino search");
             black_box(hits)
@@ -282,21 +283,23 @@ fn bench(c: &mut Criterion) {
     {
         let mut g = c.benchmark_group("superfile_fts_search");
 
-        bench_infino(&mut g, "single_rare", &r, &["term09999"]);
-        bench_infino(&mut g, "single_df1", &r, &["doc0500000"]);
-        bench_infino(&mut g, "single_common", &r, &["term00001"]);
-        bench_infino(&mut g, "two_term_or", &r, &["term00001", "term00050"]);
+        bench_infino(&mut g, "single_rare", &r, &["term09999"], BoolMode::Or);
+        bench_infino(&mut g, "single_df1", &r, &["doc0500000"], BoolMode::Or);
+        bench_infino(&mut g, "single_common", &r, &["term00001"], BoolMode::Or);
+        bench_infino(&mut g, "two_term_or", &r, &["term00001", "term00050"], BoolMode::Or);
         bench_infino(
             &mut g,
             "three_wide",
             &r,
             &["term00001", "term00050", "term00100"],
+            BoolMode::Or,
         );
         bench_infino(
             &mut g,
             "three_similar",
             &r,
             &["term00050", "term00051", "term00052"],
+            BoolMode::Or,
         );
         bench_infino(
             &mut g,
@@ -309,6 +312,36 @@ fn bench(c: &mut Criterion) {
                 "term00053",
                 "term00054",
             ],
+            BoolMode::Or,
+        );
+
+        bench_infino(&mut g, "two_term_and", &r, &["term00001", "term00050"], BoolMode::And);
+        bench_infino(
+            &mut g,
+            "three_wide_and",
+            &r,
+            &["term00001", "term00050", "term00100"],
+            BoolMode::And,
+        );
+        bench_infino(
+            &mut g,
+            "three_similar_and",
+            &r,
+            &["term00050", "term00051", "term00052"],
+            BoolMode::And,
+        );
+        bench_infino(
+            &mut g,
+            "five_term_and",
+            &r,
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+            ],
+            BoolMode::And,
         );
 
         // Per-algo probes
@@ -381,11 +414,9 @@ fn emit_search_markdown() {
 
     let mut body = String::new();
     body.push_str(&format!("### Superfile FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str("| Query          | infino     |\n");
-    body.push_str("|----------------|------------|\n");
 
     let group = "superfile_fts_search";
-    let queries = [
+    let queries_or = [
         "single_rare",
         "single_df1",
         "single_common",
@@ -394,14 +425,32 @@ fn emit_search_markdown() {
         "three_similar",
         "five_term",
     ];
-    for q in queries {
+    let queries_and = [
+        "two_term_and",
+        "three_wide_and",
+        "three_similar_and",
+        "five_term_and",
+    ];
+
+    body.push_str("**OR queries:**\n\n");
+    body.push_str("| Query          | infino     |\n");
+    body.push_str("|----------------|------------|\n");
+    for q in queries_or {
         let inf = read_mean_ns(group, &format!("{q}_infino_top10"));
         let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
         body.push_str(&format!("| {q:14} | {inf_s:10} |\n"));
     }
 
-    body.push('\n');
-    body.push_str("**Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):\n\n");
+    body.push_str("\n**AND queries:**\n\n");
+    body.push_str("| Query          | infino     |\n");
+    body.push_str("|----------------|------------|\n");
+    for q in queries_and {
+        let inf = read_mean_ns(group, &format!("{q}_infino_top10"));
+        let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
+        body.push_str(&format!("| {q:14} | {inf_s:10} |\n"));
+    }
+
+    body.push_str("\n**Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):\n\n");
     body.push_str("| Shape         | WAND+BMW   | MaxScore+BMM |\n");
     body.push_str("|---------------|------------|--------------|\n");
     for shape in ["wide_3", "similar_3", "similar_5"] {
