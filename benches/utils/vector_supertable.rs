@@ -20,6 +20,8 @@ use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use crate::corpus::{self, Calibrated, DIM};
+use crate::{markdown, rss};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, Throughput, criterion_group};
@@ -28,8 +30,6 @@ use infino::superfile::vector::distance::Metric;
 use infino::supertable::query::SuperfileHit;
 use infino::supertable::query::vector::VectorSearchOptions;
 use infino::supertable::{Supertable, SupertableOptions};
-use crate::corpus::{self, Calibrated, DIM};
-use crate::{markdown, rss};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -414,14 +414,17 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "### Supertable vector — ingest ({N_DOCS} docs × dim={DIM}, sharded into {N_SEGMENTS} superfiles)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput | Peak RSS |\n");
-    body.push_str("|--------|------|------------|----------|\n");
+    body.push_str("| Engine | Time | Throughput | Peak RSS | Peak RSS Δ |\n");
+    body.push_str("|--------|------|------------|----------|------------|\n");
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-    body.push_str(&format!("| supertable | {time} | {thrpt} | {rss_cell} |\n"));
+    let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
+    body.push_str(&format!(
+        "| supertable | {time} | {thrpt} | {rss_cell} | {rss_delta} |\n"
+    ));
 
     markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/supertable/ingest".into(),
@@ -440,27 +443,35 @@ fn emit_search_markdown() {
         "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS |\n",
+        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|---------------|--------------------------------|----------------|----------|\n",
+        "|---------------|--------------------------------|----------------|----------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
-        let (cell, ns, rss_cell) = match cal.supertable[i] {
+        let (cell, ns, rss_cell, rss_delta) = match cal.supertable[i] {
             Some(c) => {
                 let bid = format!("supertable_{label}");
                 let ns = read_mean_ns(group, &bid);
                 let peak = rss::read_peak_rss_bytes(group, &bid);
                 let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-                (format!("(p={}, r={})", c.probe, c.refine), ns, rss_cell)
+                let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+                (
+                    format!("(p={}, r={})", c.probe, c.refine),
+                    ns,
+                    rss_cell,
+                    rss_delta,
+                )
             }
-            None => ("—".into(), None, "—".into()),
+            None => ("—".into(), None, "—".into(), "—".into()),
         };
         let t = ns.map(fmt_time).unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {row_target} | {cell} | {t} | {rss_cell} |\n"));
+        body.push_str(&format!(
+            "| {row_target} | {cell} | {t} | {rss_cell} | {rss_delta} |\n"
+        ));
     }
 
     markdown::emit(&MarkdownSection {
