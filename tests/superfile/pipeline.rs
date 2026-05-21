@@ -10,9 +10,9 @@ use infino::superfile::builder::{
     BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
 };
 use infino::superfile::fts::reader::BoolMode;
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use infino::superfile::vector::distance::{Metric, normalize};
 use infino::superfile::{SuperfileReader, VectorSearchOptions};
+use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 

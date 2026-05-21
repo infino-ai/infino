@@ -150,16 +150,16 @@ pub fn assign_partition(
             }
             // Multi-bucket: writer must have stamped
             // partition_hint at pre-shard time.
-            let bucket = seg.partition_hint.ok_or_else(|| {
-                CommitError::SuperfileSpansPartition {
-                    detail: format!(
-                        "Hash{{n_buckets:{n_buckets}}} strategy requires pre-sharded \
+            let bucket =
+                seg.partition_hint
+                    .ok_or_else(|| CommitError::SuperfileSpansPartition {
+                        detail: format!(
+                            "Hash{{n_buckets:{n_buckets}}} strategy requires pre-sharded \
                          superfiles; SuperfileEntry.partition_hint must be Some(bucket) \
                          (segment {})",
-                        seg.uri.0
-                    ),
-                }
-            })?;
+                            seg.uri.0
+                        ),
+                    })?;
             if bucket >= *n_buckets {
                 return Err(CommitError::SuperfileSpansPartition {
                     detail: format!(
@@ -197,10 +197,7 @@ pub fn assign_partition(
 /// `granularity_secs` are responsible for matching it to
 /// the column's actual unit (seconds for `Int64`,
 /// microseconds for `TimestampMicrosecond`, etc.).
-fn scalar_i64_minmax(
-    seg: &SuperfileEntry,
-    column: &str,
-) -> Result<(i64, i64), CommitError> {
+fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), CommitError> {
     let (mn_arr, mx_arr) =
         seg.scalar_stats
             .cols

@@ -17,25 +17,21 @@
 
 use std::sync::Arc;
 
-
 use infino::superfile::builder::FtsConfig;
 use infino::superfile::fts::tokenize::Tokenizer;
-use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::{OpenError, Supertable, SupertableOptions};
+use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
 use tempfile::TempDir;
-
-
-
 
 #[tokio::test(flavor = "multi_thread")]
 async fn open_sees_writes_made_by_a_different_handle() {
     // Producer: create + commit + drop.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
-    let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let producer =
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
     let mut w = producer.writer().expect("writer");
     w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
         .expect("append");
@@ -44,9 +40,10 @@ async fn open_sees_writes_made_by_a_different_handle() {
     drop(producer); // simulate "process exit"
 
     // Consumer: open against the same storage.
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     assert_eq!(consumer.manifest_id(), 1);
     assert_eq!(consumer.reader().n_superfiles(), 1);
     // Note: full query parity post-open requires the deferred
@@ -65,9 +62,8 @@ async fn open_on_fresh_tempdir_returns_pointer_unreadable() {
     // open() must surface a typed error the caller can
     // pattern-match on for fallback to Supertable::create.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
         .await
         .expect_err("must reject fresh dir");
@@ -89,21 +85,22 @@ async fn open_without_storage_rejects() {
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_picks_up_new_commits() {
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     // Producer commits v1.
-    let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let producer =
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
     let mut w = producer.writer().expect("w1");
     w.append(&build_title_batch(&["initial"])).expect("append1");
     w.commit().expect("commit1");
     drop(w);
 
     // Consumer opens at v1.
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     assert_eq!(consumer.manifest_id(), 1);
     let pre_refresh_reader = consumer.reader(); // pinned at v1
 
@@ -137,19 +134,20 @@ async fn refresh_picks_up_new_commits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_no_op_when_pointer_unchanged() {
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-    let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let producer =
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
     let mut w = producer.writer().expect("w");
     w.append(&build_title_batch(&["only"])).expect("append");
     w.commit().expect("commit");
     drop(w);
 
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
 
     // No producer commits between open and refresh.
     let advanced = consumer.refresh().await.expect("refresh");
@@ -163,9 +161,8 @@ async fn refresh_no_op_returns_false_when_no_pointer_yet() {
     // refresh against a storage that has no pointer yet.
     // Should be a no-op (false), not an error.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(default_supertable_options().with_storage(storage));
     let advanced = st.refresh().await.expect("refresh");
     assert!(!advanced);
@@ -179,13 +176,13 @@ async fn open_rejects_mismatched_options_via_options_hash() {
     // name) must surface a typed `OptionsHashMismatch`
     // before any decode work happens.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     // Producer: standard schema.
     {
-        let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha"])).expect("append");
         w.commit().expect("commit");
@@ -218,9 +215,9 @@ async fn open_rejects_mismatched_options_via_options_hash() {
     .with_writer_pool(pool)
     .with_storage(Arc::clone(&storage));
 
-    let err = Supertable::open(mismatched_opts).await.expect_err(
-        "open must surface OptionsHashMismatch for a reordered schema",
-    );
+    let err = Supertable::open(mismatched_opts)
+        .await
+        .expect_err("open must surface OptionsHashMismatch for a reordered schema");
     assert!(
         matches!(err, OpenError::OptionsHashMismatch { .. }),
         "expected OptionsHashMismatch; got {err:?}"
@@ -232,17 +229,18 @@ async fn open_with_matching_options_succeeds_under_options_hash_validation() {
     // D15 happy path: producer + consumer with identical
     // options round-trip cleanly.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     {
-        let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha"])).expect("append");
         w.commit().expect("commit");
     }
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open must succeed when options match");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open must succeed when options match");
     assert_eq!(consumer.manifest_id(), 1);
 }

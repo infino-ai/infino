@@ -263,7 +263,10 @@ impl FtsBuilder {
         let n_columns = self.columns.len() as u32;
         let n_docs = self.n_docs;
         let n_terms_total_usize: usize = self.postings.iter().map(|m| m.len()).sum();
-        debug_assert!(n_terms_total_usize <= u32::MAX as usize, "term count overflows u32");
+        debug_assert!(
+            n_terms_total_usize <= u32::MAX as usize,
+            "term count overflows u32"
+        );
         let n_terms_total = n_terms_total_usize as u32;
 
         // 1. Canonical FST order is lex-sorted full keys
@@ -315,7 +318,9 @@ impl FtsBuilder {
 
             // Drain this column's terms and sort lex by term bytes.
             let mut term_entries: Vec<(Box<str>, PostingAcc)> =
-                std::mem::take(&mut postings_by_col[col_idx]).into_iter().collect();
+                std::mem::take(&mut postings_by_col[col_idx])
+                    .into_iter()
+                    .collect();
             term_entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
             for (term, acc) in &term_entries {
@@ -374,10 +379,8 @@ impl FtsBuilder {
                 // Skip-table size = num_blocks × SKIP_ENTRY_SIZE.
                 let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
                 // Total per-term posting bytes = metadata + skip table + blocks.
-                let blocks_total_size: usize =
-                    encoded_blocks.iter().map(|b| b.bytes.len()).sum();
-                let postings_length =
-                    (TERM_META_SIZE + skip_table_size + blocks_total_size) as u64;
+                let blocks_total_size: usize = encoded_blocks.iter().map(|b| b.bytes.len()).sum();
+                let postings_length = (TERM_META_SIZE + skip_table_size + blocks_total_size) as u64;
 
                 // Metadata header (20 bytes). df, postings_length,
                 // and num_blocks fit u32 even at the 16 GB segment
@@ -419,8 +422,7 @@ impl FtsBuilder {
                         min_dl_per_block[i],
                         avgdl,
                     );
-                    let max_bm25_x1000 =
-                        (max_bm25 * 1000.0).max(0.0).min(u32::MAX as f32) as u32;
+                    let max_bm25_x1000 = (max_bm25 * 1000.0).max(0.0).min(u32::MAX as f32) as u32;
                     postings_buf.extend_from_slice(&last_doc_id.to_le_bytes()); // 4
                     postings_buf.extend_from_slice(&block_offset.to_le_bytes()); // 4
                     postings_buf.extend_from_slice(&max_bm25_x1000.to_le_bytes()); // 4
@@ -615,7 +617,8 @@ mod tests {
         // Doc 0: "rust" + "tokio" in title, "rust" + "async" in body.
         // Doc 1: only in body — "rust".
         // Doc 2: only in title — "rust".
-        b.add_doc(title_id, 0, "rust tokio").expect("add title doc 0");
+        b.add_doc(title_id, 0, "rust tokio")
+            .expect("add title doc 0");
         b.add_doc(body_id, 0, "rust async").expect("add body doc 0");
         b.add_doc(body_id, 1, "rust").expect("add body doc 1");
         b.add_doc(title_id, 1, "rust").expect("add title doc 1");
@@ -650,7 +653,9 @@ mod tests {
         let r = FtsReader::open(blob, json).expect("open");
 
         // "rust" in title returns title's docs (0, 1) and no others.
-        let hits_t = r.search("title", &["rust"], 10, BoolMode::Or).expect("title search");
+        let hits_t = r
+            .search("title", &["rust"], 10, BoolMode::Or)
+            .expect("title search");
         let ids_t: Vec<u32> = hits_t.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids_t.len(), 2, "title 'rust' hit count");
         assert!(ids_t.contains(&0));
@@ -659,7 +664,9 @@ mod tests {
         // "rust" in body also returns its own docs (0, 1). Same ids
         // by coincidence; what matters is the search is scoped to
         // body's posting list, not title's.
-        let hits_b = r.search("body", &["rust"], 10, BoolMode::Or).expect("body search");
+        let hits_b = r
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .expect("body search");
         let ids_b: Vec<u32> = hits_b.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids_b.len(), 2, "body 'rust' hit count");
         assert!(ids_b.contains(&0));
@@ -743,8 +750,14 @@ mod tests {
         let blob = b.finish();
         assert_eq!(&blob[0..8], format::fts::MAGIC);
         // n_docs == 0 (u32 at 16..20), n_terms_total == 0 (u32 at 20..24).
-        assert_eq!(u32::from_le_bytes([blob[16], blob[17], blob[18], blob[19]]), 0);
-        assert_eq!(u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]), 0);
+        assert_eq!(
+            u32::from_le_bytes([blob[16], blob[17], blob[18], blob[19]]),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]),
+            0
+        );
     }
 
     #[test]

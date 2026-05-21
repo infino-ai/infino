@@ -136,9 +136,9 @@ impl Supertable {
     ///   failures.
     pub async fn open(options: SupertableOptions) -> Result<Self, OpenError> {
         use crate::supertable::ManifestPartLoader;
-        use crate::supertable::manifest::{Manifest, SuperfileList};
         use crate::supertable::manifest::commit::read_pointer;
         use crate::supertable::manifest::list as list_mod;
+        use crate::supertable::manifest::{Manifest, SuperfileList};
 
         let storage = options
             .storage
@@ -179,17 +179,14 @@ impl Supertable {
         // manifest's stamped digest. The all-zero stored
         // hash bypasses validation (legacy + synthetic
         // fixtures).
-        let expected_hash =
-            crate::supertable::manifest::options_hash::compute_options_hash(
-                &options,
-                &list.partition_strategy,
-            );
-        if let Err(mismatch) =
-            crate::supertable::manifest::options_hash::verify_options_hash(
-                expected_hash,
-                list.options_hash,
-            )
-        {
+        let expected_hash = crate::supertable::manifest::options_hash::compute_options_hash(
+            &options,
+            &list.partition_strategy,
+        );
+        if let Err(mismatch) = crate::supertable::manifest::options_hash::verify_options_hash(
+            expected_hash,
+            list.options_hash,
+        ) {
             return Err(OpenError::OptionsHashMismatch {
                 expected: mismatch.expected,
                 actual: mismatch.actual,
@@ -298,9 +295,9 @@ impl Supertable {
     /// no-op refresh path).
     pub async fn refresh(&self) -> Result<bool, OpenError> {
         use crate::supertable::ManifestPartLoader;
-        use crate::supertable::manifest::{Manifest, SuperfileList};
         use crate::supertable::manifest::commit::read_pointer;
         use crate::supertable::manifest::list as list_mod;
+        use crate::supertable::manifest::{Manifest, SuperfileList};
 
         let storage = self
             .inner
@@ -392,9 +389,7 @@ impl Supertable {
         let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
         if eager {
             for entry in &new_list.parts {
-                let cell = new_parts
-                    .get(&entry.part_id)
-                    .expect("part inserted above");
+                let cell = new_parts.get(&entry.part_id).expect("part inserted above");
                 let part = cell
                     .value()
                     .get()
@@ -506,9 +501,9 @@ fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
         None => return,
     };
     let weak = Arc::downgrade(inner);
-    let pinned_fn: Arc<dyn Fn() -> std::collections::HashSet<crate::supertable::SuperfileUri>
-        + Send
-        + Sync> = Arc::new(move || {
+    let pinned_fn: Arc<
+        dyn Fn() -> std::collections::HashSet<crate::supertable::SuperfileUri> + Send + Sync,
+    > = Arc::new(move || {
         let strong = match weak.upgrade() {
             Some(s) => s,
             // Supertable already dropped; nothing to pin.
@@ -590,7 +585,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::superfile::builder::FtsConfig;
-    
+
     use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
 
     fn schema() -> Arc<Schema> {

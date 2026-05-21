@@ -30,8 +30,8 @@ use infino::superfile::builder::FtsConfig;
 use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::bench_corpus;
 use infino::test_helpers::default_tokenizer;
+use crate::{corpus, markdown, rss};
 use rayon::ThreadPool;
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ static DOCS: OnceLock<Vec<String>> = OnceLock::new();
 static INFINO: OnceLock<Supertable> = OnceLock::new();
 
 fn docs() -> &'static [String] {
-    DOCS.get_or_init(|| bench_corpus::generate_text_corpus(N_DOCS, 1))
+    DOCS.get_or_init(|| corpus::generate_text_corpus(N_DOCS, 1))
         .as_slice()
 }
 
@@ -120,8 +120,7 @@ fn build_supertable_infino(docs: &[String], reader_pool: Arc<ThreadPool>) -> Sup
     let chunk_size = docs.len().div_ceil(SEGMENTS);
     for chunk in docs.chunks(chunk_size) {
         let titles = LargeStringArray::from(chunk.iter().map(String::as_str).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)])
-            .expect("batch");
+        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
         w.append(&batch).expect("append");
     }
     w.commit().expect("commit");
@@ -170,9 +169,7 @@ fn assert_infino_self_consistent(st: &Supertable) {
 // ─── Bench: ingest (group: supertable_fts_build) ──────────────────────
 
 fn bench_ingest(c: &mut Criterion) {
-    eprintln!(
-        "[supertable_fts_build] correctness: building infino ({N_DOCS} docs)..."
-    );
+    eprintln!("[supertable_fts_build] correctness: building infino ({N_DOCS} docs)...");
     let infino = build_supertable_infino(docs(), parallel_pool());
     assert_infino_self_consistent(&infino);
     eprintln!("[supertable_fts_build] correctness OK: infino self-consistent");
@@ -182,11 +179,22 @@ fn bench_ingest(c: &mut Criterion) {
     g.sample_size(10);
     g.throughput(Throughput::Elements(N_DOCS as u64));
 
+    // Per-group peak VmRSS — covers the auto-writer-pool build of the
+    // 10M-doc supertable end-to-end (append buffers + tokenizer
+    // workspaces + per-shard FtsBuilder allocations during commit).
+    let rss_sample = rss::PeakSampler::start_default();
+
     g.bench_function("infino_auto_writer_pool", |b| {
         b.iter_with_large_drop(|| build_supertable_infino(black_box(docs()), parallel_pool()));
     });
 
     g.finish();
+    let peak = rss_sample.stop();
+    let _ = rss::write_peak_rss(
+        group_name::SUPERTABLE_FTS_BUILD,
+        "infino_auto_writer_pool",
+        peak,
+    );
 
     emit_ingest_markdown();
 }
@@ -208,6 +216,11 @@ fn bench_search(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("supertable_fts_search");
     g.sample_size(10);
+
+    // Group-level peak VmRSS for FTS-supertable search workload —
+    // primarily the resident size of per-superfile FTS index segments
+    // pinned through the read.
+    let rss_sample = rss::PeakSampler::start_default();
 
     let queries: &[(&str, &str)] = &[
         ("single_rare", "term09999"),
@@ -243,30 +256,50 @@ fn bench_search(c: &mut Criterion) {
     });
 
     g.finish();
+    let peak = rss_sample.stop();
+    let search_ids = [
+        "single_rare_supertable_top10",
+        "single_common_supertable_top10",
+        "two_term_or_supertable_top10",
+        "three_wide_supertable_top10",
+        "three_similar_supertable_top10",
+        "five_term_supertable_top10",
+        "prefix_supertable_top10",
+    ];
+    for bid in search_ids {
+        let _ = rss::write_peak_rss(group_name::SUPERTABLE_FTS_SEARCH, bid, peak);
+    }
 
     emit_search_markdown();
 }
 
 // ─── Markdown summary emitters ────────────────────────────────────────
 
-fn emit_ingest_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+mod group_name {
+    pub const SUPERTABLE_FTS_BUILD: &str = "supertable_fts_build";
+    pub const SUPERTABLE_FTS_SEARCH: &str = "supertable_fts_search";
+}
 
-    let group = "supertable_fts_build";
+fn emit_ingest_markdown() {
+    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+
+    let group = group_name::SUPERTABLE_FTS_BUILD;
     let ns = read_mean_ns(group, "infino_auto_writer_pool");
+    let peak_rss = rss::read_peak_rss_bytes(group, "infino_auto_writer_pool");
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Supertable FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
-    body.push_str("| Engine                  | Time       | Throughput |\n");
-    body.push_str("|-------------------------|------------|------------|\n");
+    body.push_str("| Engine                  | Time       | Throughput | Peak RSS  |\n");
+    body.push_str("|-------------------------|------------|------------|-----------|\n");
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
+    let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
     body.push_str(&format!(
-        "| infino_auto_writer_pool | {time:10} | {thrpt:10} |\n"
+        "| infino_auto_writer_pool | {time:10} | {thrpt:10} | {rss_cell:9} |\n"
     ));
     body.push_str(
         "\n*Output cardinality: infino emits `min(writer_pool.threads, total_rows)` superfiles \
@@ -274,20 +307,20 @@ fn emit_ingest_markdown() {
          specific shard count.*\n",
     );
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/fts/supertable/ingest".into(),
         body,
     });
 }
 
 fn emit_search_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
-    let group = "supertable_fts_search";
+    let group = group_name::SUPERTABLE_FTS_SEARCH;
     let mut body = String::new();
     body.push_str(&format!("### Supertable FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str("| Query          | infino     |\n");
-    body.push_str("|----------------|------------|\n");
+    body.push_str("| Query          | infino     | Peak RSS  |\n");
+    body.push_str("|----------------|------------|-----------|\n");
     let queries = [
         "single_rare",
         "single_common",
@@ -298,12 +331,16 @@ fn emit_search_markdown() {
         "prefix",
     ];
     for q in queries {
-        let inf = read_mean_ns(group, &format!("{q}_supertable_top10"));
+        let bid = format!("{q}_supertable_top10");
+        let inf = read_mean_ns(group, &bid);
         let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {q:14} | {inf_s:10} |\n"));
+        let rss_cell = rss::read_peak_rss_bytes(group, &bid)
+            .map(rss::fmt_bytes)
+            .unwrap_or_else(|| "—".into());
+        body.push_str(&format!("| {q:14} | {inf_s:10} | {rss_cell:9} |\n"));
     }
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/fts/supertable/search".into(),
         body,
     });

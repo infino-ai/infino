@@ -20,25 +20,29 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use memmap2::Mmap;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
+use tempfile::TempDir;
 
-use crate::superfile::SuperfileReader;
-use crate::superfile::builder::{
+use infino::superfile::SuperfileReader;
+use infino::superfile::builder::{
     BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
 };
-use crate::superfile::fts::builder::FtsBuilder;
-use crate::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use crate::superfile::vector::distance::{Metric, normalize};
-use crate::superfile::vector::reader::VectorReader;
-use crate::test_helpers::default_tokenizer;
+use infino::superfile::fts::builder::FtsBuilder;
+use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
+use infino::superfile::vector::distance::{Metric, normalize};
+use infino::superfile::vector::reader::VectorReader;
+use infino::test_helpers::default_tokenizer;
 
 // ─── Scale constants ──────────────────────────────────────────────────
 
@@ -197,6 +201,86 @@ pub fn generate_vector_corpus(
         out.extend_from_slice(&v);
     }
     out
+}
+
+/// Disk-backed raw vector corpus for the large vector benches.
+///
+/// At 10M x 384, storing the corpus as a `Vec<f32>` pins about 14.6 GiB
+/// of anonymous RAM before the builder under test starts. The mmap-backed
+/// path keeps the same `&[f32]` call sites while letting the kernel reclaim
+/// corpus pages as page cache under pressure.
+///
+/// This is not an alternate Infino ingestion path. It is only the raw input
+/// fixture: benches still build Arrow arrays, call `SupertableWriter::append`,
+/// and commit through the same path production callers use. The mmap lets
+/// ingestion, query generation, and brute-force recall share one deterministic
+/// corpus without keeping the whole corpus on the heap.
+pub struct MmapCorpus {
+    _tmp: TempDir,
+    map: Mmap,
+    n_docs: usize,
+    dim: usize,
+}
+
+impl MmapCorpus {
+    pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
+        let tmp = TempDir::new().expect("create MmapCorpus tempdir");
+        let path = tmp.path().join("corpus.bin");
+        let file = File::create(&path).expect("create corpus file");
+        let mut writer = BufWriter::with_capacity(8 << 20, file);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let dist = StandardNormal;
+        let centers: Vec<Vec<f32>> = (0..n_cent)
+            .map(|_| {
+                (0..DIM)
+                    .map(|_| {
+                        let s: f64 = dist.sample(&mut rng);
+                        (s as f32) * 3.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut row = vec![0.0f32; DIM];
+        for i in 0..n_docs {
+            let center = &centers[i % n_cent];
+            for (j, slot) in row.iter_mut().enumerate() {
+                let s: f64 = dist.sample(&mut rng);
+                *slot = center[j] + (s as f32) * 0.3;
+            }
+            if normalize_each {
+                normalize(&mut row);
+            }
+            writer
+                .write_all(bytemuck::cast_slice(&row))
+                .expect("write corpus row");
+        }
+        let file = writer.into_inner().expect("flush corpus writer");
+        file.sync_all().expect("sync corpus");
+        drop(file);
+
+        let file = File::open(&path).expect("reopen corpus");
+        // SAFETY: this helper owns the temp file and never writes to it after
+        // the fsync above, so the read-only mmap cannot observe mutation.
+        let map = unsafe { Mmap::map(&file).expect("mmap corpus") };
+        Self {
+            _tmp: tmp,
+            map,
+            n_docs,
+            dim: DIM,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        bytemuck::cast_slice(&self.map)
+    }
+
+    pub fn n_docs(&self) -> usize {
+        self.n_docs
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 }
 
 // ─── Query batteries ──────────────────────────────────────────────────

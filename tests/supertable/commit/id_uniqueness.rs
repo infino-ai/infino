@@ -35,10 +35,10 @@ use std::thread;
 
 use arrow_array::{LargeStringArray, RecordBatch};
 
-use infino::test_helpers::{default_supertable_options, schema_id_title};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
+use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::utils::idgen::IdGenerator;
+use infino::test_helpers::{default_supertable_options, schema_id_title};
 use tempfile::TempDir;
 
 const STRESS_N_WORKERS: usize = 16;
@@ -152,9 +152,10 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     // pulling segment bytes back from storage just to
     // verify ids — the manifest already carries everything
     // we need.
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open");
     let reader = consumer.reader();
     let segs = &reader.manifest().superfile_list.superfiles;
     assert_eq!(

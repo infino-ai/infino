@@ -293,7 +293,7 @@ struct ManifestListEntryDto {
     n_superfiles: u64,
     size_bytes_compressed: u64,
     size_bytes_uncompressed: u64,
-    content_hash: String, // "blake3:<hex>"
+    content_hash: String,  // "blake3:<hex>"
     partition_key: String, // base64
     // i128 stringified as decimal — JSON numbers are bounded
     // to f64 precision (~53 bits) so we can't round-trip a
@@ -430,8 +430,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> ManifestListEntryDto {
 
 fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListParseError> {
     let part_id = PartId(
-        uuid::Uuid::parse_str(&d.part_id)
-            .map_err(|e| ListParseError::BadPartId(e.to_string()))?,
+        uuid::Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?,
     );
     let content_hash = decode_hash(&d.content_hash)?;
     let partition_key = decode_b64(&d.partition_key, "partition_key")?;
@@ -482,12 +481,14 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
         content_hash,
         partition_key,
         id_range: {
-            let lo = d.id_range.0.parse::<i128>().map_err(|_| {
-                ListParseError::BadFieldValue("id_range[0]", d.id_range.0.clone())
-            })?;
-            let hi = d.id_range.1.parse::<i128>().map_err(|_| {
-                ListParseError::BadFieldValue("id_range[1]", d.id_range.1.clone())
-            })?;
+            let lo =
+                d.id_range.0.parse::<i128>().map_err(|_| {
+                    ListParseError::BadFieldValue("id_range[0]", d.id_range.0.clone())
+                })?;
+            let hi =
+                d.id_range.1.parse::<i128>().map_err(|_| {
+                    ListParseError::BadFieldValue("id_range[1]", d.id_range.1.clone())
+                })?;
             (lo, hi)
         },
         scalar_stats_agg,
@@ -652,8 +653,8 @@ mod tests {
     //! major/minor compat; part reuse across versions
     //! decodes to bit-equal entries; top-level JSON keys are
     //! jq-friendly.
-    use super::*;
     use super::super::part::{ContentHash, PartId};
+    use super::*;
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
@@ -968,7 +969,10 @@ mod tests {
             assert!(obj.contains_key(key), "missing top-level key {key}");
         }
         assert!(
-            obj["options_hash"].as_str().unwrap_or("").starts_with("blake3:"),
+            obj["options_hash"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("blake3:"),
             "options_hash should be 'blake3:<hex>' for jq-debuggability"
         );
     }

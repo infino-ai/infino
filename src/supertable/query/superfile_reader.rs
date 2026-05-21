@@ -32,9 +32,9 @@
 use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
-use crate::supertable::reader_cache::DiskCacheStore;
 use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::reader_cache::{SuperfileReaderCache, ReaderCacheError};
+use crate::supertable::reader_cache::DiskCacheStore;
+use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 
 /// Look up `uri`'s `SuperfileReader`, preferring the in-
 /// memory tier and falling back to the disk cache when
@@ -66,9 +66,7 @@ pub fn superfile_reader(
             // Ambient tokio runtime — block_in_place + block_on
             // is the same pattern the writer's commit path uses
             // for its sync→async bridge.
-            tokio::task::block_in_place(|| {
-                handle.block_on(cache.reader(&uri_copy))
-            })
+            tokio::task::block_in_place(|| handle.block_on(cache.reader(&uri_copy)))
         }
         Err(_) => {
             // No ambient runtime. Build a tiny one just for
@@ -84,9 +82,9 @@ pub fn superfile_reader(
                 Ok(rt) => rt,
                 Err(e) => {
                     return Err(ReaderCacheError::OpenFailed {
-                        source: crate::superfile::ReadError::Io(std::io::Error::other(
-                            format!("tokio runtime build for disk cache fetch: {e}"),
-                        )),
+                        source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
+                            "tokio runtime build for disk cache fetch: {e}"
+                        ))),
                     });
                 }
             };

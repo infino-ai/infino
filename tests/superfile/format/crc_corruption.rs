@@ -186,12 +186,8 @@ fn corrupt_parquet_footer_rejected() {
     // field type or id and Parquet's decoder rejects the result.
     let bytes = build_corruptable_superfile();
     let n = bytes.len();
-    let footer_len = u32::from_le_bytes([
-        bytes[n - 8],
-        bytes[n - 7],
-        bytes[n - 6],
-        bytes[n - 5],
-    ]) as usize;
+    let footer_len =
+        u32::from_le_bytes([bytes[n - 8], bytes[n - 7], bytes[n - 6], bytes[n - 5]]) as usize;
     let target = n - 8 - footer_len;
     assert_corruption_rejected(bytes, target, "parquet/footer thrift");
 }

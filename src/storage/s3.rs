@@ -38,8 +38,7 @@ use bytes::Bytes;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
-    UpdateVersion,
+    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider};
@@ -167,7 +166,11 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
 impl StorageProvider for S3StorageProvider {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
         let path = Self::path(uri)?;
-        let meta = self.store.head(&path).await.map_err(|e| translate(uri, e))?;
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|e| translate(uri, e))?;
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,

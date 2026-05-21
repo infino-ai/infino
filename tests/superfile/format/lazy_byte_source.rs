@@ -29,7 +29,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
 use infino::superfile::fts::reader::BoolMode;
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use infino::superfile::{
     BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
 };
@@ -37,6 +36,7 @@ use infino::supertable::StorageRangeSource;
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
+use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use tempfile::TempDir;
 
 // ============================================================
@@ -65,8 +65,7 @@ fn build_test_bytes() -> Bytes {
         "echo special foxtrot",
         "gamma hotel",
     ]);
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
-        .expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
     b.add_batch(&batch, &[]).expect("add_batch");
     Bytes::from(b.finish().expect("finish"))
 }
@@ -81,7 +80,9 @@ async fn open_lazy_via_bytes_source_matches_open() {
     let eager = SuperfileReader::open(bytes.clone()).expect("eager open");
 
     let source = BytesLazyByteSource::new(bytes);
-    let lazy = SuperfileReader::open_lazy(&source).await.expect("lazy open");
+    let lazy = SuperfileReader::open_lazy(&source)
+        .await
+        .expect("lazy open");
 
     assert_eq!(lazy.schema(), eager.schema());
     assert_eq!(lazy.id_column(), eager.id_column());
@@ -153,17 +154,13 @@ impl StorageProvider for CountingProxy {
 #[tokio::test]
 async fn storage_range_source_drives_open_lazy_against_localfs() {
     let dir = TempDir::new().expect("tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
 
     // Seed the segment at a stable URI.
     let uri = "data/seg-test.sf";
-    local
-        .put_atomic(uri, bytes.clone())
-        .await
-        .expect("seed");
+    local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     // Counting proxy so we can assert the trait is actually
     // driving I/O (not a hidden path).
@@ -178,7 +175,9 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
         "StorageRangeSource::new must HEAD the object once"
     );
 
-    let reader = SuperfileReader::open_lazy(&source).await.expect("open_lazy");
+    let reader = SuperfileReader::open_lazy(&source)
+        .await
+        .expect("open_lazy");
     let range_after_open = proxy.get_range_calls.load(Ordering::Acquire);
     assert!(
         range_after_open >= 1,
@@ -196,15 +195,11 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
 #[tokio::test]
 async fn open_lazy_via_storage_matches_open_via_bytes() {
     let dir = TempDir::new().expect("tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = "data/seg-equiv.sf";
-    local
-        .put_atomic(uri, bytes.clone())
-        .await
-        .expect("seed");
+    local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let eager = SuperfileReader::open(bytes).expect("eager");
     let source = StorageRangeSource::new(Arc::clone(&local), uri)
@@ -235,24 +230,17 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
 #[tokio::test]
 async fn storage_range_source_out_of_bounds_surfaces_typed_error() {
     let dir = TempDir::new().expect("tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
     let uri = "data/seg-oob.sf";
-    local
-        .put_atomic(uri, bytes.clone())
-        .await
-        .expect("seed");
+    local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let source = StorageRangeSource::new(Arc::clone(&local), uri)
         .await
         .expect("source");
     let size = source.size();
-    let err = source
-        .range(size, 1024)
-        .await
-        .expect_err("must reject");
+    let err = source.range(size, 1024).await.expect_err("must reject");
     assert!(
         matches!(err, LazyByteSourceError::OutOfBounds { .. }),
         "expected OutOfBounds, got {err:?}"

@@ -40,11 +40,7 @@ use crate::supertable::manifest::part::PartId;
 /// Parts without an `fts_summary_agg` entry for this column
 /// (no info) survive — same "always-keep" treatment the
 /// list-level pruner gives to missing aggregates.
-pub fn prune_parts_for_fts_prefix(
-    list: &ManifestList,
-    column: &str,
-    prefix: &[u8],
-) -> Vec<PartId> {
+pub fn prune_parts_for_fts_prefix(list: &ManifestList, column: &str, prefix: &[u8]) -> Vec<PartId> {
     let upper = prefix_upper_bound(prefix);
     list.parts
         .iter()
@@ -155,8 +151,7 @@ fn part_matches_terms(
     if agg.term_bloom_union.is_empty() || agg.term_bloom_n_blocks == 0 {
         return true; // empty union → always-keep
     }
-    let Some(bloom) =
-        crate::supertable::manifest::bloom::Bloom::from_bytes(&agg.term_bloom_union)
+    let Some(bloom) = crate::supertable::manifest::bloom::Bloom::from_bytes(&agg.term_bloom_union)
     else {
         // Corrupt / unexpected shape → fall back to
         // always-keep (correctness over selectivity).
@@ -347,10 +342,7 @@ mod tests {
         })
     }
 
-    fn entry_from_segments(
-        superfiles: &[Arc<SuperfileEntry>],
-        seed: u8,
-    ) -> ManifestListEntry {
+    fn entry_from_segments(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
         let aggs = aggregates::compute(superfiles);
         ManifestListEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
@@ -602,18 +594,11 @@ mod tests {
 
     #[test]
     fn prune_parts_for_fts_prefix_filters_disjoint_term_ranges() {
-        let part0 = entry_from_segments(
-            &[seg(0, 10, &["alpha", "bravo", "charlie"], None, 0.0)],
-            0,
-        );
-        let part1 = entry_from_segments(
-            &[seg(11, 20, &["delta", "echo", "foxtrot"], None, 0.0)],
-            1,
-        );
-        let part2 = entry_from_segments(
-            &[seg(21, 30, &["hotel", "kilo", "lima"], None, 0.0)],
-            2,
-        );
+        let part0 =
+            entry_from_segments(&[seg(0, 10, &["alpha", "bravo", "charlie"], None, 0.0)], 0);
+        let part1 =
+            entry_from_segments(&[seg(11, 20, &["delta", "echo", "foxtrot"], None, 0.0)], 1);
+        let part2 = entry_from_segments(&[seg(21, 30, &["hotel", "kilo", "lima"], None, 0.0)], 2);
         let list = list_with(vec![part0, part1.clone(), part2]);
 
         let survivors = prune_parts_for_fts_prefix(&list, "title", b"echo");
@@ -633,14 +618,8 @@ mod tests {
 
     #[test]
     fn prune_parts_for_vector_filters_far_parts() {
-        let part_a = entry_from_segments(
-            &[seg(0, 10, &[], Some(vec![10.0, 0.0, 0.0]), 0.5)],
-            0,
-        );
-        let part_b = entry_from_segments(
-            &[seg(11, 20, &[], Some(vec![-10.0, 0.0, 0.0]), 0.5)],
-            1,
-        );
+        let part_a = entry_from_segments(&[seg(0, 10, &[], Some(vec![10.0, 0.0, 0.0]), 0.5)], 0);
+        let part_b = entry_from_segments(&[seg(11, 20, &[], Some(vec![-10.0, 0.0, 0.0]), 0.5)], 1);
         let list = list_with(vec![part_a.clone(), part_b]);
         let survivors = prune_parts_for_vector(&list, "emb", &[10.0, 0.0, 0.0], 1.0);
         assert_eq!(survivors.len(), 1);
@@ -649,17 +628,15 @@ mod tests {
 
     #[test]
     fn prune_parts_for_vector_keeps_overlapping_envelope() {
-        let part_a = entry_from_segments(
-            &[seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 1.0)],
-            0,
-        );
-        let part_b = entry_from_segments(
-            &[seg(11, 20, &[], Some(vec![-1.0, 0.0, 0.0]), 1.0)],
-            1,
-        );
+        let part_a = entry_from_segments(&[seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 1.0)], 0);
+        let part_b = entry_from_segments(&[seg(11, 20, &[], Some(vec![-1.0, 0.0, 0.0]), 1.0)], 1);
         let list = list_with(vec![part_a, part_b]);
         let survivors = prune_parts_for_vector(&list, "emb", &[0.0, 0.0, 0.0], 1.0);
-        assert_eq!(survivors.len(), 2, "both envelopes contain origin within cutoff");
+        assert_eq!(
+            survivors.len(),
+            2,
+            "both envelopes contain origin within cutoff"
+        );
     }
 
     #[test]
@@ -681,7 +658,10 @@ mod tests {
         let list = list_with(vec![part0.clone(), part1.clone()]);
 
         let survivors = prune_parts_for_fts_prefix(&list, "title", b"ban");
-        assert!(survivors.contains(&part0.part_id), "must keep matching part");
+        assert!(
+            survivors.contains(&part0.part_id),
+            "must keep matching part"
+        );
 
         let survivors2 = prune_parts_for_fts_prefix(&list, "title", b"ec");
         assert!(survivors2.contains(&part1.part_id));

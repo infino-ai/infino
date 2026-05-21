@@ -33,9 +33,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema};
 
 use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::list::{
-    FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg,
-};
+use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
 /// Built by [`compute`] and inserted verbatim into the entry.
@@ -242,26 +240,21 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
     // n_blocks). The union bloom starts at zero-init the
     // first time we see a segment with a populated bloom for
     // that column; subsequent superfiles bit-OR into it.
-    let mut per_column: HashMap<
-        String,
-        (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, u32),
-    > = HashMap::new();
+    let mut per_column: HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, u32)> =
+        HashMap::new();
     for seg in superfiles {
         for (col, summary) in &seg.fts_summary {
             let entry = per_column.entry(col.clone()).or_default();
             // Range update (skipping superfiles with empty FST
             // ranges; they contribute neither min nor max).
-            let has_range = !(summary.term_range.0.is_empty()
-                && summary.term_range.1.is_empty());
+            let has_range = !(summary.term_range.0.is_empty() && summary.term_range.1.is_empty());
             if has_range {
                 match &entry.0 {
-                    Some(curr_min)
-                        if curr_min.as_slice() <= summary.term_range.0.as_slice() => {}
+                    Some(curr_min) if curr_min.as_slice() <= summary.term_range.0.as_slice() => {}
                     _ => entry.0 = Some(summary.term_range.0.clone()),
                 }
                 match &entry.1 {
-                    Some(curr_max)
-                        if curr_max.as_slice() >= summary.term_range.1.as_slice() => {}
+                    Some(curr_max) if curr_max.as_slice() >= summary.term_range.1.as_slice() => {}
                     _ => entry.1 = Some(summary.term_range.1.clone()),
                 }
             }
@@ -400,12 +393,7 @@ mod tests {
     use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use std::collections::HashMap;
 
-    fn seg_with_string_minmax(
-        col: &str,
-        min: &str,
-        max: &str,
-        large: bool,
-    ) -> Arc<SuperfileEntry> {
+    fn seg_with_string_minmax(col: &str, min: &str, max: &str, large: bool) -> Arc<SuperfileEntry> {
         let (mn, mx): (ArrayRef, ArrayRef) = if large {
             (
                 Arc::new(LargeStringArray::from(vec![Some(min)])),
@@ -445,7 +433,10 @@ mod tests {
         if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
             return a.value(0).to_string();
         }
-        panic!("expected Utf8 or LargeUtf8 column; got {:?}", col.data_type());
+        panic!(
+            "expected Utf8 or LargeUtf8 column; got {:?}",
+            col.data_type()
+        );
     }
 
     #[test]

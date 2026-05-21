@@ -154,8 +154,7 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
     for chunk in corpus.chunks(chunk_size) {
         let titles =
             LargeStringArray::from(chunk.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)])
-            .expect("batch");
+        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
         w.append(&batch).expect("append");
         w.commit().expect("commit");
     }
@@ -184,12 +183,7 @@ fn supertable_to_global_ids(
         .collect()
 }
 
-fn supertable_search_global(
-    st: &Supertable,
-    query: &str,
-    k: usize,
-    chunk_size: usize,
-) -> Vec<u64> {
+fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
     let r = st.reader();
     let hits = r
         .bm25_search("title", query, k, BoolMode::Or)
@@ -231,11 +225,7 @@ fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForc
 
 /// Run per-segment brute-force BM25 and merge into a global top-k
 /// in the same shape the supertable's fan-out produces.
-fn brute_force_top_k(
-    oracles: &[BruteForceBm25],
-    query: &str,
-    k: usize,
-) -> Vec<u64> {
+fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
     let tok = default_tokenizer();
     let mut all: Vec<(u64, f32)> = Vec::new();
     for o in oracles {
@@ -252,11 +242,7 @@ fn brute_force_top_k(
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
 /// OR query (used to mirror the supertable's prefix expansion).
-fn brute_force_terms_top_k(
-    oracles: &[BruteForceBm25],
-    terms: &[String],
-    k: usize,
-) -> Vec<u64> {
+fn brute_force_terms_top_k(oracles: &[BruteForceBm25], terms: &[String], k: usize) -> Vec<u64> {
     let mut all: Vec<(u64, f32)> = Vec::new();
     for o in oracles {
         all.extend(o.top_k_terms(terms, k));
@@ -356,8 +342,7 @@ fn oracle_three_wide_or_top3_matches() {
 fn oracle_three_similar_or_top3_matches() {
     // Three single-doc terms (docs 14, 15, 16).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_global(&f.infino, "redis kafka elasticsearch", 5, CHUNK_SIZE);
+    let inf_hits = supertable_search_global(&f.infino, "redis kafka elasticsearch", 5, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "redis kafka elasticsearch", 5);
     let want: HashSet<u64> = [14u64, 15, 16].into_iter().collect();
     let inf_top: HashSet<u64> = inf_hits.iter().take(3).copied().collect();
@@ -370,8 +355,7 @@ fn oracle_three_similar_or_top3_matches() {
 fn oracle_five_term_or_top5_matches() {
     // Five single-doc terms (docs 30..34).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_global(&f.infino, "tcp udp http2 http3 tls", 10, CHUNK_SIZE);
+    let inf_hits = supertable_search_global(&f.infino, "tcp udp http2 http3 tls", 10, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "tcp udp http2 http3 tls", 10);
     let want: HashSet<u64> = [30u64, 31, 32, 33, 34].into_iter().collect();
     let inf_top: HashSet<u64> = inf_hits.iter().take(5).copied().collect();
@@ -389,7 +373,9 @@ fn oracle_prefix_query_matches_explicit_term_or() {
     // by running a brute-force OR over the same explicit term list.
     let f = &*STANDARD_FIXTURE;
     let prefix = "alphafox";
-    let expanded: Vec<String> = (0..N_PREFIX_TERMS).map(|i| format!("alphafox{i:02}")).collect();
+    let expanded: Vec<String> = (0..N_PREFIX_TERMS)
+        .map(|i| format!("alphafox{i:02}"))
+        .collect();
 
     let inf_hits = supertable_prefix_global(&f.infino, prefix, 10, CHUNK_SIZE);
     let ora_hits = brute_force_terms_top_k(&f.oracles, &expanded, 10);

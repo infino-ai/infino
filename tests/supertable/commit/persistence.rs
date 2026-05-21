@@ -23,22 +23,17 @@
 
 use std::sync::Arc;
 
-
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::supertable::Supertable;
 use infino::supertable::manifest::commit::read_pointer;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::Supertable;
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
-
-
-
 
 #[test]
 fn commit_persists_pointer_list_part_and_segment() {
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
@@ -51,11 +46,15 @@ fn commit_persists_pointer_list_part_and_segment() {
         .expect("read")
         .expect("pointer present");
     assert_eq!(pointer.manifest_id, 1);
-    assert!(pointer.manifest_list_uri.starts_with("manifest-lists/list-"));
+    assert!(
+        pointer
+            .manifest_list_uri
+            .starts_with("manifest-lists/list-")
+    );
 
     // Manifest list file exists and is non-empty.
-    let list_bytes = futures::executor::block_on(storage.get(&pointer.manifest_list_uri))
-        .expect("get list");
+    let list_bytes =
+        futures::executor::block_on(storage.get(&pointer.manifest_list_uri)).expect("get list");
     assert!(!list_bytes.is_empty());
 
     // At least one manifest part exists in manifests/.
@@ -91,13 +90,13 @@ fn commit_persists_pointer_list_part_and_segment() {
 #[test]
 fn two_successive_commits_both_publish() {
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
 
     let mut w = st.writer().expect("w1");
-    w.append(&build_title_batch(&["foo", "bar"])).expect("append1");
+    w.append(&build_title_batch(&["foo", "bar"]))
+        .expect("append1");
     w.commit().expect("commit1");
     drop(w);
 
@@ -156,11 +155,11 @@ async fn multipart_threshold_forces_segment_through_put_multipart() {
     // `Supertable::open` to assert the segment bytes were
     // correctly assembled by the multipart path.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
-    let opts =
-        default_supertable_options().with_storage(Arc::clone(&storage)).with_put_multipart_threshold_bytes(1);
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_put_multipart_threshold_bytes(1);
     let producer = Supertable::create(opts);
     {
         let mut w = producer.writer().expect("writer");
@@ -188,9 +187,10 @@ async fn multipart_threshold_forces_segment_through_put_multipart() {
     // Cross-process open recovers correctly — proof the
     // multipart-uploaded segment is byte-identical to what
     // the writer produced.
-    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
-        .expect("open after multipart commit");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .await
+            .expect("open after multipart commit");
     let r = consumer.reader();
     assert_eq!(r.manifest_id(), 1);
     assert_eq!(r.n_superfiles(), 1);
@@ -232,13 +232,14 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
     // 002 query paths keep working unchanged. Verifies no
     // regression to the FTS read path.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
     let mut w = st.writer().expect("writer");
-    w.append(&build_title_batch(&["nimblefox special token", "ordinary common text"],
-    ))
+    w.append(&build_title_batch(&[
+        "nimblefox special token",
+        "ordinary common text",
+    ]))
     .expect("append");
     w.commit().expect("commit");
     drop(w);
@@ -261,9 +262,8 @@ fn manifest_id_increments_only_on_non_empty_commits() {
     // Storage write-through should preserve this — no spurious
     // pointer rewrites on empty commits.
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
 
     let mut w = st.writer().expect("w");
@@ -276,7 +276,8 @@ fn manifest_id_increments_only_on_non_empty_commits() {
 
     // Now do a real commit; pointer appears at manifest_id=1.
     let mut w = st.writer().expect("w");
-    w.append(&build_title_batch(&["only", "real"])).expect("append");
+    w.append(&build_title_batch(&["only", "real"]))
+        .expect("append");
     w.commit().expect("real commit");
     drop(w);
 

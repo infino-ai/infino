@@ -54,13 +54,10 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-
-use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino::supertable::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-};
-use infino::supertable::storage::{S3StorageProvider, StorageProvider};
 use infino::supertable::Supertable;
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
+use infino::supertable::storage::{S3StorageProvider, StorageProvider};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
@@ -89,10 +86,7 @@ async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
     // signed request.
     let service = {
         let mut b = S3ServiceBuilder::new(fs_backend);
-        b.set_auth(SimpleAuth::from_single(
-            TEST_ACCESS_KEY,
-            TEST_SECRET_KEY,
-        ));
+        b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
         b.build()
     };
     // S3Service derives Clone (internally Arc<Inner>); clones
@@ -113,17 +107,13 @@ async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
             let service = service.clone();
             let http = http.clone();
             tokio::spawn(async move {
-                let _ = http
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await;
+                let _ = http.serve_connection(TokioIo::new(stream), service).await;
             });
         }
     });
 
     (addr, fs_root)
 }
-
-
 
 fn make_cache(
     storage: Arc<dyn StorageProvider>,
@@ -193,13 +183,17 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             )
             .expect("s3 provider for producer"),
         );
-        let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
         w.commit().expect("producer commit via S3");
         assert_eq!(producer.manifest_id(), 1);
-        eprintln!("[m16] producer commit OK; manifest_id={}", producer.manifest_id());
+        eprintln!(
+            "[m16] producer commit OK; manifest_id={}",
+            producer.manifest_id()
+        );
     }
 
     // Consumer: opens via the same S3 endpoint + a disk

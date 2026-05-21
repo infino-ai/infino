@@ -130,11 +130,9 @@ impl SupertableReader {
                     &kept,
                 )?
             }
-            None => {
-                crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-                    manifest.as_ref(),
-                )
-            }
+            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
+                manifest.as_ref(),
+            ),
         };
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -158,12 +156,8 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-        let work_units = build_or_work_units(
-            &kept,
-            mode,
-            term_refs.len(),
-            pool.current_num_threads(),
-        );
+        let work_units =
+            build_or_work_units(&kept, mode, term_refs.len(), pool.current_num_threads());
 
         let per_unit: Result<Vec<Vec<SuperfileHit>>, QueryError> = pool.install(|| {
             work_units
@@ -231,22 +225,19 @@ impl SupertableReader {
         // term-range skip + fan-out.
         let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
             Some(list) => {
-                let kept =
-                    crate::supertable::manifest::list_prune::prune_parts_for_fts_prefix(
-                        list,
-                        &column_owned,
-                        prefix_lower.as_bytes(),
-                    );
+                let kept = crate::supertable::manifest::list_prune::prune_parts_for_fts_prefix(
+                    list,
+                    &column_owned,
+                    prefix_lower.as_bytes(),
+                );
                 crate::supertable::query::hierarchical_iter::load_and_flatten(
                     manifest.as_ref(),
                     &kept,
                 )?
             }
-            None => {
-                crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-                    manifest.as_ref(),
-                )
-            }
+            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
+                manifest.as_ref(),
+            ),
         };
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -275,8 +266,7 @@ impl SupertableReader {
         // since the prefix path always runs BoolMode::Or and the
         // expansion typically yields ≥2 terms at the scales we
         // care about.
-        let work_units =
-            build_or_work_units(&kept, BoolMode::Or, 2, pool.current_num_threads());
+        let work_units = build_or_work_units(&kept, BoolMode::Or, 2, pool.current_num_threads());
 
         let per_unit: Result<Vec<Vec<SuperfileHit>>, QueryError> = pool.install(|| {
             work_units
@@ -285,13 +275,7 @@ impl SupertableReader {
                     let r = open_reader(&store, disk_cache.as_ref(), &unit.entry)?;
                     let hits = match unit.range {
                         Some((start, end)) => r
-                            .bm25_search_prefix_range(
-                                &column_owned,
-                                &prefix_owned,
-                                k,
-                                start,
-                                end,
-                            )
+                            .bm25_search_prefix_range(&column_owned, &prefix_owned, k, start, end)
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                         None => r
                             .bm25_search_prefix(&column_owned, &prefix_owned, k)
@@ -444,7 +428,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::{FtsConfig, SuperfileBuilder};
-    
+
     use crate::supertable::error::QueryError;
     use crate::supertable::{Supertable, SupertableOptions};
 
@@ -521,8 +505,8 @@ mod tests {
             )
             .expect("decimal128");
         let titles_arr = LargeStringArray::from(titles.to_vec());
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles_arr)])
-            .expect("batch");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles_arr)]).expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = bytes::Bytes::from(b.finish().expect("finish"));
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))

@@ -52,10 +52,7 @@ use crate::supertable::options::SupertableOptions;
 /// Compute the canonical options-hash from `opts` + the
 /// resolved `strategy`. See the module-level docs for the
 /// encoding layout.
-pub fn compute_options_hash(
-    opts: &SupertableOptions,
-    strategy: &PartitionStrategy,
-) -> ContentHash {
+pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrategy) -> ContentHash {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
     // 1. schema (field-by-field).
@@ -100,7 +97,10 @@ pub fn compute_options_hash(
     // 5. partition_strategy.
     push_tag(&mut buf, b"partition_strategy");
     match strategy {
-        PartitionStrategy::TimeRange { column, granularity_secs } => {
+        PartitionStrategy::TimeRange {
+            column,
+            granularity_secs,
+        } => {
             push_tag(&mut buf, b"time_range");
             push_str(&mut buf, column);
             buf.extend_from_slice(&granularity_secs.to_le_bytes());

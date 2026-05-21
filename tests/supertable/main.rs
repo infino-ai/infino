@@ -21,7 +21,7 @@
 //! `tests/` because they need their own binary.
 
 mod commit;
-mod query;
-mod manifest;
 mod disk_cache;
+mod manifest;
+mod query;
 mod storage;

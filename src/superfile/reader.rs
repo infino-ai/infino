@@ -122,13 +122,11 @@ impl SuperfileReader {
             crate::superfile::LazyByteSourceError::Storage(se) => {
                 ReadError::MalformedKv(format!("lazy source storage: {se}"))
             }
-            crate::superfile::LazyByteSourceError::OutOfBounds {
-                start,
-                len,
-                size,
-            } => ReadError::MalformedKv(format!(
-                "lazy source out-of-bounds: start={start} len={len} size={size}"
-            )),
+            crate::superfile::LazyByteSourceError::OutOfBounds { start, len, size } => {
+                ReadError::MalformedKv(format!(
+                    "lazy source out-of-bounds: start={start} len={len} size={size}"
+                ))
+            }
         })?;
         Self::open_with(bytes, opts)
     }
@@ -425,13 +423,7 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| std::str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search_or_range_pretokenized(
-            column,
-            &term_strings,
-            k,
-            doc_id_start,
-            doc_id_end,
-        )?)
+        Ok(fts.search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)?)
     }
 
     /// Multi-column BM25 search with per-column weights ("most

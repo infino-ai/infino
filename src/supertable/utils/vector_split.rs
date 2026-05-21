@@ -191,7 +191,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::{FtsConfig, VectorConfig};
-    
+
     use crate::superfile::vector::distance::Metric;
 
     fn fixed_list_f32(dim: usize) -> DataType {
@@ -303,8 +303,8 @@ mod tests {
             false,
         )]));
         let fsl = build_fsl(vec![0.0; 2 * dim], dim);
-        let other_batch = RecordBatch::try_new(other_schema, vec![Arc::new(fsl)])
-            .expect("build batch");
+        let other_batch =
+            RecordBatch::try_new(other_schema, vec![Arc::new(fsl)]).expect("build batch");
 
         let err = split_vectors(&other_batch, &opts).expect_err("expected error");
         assert!(matches!(err, BuildError::BatchSchemaMismatch));
@@ -362,13 +362,8 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![], Some(tok()))
+            .expect("valid options");
 
         let titles = LargeStringArray::from(vec!["x", "y"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(titles)]).expect("build batch");

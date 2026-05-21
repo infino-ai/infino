@@ -22,14 +22,14 @@ use std::time::Instant;
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
+use criterion::{Criterion, Throughput, criterion_group};
 use infino::superfile::builder::VectorConfig;
 use infino::superfile::vector::distance::Metric;
 use infino::supertable::query::SuperfileHit;
 use infino::supertable::query::vector::VectorSearchOptions;
 use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::bench_corpus;
-use infino::test_helpers::bench_corpus::{Calibrated, DIM};
+use crate::corpus::{self, Calibrated, DIM};
+use crate::{markdown, rss};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -58,7 +58,7 @@ const CORRECTNESS_SUPERTABLE_RERANK_MULT: usize = 256;
 
 // ─── Fixtures ────────────────────────────────────────────────────────
 
-static VECTORS: OnceLock<Vec<f32>> = OnceLock::new();
+static VECTORS: OnceLock<corpus::MmapCorpus> = OnceLock::new();
 static QUERIES_CORRECTNESS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static QUERIES_CALIBRATION: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
@@ -67,45 +67,36 @@ static SUPERTABLE: OnceLock<Supertable> = OnceLock::new();
 static CALIBRATIONS: OnceLock<Calibrations> = OnceLock::new();
 
 fn vectors() -> &'static [f32] {
-    VECTORS.get_or_init(|| {
-        bench_corpus::generate_vector_corpus(N_DOCS, bench_corpus::n_cent(N_DOCS), 1, true)
-    })
+    VECTORS
+        .get_or_init(|| {
+            // Raw corpus fixture only. Ingestion below still goes through
+            // RecordBatch -> writer.append() -> commit(); the mmap prevents
+            // the synthetic 10M x 384 source corpus from living as heap RAM.
+            corpus::MmapCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
+        })
+        .as_slice()
 }
 
 fn queries_correctness() -> &'static [Vec<f32>] {
     QUERIES_CORRECTNESS.get_or_init(|| {
-        bench_corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CORRECTNESS_QUERIES,
-            17,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CORRECTNESS_QUERIES, 17, true, 0.05)
     })
 }
 
 fn queries_calibration() -> &'static [Vec<f32>] {
     QUERIES_CALIBRATION.get_or_init(|| {
-        bench_corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CALIBRATION_QUERIES,
-            99,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CALIBRATION_QUERIES, 99, true, 0.05)
     })
 }
 
 fn ground_truth_correctness() -> &'static [Vec<u32>] {
     GROUND_TRUTH_CORRECTNESS
-        .get_or_init(|| bench_corpus::ground_truth(vectors(), N_DOCS, queries_correctness(), TOP_K))
+        .get_or_init(|| corpus::ground_truth(vectors(), N_DOCS, queries_correctness(), TOP_K))
 }
 
 fn ground_truth_calibration() -> &'static [Vec<u32>] {
     GROUND_TRUTH_CALIBRATION
-        .get_or_init(|| bench_corpus::ground_truth(vectors(), N_DOCS, queries_calibration(), TOP_K))
+        .get_or_init(|| corpus::ground_truth(vectors(), N_DOCS, queries_calibration(), TOP_K))
 }
 
 fn supertable() -> &'static Supertable {
@@ -126,7 +117,7 @@ fn supertable_schema() -> Arc<Schema> {
 }
 
 fn build_supertable() -> Supertable {
-    let n_cent_total = bench_corpus::n_cent(N_DOCS);
+    let n_cent_total = corpus::n_cent(N_DOCS);
     let n_cent_per_segment = (n_cent_total / N_SEGMENTS).max(1);
 
     let pool = Arc::new(
@@ -158,6 +149,8 @@ fn build_supertable() -> Supertable {
     for chunk_idx in 0..N_SEGMENTS {
         let start = chunk_idx * chunk_size;
         let end = start + chunk_size;
+        // Materialize one append batch from the disk-backed corpus, then feed
+        // it through the normal production ingestion API.
         let flat: Vec<f32> = v[start * DIM..end * DIM].to_vec();
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let values = Float32Array::from(flat);
@@ -168,8 +161,7 @@ fn build_supertable() -> Supertable {
             None,
         )
         .expect("FSL");
-        let batch =
-            RecordBatch::try_new(supertable_schema(), vec![Arc::new(fsl)]).expect("batch");
+        let batch = RecordBatch::try_new(supertable_schema(), vec![Arc::new(fsl)]).expect("batch");
         w.append(&batch).expect("append");
         w.commit().expect("commit");
     }
@@ -343,17 +335,18 @@ fn bench(c: &mut Criterion) {
         g.sample_size(10);
         g.throughput(Throughput::Elements(N_DOCS as u64));
 
-        g.bench_function(
-            format!("supertable_{N_DOCS}docs_{N_SEGMENTS}superfiles"),
-            |b| {
-                b.iter_with_large_drop(|| {
-                    let _ = black_box(v);
-                    build_supertable()
-                });
-            },
-        );
+        let rss_sample = rss::PeakSampler::start_default();
+        let bench_id = format!("supertable_{N_DOCS}docs_{N_SEGMENTS}superfiles");
+        g.bench_function(bench_id.clone(), |b| {
+            b.iter_with_large_drop(|| {
+                let _ = black_box(v);
+                build_supertable()
+            });
+        });
 
         g.finish();
+        let peak = rss_sample.stop();
+        let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_BUILD, &bench_id, peak);
 
         emit_ingest_markdown();
     }
@@ -365,31 +358,38 @@ fn bench(c: &mut Criterion) {
 
         let mut g = c.benchmark_group("supertable_vec_search");
         g.sample_size(10);
+        let rss_sample = rss::PeakSampler::start_default();
 
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
             let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
             if let Some(c_st) = cal.supertable[i] {
-                g.bench_with_input(
-                    BenchmarkId::new(
-                        format!("supertable_{label}"),
-                        format!("p={},r={}", c_st.probe, c_st.refine),
-                    ),
-                    &(c_st.probe, c_st.refine),
-                    |b, &(p, r)| {
-                        let q = &qs[0];
-                        let opts = VectorSearchOptions::new()
-                            .with_nprobe(p)
-                            .with_rerank_mult(r);
-                        b.iter(|| {
-                            let hits = supertable_topk(st, black_box(q), TOP_K, opts);
-                            black_box(hits)
-                        });
-                    },
-                );
+                // Stable bench id: the calibrated (probe, refine) lives in
+                // the markdown table, not the criterion id, so criterion can
+                // match this row against its prior baseline and print its
+                // own improved/regressed delta on subsequent runs.
+                let (p, r) = (c_st.probe, c_st.refine);
+                g.bench_function(format!("supertable_{label}"), |b| {
+                    let q = &qs[0];
+                    let opts = VectorSearchOptions::new()
+                        .with_nprobe(p)
+                        .with_rerank_mult(r);
+                    b.iter(|| {
+                        let hits = supertable_topk(st, black_box(q), TOP_K, opts);
+                        black_box(hits)
+                    });
+                });
             }
         }
 
         g.finish();
+        let peak = rss_sample.stop();
+        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            if cal.supertable[i].is_some() {
+                let bid = format!("supertable_{label}");
+                let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_SEARCH, &bid, peak);
+            }
+        }
 
         emit_search_markdown();
     }
@@ -397,60 +397,73 @@ fn bench(c: &mut Criterion) {
 
 // ─── Markdown summary emitters ────────────────────────────────────────
 
-fn emit_ingest_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+mod group_name {
+    pub const SUPERTABLE_VEC_BUILD: &str = "supertable_vec_build";
+    pub const SUPERTABLE_VEC_SEARCH: &str = "supertable_vec_search";
+}
 
-    let group = "supertable_vec_build";
+fn emit_ingest_markdown() {
+    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+
+    let group = group_name::SUPERTABLE_VEC_BUILD;
     let bench = format!("supertable_{N_DOCS}docs_{N_SEGMENTS}superfiles");
     let ns = read_mean_ns(group, &bench);
+    let peak_rss = rss::read_peak_rss_bytes(group, &bench);
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Supertable vector — ingest ({N_DOCS} docs × dim={DIM}, sharded into {N_SEGMENTS} superfiles)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput |\n");
-    body.push_str("|--------|------|------------|\n");
+    body.push_str("| Engine | Time | Throughput | Peak RSS |\n");
+    body.push_str("|--------|------|------------|----------|\n");
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
-    body.push_str(&format!("| supertable | {time} | {thrpt} |\n"));
+    let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+    body.push_str(&format!("| supertable | {time} | {thrpt} | {rss_cell} |\n"));
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/supertable/ingest".into(),
         body,
     });
 }
 
 fn emit_search_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
     let cal = calibrations();
-    let group = "supertable_vec_search";
+    let group = group_name::SUPERTABLE_VEC_SEARCH;
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
-    body.push_str("| Recall target | supertable (probe/seg, refine) | supertable p50 |\n");
-    body.push_str("|---------------|--------------------------------|----------------|\n");
+    body.push_str(
+        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS |\n",
+    );
+    body.push_str(
+        "|---------------|--------------------------------|----------------|----------|\n",
+    );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
-        let (cell, ns) = match cal.supertable[i] {
+        let (cell, ns, rss_cell) = match cal.supertable[i] {
             Some(c) => {
-                let bid = format!("supertable_{label}/p={},r={}", c.probe, c.refine);
+                let bid = format!("supertable_{label}");
                 let ns = read_mean_ns(group, &bid);
-                (format!("(p={}, r={})", c.probe, c.refine), ns)
+                let peak = rss::read_peak_rss_bytes(group, &bid);
+                let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+                (format!("(p={}, r={})", c.probe, c.refine), ns, rss_cell)
             }
-            None => ("—".into(), None),
+            None => ("—".into(), None, "—".into()),
         };
         let t = ns.map(fmt_time).unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {row_target} | {cell} | {t} |\n"));
+        body.push_str(&format!("| {row_target} | {cell} | {t} | {rss_cell} |\n"));
     }
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/supertable/search".into(),
         body,
     });

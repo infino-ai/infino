@@ -76,9 +76,7 @@ pub fn load_kept_parts(
                 .enable_all()
                 .build()
                 .map_err(|e| {
-                    QueryError::Store(format!(
-                        "tokio runtime build for hierarchical_iter: {e}"
-                    ))
+                    QueryError::Store(format!("tokio runtime build for hierarchical_iter: {e}"))
                 })?;
             rt.block_on(drive)
         }

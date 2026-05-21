@@ -117,11 +117,7 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     async fn get(&self, uri: &str) -> Result<Bytes, StorageError>;
 
     /// Range-fetch. `range.end` is exclusive.
-    async fn get_range(
-        &self,
-        uri: &str,
-        range: Range<u64>,
-    ) -> Result<Bytes, StorageError>;
+    async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 
     /// Atomic write — succeeds only if the target doesn't
     /// exist. Maps to `If-None-Match: *` on S3,

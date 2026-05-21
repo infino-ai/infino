@@ -40,9 +40,7 @@ use infino::supertable::manifest::commit::{
 use infino::supertable::manifest::list::{
     FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
 };
-use infino::supertable::manifest::part::{
-    self as part_mod, ContentHash, ManifestPart, PartId,
-};
+use infino::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
@@ -163,7 +161,10 @@ async fn initial_commit_writes_list_part_pointer() {
     // List + part are at their expected URIs.
     let list_bytes = storage.get(&list_uri(0)).await.expect("list bytes");
     assert!(!list_bytes.is_empty());
-    let part_bytes = storage.get(&entry_for(&part).uri).await.expect("part bytes");
+    let part_bytes = storage
+        .get(&entry_for(&part).uri)
+        .await
+        .expect("part bytes");
     assert!(!part_bytes.is_empty());
 }
 
@@ -233,9 +234,15 @@ async fn stale_prev_etag_surfaces_write_contention_exhausted() {
     // Stale writer tries to publish with v0's etag — must fail.
     let part_v1_stale = fresh_part(6);
     let list_v1_stale = empty_list(1, vec![entry_for(&part_v1_stale)]);
-    let err = commit_manifest(&storage, Some(&etag_v0), &list_v1_stale, &[&part_v1_stale], 3)
-        .await
-        .expect_err("stale etag must fail");
+    let err = commit_manifest(
+        &storage,
+        Some(&etag_v0),
+        &list_v1_stale,
+        &[&part_v1_stale],
+        3,
+    )
+    .await
+    .expect_err("stale etag must fail");
     assert!(
         matches!(err, CommitError::WriteContentionExhausted),
         "expected WriteContentionExhausted, got {err:?}"
@@ -555,4 +562,3 @@ fn directory_layout_constants_match_plan() {
     assert!(u.starts_with("manifests/part-"));
     assert!(u.ends_with(".avro.zst"));
 }
-

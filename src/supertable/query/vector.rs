@@ -113,11 +113,9 @@ impl SupertableReader {
                     &kept,
                 )?
             }
-            None => {
-                crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-                    manifest.as_ref(),
-                )
-            }
+            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
+                manifest.as_ref(),
+            ),
         };
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -180,13 +178,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::Array;
-    use arrow_array::{
-        FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
-    };
+    use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::{FtsConfig, SuperfileBuilder, VectorConfig};
-    
+
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::error::QueryError;
     use crate::supertable::{Supertable, SupertableOptions};

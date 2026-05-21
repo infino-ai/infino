@@ -31,7 +31,6 @@
 #[derive(Debug, Clone, Default)]
 pub struct SupertableStats {
     // ---- Manifest-side observables ---------------------------------
-
     /// Current pinned `manifest_id`. Monotonically increasing
     /// across commits; `0` for a freshly `create`'d supertable
     /// with no commits.
@@ -60,7 +59,6 @@ pub struct SupertableStats {
     pub n_manifest_parts_loaded: usize,
 
     // ---- Process memory --------------------------------------------
-
     /// Resident set size of this **process**, as reported by
     /// the OS (Mach `task_info` on macOS, `/proc/self/statm`
     /// on Linux, etc.). The whole-process RSS includes
@@ -75,7 +73,6 @@ pub struct SupertableStats {
     pub process_rss_bytes: u64,
 
     // ---- Disk cache (when attached) --------------------------------
-
     /// Disk cache's mmap virtual-size sum.
     /// `None` for supertables without a disk cache attached.
     /// Upper bound on the cache's resident memory — actual

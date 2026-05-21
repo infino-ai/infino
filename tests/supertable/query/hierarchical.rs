@@ -30,16 +30,13 @@
 
 use std::sync::Arc;
 
-
 use std::collections::HashSet;
 
 use infino::superfile::fts::reader::BoolMode;
-use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino::supertable::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
+use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
 fn make_cache(
@@ -61,17 +58,16 @@ fn make_cache(
     DiskCacheStore::new(storage, cfg, pinned).expect("cache")
 }
 
-
-
 /// Build a producer that creates one part per commit (via
 /// target_superfiles_per_partition=1, the M15a split path),
 /// then drop it. Returns the path to the storage root for
 /// the consumer to open against.
 fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(storage_dir).expect("provider"),
-    );
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_target_superfiles_per_partition(1);
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let opts = default_supertable_options()
+        .with_storage(Arc::clone(&storage))
+        .with_target_superfiles_per_partition(1);
     let producer = Supertable::create(opts);
 
     // Each commit's batch uses a distinct vocabulary so the
@@ -96,9 +92,8 @@ async fn bm25_exact_term_loads_only_the_matching_part() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     // Force lazy mode so the OnceCell occupancy delta is
     // observable. (Default threshold=4 + 5 parts also
     // produces lazy mode but eager_load_threshold=0 is
@@ -106,7 +101,8 @@ async fn bm25_exact_term_loads_only_the_matching_part() {
     let cache_dir = TempDir::new().expect("cache");
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
-        default_supertable_options().with_storage(Arc::clone(&storage))
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
@@ -170,13 +166,13 @@ async fn bm25_term_in_no_part_loads_nothing() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let cache_dir = TempDir::new().expect("cache");
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
-        default_supertable_options().with_storage(Arc::clone(&storage))
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
@@ -226,13 +222,13 @@ async fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let cache_dir = TempDir::new().expect("cache");
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
-        default_supertable_options().with_storage(Arc::clone(&storage))
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
@@ -245,7 +241,10 @@ async fn bm25_prefix_with_narrow_prefix_loads_one_part() {
         .reader()
         .bm25_search_prefix("title", "ech", 10)
         .expect("prefix");
-    assert!(!hits.is_empty(), "prefix search must find 'echo'-rooted terms");
+    assert!(
+        !hits.is_empty(),
+        "prefix search must find 'echo'-rooted terms"
+    );
 
     let r = consumer.reader();
     let m = r.manifest();
@@ -282,13 +281,13 @@ async fn sql_loads_all_parts_returns_correct_count() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let cache_dir = TempDir::new().expect("cache");
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
-        default_supertable_options().with_storage(Arc::clone(&storage))
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
@@ -335,11 +334,11 @@ async fn eager_mode_query_paths_observationally_unchanged() {
     // M15c, and the OnceCell is populated from open (not
     // first query).
     let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(dir.path()).expect("provider"),
-    );
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     {
-        let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -349,7 +348,9 @@ async fn eager_mode_query_paths_observationally_unchanged() {
     let cache_dir = TempDir::new().expect("cache");
     let cache = make_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
-        default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)),
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
     )
     .await
     .expect("open");

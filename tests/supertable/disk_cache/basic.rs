@@ -33,13 +33,13 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use infino::supertable::SuperfileUri;
-use infino::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::reader_cache::disk::DiskCacheError;
+use infino::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
+use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use tempfile::TempDir;
 
 // ============================================================
@@ -130,22 +130,14 @@ fn build_test_superfile_bytes() -> Bytes {
     let mut b = SuperfileBuilder::new(opts).expect("builder");
     let ids = decimal128_ids(vec![1u64, 2, 3]);
     let titles = LargeStringArray::from(vec!["alpha bravo", "charlie delta", "echo foxtrot"]);
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
-        .expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
     b.add_batch(&batch, &[]).expect("add_batch");
     Bytes::from(b.finish().expect("finish"))
 }
 
-async fn seed_segment(
-    storage: &dyn StorageProvider,
-    uri: SuperfileUri,
-    bytes: Bytes,
-) {
+async fn seed_segment(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
     let path = format!("data/seg-{}.sf", uri.0);
-    storage
-        .put_atomic(&path, bytes)
-        .await
-        .expect("seed put");
+    storage.put_atomic(&path, bytes).await.expect("seed put");
 }
 
 fn fresh_cache_with_storage(
@@ -175,9 +167,7 @@ fn fresh_cache_with_storage(
 #[tokio::test]
 async fn cold_miss_triggers_range_fetches_warm_hit_does_not() {
     let store_dir = TempDir::new().expect("storage tempdir");
-    let local = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local = Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let proxy = CountingProxy::new(local);
 
     let uri = SuperfileUri::new_v4();
@@ -213,9 +203,7 @@ async fn cold_miss_triggers_range_fetches_warm_hit_does_not() {
 #[tokio::test]
 async fn concurrent_cold_readers_coalesce_to_one_fetch() {
     let store_dir = TempDir::new().expect("storage tempdir");
-    let local = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local = Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let proxy = CountingProxy::new(local);
 
     let uri = SuperfileUri::new_v4();
@@ -251,9 +239,8 @@ async fn reader_returns_working_superfile_reader() {
     // SuperfileReader::open path produces a reader that
     // actually serves queries.
     let store_dir = TempDir::new().expect("storage tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
 
     let uri = SuperfileUri::new_v4();
     let bytes = build_test_superfile_bytes();
@@ -279,9 +266,8 @@ async fn eviction_respects_pinned_set() {
     // (BudgetExceeded surfaces because the policy can't evict
     // A and B alone exceeds budget when A is held).
     let store_dir = TempDir::new().expect("storage tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
 
     let uri_a = SuperfileUri::new_v4();
     let uri_b = SuperfileUri::new_v4();
@@ -336,9 +322,8 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
     // newer). Touch C → forces eviction; A (older) should be
     // the victim.
     let store_dir = TempDir::new().expect("storage tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
 
     let uri_a = SuperfileUri::new_v4();
     let uri_b = SuperfileUri::new_v4();
@@ -362,8 +347,7 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
     };
-    let cache =
-        DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
+    let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
 
     let _ra = cache.reader(&uri_a).await.expect("a");
     // Tiny sleep so B's last_access_us > A's. Avoids relying
@@ -386,9 +370,8 @@ async fn reservation_race_preserves_budget_invariant() {
     // current_bytes ≤ budget at every observation, never
     // overshooting transiently.
     let store_dir = TempDir::new().expect("storage tempdir");
-    let local: Arc<dyn StorageProvider> = Arc::new(
-        LocalFsStorageProvider::new(store_dir.path()).expect("local"),
-    );
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
 
     let bytes = build_test_superfile_bytes();
     let size = bytes.len() as u64;
@@ -412,8 +395,7 @@ async fn reservation_race_preserves_budget_invariant() {
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
     };
-    let cache =
-        DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
+    let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
 
     // Spawn 8 concurrent readers. With budget for ~3 and
     // 8 distinct URIs, some readers may legitimately hit

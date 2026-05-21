@@ -1,0 +1,23 @@
+[package]
+name = "infino-bench-utils"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "mod.rs"
+
+[dependencies]
+arrow-array = "58"
+arrow-schema = "58"
+bytemuck = "1"
+bytes = "1"
+criterion = "0.8"
+infino = { path = "../..", features = ["test-helpers"] }
+memmap2 = "0.9"
+num_cpus = "1"
+rand = "0.10"
+rand_distr = "0.6"
+rayon = "1"
+serde_json = "1"
+tempfile = "3"

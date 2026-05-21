@@ -348,7 +348,6 @@ impl SupertableWriter {
         publish_superfiles(&self.inner, outputs)?;
         Ok(())
     }
-
 }
 
 impl Drop for SupertableWriter {
@@ -486,13 +485,8 @@ fn prepare_segment(
 
     let uri = SuperfileUri::new_v4();
 
-    let bytes_for_storage = inner
-        .options
-        .storage
-        .is_some()
-        .then(|| shard.bytes.clone());
-    let cache_attached =
-        inner.options.disk_cache.is_some() && inner.options.storage.is_some();
+    let bytes_for_storage = inner.options.storage.is_some().then(|| shard.bytes.clone());
+    let cache_attached = inner.options.disk_cache.is_some() && inner.options.storage.is_some();
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
     let bytes_for_cache = cache_attached.then(|| shard.bytes.clone());
 
@@ -537,10 +531,7 @@ fn prepare_segment(
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
             if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
-                vector_summary.insert(
-                    vc.column.clone(),
-                    VectorSummary { centroid, radius },
-                );
+                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, radius });
             }
         }
     }
@@ -579,7 +570,10 @@ fn prepare_segment(
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
 /// docs × 4 superfiles is the dominant cost. Manifest swap +
 /// storage write-through stay serial after the join.
-fn publish_superfiles(inner: &SupertableInner, outputs: Vec<ShardOutput>) -> Result<(), BuildError> {
+fn publish_superfiles(
+    inner: &SupertableInner,
+    outputs: Vec<ShardOutput>,
+) -> Result<(), BuildError> {
     let prepared: Vec<PreparedSegment> = inner.options.writer_pool.install(|| {
         outputs
             .into_par_iter()
@@ -762,8 +756,7 @@ fn persist_commit(
             // iteration) feeds into our successor's
             // `new_segment_list`.
             let old = inner.manifest.load_full();
-            let new_segment_list =
-                old.superfile_list.with_appended(new_entries.clone());
+            let new_segment_list = old.superfile_list.with_appended(new_entries.clone());
             let pending_writes = pending_storage_writes.clone();
 
             match try_commit_attempt(
@@ -851,15 +844,13 @@ async fn try_commit_attempt(
     new_manifest_id: u64,
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
 ) -> Result<crate::supertable::manifest::list::ManifestList, crate::supertable::CommitError> {
+    use crate::storage::StorageError;
     use crate::supertable::manifest::commit::{self as commit_mod, POINTER_PATH};
     use crate::supertable::manifest::list::{
         FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
     };
     use crate::supertable::manifest::part::{self as part_mod, ManifestPart, PartId};
-    use crate::supertable::manifest::partition::{
-        assign_partition, encode_partition_key,
-    };
-    use crate::storage::StorageError;
+    use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     // 1. Write each new segment's bytes to storage in parallel.
@@ -978,14 +969,10 @@ async fn try_commit_attempt(
                     // emit a fresh part with just the new
                     // superfiles for this partition.
                     out_list_entries.push(entry.clone());
-                    let new_segs: Vec<Arc<SuperfileEntry>> = combined_segments
-                        [existing_part.superfiles.len()..]
-                        .to_vec();
-                    let (fresh_entry, fresh_part) = build_part_and_entry(
-                        &opts,
-                        new_segs,
-                        entry.partition_key.clone(),
-                    )?;
+                    let new_segs: Vec<Arc<SuperfileEntry>> =
+                        combined_segments[existing_part.superfiles.len()..].to_vec();
+                    let (fresh_entry, fresh_part) =
+                        build_part_and_entry(&opts, new_segs, entry.partition_key.clone())?;
                     out_list_entries.push(fresh_entry);
                     parts_to_write.push(fresh_part);
                 } else {
@@ -1030,10 +1017,7 @@ async fn try_commit_attempt(
     //    typed error rather than a downstream decode
     //    failure.
     let opts_hash =
-        crate::supertable::manifest::options_hash::compute_options_hash(
-            opts.as_ref(),
-            &strategy,
-        );
+        crate::supertable::manifest::options_hash::compute_options_hash(opts.as_ref(), &strategy);
     let new_list = ManifestList {
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id: new_manifest_id,
@@ -1158,10 +1142,10 @@ async fn refresh_inner_state_async(
     inner: &SupertableInner,
     storage: &Arc<dyn crate::storage::StorageProvider>,
 ) -> Result<(), crate::supertable::CommitError> {
+    use crate::supertable::manifest::ManifestPartLoader;
     use crate::supertable::manifest::commit::read_pointer;
     use crate::supertable::manifest::list as list_mod;
     use crate::supertable::manifest::{Manifest, SuperfileList};
-    use crate::supertable::manifest::ManifestPartLoader;
 
     let pointer = match read_pointer(storage.as_ref()).await? {
         Some(p) => p,
@@ -1224,9 +1208,7 @@ async fn refresh_inner_state_async(
 
     let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
     for entry in &new_list.parts {
-        let cell = new_parts
-            .get(&entry.part_id)
-            .expect("part inserted above");
+        let cell = new_parts.get(&entry.part_id).expect("part inserted above");
         let part = cell
             .value()
             .get()
@@ -1366,15 +1348,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow_array::{
-        FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
-    };
+    use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use rayon::ThreadPoolBuilder;
 
     use crate::superfile::builder::FtsConfig;
     use crate::superfile::builder::VectorConfig;
-    
+
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::SupertableOptions;
     use crate::supertable::handle::Supertable;
@@ -1704,7 +1684,11 @@ supertable:
         w.commit().expect("commit");
 
         let r = st.reader();
-        assert_eq!(r.n_superfiles(), 4, "writer_threads=4 should yield 4 shards");
+        assert_eq!(
+            r.n_superfiles(),
+            4,
+            "writer_threads=4 should yield 4 shards"
+        );
         assert_eq!(r.n_docs_total(), 24);
     }
 

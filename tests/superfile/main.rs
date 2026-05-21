@@ -19,7 +19,7 @@
 //!   cargo test --test superfile vector::brute_force_oracle::
 //!   cargo test --test superfile format::crc_corruption::
 
-mod pipeline;
-mod fts;
-mod vector;
 mod format;
+mod fts;
+mod pipeline;
+mod vector;

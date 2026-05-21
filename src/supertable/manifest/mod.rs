@@ -130,7 +130,10 @@ impl SuperfileList {
 pub struct Manifest {
     pub superfile_list: SuperfileList,
     pub list: Option<list::ManifestList>,
-    pub parts: dashmap::DashMap<part::PartId, std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<part::ManifestPart>>>>,
+    pub parts: dashmap::DashMap<
+        part::PartId,
+        std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<part::ManifestPart>>>,
+    >,
     pub loader: Option<std::sync::Arc<ManifestPartLoader>>,
 }
 
@@ -140,7 +143,10 @@ impl std::fmt::Debug for Manifest {
             .field("manifest_id", &self.superfile_list.manifest_id)
             .field("n_superfiles", &self.superfile_list.superfiles.len())
             .field("has_list", &self.list.is_some())
-            .field("n_parts", &self.list.as_ref().map(|l| l.parts.len()).unwrap_or(0))
+            .field(
+                "n_parts",
+                &self.list.as_ref().map(|l| l.parts.len()).unwrap_or(0),
+            )
             .field("n_parts_loaded", &self.parts.len())
             .field("has_loader", &self.loader.is_some())
             .finish()
@@ -208,9 +214,7 @@ impl Manifest {
             .entry(part_id)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
             .clone();
-        let loaded = cell
-            .get_or_try_init(|| loader.load(part_id))
-            .await?;
+        let loaded = cell.get_or_try_init(|| loader.load(part_id)).await?;
         Ok(std::sync::Arc::clone(loaded))
     }
 }
@@ -225,8 +229,7 @@ pub struct ManifestPartLoader {
     storage: std::sync::Arc<dyn crate::storage::StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri)`. Built from
     /// the manifest list at construction; immutable per-`Manifest`.
-    parts_index:
-        std::collections::HashMap<part::PartId, (part::ContentHash, String)>,
+    parts_index: std::collections::HashMap<part::PartId, (part::ContentHash, String)>,
 }
 
 impl ManifestPartLoader {
@@ -250,10 +253,10 @@ impl ManifestPartLoader {
         &self,
         part_id: part::PartId,
     ) -> Result<std::sync::Arc<part::ManifestPart>, ManifestLoadError> {
-        let (expected_hash, uri) =
-            self.parts_index
-                .get(&part_id)
-                .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+        let (expected_hash, uri) = self
+            .parts_index
+            .get(&part_id)
+            .ok_or(ManifestLoadError::PartNotInList { part_id })?;
         let bytes = self
             .storage
             .get(uri)
@@ -555,7 +558,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::FtsConfig;
-    
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -866,8 +868,8 @@ mod tests {
         }
 
         fn options_for_test() -> Arc<crate::supertable::SupertableOptions> {
-            use arrow_schema::{DataType, Field, Schema};
             use crate::supertable::SupertableOptions;
+            use arrow_schema::{DataType, Field, Schema};
             let s = Arc::new(Schema::new(vec![Field::new(
                 "title",
                 DataType::LargeUtf8,
@@ -895,10 +897,8 @@ mod tests {
             let (objects, entries) = encode_and_index(&[part.clone()]);
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
-            let manifest = build_manifest_with_loader(
-                list,
-                Arc::clone(&storage) as Arc<dyn StorageProvider>,
-            );
+            let manifest =
+                build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
             let loaded = manifest.part(part.part_id).await.expect("load");
             assert_eq!(loaded.part_id, part.part_id);
@@ -911,10 +911,8 @@ mod tests {
             let (objects, entries) = encode_and_index(&[part.clone()]);
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
-            let manifest = build_manifest_with_loader(
-                list,
-                Arc::clone(&storage) as Arc<dyn StorageProvider>,
-            );
+            let manifest =
+                build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
             let a = manifest.part(part.part_id).await.expect("first load");
             let b = manifest.part(part.part_id).await.expect("second load");
@@ -974,10 +972,8 @@ mod tests {
             let list = fresh_list(fresh_entries);
 
             let storage = Arc::new(CountingMockStorage::new(objects));
-            let manifest = build_manifest_with_loader(
-                list,
-                Arc::clone(&storage) as Arc<dyn StorageProvider>,
-            );
+            let manifest =
+                build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
             let err = manifest
                 .part(part.part_id)
@@ -997,7 +993,10 @@ mod tests {
                 .part(part.part_id)
                 .await
                 .expect_err("must reject on retry too");
-            assert!(matches!(err2, ManifestLoadError::ContentHashMismatch { .. }));
+            assert!(matches!(
+                err2,
+                ManifestLoadError::ContentHashMismatch { .. }
+            ));
         }
 
         #[tokio::test]
@@ -1006,10 +1005,8 @@ mod tests {
             let (objects, entries) = encode_and_index(&[part]);
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
-            let manifest = build_manifest_with_loader(
-                list,
-                Arc::clone(&storage) as Arc<dyn StorageProvider>,
-            );
+            let manifest =
+                build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
             let stranger = PartId(Uuid::from_bytes([0xff; 16]));
             let err = manifest.part(stranger).await.expect_err("must reject");

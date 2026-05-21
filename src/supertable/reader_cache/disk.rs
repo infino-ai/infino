@@ -16,9 +16,9 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
 use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate};
+use crate::storage::{StorageError, StorageProvider};
 use crate::superfile::reader::{OpenOptions, SuperfileReader};
 use crate::supertable::manifest::SuperfileUri;
-use crate::storage::{StorageError, StorageProvider};
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
@@ -132,7 +132,10 @@ impl std::fmt::Debug for DiskCacheStore {
             .field("budget_bytes", &self.config.disk_budget_bytes)
             .field("current_bytes", &self.current_bytes.load(Ordering::Acquire))
             .field("n_entries", &self.cached.len())
-            .field("n_cold_fetches", &self.n_cold_fetches.load(Ordering::Acquire))
+            .field(
+                "n_cold_fetches",
+                &self.n_cold_fetches.load(Ordering::Acquire),
+            )
             .finish()
     }
 }
@@ -216,7 +219,10 @@ impl DiskCacheStore {
     /// eviction during the sweep — `madvise` on a multi-GB
     /// mmap can take milliseconds.
     pub fn sweep_once(&self) -> u64 {
-        let threshold_us = self.config.mmap_cold_threshold_secs.saturating_mul(1_000_000);
+        let threshold_us = self
+            .config
+            .mmap_cold_threshold_secs
+            .saturating_mul(1_000_000);
         let now_us = self.now_us();
         // Snapshot: clone the Arc<Mmap> + last-access into an
         // owned Vec, then drop the iterator.
@@ -249,9 +255,7 @@ impl DiskCacheStore {
                 // file is immutable for the lifetime of this
                 // mapping; pages dropped by `MADV_DONTNEED`
                 // re-fault from disk on next read.
-                let _ = unsafe {
-                    mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
-                };
+                let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
                 n_advised += 1;
             }
         }
@@ -308,9 +312,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
-            entry
-                .last_access_us
-                .store(self.now_us(), Ordering::Release);
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
             return Ok(Arc::clone(&entry.reader));
         }
         let cell = self
@@ -318,7 +320,9 @@ impl DiskCacheStore {
             .entry(*uri)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
-        let result = cell.get_or_init(|| async { self.cold_fetch(uri).await }).await;
+        let result = cell
+            .get_or_init(|| async { self.cold_fetch(uri).await })
+            .await;
         match result {
             Ok(entry) => {
                 self.coordinators.remove(uri);
@@ -326,9 +330,11 @@ impl DiskCacheStore {
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                Err(self.cold_fetch(uri).await.err().unwrap_or(
-                    DiskCacheError::SuperfileOpen("cold fetch error".into()),
-                ))
+                Err(self
+                    .cold_fetch(uri)
+                    .await
+                    .err()
+                    .unwrap_or(DiskCacheError::SuperfileOpen("cold fetch error".into())))
             }
         }
     }
@@ -342,9 +348,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
-            entry
-                .last_access_us
-                .store(self.now_us(), Ordering::Release);
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
             return Ok(Arc::clone(&entry.reader));
         }
         let cell = self
@@ -399,14 +403,8 @@ impl DiskCacheStore {
     /// recent `set_pinned_fn` call wins. The closure can
     /// itself walk multiple `Weak<...>` references if a
     /// caller needs to pin URIs from several supertables.
-    pub fn set_pinned_fn(
-        &self,
-        pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>,
-    ) {
-        let mut g = self
-            .pinned_fn
-            .lock()
-            .expect("pinned_fn mutex poisoned");
+    pub fn set_pinned_fn(&self, pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>) {
+        let mut g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
         *g = pinned_fn;
     }
 
@@ -501,10 +499,7 @@ impl DiskCacheStore {
     /// / [`crate::supertable::Supertable::open`].
     pub fn current_pinned_uris(&self) -> HashSet<SuperfileUri> {
         let f = {
-            let g = self
-                .pinned_fn
-                .lock()
-                .expect("pinned_fn mutex poisoned");
+            let g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
             Arc::clone(&g)
         };
         f()
@@ -640,17 +635,13 @@ impl DiskCacheStore {
 
     /// Build a per-URI cache file path under `cache_root`.
     fn cache_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config
-            .cache_root
-            .join(format!("seg-{}.sf", uri.0))
+        self.config.cache_root.join(format!("seg-{}.sf", uri.0))
     }
 
     /// Build a per-URI tempfile path (sparse destination
     /// during cold fetch; renamed to `cache_path` on success).
     fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config
-            .cache_root
-            .join(format!("seg-{}.sf.tmp", uri.0))
+        self.config.cache_root.join(format!("seg-{}.sf.tmp", uri.0))
     }
 
     /// The storage-side URI for a segment, mirroring the
@@ -691,7 +682,11 @@ impl DiskCacheStore {
             .config
             .cold_fetch_chunk_bytes
             .max(size.div_ceil(n_streams));
-        let n_chunks = if size == 0 { 0 } else { size.div_ceil(chunk_size) };
+        let n_chunks = if size == 0 {
+            0
+        } else {
+            size.div_ceil(chunk_size)
+        };
 
         let file = tokio::fs::File::create(&tmp).await?;
         file.set_len(size).await?;
@@ -715,8 +710,9 @@ impl DiskCacheStore {
             // Spawn the fetch task. It captures a Sender for
             // its pwrite handle so the outer task can join
             // pwrites separately from fetches.
-            let (write_tx, write_rx) =
-                tokio::sync::oneshot::channel::<tokio::task::JoinHandle<Result<(), DiskCacheError>>>();
+            let (write_tx, write_rx) = tokio::sync::oneshot::channel::<
+                tokio::task::JoinHandle<Result<(), DiskCacheError>>,
+            >();
             write_handles.push(write_rx);
 
             fetch_handles.push(tokio::spawn(async move {
@@ -818,10 +814,7 @@ impl DiskCacheStore {
 
     /// Run the cold-fetch coordinator for `uri`. Reserves
     /// budget, fetches, mmap's, registers in `cached`.
-    async fn cold_fetch(
-        &self,
-        uri: &SuperfileUri,
-    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+    async fn cold_fetch(&self, uri: &SuperfileUri) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
         let head = self.storage.head(&storage_uri).await?;
         let size = head.size;
@@ -875,12 +868,7 @@ impl DiskCacheStore {
             if cur + bytes <= self.config.disk_budget_bytes {
                 if self
                     .current_bytes
-                    .compare_exchange_weak(
-                        cur,
-                        cur + bytes,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+                    .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
                     return Ok(());
@@ -901,12 +889,7 @@ impl DiskCacheStore {
             if cur + bytes <= self.config.disk_budget_bytes {
                 if self
                     .current_bytes
-                    .compare_exchange_weak(
-                        cur,
-                        cur + bytes,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+                    .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
                     return Ok(Reservation {
@@ -939,10 +922,7 @@ impl DiskCacheStore {
         // pinned_fn mutex across that call invites
         // deadlocks.
         let pinned_fn = {
-            let g = self
-                .pinned_fn
-                .lock()
-                .expect("pinned_fn mutex poisoned");
+            let g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
             Arc::clone(&g)
         };
         let pinned = pinned_fn();
@@ -955,8 +935,10 @@ impl DiskCacheStore {
                 last_access_us: e.value().last_access_us.load(Ordering::Acquire),
             })
             .collect();
-        let victims =
-            self.config.eviction.select_for_eviction(&candidates, &pinned, bytes_needed);
+        let victims = self
+            .config
+            .eviction
+            .select_for_eviction(&candidates, &pinned, bytes_needed);
         if victims.is_empty() {
             return Err(DiskCacheError::BudgetExceeded);
         }
@@ -996,7 +978,11 @@ impl DiskCacheStore {
         file.set_len(size).await?;
         let file = Arc::new(tokio::sync::Mutex::new(file));
 
-        let n_chunks = if size == 0 { 0 } else { size.div_ceil(chunk_size) };
+        let n_chunks = if size == 0 {
+            0
+        } else {
+            size.div_ceil(chunk_size)
+        };
         let mut joins = Vec::with_capacity(n_chunks as usize);
         for i in 0..n_chunks {
             let start = i * chunk_size;
@@ -1013,9 +999,8 @@ impl DiskCacheStore {
             }));
         }
         for h in joins {
-            h.await.map_err(|e| {
-                DiskCacheError::SuperfileOpen(format!("join error: {e}"))
-            })??;
+            h.await
+                .map_err(|e| DiskCacheError::SuperfileOpen(format!("join error: {e}")))??;
         }
         let mut guard = file.lock().await;
         guard.flush().await?;
@@ -1112,9 +1097,7 @@ async fn finalize_to_mmap(
                     reader: Arc::new(reader),
                     mmap: Some(mmap_arc),
                     size_bytes: size,
-                    last_access_us: AtomicU64::new(
-                        store.started_at.elapsed().as_micros() as u64,
-                    ),
+                    last_access_us: AtomicU64::new(store.started_at.elapsed().as_micros() as u64),
                 });
             }
             Entry::Vacant(_) => {
