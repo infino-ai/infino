@@ -347,8 +347,8 @@ fn bench(c: &mut Criterion) {
         });
 
         g.finish();
-        let peak = rss_sample.stop();
-        let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_BUILD, &bench_id, peak);
+        let stats = rss_sample.stop_stats();
+        let _ = rss::write_rss_stats(group_name::SUPERTABLE_VEC_BUILD, &bench_id, stats);
 
         emit_ingest_markdown();
     }
@@ -384,12 +384,12 @@ fn bench(c: &mut Criterion) {
         }
 
         g.finish();
-        let peak = rss_sample.stop();
+        let stats = rss_sample.stop_stats();
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
             let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
             if cal.supertable[i].is_some() {
                 let bid = format!("supertable_{label}");
-                let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_SEARCH, &bid, peak);
+                let _ = rss::write_rss_stats(group_name::SUPERTABLE_VEC_SEARCH, &bid, stats);
             }
         }
 
@@ -416,16 +416,22 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "### Supertable vector — ingest ({N_DOCS} docs × dim={DIM}, sharded into {N_SEGMENTS} superfiles)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput | Peak RSS | Peak RSS Δ |\n");
-    body.push_str("|--------|------|------------|----------|------------|\n");
+    body.push_str(
+        "| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|--------|------|------------|----------|------------|---------|------------|\n",
+    );
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+    let median_rss = rss::fmt_median_rss(group, &bench);
+    let p90_rss = rss::fmt_p90_rss(group, &bench);
     let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
     body.push_str(&format!(
-        "| supertable | {time} | {thrpt} | {rss_cell} | {rss_delta} |\n"
+        "| supertable | {time} | {thrpt} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n"
     ));
 
     markdown::emit(&MarkdownSection {
@@ -445,34 +451,45 @@ fn emit_search_markdown() {
         "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS | Peak RSS Δ |\n",
+        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|---------------|--------------------------------|----------------|----------|------------|\n",
+        "|---------------|--------------------------------|----------------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
-        let (cell, ns, rss_cell, rss_delta) = match cal.supertable[i] {
+        let (cell, ns, rss_cell, median_rss, p90_rss, rss_delta) = match cal.supertable[i] {
             Some(c) => {
                 let bid = format!("supertable_{label}");
                 let ns = read_mean_ns(group, &bid);
                 let peak = rss::read_peak_rss_bytes(group, &bid);
                 let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+                let median_rss = rss::fmt_median_rss(group, &bid);
+                let p90_rss = rss::fmt_p90_rss(group, &bid);
                 let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
                 (
                     format!("(p={}, r={})", c.probe, c.refine),
                     ns,
                     rss_cell,
+                    median_rss,
+                    p90_rss,
                     rss_delta,
                 )
             }
-            None => ("—".into(), None, "—".into(), "—".into()),
+            None => (
+                "—".into(),
+                None,
+                "—".into(),
+                "—".into(),
+                "—".into(),
+                "—".into(),
+            ),
         };
         let t = ns.map(fmt_time).unwrap_or_else(|| "—".into());
         body.push_str(&format!(
-            "| {row_target} | {cell} | {t} | {rss_cell} | {rss_delta} |\n"
+            "| {row_target} | {cell} | {t} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n"
         ));
     }
 
