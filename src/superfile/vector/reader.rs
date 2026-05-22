@@ -162,74 +162,8 @@ impl VectorReader {
             }));
         }
 
-        // CRC verification: the outer-blob scan and per-subsection scans
-        // each touch ~1.5 GiB at 1M x 384; together they're the bulk of
-        // cold-open cost when `verify_crc=true`. The scans are independent,
-        // so verify them in parallel and let the checksum module's CLMUL
-        // implementation handle each byte stream quickly.
         if opts.verify_crc {
-            struct CrcJob<'a> {
-                idx: i32,
-                bytes: &'a [u8],
-                expected: u32,
-            }
-
-            let mut jobs: Vec<CrcJob<'_>> = Vec::with_capacity(n_columns + 1);
-
-            let outer_total = blob.len();
-            let outer_crc_pos = outer_total - 4;
-            jobs.push(CrcJob {
-                idx: -1,
-                bytes: &blob[..outer_crc_pos],
-                expected: read_u32_le(&blob[outer_crc_pos..outer_total]),
-            });
-
-            for i in 0..n_columns {
-                let entry_off = i * DIR_ENTRY_SIZE;
-                let subsection_off =
-                    read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
-                let subsection_len =
-                    read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
-                let sub_end = subsection_off + subsection_len;
-                if sub_end > blob.len() {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "subsection {i} runs past blob"
-                    ))));
-                }
-                let sub = &blob[subsection_off..sub_end];
-                if sub.len() < SUB_HEADER_SIZE + 4 {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "subsection {i} too short"
-                    ))));
-                }
-                let sub_crc_pos = sub.len() - 4;
-                jobs.push(CrcJob {
-                    idx: i as i32,
-                    bytes: &sub[..sub_crc_pos],
-                    expected: read_u32_le(&sub[sub_crc_pos..]),
-                });
-            }
-
-            let mismatch = jobs.par_iter().find_map_any(|job| {
-                if crc32c(job.bytes) != job.expected {
-                    Some(job.idx)
-                } else {
-                    None
-                }
-            });
-            if let Some(idx) = mismatch {
-                if idx < 0 {
-                    return Err(VectorError::Read(ReadError::ChecksumMismatch {
-                        section: "vector",
-                        column: String::new(),
-                    }));
-                }
-                let i = idx as usize;
-                return Err(VectorError::Read(ReadError::ChecksumMismatch {
-                    section: "vector/subsection",
-                    column: format!(" (column index {i})"),
-                }));
-            }
+            verify_vector_crcs(&blob, dir_bytes, n_columns)?;
         }
 
         // Parse JSON.
@@ -631,6 +565,76 @@ fn read_u64_le(b: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&b[0..8]);
     u64::from_le_bytes(buf)
+}
+
+#[inline]
+fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Result<(), VectorError> {
+    struct CrcJob<'a> {
+        idx: i32,
+        bytes: &'a [u8],
+        expected: u32,
+    }
+
+    let mut jobs: Vec<CrcJob<'_>> = Vec::with_capacity(n_columns + 1);
+
+    let outer_total = blob.len();
+    let outer_crc_pos = outer_total - 4;
+    jobs.push(CrcJob {
+        idx: -1,
+        bytes: &blob[..outer_crc_pos],
+        expected: read_u32_le(&blob[outer_crc_pos..outer_total]),
+    });
+
+    for i in 0..n_columns {
+        let entry_off = i * DIR_ENTRY_SIZE;
+        let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
+        let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
+        let sub_end = subsection_off + subsection_len;
+        if sub_end > blob.len() {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "subsection {i} runs past blob"
+            ))));
+        }
+        let sub = &blob[subsection_off..sub_end];
+        if sub.len() < SUB_HEADER_SIZE + 4 {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "subsection {i} too short"
+            ))));
+        }
+        let sub_crc_pos = sub.len() - 4;
+        jobs.push(CrcJob {
+            idx: i as i32,
+            bytes: &sub[..sub_crc_pos],
+            expected: read_u32_le(&sub[sub_crc_pos..]),
+        });
+    }
+
+    // The outer-blob scan and per-subsection scans each touch ~1.5 GiB
+    // at 1M x 384. They are independent, so run them as parallel jobs
+    // and let the checksum module's CLMUL implementation handle each
+    // byte stream quickly.
+    let mismatch = jobs.par_iter().find_map_any(|job| {
+        if crc32c(job.bytes) != job.expected {
+            Some(job.idx)
+        } else {
+            None
+        }
+    });
+    if let Some(idx) = mismatch {
+        if idx < 0 {
+            return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                section: "vector",
+                column: String::new(),
+            }));
+        }
+        let i = idx as usize;
+        return Err(VectorError::Read(ReadError::ChecksumMismatch {
+            section: "vector/subsection",
+            column: format!(" (column index {i})"),
+        }));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
