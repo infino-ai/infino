@@ -191,6 +191,19 @@ fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: 
     supertable_to_global_ids(st, hits, chunk_size)
 }
 
+fn supertable_search_and_global(
+    st: &Supertable,
+    query: &str,
+    k: usize,
+    chunk_size: usize,
+) -> Vec<u64> {
+    let r = st.reader();
+    let hits = r
+        .bm25_search("title", query, k, BoolMode::And)
+        .expect("supertable bm25 AND");
+    supertable_to_global_ids(st, hits, chunk_size)
+}
+
 fn supertable_prefix_global(
     st: &Supertable,
     prefix: &str,
@@ -230,6 +243,27 @@ fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u
     let mut all: Vec<(u64, f32)> = Vec::new();
     for o in oracles {
         all.extend(o.top_k(query, k, tok.as_ref()));
+    }
+    all.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    all.truncate(k);
+    all.into_iter().map(|(d, _)| d).collect()
+}
+
+/// Same as [`brute_force_top_k`] but for a multi-term explicit
+/// AND query. Each segment scores its AND intersection
+/// independently; the global merge keeps the highest-scoring docs
+/// across segments. Mirrors the supertable's AND fan-out shape.
+fn brute_force_and_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
+    let tok = default_tokenizer();
+    let mut terms: Vec<String> = Vec::new();
+    tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
+    let mut all: Vec<(u64, f32)> = Vec::new();
+    for o in oracles {
+        all.extend(o.top_k_terms_and(&terms, k));
     }
     all.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -362,6 +396,55 @@ fn oracle_five_term_or_top5_matches() {
     let ora_top: HashSet<u64> = ora_hits.iter().take(5).copied().collect();
     assert_eq!(inf_top, want);
     assert_eq!(ora_top, want);
+}
+
+// ---- Tests: AND-mode oracle (multi-segment intersection) ------------
+
+#[test]
+fn oracle_two_term_and_matches() {
+    // "rust" + "async" co-occur in docs 0, 20, 22 — split across
+    // segments 0 (doc 0) and 1 (docs 20, 22), so this exercises
+    // multi-segment AND fan-out.
+    let f = &*STANDARD_FIXTURE;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust async", 10, CHUNK_SIZE);
+    let ora_hits = brute_force_and_top_k(&f.oracles, "rust async", 10);
+    let want: HashSet<u64> = [0u64, 20, 22].into_iter().collect();
+    let inf_set: HashSet<u64> = inf_hits.iter().copied().collect();
+    let ora_set: HashSet<u64> = ora_hits.iter().copied().collect();
+    assert_eq!(inf_set, want, "supertable AND={inf_hits:?}");
+    assert_eq!(ora_set, want, "oracle AND={ora_hits:?}");
+}
+
+#[test]
+fn oracle_three_term_and_singleton_match() {
+    // "rust" + "async" + "tokio" intersect only at doc 0 (segment 0).
+    let f = &*STANDARD_FIXTURE;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE);
+    assert_eq!(inf_hits, vec![0u64], "got {inf_hits:?}");
+}
+
+#[test]
+fn oracle_and_missing_term_returns_empty() {
+    // A globally absent term must short-circuit AND to empty even
+    // when the other term has many hits.
+    let f = &*STANDARD_FIXTURE;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust definitelynotpresent", 10, CHUNK_SIZE);
+    assert!(inf_hits.is_empty(), "got {inf_hits:?}");
+}
+
+#[test]
+fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
+    // "rust" + "kafka" — "rust" appears in every segment, but
+    // "kafka" only appears in doc 15 (segment 1) where "rust" does
+    // not co-occur. The intersection is empty across the whole
+    // table, but the test confirms that segments with the missing
+    // term contribute nothing and segments without the missing term
+    // also contribute nothing.
+    let f = &*STANDARD_FIXTURE;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust kafka", 10, CHUNK_SIZE);
+    let ora_hits = brute_force_and_top_k(&f.oracles, "rust kafka", 10);
+    assert!(inf_hits.is_empty(), "supertable AND must be empty; got {inf_hits:?}");
+    assert!(ora_hits.is_empty(), "oracle AND must be empty; got {ora_hits:?}");
 }
 
 // ---- Tests: prefix-row exercise ---------------------------------------

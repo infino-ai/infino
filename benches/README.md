@@ -51,21 +51,73 @@ which is the structured source of truth the markdown is derived from.
 ### FTS — superfile (single-segment, 1M docs)
 
 <!-- BEGIN: bench/fts/superfile/ingest -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts -- superfile_fts_build` to populate_
+### Superfile FTS — ingest (1000000 docs, Zipfian, 200 tokens/doc, 10K vocab)
+
+| Engine                       | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|------------------------------|------------|------------|-----------|------------|-----------|------------|
+| infino_1thread               | 9.30 s     | 107.5 K/s  | 0 B       | 0 B        | 0 B       | —          |
+| infino_rayon_default_threads | 815.44 ms  | 1.23 M/s   | 0 B       | 0 B        | 0 B       | —          |
+
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts -- superfile_fts_search` to populate_
+### Superfile FTS — search (1000000 docs)
+
+| Query          | infino     | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|-----------|------------|-----------|------------|
+**OR queries:**
+
+| single_rare    | 260 ns     | 0 B       | 0 B        | 0 B       | —          |
+| single_df1     | 119 ns     | 0 B       | 0 B        | 0 B       | —          |
+| single_common  | 14.83 µs   | 0 B       | 0 B        | 0 B       | —          |
+| two_term_or    | 106.07 µs  | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_or  | 1.61 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_or | 9.07 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_or   | 15.69 ms   | 0 B       | 0 B        | 0 B       | —          |
+
+**AND queries:**
+
+| two_term_and   | 4.44 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_and | 3.33 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_and | 4.58 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_and  | 5.11 ms    | 0 B       | 0 B        | 0 B       | —          |
+
+**Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):
+
+| Shape         | WAND+BMW   | MaxScore+BMM |
+|---------------|------------|--------------|
+| wide_3_or     | 4.80 ms    | 1.34 ms      |
+| similar_3_or  | 9.17 ms    | 5.98 ms      |
+| similar_5_or  | 26.35 ms   | 10.07 ms     |
+
 <!-- END: bench/fts/superfile/search -->
 
 ### FTS — supertable (multi-segment, 10M docs)
 
 <!-- BEGIN: bench/fts/supertable/ingest -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts -- supertable_fts_build` to populate_
+### Supertable FTS — ingest (10000000 docs, Zipfian, 200 tokens/doc, 10K vocab)
+
+| Engine                  | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|-------------------------|------------|------------|-----------|------------|-----------|------------|
+| infino_auto_writer_pool | 41.97 s    | 238.3 K/s  | 0 B       | 0 B        | 0 B       | —          |
+
+*Output cardinality: infino emits `min(writer_pool.threads, total_rows)` superfiles per commit (auto = cpus/2). Override with `INFINO_SUPERTABLE__WRITER_THREADS=N` for a specific shard count.*
+
 <!-- END: bench/fts/supertable/ingest -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts -- supertable_fts_search` to populate_
+### Supertable FTS — search (10000000 docs)
+
+| Query          | infino     | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|-----------|------------|-----------|------------|
+| single_rare    | 42.69 µs   | 0 B       | 0 B        | 0 B       | —          |
+| single_common  | 57.57 µs   | 0 B       | 0 B        | 0 B       | —          |
+| two_term_or    | 301.85 µs  | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_or  | 2.67 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_or | 8.32 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_or   | 14.18 ms   | 0 B       | 0 B        | 0 B       | —          |
+| prefix         | 33.19 ms   | 0 B       | 0 B        | 0 B       | —          |
+
 <!-- END: bench/fts/supertable/search -->
 
 ### Vector — superfile (single-segment, 1M × 384)

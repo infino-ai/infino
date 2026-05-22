@@ -389,30 +389,6 @@ impl FtsReader {
             .collect()
     }
 
-    /// Read one doc's length (u16, LE) from the column's doc-lengths
-    /// array. Manual byte extraction — avoids any alignment requirement
-    /// on the underlying `Bytes` buffer.
-    ///
-    /// Hot path: called once per (doc, term) during BM25 scoring. Kept
-    /// branch-free in release.
-    #[inline(always)]
-    fn doc_len(&self, column_id: u32, doc_id: u32) -> u16 {
-        debug_assert!(
-            doc_id < self.n_docs,
-            "doc_id {doc_id} out of range vs n_docs {} — caller invariant violation",
-            self.n_docs,
-        );
-        let r = &self.columns[column_id as usize].doc_lengths_range;
-        // 64-bit-only crate: `(doc_id as usize) * 2` cannot overflow
-        // (max doc_id is u32::MAX, max product is ~2^33). The bounds
-        // check below catches any column-internal range mismatch.
-        let off = r.start + (doc_id as usize) * 2;
-        if off + 2 > r.end {
-            return 0;
-        }
-        u16::from_le_bytes([self.blob[off], self.blob[off + 1]])
-    }
-
     /// Single-column BM25 search.
     ///
     /// `terms` are the *already-tokenized* query terms — caller-tokenized
@@ -445,111 +421,27 @@ impl FtsReader {
             return self.search_single_term_bmw(column_id, terms[0], k);
         }
 
-        // Multi-term OR routes to MaxScore+BMM via
-        // `dispatch_multi_term_or`. WAND+BMW remains in-tree for
-        // the bench harness (`search_with_algo_for_bench`) but is
-        // not used by `search`; see the routing-decision table on
-        // `dispatch_multi_term_or` for why BMM wins on the shapes
-        // we benchmark. AND mode continues to use the full-decode
-        // + HashMap intersection path below.
-        if mode == BoolMode::Or {
-            return self.dispatch_multi_term_or(column_id, terms, k);
-        }
-
-        let dict = self.dict();
-        let col_meta = &self.columns[column_id as usize];
-        let avgdl = col_meta.avgdl;
-
-        // Decode each term's full posting list. Build per-doc score map.
-        // For OR/AND simplicity, we accumulate scores into a HashMap.
-        let mut term_postings: Vec<(f32 /* idf_t */, Vec<(u32, u32)>)> = Vec::new();
-        for term in terms {
-            let key = make_key(&col_meta.name, term);
-            let value = dict.lookup(&key);
-            match value {
-                Some(packed) => {
-                    let pl: Vec<(u32, u32)> = match FstValue::unpack(packed) {
-                        FstValue::Inline { doc_id, tf } => vec![(doc_id, tf)],
-                        FstValue::Pfor { metadata_offset } => {
-                            self.decode_term_postings(metadata_offset as usize)?
-                        }
-                    };
-                    let df = pl.len() as u64;
-                    let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, df);
-                    term_postings.push((idf_t, pl));
-                }
-                None => {
-                    if mode == BoolMode::And {
-                        // AND: any missing term short-circuits.
-                        return Ok(Vec::new());
-                    }
-                    // OR: missing terms simply contribute nothing.
-                }
-            }
-        }
-
-        if term_postings.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Score docs:
-        //   AND: only docs present in EVERY term posting list.
-        //   OR:  union of doc ids across term posting lists; sum scores.
-        let scored: HashMap<u32, f32> = match mode {
-            BoolMode::Or => {
-                let mut scores: HashMap<u32, f32> = HashMap::new();
-                for (idf_t, postings) in &term_postings {
-                    for (doc_id, tf) in postings {
-                        let dl = self.doc_len(column_id, *doc_id) as u32;
-                        let s = crate::superfile::fts::bm25::score(*idf_t, *tf, dl, avgdl);
-                        *scores.entry(*doc_id).or_insert(0.0) += s;
-                    }
-                }
-                scores
-            }
+        // Multi-term routing:
+        //   OR  → MaxScore+BMM via `dispatch_multi_term_or`. WAND+BMW
+        //         remains in-tree for `search_with_algo_for_bench` but
+        //         is not on the production path; see the routing-
+        //         decision table on `dispatch_multi_term_or`.
+        //   AND → leapfrog intersection over the skip table via
+        //         `run_and_intersect`. Both share cursor construction
+        //         with the OR path so neither pays for cursor work
+        //         twice when the bench harness compares them.
+        match mode {
+            BoolMode::Or => self.dispatch_multi_term_or(column_id, terms, k),
             BoolMode::And => {
-                if term_postings.iter().any(|(_, pl)| pl.is_empty()) {
+                // Build cursors; if any term is missing, the
+                // intersection is empty.
+                let cursors = self.build_term_cursors(column_id, terms)?;
+                if cursors.len() != terms.len() {
                     return Ok(Vec::new());
                 }
-                // Use the smallest posting list to drive the AND-merge.
-                let (smallest_idx, _) = term_postings
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (_, pl))| pl.len())
-                    .expect("term_postings non-empty by the early-return above");
-                let driver = &term_postings[smallest_idx].1;
-                let other_sets: Vec<HashMap<u32, u32>> = term_postings
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != smallest_idx)
-                    .map(|(_, (_, pl))| pl.iter().copied().collect())
-                    .collect();
-                let mut scores: HashMap<u32, f32> = HashMap::new();
-                for (doc_id, tf) in driver {
-                    if other_sets.iter().all(|s| s.contains_key(doc_id)) {
-                        let dl = self.doc_len(column_id, *doc_id) as u32;
-                        let mut total = crate::superfile::fts::bm25::score(
-                            term_postings[smallest_idx].0,
-                            *tf,
-                            dl,
-                            avgdl,
-                        );
-                        for (i, (idf_t, _)) in term_postings.iter().enumerate() {
-                            if i == smallest_idx {
-                                continue;
-                            }
-                            let other_tf = other_sets[other_idx(i, smallest_idx)][doc_id];
-                            total +=
-                                crate::superfile::fts::bm25::score(*idf_t, other_tf, dl, avgdl);
-                        }
-                        scores.insert(*doc_id, total);
-                    }
-                }
-                scores
+                self.run_and_intersect(column_id, cursors, k)
             }
-        };
-
-        Ok(top_k(scored, k))
+        }
     }
 
     /// Multi-term OR BM25 search constrained to a doc_id sub-range.
@@ -1127,6 +1019,135 @@ impl FtsReader {
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX)
+    }
+
+    /// Multi-term AND via leapfrog intersection over the skip table.
+    ///
+    /// The smallest-df cursor is the leader: every matching doc must
+    /// be in its posting list. For each leader doc, every other
+    /// cursor runs `skip_to(candidate)` — a skip-table-driven jump
+    /// that decodes at most one block per call (and zero if the
+    /// target lies in the already-decoded block). If any cursor
+    /// lands past the candidate, that doc isn't in the intersection;
+    /// the candidate is bumped to the new high-water mark and the
+    /// remaining cursors re-skip. When all cursors converge on the
+    /// same doc, the BM25 contribution from each is summed.
+    ///
+    /// Cost is bounded by `min_df` leader steps × `n_terms` skip_to
+    /// calls, with each skip_to a constant-or-O(log) skip-table walk.
+    /// The old `run_and` did a full PFOR decode of every term's full
+    /// posting list (dominated by the largest list, e.g. ~hundreds of
+    /// K postings for a common Zipfian term) followed by a HashMap
+    /// intersection — orders of magnitude more work than this when
+    /// any term is rare.
+    fn run_and_intersect(
+        &self,
+        column_id: u32,
+        mut cursors: Vec<TermCursor>,
+        k: usize,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let postings = &self.blob[self.postings_range.clone()];
+
+        // Smallest-df cursor at index 0 = leader. The remaining order
+        // doesn't matter for correctness but ascending-df reduces the
+        // expected number of leapfrog bumps per candidate.
+        cursors.sort_by_key(|c| c.block_count());
+
+        // Top-k min-heap. Same shape as `run_max_score_bmm`/`run_wand_bmw`:
+        // peek returns the smallest score so we can compare against
+        // a new candidate without a full sort.
+        #[derive(Debug, Copy, Clone)]
+        struct HeapEntry(f32, u32);
+        impl PartialEq for HeapEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0 && self.1 == other.1
+            }
+        }
+        impl Eq for HeapEntry {}
+        impl PartialOrd for HeapEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for HeapEntry {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other
+                    .0
+                    .partial_cmp(&self.0)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| other.1.cmp(&self.1))
+            }
+        }
+
+        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(initial_cap);
+
+        let n = cursors.len();
+        'outer: loop {
+            if cursors[0].is_exhausted() {
+                break;
+            }
+            let mut candidate = cursors[0].current_doc_id();
+
+            // Converge: re-skip all cursors until each lands on the
+            // same candidate. A cursor that ends up past candidate
+            // raises the candidate to its position; the next pass
+            // catches up the others.
+            loop {
+                let mut bumped = false;
+                for i in 0..n {
+                    cursors[i].skip_to(candidate, postings);
+                    if cursors[i].is_exhausted() {
+                        break 'outer;
+                    }
+                    let here = cursors[i].current_doc_id();
+                    if here != candidate {
+                        candidate = here;
+                        bumped = true;
+                        break;
+                    }
+                }
+                if !bumped {
+                    break;
+                }
+            }
+
+            // All cursors at `candidate` — sum BM25 contributions.
+            let norm = dl_norm_k1[candidate as usize];
+            let mut score = 0.0_f32;
+            for c in &cursors {
+                score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                    c.idf_x_k1p1,
+                    c.current_tf(),
+                    norm,
+                );
+            }
+
+            if heap.len() < k {
+                heap.push(HeapEntry(score, candidate));
+            } else if let Some(&worst) = heap.peek() {
+                // Tie-break by ascending doc_id (matches OR paths).
+                if score > worst.0 || (score == worst.0 && candidate < worst.1) {
+                    heap.pop();
+                    heap.push(HeapEntry(score, candidate));
+                }
+            }
+
+            cursors[0].next(postings);
+        }
+
+        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
     }
 
     /// MaxScore+BMM constrained to the doc_id half-open range
@@ -1737,70 +1758,13 @@ impl FtsReader {
             OrAlgo::Exhaustive => self.run_exhaustive_union(column_id, cursors, k),
         }
     }
-
-    /// Decode the full posting list for a (col, term) by walking every
-    /// block. Used by the AND-merge path; OR queries go through
-    /// [`Self::dispatch_multi_term_or`], single-term queries through
-    /// [`Self::search_single_term_bmw`].
-    fn decode_term_postings(
-        &self,
-        metadata_offset_in_postings_region: usize,
-    ) -> Result<Vec<(u32, u32)>, FtsError> {
-        let postings = &self.blob[self.postings_range.clone()];
-        let off = metadata_offset_in_postings_region;
-        if off + 20 > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "term metadata offset out of postings region".into(),
-            )));
-        }
-        let df = read_u32_le(&postings[off..off + 4]) as usize;
-        let _meta_self_offset = read_u64_le(&postings[off + 4..off + 12]);
-        let _length = read_u32_le(&postings[off + 12..off + 16]);
-        let num_blocks = u32::from_le_bytes([
-            postings[off + 16],
-            postings[off + 17],
-            postings[off + 18],
-            postings[off + 19],
-        ]) as usize;
-
-        // Skip table follows: num_blocks × 16 bytes. We don't use it for
-        // BMW yet; just step over to find the first block.
-        let skip_table_end = off + 20 + num_blocks * 16;
-
-        let mut block_off = skip_table_end;
-        let mut out: Vec<(u32, u32)> = Vec::with_capacity(df);
-        let mut buf_d = vec![0u32; BLOCK_LEN];
-        let mut buf_t = vec![0u32; BLOCK_LEN];
-        for _ in 0..num_blocks {
-            // Block layout: 8-byte header (doc_count, delta_bits, tf_bits, reserved, base) + bit-packed bytes.
-            // Compute its size from the header and decode in place.
-            let header = &postings[block_off..block_off + 8];
-            let delta_bits = header[1] as usize;
-            let tf_bits = header[2] as usize;
-            let block_size = 8 + (BLOCK_LEN * delta_bits / 8) + (BLOCK_LEN * tf_bits / 8);
-            let n = decode_block(
-                &postings[block_off..block_off + block_size],
-                &mut buf_d,
-                &mut buf_t,
-            );
-            for i in 0..n {
-                out.push((buf_d[i], buf_t[i]));
-            }
-            block_off += block_size;
-        }
-        Ok(out)
-    }
 }
 
-fn other_idx(i: usize, smallest: usize) -> usize {
-    // Helper to translate a "term_postings index" to the corresponding
-    // "other_sets index" (which excludes `smallest`).
-    if i < smallest { i } else { i - 1 }
-}
-
+/// Merge a `doc_id -> score` map into top-k by descending score, ties
+/// broken by ascending doc_id. Used by `search_multi`'s cross-column
+/// combiner, where the per-column scores have already been weighted
+/// and summed into `scores`.
 fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
-    // Min-heap of size k: pop the smallest when inserting a better
-    // score. Tie-break on doc_id ascending so the output is deterministic.
     #[derive(Debug)]
     struct Entry(u32, f32);
     impl PartialEq for Entry {
@@ -1816,10 +1780,8 @@ fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     }
     impl Ord for Entry {
         fn cmp(&self, other: &Self) -> Ordering {
-            // Reverse ordering for a min-heap: smaller score = "greater"
-            // in the heap so it pops first. Tie-break: larger doc_id is
-            // "greater" so it pops first (preferring smaller doc_id at
-            // the top in equal-score case).
+            // Min-heap by score (smaller score "greater" so it pops
+            // first); tie-break with smaller doc_id at the top.
             other
                 .1
                 .partial_cmp(&self.1)
@@ -1828,12 +1790,9 @@ fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
         }
     }
 
-    // Iterate in ascending doc_id order so ties resolve deterministically
-    // (smaller doc_ids enter the heap first; the strict `score > peek`
-    // check below means subsequent equal-score entries don't displace
-    // them). Without this, HashMap's hash-order iteration would make the
-    // tied result non-deterministic and would disagree with the BMW
-    // single-term path (which naturally iterates in doc_id order).
+    // Iterate in ascending doc_id order so equal-score ties resolve
+    // deterministically — HashMap's hash order would otherwise make
+    // the top-k output non-deterministic.
     let mut sorted: Vec<(u32, f32)> = scores.into_iter().collect();
     sorted.sort_by_key(|(d, _)| *d);
 
@@ -1849,7 +1808,6 @@ fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
         }
     }
     let mut out: Vec<(u32, f32)> = heap.into_iter().map(|Entry(d, s)| (d, s)).collect();
-    // Sort descending by score, ascending by doc_id on ties.
     out.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
@@ -2069,6 +2027,16 @@ impl TermCursor {
 
     fn is_exhausted(&self) -> bool {
         self.current_block >= self.blocks.len()
+    }
+
+    /// Total number of postings (df) for this term. Used by AND
+    /// intersection to pick the rarest cursor as the leader.
+    /// Block count is an exact upper bound on df (df = (n-1)*BLOCK_LEN
+    /// + last_block_n); cursor count comparison via this method gives
+    /// stable smallest-first ordering. Inline cursors return 1.
+    #[inline(always)]
+    fn block_count(&self) -> usize {
+        self.blocks.len()
     }
 
     #[inline(always)]

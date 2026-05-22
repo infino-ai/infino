@@ -275,6 +275,161 @@ fn oracle_no_match_query_returns_empty() {
     );
 }
 
+// ─── AND-mode oracles ─────────────────────────────────────────────────
+
+fn infino_top_k_and(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
+    // The reader's `bm25_search` consumes a pre-built query string,
+    // tokenizes it column-internally, and runs the AND intersection.
+    // Returned `local_doc_id` == user `doc_id` thanks to the planted
+    // 0..N row layout.
+    let hits = reader
+        .bm25_search("title", query, k, BoolMode::And)
+        .expect("AND BM25 search");
+    hits.into_iter().map(|(d, _)| d as u64).collect()
+}
+
+fn assert_top_k_and_set_matches(
+    infino: &SuperfileReader,
+    oracle: &BruteForceBm25,
+    query: &str,
+    head_size: usize,
+    k: usize,
+) {
+    let tok = default_tokenizer();
+    let mut terms: Vec<String> = Vec::new();
+    use infino::superfile::fts::tokenize::Tokenizer as _;
+    tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
+    let infino_hits = infino_top_k_and(infino, query, k);
+    let oracle_hits: Vec<u64> = oracle
+        .top_k_terms_and(&terms, k)
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    assert!(
+        infino_hits.len() >= head_size && oracle_hits.len() >= head_size,
+        "AND query {query:?}: not enough hits — infino={infino_hits:?} oracle={oracle_hits:?}"
+    );
+    let infino_head: HashSet<u64> = infino_hits.into_iter().take(head_size).collect();
+    let oracle_head: HashSet<u64> = oracle_hits.into_iter().take(head_size).collect();
+    assert_eq!(
+        infino_head, oracle_head,
+        "AND query {query:?}: top-{head_size} sets disagree"
+    );
+}
+
+#[test]
+fn oracle_and_two_term_overlap_top3_matches() {
+    // "rust" and "async" co-occur only in docs 0, 20, 22. Both engines
+    // must return exactly that set as the AND result.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+    let infino_set: HashSet<u64> = infino_top_k_and(&infino, "rust async", 10).into_iter().collect();
+    assert_eq!(
+        infino_set,
+        HashSet::from([0u64, 20, 22]),
+        "AND(rust, async) must be exactly {{0, 20, 22}}; got {infino_set:?}"
+    );
+    assert_top_k_and_set_matches(&infino, &oracle, "rust async", 3, 10);
+}
+
+#[test]
+fn oracle_and_three_term_singleton_match() {
+    // "rust async tokio" all co-occur only in doc 0. Tightens the
+    // intersection to one doc and verifies the leapfrog over three
+    // cursors reduces correctly.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let infino_hits = infino_top_k_and(&infino, "rust async tokio", 10);
+    assert_eq!(
+        infino_hits, vec![0u64],
+        "AND(rust, async, tokio) must be exactly [0]; got {infino_hits:?}"
+    );
+}
+
+#[test]
+fn oracle_and_missing_term_returns_empty() {
+    // A term that's absent from the entire corpus must short-circuit
+    // AND to empty — even though "rust" alone has many hits.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let hits = infino_top_k_and(&infino, "rust definitely-not-a-token", 10);
+    assert!(
+        hits.is_empty(),
+        "AND with missing term must return []; got {hits:?}"
+    );
+}
+
+#[test]
+fn oracle_and_disjoint_terms_return_empty() {
+    // Two terms that both appear in the corpus but never co-occur
+    // ("python" in docs 2-3; "kafka" in doc 15). AND yields no docs.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let hits = infino_top_k_and(&infino, "python kafka", 10);
+    assert!(
+        hits.is_empty(),
+        "AND with disjoint posting lists must return []; got {hits:?}"
+    );
+}
+
+#[test]
+fn oracle_and_scores_match_brute_force_ordering() {
+    // For docs in the AND intersection of "rust" and "framework"
+    // (only doc 8), the per-doc BM25 score must match brute force
+    // bit-exactly — there's no rank ambiguity, so we can compare
+    // values directly.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+    let mut terms: Vec<String> = Vec::new();
+    use infino::superfile::fts::tokenize::Tokenizer as _;
+    tok.tokenize_each("rust framework", &mut |t| terms.push(t.to_owned()));
+
+    let infino_hits: Vec<(u64, f32)> = infino
+        .bm25_search("title", "rust framework", 10, BoolMode::And)
+        .expect("AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let oracle_hits = oracle.top_k_terms_and(&terms, 10);
+    assert_eq!(
+        infino_hits.len(),
+        oracle_hits.len(),
+        "AND(rust, framework) hit counts disagree: infino={infino_hits:?} oracle={oracle_hits:?}"
+    );
+    for ((i_doc, i_score), (o_doc, o_score)) in infino_hits.iter().zip(oracle_hits.iter()) {
+        assert_eq!(*i_doc, *o_doc, "doc-id mismatch");
+        // f32 BM25 sums diverge by ~1e-4 between the two scorers due
+        // to operand ordering (infino precomputes idf_x_k1p1 and
+        // dl_norm_k1; the oracle multiplies term-by-term). 1e-3 is
+        // tighter than any meaningful BM25 score gap on this corpus.
+        let delta = (i_score - o_score).abs();
+        assert!(
+            delta < 1e-3,
+            "score divergence on doc {i_doc}: infino={i_score} oracle={o_score} delta={delta}"
+        );
+    }
+}
+
+#[test]
+fn oracle_and_single_term_routed_consistently() {
+    // BoolMode::And with a single term must route the same as
+    // BoolMode::Or (both fall through to the single-term BMW path).
+    // Asserting symmetry catches the case where AND's branch
+    // accidentally skips the early single-term short-circuit.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let and_hits = infino_top_k_and(&infino, "rare-token-zzz", 5);
+    let or_hits = infino_top_k(&infino, "rare-token-zzz", 5);
+    assert_eq!(and_hits, or_hits);
+    assert_eq!(and_hits, vec![17u64]);
+}
+
+// ─── (resume existing OR oracles) ─────────────────────────────────────
+
 #[test]
 fn oracle_long_doc_vs_short_doc_dl_norm() {
     // BM25's dl-norm should make short docs that contain a term rank
