@@ -18,7 +18,7 @@
 
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::corpus::{self, Calibrated, DIM};
 use crate::{markdown, rss};
@@ -44,6 +44,7 @@ const N_CORRECTNESS_QUERIES: usize = 20;
 const N_CALIBRATION_QUERIES: usize = 100;
 
 const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
+const BUILD_MEASUREMENT_TIME: Duration = Duration::from_secs(60 * 60);
 
 /// Per-segment probe grid. The supertable applies a single `nprobe`
 /// to every segment, so the effective probe count is `nprobe ×
@@ -333,6 +334,7 @@ fn bench(c: &mut Criterion) {
         let v = vectors();
         let mut g = c.benchmark_group("supertable_vec_build");
         g.sample_size(10);
+        g.measurement_time(BUILD_MEASUREMENT_TIME);
         g.throughput(Throughput::Elements(N_DOCS as u64));
 
         let rss_sample = rss::PeakSampler::start_default();
