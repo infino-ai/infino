@@ -133,10 +133,10 @@ fn assert_bmw_matches_brute_force(reader: &FtsReader) -> usize {
         ("single_rare", &["term09999"]),
         ("single_common", &["term00001"]),
         ("two_term_or", &["term00001", "term00050"]),
-        ("three_wide", &["term00001", "term00050", "term00100"]),
-        ("three_similar", &["term00050", "term00051", "term00052"]),
+        ("three_wide_or", &["term00001", "term00050", "term00100"]),
+        ("three_similar_or", &["term00050", "term00051", "term00052"]),
         (
-            "five_term",
+            "five_term_or",
             &[
                 "term00050",
                 "term00051",
@@ -301,21 +301,21 @@ fn bench(c: &mut Criterion) {
         );
         bench_infino(
             &mut g,
-            "three_wide",
+            "three_wide_or",
             &r,
             &["term00001", "term00050", "term00100"],
             BoolMode::Or,
         );
         bench_infino(
             &mut g,
-            "three_similar",
+            "three_similar_or",
             &r,
             &["term00050", "term00051", "term00052"],
             BoolMode::Or,
         );
         bench_infino(
             &mut g,
-            "five_term",
+            "five_term_or",
             &r,
             &[
                 "term00050",
@@ -364,19 +364,19 @@ fn bench(c: &mut Criterion) {
         // Per-algo probes
         bench_per_algo_probe(
             &mut g,
-            "wide_3",
+            "wide_3_or",
             &r,
             &["term00001", "term00050", "term00100"],
         );
         bench_per_algo_probe(
             &mut g,
-            "similar_3",
+            "similar_3_or",
             &r,
             &["term00050", "term00051", "term00052"],
         );
         bench_per_algo_probe(
             &mut g,
-            "similar_5",
+            "similar_5_or",
             &r,
             &[
                 "term00050",
@@ -397,19 +397,19 @@ fn bench(c: &mut Criterion) {
             "single_df1_infino_top10",
             "single_common_infino_top10",
             "two_term_or_infino_top10",
-            "three_wide_infino_top10",
-            "three_similar_infino_top10",
-            "five_term_infino_top10",
+            "three_wide_or_infino_top10",
+            "three_similar_or_infino_top10",
+            "five_term_or_infino_top10",
             "two_term_and_infino_top10",
             "three_wide_and_infino_top10",
             "three_similar_and_infino_top10",
             "five_term_and_infino_top10",
-            "wide_3_wand_top10",
-            "wide_3_bmm_top10",
-            "similar_3_wand_top10",
-            "similar_3_bmm_top10",
-            "similar_5_wand_top10",
-            "similar_5_bmm_top10",
+            "wide_3_or_wand_top10",
+            "wide_3_or_bmm_top10",
+            "similar_3_or_wand_top10",
+            "similar_3_or_bmm_top10",
+            "similar_5_or_wand_top10",
+            "similar_5_or_bmm_top10",
         ];
         for bid in search_ids {
             let _ = rss::write_rss_stats(group_name::SUPERFILE_FTS_SEARCH, bid, stats);
@@ -499,9 +499,9 @@ fn emit_search_markdown() {
         "single_df1",
         "single_common",
         "two_term_or",
-        "three_wide",
-        "three_similar",
-        "five_term",
+        "three_wide_or",
+        "three_similar_or",
+        "five_term_or",
     ];
     let queries_and = [
         "two_term_and",
@@ -546,7 +546,7 @@ fn emit_search_markdown() {
     body.push_str("**Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):\n\n");
     body.push_str("| Shape         | WAND+BMW   | MaxScore+BMM |\n");
     body.push_str("|---------------|------------|--------------|\n");
-    for shape in ["wide_3", "similar_3", "similar_5"] {
+    for shape in ["wide_3_or", "similar_3_or", "similar_5_or"] {
         let wand = read_mean_ns(group, &format!("{shape}_wand_top10"));
         let bmm = read_mean_ns(group, &format!("{shape}_bmm_top10"));
         let wand_s = wand.map(fmt_time).unwrap_or_else(|| "—".into());

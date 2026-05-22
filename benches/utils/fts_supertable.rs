@@ -226,10 +226,10 @@ fn bench_search(c: &mut Criterion) {
         ("single_rare", "term09999"),
         ("single_common", "term00001"),
         ("two_term_or", "term00001 term00050"),
-        ("three_wide", "term00001 term00050 term00100"),
-        ("three_similar", "term00050 term00051 term00052"),
+        ("three_wide_or", "term00001 term00050 term00100"),
+        ("three_similar_or", "term00050 term00051 term00052"),
         (
-            "five_term",
+            "five_term_or",
             "term00050 term00051 term00052 term00053 term00054",
         ),
     ];
@@ -261,9 +261,9 @@ fn bench_search(c: &mut Criterion) {
         "single_rare_supertable_top10",
         "single_common_supertable_top10",
         "two_term_or_supertable_top10",
-        "three_wide_supertable_top10",
-        "three_similar_supertable_top10",
-        "five_term_supertable_top10",
+        "three_wide_or_supertable_top10",
+        "three_similar_or_supertable_top10",
+        "five_term_or_supertable_top10",
         "prefix_supertable_top10",
     ];
     for bid in search_ids {
@@ -337,9 +337,9 @@ fn emit_search_markdown() {
         "single_rare",
         "single_common",
         "two_term_or",
-        "three_wide",
-        "three_similar",
-        "five_term",
+        "three_wide_or",
+        "three_similar_or",
+        "five_term_or",
         "prefix",
     ];
     for q in queries {
