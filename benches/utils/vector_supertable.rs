@@ -18,8 +18,10 @@
 
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::corpus::{self, Calibrated, DIM};
+use crate::{markdown, rss};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, Throughput, criterion_group};
@@ -28,8 +30,6 @@ use infino::superfile::vector::distance::Metric;
 use infino::supertable::query::SuperfileHit;
 use infino::supertable::query::vector::VectorSearchOptions;
 use infino::supertable::{Supertable, SupertableOptions};
-use crate::corpus::{self, Calibrated, DIM};
-use crate::{markdown, rss};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -44,6 +44,7 @@ const N_CORRECTNESS_QUERIES: usize = 20;
 const N_CALIBRATION_QUERIES: usize = 100;
 
 const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
+const BUILD_MEASUREMENT_TIME: Duration = Duration::from_secs(60 * 60);
 
 /// Per-segment probe grid. The supertable applies a single `nprobe`
 /// to every segment, so the effective probe count is `nprobe ×
@@ -315,9 +316,48 @@ fn calibrations() -> &'static Calibrations {
     })
 }
 
-// ─── Bench entry ──────────────────────────────────────────────────────
+// ─── Bench: ingest (group: supertable_vec_build) ──────────────────────
+//
+// Registered ahead of `bench_search` in `criterion_group!` so the
+// build's criterion warm-up runs before the shared `SUPERTABLE`
+// OnceLock is filled. Peak RSS during the build is one fresh
+// iteration's supertable only — the alternative (filling SUPERTABLE
+// from a top-level correctness phase, then running the build) holds
+// two 10M × 384 supertables simultaneously and SIGKILLs on a 32 GiB
+// box. Mirrors the FTS supertable bench split.
 
-fn bench(c: &mut Criterion) {
+fn bench_ingest(c: &mut Criterion) {
+    let v = vectors();
+
+    let mut g = c.benchmark_group("supertable_vec_build");
+    g.sample_size(10);
+    g.measurement_time(BUILD_MEASUREMENT_TIME);
+    g.throughput(Throughput::Elements(N_DOCS as u64));
+
+    let rss_sample = rss::PeakSampler::start_default();
+    let bench_id = format!("supertable_{N_DOCS}docs_{N_SEGMENTS}superfiles");
+    g.bench_function(bench_id.clone(), |b| {
+        b.iter_with_large_drop(|| {
+            let _ = black_box(v);
+            build_supertable()
+        });
+    });
+
+    g.finish();
+    let peak = rss_sample.stop();
+    let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_BUILD, &bench_id, peak);
+
+    emit_ingest_markdown();
+}
+
+// ─── Bench: search (group: supertable_vec_search) ─────────────────────
+
+fn bench_search(c: &mut Criterion) {
+    // First call into `supertable()` lazily fills the OnceLock with
+    // the shared supertable that correctness + calibration + search
+    // all consume. Done here, not at the top of the module, so the
+    // ingest bench above has already dropped its iterations and the
+    // resident set has settled before we allocate the long-lived one.
     eprintln!(
         "[supertable_vec] correctness: building supertable ({N_DOCS} docs × {N_SEGMENTS} superfiles)..."
     );
@@ -328,71 +368,45 @@ fn bench(c: &mut Criterion) {
         CORRECTNESS_RECALL_FLOOR
     );
 
-    // ---- Ingest sub-bench (group: supertable_vec_build) ------------
-    {
-        let v = vectors();
-        let mut g = c.benchmark_group("supertable_vec_build");
-        g.sample_size(10);
-        g.throughput(Throughput::Elements(N_DOCS as u64));
+    let cal = calibrations();
+    let qs = queries_calibration();
 
-        let rss_sample = rss::PeakSampler::start_default();
-        let bench_id = format!("supertable_{N_DOCS}docs_{N_SEGMENTS}superfiles");
-        g.bench_function(bench_id.clone(), |b| {
-            b.iter_with_large_drop(|| {
-                let _ = black_box(v);
-                build_supertable()
-            });
-        });
+    let mut g = c.benchmark_group("supertable_vec_search");
+    g.sample_size(10);
+    let rss_sample = rss::PeakSampler::start_default();
 
-        g.finish();
-        let peak = rss_sample.stop();
-        let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_BUILD, &bench_id, peak);
-
-        emit_ingest_markdown();
-    }
-
-    // ---- Search sub-bench (group: supertable_vec_search) -----------
-    {
-        let cal = calibrations();
-        let qs = queries_calibration();
-
-        let mut g = c.benchmark_group("supertable_vec_search");
-        g.sample_size(10);
-        let rss_sample = rss::PeakSampler::start_default();
-
-        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
-            if let Some(c_st) = cal.supertable[i] {
-                // Stable bench id: the calibrated (probe, refine) lives in
-                // the markdown table, not the criterion id, so criterion can
-                // match this row against its prior baseline and print its
-                // own improved/regressed delta on subsequent runs.
-                let (p, r) = (c_st.probe, c_st.refine);
-                g.bench_function(format!("supertable_{label}"), |b| {
-                    let q = &qs[0];
-                    let opts = VectorSearchOptions::new()
-                        .with_nprobe(p)
-                        .with_rerank_mult(r);
-                    b.iter(|| {
-                        let hits = supertable_topk(st, black_box(q), TOP_K, opts);
-                        black_box(hits)
-                    });
+    for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        if let Some(c_st) = cal.supertable[i] {
+            // Stable bench id: the calibrated (probe, refine) lives in
+            // the markdown table, not the criterion id, so criterion can
+            // match this row against its prior baseline and print its
+            // own improved/regressed delta on subsequent runs.
+            let (p, r) = (c_st.probe, c_st.refine);
+            g.bench_function(format!("supertable_{label}"), |b| {
+                let q = &qs[0];
+                let opts = VectorSearchOptions::new()
+                    .with_nprobe(p)
+                    .with_rerank_mult(r);
+                b.iter(|| {
+                    let hits = supertable_topk(st, black_box(q), TOP_K, opts);
+                    black_box(hits)
                 });
-            }
+            });
         }
-
-        g.finish();
-        let peak = rss_sample.stop();
-        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
-            if cal.supertable[i].is_some() {
-                let bid = format!("supertable_{label}");
-                let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_SEARCH, &bid, peak);
-            }
-        }
-
-        emit_search_markdown();
     }
+
+    g.finish();
+    let peak = rss_sample.stop();
+    for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        if cal.supertable[i].is_some() {
+            let bid = format!("supertable_{label}");
+            let _ = rss::write_peak_rss(group_name::SUPERTABLE_VEC_SEARCH, &bid, peak);
+        }
+    }
+
+    emit_search_markdown();
 }
 
 // ─── Markdown summary emitters ────────────────────────────────────────
@@ -414,14 +428,17 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "### Supertable vector — ingest ({N_DOCS} docs × dim={DIM}, sharded into {N_SEGMENTS} superfiles)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput | Peak RSS |\n");
-    body.push_str("|--------|------|------------|----------|\n");
+    body.push_str("| Engine | Time | Throughput | Peak RSS | Peak RSS Δ |\n");
+    body.push_str("|--------|------|------------|----------|------------|\n");
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-    body.push_str(&format!("| supertable | {time} | {thrpt} | {rss_cell} |\n"));
+    let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
+    body.push_str(&format!(
+        "| supertable | {time} | {thrpt} | {rss_cell} | {rss_delta} |\n"
+    ));
 
     markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/supertable/ingest".into(),
@@ -440,27 +457,35 @@ fn emit_search_markdown() {
         "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS |\n",
+        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|---------------|--------------------------------|----------------|----------|\n",
+        "|---------------|--------------------------------|----------------|----------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
-        let (cell, ns, rss_cell) = match cal.supertable[i] {
+        let (cell, ns, rss_cell, rss_delta) = match cal.supertable[i] {
             Some(c) => {
                 let bid = format!("supertable_{label}");
                 let ns = read_mean_ns(group, &bid);
                 let peak = rss::read_peak_rss_bytes(group, &bid);
                 let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-                (format!("(p={}, r={})", c.probe, c.refine), ns, rss_cell)
+                let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+                (
+                    format!("(p={}, r={})", c.probe, c.refine),
+                    ns,
+                    rss_cell,
+                    rss_delta,
+                )
             }
-            None => ("—".into(), None, "—".into()),
+            None => ("—".into(), None, "—".into(), "—".into()),
         };
         let t = ns.map(fmt_time).unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {row_target} | {cell} | {t} | {rss_cell} |\n"));
+        body.push_str(&format!(
+            "| {row_target} | {cell} | {t} | {rss_cell} | {rss_delta} |\n"
+        ));
     }
 
     markdown::emit(&MarkdownSection {
@@ -469,4 +494,4 @@ fn emit_search_markdown() {
     });
 }
 
-criterion_group!(benches, bench);
+criterion_group!(benches, bench_ingest, bench_search);

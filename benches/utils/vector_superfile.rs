@@ -25,10 +25,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // against the previous run's baseline, and `(probe, refine)` drifts as
 // calibration re-picks the lowest-p50 point. The chosen point is reported
 // in the markdown table instead.
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::reader::VectorReader;
 use crate::corpus::{self, Calibrated, DIM};
 use crate::{markdown, rss};
+use infino::superfile::vector::distance::Metric;
+use infino::superfile::vector::reader::VectorReader;
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -331,14 +331,17 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "### Superfile vector — ingest ({N_DOCS} docs × dim={DIM}, Gaussian planted clusters, cosine)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput | Peak RSS |\n");
-    body.push_str("|--------|------|------------|----------|\n");
+    body.push_str("| Engine | Time | Throughput | Peak RSS | Peak RSS Δ |\n");
+    body.push_str("|--------|------|------------|----------|------------|\n");
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-    body.push_str(&format!("| infino | {time} | {thrpt} | {rss_cell} |\n"));
+    let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
+    body.push_str(&format!(
+        "| infino | {time} | {thrpt} | {rss_cell} | {rss_delta} |\n"
+    ));
 
     markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/superfile/ingest".into(),
@@ -356,8 +359,12 @@ fn emit_search_markdown() {
     body.push_str(&format!(
         "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
-    body.push_str("| Recall target | infino (probe, refine) | infino p50 | Peak RSS |\n");
-    body.push_str("|---------------|------------------------|------------|----------|\n");
+    body.push_str(
+        "| Recall target | infino (probe, refine) | infino p50 | Peak RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|---------------|------------------------|------------|----------|------------|\n",
+    );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
@@ -368,12 +375,13 @@ fn emit_search_markdown() {
             let peak = rss::read_peak_rss_bytes(group, &id);
             let p50 = ns.map(fmt_time).unwrap_or_else(|| "—".into());
             let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+            let rss_delta = rss::fmt_peak_rss_delta(group, &id);
             body.push_str(&format!(
-                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} |\n",
+                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} | {rss_delta} |\n",
                 c_inf.probe, c_inf.refine
             ));
         } else {
-            body.push_str(&format!("| {row_target:13} | — | — | — |\n"));
+            body.push_str(&format!("| {row_target:13} | — | — | — | — |\n"));
         }
     }
 

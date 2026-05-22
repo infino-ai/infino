@@ -338,11 +338,26 @@ impl SupertableWriter {
             .collect();
         let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
 
-        let outputs: Vec<ShardOutput> = writer_pool.install(|| {
-            shards
-                .par_iter()
-                .map(|slice| build_one_shard(slice.as_slice(), &self.inner.options))
-                .collect::<Result<Vec<_>, _>>()
+        let max_active_vector_builds = if self.inner.options.vector_columns.is_empty() {
+            n_shards
+        } else {
+            self.inner
+                .options
+                .max_concurrent_vector_builds
+                .max(1)
+                .min(n_shards)
+        };
+
+        let outputs: Vec<ShardOutput> = writer_pool.install(|| -> Result<Vec<_>, BuildError> {
+            let mut outputs = Vec::with_capacity(shards.len());
+            for chunk in shards.chunks(max_active_vector_builds) {
+                let mut chunk_outputs = chunk
+                    .par_iter()
+                    .map(|slice| build_one_shard(slice.as_slice(), &self.inner.options))
+                    .collect::<Result<Vec<_>, _>>()?;
+                outputs.append(&mut chunk_outputs);
+            }
+            Ok(outputs)
         })?;
 
         publish_superfiles(&self.inner, outputs)?;

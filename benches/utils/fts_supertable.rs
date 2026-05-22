@@ -23,6 +23,7 @@
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
 
+use crate::{corpus, markdown, rss};
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, Throughput, criterion_group};
@@ -31,7 +32,6 @@ use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
-use crate::{corpus, markdown, rss};
 use rayon::ThreadPool;
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -284,22 +284,28 @@ fn emit_ingest_markdown() {
     use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
 
     let group = group_name::SUPERTABLE_FTS_BUILD;
-    let ns = read_mean_ns(group, "infino_auto_writer_pool");
-    let peak_rss = rss::read_peak_rss_bytes(group, "infino_auto_writer_pool");
+    let bench = "infino_auto_writer_pool";
+    let ns = read_mean_ns(group, bench);
+    let peak_rss = rss::read_peak_rss_bytes(group, bench);
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Supertable FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
-    body.push_str("| Engine                  | Time       | Throughput | Peak RSS  |\n");
-    body.push_str("|-------------------------|------------|------------|-----------|\n");
+    body.push_str(
+        "| Engine                  | Time       | Throughput | Peak RSS  | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|-------------------------|------------|------------|-----------|------------|\n",
+    );
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+    let rss_delta = rss::fmt_peak_rss_delta(group, bench);
     body.push_str(&format!(
-        "| infino_auto_writer_pool | {time:10} | {thrpt:10} | {rss_cell:9} |\n"
+        "| infino_auto_writer_pool | {time:10} | {thrpt:10} | {rss_cell:9} | {rss_delta:10} |\n"
     ));
     body.push_str(
         "\n*Output cardinality: infino emits `min(writer_pool.threads, total_rows)` superfiles \
@@ -319,8 +325,8 @@ fn emit_search_markdown() {
     let group = group_name::SUPERTABLE_FTS_SEARCH;
     let mut body = String::new();
     body.push_str(&format!("### Supertable FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str("| Query          | infino     | Peak RSS  |\n");
-    body.push_str("|----------------|------------|-----------|\n");
+    body.push_str("| Query          | infino     | Peak RSS  | Peak RSS Δ |\n");
+    body.push_str("|----------------|------------|-----------|------------|\n");
     let queries = [
         "single_rare",
         "single_common",
@@ -337,7 +343,10 @@ fn emit_search_markdown() {
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
             .unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {q:14} | {inf_s:10} | {rss_cell:9} |\n"));
+        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+        body.push_str(&format!(
+            "| {q:14} | {inf_s:10} | {rss_cell:9} | {rss_delta:10} |\n"
+        ));
     }
 
     markdown::emit(&MarkdownSection {

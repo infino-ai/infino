@@ -23,12 +23,12 @@
 //! `superfile_fts_search` still validates the BMW oracle before
 //! timing kicks in.
 
+use crate::{corpus, markdown, rss};
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group};
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::fts::reader::{BoolMode, FtsReader, OrAlgo};
 use infino::test_helpers::default_tokenizer;
-use crate::{corpus, markdown, rss};
 use rayon::prelude::*;
 use std::hint::black_box;
 use std::sync::OnceLock;
@@ -263,21 +263,23 @@ fn bench(c: &mut Criterion) {
         g.sample_size(10);
         g.throughput(Throughput::Elements(n as u64));
 
-        let rss_sample = rss::PeakSampler::start_default();
         let one_thread_id = format!("infino_1thread_{n}docs");
         let rayon_id = format!("infino_rayon_default_threads_{n}docs");
+        let rss_sample = rss::PeakSampler::start_default();
         g.bench_function(one_thread_id.clone(), |b| {
             b.iter_with_large_drop(|| build_infino_blob_1thread(black_box(docs_for_ingest)));
         });
+        let peak = rss_sample.stop();
+        let _ = rss::write_peak_rss(group_name::SUPERFILE_FTS_BUILD, &one_thread_id, peak);
+
+        let rss_sample = rss::PeakSampler::start_default();
         g.bench_function(rayon_id.clone(), |b| {
             b.iter_with_large_drop(|| build_infino_blobs_rayon(black_box(docs_for_ingest)));
         });
-        g.finish();
         let peak = rss_sample.stop();
-        // One sampler bounds both ingest closures; record the same peak
-        // against each — the dominant builder drives the number.
-        let _ = rss::write_peak_rss(group_name::SUPERFILE_FTS_BUILD, &one_thread_id, peak);
         let _ = rss::write_peak_rss(group_name::SUPERFILE_FTS_BUILD, &rayon_id, peak);
+
+        g.finish();
 
         emit_ingest_markdown();
     }
@@ -431,8 +433,12 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "### Superfile FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
-    body.push_str("| Engine                       | Time       | Throughput | Peak RSS  |\n");
-    body.push_str("|------------------------------|------------|------------|-----------|\n");
+    body.push_str(
+        "| Engine                       | Time       | Throughput | Peak RSS  | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|------------------------------|------------|------------|-----------|------------|\n",
+    );
 
     let group = group_name::SUPERFILE_FTS_BUILD;
     let one_thread_id = format!("infino_1thread_{N_DOCS}docs");
@@ -442,17 +448,28 @@ fn emit_ingest_markdown() {
     let one_thread_rss = rss::read_peak_rss_bytes(group, &one_thread_id);
     let rayon_rss = rss::read_peak_rss_bytes(group, &rayon_id);
 
-    let row = |label: &str, ns: Option<f64>, peak: Option<u64>| -> String {
+    let row = |label: &str, bench_id: &str, ns: Option<f64>, peak: Option<u64>| -> String {
         let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
         let thrpt = ns
             .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
             .unwrap_or_else(|| "—".into());
         let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-        format!("| {label:28} | {time:10} | {thrpt:10} | {rss_cell:9} |\n")
+        let rss_delta = rss::fmt_peak_rss_delta(group, bench_id);
+        format!("| {label:28} | {time:10} | {thrpt:10} | {rss_cell:9} | {rss_delta:10} |\n")
     };
 
-    body.push_str(&row("infino_1thread", one_thread, one_thread_rss));
-    body.push_str(&row("infino_rayon_default_threads", rayon, rayon_rss));
+    body.push_str(&row(
+        "infino_1thread",
+        &one_thread_id,
+        one_thread,
+        one_thread_rss,
+    ));
+    body.push_str(&row(
+        "infino_rayon_default_threads",
+        &rayon_id,
+        rayon,
+        rayon_rss,
+    ));
 
     markdown::emit(&MarkdownSection {
         anchor_id: "bench/fts/superfile/ingest".into(),
@@ -465,8 +482,8 @@ fn emit_search_markdown() {
 
     let mut body = String::new();
     body.push_str(&format!("### Superfile FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str("| Query          | infino     | Peak RSS  |\n");
-    body.push_str("|----------------|------------|-----------|\n");
+    body.push_str("| Query          | infino     | Peak RSS  | Peak RSS Δ |\n");
+    body.push_str("|----------------|------------|-----------|------------|\n");
 
     let group = group_name::SUPERFILE_FTS_SEARCH;
     let queries_or = [
@@ -493,7 +510,10 @@ fn emit_search_markdown() {
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
             .unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {q:14} | {inf_s:10} | {rss_cell:9} |\n"));
+        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+        body.push_str(&format!(
+            "| {q:14} | {inf_s:10} | {rss_cell:9} | {rss_delta:10} |\n"
+        ));
     }
 
     body.push_str("\n**AND queries:**\n\n");
@@ -504,7 +524,10 @@ fn emit_search_markdown() {
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
             .unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {q:14} | {inf_s:10} | {rss_cell:9} |\n"));
+        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+        body.push_str(&format!(
+            "| {q:14} | {inf_s:10} | {rss_cell:9} | {rss_delta:10} |\n"
+        ));
     }
 
     body.push('\n');
