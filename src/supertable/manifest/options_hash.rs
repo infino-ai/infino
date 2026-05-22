@@ -35,11 +35,10 @@
 //!   `VectorColumnInfo.metric` uses, so list ⇄ hash stay in
 //!   lockstep.
 //!
-//! Legacy / synthetic-manifest escape hatch: a stored
-//! `options_hash` of all zeros is treated as "validation
-//! skipped" by [`verify_options_hash`] — pre-D15 manifests
-//! + test fixtures that construct lists manually keep
-//! opening cleanly.
+//! Legacy / synthetic-manifest escape hatch: a stored `options_hash` of
+//! all zeros is treated as "validation skipped" by
+//! [`verify_options_hash`] — pre-D15 manifests + test fixtures that
+//! construct lists manually keep opening cleanly.
 //!
 //! [`ManifestList::options_hash`]: super::list::ManifestList
 //! [`Supertable::open`]: crate::supertable::Supertable::open

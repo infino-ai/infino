@@ -74,10 +74,7 @@ fn part_overlaps_prefix(
     if prefix > max_term.as_slice() {
         return false;
     }
-    match upper {
-        Some(u) if min_term.as_slice() >= u => false,
-        _ => true,
-    }
+    !matches!(upper, Some(u) if min_term.as_slice() >= u)
 }
 
 /// Compute the lex-upper-bound for a prefix: the smallest
@@ -197,10 +194,9 @@ pub fn prune_parts_for_id_range(
 /// query_cutoff`. Parts with no vector summary for this
 /// column survive (no info).
 ///
-/// Distance is L2; for cosine workloads, the query vector
-/// + centroids should be normalized at the caller layer
-/// (matching the convention the segment-level vector skip
-/// already uses).
+/// Distance is L2; for cosine workloads, the query vector + centroids
+/// should be normalized at the caller layer (matching the convention the
+/// segment-level vector skip already uses).
 pub fn prune_parts_for_vector(
     list: &ManifestList,
     column: &str,
@@ -461,7 +457,7 @@ mod tests {
         // Column not in the map (skipped entirely) — list-
         // level pruner treats this as "no info, always-keep".
         assert!(
-            aggs.fts_summary_agg.get("title").is_none()
+            !aggs.fts_summary_agg.contains_key("title")
                 || aggs
                     .fts_summary_agg
                     .get("title")

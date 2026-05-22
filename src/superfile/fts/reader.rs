@@ -2475,9 +2475,8 @@ mod tests {
         let (blob, _json) = build_mixed_df_blob();
         // Re-parse the blob enough to reach the FST bytes.
         let header_size = 48usize;
-        let fst_off = u64::from_le_bytes(
-            blob[24..32].try_into().expect("fst_off slice is 8 bytes"),
-        ) as usize;
+        let fst_off =
+            u64::from_le_bytes(blob[24..32].try_into().expect("fst_off slice is 8 bytes")) as usize;
         let postings_off = u64::from_le_bytes(
             blob[32..40]
                 .try_into()

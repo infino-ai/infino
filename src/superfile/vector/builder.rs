@@ -322,8 +322,7 @@ impl VectorBuilder {
         // (header + directory + dir_crc + outer_crc). Subsection
         // bytes are unknown until built; the inner `Write` impl on
         // `Vec` will grow as needed.
-        let header_dir_hint =
-            OUTER_HEADER_SIZE + (self.columns.len() * DIR_ENTRY_SIZE) + 8;
+        let header_dir_hint = OUTER_HEADER_SIZE + (self.columns.len() * DIR_ENTRY_SIZE) + 8;
         let mut buf: Vec<u8> = Vec::with_capacity(header_dir_hint);
         self.finish_to(&mut buf)?;
         Ok(buf)
@@ -363,11 +362,7 @@ impl VectorBuilder {
         let n_columns = columns.len() as u32;
         // n_docs in the outer header is the max across columns
         // (per-segment doc count; spec: same across all columns).
-        let n_docs: u64 = columns
-            .iter()
-            .map(|c| c.n_docs as u64)
-            .max()
-            .unwrap_or(0);
+        let n_docs: u64 = columns.iter().map(|c| c.n_docs as u64).max().unwrap_or(0);
 
         // Snapshot config + n_docs first so the directory loop
         // can read them after we've consumed each ColumnState.
@@ -576,11 +571,7 @@ fn build_subsection_streaming(
     // by the trainer). At steady-state shapes (`n_docs > sample_size`,
     // `sample_size ≥ 100_000`) the sample_rows bound is the active
     // one and is comfortably above any sane n_cent.
-    let n_cent = cfg
-        .n_cent
-        .max(1)
-        .min(n_docs.max(1))
-        .min(sample_rows.max(1));
+    let n_cent = cfg.n_cent.max(1).min(n_docs.max(1)).min(sample_rows.max(1));
 
     // ---- Pass 1: k-means on the reservoir sample ----
     let centroids = if sample_rows == 0 || n_docs == 0 {
@@ -722,8 +713,8 @@ fn build_subsection_streaming(
         for _ in 0..cluster_count {
             reader.read_exact(&mut id_buf)?;
             doc_ids_layout[write_cursor] = u32::from_le_bytes(id_buf);
-            let dst_code = &mut codes_layout
-                [write_cursor * code_bytes..(write_cursor + 1) * code_bytes];
+            let dst_code =
+                &mut codes_layout[write_cursor * code_bytes..(write_cursor + 1) * code_bytes];
             reader.read_exact(dst_code)?;
             let dst_full = &mut full_layout[write_cursor * dim..(write_cursor + 1) * dim];
             let dst_full_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_full);
@@ -888,8 +879,7 @@ fn run_pass2(
             let writer = &mut bucket_writers[cid];
             writer.write_all(&local_doc_id.to_le_bytes())?;
             writer.write_all(&chunk_codes[r * code_bytes..(r + 1) * code_bytes])?;
-            writer
-                .write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
+            writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
             bucket_counts[cid] += 1;
         }
         global_doc_id += actual_rows as u32;
@@ -1204,7 +1194,11 @@ mod tests {
             let cursor = Cursor::new(&mut buf);
             b.finish_to(cursor).expect("finish_to Cursor");
         }
-        assert_eq!(&buf[0..8], format::vec::OUTER_MAGIC, "outer magic preserved");
+        assert_eq!(
+            &buf[0..8],
+            format::vec::OUTER_MAGIC,
+            "outer magic preserved"
+        );
         assert!(
             buf.len() >= OUTER_HEADER_SIZE + DIR_ENTRY_SIZE + 4 + 4,
             "blob too short: {} bytes",

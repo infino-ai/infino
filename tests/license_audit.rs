@@ -104,6 +104,14 @@ const ALLOWED_PACKAGES: &[(&str, &str, &str)] = &[
         "0.1.0",
         "UNSPECIFIED — local crate, set in Cargo.toml before OSS release",
     ),
+    // Our own crate — license field unset in Cargo.toml. Set
+    // `license = "Apache-2.0"` (or the chosen license) before any
+    // open-source release.
+    (
+        "infino-bench-utils",
+        "0.1.0",
+        "UNSPECIFIED — local crate, set in Cargo.toml before OSS release",
+    ),
 ];
 
 /// True iff at least one option in the SPDX expression is exactly
