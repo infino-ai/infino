@@ -6,7 +6,7 @@
 //!   current `VmRSS` (Linux `/proc/self/status`). Returns
 //!   `None` on platforms without procfs.
 //! - [`PeakSampler`] — background thread that polls VmRSS at
-//!   a fixed cadence and records the maximum observed value
+//!   a fixed cadence and records peak / median / p90 values
 //!   over the sampler's lifetime. Use [`PeakSampler::start`]
 //!   (or [`PeakSampler::start_default`]) before the work you
 //!   want to bound, [`PeakSampler::stop`] after — returns the
@@ -30,15 +30,15 @@
 //! training + assignment plateaus are seconds long). Faster
 //! sampling adds noise without adding signal.
 //!
-//! [`write_peak_rss`] / [`read_peak_rss_bytes`] persist + read
+//! [`write_rss_stats`] / [`read_peak_rss_bytes`] persist + read
 //! a per-bench `rss.json` next to criterion's `estimates.json`
-//! so the markdown emitters can pick the number up by the same
-//! `(group, bench)` lookup shape they use for timings.
+//! so the markdown emitters can pick memory stats up by the
+//! same `(group, bench)` lookup shape they use for timings.
 
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -72,8 +72,42 @@ pub fn current_rss_bytes() -> Option<u64> {
 /// to the work the sampler watches.
 pub struct PeakSampler {
     stop: Arc<AtomicBool>,
-    peak: Arc<AtomicU64>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Vec<u64>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RssStats {
+    pub peak_rss_bytes: u64,
+    pub median_rss_bytes: u64,
+    pub p90_rss_bytes: u64,
+}
+
+impl RssStats {
+    fn from_samples(mut samples: Vec<u64>) -> Self {
+        if samples.is_empty() {
+            samples.push(current_rss_bytes().unwrap_or(0));
+        }
+        samples.sort_unstable();
+        Self {
+            peak_rss_bytes: *samples.last().expect("rss samples is non-empty"),
+            median_rss_bytes: percentile_nearest_rank(&samples, 50),
+            p90_rss_bytes: percentile_nearest_rank(&samples, 90),
+        }
+    }
+
+    fn peak_only(peak_rss_bytes: u64) -> Self {
+        Self {
+            peak_rss_bytes,
+            median_rss_bytes: peak_rss_bytes,
+            p90_rss_bytes: peak_rss_bytes,
+        }
+    }
+}
+
+fn percentile_nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
+    debug_assert!(!sorted.is_empty());
+    let rank = ((percentile as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 impl PeakSampler {
@@ -88,40 +122,28 @@ impl PeakSampler {
     /// lands still see at least the start-time RSS.
     pub fn start(interval: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicU64::new(current_rss_bytes().unwrap_or(0)));
+        let initial = current_rss_bytes().unwrap_or(0);
 
         let stop_t = Arc::clone(&stop);
-        let peak_t = Arc::clone(&peak);
         let handle = thread::Builder::new()
             .name("rss-sampler".into())
             .spawn(move || {
+                let mut samples = vec![initial];
                 while !stop_t.load(Ordering::Acquire) {
                     if let Some(rss) = current_rss_bytes() {
-                        // Lock-free max: CAS-loop on the peak
-                        // atomic; tolerates concurrent updates
-                        // from rapid restarts (not expected
-                        // here, but cheap to be correct about).
-                        let mut cur = peak_t.load(Ordering::Acquire);
-                        while rss > cur {
-                            match peak_t.compare_exchange_weak(
-                                cur,
-                                rss,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => break,
-                                Err(observed) => cur = observed,
-                            }
-                        }
+                        samples.push(rss);
                     }
                     thread::sleep(interval);
                 }
+                if let Some(rss) = current_rss_bytes() {
+                    samples.push(rss);
+                }
+                samples
             })
             .expect("spawn rss-sampler thread");
 
         Self {
             stop,
-            peak,
             handle: Some(handle),
         }
     }
@@ -129,12 +151,20 @@ impl PeakSampler {
     /// Stop the sampler, join the background thread, return
     /// the peak VmRSS observed (in bytes). Consumes the
     /// sampler.
-    pub fn stop(mut self) -> u64 {
+    pub fn stop(self) -> u64 {
+        self.stop_stats().peak_rss_bytes
+    }
+
+    /// Stop the sampler, join the background thread, and return
+    /// peak / median / p90 VmRSS observed over the sampler's lifetime.
+    pub fn stop_stats(mut self) -> RssStats {
         self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-        self.peak.load(Ordering::Acquire)
+        let samples = self
+            .handle
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_else(|| vec![current_rss_bytes().unwrap_or(0)]);
+        RssStats::from_samples(samples)
     }
 }
 
@@ -166,6 +196,10 @@ pub fn fmt_bytes(b: u64) -> String {
 /// `estimates.json` makes the markdown emitters use the same
 /// `(group, bench)` lookup shape for both latency and memory.
 pub fn write_peak_rss(group: &str, bench: &str, peak_rss_bytes: u64) -> std::io::Result<()> {
+    write_rss_stats(group, bench, RssStats::peak_only(peak_rss_bytes))
+}
+
+pub fn write_rss_stats(group: &str, bench: &str, stats: RssStats) -> std::io::Result<()> {
     let dir = criterion_bench_dir(group, bench);
     let new_dir = dir.join("new");
     let base_dir = dir.join("base");
@@ -175,7 +209,9 @@ pub fn write_peak_rss(group: &str, bench: &str, peak_rss_bytes: u64) -> std::io:
         std::fs::write(base_dir.join("rss.json"), existing)?;
     }
     let body = serde_json::json!({
-        "peak_rss_bytes": peak_rss_bytes,
+        "peak_rss_bytes": stats.peak_rss_bytes,
+        "median_rss_bytes": stats.median_rss_bytes,
+        "p90_rss_bytes": stats.p90_rss_bytes,
     });
     std::fs::write(
         new_dir.join("rss.json"),
@@ -187,13 +223,39 @@ pub fn write_peak_rss(group: &str, bench: &str, peak_rss_bytes: u64) -> std::io:
 /// file doesn't exist (bench was filtered out or hasn't run
 /// yet) or the JSON can't be parsed.
 pub fn read_peak_rss_bytes(group: &str, bench: &str) -> Option<u64> {
+    read_rss_field(group, bench, "peak_rss_bytes")
+}
+
+pub fn read_median_rss_bytes(group: &str, bench: &str) -> Option<u64> {
+    read_rss_field(group, bench, "median_rss_bytes")
+}
+
+pub fn read_p90_rss_bytes(group: &str, bench: &str) -> Option<u64> {
+    read_rss_field(group, bench, "p90_rss_bytes")
+}
+
+pub fn fmt_median_rss(group: &str, bench: &str) -> String {
+    read_median_rss_bytes(group, bench)
+        .map(fmt_bytes)
+        .unwrap_or_else(|| "—".into())
+}
+
+pub fn fmt_p90_rss(group: &str, bench: &str) -> String {
+    read_p90_rss_bytes(group, bench)
+        .map(fmt_bytes)
+        .unwrap_or_else(|| "—".into())
+}
+
+fn read_rss_field(group: &str, bench: &str, field: &str) -> Option<u64> {
     let dir = criterion_bench_dir(group, bench);
     let path = dir.join("new").join("rss.json");
     let text = std::fs::read_to_string(&path)
         .or_else(|_| std::fs::read_to_string(dir.join("rss.json")))
         .ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    v.get("peak_rss_bytes")?.as_u64()
+    v.get(field)
+        .and_then(Value::as_u64)
+        .or_else(|| v.get("peak_rss_bytes")?.as_u64())
 }
 
 /// Read the previous run's peak RSS sample (`base/rss.json`).
@@ -295,5 +357,13 @@ mod tests {
             "sampler missed the 32 MiB faulted allocation: \
              baseline={baseline}, peak={peak}"
         );
+    }
+
+    #[test]
+    fn rss_stats_use_nearest_rank_percentiles() {
+        let stats = RssStats::from_samples(vec![50, 10, 40, 20, 30]);
+        assert_eq!(stats.peak_rss_bytes, 50);
+        assert_eq!(stats.median_rss_bytes, 30);
+        assert_eq!(stats.p90_rss_bytes, 50);
     }
 }
