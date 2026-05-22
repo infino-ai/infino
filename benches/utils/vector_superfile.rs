@@ -20,10 +20,15 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
+// Calibrated `(probe, refine)` is intentionally not in the criterion ID:
+// criterion's improved/regressed/noise panel only fires on exact-ID matches
+// against the previous run's baseline, and `(probe, refine)` drifts as
+// calibration re-picks the lowest-p50 point. The chosen point is reported
+// in the markdown table instead.
+use crate::corpus::{self, Calibrated, DIM};
+use crate::{markdown, rss};
 use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::reader::VectorReader;
-use infino::test_helpers::bench_corpus;
-use infino::test_helpers::bench_corpus::{Calibrated, DIM};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -54,7 +59,7 @@ const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
 
 // ─── Fixtures ────────────────────────────────────────────────────────
 
-static VECTORS: OnceLock<Vec<f32>> = OnceLock::new();
+static VECTORS: OnceLock<corpus::MmapCorpus> = OnceLock::new();
 static QUERIES_CORRECTNESS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static QUERIES_CALIBRATION: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
@@ -63,45 +68,36 @@ static INFINO_BLOB: OnceLock<Vec<u8>> = OnceLock::new();
 static CALIBRATIONS: OnceLock<Calibrations> = OnceLock::new();
 
 fn vectors() -> &'static [f32] {
-    VECTORS.get_or_init(|| {
-        bench_corpus::generate_vector_corpus(N_DOCS, bench_corpus::n_cent(N_DOCS), 1, true)
-    })
+    VECTORS
+        .get_or_init(|| {
+            // Raw corpus fixture only. Build/search still exercise Infino's
+            // normal vector builder/reader paths; the mmap avoids pinning the
+            // synthetic source corpus as heap RAM.
+            corpus::MmapCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
+        })
+        .as_slice()
 }
 
 fn queries_correctness() -> &'static [Vec<f32>] {
     QUERIES_CORRECTNESS.get_or_init(|| {
-        bench_corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CORRECTNESS_QUERIES,
-            17,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CORRECTNESS_QUERIES, 17, true, 0.05)
     })
 }
 
 fn queries_calibration() -> &'static [Vec<f32>] {
     QUERIES_CALIBRATION.get_or_init(|| {
-        bench_corpus::generate_realistic_queries(
-            vectors(),
-            N_DOCS,
-            N_CALIBRATION_QUERIES,
-            99,
-            true,
-            0.05,
-        )
+        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CALIBRATION_QUERIES, 99, true, 0.05)
     })
 }
 
 fn ground_truth_correctness() -> &'static [Vec<u32>] {
     GROUND_TRUTH_CORRECTNESS
-        .get_or_init(|| bench_corpus::ground_truth(vectors(), N_DOCS, queries_correctness(), TOP_K))
+        .get_or_init(|| corpus::ground_truth(vectors(), N_DOCS, queries_correctness(), TOP_K))
 }
 
 fn ground_truth_calibration() -> &'static [Vec<u32>] {
     GROUND_TRUTH_CALIBRATION
-        .get_or_init(|| bench_corpus::ground_truth(vectors(), N_DOCS, queries_calibration(), TOP_K))
+        .get_or_init(|| corpus::ground_truth(vectors(), N_DOCS, queries_calibration(), TOP_K))
 }
 
 fn infino_reader() -> VectorReader {
@@ -112,13 +108,13 @@ fn infino_reader() -> VectorReader {
 // ─── Builder ──────────────────────────────────────────────────────────
 
 fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
-    let n_cent = bench_corpus::n_cent(N_DOCS);
-    let builder = bench_corpus::build_vector_index(vectors, N_DOCS, n_cent, Metric::Cosine);
+    let n_cent = corpus::n_cent(N_DOCS);
+    let builder = corpus::build_vector_index(vectors, N_DOCS, n_cent, Metric::Cosine);
     builder.finish()
 }
 
 fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
-    let n_cent = bench_corpus::n_cent(N_DOCS);
+    let n_cent = corpus::n_cent(N_DOCS);
     let json =
         format!(r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
     VectorReader::open(Bytes::from(blob), &json).expect("open VectorReader")
@@ -140,7 +136,7 @@ fn assert_infino_self_consistent(reader: &VectorReader) -> f32 {
             "infino kNN should fill top-{TOP_K}; got {}",
             hits.len()
         );
-        total_recall += bench_corpus::recall_at_k(&hits, truth);
+        total_recall += corpus::recall_at_k(&hits, truth);
     }
     let mean_recall = total_recall / (qs.len() as f32);
     assert!(
@@ -169,8 +165,7 @@ fn calibrations() -> &'static Calibrations {
         );
         let mut inf: [Option<Calibrated>; 3] = [None; 3];
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            inf[i] =
-                bench_corpus::calibrate_infino(&reader, qs, gt, target, PROBES, REFINES, 21, TOP_K);
+            inf[i] = corpus::calibrate_infino(&reader, qs, gt, target, PROBES, REFINES, 21, TOP_K);
             eprintln!("  recall ≥ {target:.2} | infino: {:?}", inf[i]);
         }
         Calibrations { infino: inf }
@@ -189,7 +184,7 @@ fn bench(c: &mut Criterion) {
         CORRECTNESS_RECALL_FLOOR
     );
 
-    artifact_report(N_DOCS, bench_corpus::n_cent(N_DOCS), vectors());
+    artifact_report(N_DOCS, corpus::n_cent(N_DOCS), vectors());
 
     // ---- Ingest sub-bench (group: superfile_vec_build) -------------
     {
@@ -198,10 +193,16 @@ fn bench(c: &mut Criterion) {
         g.sample_size(10);
         g.throughput(Throughput::Elements(N_DOCS as u64));
 
-        g.bench_function(format!("infino_build_{N_DOCS}docs"), |b| {
+        // Peak-RSS sampler — bounds the build closure so the recorded
+        // RSS reflects this group, not earlier setup or later groups.
+        let rss_sample = rss::PeakSampler::start_default();
+        let bench_id = format!("infino_build_{N_DOCS}docs");
+        g.bench_function(bench_id.clone(), |b| {
             b.iter_with_large_drop(|| build_infino_blob(black_box(v)));
         });
         g.finish();
+        let peak = rss_sample.stop();
+        let _ = rss::write_peak_rss(group_name::SUPERFILE_VEC_BUILD, &bench_id, peak);
 
         emit_ingest_markdown();
     }
@@ -213,24 +214,23 @@ fn bench(c: &mut Criterion) {
 
         let mut g = c.benchmark_group("superfile_vec_search");
         g.sample_size(10);
+        let rss_sample = rss::PeakSampler::start_default();
 
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
             let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
             if let Some(c_inf) = cal.infino[i] {
-                g.bench_with_input(
-                    BenchmarkId::new(
-                        format!("infino_{label}"),
-                        format!("p={},r={}", c_inf.probe, c_inf.refine),
-                    ),
-                    &(c_inf.probe, c_inf.refine),
-                    |b, &(p, r)| {
-                        let q = &qs[0];
-                        b.iter(|| {
-                            let hits = reader.search("v", black_box(q), TOP_K, p, r).expect("kNN");
-                            black_box(hits)
-                        });
-                    },
-                );
+                // Stable bench id: the calibrated (probe, refine) lives in
+                // the markdown table, not the criterion id, so criterion can
+                // match this row against its prior baseline and print its
+                // own improved/regressed delta on subsequent runs.
+                let (p, r) = (c_inf.probe, c_inf.refine);
+                g.bench_function(format!("infino_{label}"), |b| {
+                    let q = &qs[0];
+                    b.iter(|| {
+                        let hits = reader.search("v", black_box(q), TOP_K, p, r).expect("kNN");
+                        black_box(hits)
+                    });
+                });
             }
         }
 
@@ -252,7 +252,7 @@ fn bench(c: &mut Criterion) {
         });
 
         // nprobe sweep (rerank fixed at default)
-        let n_cent = bench_corpus::n_cent(N_DOCS);
+        let n_cent = corpus::n_cent(N_DOCS);
         for &nprobe in &[1, 4, 8, 16, 32, 64, 128] {
             if nprobe > n_cent {
                 continue;
@@ -288,6 +288,22 @@ fn bench(c: &mut Criterion) {
         }
 
         g.finish();
+        let peak = rss_sample.stop();
+        // Single sampler covers every (probe, refine) point in this
+        // group; record the same peak against each criterion id so the
+        // markdown lookup matches the bench id verbatim.
+        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            if cal.infino[i].is_some() {
+                let bid = format!("infino_{label}");
+                let _ = rss::write_peak_rss(group_name::SUPERFILE_VEC_SEARCH, &bid, peak);
+            }
+        }
+        let _ = rss::write_peak_rss(
+            group_name::SUPERFILE_VEC_SEARCH,
+            "infino_default_options_top10",
+            peak,
+        );
 
         emit_search_markdown();
     }
@@ -295,56 +311,74 @@ fn bench(c: &mut Criterion) {
 
 // ─── Markdown summary emitters ────────────────────────────────────────
 
-fn emit_ingest_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+mod group_name {
+    pub const SUPERFILE_VEC_BUILD: &str = "superfile_vec_build";
+    pub const SUPERFILE_VEC_SEARCH: &str = "superfile_vec_search";
+}
 
-    let group = "superfile_vec_build";
-    let ns = read_mean_ns(group, &format!("infino_build_{N_DOCS}docs"));
+fn emit_ingest_markdown() {
+    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+
+    let group = group_name::SUPERFILE_VEC_BUILD;
+    let bench = format!("infino_build_{N_DOCS}docs");
+    let ns = read_mean_ns(group, &bench);
+    let peak_rss = rss::read_peak_rss_bytes(group, &bench);
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Superfile vector — ingest ({N_DOCS} docs × dim={DIM}, Gaussian planted clusters, cosine)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput |\n");
-    body.push_str("|--------|------|------------|\n");
+    body.push_str("| Engine | Time | Throughput | Peak RSS | Peak RSS Δ |\n");
+    body.push_str("|--------|------|------------|----------|------------|\n");
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
-    body.push_str(&format!("| infino | {time} | {thrpt} |\n"));
+    let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+    let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
+    body.push_str(&format!(
+        "| infino | {time} | {thrpt} | {rss_cell} | {rss_delta} |\n"
+    ));
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/superfile/ingest".into(),
         body,
     });
 }
 
 fn emit_search_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
-    let group = "superfile_vec_search";
+    let group = group_name::SUPERFILE_VEC_SEARCH;
     let cal = calibrations();
 
     let mut body = String::new();
     body.push_str(&format!(
-    "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
-  ));
-    body.push_str("| Recall target | infino (probe, refine) | infino p50 |\n");
-    body.push_str("|---------------|------------------------|------------|\n");
+        "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
+    ));
+    body.push_str(
+        "| Recall target | infino (probe, refine) | infino p50 | Peak RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|---------------|------------------------|------------|----------|------------|\n",
+    );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
         if let Some(c_inf) = cal.infino[i] {
-            let id = format!("infino_{label}/p={},r={}", c_inf.probe, c_inf.refine,);
+            let id = format!("infino_{label}");
             let ns = read_mean_ns(group, &id);
+            let peak = rss::read_peak_rss_bytes(group, &id);
             let p50 = ns.map(fmt_time).unwrap_or_else(|| "—".into());
+            let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+            let rss_delta = rss::fmt_peak_rss_delta(group, &id);
             body.push_str(&format!(
-                "| {row_target:13} | (p={}, r={}) | {p50:10} |\n",
+                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} | {rss_delta} |\n",
                 c_inf.probe, c_inf.refine
             ));
         } else {
-            body.push_str(&format!("| {row_target:13} | — | — |\n"));
+            body.push_str(&format!("| {row_target:13} | — | — | — | — |\n"));
         }
     }
 
@@ -356,9 +390,15 @@ fn emit_search_markdown() {
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");
     let def_s = def.map(fmt_time).unwrap_or_else(|| "—".into());
+    let def_rss = rss::read_peak_rss_bytes(group, "infino_default_options_top10")
+        .map(rss::fmt_bytes)
+        .unwrap_or_else(|| "—".into());
     body.push_str(&format!("| infino_default_options_top10 | {def_s} |\n"));
+    body.push_str(&format!(
+        "| infino_default_options_top10_peak_rss | {def_rss} |\n"
+    ));
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/vector/superfile/search".into(),
         body,
     });

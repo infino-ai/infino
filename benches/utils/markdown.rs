@@ -16,7 +16,7 @@
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One markdown section to emit. `anchor_id` is the stable key that
 /// matches the `<!-- BEGIN/END: ... -->` markers in
@@ -111,14 +111,31 @@ pub fn fmt_throughput(elements_per_sec: f64) -> String {
 // ─── estimates.json reader ────────────────────────────────────────────
 
 /// Read criterion's `mean.point_estimate` (in nanoseconds) for a given
-/// group + bench id from the local `target/criterion/...` tree.
+/// group + bench id from the criterion artifacts tree. Honors
+/// `CARGO_TARGET_DIR` the same way criterion itself does, so the read
+/// path tracks where criterion actually wrote (matters on CI / hosts
+/// where the target dir is redirected outside the workspace).
+///
 /// Returns `None` if the file doesn't exist (bench was filtered out or
 /// hasn't run yet) or the JSON can't be parsed.
 pub fn read_mean_ns(group: &str, bench: &str) -> Option<f64> {
-    let path = format!("target/criterion/{group}/{bench}/new/estimates.json");
+    let path = criterion_target_dir()
+        .join(group)
+        .join(bench)
+        .join("new")
+        .join("estimates.json");
     let text = fs::read_to_string(&path).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     v.get("mean")?.get("point_estimate")?.as_f64()
+}
+
+/// `$CARGO_TARGET_DIR/criterion` if set (criterion writes there when
+/// the env var is exported), else workspace-relative `target/criterion`.
+fn criterion_target_dir() -> PathBuf {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    base.join("criterion")
 }
 
 /// Mean time + throughput per second given a per-iteration element

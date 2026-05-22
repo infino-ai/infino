@@ -11,10 +11,6 @@
 //!   reference in `Cargo.toml`.
 //! - **Benches** (`benches/...`) reach it the same way.
 //!
-//! NOT part of infino's stable API. Signatures may change
-//! between any two versions. Anything that depends on this
-//! module from outside the crate is opting in to instability.
-//!
 //! Scope: small atomic idioms that repeat across dozens of
 //! test / bench fixtures (Decimal128 id construction, default
 //! tokenizer, default vector config). Higher-level "build a
@@ -25,7 +21,6 @@
 //! [`brute_force_bm25`] is the textbook BM25 reference impl
 //! used as the FTS correctness oracle.
 
-pub mod bench_corpus;
 pub mod brute_force_bm25;
 
 use std::sync::Arc;

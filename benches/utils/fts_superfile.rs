@@ -23,11 +23,11 @@
 //! `superfile_fts_search` still validates the BMW oracle before
 //! timing kicks in.
 
+use crate::{corpus, markdown, rss};
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group};
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::fts::reader::{BoolMode, FtsReader, OrAlgo};
-use infino::test_helpers::bench_corpus;
 use infino::test_helpers::default_tokenizer;
 use rayon::prelude::*;
 use std::hint::black_box;
@@ -46,7 +46,7 @@ static DOCS: OnceLock<Vec<String>> = OnceLock::new();
 static INFINO_BLOB: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn docs() -> &'static [String] {
-    DOCS.get_or_init(|| bench_corpus::generate_text_corpus(N_DOCS, 1))
+    DOCS.get_or_init(|| corpus::generate_text_corpus(N_DOCS, 1))
         .as_slice()
 }
 
@@ -197,16 +197,12 @@ fn bench_infino(
     name: &str,
     r: &FtsReader,
     terms: &'static [&'static str],
+    mode: BoolMode,
 ) {
     c.bench_function(format!("{name}_infino_top10"), |b| {
         b.iter(|| {
             let hits = r
-                .search(
-                    black_box("title"),
-                    black_box(terms),
-                    black_box(10),
-                    BoolMode::Or,
-                )
+                .search(black_box("title"), black_box(terms), black_box(10), mode)
                 .expect("infino search");
             black_box(hits)
         });
@@ -267,12 +263,22 @@ fn bench(c: &mut Criterion) {
         g.sample_size(10);
         g.throughput(Throughput::Elements(n as u64));
 
-        g.bench_function(format!("infino_1thread_{n}docs"), |b| {
+        let one_thread_id = format!("infino_1thread_{n}docs");
+        let rayon_id = format!("infino_rayon_default_threads_{n}docs");
+        let rss_sample = rss::PeakSampler::start_default();
+        g.bench_function(one_thread_id.clone(), |b| {
             b.iter_with_large_drop(|| build_infino_blob_1thread(black_box(docs_for_ingest)));
         });
-        g.bench_function(format!("infino_rayon_default_threads_{n}docs"), |b| {
+        let peak = rss_sample.stop();
+        let _ = rss::write_peak_rss(group_name::SUPERFILE_FTS_BUILD, &one_thread_id, peak);
+
+        let rss_sample = rss::PeakSampler::start_default();
+        g.bench_function(rayon_id.clone(), |b| {
             b.iter_with_large_drop(|| build_infino_blobs_rayon(black_box(docs_for_ingest)));
         });
+        let peak = rss_sample.stop();
+        let _ = rss::write_peak_rss(group_name::SUPERFILE_FTS_BUILD, &rayon_id, peak);
+
         g.finish();
 
         emit_ingest_markdown();
@@ -281,22 +287,31 @@ fn bench(c: &mut Criterion) {
     // ---- Search sub-bench (group: superfile_fts_search) ------------
     {
         let mut g = c.benchmark_group("superfile_fts_search");
+        let rss_sample = rss::PeakSampler::start_default();
 
-        bench_infino(&mut g, "single_rare", &r, &["term09999"]);
-        bench_infino(&mut g, "single_df1", &r, &["doc0500000"]);
-        bench_infino(&mut g, "single_common", &r, &["term00001"]);
-        bench_infino(&mut g, "two_term_or", &r, &["term00001", "term00050"]);
+        bench_infino(&mut g, "single_rare", &r, &["term09999"], BoolMode::Or);
+        bench_infino(&mut g, "single_df1", &r, &["doc0500000"], BoolMode::Or);
+        bench_infino(&mut g, "single_common", &r, &["term00001"], BoolMode::Or);
+        bench_infino(
+            &mut g,
+            "two_term_or",
+            &r,
+            &["term00001", "term00050"],
+            BoolMode::Or,
+        );
         bench_infino(
             &mut g,
             "three_wide",
             &r,
             &["term00001", "term00050", "term00100"],
+            BoolMode::Or,
         );
         bench_infino(
             &mut g,
             "three_similar",
             &r,
             &["term00050", "term00051", "term00052"],
+            BoolMode::Or,
         );
         bench_infino(
             &mut g,
@@ -309,6 +324,41 @@ fn bench(c: &mut Criterion) {
                 "term00053",
                 "term00054",
             ],
+            BoolMode::Or,
+        );
+        bench_infino(
+            &mut g,
+            "two_term_and",
+            &r,
+            &["term00001", "term00050"],
+            BoolMode::And,
+        );
+        bench_infino(
+            &mut g,
+            "three_wide_and",
+            &r,
+            &["term00001", "term00050", "term00100"],
+            BoolMode::And,
+        );
+        bench_infino(
+            &mut g,
+            "three_similar_and",
+            &r,
+            &["term00050", "term00051", "term00052"],
+            BoolMode::And,
+        );
+        bench_infino(
+            &mut g,
+            "five_term_and",
+            &r,
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+            ],
+            BoolMode::And,
         );
 
         // Per-algo probes
@@ -338,6 +388,32 @@ fn bench(c: &mut Criterion) {
         );
 
         g.finish();
+        let peak = rss_sample.stop();
+        // Single sampler covers every search closure in this group;
+        // record the same peak against each criterion id so the
+        // markdown lookup matches the bench id verbatim.
+        let search_ids = [
+            "single_rare_infino_top10",
+            "single_df1_infino_top10",
+            "single_common_infino_top10",
+            "two_term_or_infino_top10",
+            "three_wide_infino_top10",
+            "three_similar_infino_top10",
+            "five_term_infino_top10",
+            "two_term_and_infino_top10",
+            "three_wide_and_infino_top10",
+            "three_similar_and_infino_top10",
+            "five_term_and_infino_top10",
+            "wide_3_wand_top10",
+            "wide_3_bmm_top10",
+            "similar_3_wand_top10",
+            "similar_3_bmm_top10",
+            "similar_5_wand_top10",
+            "similar_5_bmm_top10",
+        ];
+        for bid in search_ids {
+            let _ = rss::write_peak_rss(group_name::SUPERFILE_FTS_SEARCH, bid, peak);
+        }
 
         emit_search_markdown();
     }
@@ -345,47 +421,72 @@ fn bench(c: &mut Criterion) {
 
 // ─── Markdown summary emitters ────────────────────────────────────────
 
+mod group_name {
+    pub const SUPERFILE_FTS_BUILD: &str = "superfile_fts_build";
+    pub const SUPERFILE_FTS_SEARCH: &str = "superfile_fts_search";
+}
+
 fn emit_ingest_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Superfile FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
-    body.push_str("| Engine                       | Time       | Throughput |\n");
-    body.push_str("|------------------------------|------------|------------|\n");
+    body.push_str(
+        "| Engine                       | Time       | Throughput | Peak RSS  | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|------------------------------|------------|------------|-----------|------------|\n",
+    );
 
-    let group = "superfile_fts_build";
-    let one_thread = read_mean_ns(group, &format!("infino_1thread_{N_DOCS}docs"));
-    let rayon = read_mean_ns(group, &format!("infino_rayon_default_threads_{N_DOCS}docs"));
+    let group = group_name::SUPERFILE_FTS_BUILD;
+    let one_thread_id = format!("infino_1thread_{N_DOCS}docs");
+    let rayon_id = format!("infino_rayon_default_threads_{N_DOCS}docs");
+    let one_thread = read_mean_ns(group, &one_thread_id);
+    let rayon = read_mean_ns(group, &rayon_id);
+    let one_thread_rss = rss::read_peak_rss_bytes(group, &one_thread_id);
+    let rayon_rss = rss::read_peak_rss_bytes(group, &rayon_id);
 
-    let row = |label: &str, ns: Option<f64>| -> String {
+    let row = |label: &str, bench_id: &str, ns: Option<f64>, peak: Option<u64>| -> String {
         let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
         let thrpt = ns
             .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
             .unwrap_or_else(|| "—".into());
-        format!("| {label:28} | {time:10} | {thrpt:10} |\n")
+        let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+        let rss_delta = rss::fmt_peak_rss_delta(group, bench_id);
+        format!("| {label:28} | {time:10} | {thrpt:10} | {rss_cell:9} | {rss_delta:10} |\n")
     };
 
-    body.push_str(&row("infino_1thread", one_thread));
-    body.push_str(&row("infino_rayon_default_threads", rayon));
+    body.push_str(&row(
+        "infino_1thread",
+        &one_thread_id,
+        one_thread,
+        one_thread_rss,
+    ));
+    body.push_str(&row(
+        "infino_rayon_default_threads",
+        &rayon_id,
+        rayon,
+        rayon_rss,
+    ));
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/fts/superfile/ingest".into(),
         body,
     });
 }
 
 fn emit_search_markdown() {
-    use crate::markdown::{MarkdownSection, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
     let mut body = String::new();
     body.push_str(&format!("### Superfile FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str("| Query          | infino     |\n");
-    body.push_str("|----------------|------------|\n");
+    body.push_str("| Query          | infino     | Peak RSS  | Peak RSS Δ |\n");
+    body.push_str("|----------------|------------|-----------|------------|\n");
 
-    let group = "superfile_fts_search";
-    let queries = [
+    let group = group_name::SUPERFILE_FTS_SEARCH;
+    let queries_or = [
         "single_rare",
         "single_df1",
         "single_common",
@@ -394,10 +495,39 @@ fn emit_search_markdown() {
         "three_similar",
         "five_term",
     ];
-    for q in queries {
-        let inf = read_mean_ns(group, &format!("{q}_infino_top10"));
+    let queries_and = [
+        "two_term_and",
+        "three_wide_and",
+        "three_similar_and",
+        "five_term_and",
+    ];
+
+    body.push_str("**OR queries:**\n\n");
+    for q in queries_or {
+        let bid = format!("{q}_infino_top10");
+        let inf = read_mean_ns(group, &bid);
         let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {q:14} | {inf_s:10} |\n"));
+        let rss_cell = rss::read_peak_rss_bytes(group, &bid)
+            .map(rss::fmt_bytes)
+            .unwrap_or_else(|| "—".into());
+        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+        body.push_str(&format!(
+            "| {q:14} | {inf_s:10} | {rss_cell:9} | {rss_delta:10} |\n"
+        ));
+    }
+
+    body.push_str("\n**AND queries:**\n\n");
+    for q in queries_and {
+        let bid = format!("{q}_infino_top10");
+        let inf = read_mean_ns(group, &bid);
+        let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
+        let rss_cell = rss::read_peak_rss_bytes(group, &bid)
+            .map(rss::fmt_bytes)
+            .unwrap_or_else(|| "—".into());
+        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
+        body.push_str(&format!(
+            "| {q:14} | {inf_s:10} | {rss_cell:9} | {rss_delta:10} |\n"
+        ));
     }
 
     body.push('\n');
@@ -412,7 +542,7 @@ fn emit_search_markdown() {
         body.push_str(&format!("| {shape:13} | {wand_s:10} | {bmm_s:12} |\n"));
     }
 
-    crate::markdown::emit(&MarkdownSection {
+    markdown::emit(&MarkdownSection {
         anchor_id: "bench/fts/superfile/search".into(),
         body,
     });

@@ -9,10 +9,6 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts-superfile
 //! ```
 
-#[path = "../utils/markdown.rs"]
-mod markdown;
+use infino_bench_utils::fts_superfile;
 
-#[path = "superfile.rs"]
-mod superfile;
-
-criterion::criterion_main!(superfile::benches);
+criterion::criterion_main!(fts_superfile::benches);

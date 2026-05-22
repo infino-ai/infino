@@ -9,10 +9,6 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts-supertable
 //! ```
 
-#[path = "../utils/markdown.rs"]
-mod markdown;
+use infino_bench_utils::fts_supertable;
 
-#[path = "supertable.rs"]
-mod supertable;
-
-criterion::criterion_main!(supertable::benches);
+criterion::criterion_main!(fts_supertable::benches);
