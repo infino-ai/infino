@@ -592,11 +592,11 @@ of textbook MaxScore:
    score by `essential_score + sum_others_term_max`; if even this
    can't beat the heap threshold, skip the non-essential probe +
    heap update entirely. Most rank-100 docs in the
-   `three_wide` query (`term00001 + term00050 + term00100`) score
+   `three_wide_or` query (`term00001 + term00050 + term00100`) score
    around 2.7 alone, so with `others_term_ub ≈ 2.5` their max is
    ~5.2 — well below the steady-state threshold of ~6.5, and the
    bail fires for ~70% of docs. This single optimization moved
-   `three_wide` from 4× *slower* than a naive multi-term walk to
+   `three_wide_or` from 4× *slower* than a naive multi-term walk to
    3.5× *faster*.
 
 3. **Shallow-advance bail in `f >= 2` paths.** For multi-essential
@@ -613,7 +613,7 @@ of textbook MaxScore:
 - *Heap-of-cursors plain WAND without block-max augmentation.*
   Skips by term-max alone. Vastly weaker pruning than BMW: doesn't
   use the skip table's per-block UB at all. Measured ~5× slower
-  than BMW on `three_similar`. Easy first thing to ship; we
+  than BMW on `three_similar_or`. Easy first thing to ship; we
   iterated past it.
 - *Always WAND+BMW.* The straightforward initial choice. BMW's
   pivot bound becomes loose when many query terms have similar
@@ -661,9 +661,9 @@ This single fix accounts for these post-fix improvements (1M docs):
 
 | query | before | after |
 |---|---|---|
-| `three_wide` | 2.54 ms | **1.28 ms** |
-| `three_similar` | 24.2 ms | **5.94 ms** |
-| `five_term` | 14.8 ms | **10.0 ms** |
+| `three_wide_or` | 2.54 ms | **1.28 ms** |
+| `three_similar_or` | 24.2 ms | **5.94 ms** |
+| `five_term_or` | 14.8 ms | **10.0 ms** |
 
 See `git log -p src/superfile/fts/reader.rs | grep -A40 "skip_to within-block fast path"`
 for the diff.
