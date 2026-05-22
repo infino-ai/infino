@@ -34,7 +34,7 @@ parquet = "58"
 
 # SIMD primitives
 bitpacking = "0.9"
-crc32c = "0.6"
+crc-fast = "1.10.0"
 wide = "1"
 fst = "0.4"
 bytemuck = "1"

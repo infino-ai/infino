@@ -189,11 +189,11 @@ fn bench_ingest(c: &mut Criterion) {
     });
 
     g.finish();
-    let peak = rss_sample.stop();
-    let _ = rss::write_peak_rss(
+    let stats = rss_sample.stop_stats();
+    let _ = rss::write_rss_stats(
         group_name::SUPERTABLE_FTS_BUILD,
         "infino_auto_writer_pool",
-        peak,
+        stats,
     );
 
     emit_ingest_markdown();
@@ -256,7 +256,7 @@ fn bench_search(c: &mut Criterion) {
     });
 
     g.finish();
-    let peak = rss_sample.stop();
+    let stats = rss_sample.stop_stats();
     let search_ids = [
         "single_rare_supertable_top10",
         "single_common_supertable_top10",
@@ -267,7 +267,7 @@ fn bench_search(c: &mut Criterion) {
         "prefix_supertable_top10",
     ];
     for bid in search_ids {
-        let _ = rss::write_peak_rss(group_name::SUPERTABLE_FTS_SEARCH, bid, peak);
+        let _ = rss::write_rss_stats(group_name::SUPERTABLE_FTS_SEARCH, bid, stats);
     }
 
     emit_search_markdown();
@@ -293,19 +293,21 @@ fn emit_ingest_markdown() {
         "### Supertable FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
     body.push_str(
-        "| Engine                  | Time       | Throughput | Peak RSS  | Peak RSS Δ |\n",
+        "| Engine                  | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|-------------------------|------------|------------|-----------|------------|\n",
+        "|-------------------------|------------|------------|-----------|------------|-----------|------------|\n",
     );
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+    let median_rss = rss::fmt_median_rss(group, bench);
+    let p90_rss = rss::fmt_p90_rss(group, bench);
     let rss_delta = rss::fmt_peak_rss_delta(group, bench);
     body.push_str(&format!(
-        "| infino_auto_writer_pool | {time:10} | {thrpt:10} | {rss_cell:9} | {rss_delta:10} |\n"
+        "| infino_auto_writer_pool | {time:10} | {thrpt:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
     ));
     body.push_str(
         "\n*Output cardinality: infino emits `min(writer_pool.threads, total_rows)` superfiles \
@@ -325,8 +327,12 @@ fn emit_search_markdown() {
     let group = group_name::SUPERTABLE_FTS_SEARCH;
     let mut body = String::new();
     body.push_str(&format!("### Supertable FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str("| Query          | infino     | Peak RSS  | Peak RSS Δ |\n");
-    body.push_str("|----------------|------------|-----------|------------|\n");
+    body.push_str(
+        "| Query          | infino     | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|----------------|------------|-----------|------------|-----------|------------|\n",
+    );
     let queries = [
         "single_rare",
         "single_common",
@@ -343,9 +349,11 @@ fn emit_search_markdown() {
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
             .unwrap_or_else(|| "—".into());
+        let median_rss = rss::fmt_median_rss(group, &bid);
+        let p90_rss = rss::fmt_p90_rss(group, &bid);
         let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
         body.push_str(&format!(
-            "| {q:14} | {inf_s:10} | {rss_cell:9} | {rss_delta:10} |\n"
+            "| {q:14} | {inf_s:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
         ));
     }
 

@@ -2,28 +2,45 @@
 //!
 //! Every section of every blob ends with a 4-byte CRC32C of its body —
 //! the format-spec invariant. This module is a thin shim over the
-//! `crc32c` crate (which uses SSE4.2 / ARMv8.1 hardware instructions when
-//! available, ~25 GB/s on modern hardware) so the rest of the codebase
-//! has a single, named entry point and so we can swap implementations
+//! `crc-fast` crate (CLMUL-based, folds multiple streams in vector
+//! registers on x86_64 and aarch64) so the rest of the codebase has
+//! a single, named entry point and so we can swap implementations
 //! without touching call sites.
 //!
-//! Use Castagnoli polynomial (0x1EDC6F41) — the same one used by iSCSI,
-//! Btrfs, Parquet bloom filters, and most modern systems.
+//! Earlier revisions used the `crc32c` crate, which dispatches to
+//! the scalar SSE4.2 `_mm_crc32_u64` instruction. That is fast, but
+//! bottlenecked by one dependency chain. The CLMUL path breaks that
+//! chain by folding over parallel streams, which matters on the
+//! 1.5 GiB vector cold-open path.
+//!
+//! Use the Castagnoli polynomial (0x1EDC6F41) — the same one used
+//! by iSCSI, Btrfs, Parquet bloom filters, and most modern systems.
+//! `crc-fast` exposes this as `CrcAlgorithm::Crc32Iscsi` /
+//! `crc32_iscsi(...)`.
+
+use crc_fast::CrcAlgorithm;
 
 /// Compute CRC32C over `bytes`. Hardware-accelerated when the crate's
 /// runtime feature detection finds SSE4.2 (x86) or v8.1 CRC (ARM); falls
 /// back to a software implementation otherwise.
 #[inline]
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    ::crc32c::crc32c(bytes)
+    crc_fast::crc32_iscsi(bytes) as u32
 }
 
-/// Streaming variant — useful when the input arrives in chunks (we don't
-/// need this in v1 readers/builders, but keeping the entry point so future
-/// callers don't reach for the upstream crate directly).
+/// Streaming variant — extend a prior `prev` CRC by `bytes`. Implemented
+/// via `checksum_combine` polynomial math (`crc-fast` doesn't expose a
+/// seed-from-prev API on its `Digest`). Used by streaming builders and
+/// kept here so callers don't reach for the upstream crate directly.
 #[inline]
 pub fn crc32c_append(prev: u32, bytes: &[u8]) -> u32 {
-    ::crc32c::crc32c_append(prev, bytes)
+    let suffix = crc_fast::crc32_iscsi(bytes) as u64;
+    crc_fast::checksum_combine(
+        CrcAlgorithm::Crc32Iscsi,
+        prev as u64,
+        suffix,
+        bytes.len() as u64,
+    ) as u32
 }
 
 #[cfg(test)]

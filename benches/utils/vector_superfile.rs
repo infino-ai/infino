@@ -110,10 +110,7 @@ fn infino_reader() -> VectorReader {
 fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
     let n_cent = corpus::n_cent(N_DOCS);
     let builder = corpus::build_vector_index(vectors, N_DOCS, n_cent, Metric::Cosine);
-    // Streaming branch made `VectorBuilder::finish()` fallible (returns
-    // Result<Vec<u8>, BuildError>); the bench treats a build error as a
-    // hard failure and unwraps.
-    builder.finish().expect("VectorBuilder::finish")
+    builder.finish().expect("finish vector builder")
 }
 
 fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
@@ -204,8 +201,8 @@ fn bench(c: &mut Criterion) {
             b.iter_with_large_drop(|| build_infino_blob(black_box(v)));
         });
         g.finish();
-        let peak = rss_sample.stop();
-        let _ = rss::write_peak_rss(group_name::SUPERFILE_VEC_BUILD, &bench_id, peak);
+        let stats = rss_sample.stop_stats();
+        let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_BUILD, &bench_id, stats);
 
         emit_ingest_markdown();
     }
@@ -291,7 +288,7 @@ fn bench(c: &mut Criterion) {
         }
 
         g.finish();
-        let peak = rss_sample.stop();
+        let stats = rss_sample.stop_stats();
         // Single sampler covers every (probe, refine) point in this
         // group; record the same peak against each criterion id so the
         // markdown lookup matches the bench id verbatim.
@@ -299,13 +296,13 @@ fn bench(c: &mut Criterion) {
             let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
             if cal.infino[i].is_some() {
                 let bid = format!("infino_{label}");
-                let _ = rss::write_peak_rss(group_name::SUPERFILE_VEC_SEARCH, &bid, peak);
+                let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_SEARCH, &bid, stats);
             }
         }
-        let _ = rss::write_peak_rss(
+        let _ = rss::write_rss_stats(
             group_name::SUPERFILE_VEC_SEARCH,
             "infino_default_options_top10",
-            peak,
+            stats,
         );
 
         emit_search_markdown();
@@ -331,16 +328,22 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "### Superfile vector — ingest ({N_DOCS} docs × dim={DIM}, Gaussian planted clusters, cosine)\n\n"
     ));
-    body.push_str("| Engine | Time | Throughput | Peak RSS | Peak RSS Δ |\n");
-    body.push_str("|--------|------|------------|----------|------------|\n");
+    body.push_str(
+        "| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|--------|------|------------|----------|------------|---------|------------|\n",
+    );
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
         .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+    let median_rss = rss::fmt_median_rss(group, &bench);
+    let p90_rss = rss::fmt_p90_rss(group, &bench);
     let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
     body.push_str(&format!(
-        "| infino | {time} | {thrpt} | {rss_cell} | {rss_delta} |\n"
+        "| infino | {time} | {thrpt} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n"
     ));
 
     markdown::emit(&MarkdownSection {
@@ -360,10 +363,10 @@ fn emit_search_markdown() {
         "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | infino (probe, refine) | infino p50 | Peak RSS | Peak RSS Δ |\n",
+        "| Recall target | infino (probe, refine) | infino p50 | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|---------------|------------------------|------------|----------|------------|\n",
+        "|---------------|------------------------|------------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
@@ -375,13 +378,15 @@ fn emit_search_markdown() {
             let peak = rss::read_peak_rss_bytes(group, &id);
             let p50 = ns.map(fmt_time).unwrap_or_else(|| "—".into());
             let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+            let median_rss = rss::fmt_median_rss(group, &id);
+            let p90_rss = rss::fmt_p90_rss(group, &id);
             let rss_delta = rss::fmt_peak_rss_delta(group, &id);
             body.push_str(&format!(
-                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} | {rss_delta} |\n",
+                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
                 c_inf.probe, c_inf.refine
             ));
         } else {
-            body.push_str(&format!("| {row_target:13} | — | — | — | — |\n"));
+            body.push_str(&format!("| {row_target:13} | — | — | — | — | — | — |\n"));
         }
     }
 
@@ -396,9 +401,17 @@ fn emit_search_markdown() {
     let def_rss = rss::read_peak_rss_bytes(group, "infino_default_options_top10")
         .map(rss::fmt_bytes)
         .unwrap_or_else(|| "—".into());
+    let def_median = rss::fmt_median_rss(group, "infino_default_options_top10");
+    let def_p90 = rss::fmt_p90_rss(group, "infino_default_options_top10");
     body.push_str(&format!("| infino_default_options_top10 | {def_s} |\n"));
     body.push_str(&format!(
         "| infino_default_options_top10_peak_rss | {def_rss} |\n"
+    ));
+    body.push_str(&format!(
+        "| infino_default_options_top10_median_rss | {def_median} |\n"
+    ));
+    body.push_str(&format!(
+        "| infino_default_options_top10_p90_rss | {def_p90} |\n"
     ));
 
     markdown::emit(&MarkdownSection {
