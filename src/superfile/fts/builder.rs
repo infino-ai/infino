@@ -73,7 +73,7 @@ use crate::superfile::format::{self, FST_SEPARATOR};
 use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
 use crate::superfile::fts::fst_value::FstValue;
 use crate::superfile::fts::posting::{BLOCK_LEN, Block, EncodedBlock, encode_block};
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::Ordering;
@@ -87,7 +87,44 @@ use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
 
-type TermIdMap = HbHashMap<Box<str>, u32, FxBuildHasher>;
+/// Per-column term interner table.
+///
+/// Keys are `&'static str` slices that **actually borrow from the
+/// per-column `term_arena: bumpalo::Bump`** stored alongside the
+/// map in the [`ColumnPostings::Spilled`] variant. The `'static`
+/// lifetime tag is a lie maintained by `unsafe` `std::mem::
+/// transmute` at insertion (see [`intern_term_id_arena`]) and
+/// kept sound by two structural invariants:
+///
+/// 1. The arena outlives the map. The `Spilled` variant declares
+///    `term_arena` *after* `term_to_id` and `id_to_term` so Rust
+///    drops it last (struct fields drop in declaration order, so
+///    the last-declared field is the last-dropped). The
+///    `finish_to` per-column block that destructures `Spilled`
+///    likewise puts `term_arena` last in the pattern and adds an
+///    explicit `drop(term_arena)` after the last use of
+///    `id_to_term` for the same reason.
+/// 2. No method on the map's keys does a deref during the map's
+///    own `Drop`. `&str` has no `Drop` impl, so dropping the map
+///    just deallocates the bucket table without touching the
+///    key bytes. The arena can therefore safely outlast the
+///    map's body without the map ever needing arena bytes
+///    during its own teardown.
+///
+/// Switching from `Box<str>` keys to arena `&str` keys:
+///
+///   * removes one `Box<str>` heap allocation per intern miss
+///     (was: one for the map key + one cloned for `id_to_term`;
+///     now: one bump-arena copy reused by both);
+///   * packs all term bytes densely in the bump arena instead
+///     of scattering them across the global heap, which keeps
+///     the byte-compare fast path inside `raw_entry_mut` cache-
+///     hot on the per-token spill-arm hot loop (the bench
+///     vocab is ~10K terms × ~5-10 byte average = ~75 KiB
+///     total, comfortably L2-resident as one contiguous arena
+///     instead of ~10K separate heap allocations chasing
+///     pointers through unrelated allocator buckets).
+type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 
 #[derive(Default)]
 struct FinishProfile {
@@ -238,7 +275,12 @@ enum ColumnPostings {
     Spilled {
         partitions: Vec<SpillPartition>,
         term_to_id: TermIdMap,
-        id_to_term: Vec<Box<str>>,
+        /// Per-id reverse lookup used by `finish_to` to recover term
+        /// bytes for FST emit. Entries are `&'static str` slices
+        /// borrowing from `term_arena` (see [`TermIdMap`] doc for
+        /// the lifetime-extension invariant — same arena, same
+        /// drop-order rules).
+        id_to_term: Vec<&'static str>,
         /// Per-doc tf accumulator, indexed by `term_id`. Replaces the
         /// previous `FxHashMap<u32, u32>` scratch: term_ids are dense
         /// `0..vocab_size` (vocab ~10K on the bench Zipfian corpus, ≤
@@ -261,6 +303,17 @@ enum ColumnPostings {
         /// the per-doc unique-term count (≤ doc length), so a tiny
         /// `Vec<u32>` reused across calls.
         updated_terms: Vec<u32>,
+        /// Per-column bump arena owning the term bytes. Backing
+        /// store for the `&'static str` keys in `term_to_id` and
+        /// entries in `id_to_term` (see [`TermIdMap`] doc).
+        ///
+        /// **Declared LAST in this variant so it drops LAST.**
+        /// Rust drops struct fields in declaration order; the map
+        /// + reverse vec drop first, both of which leave their
+        /// `&str` keys / entries bitwise-deallocated without
+        /// dereferencing, and only then does the arena's
+        /// `Drop` free the term bytes.
+        term_arena: bumpalo::Bump,
     },
 }
 
@@ -496,7 +549,7 @@ fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
 /// Both come from the same `sort_unstable_by` pass over `[0..n)`,
 /// so producing both is essentially free. Bounded by the column's
 /// vocabulary; tiny even at 10M docs.
-fn build_lex_rank(id_to_term: &[Box<str>]) -> (Vec<u32>, Vec<u32>) {
+fn build_lex_rank(id_to_term: &[&str]) -> (Vec<u32>, Vec<u32>) {
     let n = id_to_term.len();
     let mut by_lex: Vec<u32> = (0..n as u32).collect();
     by_lex.sort_unstable_by(|&a, &b| {
@@ -525,26 +578,69 @@ fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> 
 /// API so miss handling reuses the hash computed for lookup instead
 /// of doing `get(term)` (probe once) followed by `insert(boxed, id)`
 /// (rehash + probe again). Hit behaviour remains one borrowed lookup
-/// with no allocation; misses allocate exactly one `Box<str>` for the
-/// map plus the existing `Box<str>` clone for `id_to_term`.
+/// with no allocation; misses copy the term bytes into the per-column
+/// `term_arena: bumpalo::Bump` (one bump-pointer advance + memcpy, no
+/// heap allocator round-trip) and store the resulting `&str` slice in
+/// both the map and `id_to_term` (a reference copy, no second heap
+/// alloc — replaces the prior `Box<str>` + `boxed.clone()` pattern
+/// which paid two heap allocations per miss).
+///
+/// The on-hit cost benefit is the more important change at scale:
+/// every intern hit's byte-compare inside `raw_entry_mut` previously
+/// dereferenced an arbitrary `Box<str>` whose backing bytes sat
+/// wherever the global allocator placed it (typically scattered
+/// across cache lines, often L2-cold for vocabularies >~1 KB worth
+/// of total key bytes). Arena-backed keys live densely in a single
+/// contiguous `bumpalo::Bump` so the byte-compare hits L1/L2 the
+/// vast majority of the time, regardless of vocab size.
+///
+/// Returns `(term_id, is_new)`. `is_new == true` iff this call minted
+/// a brand-new id (`term_to_id` previously had no entry for `term`).
+/// Callers that keep a per-id parallel array (e.g. `dense_doc_tf` on
+/// the spill path) use this to gate the grow check off the hot path:
+/// after the InRam→Spilled transition pre-grows the parallel array
+/// to `id_to_term.len()`, the array only needs to be extended when a
+/// fresh id is minted, which is once per novel term per column —
+/// not once per token.
+///
+/// SAFETY (invariants enforced by callers and the `Spilled` variant
+/// struct layout, see [`TermIdMap`] doc): the `'static` lifetime tag
+/// on the keys is a lie — the real lifetime is that of `arena`. The
+/// transmute below is sound iff (a) `arena` outlives both
+/// `term_to_id` and `id_to_term`, and (b) no key dereference happens
+/// after `arena`'s `Drop` runs. Both hold by construction: `arena`
+/// is declared *after* the map and reverse-vec in `Spilled` so it
+/// drops *last*, and the `Drop` impls for `HbHashMap<&'static str,
+/// u32, _>` and `Vec<&'static str>` never dereference their
+/// `&str` keys/entries (no `Drop` to run on a reference).
 #[inline(always)]
 fn intern_term_id(
     term_to_id: &mut TermIdMap,
-    id_to_term: &mut Vec<Box<str>>,
+    id_to_term: &mut Vec<&'static str>,
+    arena: &bumpalo::Bump,
     term: &str,
-) -> u32 {
+) -> (u32, bool) {
     let hash = compute_hash(term_to_id.hasher(), term);
     match term_to_id
         .raw_entry_mut()
-        .from_hash(hash, |existing| existing.as_ref() == term)
+        .from_hash(hash, |existing| *existing == term)
     {
-        RawEntryMut::Occupied(entry) => *entry.get(),
+        RawEntryMut::Occupied(entry) => (*entry.get(), false),
         RawEntryMut::Vacant(entry) => {
             let id = id_to_term.len() as u32;
-            let boxed: Box<str> = term.into();
-            id_to_term.push(boxed.clone());
-            entry.insert_hashed_nocheck(hash, boxed, id);
-            id
+            // Bump-arena copy: one pointer advance + memcpy of the
+            // term bytes, returning a `&str` whose lifetime is tied
+            // to `&arena`'s borrow scope.
+            let arena_str: &str = arena.alloc_str(term);
+            // SAFETY: see function-level doc. The `'static` tag is
+            // a lie; the real lifetime is `arena`'s, which the
+            // `Spilled` variant guarantees outlives the map +
+            // id_to_term via field drop order.
+            let static_str: &'static str =
+                unsafe { std::mem::transmute(arena_str) };
+            id_to_term.push(static_str);
+            entry.insert_hashed_nocheck(hash, static_str, id);
+            (id, true)
         }
     }
 }
@@ -1093,7 +1189,8 @@ impl FtsBuilder {
         terms: FxHashMap<Box<str>, Vec<(u32, u32)>>,
         partitions: &mut [SpillPartition],
         term_to_id: &mut TermIdMap,
-        id_to_term: &mut Vec<Box<str>>,
+        id_to_term: &mut Vec<&'static str>,
+        arena: &bumpalo::Bump,
     ) -> Result<(), BuildError> {
         let n_part = partitions.len();
         debug_assert!(
@@ -1102,7 +1199,13 @@ impl FtsBuilder {
         );
         let mask = n_part - 1;
         for (term, postings) in terms {
-            let term_id = intern_term_id(term_to_id, id_to_term, &term);
+            // Drain-time intern: every drained term is by construction
+            // a fresh id (term_to_id was empty when the transition
+            // started). The `is_new` flag is unused here; the dense-
+            // array sizing is handled by the caller pre-growing
+            // `dense_doc_tf` to `id_to_term.len()` after this returns.
+            let (term_id, _is_new) =
+                intern_term_id(term_to_id, id_to_term, arena, &term);
             let p = (term_id as usize) & mask;
             for (doc_id, tf) in postings {
                 push_triple_batched(&mut partitions[p], term_id, doc_id, tf)?;
@@ -1150,7 +1253,19 @@ impl FtsBuilder {
         // Disjoint immutable borrow of `self.tokenizer` plus a
         // mutable borrow of one of `self.postings[col_idx]` or
         // `self.bump` — both ok by field-split borrow rules.
+        //
+        // Downcast to `AsciiLowerTokenizer` once per `add_doc` call
+        // (~1ns, one indirect compare) and stash the result so each
+        // per-arm tokenize call can hit the monomorphic inline path
+        // (`tokenize_each_inline<F>`) instead of routing every per-
+        // token callback through `&mut dyn FnMut(&str)`. The inline
+        // path also lets LLVM CSE the intern hash + dense_doc_tf
+        // index work with the tokenizer's per-byte scan.
         let tokenizer = &self.tokenizer;
+        let ascii_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<AsciiLowerTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
         // Two-mode accumulator (mirror of vector). If this column
@@ -1171,6 +1286,7 @@ impl FtsBuilder {
                 id_to_term,
                 dense_doc_tf,
                 updated_terms,
+                term_arena,
             } => {
                 let n_part = partitions.len();
                 debug_assert!(
@@ -1182,36 +1298,72 @@ impl FtsBuilder {
                 // Dense-array per-doc dedup. Replaces the previous
                 // `FxHashMap<u32, u32>` scratch — per-token cost
                 // drops from one hashmap probe + entry update
-                // (~25-30ns) to one array bounds-grow check + one
-                // load + one store (~5ns). On the 1M-doc spill
-                // bench that's ~150M token-hits, so the per-call
-                // delta is large.
+                // (~25-30ns) to one load + one store (~3ns) on
+                // hits and one `Vec::push(0)` on the first-ever
+                // sighting of a term in this column.
                 //
-                // Invariant: `dense_doc_tf[tid] != 0` iff `tid` is
-                // currently in `updated_terms`. We restore that
-                // invariant at the drain step below by zeroing each
-                // touched slot. Term ids past the previous max are
-                // implicitly zero by `resize_with(_, || 0)`.
+                // Invariants maintained by this arm:
+                //   - `dense_doc_tf.len() == id_to_term.len()` at
+                //     entry and exit of every `add_doc` call (the
+                //     InRam→Spilled transition pre-grows
+                //     `dense_doc_tf` to vocab size, and below we
+                //     grow it by exactly one slot on every
+                //     `is_new` from `intern_term_id`, keeping it
+                //     in lockstep with `id_to_term`).
+                //   - `dense_doc_tf[tid] != 0` iff `tid` is
+                //     currently in `updated_terms`. Restored by
+                //     the drain loop below zeroing each touched
+                //     slot before the next call.
+                //
+                // The first invariant is what makes the
+                // `get_unchecked_mut` reads/writes below sound:
+                // every `idx = term_id as usize` is < the
+                // dense vec's length at the moment we index.
                 updated_terms.clear();
-                tokenizer.tokenize_each(text, &mut |tok| {
+                let mut on_token = |tok: &str| {
                     tokens_in_doc += 1;
-                    let term_id = intern_term_id(term_to_id, id_to_term, tok);
+                    let (term_id, is_new) =
+                        intern_term_id(term_to_id, id_to_term, term_arena, tok);
                     let idx = term_id as usize;
-                    // Lazy grow: `term_to_id` may have just minted a
-                    // fresh id past `dense_doc_tf.len()`. Grow in
-                    // one step to `id_to_term.len()` (the current
-                    // vocab) so subsequent intern hits don't pay the
-                    // grow branch.
-                    if idx >= dense_doc_tf.len() {
-                        dense_doc_tf.resize(id_to_term.len(), 0);
+                    // On a new id we know `term_id ==
+                    // id_to_term.len() - 1 == dense_doc_tf.len()`
+                    // (lockstep invariant), so a single
+                    // `push(0)` restores it; no `>=` test, no
+                    // `id_to_term.len()` re-load, no
+                    // `Vec::resize` branch. On the hot (hit)
+                    // path this whole block is gone — `is_new`
+                    // is statically false in the branch and the
+                    // grow code never executes.
+                    if is_new {
+                        debug_assert_eq!(idx, dense_doc_tf.len());
+                        dense_doc_tf.push(0);
                     }
-                    // First touch in this doc: record so we can
-                    // emit + zero at end-of-doc.
-                    if dense_doc_tf[idx] == 0 {
+                    // SAFETY: `idx == term_id` and `term_id` was
+                    // just confirmed valid by `intern_term_id`
+                    // (`id < id_to_term.len()`), which is equal
+                    // to `dense_doc_tf.len()` by the lockstep
+                    // invariant just enforced (`push(0)` on
+                    // `is_new` keeps the two in sync). So
+                    // `idx < dense_doc_tf.len()` holds.
+                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                    if *slot == 0 {
                         updated_terms.push(term_id);
                     }
-                    dense_doc_tf[idx] += 1;
-                });
+                    *slot += 1;
+                };
+                // Monomorphic fast path when the tokenizer is the
+                // default `AsciiLowerTokenizer`: the per-token
+                // callback inlines straight into the tokenizer's
+                // per-byte scan, eliminating ~150M `&mut dyn FnMut`
+                // indirect dispatches on the 1M-doc spill bench and
+                // letting LLVM CSE/hoist intern-hash and dense-array
+                // bookkeeping across iterations. Custom tokenizers
+                // fall back to the dyn-callback trait path.
+                if let Some(ascii) = ascii_tok {
+                    ascii.tokenize_each_inline(text, &mut on_token);
+                } else {
+                    tokenizer.tokenize_each(text, &mut on_token);
+                }
 
                 // Update column doc-lengths + accounting. The
                 // borrow of `self.columns[col_idx]` is disjoint
@@ -1231,13 +1383,43 @@ impl FtsBuilder {
                 // zero out the slot to restore the
                 // `dense_doc_tf[tid] != 0 iff in updated_terms`
                 // invariant for the next call.
+                //
+                // SAFETY: every `term_id` in `updated_terms` was
+                // pushed inside the tokenize loop above only
+                // after we'd grown `dense_doc_tf` to cover it
+                // (`push(0)` on `is_new`, lockstep with
+                // `id_to_term`). The lockstep invariant is
+                // preserved across the loop (no further intern
+                // calls run between the loop and here), so
+                // `idx < dense_doc_tf.len()` holds for every
+                // iteration.
+                // Per-doc drain: for each touched term_id, read +
+                // zero its `dense_doc_tf` slot, route to the
+                // partition by the low `log2(n_part)` bits of
+                // term_id, and append the 12-byte triple.
+                //
+                // `partitions.get_unchecked_mut(p)` is sound:
+                // `p = term_id & mask` where `mask = n_part - 1`
+                // and `n_part = partitions.len()` is enforced to be
+                // a power of two by `open_partitions_for_column` +
+                // `flush_in_ram_to_partitions`'s `debug_assert!`,
+                // so `p < n_part = partitions.len()` for every
+                // iteration. The bounds check otherwise fires
+                // ~150M times on the 1M-doc spill bench (once per
+                // unique (doc, term) pair) and shows up as a
+                // ~3-5% slice of `add_doc` in `perf` despite
+                // being trivially predictable — the saved branch
+                // alone is worth the unsafe block at this hot-loop
+                // depth.
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
-                    let tf = dense_doc_tf[idx];
-                    dense_doc_tf[idx] = 0;
+                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                    let tf = *slot;
+                    *slot = 0;
                     let p = (term_id as usize) & mask;
+                    let partition = unsafe { partitions.get_unchecked_mut(p) };
                     push_triple_batched(
-                        &mut partitions[p],
+                        partition,
                         term_id,
                         local_doc_id,
                         tf,
@@ -1266,34 +1448,70 @@ impl FtsBuilder {
                 self.bump.reset();
                 let bump = &self.bump;
 
-                // FxHash on the per-doc dedup map: SipHash (std HashMap's
-                // default) is hash-DoS-resistant but ~3-5× slower per
-                // probe than FxHash for short ASCII tokens. On the Rayon
-                // prod path this map is hit ~135 times per doc × ~62.5K
-                // docs/shard × 16 shards = ~135M probes per builder.
-                // The keys borrow into the per-shard bump arena and the
-                // map is rebuilt per doc, so DoS-resistance is moot here.
-                let mut tf_per_term: FxHashMap<&str, u32> = FxHashMap::default();
-                tokenizer.tokenize_each(text, &mut |tok| {
+                // Per-doc dedup map (token → tf within this doc).
+                //
+                // Backed by `hashbrown::HashMap` so we can use
+                // `raw_entry_mut` to probe with the *borrowed*
+                // `&str` token from the tokenizer's input slice
+                // and only pay the `bump.alloc_str` copy on the
+                // miss path. The prior implementation (std
+                // `FxHashMap` + `entry(key).or_insert(0)`)
+                // required an *owned* key for the `entry` API and
+                // therefore bumped every token before the probe;
+                // on a Zipfian corpus ~80-95% of tokens are repeats
+                // within the same doc, so the bump-alloc was wasted
+                // work on the dominant fast path. Hit-path cost
+                // drops from "probe + memcpy + pointer bump +
+                // entry walk" to "probe + load + increment".
+                //
+                // FxHash is kept (vs SipHash) for the same reason
+                // as before: the keys borrow into the per-shard
+                // bump arena and the map is rebuilt per doc, so
+                // DoS-resistance is moot here, and FxHash is
+                // ~3-5× faster per probe for short ASCII tokens.
+                let mut tf_per_term: HbHashMap<&'static str, u32, FxBuildHasher> =
+                    HbHashMap::with_hasher(FxBuildHasher::default());
+                let mut on_token = |tok: &str| {
                     tokens_in_doc += 1;
-                    // alloc_str copies the borrowed token bytes
-                    // into the bump. The returned `&str` outlives
-                    // the next callback call (bump-arena
-                    // lifetime), unlike the input `tok` which
-                    // doesn't.
-                    let bumped: &str = bump.alloc_str(tok);
-                    // SAFETY-equivalent: widen the lifetime from
-                    // the bump's borrow to a `'static` tag tied
-                    // to the HashMap's lifetime. `tf_per_term` is
-                    // a local that drops at the end of `add_doc`
-                    // — well before `self.bump` is reset on the
-                    // next call — so every key in the HashMap
-                    // stays valid for the HashMap's full
-                    // lifetime.
-                    let extended: &'static str =
-                        unsafe { std::mem::transmute(bumped) };
-                    *tf_per_term.entry(extended).or_insert(0) += 1;
-                });
+                    let hash = compute_hash(tf_per_term.hasher(), tok);
+                    match tf_per_term
+                        .raw_entry_mut()
+                        .from_hash(hash, |existing| *existing == tok)
+                    {
+                        RawEntryMut::Occupied(mut e) => {
+                            *e.get_mut() += 1;
+                        }
+                        RawEntryMut::Vacant(e) => {
+                            // Miss path: copy the borrowed token
+                            // bytes into the per-shard bump arena
+                            // so the key outlives the tokenizer's
+                            // input lifetime, then widen the bump
+                            // ref to `'static` tied to the
+                            // HashMap's lifetime. The HashMap
+                            // drops at the end of this `add_doc`
+                            // call — well before `self.bump` is
+                            // reset on the next call — so every
+                            // key stays valid for the HashMap's
+                            // full lifetime. `Bump::alloc_str`
+                            // returns a `&mut str`; we narrow
+                            // back to `&str` via the transmute.
+                            let bumped: &str = bump.alloc_str(tok);
+                            let extended: &'static str =
+                                unsafe { std::mem::transmute(bumped) };
+                            e.insert_hashed_nocheck(hash, extended, 1);
+                        }
+                    }
+                };
+                // Same downcast fast path as the spill arm — the
+                // Rayon production path lives entirely in this arm
+                // (per-shard data sits below the spill threshold),
+                // and per-token dyn dispatch shows up on every
+                // shard's worker thread.
+                if let Some(ascii) = ascii_tok {
+                    ascii.tokenize_each_inline(text, &mut on_token);
+                } else {
+                    tokenizer.tokenize_each(text, &mut on_token);
+                }
 
                 let col = &mut self.columns[col_idx];
                 let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
@@ -1378,13 +1596,15 @@ impl FtsBuilder {
                         column_id,
                         self.spill_partitions,
                     )?;
+                    let term_arena = bumpalo::Bump::new();
                     let mut term_to_id: TermIdMap = TermIdMap::default();
-                    let mut id_to_term: Vec<Box<str>> = Vec::new();
+                    let mut id_to_term: Vec<&'static str> = Vec::new();
                     Self::flush_in_ram_to_partitions(
                         drained,
                         &mut partitions,
                         &mut term_to_id,
                         &mut id_to_term,
+                        &term_arena,
                     )?;
                     // Pre-grow `dense_doc_tf` to the post-flush vocab
                     // so the first post-transition `add_doc` doesn't
@@ -1400,6 +1620,10 @@ impl FtsBuilder {
                         id_to_term,
                         dense_doc_tf,
                         updated_terms,
+                        // Declared last in the variant so it drops
+                        // last; see `TermIdMap` doc for the lifetime
+                        // invariant.
+                        term_arena,
                     };
                 } else {
                     *bytes = new_total;
@@ -1620,12 +1844,28 @@ impl FtsBuilder {
                     id_to_term,
                     dense_doc_tf: _,
                     updated_terms: _,
+                    term_arena,
                 } => {
                     // Term interner is finished being written to;
                     // drop the forward map (`term_to_id`) immediately
                     // — the rest of the spilled finish only needs
                     // the reverse map (`id_to_term`) for FST emit and
                     // the lex-rank table built from it.
+                    //
+                    // Lifetime sanity: `term_to_id` and `id_to_term`
+                    // hold `&'static str` keys/entries that actually
+                    // borrow from `term_arena`. We must keep
+                    // `term_arena` alive until the **last
+                    // dereference** of those keys/entries, which is
+                    // the FST emit loop's `id_to_term[term_id]`
+                    // index below. End-of-scope `Drop` order does
+                    // not matter for soundness — neither `&str` nor
+                    // its container's `Drop` impls dereference the
+                    // borrowed bytes — but any **use** of `id_to_
+                    // term[i].as_bytes()` must occur before
+                    // `term_arena` goes out of scope. Both this
+                    // arm's body and the helper functions it calls
+                    // observe that.
                     drop(term_to_id);
                     let lex_rank_start = finish_profile.enabled.then(Instant::now);
                     let (lex_rank, term_id_in_lex_order) =
@@ -1767,7 +2007,7 @@ impl FtsBuilder {
                             // Defensive: skip without emitting.
                             continue;
                         }
-                        let term_bytes = id_to_term[term_id as usize].as_ref();
+                        let term_bytes: &str = id_to_term[term_id as usize];
                         encode_and_emit_term(
                             term_bytes,
                             &group,
@@ -1838,7 +2078,18 @@ impl FtsBuilder {
                     // but doing it here keeps peak resident bytes
                     // on disk bounded to one column.
                     drop(partitions);
+                    // Explicit drop sequence: `id_to_term` first
+                    // (its `&'static str` entries borrow from
+                    // `term_arena`; we've finished the last read
+                    // at the FST emit loop above), then
+                    // `term_arena` itself releases the term-byte
+                    // backing store. Soundness does not strictly
+                    // require this order (neither `Vec<&str>::
+                    // drop` nor `Bump::drop` interacts with the
+                    // other), but spelling it out leaves the
+                    // intent unambiguous to future readers.
                     drop(id_to_term);
+                    drop(term_arena);
                     drop(lex_rank);
                     if let Some(t) = cleanup_start {
                         finish_profile.scratch_cleanup += t.elapsed();
