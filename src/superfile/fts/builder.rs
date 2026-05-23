@@ -72,18 +72,22 @@ use crate::superfile::format::checksum::{crc32c, crc32c_append};
 use crate::superfile::format::{self, FST_SEPARATOR};
 use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
 use crate::superfile::fts::fst_value::FstValue;
-use crate::superfile::fts::posting::{BLOCK_LEN, Block, encode_block};
+use crate::superfile::fts::posting::{BLOCK_LEN, Block, EncodedBlock, encode_block};
 use crate::superfile::fts::tokenize::Tokenizer;
-use rustc_hash::FxHashMap;
+use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::fs::File;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
+
+type TermIdMap = HbHashMap<Box<str>, u32, FxBuildHasher>;
 
 #[derive(Default)]
 struct FinishProfile {
@@ -97,6 +101,18 @@ struct FinishProfile {
     encode_skip_write: Duration,
     encode_block_write: Duration,
     fst_insert: Duration,
+    // Per-column phase totals (summed across columns; printed in the
+    // [fts-finish] summary line at the end of finish_to).
+    partition_flush: Duration,
+    lex_rank_build: Duration,
+    partition_sort: Duration,
+    mmap_open: Duration,
+    scratch_cleanup: Duration,
+    // Whole-finish phase totals (printed once at end of finish_to).
+    fst_close: Duration,
+    postings_close: Duration,
+    doc_lengths_emit: Duration,
+    blob_copy: Duration,
 }
 
 impl FinishProfile {
@@ -221,8 +237,30 @@ enum ColumnPostings {
     /// doc corpora — millions of bytes, not gigabytes.
     Spilled {
         partitions: Vec<SpillPartition>,
-        term_to_id: FxHashMap<Box<str>, u32>,
+        term_to_id: TermIdMap,
         id_to_term: Vec<Box<str>>,
+        /// Per-doc tf accumulator, indexed by `term_id`. Replaces the
+        /// previous `FxHashMap<u32, u32>` scratch: term_ids are dense
+        /// `0..vocab_size` (vocab ~10K on the bench Zipfian corpus, ≤
+        /// few M on 10M-doc corpora), so a dense `Vec<u32>` keyed on
+        /// `term_id` is a single array store per token (~5ns) vs a
+        /// hashmap probe + entry update (~25-30ns). On the 1M-doc
+        /// spill bench that's ~150M token-hits, so the per-call delta
+        /// is the dominant `add_doc` cost saving.
+        ///
+        /// Memory: 4 bytes × vocab. 40 KiB at 10K vocab; a few MiB
+        /// even at multi-M vocab — well inside the `O(max_partition_
+        /// bytes)` budget. The Vec grows monotonically as `intern_
+        /// term_id` mints new IDs; only ever read at the indices
+        /// listed in `updated_terms`, so stale entries past the
+        /// current `add_doc`'s set are ignored.
+        dense_doc_tf: Vec<u32>,
+        /// Set of `term_id`s that were written in the current
+        /// `add_doc` call. Drained at the end of each call to emit
+        /// triples and zero out `dense_doc_tf` slots — bounded by
+        /// the per-doc unique-term count (≤ doc length), so a tiny
+        /// `Vec<u32>` reused across calls.
+        updated_terms: Vec<u32>,
     },
 }
 
@@ -246,16 +284,27 @@ impl ColumnPostings {
 /// per posting". On the 1M-doc bench this is ~440K BufWriter
 /// branches instead of ~150M.
 const SPILL_BATCH_TRIPLES: usize = 341;
-const SPILL_BATCH_BYTES: usize = SPILL_BATCH_TRIPLES * TRIPLE_BYTES;
 
 struct SpillPartition {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
-    /// 4 KiB batch buffer flushed into `writer` when full.
-    /// `add_doc` appends 12-byte triples here in the hot path;
-    /// `finish_to`'s flush-stage drains any partial buffer once
-    /// per partition before the merge starts.
-    batch: Vec<u8>,
+    /// In-memory batch buffer flushed into `writer` when full.
+    /// `add_doc` appends triples here in the hot path; `finish_to`'s
+    /// flush-stage drains any partial buffer once per partition before
+    /// the merge starts.
+    ///
+    /// Stored as `Vec<Triple>` rather than `Vec<u8>` so the hot-path
+    /// `push_triple_batched` is a single `Vec::push` (one len-bump +
+    /// 12-byte store) instead of `extend_from_slice` of three
+    /// per-field `copy_from_slice` writes. On the 1M-doc spill bench
+    /// that's ~135M call-sites in the hot loop; the per-call delta
+    /// adds up.
+    ///
+    /// On flush the buffer is cast to `&[u8]` via `bytemuck::cast_slice`
+    /// (LE hosts) — zero copy. BE hosts pay a per-triple byte-swap
+    /// path. Capacity reserved to `SPILL_BATCH_TRIPLES` up front so
+    /// the steady-state push is branch-free w.r.t. capacity.
+    batch: Vec<Triple>,
 }
 
 /// Fixed on-disk record size in the spill files: 4 bytes `term_id`
@@ -337,12 +386,8 @@ fn push_triple_batched(
     doc_id: u32,
     tf: u32,
 ) -> Result<(), BuildError> {
-    let mut buf = [0u8; TRIPLE_BYTES];
-    buf[0..4].copy_from_slice(&term_id.to_le_bytes());
-    buf[4..8].copy_from_slice(&doc_id.to_le_bytes());
-    buf[8..12].copy_from_slice(&tf.to_le_bytes());
-    partition.batch.extend_from_slice(&buf);
-    if partition.batch.len() >= SPILL_BATCH_BYTES {
+    partition.batch.push([term_id, doc_id, tf]);
+    if partition.batch.len() >= SPILL_BATCH_TRIPLES {
         flush_partition_batch(partition)?;
     }
     Ok(())
@@ -363,7 +408,19 @@ fn flush_partition_batch(
         .writer
         .as_mut()
         .expect("partition writer is open before finish");
-    writer.write_all(&partition.batch)?;
+    // LE host: zero-copy cast from `&[Triple]` to `&[u8]`. BE host:
+    // per-triple swap path keeps the on-disk file little-endian so
+    // the LE fast read path stays valid cross-arch.
+    #[cfg(target_endian = "little")]
+    {
+        writer.write_all(bytemuck::cast_slice::<Triple, u8>(&partition.batch))?;
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for t in &partition.batch {
+            write_triple(writer, t[0], t[1], t[2])?;
+        }
+    }
     partition.batch.clear();
     Ok(())
 }
@@ -453,6 +510,45 @@ fn build_lex_rank(id_to_term: &[Box<str>]) -> (Vec<u32>, Vec<u32>) {
     }
     (rank, by_lex)
 }
+
+#[inline(always)]
+fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> u64 {
+    let mut state = hash_builder.build_hasher();
+    key.hash(&mut state);
+    state.finish()
+}
+
+/// Intern `term` in the spill-mode column vocabulary and return its
+/// stable `term_id`.
+///
+/// This is the hot spill `add_doc` lookup. Use hashbrown's raw entry
+/// API so miss handling reuses the hash computed for lookup instead
+/// of doing `get(term)` (probe once) followed by `insert(boxed, id)`
+/// (rehash + probe again). Hit behaviour remains one borrowed lookup
+/// with no allocation; misses allocate exactly one `Box<str>` for the
+/// map plus the existing `Box<str>` clone for `id_to_term`.
+#[inline(always)]
+fn intern_term_id(
+    term_to_id: &mut TermIdMap,
+    id_to_term: &mut Vec<Box<str>>,
+    term: &str,
+) -> u32 {
+    let hash = compute_hash(term_to_id.hasher(), term);
+    match term_to_id
+        .raw_entry_mut()
+        .from_hash(hash, |existing| existing.as_ref() == term)
+    {
+        RawEntryMut::Occupied(entry) => *entry.get(),
+        RawEntryMut::Vacant(entry) => {
+            let id = id_to_term.len() as u32;
+            let boxed: Box<str> = term.into();
+            id_to_term.push(boxed.clone());
+            entry.insert_hashed_nocheck(hash, boxed, id);
+            id
+        }
+    }
+}
+
 
 /// Min-heap entry for the k-way merge over sorted partition chunks.
 /// Sort key is a packed `u64 = (lex_rank as u64) << 32 | doc_id as
@@ -617,44 +713,39 @@ fn spill_sorted_chunk(
     Ok(())
 }
 
-/// Sort `triples` in place by `(lex_rank[term_id], doc_id)`
-/// using an 8-pass LSB byte-bucket radix sort over packed u64
-/// keys (`(lex_rank << 32) | doc_id`). Active byte count is
-/// detected per call so a corpus whose `(vocab × n_docs)`
-/// product fits in 40 bits only pays 5 passes, etc.
+/// Sort `triples` in place by `(lex_rank[term_id], doc_id)` using a
+/// single-pass O(n) stable counting sort over `lex_rank`.
 ///
-/// Why this beats `sort_unstable_by` (pdqsort):
+/// **Why a counting sort suffices** (and beats every comparison /
+/// LSB-radix variant we tried):
 ///
-/// - **No comparator overhead.** pdqsort's branchy compare
-///   chases `lex_rank[term_id]` twice per call; this radix
-///   does that lookup *once* per element in the key-build
-///   pass and never again. At 1M triples × O(log n) compares
-///   that's ~25M lex_rank lookups eliminated.
-/// - **Auto-vectorizable key build.** The first pass is a
-///   tight `for t in triples` loop that loads
-///   `lex_rank[t[0] as usize]` per element. With our
-///   `target-cpu=x86-64-v3` config LLVM lowers this to an
-///   AVX2 `vpgatherdd` gather (8 u32 lanes per instruction)
-///   plus shifts/packs. Eight elements processed per
-///   gathered batch; gather throughput on Sapphire Rapids is
-///   ~8 elements / 5 cycles.
-/// - **O(n) per pass instead of O(n log n) total.** For our
-///   1M-doc bench (1.2M triples per partition, 46-bit
-///   packed-key range → 6 passes) the radix does ~7.2M
-///   scatter writes per partition vs pdqsort's ~25M
-///   compare+swap operations.
-/// - **Stable key ordering.** LSB byte radix is stable, so
-///   ties on `lex_rank` resolve to insertion order; insertion
-///   order here equals `doc_id` order from the in-RAM batch
-///   buffer, so the final ordering is exactly
-///   `(lex_rank, doc_id)`. (`pdqsort` is unstable; we
-///   recovered the tiebreak via `.then(doc_id.cmp(...))` —
-///   no longer needed.)
+/// 1. The sort key is *bounded*. `lex_rank[term_id]` is in
+///    `0..vocab_size`. The bench Zipfian column has ~10K vocab; even
+///    a 10M-doc supertable column tops out around a few million —
+///    the counts table fits comfortably in L2 either way.
+/// 2. The secondary key is *free*. Within a partition file, all
+///    triples for a fixed `term_id` are appended in strictly
+///    increasing `doc_id` order (`add_doc` is called with monotonic
+///    `local_doc_id` per `column_id`, and each call emits one
+///    triple per unique term in iteration order over
+///    `updated_terms`, with all triples for that doc emitted
+///    contiguously). So a *stable* sort on `lex_rank[term_id]`
+///    leaves the within-rank order as the original `doc_id` order
+///    — exactly the `(lex_rank, doc_id)` order the finish-time
+///    lex-order partition traversal needs.
+/// 3. Counting sort is **one pass to histogram + one pass to
+///    scatter**. No `O(log n)` compare chain (pdqsort), no 5–8
+///    LSB-byte passes (radix), no comparator chasing `lex_rank`
+///    twice per call. Two reads of every triple and one write.
 ///
-/// Falls back to `sort_unstable_by` for n < 256, where the
-/// radix bookkeeping (allocate parallel arrays, 256-bucket
-/// histograms × ≥4 passes) costs more than just sorting
-/// scalar.
+/// **Memory shape**: `counts: Vec<u32>` of length
+/// `vocab_size + 1` (~40 KiB at 10K vocab), plus the `out: Vec
+/// <Triple>` of the same length as `triples` — the same size as the
+/// radix variant's parallel-array workspace, just a single
+/// allocation instead of three.
+///
+/// Falls back to `sort_unstable_by` for tiny inputs where the counts
+/// allocation outweighs the algorithmic savings.
 fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
     let n = triples.len();
     if n < 256 {
@@ -666,92 +757,51 @@ fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
         return;
     }
 
-    // Parallel arrays: packed sort key (u64) + tf payload + term_id payload.
-    // Single fused build pass — LLVM lowers
-    // `lex_rank[t[0] as usize]` to AVX2 vpgatherdd at the
-    // configured target-cpu.
-    let mut keys: Vec<u64> = Vec::with_capacity(n);
-    let mut tfs: Vec<u32> = Vec::with_capacity(n);
-    let mut term_ids: Vec<u32> = Vec::with_capacity(n);
-    let mut max_key: u64 = 0;
+    let vocab_size = lex_rank.len();
+    // Histogram + prefix-sum table. `+1` so the final entry holds
+    // `n` after prefix-sum, which simplifies the bounds check below.
+    let mut offsets: Vec<u32> = vec![0u32; vocab_size + 1];
+
+    // Pass 1: count triples per `lex_rank`. The hot inner step is
+    // `lex_rank[term_id as usize]` — at `target-cpu=x86-64-v3` LLVM
+    // lowers the strided load to an AVX2 `vpgatherdd` (8 ranks per
+    // instruction). The histogram `offsets[rank] += 1` has a self-
+    // dependency that prevents auto-vectorisation, but the loop
+    // body is short enough that out-of-order issue absorbs the
+    // latency.
     for t in triples.iter() {
-        let term_id = t[0];
-        let doc_id = t[1];
-        let tf = t[2];
-        let rank = lex_rank[term_id as usize];
-        let key = ((rank as u64) << 32) | (doc_id as u64);
-        keys.push(key);
-        tfs.push(tf);
-        term_ids.push(term_id);
-        if key > max_key {
-            max_key = key;
-        }
-    }
-    // Skip leading-zero byte passes.
-    let n_passes = if max_key == 0 {
-        1
-    } else {
-        ((64 - max_key.leading_zeros() + 7) / 8) as usize
-    };
-
-    let mut keys2: Vec<u64> = vec![0u64; n];
-    let mut tfs2: Vec<u32> = vec![0u32; n];
-    let mut term_ids2: Vec<u32> = vec![0u32; n];
-
-    for pass in 0..n_passes {
-        let shift = (pass * 8) as u32;
-
-        // Histogram. Two-pass histogram intentionally — first
-        // a write of zeros (`[0u32; 256]` initialiser, lowered
-        // to AVX2 vmovaps), then the count loop. Hot inner
-        // body is `hist[byte] += 1` which the AVX2 backend
-        // can't vectorise (data dep on hist[byte]), but the
-        // loop body is tight enough that branch prediction
-        // and L1 hits make it ~1 cycle/element in practice.
-        let mut hist = [0u32; 256];
-        for &k in &keys {
-            hist[((k >> shift) & 0xff) as usize] += 1;
-        }
-
-        // Prefix sum (in place). 256 elements, runs once per
-        // pass — negligible.
-        let mut sum: u32 = 0;
-        for c in hist.iter_mut() {
-            let tmp = *c;
-            *c = sum;
-            sum = sum.wrapping_add(tmp);
-        }
-
-        // Scatter. Carries the dominant cost; data dep on
-        // hist[bucket]++ prevents vectorisation, but the 4
-        // memory streams (keys2, tfs2, term_ids2, hist) all
-        // sit in L1/L2 for typical partition sizes.
-        for i in 0..n {
-            let k = keys[i];
-            let bucket = ((k >> shift) & 0xff) as usize;
-            let dst = hist[bucket] as usize;
-            keys2[dst] = k;
-            tfs2[dst] = tfs[i];
-            term_ids2[dst] = term_ids[i];
-            hist[bucket] += 1;
-        }
-
-        std::mem::swap(&mut keys, &mut keys2);
-        std::mem::swap(&mut tfs, &mut tfs2);
-        std::mem::swap(&mut term_ids, &mut term_ids2);
+        let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
+        offsets[rank] = offsets[rank].wrapping_add(1);
     }
 
-    // If `n_passes` was even, the sorted data is in
-    // `keys`/`tfs`/`term_ids` (the originals after even-many
-    // swaps). For odd `n_passes`, it's also there because the
-    // final iteration's swap moved the sorted output back. So
-    // we always read from the "primary" arrays here.
-    triples.clear();
-    triples.reserve(n);
-    for i in 0..n {
-        // Low 32 bits of the packed sort key carry doc_id.
-        triples.push([term_ids[i], keys[i] as u32, tfs[i]]);
+    // Pass 2 (cheap): convert counts into starting-offset table by
+    // exclusive prefix sum. Runs over `vocab_size + 1` entries
+    // (~10K on the bench) — well below the partition sort cost.
+    let mut sum: u32 = 0;
+    for c in offsets.iter_mut() {
+        let tmp = *c;
+        *c = sum;
+        sum = sum.wrapping_add(tmp);
     }
+    debug_assert_eq!(sum as usize, n, "histogram total != triple count");
+
+    // Pass 3: scatter into `out`. Each triple lands at
+    // `offsets[rank]`, then we bump that slot so the next triple
+    // for the same rank lands immediately after. Because we walk
+    // `triples` in arrival order and arrival order is `(doc_id,
+    // term_id_within_doc)`, the within-rank order in `out` is the
+    // partition's `doc_id` order — i.e. `(lex_rank, doc_id)`.
+    let mut out: Vec<Triple> = vec![[0u32; 3]; n];
+    for t in triples.iter() {
+        let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
+        let dst = unsafe { *offsets.get_unchecked(rank) } as usize;
+        unsafe {
+            *out.get_unchecked_mut(dst) = *t;
+            *offsets.get_unchecked_mut(rank) = (dst as u32).wrapping_add(1);
+        }
+    }
+
+    *triples = out;
 }
 
 /// Open a partition as a sorted-triple iterator. Picks the in-
@@ -868,18 +918,9 @@ pub struct FtsBuilder {
     ///
     /// Only the in-RAM arm of `add_doc` consumes this — the spill
     /// arm interns tokens straight into the column's `term_to_id`
-    /// and dedupes via `doc_tf_scratch` keyed by `term_id` instead.
+    /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
+    /// ::Spilled`) keyed by `term_id` instead.
     bump: bumpalo::Bump,
-    /// Per-doc `term_id -> tf` dedup scratch, reused across every
-    /// spill-mode `add_doc` call. Cleared (`.clear()`, retain
-    /// capacity) on each entry instead of being freshly allocated,
-    /// saving 1M `FxHashMap::default()` + grow + drop cycles on
-    /// the 1M-doc bench. Only used by the spill arm; the in-RAM
-    /// arm stages tokens through bumpalo + a local
-    /// `HashMap<&str, u32>` instead (so `&str` keys can be cheaply
-    /// promoted to `Box<str>` for the `terms` map without an
-    /// extra copy).
-    doc_tf_scratch: FxHashMap<u32, u32>,
 }
 
 impl FtsBuilder {
@@ -928,7 +969,6 @@ impl FtsBuilder {
             max_partition_bytes: DEFAULT_MAX_PARTITION_BYTES,
             n_docs: 0,
             bump: bumpalo::Bump::new(),
-            doc_tf_scratch: FxHashMap::default(),
         }
     }
 
@@ -1033,7 +1073,7 @@ impl FtsBuilder {
             partitions.push(SpillPartition {
                 path,
                 writer: Some(BufWriter::with_capacity(PARTITION_BUF_SIZE, file)),
-                batch: Vec::with_capacity(SPILL_BATCH_BYTES),
+                batch: Vec::with_capacity(SPILL_BATCH_TRIPLES),
             });
         }
         Ok(partitions)
@@ -1052,7 +1092,7 @@ impl FtsBuilder {
     fn flush_in_ram_to_partitions(
         terms: FxHashMap<Box<str>, Vec<(u32, u32)>>,
         partitions: &mut [SpillPartition],
-        term_to_id: &mut FxHashMap<Box<str>, u32>,
+        term_to_id: &mut TermIdMap,
         id_to_term: &mut Vec<Box<str>>,
     ) -> Result<(), BuildError> {
         let n_part = partitions.len();
@@ -1062,15 +1102,7 @@ impl FtsBuilder {
         );
         let mask = n_part - 1;
         for (term, postings) in terms {
-            let term_id = match term_to_id.get(&term) {
-                Some(&id) => id,
-                None => {
-                    let id = id_to_term.len() as u32;
-                    id_to_term.push(term.clone());
-                    term_to_id.insert(term, id);
-                    id
-                }
-            };
+            let term_id = intern_term_id(term_to_id, id_to_term, &term);
             let p = (term_id as usize) & mask;
             for (doc_id, tf) in postings {
                 push_triple_batched(&mut partitions[p], term_id, doc_id, tf)?;
@@ -1131,21 +1163,14 @@ impl FtsBuilder {
         // whether this batch would cross the spill threshold and
         // transition if so.
         let column_id = col_idx as u32;
-        // Split-borrow: spill arm needs `&mut self.doc_tf_scratch`
-        // alongside `&mut self.postings[col_idx]`. Pre-borrow the
-        // scratch here (disjoint field from `postings`) so the
-        // `match col_post { ... }` arm can capture both. Cleared
-        // (capacity retained) so the per-doc dedup map reuses its
-        // hash buckets instead of allocating a fresh table per
-        // call.
-        let doc_tf = &mut self.doc_tf_scratch;
-        doc_tf.clear();
         let col_post = &mut self.postings[col_idx];
         match col_post {
             ColumnPostings::Spilled {
                 partitions,
                 term_to_id,
                 id_to_term,
+                dense_doc_tf,
+                updated_terms,
             } => {
                 let n_part = partitions.len();
                 debug_assert!(
@@ -1154,41 +1179,38 @@ impl FtsBuilder {
                 );
                 let mask = n_part - 1;
 
-                // Per-doc dedup keyed by `term_id` (u32). No
-                // `Box<str>` keys, no bumpalo, no `tf_per_term:
-                // HashMap<&str, u32>` intermediate: we intern
-                // per-token using the column's already-warm
-                // `term_to_id`, sum per-doc term frequencies in
-                // the reusable `doc_tf` scratch, then drain
-                // straight to spill at the end of the doc.
+                // Dense-array per-doc dedup. Replaces the previous
+                // `FxHashMap<u32, u32>` scratch — per-token cost
+                // drops from one hashmap probe + entry update
+                // (~25-30ns) to one array bounds-grow check + one
+                // load + one store (~5ns). On the 1M-doc spill
+                // bench that's ~150M token-hits, so the per-call
+                // delta is large.
                 //
-                // Saves on the spill hot path (1M docs × ~150
-                // tokens/doc on the bench):
-                //   - 150M `bumpalo::alloc_str` calls
-                //   - 150M `Box<str>::from(&str)` boxings
-                //   - 150M `tf_per_term.entry(&'static str)` probes
-                //   - 1M  `FxHashMap::default()` allocations
-                //     (scratch is reused across calls; cleared
-                //     above)
-                //
-                // Term lookup is `term_to_id.get(tok)`: 1 probe
-                // on hit (Zipfian vocab plateaus quickly so hit
-                // dominates), 2 probes on miss (`get` + `insert`).
-                // The `Box<str>::from(tok)` allocation only fires
-                // on the miss branch.
+                // Invariant: `dense_doc_tf[tid] != 0` iff `tid` is
+                // currently in `updated_terms`. We restore that
+                // invariant at the drain step below by zeroing each
+                // touched slot. Term ids past the previous max are
+                // implicitly zero by `resize_with(_, || 0)`.
+                updated_terms.clear();
                 tokenizer.tokenize_each(text, &mut |tok| {
                     tokens_in_doc += 1;
-                    let term_id = match term_to_id.get(tok) {
-                        Some(&id) => id,
-                        None => {
-                            let id = id_to_term.len() as u32;
-                            let boxed: Box<str> = tok.into();
-                            id_to_term.push(boxed.clone());
-                            term_to_id.insert(boxed, id);
-                            id
-                        }
-                    };
-                    *doc_tf.entry(term_id).or_insert(0) += 1;
+                    let term_id = intern_term_id(term_to_id, id_to_term, tok);
+                    let idx = term_id as usize;
+                    // Lazy grow: `term_to_id` may have just minted a
+                    // fresh id past `dense_doc_tf.len()`. Grow in
+                    // one step to `id_to_term.len()` (the current
+                    // vocab) so subsequent intern hits don't pay the
+                    // grow branch.
+                    if idx >= dense_doc_tf.len() {
+                        dense_doc_tf.resize(id_to_term.len(), 0);
+                    }
+                    // First touch in this doc: record so we can
+                    // emit + zero at end-of-doc.
+                    if dense_doc_tf[idx] == 0 {
+                        updated_terms.push(term_id);
+                    }
+                    dense_doc_tf[idx] += 1;
                 });
 
                 // Update column doc-lengths + accounting. The
@@ -1205,10 +1227,14 @@ impl FtsBuilder {
                     self.n_docs = docs_now;
                 }
 
-                // Iterate by reference; the scratch is owned by
-                // `self.doc_tf_scratch` and stays allocated for
-                // the next `add_doc` call (cleared at the top).
-                for (&term_id, &tf) in doc_tf.iter() {
+                // Drain: emit one triple per touched term, then
+                // zero out the slot to restore the
+                // `dense_doc_tf[tid] != 0 iff in updated_terms`
+                // invariant for the next call.
+                for &term_id in updated_terms.iter() {
+                    let idx = term_id as usize;
+                    let tf = dense_doc_tf[idx];
+                    dense_doc_tf[idx] = 0;
                     let p = (term_id as usize) & mask;
                     push_triple_batched(
                         &mut partitions[p],
@@ -1240,7 +1266,14 @@ impl FtsBuilder {
                 self.bump.reset();
                 let bump = &self.bump;
 
-                let mut tf_per_term: HashMap<&str, u32> = HashMap::new();
+                // FxHash on the per-doc dedup map: SipHash (std HashMap's
+                // default) is hash-DoS-resistant but ~3-5× slower per
+                // probe than FxHash for short ASCII tokens. On the Rayon
+                // prod path this map is hit ~135 times per doc × ~62.5K
+                // docs/shard × 16 shards = ~135M probes per builder.
+                // The keys borrow into the per-shard bump arena and the
+                // map is rebuilt per doc, so DoS-resistance is moot here.
+                let mut tf_per_term: FxHashMap<&str, u32> = FxHashMap::default();
                 tokenizer.tokenize_each(text, &mut |tok| {
                     tokens_in_doc += 1;
                     // alloc_str copies the borrowed token bytes
@@ -1284,35 +1317,43 @@ impl FtsBuilder {
                         "column was InRam at top of add_doc; cannot have spilled mid-call"
                     ),
                 };
-                // Insert via `Entry` API: one HashMap probe per
-                // posting (vs the old two probes — `contains_key`
-                // pre-check + `entry().or_default()`). At 100
-                // terms/doc × 1M docs this halves the in-RAM
-                // hot-path HashMap traffic and is the dominant
-                // win on the rayon multi-thread path (where
-                // segments are small enough to never spill but
-                // were paying double-probe per posting). Bytes
-                // accounting is folded into the same arm so the
-                // threshold check is a single `>` after the
-                // insert loop, no separate scan over
-                // `tf_per_term.keys()`.
+                // Lookup with `get_mut(&str)` first — borrowed
+                // probe against a `Box<str>` key, no allocation
+                // on hits. Only the miss path constructs a
+                // `Box::<str>::from(term)` for insertion. On a
+                // Zipfian corpus the vocabulary plateaus around
+                // ~10k unique terms while we ingest 1M docs ×
+                // ~135 tokens/doc = ~135M postings, so hits
+                // dominate by >4 orders of magnitude. Allocating
+                // a `Box<str>` per hit (as the prior `Entry` API
+                // shape did, since `Entry` needs key ownership
+                // up front) costs the production rayon-sharded
+                // path (which never spills) ~135M unnecessary
+                // heap allocations per builder — the dominant
+                // cause of the InRam-path regression vs parent.
+                //
+                // Bytes accounting folds into the same loop so
+                // the spill-threshold check is one `>` after the
+                // posting loop instead of a second pass.
                 let mut new_bytes: usize = 0;
                 for (term, tf) in tf_per_term {
-                    use std::collections::hash_map::Entry;
                     let term_len = term.len();
-                    match terms.entry(term.into()) {
-                        Entry::Vacant(e) => {
-                            e.insert(vec![(local_doc_id, tf)]);
+                    match terms.get_mut(term) {
+                        Some(acc) => {
+                            acc.push((local_doc_id, tf));
+                            new_bytes =
+                                new_bytes.saturating_add(ACCUM_POSTING_BYTES);
+                        }
+                        None => {
+                            terms.insert(
+                                Box::<str>::from(term),
+                                vec![(local_doc_id, tf)],
+                            );
                             new_bytes = new_bytes.saturating_add(
                                 ACCUM_NEW_TERM_FIXED_BYTES
                                     + term_len
                                     + ACCUM_POSTING_BYTES,
                             );
-                        }
-                        Entry::Occupied(mut e) => {
-                            e.get_mut().push((local_doc_id, tf));
-                            new_bytes =
-                                new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                         }
                     }
                 }
@@ -1337,8 +1378,7 @@ impl FtsBuilder {
                         column_id,
                         self.spill_partitions,
                     )?;
-                    let mut term_to_id: FxHashMap<Box<str>, u32> =
-                        FxHashMap::default();
+                    let mut term_to_id: TermIdMap = TermIdMap::default();
                     let mut id_to_term: Vec<Box<str>> = Vec::new();
                     Self::flush_in_ram_to_partitions(
                         drained,
@@ -1346,10 +1386,20 @@ impl FtsBuilder {
                         &mut term_to_id,
                         &mut id_to_term,
                     )?;
+                    // Pre-grow `dense_doc_tf` to the post-flush vocab
+                    // so the first post-transition `add_doc` doesn't
+                    // pay a resize on every novel term it sees. The
+                    // values are zero-initialised so the dedup
+                    // invariant (`dense_doc_tf[tid] != 0 iff tid in
+                    // updated_terms`) holds from the start.
+                    let dense_doc_tf = vec![0u32; id_to_term.len()];
+                    let updated_terms: Vec<u32> = Vec::new();
                     *col_post = ColumnPostings::Spilled {
                         partitions,
                         term_to_id,
                         id_to_term,
+                        dense_doc_tf,
+                        updated_terms,
                     };
                 } else {
                     *bytes = new_total;
@@ -1413,7 +1463,6 @@ impl FtsBuilder {
             max_partition_bytes,
             n_docs,
             bump: _,
-            doc_tf_scratch: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -1470,6 +1519,9 @@ impl FtsBuilder {
         let mut postings_len: u64 = 0;
         let mut postings_crc_acc: u32 = 0;
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+        // Single per-column scratch reused across every term in every
+        // column. See `TermScratch` for what's pooled and why.
+        let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_env();
 
         // Path-dependent FST destination:
@@ -1493,6 +1545,7 @@ impl FtsBuilder {
         // into the partition's `BufWriter`, then flush + close
         // the `BufWriter` so reads see a complete file. In-RAM
         // columns are no-ops.
+        let partition_flush_start = finish_profile.enabled.then(Instant::now);
         for (_, _, cp) in &mut work {
             if let ColumnPostings::Spilled { partitions, .. } = cp {
                 for partition in partitions {
@@ -1502,6 +1555,9 @@ impl FtsBuilder {
                     }
                 }
             }
+        }
+        if let Some(t) = partition_flush_start {
+            finish_profile.partition_flush += t.elapsed();
         }
 
         // Per-column doc-lengths held back so the (avgdl + array)
@@ -1553,6 +1609,7 @@ impl FtsBuilder {
                             fst_entries_inram.as_mut(),
                             fst_streaming.as_mut(),
                             &mut finish_profile,
+                            &mut term_scratch,
                         )?;
                         n_terms_total_usize += 1;
                     }
@@ -1561,6 +1618,8 @@ impl FtsBuilder {
                     partitions,
                     term_to_id,
                     id_to_term,
+                    dense_doc_tf: _,
+                    updated_terms: _,
                 } => {
                     // Term interner is finished being written to;
                     // drop the forward map (`term_to_id`) immediately
@@ -1568,8 +1627,12 @@ impl FtsBuilder {
                     // the reverse map (`id_to_term`) for FST emit and
                     // the lex-rank table built from it.
                     drop(term_to_id);
+                    let lex_rank_start = finish_profile.enabled.then(Instant::now);
                     let (lex_rank, term_id_in_lex_order) =
                         build_lex_rank(&id_to_term);
+                    if let Some(t) = lex_rank_start {
+                        finish_profile.lex_rank_build += t.elapsed();
+                    }
 
                     // Pre-sort every partition to a sorted-triple
                     // file under scratch. Sorting partition-at-a-
@@ -1579,6 +1642,7 @@ impl FtsBuilder {
                     // resulting sorted files runs with
                     // O(n_partitions) cursors each holding one
                     // triple + a small read buffer.
+                    let sort_start = finish_profile.enabled.then(Instant::now);
                     let mut sorted_files: Vec<PathBuf> =
                         Vec::with_capacity(partitions.len());
                     for (partition_idx, partition) in partitions.iter().enumerate() {
@@ -1594,6 +1658,9 @@ impl FtsBuilder {
                             &lex_rank,
                         )?;
                         sorted_files.push(sorted_path);
+                    }
+                    if let Some(t) = sort_start {
+                        finish_profile.partition_sort += t.elapsed();
                     }
 
                     // Lex-order partition traversal. Replaces the
@@ -1626,6 +1693,7 @@ impl FtsBuilder {
                     // (zero-copy `&[Triple]` over page-cache-hot
                     // bytes), so the per-posting access is pointer
                     // arithmetic against contiguous memory.
+                    let mmap_start = finish_profile.enabled.then(Instant::now);
                     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
                     for p in &sorted_files {
                         let f = File::open(p)?;
@@ -1635,6 +1703,9 @@ impl FtsBuilder {
                         // for the lifetime of the `Mmap`.
                         let mmap = unsafe { Mmap::map(&f)? };
                         mmaps.push(mmap);
+                    }
+                    if let Some(t) = mmap_start {
+                        finish_profile.mmap_open += t.elapsed();
                     }
                     let sorted_slices: Vec<&[Triple]> = mmaps
                         .iter()
@@ -1711,6 +1782,7 @@ impl FtsBuilder {
                             fst_entries_inram.as_mut(),
                             fst_streaming.as_mut(),
                             &mut finish_profile,
+                            &mut term_scratch,
                         )?;
                         n_terms_total_usize += 1;
                     }
@@ -1754,6 +1826,7 @@ impl FtsBuilder {
                     // doesn't see their disk residency. (Original
                     // partition files are owned by `partitions`
                     // and dropped at the next iteration boundary.)
+                    let cleanup_start = finish_profile.enabled.then(Instant::now);
                     drop(sorted_slices);
                     drop(mmaps);
                     for p in &sorted_files {
@@ -1767,6 +1840,9 @@ impl FtsBuilder {
                     drop(partitions);
                     drop(id_to_term);
                     drop(lex_rank);
+                    if let Some(t) = cleanup_start {
+                        finish_profile.scratch_cleanup += t.elapsed();
+                    }
                 }
             }
 
@@ -1787,12 +1863,16 @@ impl FtsBuilder {
         let n_terms_total = n_terms_total_usize as u32;
 
         // Close the posting body file (CRC trailer + flush).
+        let postings_close_start = finish_profile.enabled.then(Instant::now);
         let postings_crc = postings_crc_acc;
         let postings_crc_le = postings_crc.to_le_bytes();
         postings_writer.write_all(&postings_crc_le)?;
         postings_writer.flush()?;
         drop(postings_writer);
         postings_len += postings_crc_le.len() as u64;
+        if let Some(t) = postings_close_start {
+            finish_profile.postings_close += t.elapsed();
+        }
 
         // Finalise the FST. Either path produces "FST bytes followed
         // by 4 trailing CRC bytes"; the source differs.
@@ -1800,6 +1880,7 @@ impl FtsBuilder {
             InRam(Vec<u8>),
             Streamed { path: PathBuf, len: u64, crc: u32 },
         }
+        let fst_close_start = finish_profile.enabled.then(Instant::now);
         let fst_source = if let Some(db) = fst_entries_inram.take() {
             let mut bytes = db.finish();
             let crc = crc32c(&bytes);
@@ -1842,8 +1923,12 @@ impl FtsBuilder {
                 crc,
             }
         };
+        if let Some(t) = fst_close_start {
+            finish_profile.fst_close += t.elapsed();
+        }
 
         // Compute final-blob offsets now that both region lengths are known.
+        let dl_emit_start = finish_profile.enabled.then(Instant::now);
         let fst_total_len: u64 = match &fst_source {
             FstSource::InRam(bytes) => bytes.len() as u64,
             FstSource::Streamed { len, .. } => *len,
@@ -1889,9 +1974,13 @@ impl FtsBuilder {
         }
         let dir_crc = crc32c(&dir_buf);
         dir_buf.extend_from_slice(&dir_crc.to_le_bytes());
+        if let Some(t) = dl_emit_start {
+            finish_profile.doc_lengths_emit += t.elapsed();
+        }
 
         // Final assembly. Bytes flow scratch → small streaming buffer
         // → `w`, never re-materialising the full blob in RAM.
+        let blob_copy_start = finish_profile.enabled.then(Instant::now);
         let mut header = Vec::with_capacity(header_size as usize);
         header.extend_from_slice(format::fts::MAGIC); // 8
         header.extend_from_slice(&format::fts::VERSION.to_le_bytes()); // 4
@@ -1926,6 +2015,24 @@ impl FtsBuilder {
 
         w.write_all(&dir_buf)?;
         w.write_all(&arrays_buf)?;
+        if let Some(t) = blob_copy_start {
+            finish_profile.blob_copy += t.elapsed();
+        }
+
+        if finish_profile.enabled {
+            eprintln!(
+                "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
+                finish_profile.partition_flush.as_secs_f64(),
+                finish_profile.lex_rank_build.as_secs_f64(),
+                finish_profile.partition_sort.as_secs_f64(),
+                finish_profile.mmap_open.as_secs_f64(),
+                finish_profile.scratch_cleanup.as_secs_f64(),
+                finish_profile.postings_close.as_secs_f64(),
+                finish_profile.fst_close.as_secs_f64(),
+                finish_profile.doc_lengths_emit.as_secs_f64(),
+                finish_profile.blob_copy.as_secs_f64(),
+            );
+        }
 
         Ok(())
     }
@@ -1934,6 +2041,35 @@ impl FtsBuilder {
 #[inline]
 fn map_fst_err(e: fst::Error) -> BuildError {
     BuildError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Reusable per-term scratch buffers threaded through
+/// `encode_and_emit_term`. One instance is created at the top of
+/// `finish_to` and re-used across every term encoded in the column,
+/// turning ~3M+ per-term `Vec::new` allocations on the 1M-doc
+/// forced-spill bench into ~5 reused allocations (one per buffer,
+/// once per column). The Block's `doc_ids` / `tfs` Vecs are
+/// `mem::take`'d into a Block, encoded, then swapped back via
+/// `mem::take` so the underlying buffer is reused for the next
+/// chunk (same allocation, just `Vec::clear` between iterations).
+#[derive(Default)]
+struct TermScratch {
+    /// Per-block doc_id column passed to `encode_block`. Re-used by
+    /// taking it into a Block, encoding, and taking it back. Capacity
+    /// stabilises at `BLOCK_LEN` after the first dense term.
+    doc_ids: Vec<u32>,
+    /// Per-block tf column, same lifecycle as `doc_ids`.
+    tfs: Vec<u32>,
+    /// Per-term minimum doc-length per block, used to compute the
+    /// per-block BM25 upper bound for the skip table.
+    min_dl_per_block: Vec<u32>,
+    /// Per-term list of encoded blocks held across the meta + skip-
+    /// table + block-bytes emit stages.
+    encoded_blocks: Vec<EncodedBlock>,
+    /// Per-term contiguous byte buffer holding meta + skip table +
+    /// concatenated block bytes; written to `postings_writer` as one
+    /// `write_counted` call.
+    term_buf: Vec<u8>,
 }
 
 /// Encode one term's posting list and emit the resulting FST entry
@@ -1958,6 +2094,7 @@ fn encode_and_emit_term<W: Write>(
     fst_entries_inram: Option<&mut DictBuilder>,
     mut fst_streaming: Option<&mut StreamingDictBuilder<BufWriter<File>>>,
     profile: &mut FinishProfile,
+    scratch: &mut TermScratch,
 ) -> Result<(), BuildError> {
     let encode_start = profile.enabled.then(Instant::now);
     profile.encode_calls += 1;
@@ -1982,20 +2119,52 @@ fn encode_and_emit_term<W: Write>(
     } else {
         profile.encode_pfor += 1;
         let idf_t = crate::superfile::fts::bm25::idf(n_docs as u64, df);
-        let mut encoded_blocks: Vec<crate::superfile::fts::posting::EncodedBlock> = Vec::new();
-        let mut min_dl_per_block: Vec<u32> = Vec::new();
+        // Reuse `scratch.encoded_blocks` / `scratch.min_dl_per_block`
+        // across every dense term in the column (one allocation amortised
+        // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).
+        let encoded_blocks = &mut scratch.encoded_blocks;
+        let min_dl_per_block = &mut scratch.min_dl_per_block;
+        encoded_blocks.clear();
+        min_dl_per_block.clear();
         let block_build_start = profile.enabled.then(Instant::now);
+        // Build each block by moving the reusable `doc_ids` / `tfs`
+        // buffers into a `Block` (Vec move = pointer swap, no copy),
+        // encoding, then moving them back so the next chunk reuses the
+        // same heap allocation. `encode_block` only borrows, but the
+        // public signature takes `&Block` whose fields are owned Vecs,
+        // hence the take/put dance. The take/put preserves capacity at
+        // `BLOCK_LEN`, so the steady-state per-chunk cost is
+        // `clear` + `extend_from_slice` of ≤128 u32s with no realloc.
+        let mut block_doc_ids = std::mem::take(&mut scratch.doc_ids);
+        let mut block_tfs = std::mem::take(&mut scratch.tfs);
+        if block_doc_ids.capacity() < BLOCK_LEN {
+            block_doc_ids.reserve(BLOCK_LEN - block_doc_ids.capacity());
+        }
+        if block_tfs.capacity() < BLOCK_LEN {
+            block_tfs.reserve(BLOCK_LEN - block_tfs.capacity());
+        }
         for chunk in pairs.chunks(BLOCK_LEN) {
-            let doc_ids: Vec<u32> = chunk.iter().map(|&(d, _)| d).collect();
-            let tfs: Vec<u32> = chunk.iter().map(|&(_, t)| t).collect();
-            let min_dl = doc_ids
+            block_doc_ids.clear();
+            block_tfs.clear();
+            block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
+            block_tfs.extend(chunk.iter().map(|&(_, t)| t));
+            let min_dl = block_doc_ids
                 .iter()
                 .map(|d| col_doc_lengths[*d as usize])
                 .min()
                 .unwrap_or(0);
             min_dl_per_block.push(min_dl);
-            encoded_blocks.push(encode_block(&Block { doc_ids, tfs }));
+            let block = Block {
+                doc_ids: std::mem::take(&mut block_doc_ids),
+                tfs: std::mem::take(&mut block_tfs),
+            };
+            encoded_blocks.push(encode_block(&block));
+            // Reclaim the underlying allocations for the next chunk.
+            block_doc_ids = block.doc_ids;
+            block_tfs = block.tfs;
         }
+        scratch.doc_ids = block_doc_ids;
+        scratch.tfs = block_tfs;
         if let Some(start) = block_build_start {
             profile.encode_block_build += start.elapsed();
         }
@@ -2011,8 +2180,15 @@ fn encode_and_emit_term<W: Write>(
             "single-term posting > 4 GiB"
         );
 
+        // Reuse `scratch.term_buf` across every dense term. `clear`
+        // keeps the existing allocation; only a true grow (a term
+        // larger than any previously seen) reallocs.
+        let term_buf = &mut scratch.term_buf;
+        term_buf.clear();
+        if term_buf.capacity() < postings_length as usize {
+            term_buf.reserve(postings_length as usize - term_buf.capacity());
+        }
         let meta_write_start = profile.enabled.then(Instant::now);
-        let mut term_buf: Vec<u8> = Vec::with_capacity(postings_length as usize);
         term_buf.extend_from_slice(&(df as u32).to_le_bytes());
         term_buf.extend_from_slice(&metadata_offset.to_le_bytes());
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
@@ -2043,11 +2219,11 @@ fn encode_and_emit_term<W: Write>(
         }
 
         let block_write_start = profile.enabled.then(Instant::now);
-        for blk in &encoded_blocks {
+        for blk in encoded_blocks.iter() {
             term_buf.extend_from_slice(&blk.bytes);
         }
         debug_assert_eq!(term_buf.len(), postings_length as usize);
-        write_counted(postings_writer, postings_crc_acc, postings_len, &term_buf)?;
+        write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
         if let Some(start) = block_write_start {
             profile.encode_block_write += start.elapsed();
         }

@@ -62,15 +62,36 @@ impl Tokenizer for AsciiLowerTokenizer {
         Box::new(AsciiLowerIter::new(text.as_bytes()))
     }
 
-    /// Zero-alloc emission: walks the input once, reusing a 32-byte
-    /// stack-or-heap scratch buffer for each token. The `&str` passed
-    /// to the callback aliases that buffer; the next callback
-    /// invocation overwrites it.
+    /// Zero-alloc emission with a borrowed fast path.
+    ///
+    /// Scans the input once. For each token-byte run:
+    ///   * If the run is **already lowercase ASCII** (the common case
+    ///     for log lines, telemetry tokens, "term00042"-shaped Zipfian
+    ///     bench corpora, and lower-cased ingestion pipelines) the
+    ///     callback gets a borrowed `&str` slicing directly into the
+    ///     input — zero copy, zero scratch-buf write.
+    ///   * If the run contains uppercase ASCII bytes, the run is
+    ///     copied into a reusable scratch `buf` while lower-casing in
+    ///     place. The callback then gets `&buf`.
+    ///   * If the run contains any non-ASCII byte (≥ 0x80), the whole
+    ///     run is dropped per the v1 ASCII-only rule.
+    ///
+    /// The borrowed/copied `&str` is only valid for that one callback
+    /// call. The next callback invocation may overwrite `buf` or hand
+    /// out a different slice; copy via bumpalo/Box if you need to
+    /// keep it.
+    ///
+    /// Why this matters: at 1M docs × ~150 tokens/doc the inner
+    /// per-byte work in the buf-copy path (`buf.push(b.to_ascii_
+    /// lowercase())`) is multiple seconds of CPU. Skipping the copy
+    /// when there's nothing to lowercase cuts the byte loop to a
+    /// single bounded scan that LLVM autovectorises into a SWAR
+    /// run-length scan.
     fn tokenize_each(&self, text: &str, f: &mut dyn FnMut(&str)) {
         let bytes = text.as_bytes();
-        let mut buf: Vec<u8> = Vec::with_capacity(32);
+        let mut buf: Vec<u8> = Vec::new();
         let mut pos = 0;
-        loop {
+        while pos < bytes.len() {
             // Skip non-token bytes.
             while pos < bytes.len() && !is_token_byte(bytes[pos]) {
                 pos += 1;
@@ -78,28 +99,51 @@ impl Tokenizer for AsciiLowerTokenizer {
             if pos >= bytes.len() {
                 return;
             }
-            // Accumulate one token.
-            buf.clear();
+            let start = pos;
+            let mut had_upper = false;
             let mut had_non_ascii = false;
             while pos < bytes.len() {
                 let b = bytes[pos];
                 if is_token_byte(b) {
-                    buf.push(b.to_ascii_lowercase());
+                    // `is_token_byte` accepts ASCII alphanumerics
+                    // only, so an uppercase letter is exactly the
+                    // [`A`..=`Z`] range.
+                    had_upper |= (b'A'..=b'Z').contains(&b);
                     pos += 1;
                 } else if b >= 0x80 {
+                    // Non-ASCII byte mid-run — drop the whole run.
                     had_non_ascii = true;
                     pos += 1;
                 } else {
                     break;
                 }
             }
-            if had_non_ascii || buf.is_empty() {
+            if had_non_ascii || start == pos {
                 continue;
             }
-            // SAFETY-equivalent: we only push ASCII letters/digits (and
-            // their lowercased forms), so `buf` is always valid UTF-8.
-            let s = std::str::from_utf8(&buf).expect("ASCII-only by construction");
-            f(s);
+            if !had_upper {
+                // Fast path: borrow directly from `text`.
+                //
+                // SAFETY: `is_token_byte` only accepts ASCII
+                // alphanumerics, so every byte in `bytes[start..pos]`
+                // is a single-byte ASCII codepoint. The slice is
+                // therefore valid UTF-8 and the original `text`
+                // outlives the callback call.
+                let s = unsafe { std::str::from_utf8_unchecked(&bytes[start..pos]) };
+                f(s);
+            } else {
+                // Slow path: copy + lowercase into the reusable buf.
+                buf.clear();
+                buf.reserve(pos - start);
+                for &b in &bytes[start..pos] {
+                    buf.push(b.to_ascii_lowercase());
+                }
+                // SAFETY: same reasoning — every byte pushed is an
+                // ASCII alphanumeric (or its lowercased form, which
+                // is also ASCII).
+                let s = unsafe { std::str::from_utf8_unchecked(&buf) };
+                f(s);
+            }
         }
     }
 }
