@@ -405,12 +405,7 @@ fn triple_tf(t: &Triple) -> u32 {
 /// the only one compiled, so this function isn't built at all.
 #[cfg(not(target_endian = "little"))]
 #[inline(always)]
-fn write_triple<W: Write>(
-    w: &mut W,
-    term_id: u32,
-    doc_id: u32,
-    tf: u32,
-) -> Result<(), BuildError> {
+fn write_triple<W: Write>(w: &mut W, term_id: u32, doc_id: u32, tf: u32) -> Result<(), BuildError> {
     let mut buf = [0u8; TRIPLE_BYTES];
     buf[0..4].copy_from_slice(&term_id.to_le_bytes());
     buf[4..8].copy_from_slice(&doc_id.to_le_bytes());
@@ -451,9 +446,7 @@ fn push_triple_batched(
 /// from `finish_to`'s flush stage so partial buffers reach disk
 /// before the merge starts.
 #[inline]
-fn flush_partition_batch(
-    partition: &mut SpillPartition,
-) -> Result<(), BuildError> {
+fn flush_partition_batch(partition: &mut SpillPartition) -> Result<(), BuildError> {
     if partition.batch.is_empty() {
         return Ok(());
     }
@@ -636,15 +629,13 @@ fn intern_term_id(
             // a lie; the real lifetime is `arena`'s, which the
             // `Spilled` variant guarantees outlives the map +
             // id_to_term via field drop order.
-            let static_str: &'static str =
-                unsafe { std::mem::transmute(arena_str) };
+            let static_str: &'static str = unsafe { std::mem::transmute(arena_str) };
             id_to_term.push(static_str);
             entry.insert_hashed_nocheck(hash, static_str, id);
             (id, true)
         }
     }
 }
-
 
 /// Min-heap entry for the k-way merge over sorted partition chunks.
 /// Sort key is a packed `u64 = (lex_rank as u64) << 32 | doc_id as
@@ -719,10 +710,7 @@ impl PartitionIter {
     /// the sort key via `lex_rank` when refilling a merge cursor
     /// (so the heap stays minimal — only sort_key + tf + term_id
     /// + reader_idx).
-    fn next_with(
-        &mut self,
-        lex_rank: &[u32],
-    ) -> Option<Result<Triple, BuildError>> {
+    fn next_with(&mut self, lex_rank: &[u32]) -> Option<Result<Triple, BuildError>> {
         match self {
             PartitionIter::InMemory(it) => it.next().map(Ok),
             PartitionIter::Merge { readers, heap, .. } => {
@@ -773,10 +761,7 @@ fn read_one_triple<R: Read>(r: &mut R) -> Result<Option<Triple>, BuildError> {
 
 /// Write a slice of triples to a sorted-chunk file. Single
 /// `write_all` per chunk on LE hosts via `bytemuck` byte-cast.
-fn write_triples_sorted(
-    triples: &[Triple],
-    path: &Path,
-) -> Result<(), BuildError> {
+fn write_triples_sorted(triples: &[Triple], path: &Path) -> Result<(), BuildError> {
     let mut w = BufWriter::with_capacity(PARTITION_BUF_SIZE, File::create(path)?);
     #[cfg(target_endian = "little")]
     {
@@ -1113,9 +1098,7 @@ impl FtsBuilder {
         if !n.is_power_of_two() {
             return Err(BuildError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "FtsBuilder: spill_partitions must be a power of two; got {n}"
-                ),
+                format!("FtsBuilder: spill_partitions must be a power of two; got {n}"),
             )));
         }
         self.spill_partitions = n;
@@ -1204,8 +1187,7 @@ impl FtsBuilder {
             // started). The `is_new` flag is unused here; the dense-
             // array sizing is handled by the caller pre-growing
             // `dense_doc_tf` to `id_to_term.len()` after this returns.
-            let (term_id, _is_new) =
-                intern_term_id(term_to_id, id_to_term, arena, &term);
+            let (term_id, _is_new) = intern_term_id(term_to_id, id_to_term, arena, &term);
             let p = (term_id as usize) & mask;
             for (doc_id, tf) in postings {
                 push_triple_batched(&mut partitions[p], term_id, doc_id, tf)?;
@@ -1322,8 +1304,7 @@ impl FtsBuilder {
                 updated_terms.clear();
                 let mut on_token = |tok: &str| {
                     tokens_in_doc += 1;
-                    let (term_id, is_new) =
-                        intern_term_id(term_to_id, id_to_term, term_arena, tok);
+                    let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
                     let idx = term_id as usize;
                     // On a new id we know `term_id ==
                     // id_to_term.len() - 1 == dense_doc_tf.len()`
@@ -1418,12 +1399,7 @@ impl FtsBuilder {
                     *slot = 0;
                     let p = (term_id as usize) & mask;
                     let partition = unsafe { partitions.get_unchecked_mut(p) };
-                    push_triple_batched(
-                        partition,
-                        term_id,
-                        local_doc_id,
-                        tf,
-                    )?;
+                    push_triple_batched(partition, term_id, local_doc_id, tf)?;
                 }
             }
             ColumnPostings::InRam { .. } => {
@@ -1496,8 +1472,7 @@ impl FtsBuilder {
                             // returns a `&mut str`; we narrow
                             // back to `&str` via the transmute.
                             let bumped: &str = bump.alloc_str(tok);
-                            let extended: &'static str =
-                                unsafe { std::mem::transmute(bumped) };
+                            let extended: &'static str = unsafe { std::mem::transmute(bumped) };
                             e.insert_hashed_nocheck(hash, extended, 1);
                         }
                     }
@@ -1559,18 +1534,12 @@ impl FtsBuilder {
                     match terms.get_mut(term) {
                         Some(acc) => {
                             acc.push((local_doc_id, tf));
-                            new_bytes =
-                                new_bytes.saturating_add(ACCUM_POSTING_BYTES);
+                            new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                         }
                         None => {
-                            terms.insert(
-                                Box::<str>::from(term),
-                                vec![(local_doc_id, tf)],
-                            );
+                            terms.insert(Box::<str>::from(term), vec![(local_doc_id, tf)]);
                             new_bytes = new_bytes.saturating_add(
-                                ACCUM_NEW_TERM_FIXED_BYTES
-                                    + term_len
-                                    + ACCUM_POSTING_BYTES,
+                                ACCUM_NEW_TERM_FIXED_BYTES + term_len + ACCUM_POSTING_BYTES,
                             );
                         }
                     }
@@ -1754,8 +1723,7 @@ impl FtsBuilder {
         //   - Spilled path: a `StreamingDictBuilder` writes FST bytes
         //     into a scratch file as we go (`fst_streaming`).
         // Exactly one is `Some`.
-        let mut fst_entries_inram: Option<DictBuilder> =
-            (!any_spilled).then(DictBuilder::new);
+        let mut fst_entries_inram: Option<DictBuilder> = (!any_spilled).then(DictBuilder::new);
         let fst_streaming_path = scratch_path.join("infino_fts_dict.bin");
         let mut fst_streaming: Option<StreamingDictBuilder<BufWriter<File>>> = if any_spilled {
             let fst_file = File::create(&fst_streaming_path)?;
@@ -1811,8 +1779,7 @@ impl FtsBuilder {
                     // in insertion order which is monotonically
                     // increasing local_doc_id per the add_doc
                     // contract — no per-list sort needed.
-                    let mut entries: Vec<(Box<str>, Vec<(u32, u32)>)> =
-                        terms.into_iter().collect();
+                    let mut entries: Vec<(Box<str>, Vec<(u32, u32)>)> = terms.into_iter().collect();
                     // pdqsort: posting-table dictionary entries for
                     // one in-RAM column can run into millions of
                     // terms; stability is unnecessary because keys
@@ -1868,8 +1835,7 @@ impl FtsBuilder {
                     // observe that.
                     drop(term_to_id);
                     let lex_rank_start = finish_profile.enabled.then(Instant::now);
-                    let (lex_rank, term_id_in_lex_order) =
-                        build_lex_rank(&id_to_term);
+                    let (lex_rank, term_id_in_lex_order) = build_lex_rank(&id_to_term);
                     if let Some(t) = lex_rank_start {
                         finish_profile.lex_rank_build += t.elapsed();
                     }
@@ -1883,8 +1849,7 @@ impl FtsBuilder {
                     // O(n_partitions) cursors each holding one
                     // triple + a small read buffer.
                     let sort_start = finish_profile.enabled.then(Instant::now);
-                    let mut sorted_files: Vec<PathBuf> =
-                        Vec::with_capacity(partitions.len());
+                    let mut sorted_files: Vec<PathBuf> = Vec::with_capacity(partitions.len());
                     for (partition_idx, partition) in partitions.iter().enumerate() {
                         let sorted_path = scratch_path.join(format!(
                             "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
@@ -2050,10 +2015,14 @@ impl FtsBuilder {
                             finish_profile.encode_calls - encode_calls_before,
                             finish_profile.encode_df1 - encode_df1_before,
                             finish_profile.encode_pfor - encode_pfor_before,
-                            (finish_profile.encode_block_build - encode_block_build_before).as_secs_f64(),
-                            (finish_profile.encode_meta_write - encode_meta_write_before).as_secs_f64(),
-                            (finish_profile.encode_skip_write - encode_skip_write_before).as_secs_f64(),
-                            (finish_profile.encode_block_write - encode_block_write_before).as_secs_f64(),
+                            (finish_profile.encode_block_build - encode_block_build_before)
+                                .as_secs_f64(),
+                            (finish_profile.encode_meta_write - encode_meta_write_before)
+                                .as_secs_f64(),
+                            (finish_profile.encode_skip_write - encode_skip_write_before)
+                                .as_secs_f64(),
+                            (finish_profile.encode_block_write - encode_block_write_before)
+                                .as_secs_f64(),
                             (finish_profile.fst_insert - fst_insert_before).as_secs_f64(),
                         );
                     }
@@ -2252,7 +2221,8 @@ impl FtsBuilder {
                 w.write_all(&crc.to_le_bytes())?;
             }
         }
-        let mut postings_reader = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
+        let mut postings_reader =
+            BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
         std::io::copy(&mut postings_reader, &mut w)?;
         drop(postings_reader);
 
@@ -2632,8 +2602,8 @@ mod tests {
         b.add_doc(0, 0, "rust rust rust async").expect("add doc");
 
         let blob = Bytes::from(b.finish().expect("finish"));
-        let r = FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#)
-            .expect("open");
+        let r =
+            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
         let rust_hits = r
             .search("title", &["rust"], 10, BoolMode::Or)
             .expect("rust search");
@@ -2850,9 +2820,8 @@ mod tests {
         // during add_doc" gate. With the default spill threshold
         // (256 MiB) a 100-doc build can never cross it.
         let parent = tempfile::tempdir().expect("parent");
-        let mut b =
-            FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
-                .expect("with_scratch");
+        let mut b = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
+            .expect("with_scratch");
         b.register_column("body".into()).expect("register col");
         for i in 0..100u32 {
             b.add_doc(0, i, &format!("alpha beta gamma{i}"))
@@ -2901,9 +2870,7 @@ mod tests {
                 b.add_doc(
                     0,
                     i,
-                    &format!(
-                        "common shared term{i:04} payload{i:04} extra word{i:04}"
-                    ),
+                    &format!("common shared term{i:04} payload{i:04} extra word{i:04}"),
                 )
                 .expect("add doc");
             }

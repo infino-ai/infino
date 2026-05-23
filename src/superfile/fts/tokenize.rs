@@ -125,8 +125,7 @@ impl AsciiLowerTokenizer {
                 return;
             }
             let start = pos;
-            let (end, had_upper, had_non_ascii) =
-                simd_scan_token_run(bytes, pos);
+            let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
             pos = end;
             if had_non_ascii || start == pos {
                 continue;
@@ -176,16 +175,11 @@ fn simd_skip_non_token(bytes: &[u8], mut pos: usize) -> usize {
         // in-bounds. The cast to `*const [u8; LANES]` and deref
         // produces a copy (the array is loaded by value into the
         // SIMD register on the next line).
-        let arr: [u8; LANES] = unsafe {
-            *(bytes.as_ptr().add(pos) as *const [u8; LANES])
-        };
+        let arr: [u8; LANES] = unsafe { *(bytes.as_ptr().add(pos) as *const [u8; LANES]) };
         let chunk = u8x16::from(arr);
-        let is_digit = chunk.simd_ge(u8x16::splat(b'0'))
-            & chunk.simd_le(u8x16::splat(b'9'));
-        let is_upper = chunk.simd_ge(u8x16::splat(b'A'))
-            & chunk.simd_le(u8x16::splat(b'Z'));
-        let is_lower = chunk.simd_ge(u8x16::splat(b'a'))
-            & chunk.simd_le(u8x16::splat(b'z'));
+        let is_digit = chunk.simd_ge(u8x16::splat(b'0')) & chunk.simd_le(u8x16::splat(b'9'));
+        let is_upper = chunk.simd_ge(u8x16::splat(b'A')) & chunk.simd_le(u8x16::splat(b'Z'));
+        let is_lower = chunk.simd_ge(u8x16::splat(b'a')) & chunk.simd_le(u8x16::splat(b'z'));
         let is_token = is_digit | is_upper | is_lower;
         let mask = is_token.to_bitmask() & 0xFFFF;
         if mask == 0 {
@@ -224,23 +218,17 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
     let mut had_non_ascii = false;
     while pos + LANES <= bytes.len() {
         // SAFETY: bounds-checked at the loop guard above.
-        let arr: [u8; LANES] = unsafe {
-            *(bytes.as_ptr().add(pos) as *const [u8; LANES])
-        };
+        let arr: [u8; LANES] = unsafe { *(bytes.as_ptr().add(pos) as *const [u8; LANES]) };
         let chunk = u8x16::from(arr);
-        let is_digit = chunk.simd_ge(u8x16::splat(b'0'))
-            & chunk.simd_le(u8x16::splat(b'9'));
-        let is_upper = chunk.simd_ge(u8x16::splat(b'A'))
-            & chunk.simd_le(u8x16::splat(b'Z'));
-        let is_lower = chunk.simd_ge(u8x16::splat(b'a'))
-            & chunk.simd_le(u8x16::splat(b'z'));
+        let is_digit = chunk.simd_ge(u8x16::splat(b'0')) & chunk.simd_le(u8x16::splat(b'9'));
+        let is_upper = chunk.simd_ge(u8x16::splat(b'A')) & chunk.simd_le(u8x16::splat(b'Z'));
+        let is_lower = chunk.simd_ge(u8x16::splat(b'a')) & chunk.simd_le(u8x16::splat(b'z'));
         // High-bit detect: mask high bit, compare equal to 0x80.
         // `simd_eq` is bit-equality on signed/unsigned-agnostic
         // `cmp_eq_mask_i8_m128i`, so this works for high bytes
         // even though `simd_gt`/`simd_ge` against `0x80` would
         // need an XOR-flip trick to handle signed-i8 wrap.
-        let is_high = (chunk & u8x16::splat(0x80))
-            .simd_eq(u8x16::splat(0x80));
+        let is_high = (chunk & u8x16::splat(0x80)).simd_eq(u8x16::splat(0x80));
         let is_token = is_digit | is_upper | is_lower;
         let is_extend = is_token | is_high;
         let extend_mask = is_extend.to_bitmask() & 0xFFFF;
