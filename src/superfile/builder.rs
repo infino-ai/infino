@@ -432,11 +432,10 @@ impl SuperfileBuilder {
         }
         let n_docs = self.next_local_doc_id as u64;
 
-        let fts_blob: Vec<u8> = self
-            .fts_builder
-            .take()
-            .map(FtsBuilder::finish)
-            .unwrap_or_default();
+        let fts_blob: Vec<u8> = match self.fts_builder.take() {
+            Some(fb) => fb.finish()?,
+            None => Vec::new(),
+        };
         let vec_blob: Vec<u8> = match self.vec_builder.take() {
             Some(vb) => vb.finish()?,
             None => Vec::new(),

@@ -28,7 +28,7 @@ fn build_with_two_columns() -> (Bytes, String) {
     b.add_doc(0, 3, "empty filler").expect("add doc");
     b.add_doc(1, 3, "filler only here").expect("add doc");
 
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish fts");
     let json =
         r#"[{"name":"title","tokenizer":"ascii_lower"},{"name":"body","tokenizer":"ascii_lower"}]"#;
     (Bytes::from(bytes), json.to_string())
@@ -183,7 +183,7 @@ fn bmw_single_term_matches_brute_force() {
         }
         b.add_doc(0, i, &text).expect("add doc");
     }
-    let bytes = b.finish();
+    let bytes = b.finish().expect("finish fts");
     let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 

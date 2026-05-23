@@ -190,11 +190,42 @@ fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
 }
 
 /// In-place L2-normalize. Zero vectors stay zero (no division).
+///
+/// Both passes (sum-of-squares and per-lane scaling) are vectorised
+/// in 8-lane `f32x8` chunks; a scalar tail handles inputs whose
+/// length isn't a multiple of 8. Same SIMD-then-scalar shape as
+/// [`dot`] and [`l2_sq`] above; load-bearing for the build-time
+/// "normalize then rotate then bit-quantize" pipeline where this
+/// runs once per input vector.
 pub fn normalize(v: &mut [f32]) {
-    let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag = {
+        let mut acc = f32x8::ZERO;
+        let mut tail_acc: f32 = 0.0;
+        let chunks = v.chunks_exact(8);
+        let tail = chunks.remainder();
+        for c in chunks {
+            let lane = f32x8::from(
+                <[f32; 8]>::try_from(c).expect("chunks_exact(8) yields slices of length 8"),
+            );
+            acc += lane * lane;
+        }
+        for &x in tail {
+            tail_acc += x * x;
+        }
+        (acc.reduce_add() + tail_acc).sqrt()
+    };
     if mag > 0.0 {
         let inv = 1.0 / mag;
-        for x in v.iter_mut() {
+        let inv_v = f32x8::splat(inv);
+        let mut chunks = v.chunks_exact_mut(8);
+        for c in chunks.by_ref() {
+            let lane = f32x8::from(
+                <[f32; 8]>::try_from(&*c).expect("chunks_exact_mut(8) yields slices of length 8"),
+            );
+            let scaled = lane * inv_v;
+            c.copy_from_slice(&scaled.to_array());
+        }
+        for x in chunks.into_remainder() {
             *x *= inv;
         }
     }

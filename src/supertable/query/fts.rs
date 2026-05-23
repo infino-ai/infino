@@ -402,7 +402,10 @@ fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> 
 /// "least relevant" (sorted to the bottom) defensively.
 fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     let mut all: Vec<SuperfileHit> = per_segment.into_iter().flatten().collect();
-    all.sort_by(|a, b| {
+    // pdqsort: same rationale as `top_k_ascending` in the vector
+    // path — cross-segment top-k merge, partial_cmp tie-break
+    // composes with (segment, local_doc_id) for total order.
+    all.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)

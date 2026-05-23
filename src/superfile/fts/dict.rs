@@ -21,6 +21,7 @@
 use crate::superfile::format::FST_SEPARATOR;
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use std::collections::BTreeMap;
+use std::io::Write;
 
 /// Build a canonical FST key from `(column_name, term)`.
 ///
@@ -98,6 +99,55 @@ impl DictBuilder {
         builder
             .into_inner()
             .expect("in-memory FST writer cannot fail at finalize")
+    }
+}
+
+/// Streaming FST builder: wraps `fst::MapBuilder<W>` for callers that
+/// can supply keys in already-sorted order and want the FST bytes
+/// written progressively to a `Write` sink (e.g. a scratch file) so
+/// the dictionary never has to be materialised in RAM.
+///
+/// Use this when build-time memory matters and the producer already
+/// emits keys in lex order — for example after a k-way merge over
+/// pre-sorted partition spills. Use [`DictBuilder`] when the caller
+/// inserts in arbitrary order and the dictionary fits in RAM.
+///
+/// Mirrors the `fst::MapBuilder<W>` contract: keys MUST be strictly
+/// greater than the previous key. Out-of-order inserts return an
+/// `fst::Error`.
+pub struct StreamingDictBuilder<W: Write> {
+    inner: MapBuilder<W>,
+    n_keys: u64,
+}
+
+impl<W: Write> StreamingDictBuilder<W> {
+    /// Wrap a `Write` sink. The FST format header is written
+    /// immediately so the sink position advances on construction.
+    pub fn new(w: W) -> Result<Self, fst::Error> {
+        Ok(Self {
+            inner: MapBuilder::new(w)?,
+            n_keys: 0,
+        })
+    }
+
+    /// Insert a `(key, value)` pair. `key` must be strictly greater
+    /// than the previously inserted key. Returns an error otherwise.
+    pub fn insert_sorted(&mut self, key: &[u8], value: u64) -> Result<(), fst::Error> {
+        self.inner.insert(key, value)?;
+        self.n_keys += 1;
+        Ok(())
+    }
+
+    /// Number of keys inserted so far.
+    #[inline]
+    pub fn n_keys(&self) -> u64 {
+        self.n_keys
+    }
+
+    /// Finalise the FST (writes the trailer) and return the inner
+    /// writer. The writer is left at the byte just past the FST.
+    pub fn finish(self) -> Result<W, fst::Error> {
+        self.inner.into_inner()
     }
 }
 

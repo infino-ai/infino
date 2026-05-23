@@ -164,7 +164,10 @@ fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> 
 /// at zero-norm so NaN-defense matters more here than for BM25.
 fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     let mut all: Vec<SuperfileHit> = per_segment.into_iter().flatten().collect();
-    all.sort_by(|a, b| {
+    // pdqsort: cross-segment top-k merge runs on every query; the
+    // tie-break inside `partial_cmp` plus the (segment, local_doc_id)
+    // composite already gives a total order so stability isn't needed.
+    all.sort_unstable_by(|a, b| {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)

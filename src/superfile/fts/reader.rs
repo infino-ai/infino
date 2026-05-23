@@ -794,8 +794,11 @@ impl FtsReader {
         }
 
         // Drain heap → sorted descending by score, ascending by doc_id on ties.
+        // pdqsort: top-k tuples are unique by `(score, doc_id)`
+        // (BinaryHeap drains each doc at most once), so stability
+        // isn't required.
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
@@ -925,7 +928,10 @@ impl FtsReader {
             // Sort cursor indices ascending by current doc_id.
             idx.clear();
             idx.extend(0..cursors.len());
-            idx.sort_by_key(|&i| cursors[i].current_doc_id());
+            // Per-iteration WAND cursor reorder; pdqsort because
+            // cursors hold distinct current doc_ids in the heap
+            // state used by this scan.
+            idx.sort_unstable_by_key(|&i| cursors[i].current_doc_id());
 
             // WAND pivot: smallest j such that the prefix-sum of
             // *term-level* upper bounds exceeds the threshold.
@@ -1075,8 +1081,9 @@ impl FtsReader {
         }
 
         // Drain heap → sorted descending by score, ascending by doc_id on ties.
+        // pdqsort: top-k tuples unique by `(doc_id, score)`.
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
@@ -1173,8 +1180,11 @@ impl FtsReader {
             }
         }
 
-        // Sort descending by term-max UB. Stability isn't required.
-        cursors.sort_by(|a, b| {
+        // Sort descending by term-max UB. Stability isn't required —
+        // ties (equal `term_max_bm25` across terms) are rare and the
+        // tie-break is arbitrary as long as the prefix-sum invariant
+        // holds.
+        cursors.sort_unstable_by(|a, b| {
             b.term_max_bm25
                 .partial_cmp(&a.term_max_bm25)
                 .unwrap_or(Ordering::Equal)
@@ -1496,8 +1506,9 @@ impl FtsReader {
         }
 
         // Drain heap → sorted descending by score, ascending by doc_id on ties.
+        // pdqsort: top-k tuples unique by `(doc_id, score)`.
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
@@ -1654,8 +1665,9 @@ impl FtsReader {
             }
         }
 
+        // pdqsort: top-k tuples unique by `(doc_id, score)`.
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
@@ -1834,8 +1846,9 @@ fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     // them). Without this, HashMap's hash-order iteration would make the
     // tied result non-deterministic and would disagree with the BMW
     // single-term path (which naturally iterates in doc_id order).
+    // pdqsort: doc_ids are unique by construction (HashMap keys).
     let mut sorted: Vec<(u32, f32)> = scores.into_iter().collect();
-    sorted.sort_by_key(|(d, _)| *d);
+    sorted.sort_unstable_by_key(|(d, _)| *d);
 
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k.min(sorted.len()).max(1));
     for (doc_id, score) in sorted {
@@ -1850,7 +1863,8 @@ fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     }
     let mut out: Vec<(u32, f32)> = heap.into_iter().map(|Entry(d, s)| (d, s)).collect();
     // Sort descending by score, ascending by doc_id on ties.
-    out.sort_by(|a, b| {
+    // pdqsort: top-k tuples unique by `(doc_id, score)`.
+    out.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
             .then(a.0.cmp(&b.0))
@@ -2251,7 +2265,7 @@ mod tests {
         b.add_doc(0, 0, "rust async runtime").expect("add doc");
         b.add_doc(0, 1, "tokio is a rust runtime").expect("add doc");
         b.add_doc(0, 2, "java spring boot").expect("add doc");
-        let bytes = b.finish();
+        let bytes = b.finish().expect("finish");
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         (Bytes::from(bytes), json.to_string())
     }
@@ -2342,7 +2356,7 @@ mod tests {
         for (i, text) in docs.iter().enumerate() {
             b.add_doc(0, i as u32, text).expect("add doc");
         }
-        let blob = Bytes::from(b.finish());
+        let blob = Bytes::from(b.finish().expect("finish"));
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
@@ -2463,7 +2477,7 @@ mod tests {
         b.add_doc(0, 0, "common rust uniqzero").expect("add doc");
         b.add_doc(0, 1, "common rust").expect("add doc");
         b.add_doc(0, 2, "common uniqtwo").expect("add doc");
-        let bytes = b.finish();
+        let bytes = b.finish().expect("finish");
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         (Bytes::from(bytes), json.to_string())
     }
@@ -2475,9 +2489,8 @@ mod tests {
         let (blob, _json) = build_mixed_df_blob();
         // Re-parse the blob enough to reach the FST bytes.
         let header_size = 48usize;
-        let fst_off = u64::from_le_bytes(
-            blob[24..32].try_into().expect("fst_off slice is 8 bytes"),
-        ) as usize;
+        let fst_off =
+            u64::from_le_bytes(blob[24..32].try_into().expect("fst_off slice is 8 bytes")) as usize;
         let postings_off = u64::from_le_bytes(
             blob[32..40]
                 .try_into()
@@ -2584,7 +2597,7 @@ mod tests {
                 .add_doc(0, i, &format!("uniq{i:03}"))
                 .expect("add doc");
         }
-        let blob_inline = b_inline.finish();
+        let blob_inline = b_inline.finish().expect("finish inline");
 
         let mut b_pfor = FtsBuilder::new(tok);
         b_pfor
@@ -2598,7 +2611,7 @@ mod tests {
                 .join(" ");
             b_pfor.add_doc(0, i, &text).expect("add doc");
         }
-        let blob_pfor = b_pfor.finish();
+        let blob_pfor = b_pfor.finish().expect("finish pfor");
 
         // Extract postings-region sizes from the headers.
         let postings_off_i = u64::from_le_bytes(
