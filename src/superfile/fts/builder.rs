@@ -13,7 +13,7 @@
 //!
 //! See `docs/architecture/superfile.md` for the full byte-level spec.
 //!
-//! ## Build architecture (plan 017, mirrors plan 010)
+//! ## Build architecture
 //!
 //! Two-mode accumulator, threshold-based, identical in shape to
 //! `VectorBuilder`:
@@ -198,8 +198,8 @@ const DOC_LENGTHS_ENTRY_SIZE: usize = 16;
 
 /// Default per-column in-RAM accumulator budget before a column
 /// flushes to spill files. Mirrors `VectorBuilder::spill_threshold_bytes`
-/// (also 256 MiB by default; plan 010). Builds whose every column
-/// stays below this never touch the disk during `add_doc`.
+/// (also 256 MiB by default). Builds whose every column stays below
+/// this never touch the disk during `add_doc`.
 ///
 /// Overridable per-builder via `FtsBuilder::set_spill_threshold_bytes(b)`.
 pub const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
@@ -1042,8 +1042,8 @@ impl FtsBuilder {
     /// instead of the default `$TMPDIR` (which on EC2 is typically
     /// EBS-backed `/tmp`).
     ///
-    /// Mirror of `VectorBuilder::with_scratch` under plan 010, same
-    /// return type (`Result<Self, BuildError>`).
+    /// Mirror of `VectorBuilder::with_scratch`, same return type
+    /// (`Result<Self, BuildError>`).
     pub fn with_scratch(
         tokenizer: Arc<dyn Tokenizer>,
         scratch: PathBuf,
@@ -1640,7 +1640,7 @@ impl FtsBuilder {
     /// occur on the spill path (partition write/read, streaming-FST
     /// scratch file, posting region scratch file). Mirror of
     /// `VectorBuilder::finish`, which has the same return type for
-    /// the same reason after plan 010.
+    /// the same reason.
     pub fn finish(self) -> Result<Vec<u8>, BuildError> {
         let mut blob = Vec::new();
         self.finish_to(&mut blob)?;
@@ -2514,8 +2514,8 @@ fn write_counted<W: Write>(
 /// Sort one partition file to a sorted-triple file at `out_path`.
 /// Uses an in-memory sort when the partition is at or below
 /// `max_partition_bytes`, otherwise external merge over chunked
-/// sorted spills (mirror of the partition-skew defense documented in
-/// plan 017's "Skew control" section).
+/// sorted spills (partition-skew defense: a single pathologically
+/// large partition would otherwise blow the in-memory sort budget).
 ///
 /// Both the input and the output are runs of fixed 12-byte triples
 /// `(term_id_le, doc_id_le, tf_le)`. The ordering written to
@@ -3001,8 +3001,7 @@ mod tests {
     #[test]
     fn scratch_dir_under_with_scratch_is_removed_after_finish() {
         // `with_scratch(PathBuf)` lets operators pin spill files to
-        // instance-store NVMe (see plan 017's "Scratch directory
-        // placement"). The `tempfile::TempDir` produced under the
+        // instance-store NVMe. The `tempfile::TempDir` produced under the
         // override must still be cleaned up when the builder is
         // consumed by `finish`; if it isn't, repeated builds leak
         // disk. This test asserts the directory the builder created

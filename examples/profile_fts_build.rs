@@ -3,8 +3,7 @@
 //!
 //! Run with:
 //! ```text
-//! INFINO_FTS_PROFILE=1 CARGO_TARGET_DIR=target-fts-oom-bench \
-//!   cargo run --release --example profile_fts_build
+//! INFINO_FTS_PROFILE=1 cargo run --release --example profile_fts_build
 //! ```
 
 use infino::superfile::fts::builder::FtsBuilder;

@@ -1,17 +1,16 @@
-//! Production-wiring integration test for plan 017's spill-backed
-//! FTS builder. Confirms that `SuperfileBuilder::finish` flows through
-//! `FtsBuilder::finish` → `finish_to`, exercising the partition-spill
-//! path on a corpus large enough to populate multiple partitions.
+//! Production-wiring integration test for the spill-backed FTS
+//! builder. Confirms that `SuperfileBuilder::finish` flows through
+//! `FtsBuilder::finish` → `finish_to`, exercising the partition-
+//! spill path on a corpus large enough to populate multiple
+//! partitions.
 //!
-//! The bar this guards: the on-disk superfile must be byte-for-byte
-//! readable by `SuperfileReader` with BM25 search returning the
-//! expected docs. If a refactor accidentally bypasses the spill
-//! pipeline (e.g. reintroduces an in-memory shortcut at the
-//! `SuperfileBuilder` layer), the build will still likely succeed,
-//! but this test will catch behavioural regressions in the production
-//! path used by `SupertableWriter`.
-//!
-//! See `claude-plans/017_streaming_fts_build.md`, Stage 4.
+//! The bar this guards: the on-disk superfile must be byte-for-
+//! byte readable by `SuperfileReader` with BM25 search returning
+//! the expected docs. If a refactor accidentally bypasses the
+//! spill pipeline (e.g. reintroduces an in-memory shortcut at the
+//! `SuperfileBuilder` layer), the build will still likely
+//! succeed, but this test will catch behavioural regressions in
+//! the production path used by `SupertableWriter`.
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
