@@ -39,6 +39,8 @@ pub enum DiskCacheError {
     BudgetExceeded,
 }
 
+type ChunkSlot = Arc<tokio::sync::Mutex<Vec<Option<(u64, Bytes)>>>>;
+
 /// Live cache entry. Holds the cached `Arc<SuperfileReader>`
 /// (constructed once on cache fill); the `Bytes` inside the
 /// reader is mmap-backed via `Bytes::from_owner(ArcMmapOwner)`,
@@ -303,10 +305,10 @@ impl DiskCacheStore {
         }
     }
 
-    /// Strictly-cached cold-fetch path — waits for all pwrites
-    /// + fsync + mmap before returning. Public for integration
-    /// tests that want this deterministic behavior; the
-    /// production reader path uses `reader_hybrid`.
+    /// Strictly-cached cold-fetch path — waits for all pwrites + fsync +
+    /// mmap before returning. Public for integration tests that want this
+    /// deterministic behavior; the production reader path uses
+    /// `reader_hybrid`.
     pub async fn reader_synchronous(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -693,8 +695,7 @@ impl DiskCacheStore {
         let file = Arc::new(tokio::sync::Mutex::new(file));
 
         // Per-chunk slot for the foreground buffer assembly.
-        let chunks: Arc<tokio::sync::Mutex<Vec<Option<(u64, Bytes)>>>> =
-            Arc::new(tokio::sync::Mutex::new(vec![None; n_chunks as usize]));
+        let chunks: ChunkSlot = Arc::new(tokio::sync::Mutex::new(vec![None; n_chunks as usize]));
 
         let mut fetch_handles = Vec::with_capacity(n_chunks as usize);
         let mut write_handles = Vec::with_capacity(n_chunks as usize);
@@ -748,12 +749,10 @@ impl DiskCacheStore {
         let buffer = {
             let chunks_guard = chunks.lock().await;
             let mut buf = vec![0u8; size as usize];
-            for slot in chunks_guard.iter() {
-                if let Some((start, bytes)) = slot {
-                    let s = *start as usize;
-                    let e = s + bytes.len();
-                    buf[s..e].copy_from_slice(bytes);
-                }
+            for (start, bytes) in chunks_guard.iter().flatten() {
+                let s = *start as usize;
+                let e = s + bytes.len();
+                buf[s..e].copy_from_slice(bytes);
             }
             buf
         };
@@ -796,16 +795,16 @@ impl DiskCacheStore {
         let final_owned = final_path.clone();
         let file_owned = Arc::clone(&file);
         tokio::spawn(async move {
-            let _ = finalize_to_mmap(
+            let _ = finalize_to_mmap(FinalizationParams {
                 store,
-                uri_owned,
-                tmp_owned,
-                final_owned,
-                file_owned,
-                write_handles,
+                uri: uri_owned,
+                tmp_path: tmp_owned,
+                final_path: final_owned,
+                file: file_owned,
+                pwrite_handles: write_handles,
                 size,
                 reserved_bytes,
-            )
+            })
             .await;
         });
 
@@ -1035,23 +1034,34 @@ impl<'a> Drop for Reservation<'a> {
     }
 }
 
-/// Background finalizer for the hybrid cold-fetch. Awaits
-/// all pwrites, fsyncs + renames the destination file, mmaps
-/// it, and atomically replaces the cache entry with a
-/// mmap-backed reader. On failure, releases the disk
-/// reservation back to the pool and removes the entry.
-async fn finalize_to_mmap(
+struct FinalizationParams {
     store: Arc<DiskCacheStore>,
     uri: SuperfileUri,
     tmp_path: std::path::PathBuf,
     final_path: std::path::PathBuf,
     file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
-    pwrite_handles: Vec<
-        tokio::sync::oneshot::Receiver<tokio::task::JoinHandle<Result<(), DiskCacheError>>>,
-    >,
+    pwrite_handles:
+        Vec<tokio::sync::oneshot::Receiver<tokio::task::JoinHandle<Result<(), DiskCacheError>>>>,
     size: u64,
     reserved_bytes: u64,
-) -> Result<(), DiskCacheError> {
+}
+
+/// Background finalizer for the hybrid cold-fetch. Awaits
+/// all pwrites, fsyncs + renames the destination file, mmaps
+/// it, and atomically replaces the cache entry with a
+/// mmap-backed reader. On failure, releases the disk
+/// reservation back to the pool and removes the entry.
+async fn finalize_to_mmap(params: FinalizationParams) -> Result<(), DiskCacheError> {
+    let FinalizationParams {
+        store,
+        uri,
+        tmp_path,
+        final_path,
+        file,
+        pwrite_handles,
+        size,
+        reserved_bytes,
+    } = params;
     let res: Result<(), DiskCacheError> = async {
         // 1. Resolve every pwrite handle through its oneshot,
         //    then await the underlying join.

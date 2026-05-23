@@ -105,9 +105,8 @@ fn build_reader_with_sample_size(
             .expect("add to vector builder");
     }
     let bytes = b.finish().expect("finish vector builder");
-    let json = format!(
-        r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
-    );
+    let json =
+        format!(r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
@@ -199,9 +198,8 @@ fn recall_with_default_reservoir_equivalent_to_pre_m2() {
             .expect("add to vector builder");
     }
     let bytes = b.finish().expect("finish vector builder");
-    let json = format!(
-        r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
-    );
+    let json =
+        format!(r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
     let reader = VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader");
 
     for q_idx in [0usize, 73, 142, 199] {
@@ -215,6 +213,9 @@ fn recall_with_default_reservoir_equivalent_to_pre_m2() {
         let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::Cosine, top_k);
         let a: HashSet<u32> = approx.iter().copied().collect();
         let e: HashSet<u32> = exact.iter().copied().collect();
-        assert_eq!(a, e, "default-reservoir top-{top_k} set diverges at q={q_idx}");
+        assert_eq!(
+            a, e,
+            "default-reservoir top-{top_k} set diverges at q={q_idx}"
+        );
     }
 }

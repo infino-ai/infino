@@ -235,13 +235,14 @@ fn ipc_encode_length1(col_name: &str, arr: &ArrayRef) -> Vec<u8> {
 // would let the planner pick prune ordering across columns,
 // but isn't required for correctness; lands when measured.
 
+type FtsColumnAccumulator = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, u32);
+
 fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSummaryAgg> {
     // Per-column accumulators: (min, max, union-bloom-bytes,
     // n_blocks). The union bloom starts at zero-init the
     // first time we see a segment with a populated bloom for
     // that column; subsequent superfiles bit-OR into it.
-    let mut per_column: HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, u32)> =
-        HashMap::new();
+    let mut per_column: HashMap<String, FtsColumnAccumulator> = HashMap::new();
     for seg in superfiles {
         for (col, summary) in &seg.fts_summary {
             let entry = per_column.entry(col.clone()).or_default();

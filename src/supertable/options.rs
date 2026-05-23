@@ -529,11 +529,11 @@ impl SupertableOptions {
         self
     }
 
-    /// Bound how many vector-bearing shard builds may be active at
-    /// once inside a single writer commit. Values < 1 are clamped to
-    /// 1. This is independent of [`Self::with_writer_pool`]: callers
-    /// can keep a wide pool for scheduling while capping the resident
-    /// vector-builder working set.
+    /// Bound how many vector-bearing shard builds may be active at once
+    /// inside a single writer commit. Values < 1 are clamped to 1. This
+    /// is independent of [`Self::with_writer_pool`]: callers can keep a
+    /// wide pool for scheduling while capping the resident vector-builder
+    /// working set.
     pub fn with_max_concurrent_vector_builds(mut self, n: usize) -> Self {
         self.max_concurrent_vector_builds = n.max(1);
         self

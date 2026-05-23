@@ -149,6 +149,49 @@ impl BruteForceBm25 {
         scored
     }
 
+    /// Same as [`Self::top_k_terms`] but with AND semantics: only docs
+    /// that contain *every* query term contribute a score. Used by the
+    /// AND-mode oracle tests against the reader's leapfrog
+    /// intersection. Each term still contributes its own BM25 score to
+    /// the per-doc sum; tie-break is ascending doc_id, identical to
+    /// the OR helper.
+    pub fn top_k_terms_and(&self, terms: &[String], k: usize) -> Vec<(u64, f32)> {
+        if k == 0 || terms.is_empty() || self.n == 0 {
+            return Vec::new();
+        }
+
+        let n = self.n as f32;
+        let avgdl = self.avgdl;
+
+        let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());
+        'docs: for doc in &self.docs {
+            let dl = doc.dl as f32;
+            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let mut score: f32 = 0.0;
+            for term in terms {
+                let Some(&tf) = doc.tf.get(term) else {
+                    continue 'docs;
+                };
+                let df = *self.df.get(term).unwrap_or(&0) as f32;
+                if df == 0.0 {
+                    continue 'docs;
+                }
+                let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                let tf_f = tf as f32;
+                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+            }
+            scored.push((doc.doc_id, score));
+        }
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        scored.truncate(k);
+        scored
+    }
+
     /// Number of indexed docs.
     pub fn n_docs(&self) -> u32 {
         self.n

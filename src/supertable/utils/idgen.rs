@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn strict_monotonicity_within_one_generator() {
-        let g = IdGenerator::with_worker_id(0x1234_5678_9A);
+        let g = IdGenerator::with_worker_id(0x0012_3456_789A);
         let mut last = i128::MIN;
         for _ in 0..100_000 {
             let id = g.next_id();

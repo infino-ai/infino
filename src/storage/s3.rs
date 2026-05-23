@@ -52,10 +52,9 @@ pub struct S3StorageProvider {
 }
 
 impl S3StorageProvider {
-    /// Construct an S3 provider from the standard AWS
-    /// credential chain (env vars / instance profile / etc.)
-    /// + an explicit bucket. The supertable's URIs are
-    /// keyed off `<bucket>/<uri>`.
+    /// Construct an S3 provider from the standard AWS credential chain
+    /// (env vars / instance profile / etc.) + an explicit bucket. The
+    /// supertable's URIs are keyed off `<bucket>/<uri>`.
     pub fn new(bucket: impl Into<String>) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let store = AmazonS3Builder::from_env()
@@ -72,12 +71,10 @@ impl S3StorageProvider {
         })
     }
 
-    /// Construct an S3 provider pointed at a custom endpoint
-    /// + explicit credentials. Used by
-    /// `tests/supertable_smoke_s3.rs` for the s3s-fs
-    /// integration test (`endpoint = "http://127.0.0.1:<port>"`)
-    /// and by callers using a self-hosted S3-compatible
-    /// service (MinIO etc.).
+    /// Construct an S3 provider pointed at a custom endpoint + explicit
+    /// credentials. Used by `tests/supertable_smoke_s3.rs` for the s3s-fs
+    /// integration test (`endpoint = "http://127.0.0.1:<port>"`) and by
+    /// callers using a self-hosted S3-compatible service (MinIO etc.).
     ///
     /// `allow_http` is enabled so plain-HTTP endpoints
     /// (typical for in-process test harnesses) don't get

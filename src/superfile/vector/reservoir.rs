@@ -261,13 +261,19 @@ mod tests {
         let s = r.sample();
         assert_eq!(s.len(), 5 * dim);
         for i in 0..5 {
-            assert_eq!(s[i * dim], i as f32, "fill phase didn't preserve insertion order");
+            assert_eq!(
+                s[i * dim],
+                i as f32,
+                "fill phase didn't preserve insertion order"
+            );
         }
     }
 
     #[test]
     fn n_seen_counts_every_update_regardless_of_acceptance() {
-        let r = run(/*sample=*/ 10, /*dim=*/ 2, /*n=*/ 1000, /*seed=*/ 42);
+        let r = run(
+            /*sample=*/ 10, /*dim=*/ 2, /*n=*/ 1000, /*seed=*/ 42,
+        );
         assert_eq!(r.n_seen(), 1000);
         assert_eq!(r.n_rows(), 10);
     }
@@ -286,7 +292,11 @@ mod tests {
         // Same-seed equality is guaranteed; different-seed
         // inequality is overwhelmingly likely (probability of
         // collision ≈ (50/10000)^50, astronomically small).
-        assert_ne!(a.sample(), b.sample(), "two seeds yielded identical reservoirs");
+        assert_ne!(
+            a.sample(),
+            b.sample(),
+            "two seeds yielded identical reservoirs"
+        );
     }
 
     /// Each source item should appear in the reservoir with
@@ -359,7 +369,9 @@ mod tests {
 
     #[test]
     fn handles_n_equal_to_sample_size() {
-        let r = run(/*sample=*/ 50, /*dim=*/ 3, /*n=*/ 50, /*seed=*/ 7);
+        let r = run(
+            /*sample=*/ 50, /*dim=*/ 3, /*n=*/ 50, /*seed=*/ 7,
+        );
         assert_eq!(r.n_seen(), 50);
         assert_eq!(r.n_rows(), 50);
         let s = r.sample();

@@ -435,10 +435,9 @@ impl Supertable {
     }
 
     /// Observability snapshot of the supertable's load.
-    /// Cheap to call: one RSS syscall + an `ArcSwap::load`
-    /// + a couple of length reads on the in-memory manifest.
-    /// See [`crate::supertable::SupertableStats`] for the
-    /// field-level contract.
+    /// Cheap to call: one RSS syscall + an `ArcSwap::load` + a couple of
+    /// length reads on the in-memory manifest. See
+    /// [`crate::supertable::SupertableStats`] for the field-level contract.
     pub fn stats(&self) -> crate::supertable::SupertableStats {
         let manifest = self.inner.manifest.load();
         let n_manifest_parts = manifest.list.as_ref().map(|l| l.parts.len());

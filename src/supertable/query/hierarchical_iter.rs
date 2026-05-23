@@ -108,11 +108,10 @@ pub fn load_and_flatten(
 
 /// **Fallback shape** for query callers operating on
 /// in-process manifests with no `list` (in-memory-only
-/// supertables, or supertables that haven't persisted yet):
-/// just return the flat `manifest.superfiles`. The eager-mode
-/// + lazy-mode hierarchical path through `load_and_flatten`
-/// requires a `ManifestList`; this branch covers the no-list
-/// case so the query paths remain uniformly callable.
+/// supertables, or supertables that haven't persisted yet): just return
+/// the flat `manifest.superfiles`. The eager-mode + lazy-mode hierarchical
+/// path through `load_and_flatten` requires a `ManifestList`; this branch
+/// covers the no-list case so the query paths remain uniformly callable.
 pub fn fallback_to_flat_segments(manifest: &Manifest) -> Vec<Arc<SuperfileEntry>> {
-    manifest.superfiles.iter().cloned().collect()
+    manifest.superfiles.to_vec()
 }

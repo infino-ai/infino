@@ -1,9 +1,8 @@
-//! `ManifestList` — the top-tier of the two-tier hierarchical
-//! manifest. A small JSON document (~MB even at 1M superfiles)
-//! that references one or more [`ManifestPart`] files by URI
-//! + content hash, carries the table-level metadata (schema,
-//! column configs, partition strategy), and surfaces per-part
-//! aggregate skip summaries that drive list-level pruning.
+//! `ManifestList` — the top-tier of the two-tier hierarchical manifest.
+//! A small JSON document (~MB even at 1M superfiles) that references one or
+//! more [`ManifestPart`] files by URI + content hash, carries the
+//! table-level metadata (schema, column configs, partition strategy), and
+//! surfaces per-part aggregate skip summaries that drive list-level pruning.
 //!
 //! Format: JSON, **pretty-printed and deterministically
 //! ordered** so byte-equal logical content produces byte-equal
