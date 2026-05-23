@@ -252,7 +252,7 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
     while pos < bytes.len() {
         let b = bytes[pos];
         if is_token_byte(b) {
-            had_upper |= (b'A'..=b'Z').contains(&b);
+            had_upper |= b.is_ascii_uppercase();
             pos += 1;
         } else if b >= 0x80 {
             had_non_ascii = true;

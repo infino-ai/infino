@@ -79,7 +79,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -310,9 +310,9 @@ enum ColumnPostings {
         /// **Declared LAST in this variant so it drops LAST.**
         /// Rust drops struct fields in declaration order; the map
         /// + reverse vec drop first, both of which leave their
-        /// `&str` keys / entries bitwise-deallocated without
-        /// dereferencing, and only then does the arena's
-        /// `Drop` free the term bytes.
+        ///   `&str` keys / entries bitwise-deallocated without
+        ///   dereferencing, and only then does the arena's
+        ///   `Drop` free the term bytes.
         term_arena: bumpalo::Bump,
     },
 }
@@ -559,9 +559,7 @@ fn build_lex_rank(id_to_term: &[&str]) -> (Vec<u32>, Vec<u32>) {
 
 #[inline(always)]
 fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> u64 {
-    let mut state = hash_builder.build_hasher();
-    key.hash(&mut state);
-    state.finish()
+    hash_builder.hash_one(key)
 }
 
 /// Intern `term` in the spill-mode column vocabulary and return its
@@ -1446,7 +1444,7 @@ impl FtsBuilder {
                 // DoS-resistance is moot here, and FxHash is
                 // ~3-5× faster per probe for short ASCII tokens.
                 let mut tf_per_term: HbHashMap<&'static str, u32, FxBuildHasher> =
-                    HbHashMap::with_hasher(FxBuildHasher::default());
+                    HbHashMap::with_hasher(FxBuildHasher);
                 let mut on_token = |tok: &str| {
                     tokens_in_doc += 1;
                     let hash = compute_hash(tf_per_term.hasher(), tok);
@@ -1779,7 +1777,8 @@ impl FtsBuilder {
                     // in insertion order which is monotonically
                     // increasing local_doc_id per the add_doc
                     // contract — no per-list sort needed.
-                    let mut entries: Vec<(Box<str>, Vec<(u32, u32)>)> = terms.into_iter().collect();
+                    type InRamEntries = Vec<(Box<str>, Vec<(u32, u32)>)>;
+                    let mut entries: InRamEntries = terms.into_iter().collect();
                     // pdqsort: posting-table dictionary entries for
                     // one in-RAM column can run into millions of
                     // terms; stability is unnecessary because keys

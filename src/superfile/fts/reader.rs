@@ -1107,12 +1107,12 @@ impl FtsReader {
             // catches up the others.
             loop {
                 let mut bumped = false;
-                for i in 0..n {
-                    cursors[i].skip_to(candidate, postings);
-                    if cursors[i].is_exhausted() {
+                for cur in cursors.iter_mut().take(n) {
+                    cur.skip_to(candidate, postings);
+                    if cur.is_exhausted() {
                         break 'outer;
                     }
-                    let here = cursors[i].current_doc_id();
+                    let here = cur.current_doc_id();
                     if here != candidate {
                         candidate = here;
                         bumped = true;
@@ -2049,9 +2049,10 @@ impl TermCursor {
 
     /// Total number of postings (df) for this term. Used by AND
     /// intersection to pick the rarest cursor as the leader.
-    /// Block count is an exact upper bound on df (df = (n-1)*BLOCK_LEN
-    /// + last_block_n); cursor count comparison via this method gives
-    /// stable smallest-first ordering. Inline cursors return 1.
+    /// Block count is an exact upper bound on df
+    /// (df = (n-1)*BLOCK_LEN + last_block_n); cursor count comparison
+    /// via this method gives stable smallest-first ordering. Inline
+    /// cursors return 1.
     #[inline(always)]
     fn block_count(&self) -> usize {
         self.blocks.len()
