@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
@@ -58,9 +58,13 @@ pub struct ColumnReader {
     codes_off: usize,
     full_off: usize,
     doc_ids_off: usize,
-    /// `local_doc_id → cluster-position`. Built at open. ~4 MB at 1 M
-    /// docs per column.
-    doc_to_pos: Vec<u32>,
+    /// `local_doc_id → cluster-position`. Plan 011 M2: built lazily
+    /// on first rerank (or eagerly at open when
+    /// [`OpenOptions::prefetch_eager`] is on). ~4 MB at 1 M docs
+    /// per column when populated. Concurrent first-rerank queries
+    /// may each build the table; one wins the `set` race, the
+    /// other drops their copy — no `Mutex` on the hot path.
+    doc_to_pos: OnceLock<Vec<u32>>,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -70,9 +74,13 @@ pub struct ColumnReader {
 }
 
 /// Per-open knobs for [`VectorReader::open_with`]. `Default` is the
-/// safe choice (CRC verification on); construct with `verify_crc:
-/// false` when the caller has already validated the bytes (e.g.
-/// known-good local file) and wants the cheap-open path.
+/// safe + lazy choice (CRC verification on, no eager prefetch). The
+/// argumentless [`VectorReader::open`] takes the default.
+///
+/// Plan 011 consolidates open-time knobs here. Today: `verify_crc`
+/// (CRC pre-pass) and `prefetch_eager` (eager `doc_to_pos` build).
+/// Plan 013 may add object-storage-native knobs (e.g. `range_fetch_
+/// concurrency`) under the same struct.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Verify the per-subsection CRC during open. Each subsection is
@@ -83,11 +91,33 @@ pub struct OpenOptions {
     /// addressed object store, checksummed filesystem) to skip
     /// the scan.
     pub verify_crc: bool,
+    /// If `true`, build the per-column `doc_to_pos` lookup table at
+    /// open time by scanning each column's `doc_ids` region (today's
+    /// pre-011 behaviour). Costs ~2-3 ms at 1M × 384 + the resident
+    /// `n_docs × 4` bytes per column (4 MB at 1M, 40 MB at 10M).
+    ///
+    /// If `false` (default), `doc_to_pos` is left empty at open and
+    /// built lazily on the first `search()` that reaches the rerank
+    /// stage on that column — via [`std::sync::OnceLock::set`] under
+    /// concurrent searches, so two simultaneous first-rerank queries
+    /// may each build the table; one wins, the other drops their
+    /// copy. The build itself uses [`Source::try_get_range_sync`],
+    /// so on `Source::InMemory` it's a zero-copy walk over the
+    /// already-resident bytes.
+    ///
+    /// Bench harnesses + tests that want today's "first-search is
+    /// hot" semantics flip this to `true`. The supertable reader
+    /// path leaves it `false` (the lazy default) — first query pays
+    /// the build cost, every subsequent one is unchanged.
+    pub prefetch_eager: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
-        Self { verify_crc: true }
+        Self {
+            verify_crc: true,
+            prefetch_eager: false,
+        }
     }
 }
 
@@ -422,7 +452,13 @@ impl VectorReader {
             let full_size = (col_n_docs as usize) * dim * 4;
             let doc_ids_off = full_off + full_size;
 
-            // Build doc_to_pos lookup table.
+            // Bounds-check the cluster_idx + doc_ids regions without
+            // reading them. Plan 011 M2: the per-cluster walk that
+            // builds `doc_to_pos` is gated on `opts.prefetch_eager`
+            // — without it, open never touches the `doc_ids` region
+            // (the table is built lazily on first rerank). The whole-
+            // region bounds checks below are pure offset math, so
+            // they're cheap and run unconditionally.
             let cluster_idx_size = (n_cent as usize) * 8;
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
@@ -431,36 +467,30 @@ impl VectorReader {
                     cfg.name
                 ))));
             }
-            let mut doc_to_pos = vec![u32::MAX; col_n_docs as usize];
-            for c in 0..n_cent as usize {
-                let idx_start = cluster_idx_off + c * 8;
-                let off = u32::from_le_bytes([
-                    sub[idx_start],
-                    sub[idx_start + 1],
-                    sub[idx_start + 2],
-                    sub[idx_start + 3],
-                ]);
-                let cnt = u32::from_le_bytes([
-                    sub[idx_start + 4],
-                    sub[idx_start + 5],
-                    sub[idx_start + 6],
-                    sub[idx_start + 7],
-                ]);
-                let did_start = doc_ids_off + (off as usize) * 4;
-                let did_end = did_start + (cnt as usize) * 4;
-                if did_end > sub_crc_pos {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "column '{}' doc_ids slice {did_start}..{did_end} past subsection",
-                        cfg.name
-                    ))));
-                }
-                for i in 0..cnt as usize {
-                    let s = did_start + i * 4;
-                    let d = u32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]]);
-                    if (d as usize) < doc_to_pos.len() {
-                        doc_to_pos[d as usize] = off + i as u32;
-                    }
-                }
+            let doc_ids_size = (col_n_docs as usize) * 4;
+            if doc_ids_off + doc_ids_size > sub_crc_pos {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' doc_ids region runs past subsection",
+                    cfg.name
+                ))));
+            }
+
+            let doc_to_pos: OnceLock<Vec<u32>> = OnceLock::new();
+            if opts.prefetch_eager {
+                // Eager path: walk every cluster's doc_ids slice now
+                // and seed the OnceLock. Matches today's pre-011
+                // behaviour for callers (bench harnesses, eager
+                // tests) that want first-search to be hot.
+                let table = build_doc_to_pos(
+                    &sub,
+                    n_cent,
+                    cluster_idx_off,
+                    doc_ids_off,
+                    col_n_docs,
+                    sub_crc_pos,
+                    &cfg.name,
+                )?;
+                let _ = doc_to_pos.set(table);
             }
 
             // Soft cross-check: cfg.metric matches blob's metric.
@@ -680,11 +710,20 @@ impl VectorReader {
                     col.name
                 )))
             })?;
+        // Plan 011 M2: lazy `doc_to_pos` build on first rerank.
+        // The first search through this branch on this column
+        // walks the cluster index + doc_ids region and seeds the
+        // `OnceLock`; every subsequent search hits the populated
+        // table via `OnceLock::get`. Two concurrent first-rerank
+        // queries may both build the table; one wins the `set`
+        // race, the other drops its copy — no `Mutex` on the
+        // hot path.
+        let doc_to_pos = ensure_doc_to_pos(col, &sub)?;
         let dim_bytes = col.dim * 4;
         let mut reranked: Vec<(u32, f32)> = shortlist
             .iter()
             .map(|&(did, _)| {
-                let pos = col.doc_to_pos[did as usize] as usize;
+                let pos = doc_to_pos[did as usize] as usize;
                 let start = col.full_off + pos * dim_bytes;
                 let bytes = &sub[start..start + dim_bytes];
                 let d = distance_bytes(col.metric, query, bytes);
@@ -695,6 +734,40 @@ impl VectorReader {
         reranked.truncate(k);
         Ok(reranked)
     }
+}
+
+/// Return the column's `doc_to_pos` table, building it on first
+/// access. The `sub` slice is the column's subsection bytes —
+/// caller already fetched it via `Source::try_get_range_sync`.
+///
+/// Free function (not a method on `VectorReader`) because the
+/// returned `&[u32]` borrow is tied to the `col: &ColumnReader`
+/// argument, not to `&self`. Keeping the function shape narrow
+/// keeps the lifetime trivial.
+#[inline]
+fn ensure_doc_to_pos<'a>(col: &'a ColumnReader, sub: &[u8]) -> Result<&'a [u32], VectorError> {
+    if let Some(t) = col.doc_to_pos.get() {
+        return Ok(t.as_slice());
+    }
+    let sub_crc_pos = sub.len() - 4;
+    let table = build_doc_to_pos(
+        sub,
+        col.n_cent,
+        col.cluster_idx_off,
+        col.doc_ids_off,
+        col.n_docs,
+        sub_crc_pos,
+        &col.name,
+    )?;
+    // Race-safe: if another thread `set` first, our table is
+    // dropped and we return that thread's view. Either way the
+    // post-condition holds.
+    let _ = col.doc_to_pos.set(table);
+    Ok(col
+        .doc_to_pos
+        .get()
+        .expect("doc_to_pos OnceLock set above")
+        .as_slice())
 }
 
 #[inline]
@@ -813,6 +886,59 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
     })
 }
 
+/// Walk a column's `cluster_idx + doc_ids` regions and produce the
+/// `local_doc_id → cluster-position` lookup table that powers the
+/// rerank fetch.
+///
+/// Pulled out of the per-column open loop in plan 011 M2 so it can
+/// also run lazily on first rerank. `sub` is the subsection bytes
+/// (relative offsets); `sub_crc_pos` is the trailing-CRC boundary
+/// inside that slice (`sub.len() - 4`). Per-cluster `doc_ids` slice
+/// bounds are checked here — the per-cluster check used to live in
+/// the open loop; with the open loop now skipping this walk in the
+/// lazy path, the bounds check moves with it.
+fn build_doc_to_pos(
+    sub: &[u8],
+    n_cent: u32,
+    cluster_idx_off: usize,
+    doc_ids_off: usize,
+    n_docs: u32,
+    sub_crc_pos: usize,
+    column_name: &str,
+) -> Result<Vec<u32>, VectorError> {
+    let mut doc_to_pos = vec![u32::MAX; n_docs as usize];
+    for c in 0..n_cent as usize {
+        let idx_start = cluster_idx_off + c * 8;
+        let off = u32::from_le_bytes([
+            sub[idx_start],
+            sub[idx_start + 1],
+            sub[idx_start + 2],
+            sub[idx_start + 3],
+        ]);
+        let cnt = u32::from_le_bytes([
+            sub[idx_start + 4],
+            sub[idx_start + 5],
+            sub[idx_start + 6],
+            sub[idx_start + 7],
+        ]);
+        let did_start = doc_ids_off + (off as usize) * 4;
+        let did_end = did_start + (cnt as usize) * 4;
+        if did_end > sub_crc_pos {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "column '{column_name}' doc_ids slice {did_start}..{did_end} past subsection"
+            ))));
+        }
+        for i in 0..cnt as usize {
+            let s = did_start + i * 4;
+            let d = u32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]]);
+            if (d as usize) < doc_to_pos.len() {
+                doc_to_pos[d as usize] = off + i as u32;
+            }
+        }
+    }
+    Ok(doc_to_pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,8 +1020,14 @@ mod tests {
         let mut bytes = blob.to_vec();
         let pos = OUTER_HEADER_SIZE + 10;
         bytes[pos] ^= 0xFF;
-        let r =
-            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false });
+        let r = VectorReader::open_with(
+            Bytes::from(bytes),
+            &json,
+            OpenOptions {
+                verify_crc: false,
+                ..OpenOptions::default()
+            },
+        );
         // Open succeeds; the corruption may surface later as a
         // bad-magic / bounds error or be silently absorbed depending
         // on which byte got flipped. The contract is "we don't
@@ -1055,8 +1187,7 @@ mod tests {
         // doesn't drift apart from the InMemory arm.
         use crate::superfile::lazy_source::BytesLazyByteSource;
         let payload = Bytes::from(vec![7u8, 8, 9, 10, 11, 12, 13, 14]);
-        let lazy: Arc<dyn LazyByteSource> =
-            Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let lazy: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload.clone()));
         let src = Source::Lazy(lazy);
         let slice = src
             .try_get_range_sync(2..6)
@@ -1068,8 +1199,7 @@ mod tests {
     async fn source_lazy_get_range_dispatches_to_trait_range() {
         use crate::superfile::lazy_source::BytesLazyByteSource;
         let payload = Bytes::from(vec![21u8, 22, 23, 24, 25, 26, 27]);
-        let lazy: Arc<dyn LazyByteSource> =
-            Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let lazy: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload.clone()));
         let src = Source::Lazy(lazy);
         let got = src.get_range(1..5).await.expect("async range");
         assert_eq!(got.as_ref(), &payload[1..5]);
@@ -1099,5 +1229,241 @@ mod tests {
             err,
             VectorError::Read(ReadError::MalformedVersion(_))
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 011 M2 — lazy `doc_to_pos` + `OpenOptions::prefetch_eager`
+    // -----------------------------------------------------------------
+    //
+    // These tests pin the M2 contract: `open_with` no longer touches
+    // the `doc_ids` region when `prefetch_eager: false` (default),
+    // the table populates on first rerank via `OnceLock`, and the
+    // search results are bit-for-bit identical to the eager path.
+    // The memory-ceiling guarantee is asserted as a structural
+    // post-condition: `doc_to_pos.get() == None` immediately after
+    // a lazy open, `Some(vec.len() == n_docs)` after the first
+    // rerank.
+
+    /// Build the same shape used by the search-correctness tests
+    /// elsewhere in this module, with a non-trivial `n_docs` so
+    /// the `doc_to_pos` allocation is observable (≥ n_cent so
+    /// the cluster walk has work to do).
+    fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            name: "embedding".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+        })
+        .expect("register column");
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim)
+                .map(|j| ((i.wrapping_mul(13) + j as u32 * 5) % 100) as f32)
+                .collect();
+            b.add(0, &v).expect("add to vector builder");
+            all.push(v);
+        }
+        let bytes = b.finish().expect("finish vector builder");
+        let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+            .to_string();
+        (Bytes::from(bytes), json, all)
+    }
+
+    /// Default open uses `prefetch_eager: false` — the per-column
+    /// `OnceLock<Vec<u32>>` must be empty right after open. This
+    /// is the memory-ceiling pre-state: zero bytes allocated for
+    /// `doc_to_pos` until a rerank touches it.
+    #[test]
+    fn open_lazy_default_leaves_doc_to_pos_empty() {
+        let (blob, json, _) = build_search_corpus();
+        let r = VectorReader::open(blob, &json).expect("open");
+        for col in &r.columns {
+            assert!(
+                col.doc_to_pos.get().is_none(),
+                "lazy open must leave doc_to_pos empty for column '{}', \
+                 got Some({} entries)",
+                col.name,
+                col.doc_to_pos.get().map(|v| v.len()).unwrap_or(0)
+            );
+        }
+    }
+
+    /// `prefetch_eager: true` runs the cluster walk at open time
+    /// (today's pre-011 semantics). The `OnceLock` is populated
+    /// before any `search()` is called, with exactly `n_docs`
+    /// entries per column.
+    #[test]
+    fn open_eager_populates_doc_to_pos_at_open() {
+        let (blob, json, _) = build_search_corpus();
+        let r = VectorReader::open_with(
+            blob,
+            &json,
+            OpenOptions {
+                verify_crc: true,
+                prefetch_eager: true,
+            },
+        )
+        .expect("open");
+        for col in &r.columns {
+            let table = col.doc_to_pos.get().unwrap_or_else(|| {
+                panic!(
+                    "eager open must populate doc_to_pos for column '{}', got None",
+                    col.name
+                )
+            });
+            assert_eq!(
+                table.len(),
+                col.n_docs as usize,
+                "doc_to_pos length for column '{}' should equal n_docs",
+                col.name
+            );
+        }
+    }
+
+    /// On the lazy path, the first `search()` that reaches the
+    /// rerank stage must populate the `OnceLock`. Captures the
+    /// transition pre → post first-rerank that plan 011 calls out
+    /// in its memory-ceiling table.
+    #[test]
+    fn first_search_on_lazy_path_populates_doc_to_pos() {
+        let (blob, json, all) = build_search_corpus();
+        let r = VectorReader::open(blob, &json).expect("open");
+
+        let col = &r.columns[0];
+        assert!(
+            col.doc_to_pos.get().is_none(),
+            "pre-state: doc_to_pos must start empty"
+        );
+
+        let hits = r
+            .search("embedding", &all[17], 5, 4, 5)
+            .expect("search must succeed on lazy InMemory");
+        assert_eq!(hits[0].0, 17, "self-query must recover self");
+
+        let table = r.columns[0]
+            .doc_to_pos
+            .get()
+            .expect("post-state: doc_to_pos must be populated after first rerank");
+        assert_eq!(
+            table.len(),
+            r.columns[0].n_docs as usize,
+            "populated table length must equal n_docs"
+        );
+    }
+
+    /// Bit-for-bit parity between `prefetch_eager: true` and
+    /// `prefetch_eager: false` paths. The lazy build runs the
+    /// exact same `build_doc_to_pos` function as the eager open;
+    /// any drift would surface as different search results on
+    /// identical input.
+    #[test]
+    fn lazy_vs_eager_search_results_bit_for_bit_identical() {
+        let (blob, json, all) = build_search_corpus();
+
+        let r_eager = VectorReader::open_with(
+            blob.clone(),
+            &json,
+            OpenOptions {
+                verify_crc: true,
+                prefetch_eager: true,
+            },
+        )
+        .expect("eager open");
+        let r_lazy = VectorReader::open_with(
+            blob,
+            &json,
+            OpenOptions {
+                verify_crc: true,
+                prefetch_eager: false,
+            },
+        )
+        .expect("lazy open");
+
+        for &q_idx in &[0usize, 17, 31, 63] {
+            let hits_eager = r_eager
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("eager search");
+            let hits_lazy = r_lazy
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("lazy search");
+            assert_eq!(
+                hits_eager, hits_lazy,
+                "eager vs lazy results must match for query {q_idx}"
+            );
+        }
+    }
+
+    /// `OnceLock::set` is single-shot. Two back-to-back searches
+    /// on the lazy path must observe the same allocation (proves
+    /// the second call doesn't rebuild the table). We compare
+    /// the underlying `Vec`'s data pointer, which only stays
+    /// stable across calls if the lookup table is reused.
+    #[test]
+    fn second_search_reuses_lazy_built_doc_to_pos() {
+        let (blob, json, all) = build_search_corpus();
+        let r = VectorReader::open(blob, &json).expect("open");
+
+        let _ = r
+            .search("embedding", &all[3], 5, 4, 5)
+            .expect("first search");
+        let ptr_after_first = r.columns[0]
+            .doc_to_pos
+            .get()
+            .expect("populated after first search")
+            .as_ptr();
+
+        let _ = r
+            .search("embedding", &all[40], 5, 4, 5)
+            .expect("second search");
+        let ptr_after_second = r.columns[0]
+            .doc_to_pos
+            .get()
+            .expect("still populated after second search")
+            .as_ptr();
+
+        assert_eq!(
+            ptr_after_first, ptr_after_second,
+            "OnceLock::set is single-shot; second search must reuse the same allocation"
+        );
+    }
+
+    /// Memory-ceiling proxy at the structural level: per column,
+    /// the lazy `doc_to_pos` allocation is bounded by
+    /// `n_docs × 4` bytes when populated and is exactly 0 bytes
+    /// when empty. The `Vec<u32>::capacity()` ≥ length invariant
+    /// means `capacity * 4 ≥ resident` for the lookup table.
+    /// We pin the upper bound at `2 × n_docs × 4` to absorb the
+    /// Vec's reserve slack without letting it grow unbounded.
+    #[test]
+    fn doc_to_pos_lazy_allocation_is_bounded_by_n_docs() {
+        let (blob, json, all) = build_search_corpus();
+
+        let r_lazy = VectorReader::open(blob.clone(), &json).expect("lazy open");
+        let col = &r_lazy.columns[0];
+        let n_docs = col.n_docs as usize;
+        assert_eq!(
+            col.doc_to_pos.get().map(|v| v.capacity()).unwrap_or(0),
+            0,
+            "lazy open: zero bytes for doc_to_pos"
+        );
+
+        let _ = r_lazy
+            .search("embedding", &all[0], 5, 4, 5)
+            .expect("first search to trigger lazy build");
+        let cap = r_lazy.columns[0]
+            .doc_to_pos
+            .get()
+            .expect("populated after rerank")
+            .capacity();
+        assert!(
+            cap >= n_docs && cap <= 2 * n_docs,
+            "post-rerank: doc_to_pos capacity {cap} should be in [n_docs, 2 × n_docs] (n_docs={n_docs})"
+        );
     }
 }

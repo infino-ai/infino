@@ -207,6 +207,15 @@ impl SuperfileReader {
                 cols_json,
                 crate::superfile::vector::reader::OpenOptions {
                     verify_crc: opts.verify_crc,
+                    // Plan 011 M2: supertable opens default to the
+                    // lazy `doc_to_pos` path. The first query through
+                    // each column pays the (~few ms at 1M) build
+                    // cost; subsequent queries are identical to the
+                    // pre-011 hot path. Callers that need today's
+                    // "first-search is hot" semantics can construct
+                    // `VectorReader::open_with` directly with
+                    // `prefetch_eager: true`.
+                    prefetch_eager: false,
                 },
             )?)
         } else if any_present(&kv_map, kv::VEC_KEYS) {

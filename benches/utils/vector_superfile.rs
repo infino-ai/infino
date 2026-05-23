@@ -28,7 +28,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use crate::corpus::{self, Calibrated, DIM};
 use crate::{markdown, rss};
 use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -113,11 +113,25 @@ fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
     builder.finish().expect("finish vector builder")
 }
 
+// Bench harness: opens with `prefetch_eager: true` so the pre-011
+// hot-first-search semantics are preserved — criterion measurements
+// of `first_search_*` etc. compare against the documented numbers
+// in `benches/vector/README.md` without picking up the lazy-build
+// cost on the first iteration. The lazy path is benched separately
+// via `open_lazy_vs_eager` once 011 M5 lands.
 fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
     let n_cent = corpus::n_cent(N_DOCS);
     let json =
         format!(r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
-    VectorReader::open(Bytes::from(blob), &json).expect("open VectorReader")
+    VectorReader::open_with(
+        Bytes::from(blob),
+        &json,
+        OpenOptions {
+            verify_crc: true,
+            prefetch_eager: true,
+        },
+    )
+    .expect("open VectorReader")
 }
 
 // ─── Correctness ──────────────────────────────────────────────────────
