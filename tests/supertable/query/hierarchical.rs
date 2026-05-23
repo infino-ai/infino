@@ -80,7 +80,7 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
         ("golf", "hotel"),
         ("india", "juliet"),
     ];
-    for (_i, (a, b)) in vocabs.iter().enumerate() {
+    for (a, b) in vocabs.iter() {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&[a, b])).expect("append");
         w.commit().expect("commit");

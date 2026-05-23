@@ -649,10 +649,10 @@ fn publish_superfiles(
         // doesn't fail the commit — the segment is durably
         // in storage, and a subsequent query will cold-fetch
         // it as if pre-population hadn't been attempted.
-        if !pending_cache_inserts.is_empty() {
-            if let Some(cache) = inner.options.disk_cache.as_ref().cloned() {
-                warm_cache_after_commit(inner, &cache, pending_cache_inserts);
-            }
+        if !pending_cache_inserts.is_empty()
+            && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
+        {
+            warm_cache_after_commit(inner, &cache, pending_cache_inserts);
         }
 
         // Best-effort memory-budget enforcement. Each commit
@@ -975,7 +975,7 @@ async fn try_commit_attempt(
                     .superfiles
                     .iter()
                     .cloned()
-                    .chain(new_for_pk.into_iter())
+                    .chain(new_for_pk)
                     .collect();
 
                 if combined_n as u64 > opts.target_superfiles_per_partition {

@@ -277,13 +277,10 @@ async fn eviction_respects_pinned_set() {
     seed_segment(&*local, uri_b, bytes).await;
 
     // Pinned-fn pins exactly URI A.
-    let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new({
-        let uri_a = uri_a;
-        move || {
-            let mut s = HashSet::new();
-            s.insert(uri_a);
-            s
-        }
+    let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(move || {
+        let mut s = HashSet::new();
+        s.insert(uri_a);
+        s
     });
 
     let cache_dir = TempDir::new().expect("cache tempdir");

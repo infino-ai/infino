@@ -278,10 +278,7 @@ impl MmapVectorSource {
     /// only the build process owns the file.
     pub fn open(path: &Path, dim: usize, chunk_rows: usize) -> Result<Self, BuildError> {
         debug_assert!(dim > 0, "MmapVectorSource: dim must be > 0");
-        debug_assert!(
-            chunk_rows > 0,
-            "MmapVectorSource: chunk_rows must be > 0"
-        );
+        debug_assert!(chunk_rows > 0, "MmapVectorSource: chunk_rows must be > 0");
         let file = File::open(path)?;
         let file_len = file.metadata()?.len() as usize;
         let row_bytes = dim
@@ -394,8 +391,7 @@ mod tests {
         }
 
         // Read back via MmapVectorSource; verify f32-identical.
-        let mut src = MmapVectorSource::open(&path, dim, /*chunk_rows=*/ 5)
-            .expect("mmap open");
+        let mut src = MmapVectorSource::open(&path, dim, /*chunk_rows=*/ 5).expect("mmap open");
         assert_eq!(src.n_rows(), n_rows);
         assert_eq!(src.dim(), dim);
         assert_eq!(src.chunk_rows(), 5);
@@ -436,11 +432,8 @@ mod tests {
         let dim = 3;
         let corpus = synth(n_rows, dim);
 
-        let mut src = InMemoryVectorSource::new(
-            Arc::new(corpus.clone()),
-            dim,
-            /*chunk_rows=*/ 7,
-        );
+        let mut src =
+            InMemoryVectorSource::new(Arc::new(corpus.clone()), dim, /*chunk_rows=*/ 7);
         assert_eq!(src.n_rows(), n_rows);
         assert_eq!(src.dim(), dim);
         assert_eq!(src.chunk_rows(), 7);

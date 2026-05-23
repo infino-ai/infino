@@ -894,7 +894,7 @@ mod tests {
         #[tokio::test]
         async fn part_first_touch_loads_and_caches() {
             let part = make_test_part(7);
-            let (objects, entries) = encode_and_index(&[part.clone()]);
+            let (objects, entries) = encode_and_index(std::slice::from_ref(&part));
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
             let manifest =
@@ -908,7 +908,7 @@ mod tests {
         #[tokio::test]
         async fn second_touch_hits_cache_zero_additional_gets() {
             let part = make_test_part(11);
-            let (objects, entries) = encode_and_index(&[part.clone()]);
+            let (objects, entries) = encode_and_index(std::slice::from_ref(&part));
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
             let manifest =
@@ -923,7 +923,7 @@ mod tests {
         #[tokio::test]
         async fn concurrent_loaders_coalesce_to_one_get() {
             let part = make_test_part(13);
-            let (objects, entries) = encode_and_index(&[part.clone()]);
+            let (objects, entries) = encode_and_index(std::slice::from_ref(&part));
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
             let manifest = Arc::new(build_manifest_with_loader(
@@ -959,7 +959,7 @@ mod tests {
         #[tokio::test]
         async fn content_hash_mismatch_surfaces_typed_error_without_refetch() {
             let part = make_test_part(17);
-            let (mut objects, entries) = encode_and_index(&[part.clone()]);
+            let (mut objects, entries) = encode_and_index(std::slice::from_ref(&part));
             // Tamper with the stored bytes — content_hash on
             // the list entry no longer matches.
             let bytes = objects.values().next().expect("one obj").clone();
@@ -968,7 +968,7 @@ mod tests {
             tampered[last] ^= 0xff;
             let uri = entries[0].uri.clone();
             objects.insert(uri, Bytes::from(tampered));
-            let (_, fresh_entries) = encode_and_index(&[part.clone()]);
+            let (_, fresh_entries) = encode_and_index(std::slice::from_ref(&part));
             let list = fresh_list(fresh_entries);
 
             let storage = Arc::new(CountingMockStorage::new(objects));
