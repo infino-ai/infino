@@ -13,7 +13,11 @@ env:
 jobs:
   check:
     name: Format, Build & Test
-    runs-on: ubuntu-latest
+    runs-on:
+      - runner=8cpu-linux-x64
+      - disk=large
+      - image=ubuntu22-full-x64
+      - extras=s3-cache
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
