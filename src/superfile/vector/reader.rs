@@ -1082,14 +1082,8 @@ mod tests {
         let mut bytes = blob.to_vec();
         let pos = OUTER_HEADER_SIZE + 10;
         bytes[pos] ^= 0xFF;
-        let r = VectorReader::open_with(
-            Bytes::from(bytes),
-            &json,
-            OpenOptions {
-                verify_crc: false,
-                ..OpenOptions::default()
-            },
-        );
+        let r =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false });
         // Open succeeds; the corruption may surface later as a
         // bad-magic / bounds error or be silently absorbed depending
         // on which byte got flipped. The contract is "we don't
