@@ -181,7 +181,6 @@ hashbrown = "0.17.1"
 infino = { path = ".", features = ["test-helpers"] }
 infino-bench-utils = { path = "benches/utils" }
 
-tempfile = "3"
 proptest = "1"
 criterion = "0.8"
 hdrhistogram = "7"
