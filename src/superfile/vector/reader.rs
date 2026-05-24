@@ -70,9 +70,9 @@ pub struct ColumnReader {
 /// safe choice (CRC verification on). The argumentless
 /// [`VectorReader::open`] takes the default.
 ///
-/// Plan 011 consolidates open-time knobs here. Today: `verify_crc`
-/// only. Plan 013 may add object-storage-native knobs (e.g.
-/// `range_fetch_concurrency`) under the same struct.
+/// Today: `verify_crc` only. Object-storage-native knobs (e.g.
+/// `range_fetch_concurrency`) may land here later under the same
+/// struct.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Verify the per-subsection CRC during open. Each subsection is
@@ -91,27 +91,28 @@ impl Default for OpenOptions {
     }
 }
 
-/// Backing for a [`VectorReader`]. Plan 011 M1.
+/// Backing for a [`VectorReader`].
 ///
-/// Two variants today, plumbed through every byte-fetch point:
+/// Two variants, plumbed through every byte-fetch point:
 ///
-/// - `InMemory(Bytes)`: the legacy path — caller materialised
-///   the full subsection before opening. Every byte fetch is a
+/// - `InMemory(Bytes)`: caller materialised the full
+///   subsection before opening. Every byte fetch is a
 ///   zero-copy `Bytes::slice` against the buffer.
 /// - `Lazy(Arc<dyn LazyByteSource>)`: a range-fetching source
-///   (mmap, S3 range GET, broadcast subscription). M1 wires
-///   the enum + every access site through it; M2 lands the
-///   lazy-friendly `open_with_source` shape.
+///   (mmap, object-store range GET, broadcast subscription).
+///   Every byte access in the open + search paths routes
+///   through the same call sites so swapping the backing in
+///   doesn't require a second rewrite.
 ///
-/// Both variants expose **sync-only** byte access matching
-/// plan 002 Q9 (resolved as commit `2e351ba`) — every public
-/// surface in `src/` is sync. The `LazyByteSource::range`
-/// trait method is async because production impls (S3 / object
-/// store) are; `Source::get_range` hides that under the same
+/// Both variants expose **sync-only** byte access — every
+/// public surface in `src/` is sync. The
+/// `LazyByteSource::range` trait method is async because
+/// production impls (object store, network sources) are;
+/// [`Source::get_range`] hides that under the same
 /// `block_in_place + Handle::block_on` / one-shot
-/// `current_thread` `Runtime` bridge `supertable::query::
-/// segment_reader` uses for the disk-cache fetch path. Hot-
-/// path callers (`Source::InMemory`, mmap-backed
+/// `current_thread` `Runtime` bridge the supertable's
+/// per-segment reader uses for the disk-cache fetch path.
+/// Hot-path callers (`Source::InMemory`, mmap-backed
 /// `BytesLazyByteSource`) never hit the bridge — both override
 /// `try_get_range_sync` to return zero-copy slices, so
 /// `get_range` resolves on the sync fast path.
@@ -197,9 +198,8 @@ impl Source {
     /// no-ambient branch fires only in standalone tests /
     /// scripts.
     ///
-    /// Plan 002 Q9 (commit `2e351ba`) resolved the project's
-    /// sync-vs-async convention: every public surface stays
-    /// sync, async is hidden behind well-defined bridge points.
+    /// Convention: every public surface in `src/` stays sync,
+    /// async is hidden behind well-defined bridge points.
     /// `Source::get_range` is one of those bridge points.
     pub fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
         if let Some(bytes) = self.try_get_range_sync(range.clone()) {
@@ -269,14 +269,14 @@ impl VectorReader {
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, VectorError> {
-        // M1: every byte fetch routes through `Source::try_get_range_sync`
-        // so a future lazy variant can intercept the same call sites
+        // Every byte fetch routes through `Source::try_get_range_sync`
+        // so the lazy variant can intercept the same call sites
         // without a second rewrite. `InMemory` returns zero-copy
         // `Bytes::slice` views; refcount bumps only.
         Self::open_with_source(Source::InMemory(blob), columns_json, opts)
     }
 
-    /// Plan 011 M3 — open over an arbitrary [`Source`].
+    /// Open over an arbitrary [`Source`].
     ///
     /// The structural decode path is the same as
     /// [`Self::open_with`]; this entry just accepts a pre-built
@@ -284,8 +284,8 @@ impl VectorReader {
     /// - Test helpers that need to wire a counting / mock
     ///   [`LazyByteSource`] under a `Source::Lazy` (e.g. the
     ///   range-counting integration test).
-    /// - A future `SuperfileReader::open_lazy` rewrite (013 / 014)
-    ///   that hands the underlying source through to the
+    /// - A future `SuperfileReader::open_lazy` rewrite that
+    ///   hands the underlying source through to the
     ///   `VectorReader` instead of materialising the full
     ///   subsection up-front.
     ///
@@ -294,9 +294,9 @@ impl VectorReader {
     /// [`Source::try_get_range_sync`], so the lazy source must
     /// already have the structural-decode regions (header,
     /// directory, per-subsection headers) resident — typically
-    /// via a one-range pre-fetch issued by the caller. M3.b will
-    /// add an async open entrypoint that pre-fetches those
-    /// regions on the source's behalf.
+    /// via a one-range pre-fetch issued by the caller. A future
+    /// async open entrypoint can pre-fetch those regions on the
+    /// source's behalf.
     pub fn open_with_source(
         source: Source,
         columns_json: &str,
@@ -505,9 +505,9 @@ impl VectorReader {
             let doc_ids_off = full_off + full_size;
 
             // Bounds-check the cluster_idx + doc_ids regions without
-            // reading them. Plan 011 M3.b carries `pos = off + i`
-            // inline in the shortlist, so search never touches the
-            // `doc_ids` region; open only needs the offset math.
+            // reading them. Search carries `pos = off + i` inline
+            // in the shortlist, so it never needs a `doc_to_pos`
+            // lookup table; open only needs the offset math.
             let cluster_idx_size = (n_cent as usize) * 8;
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
@@ -582,8 +582,9 @@ impl VectorReader {
     pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
-        // M1: byte access routed through `Source::try_get_range_sync`
-        // — zero-copy on `InMemory`, M2/M3 wires the lazy path.
+        // Byte access routed through `Source::try_get_range_sync`
+        // — zero-copy on `InMemory`, same call site serves the
+        // lazy path.
         let sub = self
             .source
             .try_get_range_sync(col.subsection_range.clone())?;
@@ -602,19 +603,18 @@ impl VectorReader {
     /// distance)` sorted ascending by distance (smaller = closer
     /// for every metric).
     ///
-    /// Sync — matches plan 002 Q9's convention (every public
-    /// surface in `src/` is sync). Routes per-region byte
-    /// access through [`Source::get_range`], which is itself
-    /// sync and bridges to the underlying async
-    /// `LazyByteSource::range` only on a cold `Source::Lazy`
-    /// miss (via `block_in_place + Handle::block_on`, same
-    /// pattern as `supertable::query::segment_reader`). On
-    /// `Source::InMemory` and on `Source::Lazy` warm caches
-    /// (`BytesLazyByteSource`, mmap-backed) every fetch resolves
-    /// zero-copy on the sync fast path.
+    /// Sync — every public surface in `src/` is sync. Routes
+    /// per-region byte access through [`Source::get_range`],
+    /// which is itself sync and bridges to the underlying
+    /// async `LazyByteSource::range` only on a cold
+    /// `Source::Lazy` miss (via `block_in_place +
+    /// Handle::block_on`, same pattern as the supertable's
+    /// per-segment reader). On `Source::InMemory` and on
+    /// `Source::Lazy` warm caches (`BytesLazyByteSource`,
+    /// mmap-backed) every fetch resolves zero-copy on the
+    /// sync fast path.
     ///
-    /// Range count per cold first search at `nprobe = 8` on the
-    /// v0 layout:
+    /// Range count per cold first search at `nprobe = 8`:
     ///
     /// - 1 range for centroids (`n_cent × dim × 4` bytes)
     /// - 1 range for the cluster_idx header (`n_cent × 8` bytes)
@@ -628,10 +628,7 @@ impl VectorReader {
     /// time (each candidate's position is `off + i` where
     /// `(off, cnt)` is the cluster's entry and `i` is the
     /// in-cluster index), so there is no `doc_to_pos` lookup
-    /// table at all — that 4 MB / 1M-doc allocation was deleted
-    /// in plan 011 M4 once the audit confirmed zero external
-    /// readers. See `claude_plans/011_lazy_reader_loads.md`
-    /// § Search path for the contract.
+    /// table at all.
     pub fn search(
         &self,
         column: &str,
@@ -725,9 +722,9 @@ impl VectorReader {
 
         // 7. Fat range over `full[]` covering all rerank
         //    candidates. `[min_pos..max_pos + 1]` over-fetches
-        //    in v0 (positions span probed clusters); v1
-        //    (013 M1) interleaves codes + doc_ids + full per
-        //    cluster, dropping this to `nprobe` cluster-sized
+        //    today (positions span probed clusters); a future
+        //    layout that interleaves codes + doc_ids + full per
+        //    cluster would drop this to `nprobe` cluster-sized
         //    ranges. Single get_range either way.
         let mut min_pos = shortlist[0].2;
         let mut max_pos = shortlist[0].2;
@@ -987,13 +984,12 @@ fn verify_vector_crcs(
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
 /// `open_with` so every byte access goes through the `Source`
-/// abstraction — the lazy variant (M2) will plumb the eager-prefetch
+/// abstraction — the lazy variant plumbs the eager-prefetch
 /// path through the same call sites without a second rewrite.
 ///
 /// Failure mode here means the range is out-of-bounds or not
-/// present in the sync cache. M1 only opens `Source::InMemory`, where
-/// any in-bounds range succeeds zero-copy; this only fires on a
-/// malformed blob today.
+/// present in the sync cache. On `Source::InMemory` any in-bounds
+/// range succeeds zero-copy; this only fires on a malformed blob.
 #[inline]
 fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, VectorError> {
     let start = range.start;
@@ -1201,15 +1197,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Plan 011 M1 — Source enum sanity tests
+    // Source enum sanity tests
     // -----------------------------------------------------------------
     //
-    // M1 only adds the enum + reroutes runtime byte access through
-    // it; the public open path still takes a `Bytes` (M2 introduces
-    // `open_lazy`). These tests directly exercise the `Source`
-    // contract so any future refactor that breaks the InMemory
-    // zero-copy invariant or mis-implements the Lazy wrapper fails
-    // here rather than at the wider Lance oracle gate.
+    // These tests directly exercise the `Source` contract so any
+    // future refactor that breaks the InMemory zero-copy invariant
+    // or mis-implements the Lazy wrapper fails here rather than at
+    // the wider Lance oracle gate.
 
     #[test]
     fn source_in_memory_try_get_range_sync_zero_copy() {
@@ -1300,18 +1294,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Plan 011 M3.b / M4 — lazy open + inline-`pos` search
+    // Lazy open + inline-`pos` search
     // -----------------------------------------------------------------
     //
     // Open touches only the structural-decode regions (directory,
     // sub-header, summary, centroids, cluster_idx). Search carries
     // `pos = off + i` inline in the shortlist tuple — there is no
-    // `doc_to_pos` lookup table to populate (deleted in M4 after
-    // the audit confirmed zero external readers). The structural
+    // `doc_to_pos` lookup table to populate. The structural
     // memory-ceiling tests below ride on these invariants.
 
-    /// Search-shape corpus used by the M3.b inline-pos tests and the
-    /// M3 sync-search / counting-source tests. Picks a non-trivial
+    /// Search-shape corpus used by the inline-pos tests and the
+    /// sync-search / counting-source tests. Picks a non-trivial
     /// `n_docs ≥ n_cent` so each cluster has multiple candidates.
     fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
         let dim = 16usize;
@@ -1340,10 +1333,10 @@ mod tests {
         (Bytes::from(bytes), json, all)
     }
 
-    /// Plan 011 M3.b self-query smoke: lazy default open must
-    /// recover the planted self-vector at top-1, confirming the
-    /// inline-`pos` rerank path returns the correct results on
-    /// the search-shape corpus that every M3/M4 test uses.
+    /// Self-query smoke: lazy default open must recover the
+    /// planted self-vector at top-1, confirming the inline-`pos`
+    /// rerank path returns the correct results on the
+    /// search-shape corpus that every test in this section uses.
     #[test]
     fn lazy_default_search_recovers_self_query() {
         let (blob, json, all) = build_search_corpus();
@@ -1355,20 +1348,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Plan 011 M3 — sync `search()` on `Source::Lazy`
+    // Sync `search()` on `Source::Lazy`
     // -----------------------------------------------------------------
     //
-    // These tests pin the M3 contract per plan 002 Q9 (commit
-    // `2e351ba`): the *only* public entry point is sync
-    // `search()`. It works on every `Source` variant — `InMemory`
-    // and warm-cache `Source::Lazy` resolve every range through
-    // `try_get_range_sync` (zero-copy); cold-miss `Source::Lazy`
-    // bridges to the source's async `range()` via
+    // These tests pin the contract: the *only* public entry point
+    // is sync `search()`. It works on every `Source` variant —
+    // `InMemory` and warm-cache `Source::Lazy` resolve every range
+    // through `try_get_range_sync` (zero-copy); cold-miss
+    // `Source::Lazy` bridges to the source's async `range()` via
     // `block_in_place + Handle::block_on` / one-shot
-    // `current_thread` `Runtime`, the same pattern
-    // `supertable::query::segment_reader` uses for the disk-cache
-    // fetch path. No `search_async` is exposed at the public
-    // surface; the cold-path async bridging is hidden inside
+    // `current_thread` `Runtime`, the same pattern the supertable's
+    // per-segment reader uses for the disk-cache fetch path. No
+    // `search_async` is exposed at the public surface; the
+    // cold-path async bridging is hidden inside
     // `Source::get_range`.
     //
     // A `CountingLazyByteSource` test helper wraps a `Bytes`
@@ -1498,8 +1490,8 @@ mod tests {
     /// impl. Production callers always have an ambient runtime
     /// (the supertable owns one), so the `block_in_place +
     /// Handle::block_on` branch is what fires there; this test
-    /// exercises the no-ambient-runtime fallback branch to
-    /// keep that path live.
+    /// exercises the no-ambient-runtime fallback to keep that
+    /// path live.
     #[test]
     fn search_on_lazy_source_with_no_sync_fallback_bridges_to_async() {
         let (blob, json, all) = build_search_corpus();
@@ -1534,9 +1526,8 @@ mod tests {
         );
     }
 
-    /// Range-counting test (plan 011 M3 budget). Sync `search()`
-    /// issues per-region / per-cluster `Source::get_range`
-    /// calls:
+    /// Range-counting budget. Sync `search()` issues per-region
+    /// / per-cluster `Source::get_range` calls:
     ///
     /// - 1 range for centroids
     /// - 1 range for cluster_idx
@@ -1544,14 +1535,14 @@ mod tests {
     /// - 1 range per probed cluster's doc_ids
     /// - 1 fat range for the rerank batch in `full[]`
     ///
-    /// On v0 layout at `nprobe = N` with all probed clusters
-    /// non-empty: `2 + 2N + 1 = 2N + 3` ranges. The corpus here
-    /// has `n_cent = 4` and the test uses `nprobe = 4`, so the
-    /// worst-case budget is `2·4 + 3 = 11`. The plan's
-    /// production budget (`nprobe = 8` on a 1M corpus) is
-    /// `2·8 + 3 = 19` — and 013 M1's v1 layout drops this further
-    /// by interleaving codes + doc_ids per cluster (one range
-    /// per cluster instead of two).
+    /// At `nprobe = N` with all probed clusters non-empty:
+    /// `2 + 2N + 1 = 2N + 3` ranges. The corpus here has
+    /// `n_cent = 4` and the test uses `nprobe = 4`, so the
+    /// worst-case budget is `2·4 + 3 = 11`. The production
+    /// shape (`nprobe = 8` on a 1M corpus) is
+    /// `2·8 + 3 = 19` — a future layout that interleaves
+    /// codes + doc_ids per cluster would drop this further by
+    /// turning the per-cluster pair into a single range.
     ///
     /// Forcing `try_get_range_sync` off makes every range route
     /// through the source's async `range()` via the block_on
@@ -1560,9 +1551,9 @@ mod tests {
     /// `search()` request".
     ///
     /// A regression that smuggles in extra range fetches — e.g.
-    /// reintroducing the whole-subsection fallback, or pulling the
-    /// full `doc_ids` region over the wire at open — surfaces here
-    /// rather than at the production S3 harness in 013.
+    /// reintroducing the whole-subsection fallback, or pulling
+    /// the full `doc_ids` region over the wire at open — surfaces
+    /// here rather than at the production object-store harness.
     #[test]
     fn search_cold_first_search_range_count_per_cluster() {
         let (blob, json, all) = build_search_corpus();
@@ -1637,29 +1628,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Plan 011 § Acceptance #2 — memory-ceiling unit test
+    // Memory-ceiling unit tests
     // -----------------------------------------------------------------
     //
-    // Plan 011's headline guarantee is "resident set per open
-    // vector segment is bounded by O(n_cent × dim × 4 + small)",
-    // independent of `n_docs`. Acceptance criterion #2 spells it
-    // out: opening a `Source::Lazy` over a mmap-backed
-    // `BytesLazyByteSource` at 1M × 384 with
+    // Headline guarantee: resident set per open vector segment is
+    // bounded by `O(n_cent × dim × 4 + small)`, independent of
+    // `n_docs`. Concretely: opening a `Source::Lazy` over a
+    // mmap-backed `BytesLazyByteSource` at 1M × 384 with
     // `OpenOptions { verify_crc: false }` must leave the process
     // RSS delta ≤ 10 MB per opened column.
     //
-    // Why mmap specifically: this is exactly how the disk cache
-    // (003 M5) feeds bytes into `SuperfileReader` —
-    // `Bytes::from_owner(Arc<Mmap>)`. The kernel never faults the
-    // bulk codes/full/doc_ids pages on the default path because
-    // nothing in `open_with_source` accesses them: the CRC scan
-    // is gated on `verify_crc`, search uses inline `pos` (M3.b)
-    // so no `doc_ids` walk happens, and the structural-decode
-    // bytes (outer header + dir + sub_header) are a handful of
-    // pages. The resident allocation is dominated by the rotation
-    // matrix (≈ 590 KB at dim=384) and small column metadata —
-    // well inside the 10 MB ceiling at any practical
-    // `n_docs`.
+    // Why mmap specifically: this is how the disk cache feeds
+    // bytes into `SuperfileReader` —
+    // `Bytes::from_owner(Arc<Mmap>)`. The kernel never faults
+    // the bulk codes/full/doc_ids pages on the default path
+    // because nothing in `open_with_source` accesses them: the
+    // CRC scan is gated on `verify_crc`, search uses inline
+    // `pos` so no `doc_ids` walk happens, and the
+    // structural-decode bytes (outer header + dir + sub_header)
+    // are a handful of pages. The resident allocation is
+    // dominated by the rotation matrix (≈ 590 KB at dim=384)
+    // and small column metadata — well inside the 10 MB ceiling
+    // at any practical `n_docs`.
     //
     // Companion smoke test below (`mem_ceiling_lazy_open_smoke`)
     // runs in default `cargo test --lib` at a smaller scale so
@@ -1690,10 +1680,10 @@ mod tests {
     /// Build an `(n_docs × dim)` corpus, register a single
     /// vector column with the requested IVF shape, and stream
     /// the resulting unified-blob bytes to `tmp` via
-    /// `VectorBuilder::finish_to` (plan 010 M5). The streaming
-    /// write avoids materializing a 1.5 GiB `Vec<u8>` in the
-    /// test's address space at 1M × 384 — the build's transient
-    /// peak doesn't survive the `before` RSS snapshot.
+    /// `VectorBuilder::finish_to`. The streaming write avoids
+    /// materializing a 1.5 GiB `Vec<u8>` in the test's address
+    /// space at 1M × 384 — the build's transient peak doesn't
+    /// survive the `before` RSS snapshot.
     ///
     /// Deterministic per-row vector: `seed = i × 0x9E3779B1`
     /// folded through a linear congruential step per dim slot.
@@ -1783,7 +1773,7 @@ mod tests {
         (delta, n_cols)
     }
 
-    /// **Plan 011 acceptance criterion #2 (plan-spec scale).**
+    /// Memory-ceiling assertion at production scale.
     ///
     /// 1 M × 384, `n_cent = 1024`. `#[ignore]`-gated because
     /// the `VectorBuilder.finish_to(...)` call takes ~35 s in
@@ -1795,10 +1785,9 @@ mod tests {
     /// ```
     ///
     /// A regression that re-introduces eager subsection
-    /// materialization (the pre-011 behaviour) or that scans
-    /// `doc_ids` at open will push per-column RSS past the
-    /// 10 MB ceiling and fail here rather than at the 100 M
-    /// production OOM.
+    /// materialization or that scans `doc_ids` at open will
+    /// push per-column RSS past the 10 MB ceiling and fail
+    /// here rather than at the 100 M production OOM.
     #[test]
     #[ignore]
     fn mem_ceiling_lazy_open_under_10mib() {
@@ -1821,25 +1810,25 @@ mod tests {
 
         assert!(
             per_col_mib <= 10.0,
-            "Plan 011 acceptance #2: lazy open RSS delta \
-             {per_col_mib:.3} MiB/col exceeds 10 MiB ceiling \
-             at 1M × {DIM}, n_cent={N_CENT} (total delta \
-             {delta_mib:.3} MiB over {n_cols} column(s))."
+            "lazy open RSS delta {per_col_mib:.3} MiB/col \
+             exceeds 10 MiB ceiling at 1M × {DIM}, \
+             n_cent={N_CENT} (total delta {delta_mib:.3} MiB \
+             over {n_cols} column(s))."
         );
     }
 
-    /// **Plan 011 acceptance criterion #2 (smoke scale).**
+    /// Memory-ceiling assertion at smoke scale.
     ///
     /// 50 k × 64, `n_cent = 64`. Runs in default
     /// `cargo test --lib` (~1–2 s build) so every PR gets
     /// continuous feedback on the structural property: lazy
     /// open touches only the structural-decode pages, never
     /// the bulk codes/full/doc_ids regions. The 10 MiB ceiling
-    /// at the plan's headline 1M × 384 scale is asserted at
-    /// the same value here because the resident allocation
-    /// (mostly the rotation matrix at `dim²·4` = 16 KB for
-    /// dim=64) is *smaller* at smoke scale, not larger — if
-    /// this fires, the bigger test will too.
+    /// at the headline 1M × 384 scale is asserted at the same
+    /// value here because the resident allocation (mostly the
+    /// rotation matrix at `dim²·4` = 16 KB for dim=64) is
+    /// *smaller* at smoke scale, not larger — if this fires,
+    /// the bigger test will too.
     ///
     /// `dim = 64` keeps the corpus tiny (~13 MB on disk) and
     /// the rotation matrix Gram-Schmidt fast.
@@ -1871,48 +1860,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Plan 011 — supertable-scale memory ceiling
+    // Supertable-scale memory ceiling
     // -----------------------------------------------------------------
     //
-    // The single-segment `mem_ceiling_lazy_open_*` tests above pin the
-    // per-reader bound. These multi-segment variants pin the
-    // *supertable-shaped* bound: open N segments concurrently — same
-    // shape `Supertable::commit` produces (N = N_SEGMENTS_BENCH × num_cpus
-    // because `split_buffer_into_row_shards` shards each commit's
-    // buffer into one segment per writer-pool thread) — and assert the
-    // total anon RSS delta scales as `N × O(centroids + rotation +
-    // small)`, not as `N × subsection_size`.
+    // The single-segment `mem_ceiling_lazy_open_*` tests above pin
+    // the per-reader bound. These multi-segment variants pin the
+    // *supertable-shaped* bound: open N segments concurrently —
+    // same shape `Supertable::commit` produces (N =
+    // N_SEGMENTS_BENCH × num_cpus because the writer-pool sharding
+    // creates one segment per thread) — and assert the total anon
+    // RSS delta scales as `N × O(centroids + rotation + small)`,
+    // not as `N × subsection_size`.
     //
     // What this proves (and what it doesn't):
     //
-    // - PROVES: a supertable opened with the production disk-cache
-    //   path (`Source::InMemory(Bytes::from_owner(mmap))` per segment —
-    //   see `supertable::reader_cache::disk::insert`) keeps anon
-    //   RSS bounded across an arbitrary number of segments, with no
-    //   per-doc anon term. Equivalent here because
-    //   `Bytes::from_owner` is zero-copy over the mmap, and the
-    //   lazy-open path doesn't touch `doc_ids[]` / `full[]` at
-    //   open time (M3.b's inline `pos` removes the only reason
-    //   open ever touched `doc_ids[]`).
+    // - PROVES: a supertable opened with the production
+    //   disk-cache path
+    //   (`Source::InMemory(Bytes::from_owner(mmap))` per segment)
+    //   keeps anon RSS bounded across an arbitrary number of
+    //   segments, with no per-doc anon term. Equivalent here
+    //   because `Bytes::from_owner` is zero-copy over the mmap,
+    //   and the lazy-open path doesn't touch `doc_ids[]` /
+    //   `full[]` at open time (inline `pos` removes the only
+    //   reason open ever touched `doc_ids[]`).
     //
-    // - DOES NOT PROVE: the in-process `InMemoryReaderCache` path
-    //   (`Bytes::from(Vec)` per segment — see
-    //   `supertable::reader_cache::in_memory::insert`) has the same
-    //   bound. That path holds each segment's bytes in anon by
-    //   construction (no mmap involved). The in-memory cache is the
-    //   test/bench path; production attaches a `StorageProvider` and
-    //   routes through the disk cache. A separate test for the
-    //   in-memory cache path isn't a 011 deliverable — that path's
-    //   anon cost is its declared contract.
+    // - DOES NOT PROVE: the in-process `InMemoryReaderCache`
+    //   path (`Bytes::from(Vec)` per segment) has the same bound.
+    //   That path holds each segment's bytes in anon by
+    //   construction (no mmap involved). The in-memory cache is
+    //   the test/bench path; production attaches a
+    //   `StorageProvider` and routes through the disk cache. The
+    //   in-memory cache's anon cost is its declared contract.
     //
     // The bench's 10M × 4-commit × num_cpus-thread shape produces
-    // exactly the topology these tests exercise. The smoke variant
-    // mirrors the bench's *layout* at a tiny corpus size (4 segments
-    // × 50 k docs × 64 dim) so every PR catches regressions
-    // (~5 s build). The `#[ignore]`'d plan-spec variant uses the
-    // bench's actual per-segment shape (16 segments × 625 k docs ×
-    // 384 dim × n_cent_per_segment matching the bench's
-    // `n_cent_total / 4`) and runs only when called out.
+    // exactly the topology these tests exercise. The smoke
+    // variant mirrors the bench's *layout* at a tiny corpus size
+    // (4 segments × 50 k docs × 64 dim) so every PR catches
+    // regressions (~5 s build). The `#[ignore]`'d production-scale
+    // variant uses the bench's actual per-segment shape (16
+    // segments × 625 k docs × 384 dim × n_cent_per_segment
+    // matching the bench's `n_cent_total / 4`) and runs only when
+    // called out.
 
     /// Open `N` segment files (built by `build_corpus_to_file`) via
     /// `Source::Lazy(BytesLazyByteSource over Arc<Mmap>)` and return
@@ -1972,7 +1960,7 @@ mod tests {
         (delta, n_cols_total, n_segments)
     }
 
-    /// **Plan 011 supertable-scale memory ceiling (smoke).**
+    /// Supertable-scale memory ceiling — smoke.
     ///
     /// Mirrors the bench's 4-commit × num_cpus-thread shape at a
     /// tiny corpus size. Builds 4 segment files (each 50 k × 64
@@ -2026,7 +2014,7 @@ mod tests {
         drop(tmps);
     }
 
-    /// **Plan 011 supertable-scale memory ceiling (plan-spec).**
+    /// Supertable-scale memory ceiling — production shape.
     ///
     /// Mirrors the bench's actual 10M × 4-commit ×
     /// 4-thread-writer-pool topology: 16 segments × 625 k docs ×
@@ -2102,34 +2090,34 @@ mod tests {
         drop(tmps);
     }
 
-    /// **Plan 011 M4 — many-segments stress test (100M
-    /// aspiration shape).**
+    /// Many-segments stress test — 100M aspiration shape.
     ///
     /// The honest scale test for "100M docs across a supertable"
     /// can't materialise 100M production-shape segments on a
     /// developer box (the per-segment 625k × 384 shape used in
     /// the bench produces ~960 MiB on disk × 160 segments = 150
     /// GiB of corpus). Instead, this test pins the *structural*
-    /// memory bound by varying the high-cardinality axis (segment
-    /// count) at a thin per-segment shape: **100 segments × 50 k
-    /// docs × 128 dim × 128 n_cent**.
+    /// memory bound by varying the high-cardinality axis
+    /// (segment count) at a thin per-segment shape:
+    /// **100 segments × 50 k docs × 128 dim × 128 n_cent**.
     ///
     /// What this proves:
     ///
     /// - Per-segment open allocation is `O(n_cent × dim × 4 +
     ///   rotation + small)` — no `n_docs` term. At this shape:
     ///   centroids 64 KiB + rotation matrix 64 KiB + column
-    ///   metadata ≪ 1 MiB per segment. Total expected RSS delta
-    ///   ≪ 200 MiB across 100 segments; 400 MiB ceiling for
-    ///   allocator overhead + reader-struct fields.
+    ///   metadata ≪ 1 MiB per segment. Total expected RSS
+    ///   delta ≪ 200 MiB across 100 segments; 400 MiB ceiling
+    ///   for allocator overhead + reader-struct fields.
     ///
-    /// - The deletion of `doc_to_pos` (M4) made segment-count
-    ///   the only scaling dimension. A regression that reintroduced
-    ///   any per-doc resident state — e.g. a returning lookup
-    ///   table at `n_docs × 4` bytes per column — would here
-    ///   allocate 100 × 50 k × 4 = 20 MiB anon just for tables
-    ///   (small but growing); at the bench's 100 segments × 625 k
-    ///   the same regression is 250 MiB.
+    /// - With no per-doc resident state on the open path,
+    ///   segment count is the only scaling dimension. A
+    ///   regression that reintroduced any per-doc resident state
+    ///   — e.g. a returning lookup table at `n_docs × 4` bytes
+    ///   per column — would here allocate 100 × 50 k × 4 = 20
+    ///   MiB anon just for tables (small but growing); at the
+    ///   bench's 100 segments × 625 k the same regression is
+    ///   250 MiB.
     ///
     /// Each segment file is ~25 MiB on disk; the test writes
     /// ~2.5 GiB total to the tempdir. Build time is dominated by
@@ -2183,8 +2171,8 @@ mod tests {
             delta_mib <= 400.0,
             "many-segments lazy open RSS delta {delta_mib:.3} MiB exceeds 400 MiB ceiling \
              at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. A regression that reintroduced \
-             any per-doc resident state would push this much higher; M4's deletion of \
-             doc_to_pos is what keeps the bound structural."
+             any per-doc resident state at open would push this much higher; keeping the \
+             bound structural is what this test guards."
         );
 
         drop(tmps);

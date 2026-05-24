@@ -142,7 +142,7 @@ pub enum VectorError {
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 
-    /// Plan 011 M3 — the underlying [`crate::superfile::LazyByteSource`]
+    /// The underlying [`crate::superfile::LazyByteSource`]
     /// surfaced a typed error during a range fetch (storage failure,
     /// out-of-bounds range, …). Stringified for crate-boundary
     /// stability; callers that need the typed

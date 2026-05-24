@@ -68,11 +68,11 @@ pub trait LazyByteSource: Send + Sync {
     /// fetches return `Some` only if the range happens to be
     /// in an in-process LRU cache, otherwise `None`.
     ///
-    /// Plan 011 M1 introduces this method so the vector
-    /// reader's sync `search()` path can stay sync on the
-    /// in-memory source without spawning an async runtime.
-    /// On an out-of-bounds range the implementation may
-    /// return `None` (treated as "not available sync" by the
+    /// This method exists so the vector reader's sync
+    /// `search()` path can stay sync on the in-memory
+    /// source without spawning an async runtime. On an
+    /// out-of-bounds range the implementation may return
+    /// `None` (treated as "not available sync" by the
     /// caller, which then either falls back to the async
     /// `range` or surfaces an `OutOfBounds` error itself).
     ///
@@ -176,10 +176,10 @@ mod tests {
         );
     }
 
-    /// Plan 011 M1 — sync access on `BytesLazyByteSource`
-    /// must always succeed for in-bounds ranges (it's
-    /// in-memory backed) and must return a zero-copy slice
-    /// of the source's underlying buffer.
+    /// Sync access on `BytesLazyByteSource` must always
+    /// succeed for in-bounds ranges (it's in-memory backed)
+    /// and must return a zero-copy slice of the source's
+    /// underlying buffer.
     #[test]
     fn bytes_lazy_source_try_get_range_sync_returns_zero_copy_slice() {
         let payload = Bytes::from(vec![10u8, 20, 30, 40, 50, 60, 70, 80]);
