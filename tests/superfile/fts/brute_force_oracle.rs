@@ -297,7 +297,6 @@ fn assert_top_k_and_set_matches(
 ) {
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
-    use infino::superfile::fts::tokenize::Tokenizer as _;
     tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
     let infino_hits = infino_top_k_and(infino, query, k);
     let oracle_hits: Vec<u64> = oracle
@@ -388,7 +387,6 @@ fn oracle_and_scores_match_brute_force_ordering() {
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
     let mut terms: Vec<String> = Vec::new();
-    use infino::superfile::fts::tokenize::Tokenizer as _;
     tok.tokenize_each("rust framework", &mut |t| terms.push(t.to_owned()));
 
     let infino_hits: Vec<(u64, f32)> = infino
