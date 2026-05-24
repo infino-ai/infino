@@ -1100,12 +1100,12 @@ impl FtsReader {
             // catches up the others.
             loop {
                 let mut bumped = false;
-                for i in 0..n {
-                    cursors[i].skip_to(candidate, postings);
-                    if cursors[i].is_exhausted() {
+                for c in cursors.iter_mut().take(n) {
+                    c.skip_to(candidate, postings);
+                    if c.is_exhausted() {
                         break 'outer;
                     }
-                    let here = cursors[i].current_doc_id();
+                    let here = c.current_doc_id();
                     if here != candidate {
                         candidate = here;
                         bumped = true;
