@@ -67,28 +67,28 @@ which is the structured source of truth the markdown is derived from.
 |----------------|------------|-----------|------------|-----------|------------|
 **OR queries:**
 
-| single_rare    | 260 ns     | 0 B       | 0 B        | 0 B       | —          |
-| single_df1     | 119 ns     | 0 B       | 0 B        | 0 B       | —          |
-| single_common  | 14.83 µs   | 0 B       | 0 B        | 0 B       | —          |
-| two_term_or    | 106.07 µs  | 0 B       | 0 B        | 0 B       | —          |
-| three_wide_or  | 1.61 ms    | 0 B       | 0 B        | 0 B       | —          |
-| three_similar_or | 9.07 ms    | 0 B       | 0 B        | 0 B       | —          |
-| five_term_or   | 15.69 ms   | 0 B       | 0 B        | 0 B       | —          |
+| single_rare    | 256 ns     | 0 B       | 0 B        | 0 B       | —          |
+| single_df1     | 117 ns     | 0 B       | 0 B        | 0 B       | —          |
+| single_common  | 13.29 µs   | 0 B       | 0 B        | 0 B       | —          |
+| two_term_or    | 99.19 µs   | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_or  | 1.19 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_or | 5.56 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_or   | 9.70 ms    | 0 B       | 0 B        | 0 B       | —          |
 
 **AND queries:**
 
-| two_term_and   | 4.44 ms    | 0 B       | 0 B        | 0 B       | —          |
-| three_wide_and | 3.33 ms    | 0 B       | 0 B        | 0 B       | —          |
-| three_similar_and | 4.58 ms    | 0 B       | 0 B        | 0 B       | —          |
-| five_term_and  | 5.11 ms    | 0 B       | 0 B        | 0 B       | —          |
+| two_term_and   | 113.46 µs  | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_and | 2.45 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_and | 4.32 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_and  | 4.50 ms    | 0 B       | 0 B        | 0 B       | —          |
 
 **Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):
 
 | Shape         | WAND+BMW   | MaxScore+BMM |
 |---------------|------------|--------------|
-| wide_3_or     | 4.80 ms    | 1.34 ms      |
-| similar_3_or  | 9.17 ms    | 5.98 ms      |
-| similar_5_or  | 26.35 ms   | 10.07 ms     |
+| wide_3_or     | 4.62 ms    | 1.20 ms      |
+| similar_3_or  | 8.77 ms    | 5.58 ms      |
+| similar_5_or  | 25.06 ms   | 9.68 ms      |
 
 <!-- END: bench/fts/superfile/search -->
 

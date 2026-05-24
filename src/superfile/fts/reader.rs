@@ -1058,40 +1058,72 @@ impl FtsReader {
         // expected number of leapfrog bumps per candidate.
         cursors.sort_by_key(|c| c.block_count());
 
-        // Top-k min-heap. Same shape as `run_max_score_bmm`/`run_wand_bmw`:
-        // peek returns the smallest score so we can compare against
-        // a new candidate without a full sort.
-        #[derive(Debug, Copy, Clone)]
-        struct HeapEntry(f32, u32);
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0 && self.1 == other.1
-            }
-        }
-        impl Eq for HeapEntry {}
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other
-                    .0
-                    .partial_cmp(&self.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| other.1.cmp(&self.1))
-            }
-        }
-
         let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut heap: BinaryHeap<AndHeapEntry> = BinaryHeap::with_capacity(initial_cap);
 
+        // 2-term shape gets a specialized flat-merge inner loop: when
+        // both cursors sit in their decoded block buffers, we walk the
+        // two sorted `block_doc_ids` arrays with two index pointers
+        // instead of calling `skip_to` per leader doc. That removes
+        // the function-call + within-block linear-scan overhead on the
+        // hottest AND case (rare ∧ common). The general path is kept
+        // for n >= 3 because flat-merge across N arrays doesn't
+        // straightforwardly generalize and the per-doc leapfrog still
+        // amortizes well with the block-max pruning below.
+        if cursors.len() == 2 {
+            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, postings, k, &mut heap);
+        } else {
+            self.run_and_intersect_general(&mut cursors, dl_norm_k1, postings, k, &mut heap);
+        }
+
+        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
+    }
+
+    /// General `n >= 2`-term AND path. Block-max-AND prunes whole
+    /// leader blocks whose maximum possible AND score sum can't beat
+    /// the current heap floor; for survivors, runs the leapfrog
+    /// convergence over all cursors per leader doc.
+    fn run_and_intersect_general(
+        &self,
+        cursors: &mut [TermCursor],
+        dl_norm_k1: &[f32],
+        postings: &[u8],
+        k: usize,
+        heap: &mut BinaryHeap<AndHeapEntry>,
+    ) {
         let n = cursors.len();
         'outer: loop {
             if cursors[0].is_exhausted() {
                 break;
             }
+
+            // Block-max-AND pruning. After the heap fills, the kth-best
+            // score gates further inserts. If the leader's current block
+            // can't possibly produce a top-K beating-score, skip the
+            // whole block — the safest UB sums leader's block_max with
+            // each other cursor's max block_max across all blocks that
+            // overlap the leader's block doc-id range.
+            if heap.len() >= k {
+                let heap_min = heap.peek().expect("heap len == k").0;
+                let range_start = cursors[0].current_doc_id();
+                let range_end = cursors[0].current_block_last_doc_id();
+                let leader_block_max = cursors[0].current_block_max_bm25();
+                let mut other_ub = 0.0_f32;
+                for c in cursors[1..].iter_mut() {
+                    other_ub += c.block_max_in_range(range_start, range_end);
+                }
+                if leader_block_max + other_ub <= heap_min {
+                    cursors[0].skip_to(range_end.saturating_add(1), postings);
+                    continue;
+                }
+            }
+
             let mut candidate = cursors[0].current_doc_id();
 
             // Converge: re-skip all cursors until each lands on the
@@ -1120,34 +1152,126 @@ impl FtsReader {
             // All cursors at `candidate` — sum BM25 contributions.
             let norm = dl_norm_k1[candidate as usize];
             let mut score = 0.0_f32;
-            for c in &cursors {
+            for c in cursors.iter() {
                 score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
                     c.idf_x_k1p1,
                     c.current_tf(),
                     norm,
                 );
             }
-
-            if heap.len() < k {
-                heap.push(HeapEntry(score, candidate));
-            } else if let Some(&worst) = heap.peek() {
-                // Tie-break by ascending doc_id (matches OR paths).
-                if score > worst.0 || (score == worst.0 && candidate < worst.1) {
-                    heap.pop();
-                    heap.push(HeapEntry(score, candidate));
-                }
-            }
+            and_heap_push(heap, k, score, candidate);
 
             cursors[0].next(postings);
         }
+    }
 
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
-        out.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        Ok(out)
+    /// 2-term specialization. While both cursors share a doc-id region
+    /// covered by their respective decoded blocks, do a flat
+    /// sorted-merge over the two `block_doc_ids` arrays: no `skip_to`
+    /// function calls per leader doc, no per-doc within-block linear
+    /// scan — just two index pointers walking forward. When either
+    /// block exhausts, the cursor crosses to its next block (decoding
+    /// on demand) and the merge resumes.
+    fn run_and_intersect_2term(
+        &self,
+        cursors: &mut [TermCursor],
+        dl_norm_k1: &[f32],
+        postings: &[u8],
+        k: usize,
+        heap: &mut BinaryHeap<AndHeapEntry>,
+    ) {
+        debug_assert_eq!(cursors.len(), 2);
+        // Split into two simultaneous mutable refs so the inner loop
+        // can read both cursors' decoded buffers and update both
+        // positions without borrow-checker contortions.
+        let (left, right) = cursors.split_at_mut(1);
+        let c0 = &mut left[0];
+        let c1 = &mut right[0];
+
+        'outer: loop {
+            if c0.is_exhausted() || c1.is_exhausted() {
+                break;
+            }
+
+            // Block-max-AND pruning at the leader's current block.
+            if heap.len() >= k {
+                let heap_min = heap.peek().expect("heap len == k").0;
+                let range_start = c0.current_doc_id();
+                let range_end = c0.current_block_last_doc_id();
+                let ub = c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
+                if ub <= heap_min {
+                    c0.skip_to(range_end.saturating_add(1), postings);
+                    continue;
+                }
+            }
+
+            // Align c1 with c0 at the current leader doc. After this
+            // call both cursors are positioned on doc_ids >= leader.
+            // If c1 jumped past the leader's current block we'll bump
+            // the leader via the outer loop's next iteration.
+            c1.skip_to(c0.current_doc_id(), postings);
+            if c1.is_exhausted() {
+                break 'outer;
+            }
+            if c1.current_doc_id() > c0.current_block_last_doc_id() {
+                // No possible match within leader's current block;
+                // jump leader to (or past) c1's position.
+                c0.skip_to(c1.current_doc_id(), postings);
+                continue;
+            }
+            // Symmetric advance for c0 if c1 sits above c0's pos.
+            if c1.current_doc_id() > c0.current_doc_id() {
+                c0.skip_to(c1.current_doc_id(), postings);
+                if c0.is_exhausted() {
+                    break 'outer;
+                }
+            }
+
+            // Flat sorted-merge within the overlap of the two decoded
+            // blocks. Pre-load all locals; the borrow checker is
+            // satisfied because c0/c1 are independently mutable refs.
+            let lb_n = c0.block_n;
+            let rb_n = c1.block_n;
+            let mut i = c0.pos;
+            let mut j = c1.pos;
+            let c0_idf = c0.idf_x_k1p1;
+            let c1_idf = c1.idf_x_k1p1;
+            while i < lb_n && j < rb_n {
+                let a = c0.block_doc_ids[i];
+                let b = c1.block_doc_ids[j];
+                if a < b {
+                    i += 1;
+                } else if a > b {
+                    j += 1;
+                } else {
+                    let norm = dl_norm_k1[a as usize];
+                    let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                        c0_idf,
+                        c0.block_tfs[i],
+                        norm,
+                    ) + crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                        c1_idf,
+                        c1.block_tfs[j],
+                        norm,
+                    );
+                    and_heap_push(heap, k, score, a);
+                    i += 1;
+                    j += 1;
+                }
+            }
+            c0.pos = i;
+            c1.pos = j;
+
+            // Whichever cursor exhausted its block crosses to its next
+            // block; the other holds. The outer loop re-checks
+            // is_exhausted and re-aligns on the next iteration.
+            if i >= lb_n {
+                c0.next(postings);
+            }
+            if j >= rb_n {
+                c1.next(postings);
+            }
+        }
     }
 
     /// MaxScore+BMM constrained to the doc_id half-open range
@@ -1764,6 +1888,49 @@ impl FtsReader {
 /// broken by ascending doc_id. Used by `search_multi`'s cross-column
 /// combiner, where the per-column scores have already been weighted
 /// and summed into `scores`.
+/// Min-heap entry shared by both AND paths (general + 2-term):
+/// `(score, doc_id)` with score-asc / doc_id-asc ordering so the
+/// heap's "greatest" is the smallest-score doc the kth-best result
+/// is gating against. `BinaryHeap::peek` then returns the current
+/// kth-best score for the pruning + tie-break checks.
+#[derive(Debug, Copy, Clone)]
+struct AndHeapEntry(f32, u32);
+impl PartialEq for AndHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+impl Eq for AndHeapEntry {}
+impl PartialOrd for AndHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for AndHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .0
+            .partial_cmp(&self.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| other.1.cmp(&self.1))
+    }
+}
+
+/// Push `(score, doc_id)` into the top-k AND heap with the same
+/// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
+/// agree on score-tied docs.
+#[inline]
+fn and_heap_push(heap: &mut BinaryHeap<AndHeapEntry>, k: usize, score: f32, doc_id: u32) {
+    if heap.len() < k {
+        heap.push(AndHeapEntry(score, doc_id));
+    } else if let Some(&worst) = heap.peek() {
+        if score > worst.0 || (score == worst.0 && doc_id < worst.1) {
+            heap.pop();
+            heap.push(AndHeapEntry(score, doc_id));
+        }
+    }
+}
+
 fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     #[derive(Debug)]
     struct Entry(u32, f32);
@@ -2098,6 +2265,45 @@ impl TermCursor {
         {
             self.inspect_block += 1;
         }
+    }
+
+    /// Maximum `block_max_bm25` across all blocks of this cursor whose
+    /// doc-id range overlaps `[range_start, range_end]` (inclusive on
+    /// both ends). Used by AND block-max pruning to compute a safe
+    /// upper bound on this cursor's contribution across the leader's
+    /// current block — a single-block lookup at one boundary
+    /// underestimates when the leader's range spans multiple
+    /// cursor blocks with varying block_max. Uses `inspect_block` as
+    /// a hint pointer so monotonically-advancing leader ranges amortize
+    /// to O(1) amortized per call.
+    fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        // Advance inspect_block to the first block whose last_doc_id
+        // could intersect the range. shallow_advance_block_to lands on
+        // the first block with last_doc_id >= range_start, which is
+        // exactly the first block that can overlap the range.
+        self.shallow_advance_block_to(range_start);
+        let mut max: f32 = 0.0;
+        let mut i = self.inspect_block;
+        while i < self.blocks.len() {
+            // Block i starts at the doc right after the previous block's
+            // last_doc_id (or doc 0 if i == 0). Once block_start exceeds
+            // range_end the rest of the blocks lie strictly past the
+            // range; stop walking.
+            let block_start = if i == 0 {
+                0u32
+            } else {
+                self.blocks[i - 1].last_doc_id.saturating_add(1)
+            };
+            if block_start > range_end {
+                break;
+            }
+            let m = self.blocks[i].block_max_bm25;
+            if m > max {
+                max = m;
+            }
+            i += 1;
+        }
+        max
     }
 
     /// Block-max-BM25 at the inspect-block pointer. Pair with
