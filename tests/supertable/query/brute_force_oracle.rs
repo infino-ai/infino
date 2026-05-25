@@ -428,7 +428,8 @@ fn oracle_and_missing_term_returns_empty() {
     // A globally absent term must short-circuit AND to empty even
     // when the other term has many hits.
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_and_global(&f.infino, "rust definitelynotpresent", 10, CHUNK_SIZE);
+    let inf_hits =
+        supertable_search_and_global(&f.infino, "rust definitelynotpresent", 10, CHUNK_SIZE);
     assert!(inf_hits.is_empty(), "got {inf_hits:?}");
 }
 
@@ -443,8 +444,14 @@ fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
     let f = &*STANDARD_FIXTURE;
     let inf_hits = supertable_search_and_global(&f.infino, "rust kafka", 10, CHUNK_SIZE);
     let ora_hits = brute_force_and_top_k(&f.oracles, "rust kafka", 10);
-    assert!(inf_hits.is_empty(), "supertable AND must be empty; got {inf_hits:?}");
-    assert!(ora_hits.is_empty(), "oracle AND must be empty; got {ora_hits:?}");
+    assert!(
+        inf_hits.is_empty(),
+        "supertable AND must be empty; got {inf_hits:?}"
+    );
+    assert!(
+        ora_hits.is_empty(),
+        "oracle AND must be empty; got {ora_hits:?}"
+    );
 }
 
 // ---- Tests: prefix-row exercise ---------------------------------------

@@ -1198,7 +1198,8 @@ impl FtsReader {
                 let heap_min = heap.peek().expect("heap len == k").0;
                 let range_start = c0.current_doc_id();
                 let range_end = c0.current_block_last_doc_id();
-                let ub = c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
+                let ub =
+                    c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
                 if ub <= heap_min {
                     c0.skip_to(range_end.saturating_add(1), postings);
                     continue;
