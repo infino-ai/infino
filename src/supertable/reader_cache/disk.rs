@@ -370,10 +370,19 @@ impl DiskCacheStore {
         match result {
             Ok(entry) => Ok(Arc::clone(&entry.reader)),
             Err(_e) => {
+                // The cached coordinator's first attempt failed; remove
+                // it so a retry doesn't observe a stale poisoned cell,
+                // then try once more. Propagate the retry's actual
+                // outcome — an earlier version always returned Err here,
+                // which surfaced a synthetic "hybrid cold fetch error"
+                // even when the retry succeeded (e.g. a transient
+                // BudgetExceeded resolved by an in-flight reservation
+                // rolling back).
                 self.coordinators.remove(uri);
-                Err(self.cold_fetch_hybrid(uri).await.err().unwrap_or(
-                    DiskCacheError::SuperfileOpen("hybrid cold fetch error".into()),
-                ))
+                match self.cold_fetch_hybrid(uri).await {
+                    Ok(entry) => Ok(Arc::clone(&entry.reader)),
+                    Err(e) => Err(e),
+                }
             }
         }
     }
