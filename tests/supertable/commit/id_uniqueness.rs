@@ -36,6 +36,7 @@ use std::thread;
 use arrow_array::{LargeStringArray, RecordBatch};
 
 use infino::supertable::Supertable;
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::utils::idgen::IdGenerator;
 use infino::test_helpers::{default_supertable_options, schema_id_title};
@@ -142,20 +143,47 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
         t.await.expect("task");
     }
 
-    // Open a fresh handle against the same storage and
-    // inspect the manifest's per-segment `(id_min, id_max)`
-    // ranges. Each handle's single commit produces exactly
-    // one segment under the default single-threaded writer
-    // pool; ids within a segment form a contiguous
-    // monotonic block, so cross-handle uniqueness reduces
-    // to "no two superfiles' ranges overlap." This avoids
-    // pulling segment bytes back from storage just to
-    // verify ids — the manifest already carries everything
-    // we need.
-    let consumer =
-        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
-            .expect("open");
+    // Open a fresh handle against the same storage and read
+    // every `_id` value back, asserting `len(set) == total_rows`.
+    //
+    // Why we don't compare manifest-level `(id_min, id_max)`
+    // ranges: the Snowflake id is laid out as
+    // `timestamp (high) || worker_id (40 bits) || sequence`,
+    // so a handle whose mints straddle two timestamp ticks has
+    // `id_max` carrying the higher ticks while `id_min` carries
+    // the lower. Sorted by `id_min`, such a range can numerically
+    // "overlap" another handle's range that mints entirely in the
+    // lower tick — even though all ids are globally unique because
+    // the middle worker_id bits differ. Under coverage instrumentation
+    // the slowdown makes the straddle the common case, so the range
+    // check fails on perfectly valid ids. Reading the ids out is
+    // the only assertion that actually checks the property we care
+    // about (no duplicate ids) — and at 400 ids the cost is
+    // microseconds.
+    // Attach a disk cache so the consumer can pull segment bytes
+    // back from storage on demand — the consumer didn't write any
+    // of the segments, so its in-memory reader cache is empty.
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cfg = DiskCacheConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        disk_budget_bytes: 1 << 30,
+        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        cold_fetch_streams: 4,
+        cold_fetch_chunk_bytes: 1 << 20,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        verify_crc_on_open: true,
+    };
+    let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned_fn).expect("cache");
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .await
+    .expect("open");
     let reader = consumer.reader();
     let segs = &reader.manifest().superfile_list.superfiles;
     assert_eq!(
@@ -165,18 +193,31 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
         segs.len()
     );
 
-    let mut ranges: Vec<(i128, i128)> = segs.iter().map(|s| (s.id_min, s.id_max)).collect();
-    ranges.sort_by_key(|(lo, _)| *lo);
-
-    for window in ranges.windows(2) {
-        let (lo_a, hi_a) = window[0];
-        let (lo_b, _) = window[1];
-        assert!(
-            hi_a < lo_b,
-            "segment id ranges overlap: ({lo_a}, {hi_a}) vs ({lo_b}, _)"
-        );
+    let batches = consumer
+        .query_sql("SELECT _id FROM supertable")
+        .expect("query _id");
+    let mut all: HashSet<i128> = HashSet::with_capacity(N_HANDLES * ROWS_PER_HANDLE as usize);
+    for b in &batches {
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .expect("_id is Decimal128");
+        for i in 0..col.len() {
+            let id = col.value(i);
+            assert!(all.insert(id), "duplicate _id minted across handles: {id}");
+        }
     }
-    // Total id count across all superfiles matches.
+    let expected = N_HANDLES * ROWS_PER_HANDLE as usize;
+    assert_eq!(
+        all.len(),
+        expected,
+        "expected {expected} distinct ids, got {}",
+        all.len()
+    );
+
+    // Sanity: manifest's per-segment doc count totals match the
+    // ids actually persisted, so we know we read them all.
     let total_rows: u64 = segs.iter().map(|s| s.n_docs).sum();
     assert_eq!(total_rows, N_HANDLES as u64 * ROWS_PER_HANDLE);
 }
