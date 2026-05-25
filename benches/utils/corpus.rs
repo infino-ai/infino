@@ -41,7 +41,7 @@ use infino::superfile::builder::{
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, normalize};
-use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 use infino::test_helpers::default_tokenizer;
 
 // ─── Scale constants ──────────────────────────────────────────────────
@@ -613,7 +613,8 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
     let json = format!(
         r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
     );
-    VectorReader::open(Bytes::from(blob), &json).expect("open VectorReader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open VectorReader")
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.

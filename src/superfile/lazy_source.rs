@@ -59,6 +59,28 @@ pub trait LazyByteSource: Send + Sync {
     /// storage failures propagate via
     /// [`LazyByteSourceError::Storage`].
     async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError>;
+
+    /// Best-effort sync access to a contiguous range without
+    /// I/O. Implementations that always have the bytes
+    /// resident in memory (e.g. [`BytesLazyByteSource`], a
+    /// mmap'd file with the pages already faulted in) return
+    /// `Some` zero-copy. Implementations backed by network
+    /// fetches return `Some` only if the range happens to be
+    /// in an in-process LRU cache, otherwise `None`.
+    ///
+    /// This method exists so the vector reader's sync
+    /// `search()` path can stay sync on the in-memory
+    /// source without spawning an async runtime. On an
+    /// out-of-bounds range the implementation may return
+    /// `None` (treated as "not available sync" by the
+    /// caller, which then either falls back to the async
+    /// `range` or surfaces an `OutOfBounds` error itself).
+    ///
+    /// The default impl returns `None`; in-memory and warm-
+    /// cache sources override.
+    fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+        None
+    }
 }
 
 /// Errors surfaced by [`LazyByteSource`] implementations.
@@ -110,6 +132,21 @@ impl LazyByteSource for BytesLazyByteSource {
         let e = s + len as usize;
         Ok(self.bytes.slice(s..e))
     }
+
+    /// In-memory bytes are always available without I/O.
+    /// Returns a zero-copy `Bytes::slice` of the backing
+    /// buffer (atomic refcount bump only, no allocation).
+    /// `None` on out-of-bounds — the caller falls back to
+    /// `range` for a typed error if it cares.
+    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+        let total = self.bytes.len() as u64;
+        if start.saturating_add(len) > total {
+            return None;
+        }
+        let s = start as usize;
+        let e = s + len as usize;
+        Some(self.bytes.slice(s..e))
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +174,34 @@ mod tests {
             matches!(err, LazyByteSourceError::OutOfBounds { .. }),
             "expected OutOfBounds, got {err:?}"
         );
+    }
+
+    /// Sync access on `BytesLazyByteSource` must always
+    /// succeed for in-bounds ranges (it's in-memory backed)
+    /// and must return a zero-copy slice of the source's
+    /// underlying buffer.
+    #[test]
+    fn bytes_lazy_source_try_get_range_sync_returns_zero_copy_slice() {
+        let payload = Bytes::from(vec![10u8, 20, 30, 40, 50, 60, 70, 80]);
+        let src = BytesLazyByteSource::new(payload.clone());
+        let got = src
+            .try_get_range_sync(2, 4)
+            .expect("in-bounds sync must succeed");
+        assert_eq!(got.as_ref(), &payload[2..6]);
+        // Zero-copy: the returned Bytes shares the same
+        // allocation as the source (Bytes::slice does a
+        // refcount bump, never copies). Compare the raw
+        // backing pointers to assert that — Bytes::as_ptr()
+        // points at the slice's first byte, so for
+        // `slice(2..6)` it lands at `payload.as_ptr() + 2`.
+        let expected_ptr = unsafe { payload.as_ptr().add(2) };
+        assert_eq!(got.as_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn bytes_lazy_source_try_get_range_sync_returns_none_out_of_bounds() {
+        let src = BytesLazyByteSource::new(Bytes::from(vec![0u8; 4]));
+        assert!(src.try_get_range_sync(2, 100).is_none());
+        assert!(src.try_get_range_sync(100, 0).is_none());
     }
 }
