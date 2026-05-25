@@ -1,5 +1,4 @@
-//! Streaming spill primitives for the bounded-memory build path
-//! introduced by plan 010 (`claude_plans/010_streaming_vector_build.md`).
+//! Streaming spill primitives for the bounded-memory build path.
 //!
 //! Two cooperating abstractions:
 //!
@@ -20,9 +19,6 @@
 //! chunk slice returned per iteration is valid for the duration
 //! of the `&mut self` borrow, which is the scope the pass-2
 //! per-chunk loop runs inside.
-//!
-//! M1 of 010 lands the primitives but does not wire them into
-//! the builder. Wiring is M3.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -109,8 +105,8 @@ impl SpillWriter {
     }
 
     /// Path of the underlying spill file. Stable for the
-    /// lifetime of this `SpillWriter`. Useful for tests + the
-    /// `MmapVectorSource::open` call site in M3.
+    /// lifetime of this `SpillWriter`. Useful for tests and the
+    /// `MmapVectorSource::open` call site.
     pub fn path(&self) -> &Path {
         &self.path
     }

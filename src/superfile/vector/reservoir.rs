@@ -1,5 +1,5 @@
 //! Reservoir sampling for k-means training in the streaming
-//! `VectorBuilder` (plan 010, M2).
+//! `VectorBuilder`.
 //!
 //! The build path is k-means-bound, not corpus-bound — the
 //! information k-means needs to converge is a representative

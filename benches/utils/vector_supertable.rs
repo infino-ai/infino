@@ -136,6 +136,7 @@ fn build_supertable() -> Supertable {
             n_cent: n_cent_per_segment,
             rot_seed: 7,
             metric: Metric::Cosine,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8,
         }],
         None,
     )

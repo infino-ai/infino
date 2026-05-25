@@ -229,6 +229,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
+                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
             }],
             Some(tok()),
         )
@@ -297,6 +298,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
+                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
             }],
             Some(tok()),
         );
