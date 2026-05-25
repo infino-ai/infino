@@ -447,6 +447,18 @@ impl SuperfileReader {
     /// [`VectorSearchOptions::new()`] (or `..Default::default()`)
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
+    ///
+    /// Sync — every public surface in `src/` is sync. Per-range
+    /// byte access routes through
+    /// [`crate::superfile::vector::reader::Source::get_range`],
+    /// which is itself sync and bridges to the underlying
+    /// async `LazyByteSource::range` only on cold
+    /// `Source::Lazy` misses (via `block_in_place +
+    /// Handle::block_on`, same pattern as the
+    /// supertable query path's per-segment reader). On
+    /// `Source::InMemory` and on warm-cache `Source::Lazy`
+    /// (`BytesLazyByteSource`, mmap-backed) every fetch
+    /// resolves zero-copy on the sync fast path.
     pub fn vector_search(
         &self,
         column: &str,

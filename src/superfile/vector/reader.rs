@@ -10,6 +10,7 @@
 
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
+use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
 use crate::superfile::vector::distance::{Metric, distance_bytes};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rotation::RandomRotation;
@@ -20,6 +21,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
@@ -56,9 +58,6 @@ pub struct ColumnReader {
     codes_off: usize,
     full_off: usize,
     doc_ids_off: usize,
-    /// `local_doc_id → cluster-position`. Built at open. ~4 MB at 1 M
-    /// docs per column.
-    doc_to_pos: Vec<u32>,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -68,9 +67,12 @@ pub struct ColumnReader {
 }
 
 /// Per-open knobs for [`VectorReader::open_with`]. `Default` is the
-/// safe choice (CRC verification on); construct with `verify_crc:
-/// false` when the caller has already validated the bytes (e.g.
-/// known-good local file) and wants the cheap-open path.
+/// safe choice (CRC verification on). The argumentless
+/// [`VectorReader::open`] takes the default.
+///
+/// Today: `verify_crc` only. Object-storage-native knobs (e.g.
+/// `range_fetch_concurrency`) may land here later under the same
+/// struct.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Verify the per-subsection CRC during open. Each subsection is
@@ -89,11 +91,158 @@ impl Default for OpenOptions {
     }
 }
 
-/// Multi-column vector blob reader. `Send + Sync`; concurrent searches
-/// share the underlying `Bytes`.
+/// Backing for a [`VectorReader`].
+///
+/// Two variants, plumbed through every byte-fetch point:
+///
+/// - `InMemory(Bytes)`: caller materialised the full
+///   subsection before opening. Every byte fetch is a
+///   zero-copy `Bytes::slice` against the buffer.
+/// - `Lazy(Arc<dyn LazyByteSource>)`: a range-fetching source
+///   (mmap, object-store range GET, broadcast subscription).
+///   Every byte access in the open + search paths routes
+///   through the same call sites so swapping the backing in
+///   doesn't require a second rewrite.
+///
+/// Both variants expose **sync-only** byte access — every
+/// public surface in `src/` is sync. The
+/// `LazyByteSource::range` trait method is async because
+/// production impls (object store, network sources) are;
+/// [`Source::get_range`] hides that under the same
+/// `block_in_place + Handle::block_on` / one-shot
+/// `current_thread` `Runtime` bridge the supertable's
+/// per-segment reader uses for the disk-cache fetch path.
+/// Hot-path callers (`Source::InMemory`, mmap-backed
+/// `BytesLazyByteSource`) never hit the bridge — both override
+/// `try_get_range_sync` to return zero-copy slices, so
+/// `get_range` resolves on the sync fast path.
+///
+/// `Source: Clone` so `Arc`-shared instances can be handed to
+/// multiple readers / supertable segments without forking the
+/// underlying state. Lazy variant clones the `Arc`; in-memory
+/// clones the `Bytes` (refcount bump).
+#[derive(Clone)]
+pub enum Source {
+    InMemory(Bytes),
+    Lazy(Arc<dyn LazyByteSource>),
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
+            Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Source {
+    /// Total backing size in bytes — matches what a single
+    /// `get_range(0..len())` would cover.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InMemory(b) => b.len(),
+            Self::Lazy(s) => s.size() as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sync best-effort fetch. Always succeeds on
+    /// `Source::InMemory` (zero-copy `Bytes::slice`); on
+    /// `Source::Lazy` returns `Some` only if the range is
+    /// already resident in the source's in-process cache.
+    ///
+    /// Returns `None` for out-of-bounds ranges so callers can
+    /// distinguish "not available sync" from a hard error;
+    /// callers that need a typed error should fall through to
+    /// [`Self::get_range`].
+    pub fn try_get_range_sync(&self, range: Range<usize>) -> Option<Bytes> {
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        match self {
+            Self::InMemory(b) => {
+                if range.end > b.len() {
+                    return None;
+                }
+                Some(b.slice(range))
+            }
+            Self::Lazy(s) => s.try_get_range_sync(start, len),
+        }
+    }
+
+    /// Sync range fetch with internal async bridging on cold
+    /// `Source::Lazy` misses.
+    ///
+    /// Fast path: `try_get_range_sync` (zero-copy `Bytes::slice`
+    /// on `InMemory`; same on `BytesLazyByteSource` / mmap-
+    /// backed sources). This covers every production caller
+    /// today and every hot-path read at default open
+    /// (`Source::Lazy(BytesLazyByteSource over
+    /// Bytes::from_owner(mmap))`).
+    ///
+    /// Cold path (`Source::Lazy` and `try_get_range_sync`
+    /// returned `None`): bridge to the source's `async fn
+    /// range(...)` via `block_in_place + Handle::block_on`
+    /// when there's an ambient tokio runtime, or build a
+    /// throwaway `current_thread` `Runtime` when there isn't.
+    /// This is the same pattern `supertable::query::
+    /// segment_reader` uses for its sync disk-cache fetch path
+    /// (see `segment_reader::segment_reader` for the canonical
+    /// reference). The runtime-build cost on the no-ambient
+    /// fallback is ≈ 1 ms — negligible vs the network
+    /// round-trip the source is about to issue. In production
+    /// the supertable always has an ambient runtime, so the
+    /// no-ambient branch fires only in standalone tests /
+    /// scripts.
+    ///
+    /// Convention: every public surface in `src/` stays sync,
+    /// async is hidden behind well-defined bridge points.
+    /// `Source::get_range` is one of those bridge points.
+    pub fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
+            return Ok(bytes);
+        }
+        let Self::Lazy(s) = self else {
+            // `Source::InMemory` always satisfies `try_get_range_sync`
+            // for in-bounds ranges. Reaching this arm means the
+            // request was out of bounds.
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: range.start as u64,
+                len: range.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(s.range(start, len))),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
+                            uri: "lazy-source://vector-reader".to_string(),
+                            source: Box::new(std::io::Error::other(format!(
+                                "tokio runtime build for lazy source fetch: {e}"
+                            ))),
+                        })
+                    })?;
+                rt.block_on(s.range(start, len))
+            }
+        }
+    }
+}
+
+/// Multi-column vector blob reader. `Send + Sync`; concurrent
+/// searches share the underlying [`Source`] (refcount-shared via
+/// `Bytes` / `Arc<dyn LazyByteSource>`).
 #[derive(Debug)]
 pub struct VectorReader {
-    blob: Bytes,
+    source: Source,
     n_docs: u64,
     columns: Vec<ColumnReader>,
     column_id_by_name: HashMap<String, u32>,
@@ -120,41 +269,83 @@ impl VectorReader {
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, VectorError> {
-        if blob.len() < OUTER_HEADER_SIZE + 4 {
+        // Every byte fetch routes through `Source::try_get_range_sync`
+        // so the lazy variant can intercept the same call sites
+        // without a second rewrite. `InMemory` returns zero-copy
+        // `Bytes::slice` views; refcount bumps only.
+        Self::open_with_source(Source::InMemory(blob), columns_json, opts)
+    }
+
+    /// Open over an arbitrary [`Source`].
+    ///
+    /// The structural decode path is the same as
+    /// [`Self::open_with`]; this entry just accepts a pre-built
+    /// `Source`. Used by:
+    /// - Test helpers that need to wire a counting / mock
+    ///   [`LazyByteSource`] under a `Source::Lazy` (e.g. the
+    ///   range-counting integration test).
+    /// - A future `SuperfileReader::open_lazy` rewrite that
+    ///   hands the underlying source through to the
+    ///   `VectorReader` instead of materialising the full
+    ///   subsection up-front.
+    ///
+    /// Today's contract on `Source::Lazy`: every byte access in
+    /// the open path goes through
+    /// [`Source::try_get_range_sync`], so the lazy source must
+    /// already have the structural-decode regions (header,
+    /// directory, per-subsection headers) resident — typically
+    /// via a one-range pre-fetch issued by the caller. A future
+    /// async open entrypoint can pre-fetch those regions on the
+    /// source's behalf.
+    pub fn open_with_source(
+        source: Source,
+        columns_json: &str,
+        opts: OpenOptions,
+    ) -> Result<Self, VectorError> {
+        if source.len() < OUTER_HEADER_SIZE + 4 {
             return Err(VectorError::Read(ReadError::MissingKv(
                 "vector blob header",
             )));
         }
 
-        if &blob[0..8] != format::vec::OUTER_MAGIC {
+        // Pull the fixed-size outer header in one fetch — five small
+        // reads collapse into one `Bytes::slice`.
+        let header = fetch_sync(&source, 0..OUTER_HEADER_SIZE, "outer header")?;
+        if &header[0..8] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
                 expected: format::vec::OUTER_MAGIC,
-                actual: blob[0..8].to_vec(),
+                actual: header[0..8].to_vec(),
             }));
         }
 
-        let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
+        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         if version != format::vec::VERSION {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
             ))));
         }
 
-        let n_columns = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
-        let n_docs = read_u64_le(&blob[16..24]);
-        let dir_offset = read_u64_le(&blob[24..32]) as usize;
+        let n_columns =
+            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        let n_docs = read_u64_le(&header[16..24]);
+        let dir_offset = read_u64_le(&header[24..32]) as usize;
 
         // Verify directory CRC.
         let dir_size = n_columns * DIR_ENTRY_SIZE;
-        if dir_offset + dir_size + 4 > blob.len() {
+        if dir_offset + dir_size + 4 > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "vector directory runs past blob".into(),
             )));
         }
-        let dir_bytes = &blob[dir_offset..dir_offset + dir_size];
-        let dir_crc_expected = read_u32_le(&blob[dir_offset + dir_size..dir_offset + dir_size + 4]);
-        let dir_crc_actual = crc32c(dir_bytes);
+        let dir_bytes = fetch_sync(&source, dir_offset..dir_offset + dir_size, "directory")?;
+        let dir_crc_bytes = fetch_sync(
+            &source,
+            dir_offset + dir_size..dir_offset + dir_size + 4,
+            "directory crc",
+        )?;
+        let dir_crc_expected = read_u32_le(&dir_crc_bytes);
+        let dir_crc_actual = crc32c(&dir_bytes);
         if dir_crc_expected != dir_crc_actual {
             return Err(VectorError::Read(ReadError::ChecksumMismatch {
                 section: "vector/directory",
@@ -163,7 +354,7 @@ impl VectorReader {
         }
 
         if opts.verify_crc {
-            verify_vector_crcs(&blob, dir_bytes, n_columns)?;
+            verify_vector_crcs(&source, &dir_bytes, n_columns)?;
         }
 
         // Parse JSON.
@@ -248,12 +439,12 @@ impl VectorReader {
             // Validate subsection bounds + magic. Subsection CRCs are
             // verified above in the parallel CRC pre-pass when requested.
             let sub_end = subsection_off + subsection_len;
-            if sub_end > blob.len() {
+            if sub_end > source.len() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} runs past blob"
                 ))));
             }
-            let sub = &blob[subsection_off..sub_end];
+            let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
             if sub.len() < SUB_HEADER_SIZE + 4 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} too short"
@@ -313,7 +504,10 @@ impl VectorReader {
             let full_size = (col_n_docs as usize) * dim * 4;
             let doc_ids_off = full_off + full_size;
 
-            // Build doc_to_pos lookup table.
+            // Bounds-check the cluster_idx + doc_ids regions without
+            // reading them. Search carries `pos = off + i` inline
+            // in the shortlist, so it never needs a `doc_to_pos`
+            // lookup table; open only needs the offset math.
             let cluster_idx_size = (n_cent as usize) * 8;
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
@@ -322,36 +516,12 @@ impl VectorReader {
                     cfg.name
                 ))));
             }
-            let mut doc_to_pos = vec![u32::MAX; col_n_docs as usize];
-            for c in 0..n_cent as usize {
-                let idx_start = cluster_idx_off + c * 8;
-                let off = u32::from_le_bytes([
-                    sub[idx_start],
-                    sub[idx_start + 1],
-                    sub[idx_start + 2],
-                    sub[idx_start + 3],
-                ]);
-                let cnt = u32::from_le_bytes([
-                    sub[idx_start + 4],
-                    sub[idx_start + 5],
-                    sub[idx_start + 6],
-                    sub[idx_start + 7],
-                ]);
-                let did_start = doc_ids_off + (off as usize) * 4;
-                let did_end = did_start + (cnt as usize) * 4;
-                if did_end > sub_crc_pos {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "column '{}' doc_ids slice {did_start}..{did_end} past subsection",
-                        cfg.name
-                    ))));
-                }
-                for i in 0..cnt as usize {
-                    let s = did_start + i * 4;
-                    let d = u32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]]);
-                    if (d as usize) < doc_to_pos.len() {
-                        doc_to_pos[d as usize] = off + i as u32;
-                    }
-                }
+            let doc_ids_size = (col_n_docs as usize) * 4;
+            if doc_ids_off + doc_ids_size > sub_crc_pos {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' doc_ids region runs past subsection",
+                    cfg.name
+                ))));
             }
 
             // Soft cross-check: cfg.metric matches blob's metric.
@@ -385,7 +555,6 @@ impl VectorReader {
                 codes_off,
                 full_off,
                 doc_ids_off,
-                doc_to_pos,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
@@ -393,7 +562,7 @@ impl VectorReader {
         }
 
         Ok(VectorReader {
-            blob,
+            source,
             n_docs,
             columns,
             column_id_by_name,
@@ -413,7 +582,12 @@ impl VectorReader {
     pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
-        let sub = &self.blob[col.subsection_range.clone()];
+        // Byte access routed through `Source::try_get_range_sync`
+        // — zero-copy on `InMemory`, same call site serves the
+        // lazy path.
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
         let off = col.summary_off;
         let dim = col.dim;
         let centroid: Vec<f32> = (0..dim)
@@ -425,8 +599,36 @@ impl VectorReader {
         Some((centroid, col.summary_radius))
     }
 
-    /// Single-column kNN search. Returns `(local_doc_id, distance)`
-    /// sorted ascending by distance (smaller = closer for every metric).
+    /// Single-column kNN search. Returns `(local_doc_id,
+    /// distance)` sorted ascending by distance (smaller = closer
+    /// for every metric).
+    ///
+    /// Sync — every public surface in `src/` is sync. Routes
+    /// per-region byte access through [`Source::get_range`],
+    /// which is itself sync and bridges to the underlying
+    /// async `LazyByteSource::range` only on a cold
+    /// `Source::Lazy` miss (via `block_in_place +
+    /// Handle::block_on`, same pattern as the supertable's
+    /// per-segment reader). On `Source::InMemory` and on
+    /// `Source::Lazy` warm caches (`BytesLazyByteSource`,
+    /// mmap-backed) every fetch resolves zero-copy on the
+    /// sync fast path.
+    ///
+    /// Range count per cold first search at `nprobe = 8`:
+    ///
+    /// - 1 range for centroids (`n_cent × dim × 4` bytes)
+    /// - 1 range for the cluster_idx header (`n_cent × 8` bytes)
+    /// - `nprobe` ranges for per-cluster codes
+    /// - `nprobe` ranges for per-cluster doc_ids
+    /// - 1 fat range covering the rerank batch in `full[]` from
+    ///   `min(pos)` to `max(pos) + 1`
+    ///
+    /// At `nprobe = 8`: 2 + 16 + 1 = **19 ranges**. Rerank `pos`
+    /// is captured inline in the shortlist tuple at code-scoring
+    /// time (each candidate's position is `off + i` where
+    /// `(off, cnt)` is the cluster's entry and `i` is the
+    /// in-cluster index), so there is no `doc_to_pos` lookup
+    /// table at all.
     pub fn search(
         &self,
         column: &str,
@@ -435,92 +637,78 @@ impl VectorReader {
         nprobe: usize,
         rerank_mult: usize,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
-        let cid = *self
-            .column_id_by_name
-            .get(column)
-            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
-        let col = &self.columns[cid as usize];
-
-        if query.len() != col.dim {
-            return Err(VectorError::DimensionMismatch {
-                expected: col.dim,
-                got: query.len(),
-            });
-        }
-        if k == 0 || col.n_docs == 0 {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated {
             return Ok(Vec::new());
         }
+        let dim_bytes = col.dim * 4;
+        let sub_start = col.subsection_range.start;
 
-        let sub = &self.blob[col.subsection_range.clone()];
+        // 1. Centroids region. `n_cent × dim × 4` bytes,
+        //    ~1.5 MB at default shape. Source::InMemory
+        //    returns a zero-copy Bytes::slice; warm-cache
+        //    Source::Lazy returns the same; cold-miss
+        //    Source::Lazy bridges to async range() via the
+        //    sync→async pattern in Source::get_range.
+        let centroids_start = sub_start + col.centroids_off;
+        let centroids_end = centroids_start + (col.n_cent as usize) * dim_bytes;
+        let centroids = self
+            .source
+            .get_range(centroids_start..centroids_end)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
 
-        // 1. Score query vs every centroid (cheap; n_cent is small).
-        //
-        // Zero-copy `f32x8` over the centroid bytes in `sub` via
-        // `distance_bytes` — `bytemuck::try_cast_slice` borrows the
-        // 4-aligned region (common case for our layout), falling
-        // back to a per-chunk LE decode if alignment is off. At
-        // `n_cent = 1024, dim = 384` this is 1024 zero-copy SIMD
-        // dot/L2² calls per query; no per-centroid heap allocation.
-        let dim = col.dim;
-        let dim_bytes = dim * 4;
-        let mut centroid_scores: Vec<(usize, f32)> = (0..col.n_cent as usize)
-            .map(|c| {
-                let start = col.centroids_off + c * dim_bytes;
-                let bytes = &sub[start..start + dim_bytes];
-                (c, distance_bytes(col.metric, query, bytes))
-            })
-            .collect();
-        centroid_scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        // 2. Cluster_idx header. `n_cent × 8` bytes, 8 KB at
+        //    default shape. Cheap.
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let cluster_idx = self
+            .source
+            .get_range(idx_start..idx_end)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        // 3. Score centroids → top `nprobe` clusters.
+        let mut centroid_scores = score_centroids(&centroids, col, query);
         let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
         centroid_scores.truncate(nprobe_eff);
 
-        // 2. Rotate query for the 1-bit code estimator. The rotation
-        // matrix was built once at open and is cached on `col` —
-        // rebuilding it per `search()` costs `O(dim³)` Gram-Schmidt
-        // (~7.9 ms at dim=384), which dominates every other per-query
-        // stage. The `apply` itself is a cheap `O(dim²)` matvec.
-        let mut q_rot = vec![0f32; dim];
+        // 4. Rotate query once for the 1-bit code estimator.
+        let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
 
-        // 3. Scan codes within probed clusters → shortlist.
+        // 5. Per-cluster fetches (codes + doc_ids) and shortlist
+        //    build. Shortlist tuple is (doc_id, estimate, pos);
+        //    pos = off + i is captured inline.
         let cb = col.quant.code_bytes();
-        let mut shortlist: Vec<(u32, f32)> = Vec::new();
+        let mut shortlist: Vec<(u32, f32, u32)> = Vec::new();
         for &(c, _) in &centroid_scores {
-            let idx_start = col.cluster_idx_off + c * 8;
-            let off = u32::from_le_bytes([
-                sub[idx_start],
-                sub[idx_start + 1],
-                sub[idx_start + 2],
-                sub[idx_start + 3],
-            ]);
-            let cnt = u32::from_le_bytes([
-                sub[idx_start + 4],
-                sub[idx_start + 5],
-                sub[idx_start + 6],
-                sub[idx_start + 7],
-            ]);
+            let (off, cnt) = read_cluster_entry(&cluster_idx, c);
             if cnt == 0 {
                 continue;
             }
-            for i in 0..cnt as usize {
-                let code_start = col.codes_off + (off as usize + i) * cb;
-                let code = &sub[code_start..code_start + cb];
-                let est = col.quant.estimate_dot_rotated(&q_rot, code);
-                let did_start = col.doc_ids_off + (off as usize + i) * 4;
-                let did = u32::from_le_bytes([
-                    sub[did_start],
-                    sub[did_start + 1],
-                    sub[did_start + 2],
-                    sub[did_start + 3],
-                ]);
-                shortlist.push((did, est));
-            }
+            let codes_start = sub_start + col.codes_off + (off as usize) * cb;
+            let codes_end = codes_start + (cnt as usize) * cb;
+            let codes = self
+                .source
+                .get_range(codes_start..codes_end)
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            let did_start = sub_start + col.doc_ids_off + (off as usize) * 4;
+            let did_end = did_start + (cnt as usize) * 4;
+            let doc_ids = self
+                .source
+                .get_range(did_start..did_end)
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            score_cluster_codes(
+                &codes,
+                &doc_ids,
+                cnt,
+                off,
+                &col.quant,
+                &q_rot,
+                &mut shortlist,
+            );
         }
 
-        // 4. Take top `k * rerank_mult` by descending estimate
-        //    (higher est = closer for cosine / negdot; for l2sq it's
-        //    reversed but the rerank step uses true distance anyway,
-        //    so a slightly looser shortlist is fine).
+        // 6. Trim to `k × rerank_mult` by descending estimate.
         let want = (k.saturating_mul(rerank_mult)).min(shortlist.len());
         if want < shortlist.len() {
             shortlist.select_nth_unstable_by(want.saturating_sub(1), |a, b| {
@@ -528,31 +716,174 @@ impl VectorReader {
             });
             shortlist.truncate(want);
         }
+        if shortlist.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // 5. Full-precision rerank using the true metric.
-        //
-        // Score each candidate's full vector directly from its byte
-        // slice in the blob — `distance_bytes` zero-copies into
-        // `f32x8` when 4-aligned (the common case for our layout)
-        // and falls back to a per-chunk LE decode otherwise. Same
-        // zero-copy pattern as the centroid probe above; no
-        // per-candidate heap allocation.
-        let sub = &self.blob[col.subsection_range.clone()];
-        let dim_bytes = col.dim * 4;
-        let mut reranked: Vec<(u32, f32)> = shortlist
-            .iter()
-            .map(|&(did, _)| {
-                let pos = col.doc_to_pos[did as usize] as usize;
-                let start = col.full_off + pos * dim_bytes;
-                let bytes = &sub[start..start + dim_bytes];
-                let d = distance_bytes(col.metric, query, bytes);
-                (did, d)
-            })
-            .collect();
-        reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        reranked.truncate(k);
-        Ok(reranked)
+        // 7. Fat range over `full[]` covering all rerank
+        //    candidates. `[min_pos..max_pos + 1]` over-fetches
+        //    today (positions span probed clusters); a future
+        //    layout that interleaves codes + doc_ids + full per
+        //    cluster would drop this to `nprobe` cluster-sized
+        //    ranges. Single get_range either way.
+        let mut min_pos = shortlist[0].2;
+        let mut max_pos = shortlist[0].2;
+        for &(_, _, pos) in &shortlist[1..] {
+            if pos < min_pos {
+                min_pos = pos;
+            }
+            if pos > max_pos {
+                max_pos = pos;
+            }
+        }
+        let full_start = sub_start + col.full_off + (min_pos as usize) * dim_bytes;
+        let full_end = sub_start + col.full_off + ((max_pos as usize) + 1) * dim_bytes;
+        let full_run = self
+            .source
+            .get_range(full_start..full_end)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        // 8. CPU-only rerank using the true metric.
+        Ok(rerank_candidates_in_run(
+            &full_run, min_pos, &shortlist, col.metric, col.dim, query, k,
+        ))
     }
+
+    /// Look up the column by name and validate `query.len() == col.dim`
+    /// + the "empty work" short-circuit (`k == 0` or `n_docs == 0`).
+    /// `Ok((col, true))` = real search to follow; `Ok((col, false))`
+    /// = empty-result short circuit, caller returns `Ok(Vec::new())`.
+    #[inline]
+    fn resolve_column(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<(&ColumnReader, bool), VectorError> {
+        let cid = *self
+            .column_id_by_name
+            .get(column)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        let col = &self.columns[cid as usize];
+        if query.len() != col.dim {
+            return Err(VectorError::DimensionMismatch {
+                expected: col.dim,
+                got: query.len(),
+            });
+        }
+        if k == 0 || col.n_docs == 0 {
+            return Ok((col, false));
+        }
+        Ok((col, true))
+    }
+}
+
+/// Score `query` against every centroid in `centroids_bytes` and
+/// return the per-cluster `(cluster_id, distance)` pairs sorted by
+/// ascending distance (closest first). Caller truncates to `nprobe`.
+///
+/// Takes a `&[u8]` view so the caller can hand in either an
+/// in-memory subsection slice or the just-fetched centroids
+/// region bytes from [`Source::get_range`] — both reach this
+/// helper through the same shape.
+#[inline]
+fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) -> Vec<(usize, f32)> {
+    let dim_bytes = col.dim * 4;
+    let mut scores: Vec<(usize, f32)> = (0..col.n_cent as usize)
+        .map(|c| {
+            let bytes = &centroids_bytes[c * dim_bytes..(c + 1) * dim_bytes];
+            (c, distance_bytes(col.metric, query, bytes))
+        })
+        .collect();
+    scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    scores
+}
+
+/// Score one cluster's 1-bit codes against the rotated query and
+/// append `(doc_id, estimate, pos_in_full)` tuples to `shortlist`.
+/// `pos = off + i` is the candidate's index in the column's
+/// `full[]` array — captured here at no extra cost so the rerank
+/// step doesn't need any lookup table.
+#[inline]
+fn score_cluster_codes(
+    cluster_codes: &[u8],
+    cluster_doc_ids: &[u8],
+    cnt: u32,
+    off: u32,
+    quant: &BitQuantizer,
+    q_rot: &[f32],
+    shortlist: &mut Vec<(u32, f32, u32)>,
+) {
+    let cb = quant.code_bytes();
+    for i in 0..cnt as usize {
+        let code = &cluster_codes[i * cb..(i + 1) * cb];
+        let est = quant.estimate_dot_rotated(q_rot, code);
+        let did = u32::from_le_bytes([
+            cluster_doc_ids[i * 4],
+            cluster_doc_ids[i * 4 + 1],
+            cluster_doc_ids[i * 4 + 2],
+            cluster_doc_ids[i * 4 + 3],
+        ]);
+        shortlist.push((did, est, off + i as u32));
+    }
+}
+
+/// Decode one cluster's `(off, cnt)` entry from
+/// `cluster_idx_slice` (the `n_cent × 8` bytes of the column's
+/// cluster index header). `c` is the cluster id.
+#[inline]
+fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
+    let base = c * 8;
+    let off = u32::from_le_bytes([
+        cluster_idx_slice[base],
+        cluster_idx_slice[base + 1],
+        cluster_idx_slice[base + 2],
+        cluster_idx_slice[base + 3],
+    ]);
+    let cnt = u32::from_le_bytes([
+        cluster_idx_slice[base + 4],
+        cluster_idx_slice[base + 5],
+        cluster_idx_slice[base + 6],
+        cluster_idx_slice[base + 7],
+    ]);
+    (off, cnt)
+}
+
+/// Full-precision rerank over `shortlist`, returning the top-`k`
+/// `(doc_id, distance)` pairs sorted by ascending distance.
+///
+/// `full_run` is a contiguous run of `full[]` bytes covering at
+/// least the byte range `[base_pos × dim × 4 .. (max_pos + 1) ×
+/// dim × 4)` — every candidate's `pos` in `shortlist` must lie in
+/// `[base_pos, base_pos + full_run.len() / (dim × 4))`. For the
+/// sync path, `base_pos = 0` and `full_run` is the column's whole
+/// `full[]` slice; for the async path, `base_pos = min(pos)` and
+/// `full_run` is the per-query fat range. Zero-copy SIMD via
+/// `distance_bytes` over each candidate's slice.
+#[inline]
+fn rerank_candidates_in_run(
+    full_run: &[u8],
+    base_pos: u32,
+    shortlist: &[(u32, f32, u32)],
+    metric: Metric,
+    dim: usize,
+    query: &[f32],
+    k: usize,
+) -> Vec<(u32, f32)> {
+    let dim_bytes = dim * 4;
+    let mut reranked: Vec<(u32, f32)> = shortlist
+        .iter()
+        .map(|&(did, _, pos)| {
+            let local = (pos - base_pos) as usize;
+            let start = local * dim_bytes;
+            let bytes = &full_run[start..start + dim_bytes];
+            let d = distance_bytes(metric, query, bytes);
+            (did, d)
+        })
+        .collect();
+    reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    reranked.truncate(k);
+    reranked
 }
 
 #[inline]
@@ -568,21 +899,31 @@ fn read_u64_le(b: &[u8]) -> u64 {
 }
 
 #[inline]
-fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Result<(), VectorError> {
-    struct CrcJob<'a> {
+fn verify_vector_crcs(
+    source: &Source,
+    dir_bytes: &[u8],
+    n_columns: usize,
+) -> Result<(), VectorError> {
+    // `Bytes` instead of `&'a [u8]` so the par_iter doesn't need a
+    // lifetime parameter — each job owns a refcount-shared view into
+    // the source, which is itself shared via the outer `Source` for
+    // the duration of `open_with`.
+    struct CrcJob {
         idx: i32,
-        bytes: &'a [u8],
+        bytes: Bytes,
         expected: u32,
     }
 
-    let mut jobs: Vec<CrcJob<'_>> = Vec::with_capacity(n_columns + 1);
+    let mut jobs: Vec<CrcJob> = Vec::with_capacity(n_columns + 1);
 
-    let outer_total = blob.len();
+    let outer_total = source.len();
     let outer_crc_pos = outer_total - 4;
+    let outer_body = fetch_sync(source, 0..outer_crc_pos, "outer body")?;
+    let outer_crc_bytes = fetch_sync(source, outer_crc_pos..outer_total, "outer crc")?;
     jobs.push(CrcJob {
         idx: -1,
-        bytes: &blob[..outer_crc_pos],
-        expected: read_u32_le(&blob[outer_crc_pos..outer_total]),
+        bytes: outer_body,
+        expected: read_u32_le(&outer_crc_bytes),
     });
 
     for i in 0..n_columns {
@@ -590,22 +931,26 @@ fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Resul
         let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
         let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
         let sub_end = subsection_off + subsection_len;
-        if sub_end > blob.len() {
+        if sub_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "subsection {i} runs past blob"
             ))));
         }
-        let sub = &blob[subsection_off..sub_end];
+        let sub = fetch_sync(source, subsection_off..sub_end, "subsection")?;
         if sub.len() < SUB_HEADER_SIZE + 4 {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "subsection {i} too short"
             ))));
         }
         let sub_crc_pos = sub.len() - 4;
+        // `Bytes::slice` is zero-copy — no second `try_get_range_sync`
+        // round-trip needed since we already hold the subsection.
+        let sub_body = sub.slice(0..sub_crc_pos);
+        let sub_crc_bytes = sub.slice(sub_crc_pos..sub.len());
         jobs.push(CrcJob {
             idx: i as i32,
-            bytes: &sub[..sub_crc_pos],
-            expected: read_u32_le(&sub[sub_crc_pos..]),
+            bytes: sub_body,
+            expected: read_u32_le(&sub_crc_bytes),
         });
     }
 
@@ -614,7 +959,7 @@ fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Resul
     // and let the checksum module's CLMUL implementation handle each
     // byte stream quickly.
     let mismatch = jobs.par_iter().find_map_any(|job| {
-        if crc32c(job.bytes) != job.expected {
+        if crc32c(&job.bytes) != job.expected {
             Some(job.idx)
         } else {
             None
@@ -635,6 +980,25 @@ fn verify_vector_crcs(blob: &Bytes, dir_bytes: &[u8], n_columns: usize) -> Resul
     }
 
     Ok(())
+}
+
+/// Best-effort sync byte fetch with a typed error. Used throughout
+/// `open_with` so every byte access goes through the `Source`
+/// abstraction — the lazy variant plumbs the eager-prefetch
+/// path through the same call sites without a second rewrite.
+///
+/// Failure mode here means the range is out-of-bounds or not
+/// present in the sync cache. On `Source::InMemory` any in-bounds
+/// range succeeds zero-copy; this only fires on a malformed blob.
+#[inline]
+fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, VectorError> {
+    let start = range.start;
+    let end = range.end;
+    source.try_get_range_sync(range).ok_or_else(|| {
+        VectorError::Read(ReadError::MalformedVersion(format!(
+            "vector {what} range {start}..{end} past blob"
+        )))
+    })
 }
 
 #[cfg(test)]
@@ -826,6 +1190,91 @@ mod tests {
         assert!(r.summary("nonexistent").is_none());
     }
 
+    // -----------------------------------------------------------------
+    // Source enum sanity tests
+    // -----------------------------------------------------------------
+    //
+    // These tests directly exercise the `Source` contract so any
+    // future refactor that breaks the InMemory zero-copy invariant
+    // or mis-implements the Lazy wrapper fails here rather than at
+    // the wider Lance oracle gate.
+
+    #[test]
+    fn source_in_memory_try_get_range_sync_zero_copy() {
+        let payload = Bytes::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let src = Source::InMemory(payload.clone());
+        let slice = src
+            .try_get_range_sync(3..7)
+            .expect("in-bounds InMemory sync must succeed");
+        assert_eq!(slice.as_ref(), &payload[3..7]);
+        // Zero-copy invariant: returned Bytes points into the
+        // same allocation as the source.
+        let expected_ptr = unsafe { payload.as_ptr().add(3) };
+        assert_eq!(slice.as_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn source_in_memory_try_get_range_sync_out_of_bounds_returns_none() {
+        let src = Source::InMemory(Bytes::from(vec![0u8; 4]));
+        assert!(src.try_get_range_sync(0..100).is_none());
+        assert!(src.try_get_range_sync(8..10).is_none());
+    }
+
+    #[test]
+    fn source_in_memory_get_range_returns_zero_copy_slice() {
+        let payload = Bytes::from(vec![100u8, 101, 102, 103, 104, 105]);
+        let src = Source::InMemory(payload.clone());
+        let got = src
+            .get_range(1..5)
+            .expect("InMemory sync get_range always succeeds for in-bounds ranges");
+        assert_eq!(got.as_ref(), &payload[1..5]);
+    }
+
+    #[test]
+    fn source_lazy_try_get_range_sync_falls_through_to_trait_default_or_impl() {
+        // Wrap an in-memory blob in the trait-shaped
+        // `BytesLazyByteSource`, then in `Source::Lazy`. The lazy
+        // adapter's `try_get_range_sync` impl returns `Some` for
+        // in-bounds ranges; we exercise the full enum dispatch
+        // path here so the Lazy arm of `Source::try_get_range_sync`
+        // doesn't drift apart from the InMemory arm.
+        use crate::superfile::lazy_source::BytesLazyByteSource;
+        let payload = Bytes::from(vec![7u8, 8, 9, 10, 11, 12, 13, 14]);
+        let lazy: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let src = Source::Lazy(lazy);
+        let slice = src
+            .try_get_range_sync(2..6)
+            .expect("BytesLazyByteSource always serves sync");
+        assert_eq!(slice.as_ref(), &payload[2..6]);
+    }
+
+    #[test]
+    fn source_lazy_get_range_serves_warm_cache_via_try_get_range_sync() {
+        use crate::superfile::lazy_source::BytesLazyByteSource;
+        let payload = Bytes::from(vec![21u8, 22, 23, 24, 25, 26, 27]);
+        let lazy: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let src = Source::Lazy(lazy);
+        // BytesLazyByteSource overrides try_get_range_sync to
+        // return Some for every in-bounds range, so get_range
+        // takes the sync fast path — no block_on bridge fires.
+        let got = src.get_range(1..5).expect("warm cache sync hit");
+        assert_eq!(got.as_ref(), &payload[1..5]);
+    }
+
+    /// `Source::Clone` lets readers share the underlying
+    /// state cheaply (refcount bump). Clones must observe
+    /// identical bytes — no fork between paths.
+    #[test]
+    fn source_clone_observes_identical_bytes() {
+        let payload = Bytes::from(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let a = Source::InMemory(payload.clone());
+        let b = a.clone();
+        let sa = a.try_get_range_sync(2..6).expect("sa");
+        let sb = b.try_get_range_sync(2..6).expect("sb");
+        assert_eq!(sa.as_ref(), sb.as_ref());
+        assert_eq!(sa.as_ptr(), sb.as_ptr());
+    }
+
     #[test]
     fn open_rejects_columns_json_mismatch() {
         let (blob, _) = build_blob(32, 16, 4, Metric::L2Sq);
@@ -836,5 +1285,890 @@ mod tests {
             err,
             VectorError::Read(ReadError::MalformedVersion(_))
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Lazy open + inline-`pos` search
+    // -----------------------------------------------------------------
+    //
+    // Open touches only the structural-decode regions (directory,
+    // sub-header, summary, centroids, cluster_idx). Search carries
+    // `pos = off + i` inline in the shortlist tuple — there is no
+    // `doc_to_pos` lookup table to populate. The structural
+    // memory-ceiling tests below ride on these invariants.
+
+    /// Search-shape corpus used by the inline-pos tests and the
+    /// sync-search / counting-source tests. Picks a non-trivial
+    /// `n_docs ≥ n_cent` so each cluster has multiple candidates.
+    fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            name: "embedding".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+        })
+        .expect("register column");
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim)
+                .map(|j| ((i.wrapping_mul(13) + j as u32 * 5) % 100) as f32)
+                .collect();
+            b.add(0, &v).expect("add to vector builder");
+            all.push(v);
+        }
+        let bytes = b.finish().expect("finish vector builder");
+        let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+            .to_string();
+        (Bytes::from(bytes), json, all)
+    }
+
+    /// Self-query smoke: lazy default open must recover the
+    /// planted self-vector at top-1, confirming the inline-`pos`
+    /// rerank path returns the correct results on the
+    /// search-shape corpus that every test in this section uses.
+    #[test]
+    fn lazy_default_search_recovers_self_query() {
+        let (blob, json, all) = build_search_corpus();
+        let r = VectorReader::open(blob, &json).expect("open");
+        let hits = r
+            .search("embedding", &all[17], 5, 4, 5)
+            .expect("search must succeed on lazy InMemory");
+        assert_eq!(hits[0].0, 17, "self-query must recover self");
+    }
+
+    // -----------------------------------------------------------------
+    // Sync `search()` on `Source::Lazy`
+    // -----------------------------------------------------------------
+    //
+    // These tests pin the contract: the *only* public entry point
+    // is sync `search()`. It works on every `Source` variant —
+    // `InMemory` and warm-cache `Source::Lazy` resolve every range
+    // through `try_get_range_sync` (zero-copy); cold-miss
+    // `Source::Lazy` bridges to the source's async `range()` via
+    // `block_in_place + Handle::block_on` / one-shot
+    // `current_thread` `Runtime`, the same pattern the supertable's
+    // per-segment reader uses for the disk-cache fetch path. No
+    // `search_async` is exposed at the public surface; the
+    // cold-path async bridging is hidden inside
+    // `Source::get_range`.
+    //
+    // A `CountingLazyByteSource` test helper wraps a `Bytes`
+    // payload and counts every `range` / `try_get_range_sync`
+    // call against an `AtomicU64`. The `disable_sync` switch
+    // lets a test force the cold-miss path (sync access
+    // disabled) — exposes any silent fallthrough that would
+    // bypass the block_on bridge.
+
+    use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+    /// Test-only [`LazyByteSource`] that wraps a `Bytes` payload and
+    /// records every async / sync range request as a counter. The
+    /// two `*_returns_none` switches let a test force either the
+    /// "async only" path (sync access disabled) or "sync only" path
+    /// (async access disabled — exposes any silent fallthrough to
+    /// `range` on the supposedly-sync code path).
+    #[derive(Debug)]
+    struct CountingLazyByteSource {
+        bytes: Bytes,
+        /// Counts of every `range()` invocation.
+        async_calls: StdArc<AtomicU64>,
+        /// Counts of every `try_get_range_sync()` invocation.
+        sync_calls: StdArc<AtomicU64>,
+        /// If `true`, `try_get_range_sync` returns `None` for every
+        /// in-bounds range — forces the caller to the async path.
+        sync_disabled: AtomicBool,
+    }
+
+    impl CountingLazyByteSource {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                bytes,
+                async_calls: StdArc::new(AtomicU64::new(0)),
+                sync_calls: StdArc::new(AtomicU64::new(0)),
+                sync_disabled: AtomicBool::new(false),
+            }
+        }
+
+        fn async_counter(&self) -> StdArc<AtomicU64> {
+            StdArc::clone(&self.async_calls)
+        }
+
+        fn sync_counter(&self) -> StdArc<AtomicU64> {
+            StdArc::clone(&self.sync_calls)
+        }
+
+        fn disable_sync(&self) {
+            self.sync_disabled.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for CountingLazyByteSource {
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.async_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            let total = self.bytes.len() as u64;
+            if start.saturating_add(len) > total {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: total,
+                });
+            }
+            let s = start as usize;
+            Ok(self.bytes.slice(s..s + len as usize))
+        }
+
+        fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+            self.sync_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if self.sync_disabled.load(AtomicOrdering::Relaxed) {
+                return None;
+            }
+            let total = self.bytes.len() as u64;
+            if start.saturating_add(len) > total {
+                return None;
+            }
+            let s = start as usize;
+            Some(self.bytes.slice(s..s + len as usize))
+        }
+    }
+
+    /// Sync `search()` on a `Source::Lazy` whose `try_get_range_sync`
+    /// always succeeds (warm cache) behaves identically to the
+    /// `Source::InMemory` path. This is the steady-state shape the
+    /// supertable reader sees today (the reader_cache is in-process,
+    /// so every range is resident).
+    #[test]
+    fn search_on_lazy_source_with_warm_sync_cache_matches_in_memory() {
+        let (blob, json, all) = build_search_corpus();
+        let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let r_lazy =
+            VectorReader::open_with_source(Source::Lazy(counting), &json, OpenOptions::default())
+                .expect("lazy open with warm sync cache");
+
+        for &q_idx in &[0usize, 17, 31, 63] {
+            let hits_mem = r_mem
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("InMemory search");
+            let hits_lazy = r_lazy
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("Lazy(warm) search");
+            assert_eq!(
+                hits_mem, hits_lazy,
+                "lazy warm-sync results must match InMemory for query {q_idx}"
+            );
+        }
+    }
+
+    /// Sync `search()` on a `Source::Lazy` whose
+    /// `try_get_range_sync` returns `None` for every range still
+    /// succeeds — `Source::get_range` bridges to the source's
+    /// async `range()` via the one-shot `current_thread`
+    /// `Runtime` fallback (no ambient tokio runtime in
+    /// `#[test]`). Results must equal the `Source::InMemory`
+    /// baseline.
+    ///
+    /// This is the cold-path proof — the public sync surface
+    /// works against an arbitrary async-only `LazyByteSource`
+    /// impl. Production callers always have an ambient runtime
+    /// (the supertable owns one), so the `block_in_place +
+    /// Handle::block_on` branch is what fires there; this test
+    /// exercises the no-ambient-runtime fallback to keep that
+    /// path live.
+    #[test]
+    fn search_on_lazy_source_with_no_sync_fallback_bridges_to_async() {
+        let (blob, json, all) = build_search_corpus();
+        let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_counter = counting.async_counter();
+        let r_lazy = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&counting) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("lazy open");
+        counting.disable_sync();
+
+        for &q_idx in &[0usize, 17, 31, 63] {
+            let hits_mem = r_mem
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("InMemory search");
+            let hits_lazy = r_lazy
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("sync search must succeed via block_on bridge");
+            assert_eq!(
+                hits_mem, hits_lazy,
+                "sync search with block_on bridge must match InMemory for query {q_idx}"
+            );
+        }
+
+        assert!(
+            async_counter.load(AtomicOrdering::Relaxed) > 0,
+            "with sync access disabled, every fetch must route through \
+             the source's async range() via the block_on bridge"
+        );
+    }
+
+    /// Range-counting budget. Sync `search()` issues per-region
+    /// / per-cluster `Source::get_range` calls:
+    ///
+    /// - 1 range for centroids
+    /// - 1 range for cluster_idx
+    /// - 1 range per probed cluster's codes
+    /// - 1 range per probed cluster's doc_ids
+    /// - 1 fat range for the rerank batch in `full[]`
+    ///
+    /// At `nprobe = N` with all probed clusters non-empty:
+    /// `2 + 2N + 1 = 2N + 3` ranges. The corpus here has
+    /// `n_cent = 4` and the test uses `nprobe = 4`, so the
+    /// worst-case budget is `2·4 + 3 = 11`. The production
+    /// shape (`nprobe = 8` on a 1M corpus) is
+    /// `2·8 + 3 = 19` — a future layout that interleaves
+    /// codes + doc_ids per cluster would drop this further by
+    /// turning the per-cluster pair into a single range.
+    ///
+    /// Forcing `try_get_range_sync` off makes every range route
+    /// through the source's async `range()` via the block_on
+    /// bridge, so the `async_calls` counter is the right
+    /// instrumentation for "how many distinct ranges did
+    /// `search()` request".
+    ///
+    /// A regression that smuggles in extra range fetches — e.g.
+    /// reintroducing the whole-subsection fallback, or pulling
+    /// the full `doc_ids` region over the wire at open — surfaces
+    /// here rather than at the production object-store harness.
+    #[test]
+    fn search_cold_first_search_range_count_per_cluster() {
+        let (blob, json, all) = build_search_corpus();
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_counter = counting.async_counter();
+        let sync_counter = counting.sync_counter();
+        let r = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&counting) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("lazy open");
+
+        let async_after_open = async_counter.load(AtomicOrdering::Relaxed);
+        let sync_after_open = sync_counter.load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            async_after_open, 0,
+            "open path uses try_get_range_sync only — no async fetches expected"
+        );
+        assert!(
+            sync_after_open > 0,
+            "open path should have issued sync range fetches"
+        );
+
+        counting.disable_sync();
+        let hits = r
+            .search("embedding", &all[7], 5, 4, 5)
+            .expect("sync search via block_on bridge");
+        assert!(!hits.is_empty(), "search should return hits");
+
+        let async_calls_for_first_search =
+            async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
+        // Worst-case at nprobe=4, all clusters non-empty:
+        //   centroids + cluster_idx + nprobe*(codes + doc_ids) + 1 fat full[] = 11.
+        // Lower bound is 3 (centroids + cluster_idx + fat full[]) when
+        // every probed cluster is empty, but for this corpus every
+        // cluster has docs.
+        assert!(
+            (3..=11).contains(&(async_calls_for_first_search as usize)),
+            "per-cluster path: cold first search expected to issue \
+             3..=11 ranges (centroids + cluster_idx + per-cluster \
+             codes/doc_ids + 1 fat rerank range). Got {async_calls_for_first_search}."
+        );
+    }
+
+    /// `BytesLazyByteSource` (the production-ready in-memory
+    /// `LazyByteSource` impl) yields the same sync `search()`
+    /// results as `Source::InMemory`. Locks in the contract that
+    /// the trait-based path doesn't accidentally diverge from the
+    /// enum-based fast path.
+    #[test]
+    fn search_matches_in_memory_through_bytes_lazy_source() {
+        let (blob, json, all) = build_search_corpus();
+        let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
+        let lazy_src: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(blob));
+        let r_lazy =
+            VectorReader::open_with_source(Source::Lazy(lazy_src), &json, OpenOptions::default())
+                .expect("lazy open via BytesLazyByteSource");
+
+        for &q_idx in &[3usize, 19, 47] {
+            let hits_mem = r_mem
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("InMemory search");
+            let hits_lazy = r_lazy
+                .search("embedding", &all[q_idx], 5, 4, 5)
+                .expect("BytesLazyByteSource sync search");
+            assert_eq!(
+                hits_mem, hits_lazy,
+                "BytesLazyByteSource results must match InMemory for query {q_idx}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Memory-ceiling unit tests
+    // -----------------------------------------------------------------
+    //
+    // Headline guarantee: resident set per open vector segment is
+    // bounded by `O(n_cent × dim × 4 + small)`, independent of
+    // `n_docs`. Concretely: opening a `Source::Lazy` over a
+    // mmap-backed `BytesLazyByteSource` at 1M × 384 with
+    // `OpenOptions { verify_crc: false }` must leave the process
+    // RSS delta ≤ 10 MB per opened column.
+    //
+    // Why mmap specifically: this is how the disk cache feeds
+    // bytes into `SuperfileReader` —
+    // `Bytes::from_owner(Arc<Mmap>)`. The kernel never faults
+    // the bulk codes/full/doc_ids pages on the default path
+    // because nothing in `open_with_source` accesses them: the
+    // CRC scan is gated on `verify_crc`, search uses inline
+    // `pos` so no `doc_ids` walk happens, and the
+    // structural-decode bytes (outer header + dir + sub_header)
+    // are a handful of pages. The resident allocation is
+    // dominated by the rotation matrix (≈ 590 KB at dim=384)
+    // and small column metadata — well inside the 10 MB ceiling
+    // at any practical `n_docs`.
+    //
+    // Companion smoke test below (`mem_ceiling_lazy_open_smoke`)
+    // runs in default `cargo test --lib` at a smaller scale so
+    // every PR gets continuous feedback on this guarantee
+    // without paying for a 1M-doc build. The 1M × 384 plan-spec
+    // version is `#[ignore]`'d because
+    // `VectorBuilder.finish_to(...)` at that scale takes ~35 s in
+    // release / several minutes in debug. Run explicitly:
+    //
+    // ```bash
+    // cargo test --release -p infino --lib \
+    //     mem_ceiling_lazy_open_under_10mib -- --ignored --nocapture
+    // ```
+
+    /// `Bytes::from_owner` adapter for `Arc<memmap2::Mmap>` —
+    /// mirrors `supertable::reader_cache::disk::ArcMmapOwner`
+    /// (which is private to that module). Sharing the mapping
+    /// via `Arc<Mmap>` keeps it alive for the reader's lifetime
+    /// while also letting the test anchor the mmap explicitly.
+    struct MmapOwner(StdArc<memmap2::Mmap>);
+
+    impl AsRef<[u8]> for MmapOwner {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_ref()
+        }
+    }
+
+    /// Build an `(n_docs × dim)` corpus, register a single
+    /// vector column with the requested IVF shape, and stream
+    /// the resulting unified-blob bytes to `tmp` via
+    /// `VectorBuilder::finish_to`. The streaming write avoids
+    /// materializing a 1.5 GiB `Vec<u8>` in the test's address
+    /// space at 1M × 384 — the build's transient peak doesn't
+    /// survive the `before` RSS snapshot.
+    ///
+    /// Deterministic per-row vector: `seed = i × 0x9E3779B1`
+    /// folded through a linear congruential step per dim slot.
+    /// Same shape the bench corpus generators use, inlined so
+    /// the unit test doesn't reach into the bench harness.
+    fn build_corpus_to_file(
+        path: &std::path::Path,
+        n_docs: u32,
+        dim: usize,
+        n_cent: usize,
+    ) -> String {
+        use std::io::BufWriter;
+
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            name: "embedding".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+        })
+        .expect("register column");
+        let mut v = vec![0f32; dim];
+        for i in 0..n_docs {
+            let mut seed = i.wrapping_mul(0x9E37_79B1);
+            for slot in v.iter_mut() {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *slot = ((seed >> 16) as f32) / 65_535.0;
+            }
+            b.add(0, &v).expect("add to vector builder");
+        }
+        let file = std::fs::File::create(path).expect("create tempfile");
+        let writer = BufWriter::new(file);
+        b.finish_to(writer).expect("finish_to BufWriter<File>");
+
+        format!(
+            r#"[{{"name":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
+        )
+    }
+
+    /// Open a `Source::Lazy` over a mmap'd corpus file and
+    /// return the process RSS delta (bytes) attributable to
+    /// the open. Anchors `(reader, mmap_arc)` past the
+    /// after-RSS read so neither is dropped before
+    /// measurement.
+    ///
+    /// `memory_stats::memory_stats()` reads `/proc/self/statm`
+    /// on Linux — cheap syscall, no allocations of its own.
+    /// `physical_mem` is the kernel's RSS counter (anon +
+    /// file-mapped). Faulted mmap pages count; unfaulted
+    /// pages don't. The whole point of the test is that the
+    /// open path only touches a handful of pages (outer
+    /// header, directory, per-subsection header) and leaves
+    /// the rest of the file unmapped.
+    fn measure_lazy_open_rss_delta(corpus_path: &std::path::Path, json: &str) -> (usize, usize) {
+        let file = std::fs::File::open(corpus_path).expect("reopen corpus readonly");
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+        let mmap_arc = StdArc::new(mmap);
+        let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
+        let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
+
+        let before = memory_stats::memory_stats()
+            .expect("memory_stats supported")
+            .physical_mem;
+
+        let reader = VectorReader::open_with_source(
+            Source::Lazy(lazy),
+            json,
+            OpenOptions { verify_crc: false },
+        )
+        .expect("lazy open");
+
+        let after = memory_stats::memory_stats()
+            .expect("memory_stats supported")
+            .physical_mem;
+
+        let n_cols = reader.columns.len();
+        let delta = after.saturating_sub(before);
+
+        // Keep both alive past the RSS reads — dropping
+        // `reader` before reading `after` would silently
+        // make the delta look smaller than reality.
+        std::hint::black_box((&reader, &mmap_arc));
+        drop(reader);
+        drop(mmap_arc);
+
+        (delta, n_cols)
+    }
+
+    /// Memory-ceiling assertion at production scale.
+    ///
+    /// 1 M × 384, `n_cent = 1024`. `#[ignore]`-gated because
+    /// the `VectorBuilder.finish_to(...)` call takes ~35 s in
+    /// release. Run explicitly:
+    ///
+    /// ```bash
+    /// cargo test --release -p infino --lib \
+    ///     mem_ceiling_lazy_open_under_10mib -- --ignored --nocapture
+    /// ```
+    ///
+    /// A regression that re-introduces eager subsection
+    /// materialization or that scans `doc_ids` at open will
+    /// push per-column RSS past the 10 MB ceiling and fail
+    /// here rather than at the 100 M production OOM.
+    #[test]
+    #[ignore]
+    fn mem_ceiling_lazy_open_under_10mib() {
+        const N_DOCS: u32 = 1_000_000;
+        const DIM: usize = 384;
+        const N_CENT: usize = 1024;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let json = build_corpus_to_file(tmp.path(), N_DOCS, DIM, N_CENT);
+
+        let (delta_bytes, n_cols) = measure_lazy_open_rss_delta(tmp.path(), &json);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_col_mib = delta_mib / (n_cols.max(1) as f64);
+
+        eprintln!(
+            "mem_ceiling_lazy_open_under_10mib (1M × {DIM}, n_cent={N_CENT}): \
+             RSS delta = {delta_mib:.3} MiB over {n_cols} column(s) \
+             = {per_col_mib:.3} MiB/col"
+        );
+
+        assert!(
+            per_col_mib <= 10.0,
+            "lazy open RSS delta {per_col_mib:.3} MiB/col \
+             exceeds 10 MiB ceiling at 1M × {DIM}, \
+             n_cent={N_CENT} (total delta {delta_mib:.3} MiB \
+             over {n_cols} column(s))."
+        );
+    }
+
+    /// Memory-ceiling assertion at smoke scale.
+    ///
+    /// 50 k × 64, `n_cent = 64`. Runs in default
+    /// `cargo test --lib` (~1–2 s build) so every PR gets
+    /// continuous feedback on the structural property: lazy
+    /// open touches only the structural-decode pages, never
+    /// the bulk codes/full/doc_ids regions. The 10 MiB ceiling
+    /// at the headline 1M × 384 scale is asserted at the same
+    /// value here because the resident allocation (mostly the
+    /// rotation matrix at `dim²·4` = 16 KB for dim=64) is
+    /// *smaller* at smoke scale, not larger — if this fires,
+    /// the bigger test will too.
+    ///
+    /// `dim = 64` keeps the corpus tiny (~13 MB on disk) and
+    /// the rotation matrix Gram-Schmidt fast.
+    #[test]
+    fn mem_ceiling_lazy_open_smoke() {
+        const N_DOCS: u32 = 50_000;
+        const DIM: usize = 64;
+        const N_CENT: usize = 64;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let json = build_corpus_to_file(tmp.path(), N_DOCS, DIM, N_CENT);
+
+        let (delta_bytes, n_cols) = measure_lazy_open_rss_delta(tmp.path(), &json);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_col_mib = delta_mib / (n_cols.max(1) as f64);
+
+        eprintln!(
+            "mem_ceiling_lazy_open_smoke ({N_DOCS} × {DIM}, n_cent={N_CENT}): \
+             RSS delta = {delta_mib:.3} MiB over {n_cols} column(s) \
+             = {per_col_mib:.3} MiB/col"
+        );
+
+        assert!(
+            per_col_mib <= 10.0,
+            "lazy open smoke RSS delta {per_col_mib:.3} MiB/col \
+             exceeds 10 MiB ceiling at {N_DOCS} × {DIM} \
+             (total delta {delta_mib:.3} MiB over {n_cols} column(s))."
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Supertable-scale memory ceiling
+    // -----------------------------------------------------------------
+    //
+    // The single-segment `mem_ceiling_lazy_open_*` tests above pin
+    // the per-reader bound. These multi-segment variants pin the
+    // *supertable-shaped* bound: open N segments concurrently —
+    // same shape `Supertable::commit` produces (N =
+    // N_SEGMENTS_BENCH × num_cpus because the writer-pool sharding
+    // creates one segment per thread) — and assert the total anon
+    // RSS delta scales as `N × O(centroids + rotation + small)`,
+    // not as `N × subsection_size`.
+    //
+    // What this proves (and what it doesn't):
+    //
+    // - PROVES: a supertable opened with the production
+    //   disk-cache path
+    //   (`Source::InMemory(Bytes::from_owner(mmap))` per segment)
+    //   keeps anon RSS bounded across an arbitrary number of
+    //   segments, with no per-doc anon term. Equivalent here
+    //   because `Bytes::from_owner` is zero-copy over the mmap,
+    //   and the lazy-open path doesn't touch `doc_ids[]` /
+    //   `full[]` at open time (inline `pos` removes the only
+    //   reason open ever touched `doc_ids[]`).
+    //
+    // - DOES NOT PROVE: the in-process `InMemoryReaderCache`
+    //   path (`Bytes::from(Vec)` per segment) has the same bound.
+    //   That path holds each segment's bytes in anon by
+    //   construction (no mmap involved). The in-memory cache is
+    //   the test/bench path; production attaches a
+    //   `StorageProvider` and routes through the disk cache. The
+    //   in-memory cache's anon cost is its declared contract.
+    //
+    // The bench's 10M × 4-commit × num_cpus-thread shape produces
+    // exactly the topology these tests exercise. The smoke
+    // variant mirrors the bench's *layout* at a tiny corpus size
+    // (4 segments × 50 k docs × 64 dim) so every PR catches
+    // regressions (~5 s build). The `#[ignore]`'d production-scale
+    // variant uses the bench's actual per-segment shape (16
+    // segments × 625 k docs × 384 dim × n_cent_per_segment
+    // matching the bench's `n_cent_total / 4`) and runs only when
+    // called out.
+
+    /// Open `N` segment files (built by `build_corpus_to_file`) via
+    /// `Source::Lazy(BytesLazyByteSource over Arc<Mmap>)` and return
+    /// the total RSS delta attributable to those opens. Anchors
+    /// `(readers, mmaps)` past the after-RSS read.
+    fn measure_lazy_multi_segment_open_rss_delta(
+        corpus_paths: &[std::path::PathBuf],
+        jsons: &[String],
+    ) -> (usize, usize, usize) {
+        assert_eq!(corpus_paths.len(), jsons.len(), "paths/jsons must align");
+        let n_segments = corpus_paths.len();
+
+        // Pre-build (mmap, lazy source) pairs *before* the `before`
+        // snapshot so the syscalls don't contaminate the delta — we
+        // only want the open path's allocations in the measurement.
+        let mut lazies: Vec<(StdArc<memmap2::Mmap>, StdArc<dyn LazyByteSource>)> =
+            Vec::with_capacity(n_segments);
+        for path in corpus_paths {
+            let file = std::fs::File::open(path).expect("reopen corpus readonly");
+            let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+            let mmap_arc = StdArc::new(mmap);
+            let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
+            let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
+            lazies.push((mmap_arc, lazy));
+        }
+
+        let before = memory_stats::memory_stats()
+            .expect("memory_stats supported")
+            .physical_mem;
+
+        let mut readers: Vec<VectorReader> = Vec::with_capacity(n_segments);
+        let mut n_cols_total = 0usize;
+        for ((_, lazy), json) in lazies.iter().zip(jsons.iter()) {
+            let reader = VectorReader::open_with_source(
+                Source::Lazy(StdArc::clone(lazy)),
+                json,
+                OpenOptions { verify_crc: false },
+            )
+            .expect("lazy open");
+            n_cols_total += reader.columns.len();
+            readers.push(reader);
+        }
+
+        let after = memory_stats::memory_stats()
+            .expect("memory_stats supported")
+            .physical_mem;
+
+        let delta = after.saturating_sub(before);
+
+        // Keep both alive past the RSS reads — dropping any reader
+        // (or mmap) before reading `after` would silently shrink the
+        // measured delta.
+        std::hint::black_box((&readers, &lazies));
+        drop(readers);
+        drop(lazies);
+
+        (delta, n_cols_total, n_segments)
+    }
+
+    /// Supertable-scale memory ceiling — smoke.
+    ///
+    /// Mirrors the bench's 4-commit × num_cpus-thread shape at a
+    /// tiny corpus size. Builds 4 segment files (each 50 k × 64
+    /// dim × n_cent=64 — same shape as
+    /// `mem_ceiling_lazy_open_smoke`), opens all 4 lazy, and
+    /// asserts the total anon RSS delta is ≤ 10 MiB. With
+    /// per-segment ceiling of 10 MiB / column from the single-
+    /// segment smoke and a 4× multiplier in the worst case
+    /// (centroids + rotation matrix per segment), 10 MiB total
+    /// gives plenty of headroom while still failing loud if a
+    /// regression makes per-segment opens allocate per-doc.
+    ///
+    /// Runs in the default `cargo test --lib` suite (~3–5 s
+    /// total) so every PR validates the supertable-shape bound.
+    #[test]
+    fn mem_ceiling_lazy_multi_segment_open_smoke() {
+        const N_SEGMENTS: usize = 4;
+        const N_DOCS_PER_SEG: u32 = 50_000;
+        const DIM: usize = 64;
+        const N_CENT: usize = 64;
+
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
+        for _ in 0..N_SEGMENTS {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT);
+            paths.push(tmp.path().to_path_buf());
+            jsons.push(json);
+            tmps.push(tmp); // keep the tempfile alive until end
+        }
+
+        let (delta_bytes, n_cols_total, n_segments) =
+            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_seg_mib = delta_mib / n_segments as f64;
+
+        eprintln!(
+            "mem_ceiling_lazy_multi_segment_open_smoke ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT}): RSS delta = {delta_mib:.3} MiB over {n_segments} \
+             segment(s) ({n_cols_total} column(s) total) = {per_seg_mib:.3} MiB/segment"
+        );
+
+        assert!(
+            delta_mib <= 10.0,
+            "supertable-shape lazy open RSS delta {delta_mib:.3} MiB exceeds 10 MiB ceiling \
+             at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM} — regression hint: each segment may \
+             be touching its doc_ids/full[]/codes region at open"
+        );
+
+        drop(tmps);
+    }
+
+    /// Supertable-scale memory ceiling — production shape.
+    ///
+    /// Mirrors the bench's actual 10M × 4-commit ×
+    /// 4-thread-writer-pool topology: 16 segments × 625 k docs ×
+    /// 384 dim × `n_cent_per_segment = n_cent(10M) / 4` (the
+    /// bench's `corpus::n_cent(10M)` returns 1024, so this is
+    /// 256). Each segment file is ~960 MiB on disk; the test
+    /// writes ~15 GiB total to the tempdir. Build time is
+    /// dominated by the 16 sequential streaming builds at
+    /// ~10 s each in release ≈ 3 min total.
+    ///
+    /// `#[ignore]`-gated. Run explicitly:
+    ///
+    /// ```bash
+    /// cargo test --release -p infino --lib \
+    ///     mem_ceiling_lazy_supertable_scale_under_50mib -- --ignored --nocapture
+    /// ```
+    ///
+    /// Bound: 50 MiB total anon over the 16 segments. The
+    /// per-segment open materialises:
+    /// - rotation matrix: `dim² × 4 = 576 KiB` at dim=384
+    /// - centroids buffer (in lazy source page cache, not anon):
+    ///   `n_cent × dim × 4 = 384 KiB` at the smoke shape
+    /// - per-column header / cluster_idx slices (KiB-range)
+    ///
+    /// Add a 2× safety margin for allocator overhead +
+    /// reader-struct fields, multiply by 16 segments → ~20 MiB
+    /// theoretical, 50 MiB ceiling for headroom. A regression
+    /// that re-introduces eager subsection materialisation
+    /// would blow this to ~15 GiB (the full corpus) and fail
+    /// loud here rather than at the production 100 M OOM.
+    #[test]
+    #[ignore]
+    fn mem_ceiling_lazy_supertable_scale_under_50mib() {
+        const N_SEGMENTS: usize = 16;
+        const N_DOCS_PER_SEG: u32 = 625_000;
+        const DIM: usize = 384;
+        const N_CENT_PER_SEG: usize = 256;
+
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
+        for i in 0..N_SEGMENTS {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            eprintln!(
+                "  building segment {i:2}/{N_SEGMENTS} \
+                 ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
+            );
+            let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT_PER_SEG);
+            paths.push(tmp.path().to_path_buf());
+            jsons.push(json);
+            tmps.push(tmp);
+        }
+
+        let (delta_bytes, n_cols_total, n_segments) =
+            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_seg_mib = delta_mib / n_segments as f64;
+
+        eprintln!(
+            "mem_ceiling_lazy_supertable_scale_under_50mib ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT_PER_SEG}): RSS delta = {delta_mib:.3} MiB over \
+             {n_segments} segment(s) ({n_cols_total} column(s) total) = \
+             {per_seg_mib:.3} MiB/segment"
+        );
+
+        assert!(
+            delta_mib <= 50.0,
+            "supertable-scale (10M-bench shape) lazy open RSS delta {delta_mib:.3} MiB \
+             exceeds 50 MiB ceiling at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. \
+             Eager re-introduction would push this past 15 GiB."
+        );
+
+        drop(tmps);
+    }
+
+    /// Many-segments stress test — 100M aspiration shape.
+    ///
+    /// The honest scale test for "100M docs across a supertable"
+    /// can't materialise 100M production-shape segments on a
+    /// developer box (the per-segment 625k × 384 shape used in
+    /// the bench produces ~960 MiB on disk × 160 segments = 150
+    /// GiB of corpus). Instead, this test pins the *structural*
+    /// memory bound by varying the high-cardinality axis
+    /// (segment count) at a thin per-segment shape:
+    /// **100 segments × 50 k docs × 128 dim × 128 n_cent**.
+    ///
+    /// What this proves:
+    ///
+    /// - Per-segment open allocation is `O(n_cent × dim × 4 +
+    ///   rotation + small)` — no `n_docs` term. At this shape:
+    ///   centroids 64 KiB + rotation matrix 64 KiB + column
+    ///   metadata ≪ 1 MiB per segment. Total expected RSS
+    ///   delta ≪ 200 MiB across 100 segments; 400 MiB ceiling
+    ///   for allocator overhead + reader-struct fields.
+    ///
+    /// - With no per-doc resident state on the open path,
+    ///   segment count is the only scaling dimension. A
+    ///   regression that reintroduced any per-doc resident state
+    ///   — e.g. a returning lookup table at `n_docs × 4` bytes
+    ///   per column — would here allocate 100 × 50 k × 4 = 20
+    ///   MiB anon just for tables (small but growing); at the
+    ///   bench's 100 segments × 625 k the same regression is
+    ///   250 MiB.
+    ///
+    /// Each segment file is ~25 MiB on disk; the test writes
+    /// ~2.5 GiB total to the tempdir. Build time is dominated by
+    /// the 100 sequential streaming builds (~1.5 s each in
+    /// release ≈ 2.5 min total).
+    ///
+    /// `#[ignore]`-gated. Run explicitly:
+    ///
+    /// ```bash
+    /// cargo test --release -p infino --lib \
+    ///     mem_ceiling_lazy_many_segments_under_400mib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn mem_ceiling_lazy_many_segments_under_400mib() {
+        const N_SEGMENTS: usize = 100;
+        const N_DOCS_PER_SEG: u32 = 50_000;
+        const DIM: usize = 128;
+        const N_CENT_PER_SEG: usize = 128;
+
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
+        for i in 0..N_SEGMENTS {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            if i % 10 == 0 {
+                eprintln!(
+                    "  building segment {i:3}/{N_SEGMENTS} \
+                     ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
+                );
+            }
+            let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT_PER_SEG);
+            paths.push(tmp.path().to_path_buf());
+            jsons.push(json);
+            tmps.push(tmp);
+        }
+
+        let (delta_bytes, n_cols_total, n_segments) =
+            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
+        let per_seg_mib = delta_mib / n_segments as f64;
+
+        eprintln!(
+            "mem_ceiling_lazy_many_segments_under_400mib ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT_PER_SEG}): RSS delta = {delta_mib:.3} MiB over \
+             {n_segments} segment(s) ({n_cols_total} column(s) total) = \
+             {per_seg_mib:.3} MiB/segment"
+        );
+
+        assert!(
+            delta_mib <= 400.0,
+            "many-segments lazy open RSS delta {delta_mib:.3} MiB exceeds 400 MiB ceiling \
+             at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. A regression that reintroduced \
+             any per-doc resident state at open would push this much higher; keeping the \
+             bound structural is what this test guards."
+        );
+
+        drop(tmps);
     }
 }

@@ -297,7 +297,6 @@ fn assert_top_k_and_set_matches(
 ) {
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
-    use infino::superfile::fts::tokenize::Tokenizer as _;
     tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
     let infino_hits = infino_top_k_and(infino, query, k);
     let oracle_hits: Vec<u64> = oracle
@@ -325,7 +324,9 @@ fn oracle_and_two_term_overlap_top3_matches() {
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    let infino_set: HashSet<u64> = infino_top_k_and(&infino, "rust async", 10).into_iter().collect();
+    let infino_set: HashSet<u64> = infino_top_k_and(&infino, "rust async", 10)
+        .into_iter()
+        .collect();
     assert_eq!(
         infino_set,
         HashSet::from([0u64, 20, 22]),
@@ -343,7 +344,8 @@ fn oracle_and_three_term_singleton_match() {
     let infino = build_infino_superfile(&corp);
     let infino_hits = infino_top_k_and(&infino, "rust async tokio", 10);
     assert_eq!(
-        infino_hits, vec![0u64],
+        infino_hits,
+        vec![0u64],
         "AND(rust, async, tokio) must be exactly [0]; got {infino_hits:?}"
     );
 }
@@ -385,7 +387,6 @@ fn oracle_and_scores_match_brute_force_ordering() {
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
     let mut terms: Vec<String> = Vec::new();
-    use infino::superfile::fts::tokenize::Tokenizer as _;
     tok.tokenize_each("rust framework", &mut |t| terms.push(t.to_owned()));
 
     let infino_hits: Vec<(u64, f32)> = infino
