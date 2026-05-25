@@ -124,9 +124,10 @@ impl ScratchDir {
 
     fn path(&mut self) -> Result<&Path, BuildError> {
         if self.tempdir.is_none() {
-            let tmp = match &self.parent {
-                Some(parent) => tempfile::TempDir::new_in(parent)?,
-                None => tempfile::tempdir()?,
+            let tmp = if let Some(parent) = &self.parent {
+                tempfile::TempDir::new_in(parent)?
+            } else {
+                tempfile::tempdir()?
             };
             self.tempdir = Some(tmp);
         }

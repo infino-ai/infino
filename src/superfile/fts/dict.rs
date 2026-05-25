@@ -123,6 +123,16 @@ pub struct StreamingDictBuilder<W: Write> {
 impl<W: Write> StreamingDictBuilder<W> {
     /// Wrap a `Write` sink. The FST format header is written
     /// immediately so the sink position advances on construction.
+    ///
+    /// **Buffering**: `StreamingDictBuilder` does not interpose its
+    /// own buffer; callers writing to a `File` (or any sink with
+    /// per-call syscall cost) should wrap in a
+    /// `std::io::BufWriter` first. The internal `fst::MapBuilder`
+    /// writes in small chunks per key, so passing a raw `File`
+    /// makes each `insert_sorted` call trigger multiple `write`
+    /// syscalls. The FTS builder follows this contract — see
+    /// `FtsBuilder::finish_to`, which wraps the scratch FST file in
+    /// a `BufWriter` before constructing the streaming builder.
     pub fn new(w: W) -> Result<Self, fst::Error> {
         Ok(Self {
             inner: MapBuilder::new(w)?,

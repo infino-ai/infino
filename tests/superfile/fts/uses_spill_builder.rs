@@ -54,6 +54,16 @@ fn build_test_superfile() -> Bytes {
         Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    // Force the spill + streaming-FST finish path. 1024 docs at
+    // ~50 bytes/doc/column never crosses the default 256 MiB
+    // threshold, so without this override the test name
+    // ("uses_spill_builder") would be misleading — every column
+    // would stay InRam and the production spill pipeline would
+    // never be exercised. `1` is the minimum value the setter
+    // accepts (`> 0` is enforced in `FtsBuilder`) and is well below
+    // the first `add_doc`'s accumulator size, so every column
+    // transitions to Spilled on the first doc.
+    b.set_fts_spill_threshold_bytes(1);
 
     let ids = decimal128_ids(0..n_docs as u64);
     let titles_owned: Vec<String> = (0..n_docs)

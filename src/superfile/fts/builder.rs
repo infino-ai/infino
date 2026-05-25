@@ -369,7 +369,7 @@ struct SpillPartition {
 /// and reinterprets as `&[[u32; 3]]` via `bytemuck` — zero per-
 /// record allocation, no UTF-8 validation, no `Box<str>` round-
 /// trips.
-const TRIPLE_BYTES: usize = 12;
+const TRIPLE_BYTES: usize = std::mem::size_of::<Triple>();
 
 /// Sortable + heap-mergeable posting triple. Matches the on-disk
 /// layout (`[term_id_le, doc_id_le, tf_le]`) exactly so a partition
@@ -788,8 +788,49 @@ fn spill_sorted_chunk(
     let path = scratch_dir.join(format!("{partition_label}_sorted{chunk_idx}.bin"));
     write_triples_sorted(chunk, &path)?;
     chunk.clear();
+    #[cfg(test)]
+    finish_debug::record_chunk_path(&path);
     out_paths.push(path);
     Ok(())
+}
+
+/// Test-only observer for the external-merge chunk-file path.
+///
+/// Used by `external_merge_path_matches_in_memory_path_byte_for_
+/// byte` to gate that the over-budget partition branch in
+/// `open_partition_sorted` actually runs (and therefore that the
+/// reviewer's "is the external merge exercised?" question is
+/// answered by a positive test, not just blob-equality). Lives in
+/// `#[cfg(test)]` so production binaries pay zero runtime cost.
+#[cfg(test)]
+mod finish_debug {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        // Thread-local so concurrent `cargo test` workers do not
+        // cross-pollute each other's observed chunk lists. Tests
+        // that drive the external-merge path build + finish on
+        // their own worker thread, so this stays isolated.
+        static OBSERVED_CHUNKS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Clear the observed-chunks log. Tests call this before the
+    /// build whose external-merge activity they want to inspect.
+    pub fn reset() {
+        OBSERVED_CHUNKS.with(|c| c.borrow_mut().clear());
+    }
+
+    /// Called by `spill_sorted_chunk` for every sorted-chunk file
+    /// written during external-merge.
+    pub fn record_chunk_path(path: &Path) {
+        OBSERVED_CHUNKS.with(|c| c.borrow_mut().push(path.to_path_buf()));
+    }
+
+    /// Snapshot of the observed-chunk-path list.
+    pub fn observed() -> Vec<PathBuf> {
+        OBSERVED_CHUNKS.with(|c| c.borrow().clone())
+    }
 }
 
 /// Sort `triples` in place by `(lex_rank[term_id], doc_id)` using a
@@ -1131,7 +1172,6 @@ impl FtsBuilder {
             total_tokens: 0,
         });
         self.postings.push(ColumnPostings::new());
-        let _ = column_id;
         Ok(column_id)
     }
 
@@ -1228,19 +1268,34 @@ impl FtsBuilder {
             self.columns[col_idx].doc_lengths.len(),
         );
 
-        // Split borrows: `tokenize_each` calls into `self.tokenizer`
-        // and each per-arm closure captures the per-arm accumulator.
-        // Disjoint immutable borrow of `self.tokenizer` plus a
-        // mutable borrow of one of `self.postings[col_idx]` or
-        // `self.bump` — both ok by field-split borrow rules.
-        //
-        // Downcast to `AsciiLowerTokenizer` once per `add_doc` call
-        // (~1ns, one indirect compare) and stash the result so each
-        // per-arm tokenize call can hit the monomorphic inline path
-        // (`tokenize_each_inline<F>`) instead of routing every per-
-        // token callback through `&mut dyn FnMut(&str)`. The inline
-        // path also lets LLVM CSE the intern hash + dense_doc_tf
-        // index work with the tokenizer's per-byte scan.
+        // Dispatch by variant. Re-destructured inside each helper
+        // so the helper can field-split-borrow `self.postings`,
+        // `self.columns`, and (for in-RAM) `self.bump` without
+        // routing through an enum field reference held across the
+        // call.
+        if self.postings[col_idx].is_spilled() {
+            self.add_doc_spilled(col_idx, local_doc_id, text)
+        } else {
+            self.add_doc_inram(col_idx, local_doc_id, text)
+        }
+    }
+
+    /// Spilled-mode hot path. Per-token cost: intern lookup + dense-
+    /// array tf bump; per-doc cost: drain `updated_terms` into the
+    /// partition writers as 12-byte triples. Invariant maintained:
+    /// `dense_doc_tf.len() == id_to_term.len()` and
+    /// `dense_doc_tf[tid] != 0 iff tid in updated_terms`. See the
+    /// inline `SAFETY` comments for the bounds-check elisions.
+    #[inline(always)]
+    fn add_doc_spilled(
+        &mut self,
+        col_idx: usize,
+        local_doc_id: u32,
+        text: &str,
+    ) -> Result<(), BuildError> {
+        // Downcast once per call so the tokenize_each_inline fast
+        // path is reachable. See the original `add_doc` for the
+        // ~150M dyn-dispatch savings this buys on the 1M-doc bench.
         let tokenizer = &self.tokenizer;
         let ascii_tok = tokenizer
             .as_ref()
@@ -1248,354 +1303,241 @@ impl FtsBuilder {
             .downcast_ref::<AsciiLowerTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
-        // Two-mode accumulator (mirror of vector). If this column
-        // is already in spill mode, intern + write straight to its
-        // partition files without going through the bumpalo +
-        // `tf_per_term: HashMap<&str, u32>` intermediate. Otherwise
-        // (in-RAM mode) stage tokens in the bumpalo + tf_per_term
-        // pair (so we can stash `&str` keys into `terms: HashMap<
-        // Box<str>, ...>` without per-token boxing), then check
-        // whether this batch would cross the spill threshold and
-        // transition if so.
+        let col_post = &mut self.postings[col_idx];
+        let (partitions, term_to_id, id_to_term, dense_doc_tf, updated_terms, term_arena) =
+            match col_post {
+                ColumnPostings::Spilled {
+                    partitions,
+                    term_to_id,
+                    id_to_term,
+                    dense_doc_tf,
+                    updated_terms,
+                    term_arena,
+                } => (
+                    partitions,
+                    term_to_id,
+                    id_to_term,
+                    dense_doc_tf,
+                    updated_terms,
+                    term_arena,
+                ),
+                ColumnPostings::InRam { .. } => {
+                    unreachable!("add_doc_spilled called on InRam column")
+                }
+            };
+
+        let n_part = partitions.len();
+        debug_assert!(
+            n_part.is_power_of_two(),
+            "spill_partitions must be a power of 2"
+        );
+        let mask = n_part - 1;
+
+        updated_terms.clear();
+        let mut on_token = |tok: &str| {
+            tokens_in_doc += 1;
+            let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
+            let idx = term_id as usize;
+            if is_new {
+                debug_assert_eq!(idx, dense_doc_tf.len());
+                dense_doc_tf.push(0);
+            }
+            // SAFETY: lockstep invariant between `dense_doc_tf`
+            // and `id_to_term` (see type-level docs above) holds
+            // here: `intern_term_id` returns `term_id <
+            // id_to_term.len()` and we just `push(0)` on `is_new`
+            // so `idx < dense_doc_tf.len()`.
+            let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+            if *slot == 0 {
+                updated_terms.push(term_id);
+            }
+            *slot += 1;
+        };
+        if let Some(ascii) = ascii_tok {
+            ascii.tokenize_each_inline(text, &mut on_token);
+        } else {
+            tokenizer.tokenize_each(text, &mut on_token);
+        }
+
+        // `self.columns[col_idx]` is a disjoint field from
+        // `self.postings[col_idx]`, so split-borrow legal.
+        let col = &mut self.columns[col_idx];
+        let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
+        col.doc_lengths.push(dl_clamped);
+        col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
+        let docs_now = local_doc_id.saturating_add(1);
+        if docs_now > self.n_docs {
+            self.n_docs = docs_now;
+        }
+
+        // Per-doc drain: emit one 12-byte triple per touched
+        // term, then zero the dense slot to restore the
+        // `dense_doc_tf[tid] != 0 iff in updated_terms` invariant.
+        //
+        // SAFETY: `p = term_id & mask` where
+        // `mask = partitions.len() - 1` (power-of-two enforced),
+        // so `p < partitions.len()`; the dense-slot index `idx`
+        // was already validated above.
+        for &term_id in updated_terms.iter() {
+            let idx = term_id as usize;
+            let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+            let tf = *slot;
+            *slot = 0;
+            let p = (term_id as usize) & mask;
+            let partition = unsafe { partitions.get_unchecked_mut(p) };
+            push_triple_batched(partition, term_id, local_doc_id, tf)?;
+        }
+
+        Ok(())
+    }
+
+    /// In-RAM hot path. Stages tokens into a per-doc `tf_per_term`
+    /// hashbrown map (`&str` keys backed by `self.bump`), then
+    /// drains into the column's `terms: HashMap<Box<str>, …>`
+    /// posting accumulator. On a Zipfian corpus ~80-95% of tokens
+    /// are repeats within the same doc, so the bump-arena-keyed
+    /// raw-entry probe pays off vs a `Box<str>`-keyed map.
+    ///
+    /// After the drain, if the column's accumulated bytes cross
+    /// `self.spill_threshold_bytes`, transitions it to
+    /// `ColumnPostings::Spilled` (one-shot — every subsequent
+    /// `add_doc` for this column routes through
+    /// [`Self::add_doc_spilled`]).
+    #[inline(always)]
+    fn add_doc_inram(
+        &mut self,
+        col_idx: usize,
+        local_doc_id: u32,
+        text: &str,
+    ) -> Result<(), BuildError> {
+        let tokenizer = &self.tokenizer;
+        let ascii_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<AsciiLowerTokenizer>();
+        let mut tokens_in_doc: u64 = 0;
+
+        // Reset the per-shard bump arena: leftover token bytes
+        // from the prior `add_doc` call are invalidated before we
+        // reuse the chunk. `Bump::reset` keeps the largest chunk
+        // (no system-allocator round trip on the steady-state
+        // doc) and frees any extra chunks the pathological-long
+        // doc grew.
+        self.bump.reset();
+        let bump = &self.bump;
+
+        // Per-doc dedup map. `hashbrown::raw_entry_mut` probes
+        // with the *borrowed* `&str` token from the tokenizer's
+        // input slice and only pays the `bump.alloc_str` copy on
+        // the miss path. Hit-path cost: hash + load + increment.
+        let mut tf_per_term: HbHashMap<&'static str, u32, FxBuildHasher> =
+            HbHashMap::with_hasher(FxBuildHasher);
+        let mut on_token = |tok: &str| {
+            tokens_in_doc += 1;
+            let hash = compute_hash(tf_per_term.hasher(), tok);
+            match tf_per_term
+                .raw_entry_mut()
+                .from_hash(hash, |existing| *existing == tok)
+            {
+                RawEntryMut::Occupied(mut e) => {
+                    *e.get_mut() += 1;
+                }
+                RawEntryMut::Vacant(e) => {
+                    // Miss path: copy borrowed token bytes into
+                    // the bump arena so the key outlives the
+                    // tokenizer's input lifetime, then widen the
+                    // bump ref to `'static` tied to the HashMap's
+                    // lifetime. The HashMap drops at the end of
+                    // this call — well before `self.bump` is
+                    // reset on the next call.
+                    let bumped: &str = bump.alloc_str(tok);
+                    let extended: &'static str = unsafe { std::mem::transmute(bumped) };
+                    e.insert_hashed_nocheck(hash, extended, 1);
+                }
+            }
+        };
+        if let Some(ascii) = ascii_tok {
+            ascii.tokenize_each_inline(text, &mut on_token);
+        } else {
+            tokenizer.tokenize_each(text, &mut on_token);
+        }
+
+        let col = &mut self.columns[col_idx];
+        let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
+        col.doc_lengths.push(dl_clamped);
+        col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
+        let docs_now = local_doc_id.saturating_add(1);
+        if docs_now > self.n_docs {
+            self.n_docs = docs_now;
+        }
+
         let column_id = col_idx as u32;
         let col_post = &mut self.postings[col_idx];
-        match col_post {
-            ColumnPostings::Spilled {
+        let (terms, bytes) = match col_post {
+            ColumnPostings::InRam { terms, bytes } => (terms, bytes),
+            ColumnPostings::Spilled { .. } => {
+                unreachable!("add_doc_inram called on Spilled column")
+            }
+        };
+        // Lookup with `get_mut(&str)` first — borrowed probe
+        // against a `Box<str>` key, no allocation on hits. Only
+        // the miss path constructs a `Box::<str>::from(term)` for
+        // insertion. Bytes accounting folds into the same loop.
+        let mut new_bytes: usize = 0;
+        for (term, tf) in tf_per_term {
+            let term_len = term.len();
+            match terms.get_mut(term) {
+                Some(acc) => {
+                    acc.push((local_doc_id, tf));
+                    new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
+                }
+                None => {
+                    terms.insert(Box::<str>::from(term), vec![(local_doc_id, tf)]);
+                    new_bytes = new_bytes.saturating_add(
+                        ACCUM_NEW_TERM_FIXED_BYTES + term_len + ACCUM_POSTING_BYTES,
+                    );
+                }
+            }
+        }
+        let new_total = bytes.saturating_add(new_bytes);
+
+        if new_total > self.spill_threshold_bytes {
+            // Crossed the threshold. Drain the in-RAM map into a
+            // fresh set of spill files for this column, build the
+            // interner from the drained vocab, transition to
+            // `Spilled` so subsequent `add_doc` calls route to
+            // `add_doc_spilled`.
+            let drained = std::mem::take(terms);
+            let mut partitions = Self::open_partitions_for_column(
+                self.scratch_dir.path(),
+                column_id,
+                self.spill_partitions,
+            )?;
+            let term_arena = bumpalo::Bump::new();
+            let mut term_to_id: TermIdMap = TermIdMap::default();
+            // Pre-size to the exact post-flush vocab.
+            let mut id_to_term: Vec<&'static str> = Vec::with_capacity(drained.len());
+            Self::flush_in_ram_to_partitions(
+                drained,
+                &mut partitions,
+                &mut term_to_id,
+                &mut id_to_term,
+                &term_arena,
+            )?;
+            let dense_doc_tf = vec![0u32; id_to_term.len()];
+            let updated_terms: Vec<u32> = Vec::new();
+            *col_post = ColumnPostings::Spilled {
                 partitions,
                 term_to_id,
                 id_to_term,
                 dense_doc_tf,
                 updated_terms,
+                // Declared last in the variant so it drops last;
+                // see `TermIdMap` doc for the lifetime invariant.
                 term_arena,
-            } => {
-                let n_part = partitions.len();
-                debug_assert!(
-                    n_part.is_power_of_two(),
-                    "spill_partitions must be a power of 2"
-                );
-                let mask = n_part - 1;
-
-                // Dense-array per-doc dedup. Replaces the previous
-                // `FxHashMap<u32, u32>` scratch — per-token cost
-                // drops from one hashmap probe + entry update
-                // (~25-30ns) to one load + one store (~3ns) on
-                // hits and one `Vec::push(0)` on the first-ever
-                // sighting of a term in this column.
-                //
-                // Invariants maintained by this arm:
-                //   - `dense_doc_tf.len() == id_to_term.len()` at
-                //     entry and exit of every `add_doc` call (the
-                //     InRam→Spilled transition pre-grows
-                //     `dense_doc_tf` to vocab size, and below we
-                //     grow it by exactly one slot on every
-                //     `is_new` from `intern_term_id`, keeping it
-                //     in lockstep with `id_to_term`).
-                //   - `dense_doc_tf[tid] != 0` iff `tid` is
-                //     currently in `updated_terms`. Restored by
-                //     the drain loop below zeroing each touched
-                //     slot before the next call.
-                //
-                // The first invariant is what makes the
-                // `get_unchecked_mut` reads/writes below sound:
-                // every `idx = term_id as usize` is < the
-                // dense vec's length at the moment we index.
-                updated_terms.clear();
-                let mut on_token = |tok: &str| {
-                    tokens_in_doc += 1;
-                    let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
-                    let idx = term_id as usize;
-                    // On a new id we know `term_id ==
-                    // id_to_term.len() - 1 == dense_doc_tf.len()`
-                    // (lockstep invariant), so a single
-                    // `push(0)` restores it; no `>=` test, no
-                    // `id_to_term.len()` re-load, no
-                    // `Vec::resize` branch. On the hot (hit)
-                    // path this whole block is gone — `is_new`
-                    // is statically false in the branch and the
-                    // grow code never executes.
-                    if is_new {
-                        debug_assert_eq!(idx, dense_doc_tf.len());
-                        dense_doc_tf.push(0);
-                    }
-                    // SAFETY: `idx == term_id` and `term_id` was
-                    // just confirmed valid by `intern_term_id`
-                    // (`id < id_to_term.len()`), which is equal
-                    // to `dense_doc_tf.len()` by the lockstep
-                    // invariant just enforced (`push(0)` on
-                    // `is_new` keeps the two in sync). So
-                    // `idx < dense_doc_tf.len()` holds.
-                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
-                    if *slot == 0 {
-                        updated_terms.push(term_id);
-                    }
-                    *slot += 1;
-                };
-                // Monomorphic fast path when the tokenizer is the
-                // default `AsciiLowerTokenizer`: the per-token
-                // callback inlines straight into the tokenizer's
-                // per-byte scan, eliminating ~150M `&mut dyn FnMut`
-                // indirect dispatches on the 1M-doc spill bench and
-                // letting LLVM CSE/hoist intern-hash and dense-array
-                // bookkeeping across iterations. Custom tokenizers
-                // fall back to the dyn-callback trait path.
-                if let Some(ascii) = ascii_tok {
-                    ascii.tokenize_each_inline(text, &mut on_token);
-                } else {
-                    tokenizer.tokenize_each(text, &mut on_token);
-                }
-
-                // Update column doc-lengths + accounting. The
-                // borrow of `self.columns[col_idx]` is disjoint
-                // from the `&mut self.postings[col_idx]` we still
-                // hold via `partitions` etc. (different fields of
-                // `self`), so this is split-borrow legal.
-                let col = &mut self.columns[col_idx];
-                let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
-                col.doc_lengths.push(dl_clamped);
-                col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
-                let docs_now = local_doc_id.saturating_add(1);
-                if docs_now > self.n_docs {
-                    self.n_docs = docs_now;
-                }
-
-                // Drain: emit one triple per touched term, then
-                // zero out the slot to restore the
-                // `dense_doc_tf[tid] != 0 iff in updated_terms`
-                // invariant for the next call.
-                //
-                // SAFETY: every `term_id` in `updated_terms` was
-                // pushed inside the tokenize loop above only
-                // after we'd grown `dense_doc_tf` to cover it
-                // (`push(0)` on `is_new`, lockstep with
-                // `id_to_term`). The lockstep invariant is
-                // preserved across the loop (no further intern
-                // calls run between the loop and here), so
-                // `idx < dense_doc_tf.len()` holds for every
-                // iteration.
-                // Per-doc drain: for each touched term_id, read +
-                // zero its `dense_doc_tf` slot, route to the
-                // partition by the low `log2(n_part)` bits of
-                // term_id, and append the 12-byte triple.
-                //
-                // `partitions.get_unchecked_mut(p)` is sound:
-                // `p = term_id & mask` where `mask = n_part - 1`
-                // and `n_part = partitions.len()` is enforced to be
-                // a power of two by `open_partitions_for_column` +
-                // `flush_in_ram_to_partitions`'s `debug_assert!`,
-                // so `p < n_part = partitions.len()` for every
-                // iteration. The bounds check otherwise fires
-                // ~150M times on the 1M-doc spill bench (once per
-                // unique (doc, term) pair) and shows up as a
-                // ~3-5% slice of `add_doc` in `perf` despite
-                // being trivially predictable — the saved branch
-                // alone is worth the unsafe block at this hot-loop
-                // depth.
-                for &term_id in updated_terms.iter() {
-                    let idx = term_id as usize;
-                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
-                    let tf = *slot;
-                    *slot = 0;
-                    let p = (term_id as usize) & mask;
-                    let partition = unsafe { partitions.get_unchecked_mut(p) };
-                    push_triple_batched(partition, term_id, local_doc_id, tf)?;
-                }
-            }
-            ColumnPostings::InRam { .. } => {
-                // Re-borrow `terms` + `bytes` inside this arm via a
-                // separate match below so we can split-borrow
-                // `self.columns[col_idx]` (a disjoint field) in
-                // between. The outer destructure is unused.
-                //
-                // Reset the per-shard bump arena so leftover token
-                // bytes from the prior `add_doc` call are
-                // invalidated before we reuse the chunk.
-                // `Bump::reset` keeps the largest chunk (no
-                // system-allocator round trip on the typical
-                // steady-state doc) and frees any extra chunks the
-                // pathological-long doc grew.
-                //
-                // We only reset (and use) the bump in the in-RAM
-                // arm because the spill arm interns each token
-                // straight into `term_to_id` and never needs a
-                // backing `&str` allocation that outlives the
-                // tokenizer callback.
-                self.bump.reset();
-                let bump = &self.bump;
-
-                // Per-doc dedup map (token → tf within this doc).
-                //
-                // Backed by `hashbrown::HashMap` so we can use
-                // `raw_entry_mut` to probe with the *borrowed*
-                // `&str` token from the tokenizer's input slice
-                // and only pay the `bump.alloc_str` copy on the
-                // miss path. The prior implementation (std
-                // `FxHashMap` + `entry(key).or_insert(0)`)
-                // required an *owned* key for the `entry` API and
-                // therefore bumped every token before the probe;
-                // on a Zipfian corpus ~80-95% of tokens are repeats
-                // within the same doc, so the bump-alloc was wasted
-                // work on the dominant fast path. Hit-path cost
-                // drops from "probe + memcpy + pointer bump +
-                // entry walk" to "probe + load + increment".
-                //
-                // FxHash is kept (vs SipHash) for the same reason
-                // as before: the keys borrow into the per-shard
-                // bump arena and the map is rebuilt per doc, so
-                // DoS-resistance is moot here, and FxHash is
-                // ~3-5× faster per probe for short ASCII tokens.
-                let mut tf_per_term: HbHashMap<&'static str, u32, FxBuildHasher> =
-                    HbHashMap::with_hasher(FxBuildHasher);
-                let mut on_token = |tok: &str| {
-                    tokens_in_doc += 1;
-                    let hash = compute_hash(tf_per_term.hasher(), tok);
-                    match tf_per_term
-                        .raw_entry_mut()
-                        .from_hash(hash, |existing| *existing == tok)
-                    {
-                        RawEntryMut::Occupied(mut e) => {
-                            *e.get_mut() += 1;
-                        }
-                        RawEntryMut::Vacant(e) => {
-                            // Miss path: copy the borrowed token
-                            // bytes into the per-shard bump arena
-                            // so the key outlives the tokenizer's
-                            // input lifetime, then widen the bump
-                            // ref to `'static` tied to the
-                            // HashMap's lifetime. The HashMap
-                            // drops at the end of this `add_doc`
-                            // call — well before `self.bump` is
-                            // reset on the next call — so every
-                            // key stays valid for the HashMap's
-                            // full lifetime. `Bump::alloc_str`
-                            // returns a `&mut str`; we narrow
-                            // back to `&str` via the transmute.
-                            let bumped: &str = bump.alloc_str(tok);
-                            let extended: &'static str = unsafe { std::mem::transmute(bumped) };
-                            e.insert_hashed_nocheck(hash, extended, 1);
-                        }
-                    }
-                };
-                // Same downcast fast path as the spill arm — the
-                // Rayon production path lives entirely in this arm
-                // (per-shard data sits below the spill threshold),
-                // and per-token dyn dispatch shows up on every
-                // shard's worker thread.
-                if let Some(ascii) = ascii_tok {
-                    ascii.tokenize_each_inline(text, &mut on_token);
-                } else {
-                    tokenizer.tokenize_each(text, &mut on_token);
-                }
-
-                let col = &mut self.columns[col_idx];
-                let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
-                col.doc_lengths.push(dl_clamped);
-                col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
-                let docs_now = local_doc_id.saturating_add(1);
-                if docs_now > self.n_docs {
-                    self.n_docs = docs_now;
-                }
-                // Re-borrow the postings slot mutably after the
-                // disjoint borrow of `self.columns[col_idx]` so
-                // the InRam-mode insert + threshold-check block
-                // below has the right `&mut` shape.
-                let col_post = &mut self.postings[col_idx];
-                let (terms, bytes) = match col_post {
-                    ColumnPostings::InRam { terms, bytes } => (terms, bytes),
-                    // We're already inside the `InRam` arm of the
-                    // outer match; no other variant is reachable
-                    // before we transition below.
-                    ColumnPostings::Spilled { .. } => unreachable!(
-                        "column was InRam at top of add_doc; cannot have spilled mid-call"
-                    ),
-                };
-                // Lookup with `get_mut(&str)` first — borrowed
-                // probe against a `Box<str>` key, no allocation
-                // on hits. Only the miss path constructs a
-                // `Box::<str>::from(term)` for insertion. On a
-                // Zipfian corpus the vocabulary plateaus around
-                // ~10k unique terms while we ingest 1M docs ×
-                // ~135 tokens/doc = ~135M postings, so hits
-                // dominate by >4 orders of magnitude. Allocating
-                // a `Box<str>` per hit (as the prior `Entry` API
-                // shape did, since `Entry` needs key ownership
-                // up front) costs the production rayon-sharded
-                // path (which never spills) ~135M unnecessary
-                // heap allocations per builder — the dominant
-                // cause of the InRam-path regression vs parent.
-                //
-                // Bytes accounting folds into the same loop so
-                // the spill-threshold check is one `>` after the
-                // posting loop instead of a second pass.
-                let mut new_bytes: usize = 0;
-                for (term, tf) in tf_per_term {
-                    let term_len = term.len();
-                    match terms.get_mut(term) {
-                        Some(acc) => {
-                            acc.push((local_doc_id, tf));
-                            new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
-                        }
-                        None => {
-                            terms.insert(Box::<str>::from(term), vec![(local_doc_id, tf)]);
-                            new_bytes = new_bytes.saturating_add(
-                                ACCUM_NEW_TERM_FIXED_BYTES + term_len + ACCUM_POSTING_BYTES,
-                            );
-                        }
-                    }
-                }
-                let new_total = bytes.saturating_add(new_bytes);
-
-                if new_total > self.spill_threshold_bytes {
-                    // We just crossed the threshold. Drain the
-                    // (now-just-grown) in-RAM map into a fresh
-                    // set of spill files for this column,
-                    // building the term interner from the drained
-                    // vocabulary; transition the column to
-                    // `Spilled` so subsequent `add_doc` calls
-                    // skip the in-RAM hashmap entirely. The
-                    // current batch's postings are already in the
-                    // map and flushed alongside everything else,
-                    // so no separate batch-to-spill step is
-                    // needed (same shape as
-                    // VectorBuilder's pre_spill_buffer transition).
-                    let drained = std::mem::take(terms);
-                    let mut partitions = Self::open_partitions_for_column(
-                        self.scratch_dir.path(),
-                        column_id,
-                        self.spill_partitions,
-                    )?;
-                    let term_arena = bumpalo::Bump::new();
-                    let mut term_to_id: TermIdMap = TermIdMap::default();
-                    let mut id_to_term: Vec<&'static str> = Vec::new();
-                    Self::flush_in_ram_to_partitions(
-                        drained,
-                        &mut partitions,
-                        &mut term_to_id,
-                        &mut id_to_term,
-                        &term_arena,
-                    )?;
-                    // Pre-grow `dense_doc_tf` to the post-flush vocab
-                    // so the first post-transition `add_doc` doesn't
-                    // pay a resize on every novel term it sees. The
-                    // values are zero-initialised so the dedup
-                    // invariant (`dense_doc_tf[tid] != 0 iff tid in
-                    // updated_terms`) holds from the start.
-                    let dense_doc_tf = vec![0u32; id_to_term.len()];
-                    let updated_terms: Vec<u32> = Vec::new();
-                    *col_post = ColumnPostings::Spilled {
-                        partitions,
-                        term_to_id,
-                        id_to_term,
-                        dense_doc_tf,
-                        updated_terms,
-                        // Declared last in the variant so it drops
-                        // last; see `TermIdMap` doc for the lifetime
-                        // invariant.
-                        term_arena,
-                    };
-                } else {
-                    *bytes = new_total;
-                }
-            }
+            };
+        } else {
+            *bytes = new_total;
         }
 
         Ok(())
@@ -1634,16 +1576,169 @@ impl FtsBuilder {
     ///   Mirrors the spilled `VectorBuilder` finish.
     ///
     /// Final blob assembly is byte-identical between the two paths
-    /// (regression-gated by `finish_to_matches_finish_byte_for_byte`).
-    pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
-        // Destructure `self` up front. Mirror of vector's
-        // `let VectorBuilder { columns, scratch_dir, .. } = self;`
-        // at the top of `VectorBuilder::finish_to`: makes per-field
-        // ownership explicit, lets the loop body consume `columns`
-        // and `postings` by value without partial-move bookkeeping,
-        // and surfaces unused fields (`tokenizer`, `bump`,
-        // `spill_threshold_bytes`, `spill_partitions`) as `_`
-        // bindings rather than dead `self.field` references.
+    /// (regression-gated by
+    /// `build_above_threshold_spills_and_matches_in_ram_byte_for_byte`).
+    pub fn finish_to<W: Write>(self, w: W) -> Result<(), BuildError> {
+        // Dispatch to the path that matches the builder's current
+        // state. The two paths share `assemble_and_write_blob` as
+        // their tail, so the output blob is byte-identical for
+        // builds that *could* be served by either (regression-
+        // gated by `build_above_threshold_spills_and_matches_in_
+        // ram_byte_for_byte`).
+        if self.postings.iter().any(|c| c.is_spilled()) {
+            self.finish_to_spilled(w)
+        } else {
+            self.finish_to_inram(w)
+        }
+    }
+
+    /// In-RAM finish path: every column's accumulated `terms` map
+    /// stayed under `spill_threshold_bytes`, so the FST is built in
+    /// one shot via [`DictBuilder`] (no scratch FST file), no
+    /// partition flush runs, and the per-column emit loop only ever
+    /// sees the `InRam` variant.
+    ///
+    /// This is the production rayon-sharded path for builds whose
+    /// per-shard data fits below the spill threshold — the case the
+    /// 1M-doc Zipfian bench measures.
+    fn finish_to_inram<W: Write>(self, mut w: W) -> Result<(), BuildError> {
+        let FtsBuilder {
+            tokenizer: _,
+            columns,
+            postings,
+            scratch_dir,
+            spill_threshold_bytes: _,
+            spill_partitions: _,
+            max_partition_bytes: _,
+            n_docs,
+            bump: _,
+        } = self;
+
+        let n_columns = columns.len() as u32;
+        let mut n_terms_total_usize: usize = 0;
+
+        // Build the per-column work list, sorted by lex name. Drained
+        // by value below so each column's in-RAM map is dropped the
+        // instant its terms have been emitted. Mirror of vector's
+        // `columns.into_iter().enumerate()` pattern.
+        let mut work: Vec<(usize, ColumnState, ColumnPostings)> = columns
+            .into_iter()
+            .zip(postings)
+            .enumerate()
+            .map(|(orig_idx, (state, posting_state))| (orig_idx, state, posting_state))
+            .collect();
+        work.sort_unstable_by(|a, b| a.1.name.cmp(&b.1.name));
+
+        let mut avgdl_per_col: Vec<f32> = vec![0.0; n_columns as usize];
+        for (orig_idx, state, _) in &work {
+            let n = state.doc_lengths.len() as u64;
+            avgdl_per_col[*orig_idx] = if n == 0 {
+                0.0
+            } else {
+                (state.total_tokens as f32) / (n as f32)
+            };
+        }
+
+        let scratch_path = scratch_dir.path().to_path_buf();
+        // Posting body scratch file. Encoded posting blocks for every
+        // (column, term) flow here in lex order, then get streamed
+        // through to `w` at assembly time.
+        let postings_path = scratch_path.join("infino_fts_postings.bin");
+        let mut postings_writer = BufWriter::new(File::create(&postings_path)?);
+        let mut postings_len: u64 = 0;
+        let mut postings_crc_acc: u32 = 0;
+        let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut term_scratch = TermScratch::default();
+        let mut finish_profile = FinishProfile::from_env();
+
+        // The in-RAM path's FST sink: collect (key, value) into a
+        // `DictBuilder` and serialise once at assembly time. No
+        // scratch file, no streaming.
+        let mut fst_inram = DictBuilder::new();
+
+        let mut doc_lengths_by_orig_col: Vec<Option<Vec<u32>>> =
+            (0..n_columns as usize).map(|_| None).collect();
+
+        for (orig_col_idx, col_state, posting_state) in work.drain(..) {
+            let ColumnState {
+                name: col_name,
+                doc_lengths: col_doc_lengths_owned,
+                total_tokens: _,
+            } = col_state;
+            let col_name_bytes = col_name.as_bytes();
+            let avgdl = avgdl_per_col[orig_col_idx];
+            let col_doc_lengths: &[u32] = &col_doc_lengths_owned;
+
+            // In-RAM path invariant: dispatcher checked
+            // `!any_spilled`, so every column is `InRam`.
+            let terms = match posting_state {
+                ColumnPostings::InRam { terms, bytes: _ } => terms,
+                ColumnPostings::Spilled { .. } => unreachable!(
+                    "finish_to_inram dispatched on !any_spilled; \
+                     Spilled column cannot appear here"
+                ),
+            };
+
+            // Sort term keys; per-term doc lists are already in
+            // insertion order (monotonically increasing local_doc_id
+            // per the `add_doc` contract), so no per-list sort
+            // needed. pdqsort: dictionary entries for one in-RAM
+            // column can run into millions; stability is unnecessary
+            // because keys are unique.
+            type InRamEntries = Vec<(Box<str>, Vec<(u32, u32)>)>;
+            let mut entries: InRamEntries = terms.into_iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            for (term, postings) in entries {
+                encode_and_emit_term(
+                    &term,
+                    &postings,
+                    col_name_bytes,
+                    col_doc_lengths,
+                    avgdl,
+                    n_docs,
+                    &mut key_buf,
+                    &mut postings_writer,
+                    &mut postings_crc_acc,
+                    &mut postings_len,
+                    Some(&mut fst_inram),
+                    None,
+                    &mut finish_profile,
+                    &mut term_scratch,
+                )?;
+                n_terms_total_usize += 1;
+            }
+
+            doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
+        }
+
+        assemble_and_write_blob(
+            BlobAssemblyInputs {
+                postings_writer,
+                postings_path,
+                postings_crc_acc,
+                postings_len,
+                fst_sink: FstSinkFinish::InRam(fst_inram),
+                n_columns,
+                n_docs,
+                n_terms_total_usize,
+                avgdl_per_col,
+                doc_lengths_by_orig_col,
+                scratch_dir,
+                finish_profile,
+            },
+            &mut w,
+        )
+    }
+
+    /// Spilled finish path: at least one column transitioned to
+    /// `Spilled` during `add_doc`. Uses a streaming `MapBuilder`
+    /// (FST bytes go to a scratch file as we go, never resident in
+    /// RAM in full), drains every spilled column's per-partition
+    /// batch buffers + closes their `BufWriter`s before the merge
+    /// reads them, and the per-column emit loop handles both
+    /// variants (a spilled build can still have InRam columns whose
+    /// accumulator stayed under threshold).
+    fn finish_to_spilled<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let FtsBuilder {
             tokenizer: _,
             columns,
@@ -1659,35 +1754,14 @@ impl FtsBuilder {
         let n_columns = columns.len() as u32;
         let mut n_terms_total_usize: usize = 0;
 
-        // Decide which finish path to take. Any column in `Spilled`
-        // mode forces the streaming-FST path; otherwise everything
-        // fits in RAM and we use the in-RAM FST builder.
-        let any_spilled = postings.iter().any(|c| c.is_spilled());
-
-        // Build the per-column work list as `(original_column_id,
-        // ColumnState, ColumnPostings)`, sorted by lex name. Draining
-        // this `Vec` in the finish loop consumes one entry per
-        // iteration *by value*, so each column's `ColumnPostings`
-        // (its partition writers and any in-RAM term map) is dropped
-        // the instant its terms have been emitted. Mirror of vector's
-        // `columns.into_iter().enumerate()` pattern in
-        // `VectorBuilder::finish_to`, which releases per-column
-        // reservoir + pre-spill buf + spill file as each subsection
-        // is built.
         let mut work: Vec<(usize, ColumnState, ColumnPostings)> = columns
             .into_iter()
             .zip(postings)
             .enumerate()
             .map(|(orig_idx, (state, posting_state))| (orig_idx, state, posting_state))
             .collect();
-        // n_columns is small (typically < 16), so the sort itself
-        // doesn't matter for wall time — `sort_unstable_by` here is
-        // for style consistency with the hot posting-record sorts.
         work.sort_unstable_by(|a, b| a.1.name.cmp(&b.1.name));
 
-        // Per-column avgdl (×1000 fixed-point per spec), keyed by
-        // *original* column id so the doc-lengths directory below
-        // can iterate in declaration order regardless of lex order.
         let mut avgdl_per_col: Vec<f32> = vec![0.0; n_columns as usize];
         for (orig_idx, state, _) in &work {
             let n = state.doc_lengths.len() as u64;
@@ -1699,42 +1773,29 @@ impl FtsBuilder {
         }
 
         let scratch_path = scratch_dir.path().to_path_buf();
-
-        // Posting body scratch file. Encoded posting blocks for every
-        // (column, term) flow here in lex order, then get streamed
-        // through to `w` at assembly time. Lives under `scratch_dir`
-        // so it's cleaned up by the tempdir drop at the end of
-        // `finish_to`.
         let postings_path = scratch_path.join("infino_fts_postings.bin");
         let mut postings_writer = BufWriter::new(File::create(&postings_path)?);
         let mut postings_len: u64 = 0;
         let mut postings_crc_acc: u32 = 0;
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
-        // Single per-column scratch reused across every term in every
-        // column. See `TermScratch` for what's pooled and why.
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_env();
 
-        // Path-dependent FST destination:
-        //   - In-RAM path: collect (key, value) into a `DictBuilder`
-        //     and serialise once at the end (`fst_entries_inram`).
-        //   - Spilled path: a `StreamingDictBuilder` writes FST bytes
-        //     into a scratch file as we go (`fst_streaming`).
-        // Exactly one is `Some`.
-        let mut fst_entries_inram: Option<DictBuilder> = (!any_spilled).then(DictBuilder::new);
+        // Streaming FST: bytes flow to a scratch file as we insert
+        // sorted keys, so the FST never lives in RAM in full.
+        // Assembly reopens the file, CRCs it, and copies it into the
+        // output writer.
         let fst_streaming_path = scratch_path.join("infino_fts_dict.bin");
-        let mut fst_streaming: Option<StreamingDictBuilder<BufWriter<File>>> = if any_spilled {
+        let mut fst_streaming = {
             let fst_file = File::create(&fst_streaming_path)?;
             let bw = BufWriter::new(fst_file);
-            Some(StreamingDictBuilder::new(bw).map_err(map_fst_err)?)
-        } else {
-            None
+            StreamingDictBuilder::new(bw).map_err(map_fst_err)?
         };
 
         // Drain every spilled column's per-partition batch buffer
-        // into the partition's `BufWriter`, then flush + close
-        // the `BufWriter` so reads see a complete file. In-RAM
-        // columns are no-ops.
+        // into the partition's `BufWriter`, then flush + close it
+        // so the merge phase reads a complete file. InRam columns
+        // in this work list are no-ops.
         let partition_flush_start = finish_profile.enabled.then(Instant::now);
         for (_, _, cp) in &mut work {
             if let ColumnPostings::Spilled { partitions, .. } = cp {
@@ -1750,11 +1811,6 @@ impl FtsBuilder {
             finish_profile.partition_flush += t.elapsed();
         }
 
-        // Per-column doc-lengths held back so the (avgdl + array)
-        // assembly at the end can iterate by original column id
-        // independent of work-list ordering. Each entry is moved out
-        // of `work` as that column finishes, then consumed once at
-        // assembly time.
         let mut doc_lengths_by_orig_col: Vec<Option<Vec<u32>>> =
             (0..n_columns as usize).map(|_| None).collect();
 
@@ -1796,8 +1852,8 @@ impl FtsBuilder {
                             &mut postings_writer,
                             &mut postings_crc_acc,
                             &mut postings_len,
-                            fst_entries_inram.as_mut(),
-                            fst_streaming.as_mut(),
+                            None,
+                            Some(&mut fst_streaming),
                             &mut finish_profile,
                             &mut term_scratch,
                         )?;
@@ -1983,8 +2039,8 @@ impl FtsBuilder {
                             &mut postings_writer,
                             &mut postings_crc_acc,
                             &mut postings_len,
-                            fst_entries_inram.as_mut(),
-                            fst_streaming.as_mut(),
+                            None,
+                            Some(&mut fst_streaming),
                             &mut finish_profile,
                             &mut term_scratch,
                         )?;
@@ -2075,39 +2131,145 @@ impl FtsBuilder {
             doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
         }
 
-        debug_assert!(
-            n_terms_total_usize <= u32::MAX as usize,
-            "term count overflows u32"
-        );
-        let n_terms_total = n_terms_total_usize as u32;
+        assemble_and_write_blob(
+            BlobAssemblyInputs {
+                postings_writer,
+                postings_path,
+                postings_crc_acc,
+                postings_len,
+                fst_sink: FstSinkFinish::Streaming {
+                    builder: fst_streaming,
+                    path: fst_streaming_path,
+                },
+                n_columns,
+                n_docs,
+                n_terms_total_usize,
+                avgdl_per_col,
+                doc_lengths_by_orig_col,
+                scratch_dir,
+                finish_profile,
+            },
+            &mut w,
+        )
+    }
+}
 
-        // Close the posting body file (CRC trailer + flush).
-        let postings_close_start = finish_profile.enabled.then(Instant::now);
-        let postings_crc = postings_crc_acc;
-        let postings_crc_le = postings_crc.to_le_bytes();
-        postings_writer.write_all(&postings_crc_le)?;
-        postings_writer.flush()?;
-        drop(postings_writer);
-        postings_len += postings_crc_le.len() as u64;
-        if let Some(t) = postings_close_start {
-            finish_profile.postings_close += t.elapsed();
-        }
+/// Inputs threaded into [`assemble_and_write_blob`]. Bundled into a
+/// struct rather than a 12-arg call so the two finish paths can read
+/// like "build everything, then assemble" instead of routing through
+/// a long positional argument list. All fields are consumed by
+/// assembly.
+struct BlobAssemblyInputs {
+    /// Open scratch writer holding every encoded posting block in
+    /// lex order. Assembly closes it (CRC trailer + flush) before
+    /// streaming the file's contents into the output.
+    postings_writer: BufWriter<File>,
+    /// On-disk path of the posting body. Reopened for the streaming
+    /// copy into the output writer.
+    postings_path: PathBuf,
+    /// Running CRC32C over every byte written to `postings_writer`.
+    /// Assembly appends the little-endian trailer.
+    postings_crc_acc: u32,
+    /// Bytes written so far to `postings_writer` (excluding trailer).
+    /// Assembly grows this by 4 when it appends the CRC.
+    postings_len: u64,
+    /// Whichever FST sink was used during the per-column emit loop
+    /// (exactly one of the two variants).
+    fst_sink: FstSinkFinish,
+    n_columns: u32,
+    n_docs: u32,
+    /// Pre-cast checked downstream against `u32::MAX`.
+    n_terms_total_usize: usize,
+    /// Per-original-column avgdl (declaration order, not lex order).
+    avgdl_per_col: Vec<f32>,
+    /// Per-original-column doc-lengths, moved out of `work` by each
+    /// emit-loop iteration.
+    doc_lengths_by_orig_col: Vec<Option<Vec<u32>>>,
+    /// Scratch dir owning every spill file. Dropped after the
+    /// streamed regions (FST + postings) have been copied into `w`.
+    scratch_dir: tempfile::TempDir,
+    /// Profile accumulator — final block of `[fts-finish]` timings
+    /// is emitted at the bottom of assembly.
+    finish_profile: FinishProfile,
+}
 
-        // Finalise the FST. Either path produces "FST bytes followed
-        // by 4 trailing CRC bytes"; the source differs.
-        enum FstSource {
-            InRam(Vec<u8>),
-            Streamed { path: PathBuf, len: u64, crc: u32 },
-        }
-        let fst_close_start = finish_profile.enabled.then(Instant::now);
-        let fst_source = if let Some(db) = fst_entries_inram.take() {
+/// FST emission sink picked by the active finish path.
+enum FstSinkFinish {
+    /// In-RAM build: hand the populated `DictBuilder` to assembly,
+    /// which calls `finish()` to produce the FST bytes in one shot.
+    InRam(DictBuilder),
+    /// Spilled build: hand the open `StreamingDictBuilder` (and the
+    /// scratch path it's been writing to) to assembly, which finishes
+    /// the builder, computes the file's CRC by streaming, and copies
+    /// the file into the output.
+    Streaming {
+        builder: StreamingDictBuilder<BufWriter<File>>,
+        path: PathBuf,
+    },
+}
+
+/// Common tail of every finish path: close the posting body, finalise
+/// the FST, build the doc-lengths directory + arrays, and write
+/// `[header | fst | postings | dir | arrays]` to `w`. Lifted out of
+/// `FtsBuilder::finish_to` so the in-RAM and spilled paths share one
+/// regression target instead of two — every byte the reader observes
+/// passes through here.
+fn assemble_and_write_blob<W: Write>(
+    inputs: BlobAssemblyInputs,
+    w: &mut W,
+) -> Result<(), BuildError> {
+    let BlobAssemblyInputs {
+        mut postings_writer,
+        postings_path,
+        postings_crc_acc,
+        mut postings_len,
+        fst_sink,
+        n_columns,
+        n_docs,
+        n_terms_total_usize,
+        avgdl_per_col,
+        mut doc_lengths_by_orig_col,
+        scratch_dir,
+        mut finish_profile,
+    } = inputs;
+
+    debug_assert!(
+        n_terms_total_usize <= u32::MAX as usize,
+        "term count overflows u32"
+    );
+    let n_terms_total = n_terms_total_usize as u32;
+
+    // Close the posting body file (CRC trailer + flush).
+    let postings_close_start = finish_profile.enabled.then(Instant::now);
+    let postings_crc = postings_crc_acc;
+    let postings_crc_le = postings_crc.to_le_bytes();
+    postings_writer.write_all(&postings_crc_le)?;
+    postings_writer.flush()?;
+    drop(postings_writer);
+    postings_len += postings_crc_le.len() as u64;
+    if let Some(t) = postings_close_start {
+        finish_profile.postings_close += t.elapsed();
+    }
+
+    // Finalise the FST. Either path produces "FST bytes followed
+    // by 4 trailing CRC bytes"; the source differs.
+    enum FstSource {
+        InRam(Vec<u8>),
+        Streamed { path: PathBuf, len: u64, crc: u32 },
+    }
+    let fst_close_start = finish_profile.enabled.then(Instant::now);
+    let fst_source = match fst_sink {
+        FstSinkFinish::InRam(db) => {
             let mut bytes = db.finish();
             let crc = crc32c(&bytes);
             bytes.extend_from_slice(&crc.to_le_bytes());
             FstSource::InRam(bytes)
-        } else {
-            let sb = fst_streaming.take().expect("streaming FST must be present");
-            let mut bw = sb.finish().map_err(map_fst_err)?;
+        }
+        FstSinkFinish::Streaming {
+            builder,
+            path: fst_streaming_path,
+        } => {
+            let mut bw = builder.finish().map_err(map_fst_err)?;
             bw.flush()?;
             // Close the write side of the FST scratch file. The
             // returned `File` is `File::create`-opened (write-only),
@@ -2141,121 +2303,121 @@ impl FtsBuilder {
                 len: fst_body_len + 4, /* trailing CRC */
                 crc,
             }
-        };
-        if let Some(t) = fst_close_start {
-            finish_profile.fst_close += t.elapsed();
         }
-
-        // Compute final-blob offsets now that both region lengths are known.
-        let dl_emit_start = finish_profile.enabled.then(Instant::now);
-        let fst_total_len: u64 = match &fst_source {
-            FstSource::InRam(bytes) => bytes.len() as u64,
-            FstSource::Streamed { len, .. } => *len,
-        };
-        let header_size: u64 = 48;
-        let fst_offset: u64 = header_size;
-        let postings_offset: u64 = fst_offset + fst_total_len;
-        let doc_lengths_table_offset: u64 = postings_offset + postings_len;
-        let mut doc_lengths_array_offset: u64 =
-            doc_lengths_table_offset + (n_columns as u64) * (DOC_LENGTHS_ENTRY_SIZE as u64) + 4 /* dir CRC */;
-
-        let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * DOC_LENGTHS_ENTRY_SIZE);
-        let mut arrays_buf: Vec<u8> = Vec::new();
-        for i in 0..n_columns as usize {
-            let avgdl_x1000 = (avgdl_per_col[i] * 1000.0).max(0.0).min(u32::MAX as f32) as u32;
-            dir_buf.extend_from_slice(&(i as u32).to_le_bytes());
-            dir_buf.extend_from_slice(&doc_lengths_array_offset.to_le_bytes());
-            dir_buf.extend_from_slice(&avgdl_x1000.to_le_bytes());
-
-            let col_dls = doc_lengths_by_orig_col[i]
-                .take()
-                .expect("doc_lengths recorded for every registered column");
-            let array_start = arrays_buf.len();
-            // x86_64 is little-endian and the format spec is
-            // little-endian u32 — so a raw byte-cast over the
-            // `Vec<u32>` slice is the wire encoding. `bytemuck`
-            // gates this on `Pod` so a non-LE host would fail
-            // compilation rather than silently emit wrong bytes;
-            // the SIMD memcpy that `extend_from_slice` lowers to
-            // is materially faster than the per-u32 `to_le_bytes`
-            // + push loop, especially at the 10M-doc / column
-            // scale where this writes 40 MB per column.
-            #[cfg(target_endian = "little")]
-            arrays_buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(&col_dls));
-            #[cfg(not(target_endian = "little"))]
-            for &dl in &col_dls {
-                arrays_buf.extend_from_slice(&dl.to_le_bytes());
-            }
-            let array_bytes = &arrays_buf[array_start..];
-            let array_crc = crc32c(array_bytes);
-            arrays_buf.extend_from_slice(&array_crc.to_le_bytes());
-            doc_lengths_array_offset += (col_dls.len() as u64) * 4 + 4;
-        }
-        let dir_crc = crc32c(&dir_buf);
-        dir_buf.extend_from_slice(&dir_crc.to_le_bytes());
-        if let Some(t) = dl_emit_start {
-            finish_profile.doc_lengths_emit += t.elapsed();
-        }
-
-        // Final assembly. Bytes flow scratch → small streaming buffer
-        // → `w`, never re-materialising the full blob in RAM.
-        let blob_copy_start = finish_profile.enabled.then(Instant::now);
-        let mut header = Vec::with_capacity(header_size as usize);
-        header.extend_from_slice(format::fts::MAGIC); // 8
-        header.extend_from_slice(&format::fts::VERSION.to_le_bytes()); // 4
-        header.extend_from_slice(&n_columns.to_le_bytes()); // 4
-        header.extend_from_slice(&n_docs.to_le_bytes()); // 4
-        header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
-        header.extend_from_slice(&fst_offset.to_le_bytes()); // 8
-        header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
-        header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
-        debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
-
-        w.write_all(&header)?;
-        match fst_source {
-            FstSource::InRam(bytes) => w.write_all(&bytes)?,
-            FstSource::Streamed { path, crc, .. } => {
-                let mut reader = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&path)?);
-                std::io::copy(&mut reader, &mut w)?;
-                w.write_all(&crc.to_le_bytes())?;
-            }
-        }
-        let mut postings_reader =
-            BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
-        std::io::copy(&mut postings_reader, &mut w)?;
-        drop(postings_reader);
-
-        // Drop the scratch tempdir as soon as the streamed source
-        // files (FST + posting body) have been copied into `w`. The
-        // remaining writes (`dir_buf`, `arrays_buf`) are
-        // already-resident `Vec<u8>` and don't touch the disk.
-        // Mirror of vector's `drop(scratch_dir);` at the bottom of
-        // `VectorBuilder::finish_to`.
-        drop(scratch_dir);
-
-        w.write_all(&dir_buf)?;
-        w.write_all(&arrays_buf)?;
-        if let Some(t) = blob_copy_start {
-            finish_profile.blob_copy += t.elapsed();
-        }
-
-        if finish_profile.enabled {
-            eprintln!(
-                "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
-                finish_profile.partition_flush.as_secs_f64(),
-                finish_profile.lex_rank_build.as_secs_f64(),
-                finish_profile.partition_sort.as_secs_f64(),
-                finish_profile.mmap_open.as_secs_f64(),
-                finish_profile.scratch_cleanup.as_secs_f64(),
-                finish_profile.postings_close.as_secs_f64(),
-                finish_profile.fst_close.as_secs_f64(),
-                finish_profile.doc_lengths_emit.as_secs_f64(),
-                finish_profile.blob_copy.as_secs_f64(),
-            );
-        }
-
-        Ok(())
+    };
+    if let Some(t) = fst_close_start {
+        finish_profile.fst_close += t.elapsed();
     }
+
+    // Compute final-blob offsets now that both region lengths are known.
+    let dl_emit_start = finish_profile.enabled.then(Instant::now);
+    let fst_total_len: u64 = match &fst_source {
+        FstSource::InRam(bytes) => bytes.len() as u64,
+        FstSource::Streamed { len, .. } => *len,
+    };
+    let header_size: u64 = 48;
+    let fst_offset: u64 = header_size;
+    let postings_offset: u64 = fst_offset + fst_total_len;
+    let doc_lengths_table_offset: u64 = postings_offset + postings_len;
+    let mut doc_lengths_array_offset: u64 =
+        doc_lengths_table_offset + (n_columns as u64) * (DOC_LENGTHS_ENTRY_SIZE as u64) + 4 /* dir CRC */;
+
+    let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * DOC_LENGTHS_ENTRY_SIZE);
+    let mut arrays_buf: Vec<u8> = Vec::new();
+    for i in 0..n_columns as usize {
+        let avgdl_x1000 = (avgdl_per_col[i] * 1000.0).max(0.0).min(u32::MAX as f32) as u32;
+        dir_buf.extend_from_slice(&(i as u32).to_le_bytes());
+        dir_buf.extend_from_slice(&doc_lengths_array_offset.to_le_bytes());
+        dir_buf.extend_from_slice(&avgdl_x1000.to_le_bytes());
+
+        let col_dls = doc_lengths_by_orig_col[i]
+            .take()
+            .expect("doc_lengths recorded for every registered column");
+        let array_start = arrays_buf.len();
+        // x86_64 is little-endian and the format spec is
+        // little-endian u32 — so a raw byte-cast over the
+        // `Vec<u32>` slice is the wire encoding. `bytemuck`
+        // gates this on `Pod` so a non-LE host would fail
+        // compilation rather than silently emit wrong bytes;
+        // the SIMD memcpy that `extend_from_slice` lowers to
+        // is materially faster than the per-u32 `to_le_bytes`
+        // + push loop, especially at the 10M-doc / column
+        // scale where this writes 40 MB per column.
+        #[cfg(target_endian = "little")]
+        arrays_buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(&col_dls));
+        #[cfg(not(target_endian = "little"))]
+        for &dl in &col_dls {
+            arrays_buf.extend_from_slice(&dl.to_le_bytes());
+        }
+        let array_bytes = &arrays_buf[array_start..];
+        let array_crc = crc32c(array_bytes);
+        arrays_buf.extend_from_slice(&array_crc.to_le_bytes());
+        doc_lengths_array_offset += (col_dls.len() as u64) * 4 + 4;
+    }
+    let dir_crc = crc32c(&dir_buf);
+    dir_buf.extend_from_slice(&dir_crc.to_le_bytes());
+    if let Some(t) = dl_emit_start {
+        finish_profile.doc_lengths_emit += t.elapsed();
+    }
+
+    // Final assembly. Bytes flow scratch → small streaming buffer
+    // → `w`, never re-materialising the full blob in RAM.
+    let blob_copy_start = finish_profile.enabled.then(Instant::now);
+    let mut header = Vec::with_capacity(header_size as usize);
+    header.extend_from_slice(format::fts::MAGIC); // 8
+    header.extend_from_slice(&format::fts::VERSION.to_le_bytes()); // 4
+    header.extend_from_slice(&n_columns.to_le_bytes()); // 4
+    header.extend_from_slice(&n_docs.to_le_bytes()); // 4
+    header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
+    header.extend_from_slice(&fst_offset.to_le_bytes()); // 8
+    header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
+    header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
+    debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
+
+    w.write_all(&header)?;
+    match fst_source {
+        FstSource::InRam(bytes) => w.write_all(&bytes)?,
+        FstSource::Streamed { path, crc, .. } => {
+            let mut reader = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&path)?);
+            std::io::copy(&mut reader, w)?;
+            w.write_all(&crc.to_le_bytes())?;
+        }
+    }
+    let mut postings_reader =
+        BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
+    std::io::copy(&mut postings_reader, w)?;
+    drop(postings_reader);
+
+    // Drop the scratch tempdir as soon as the streamed source
+    // files (FST + posting body) have been copied into `w`. The
+    // remaining writes (`dir_buf`, `arrays_buf`) are
+    // already-resident `Vec<u8>` and don't touch the disk.
+    // Mirror of vector's `drop(scratch_dir);` at the bottom of
+    // `VectorBuilder::finish_to`.
+    drop(scratch_dir);
+
+    w.write_all(&dir_buf)?;
+    w.write_all(&arrays_buf)?;
+    if let Some(t) = blob_copy_start {
+        finish_profile.blob_copy += t.elapsed();
+    }
+
+    if finish_profile.enabled {
+        eprintln!(
+            "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
+            finish_profile.partition_flush.as_secs_f64(),
+            finish_profile.lex_rank_build.as_secs_f64(),
+            finish_profile.partition_sort.as_secs_f64(),
+            finish_profile.mmap_open.as_secs_f64(),
+            finish_profile.scratch_cleanup.as_secs_f64(),
+            finish_profile.postings_close.as_secs_f64(),
+            finish_profile.fst_close.as_secs_f64(),
+            finish_profile.doc_lengths_emit.as_secs_f64(),
+            finish_profile.blob_copy.as_secs_f64(),
+        );
+    }
+
+    Ok(())
 }
 
 #[inline]
@@ -2737,6 +2899,9 @@ mod tests {
         assert_eq!(fst_off, 48);
     }
 
+    /// Determinism gate: two independent in-RAM builds over the
+    /// same corpus must emit byte-identical blobs. Catches hasher
+    /// / iteration-order regressions on the in-RAM finish path.
     #[test]
     fn finish_to_matches_finish_byte_for_byte() {
         fn build() -> FtsBuilder {
@@ -2884,12 +3049,33 @@ mod tests {
         let baseline_blob = baseline.finish().expect("finish baseline");
 
         // Force spill via low threshold. 16 KiB is well below the
-        // corpus's accumulator size.
-        let mut spilled = FtsBuilder::new(tokenizer());
+        // corpus's accumulator size. Pin the scratch dir under a
+        // tempdir we control so we can inspect on-disk partition
+        // files mid-build (counterpart to the negative assertion in
+        // `small_build_stays_in_ram_no_spill_files_created`).
+        let parent = tempfile::tempdir().expect("parent");
+        let mut spilled = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
+            .expect("with_scratch");
         spilled.set_spill_threshold_bytes(16 * 1024);
         build_corpus(&mut spilled);
         let any_spilled = spilled.postings.iter().any(|c| c.is_spilled());
         assert!(any_spilled, "low threshold must force spill");
+        // Positive walkdir assert: at least one `fts_col*.bin`
+        // partition spill file must exist before `finish()`
+        // consumes the builder and drops the scratch tempdir. This
+        // gates against future refactors that keep the `Spilled`
+        // variant flag but bypass the on-disk write path.
+        let mut spill_files_found = 0usize;
+        for entry in walkdir_files(parent.path()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("fts_col") && name.ends_with(".bin") {
+                spill_files_found += 1;
+            }
+        }
+        assert!(
+            spill_files_found > 0,
+            "spilled build must materialise at least one fts_col*.bin partition file on disk"
+        );
         let spilled_blob = spilled.finish().expect("finish spilled");
 
         assert_eq!(
@@ -2946,14 +3132,26 @@ mod tests {
             }
         }
 
+        // Baseline: force the *spilled* finish path (low spill
+        // threshold), but leave `max_partition_bytes` at its
+        // effectively-unbounded default so every partition fits in
+        // memory and `open_partition_sorted` takes the in-memory
+        // branch. This isolates the variable under test (in-memory
+        // partition sort vs external merge) from the baseline's
+        // identity (the spilled finish path).
         let mut baseline = FtsBuilder::new(tokenizer());
+        baseline.set_spill_threshold_bytes(1);
         build_corpus(&mut baseline);
         let baseline_blob = baseline.finish().expect("finish baseline");
 
-        // Tight budget forces external merge. 1 KiB is well below
-        // the dominant partition's on-disk size, so the merge path
-        // is exercised on at least one partition.
+        // Tight budget forces external merge. The column must
+        // spill (`set_spill_threshold_bytes(1)`) so the spilled
+        // finish path is even taken; then 1 KiB per partition is
+        // well below the dominant partition's on-disk size, so the
+        // merge path is exercised on at least one partition.
+        finish_debug::reset();
         let mut tight = FtsBuilder::new(tokenizer());
+        tight.set_spill_threshold_bytes(1);
         tight.set_max_partition_bytes(1024);
         build_corpus(&mut tight);
         let tight_blob = tight.finish().expect("finish tight");
@@ -2961,6 +3159,16 @@ mod tests {
         assert_eq!(
             tight_blob, baseline_blob,
             "external-merge path must produce identical blob bytes"
+        );
+        // Positive gate: at least one sorted-chunk file must have
+        // been written during the tight build. Without this assert
+        // the test would pass trivially if a future refactor made
+        // every partition fit in budget.
+        let chunks = finish_debug::observed();
+        assert!(
+            !chunks.is_empty(),
+            "external-merge path must have written at least one sorted-chunk file; \
+             observed chunks were empty (test no longer exercises the over-budget branch)"
         );
     }
 

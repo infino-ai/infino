@@ -355,6 +355,20 @@ impl SuperfileBuilder {
         })
     }
 
+    /// Override the FTS builder's in-RAM spill threshold (forwarded
+    /// to [`FtsBuilder::set_spill_threshold_bytes`]). No-op if this
+    /// `SuperfileBuilder` was constructed without any FTS columns.
+    ///
+    /// Primarily useful for tests that need to force the spill +
+    /// streaming-FST finish path on a corpus too small to cross the
+    /// default 256 MiB threshold; production callers should leave
+    /// the default in place.
+    pub fn set_fts_spill_threshold_bytes(&mut self, threshold: usize) {
+        if let Some(fb) = self.fts_builder.as_mut() {
+            fb.set_spill_threshold_bytes(threshold);
+        }
+    }
+
     /// Append a `RecordBatch`. Its schema must match
     /// `opts.schema` field-for-field. `vectors[i]` is the flat f32
     /// buffer for `opts.vector_columns[i]`, length
