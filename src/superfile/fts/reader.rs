@@ -1097,7 +1097,6 @@ impl FtsReader {
         k: usize,
         heap: &mut BinaryHeap<AndHeapEntry>,
     ) {
-        let n = cursors.len();
         'outer: loop {
             if cursors[0].is_exhausted() {
                 break;
@@ -1132,12 +1131,12 @@ impl FtsReader {
             // catches up the others.
             loop {
                 let mut bumped = false;
-                for i in 0..n {
-                    cursors[i].skip_to(candidate, postings);
-                    if cursors[i].is_exhausted() {
+                for c in cursors.iter_mut() {
+                    c.skip_to(candidate, postings);
+                    if c.is_exhausted() {
                         break 'outer;
                     }
-                    let here = cursors[i].current_doc_id();
+                    let here = c.current_doc_id();
                     if here != candidate {
                         candidate = here;
                         bumped = true;
@@ -1924,11 +1923,11 @@ impl Ord for AndHeapEntry {
 fn and_heap_push(heap: &mut BinaryHeap<AndHeapEntry>, k: usize, score: f32, doc_id: u32) {
     if heap.len() < k {
         heap.push(AndHeapEntry(score, doc_id));
-    } else if let Some(&worst) = heap.peek() {
-        if score > worst.0 || (score == worst.0 && doc_id < worst.1) {
-            heap.pop();
-            heap.push(AndHeapEntry(score, doc_id));
-        }
+    } else if let Some(&worst) = heap.peek()
+        && (score > worst.0 || (score == worst.0 && doc_id < worst.1))
+    {
+        heap.pop();
+        heap.push(AndHeapEntry(score, doc_id));
     }
 }
 
@@ -2197,11 +2196,11 @@ impl TermCursor {
         self.current_block >= self.blocks.len()
     }
 
-    /// Total number of postings (df) for this term. Used by AND
-    /// intersection to pick the rarest cursor as the leader.
-    /// Block count is an exact upper bound on df (df = (n-1)*BLOCK_LEN
-    /// + last_block_n); cursor count comparison via this method gives
-    /// stable smallest-first ordering. Inline cursors return 1.
+    /// Block count, used as a cheap proxy for df when AND intersection
+    /// picks the rarest cursor as the leader. Block count is an exact
+    /// upper bound on df: a term's df is `(blocks - 1) * BLOCK_LEN +
+    /// last_block_n`, so cursors compare in the same order by block
+    /// count as they do by df. Inline cursors return 1.
     #[inline(always)]
     fn block_count(&self) -> usize {
         self.blocks.len()
