@@ -27,6 +27,7 @@ use bytes::Bytes;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, distance, normalize};
 use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -89,6 +90,7 @@ fn build_reader(
         n_cent,
         rot_seed,
         metric,
+        rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
     for v in corpus {

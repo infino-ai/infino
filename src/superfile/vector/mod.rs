@@ -13,6 +13,7 @@ pub mod distance;
 pub mod kmeans;
 pub mod quant;
 pub mod reader;
+pub mod rerank_codec;
 pub mod reservoir;
 pub mod rotation;
 pub mod spill;

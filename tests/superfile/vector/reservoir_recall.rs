@@ -1,11 +1,11 @@
-//! Recall test that exercises the M2 reservoir sampling path
+//! Recall test that exercises the reservoir sampling path
 //! end-to-end with `n_docs > sample_size`.
 //!
 //! Default reservoir size is `max(100K, min(500K, 64 × n_cent))`, so
 //! the normal-scale tests in `brute_force_oracle.rs` and
 //! `against_lance.rs` run with `n_docs ≤ sample_size` — the
 //! reservoir holds the full corpus, and k-means training is
-//! exactly equivalent to the pre-M2 path. That's necessary for
+//! exactly equivalent to the full-corpus training path. That's necessary for
 //! "no regression on small corpora" but doesn't probe the
 //! actual sampling logic.
 //!
@@ -21,6 +21,7 @@ use bytes::Bytes;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, distance, normalize};
 use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -96,6 +97,7 @@ fn build_reader_with_sample_size(
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
         })
         .expect("register column");
     b.set_kmeans_sample_size(cid, sample_size)
@@ -162,19 +164,19 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
     // delivers in this regime (empirically ≥ 0.95). A failure
     // here means either the reservoir is biased or
     // `assign_to_centroids` produced wrong assignments — both
-    // would be M2 implementation bugs.
+    // would be implementation bugs.
     assert!(
         mean_recall >= 0.85,
-        "M2 reservoir-trained recall@{top_k} = {mean_recall:.3} \
+        "reservoir-trained recall@{top_k} = {mean_recall:.3} \
          under sample_size={sample_size}; expected ≥ 0.85"
     );
 }
 
 #[test]
-fn recall_with_default_reservoir_equivalent_to_pre_m2() {
+fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
     // Sanity check: when the corpus fits inside the default
     // reservoir (which is the normal regime for unit tests), the
-    // result should be self-NN-perfect just like the pre-M2 path.
+    // result should be self-NN-perfect just like the full-corpus path.
     let dim = 32;
     let n_cent = 4;
     let n_docs = 200;
@@ -191,6 +193,7 @@ fn recall_with_default_reservoir_equivalent_to_pre_m2() {
         n_cent,
         rot_seed: 7,
         metric: Metric::Cosine,
+        rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
     for i in 0..n_docs {

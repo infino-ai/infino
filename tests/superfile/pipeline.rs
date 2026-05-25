@@ -11,6 +11,7 @@ use infino::superfile::builder::{
 };
 use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::vector::distance::{Metric, normalize};
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::superfile::{SuperfileReader, VectorSearchOptions};
 use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -46,6 +47,7 @@ fn build_pipeline_superfile() -> Bytes {
             n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
         }],
         Some(default_tokenizer()),
     );

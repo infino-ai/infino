@@ -1,0 +1,421 @@
+//! Per-column rerank codec.
+//!
+//! Each vector column picks one codec at build time:
+//!
+//! - [`RerankCodec::Fp32`]: little-endian fp32, `dim × 4` bytes
+//!   per vector. Zero-copy on the rerank distance kernel.
+//! - [`RerankCodec::Bf16`]: top 16 bits of the fp32 bit pattern,
+//!   `dim × 2` bytes per vector. SIMD widen via `u16 → u32 → fp32`
+//!   shift.
+//! - [`RerankCodec::Sq8`]: per-column per-dim 8-bit scalar
+//!   quantization, `dim × 1` bytes per vector. The quantizer
+//!   (`scale[dim]`, `offset[dim]`) lives in a sibling
+//!   `codec_meta` region at `codec_meta_off` inside the
+//!   subsection.
+//! - [`RerankCodec::None`]: no rerank column at all. The 1-bit
+//!   shortlist is the final ranking — opt-in, recall-degraded,
+//!   shrinks the segment by ~30× at 1M × 384.
+//!
+//! ## On-disk discriminator
+//!
+//! The codec choice rides as a single byte in the per-column
+//! subsection-directory entry at offset 52 (bytes 53..55 stay
+//! reserved). A zero byte at slot 52 deserializes to
+//! [`RerankCodec::Fp32`], so fp32-only segments that left the
+//! slot zero round-trip identically.
+//!
+//! ## `codec_meta` region
+//!
+//! For codecs that need per-column auxiliary data (today: just
+//! `Sq8`'s scale + offset arrays), the subsection carries a
+//! `codec_meta` region between the `codes` region and the
+//! `full[]` region. The region's relative offset within the
+//! subsection is recorded in sub-header bytes 12..16 as
+//! `codec_meta_off: u32`. `Fp32` / `Bf16` / `None` segments
+//! write `codec_meta_off = 0`.
+
+use serde::{Deserialize, Serialize};
+
+use crate::superfile::vector::distance::Metric;
+
+/// `dim` at and below which a column counts as "low-dim" for the
+/// rerank-floor calibration table in
+/// [`RerankCodec::recommended_rerank_mult_floor`]. Set at 384 to
+/// match the dominant embedding-model bucket (e5, MiniLM, etc.).
+const LOW_DIM_RERANK_FLOOR_THRESHOLD: usize = 384;
+
+/// Recommended floor on `rerank_mult` for `Fp32` / `Bf16` columns
+/// at `dim ≤ 384`. Fp32 and Bf16 share the same floor — bf16's
+/// rounding noise sits well below the 1-bit shortlist's noise
+/// floor, so the recall-driven candidate budget is the same.
+const FP32_BF16_LOW_DIM_RERANK_FLOOR: usize = 20;
+
+/// Recommended floor on `rerank_mult` for `Fp32` / `Bf16` columns
+/// at `dim > 384`. Higher dim widens the gap between the 1-bit
+/// shortlist score and the true distance; more candidates are
+/// needed to recover the same recall.
+const FP32_BF16_HIGH_DIM_RERANK_FLOOR: usize = 50;
+
+/// Recommended floor on `rerank_mult` for `Sq8` columns at
+/// `dim ≤ 384`. Sq8 needs more candidates than fp32 / bf16 to
+/// recover equivalent recall because the dequant noise floor is
+/// higher.
+const SQ8_LOW_DIM_RERANK_FLOOR: usize = 50;
+
+/// Recommended floor on `rerank_mult` for `Sq8` columns at
+/// `dim > 384`. See [`SQ8_LOW_DIM_RERANK_FLOOR`] and
+/// [`FP32_BF16_HIGH_DIM_RERANK_FLOOR`] for the underlying
+/// calibration rationale.
+const SQ8_HIGH_DIM_RERANK_FLOOR: usize = 100;
+
+/// Per-column rerank codec. Picks the on-disk byte layout of the
+/// per-vector rerank values inside the subsection's `full[]`
+/// region.
+///
+/// See the module docs for the on-disk discriminator + lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RerankCodec {
+    /// fp32 little-endian, `dim` contiguous f32s per vector.
+    /// The rerank distance kernel reads it via
+    /// `bytemuck::try_cast_slice` → zero-copy SIMD.
+    Fp32,
+    /// bf16 — top 16 bits of the fp32 bit pattern. `dim × 2`
+    /// bytes per vector. SIMD widen via `(u16 → u32 → f32 shift)`
+    /// in front of the distance kernel.
+    Bf16,
+    /// 8-bit scalar quantization. Per-column per-dim
+    /// `(scale[dim], offset[dim])` arrays live in the sibling
+    /// `codec_meta` region; per-vector body is `dim` u8s. The
+    /// distance kernel fuses dequant with the per-candidate
+    /// distance.
+    Sq8,
+    /// No rerank column at all. The shortlist (1-bit RaBitQ
+    /// scores) is the final ranking. Opt-in — recall drops
+    /// 0.05–0.15 on typical normalized-Gaussian / image-
+    /// embedding corpora; trade-off is a ~30× segment-size
+    /// shrink at 1M × 384.
+    None,
+}
+
+impl Default for RerankCodec {
+    /// `Sq8` shrinks the `full[]` rerank region to `dim × 1`
+    /// bytes per vector — 4× smaller than fp32, ~3.5× smaller
+    /// overall segment at 1M × 384 — at a typical recall drop
+    /// < 0.005 vs fp32 on normalized embeddings. Callers that
+    /// need bit-exact fp32 (oracles, regression fixtures,
+    /// recall-floor reference runs) opt in to
+    /// [`RerankCodec::Fp32`] explicitly.
+    fn default() -> Self {
+        Self::Sq8
+    }
+}
+
+impl RerankCodec {
+    /// On-disk discriminator byte. Lives at offset 52 inside the
+    /// 64-byte per-column directory entry. `0` is reserved for
+    /// [`Self::Fp32`] so fp32-only segments that left the slot
+    /// zero round-trip identically.
+    #[inline]
+    pub const fn codec_id(self) -> u8 {
+        match self {
+            Self::Fp32 => 0,
+            Self::Bf16 => 1,
+            Self::Sq8 => 2,
+            Self::None => 3,
+        }
+    }
+
+    /// Inverse of [`Self::codec_id`]. Returns `None` for unknown
+    /// discriminator bytes — the reader treats that as a
+    /// `MalformedVersion` failure so a corrupted / future segment
+    /// fails loud rather than mis-decoding.
+    #[inline]
+    pub const fn from_codec_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Fp32),
+            1 => Some(Self::Bf16),
+            2 => Some(Self::Sq8),
+            3 => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Stable human-readable name, used in JSON-config + error
+    /// strings.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Bf16 => "bf16",
+            Self::Sq8 => "sq8",
+            Self::None => "none",
+        }
+    }
+
+    /// Per-vector body size in bytes inside the `full[]` region.
+    /// `0` for [`Self::None`] (no rerank bytes at all).
+    #[inline]
+    pub const fn per_vector_bytes(self, dim: usize) -> usize {
+        match self {
+            Self::Fp32 => dim * 4,
+            Self::Bf16 => dim * 2,
+            Self::Sq8 => dim,
+            Self::None => 0,
+        }
+    }
+
+    /// Whether the build + search paths implement this codec.
+    /// All four enum variants are currently implemented; this
+    /// hook exists so future codecs can be added to the enum
+    /// (and the on-disk discriminator table) before their build
+    /// path lands — call sites use it to fail fast with a
+    /// targeted `Unimplemented` error rather than silently
+    /// writing a byte format that the reader can't decode.
+    #[inline]
+    pub const fn is_implemented(self) -> bool {
+        matches!(self, Self::Fp32 | Self::Bf16 | Self::Sq8 | Self::None)
+    }
+
+    /// Recommended **lower bound** on `rerank_mult` for this
+    /// codec at the given `dim`. Returns `None` for codecs
+    /// where rerank is meaningless (today: just [`Self::None`],
+    /// which skips the rerank step entirely).
+    ///
+    /// Sq8 needs more candidates to recover fp32-equivalent
+    /// recall because the dequant noise floor is higher than
+    /// fp32 / bf16. Bf16's rounding noise at ~2⁻⁸ per lane is
+    /// well below the 1-bit shortlist's noise floor — same
+    /// recommended floor as fp32. The bench harness uses this
+    /// as the calibration-grid lower bound; direct
+    /// `search(.., rerank_mult)` callers are unaffected.
+    ///
+    /// Numbers calibrated against FAISS-doc peer benchmarks.
+    #[inline]
+    pub const fn recommended_rerank_mult_floor(self, dim: usize) -> Option<usize> {
+        let high_dim = dim > LOW_DIM_RERANK_FLOOR_THRESHOLD;
+        match self {
+            Self::Fp32 | Self::Bf16 => Some(if high_dim {
+                FP32_BF16_HIGH_DIM_RERANK_FLOOR
+            } else {
+                FP32_BF16_LOW_DIM_RERANK_FLOOR
+            }),
+            Self::Sq8 => Some(if high_dim {
+                SQ8_HIGH_DIM_RERANK_FLOOR
+            } else {
+                SQ8_LOW_DIM_RERANK_FLOOR
+            }),
+            Self::None => None,
+        }
+    }
+
+    /// Returns the per-column `codec_meta` region size in bytes
+    /// for this codec at the given dim + n_docs + n_cent + metric.
+    /// Stored immediately before the subsection's `full[]` region.
+    ///
+    /// - `Fp32` / `Bf16` / `None`: `0` (no codec metadata).
+    /// - `Sq8`: **per-cluster** per-dim `(scale, offset)` arrays
+    ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`-metric
+    ///   columns, a per-doc `sum_x_decoded² : f32` table
+    ///   (`n_docs × 4` bytes) used to short-circuit the `Σx²`
+    ///   term in the L2Sq distance formula at search time
+    ///   (dim u8-widens + multiplies saved per rerank candidate).
+    ///   Cosine / NegDot columns drop the per-doc norms.
+    ///
+    /// **Why per-cluster, not per-column.** A naive design uses
+    /// one `(scale[dim], offset[dim])` pair for the whole
+    /// column. On highly clustered cosine corpora (real sentence
+    /// embeddings, the bench's planted-cluster generator) the
+    /// per-column min/max spans the cross-cluster spread — but the
+    /// rerank step's ranking signal lives in the *intra-cluster*
+    /// spread, which is several times narrower. With 256 buckets
+    /// stretched across the wider global range, only a small slice
+    /// of them is used within any one cluster; the quantization
+    /// noise dominates intra-cluster cosine differences and recall
+    /// collapses (the planted-cluster diagnostic in `reader.rs`
+    /// reproduces the failure mode at small scale). Per-cluster
+    /// quantizer recovers full recall by giving each cluster's docs
+    /// the finest possible buckets over their local range. Cost is
+    /// `n_cent × dim × 8` codec_meta bytes — small relative to
+    /// the Sq8 `full[]` region at typical IVF shapes.
+    #[inline]
+    pub const fn codec_meta_bytes(
+        self,
+        dim: usize,
+        n_docs: usize,
+        n_cent: usize,
+        metric: Metric,
+    ) -> usize {
+        match self {
+            Self::Fp32 | Self::Bf16 | Self::None => 0,
+            Self::Sq8 => {
+                let scale_offset_bytes = 2 * n_cent * dim * 4;
+                let norms_bytes = match metric {
+                    Metric::L2Sq => n_docs * 4,
+                    Metric::Cosine | Metric::NegDot => 0,
+                };
+                scale_offset_bytes + norms_bytes
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RerankCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default codec is `Sq8`. Any change here is a load-bearing
+    /// format choice — every caller that uses
+    /// `RerankCodec::default()` silently follows this pick, so
+    /// the test pins the contract.
+    #[test]
+    fn default_is_sq8() {
+        assert_eq!(RerankCodec::default(), RerankCodec::Sq8);
+    }
+
+    /// `Fp32`'s codec_id is zero. Pre-012 segments have all-zero
+    /// reserved bytes in the directory-entry slot we squat on
+    /// for the codec discriminator; the zero match keeps them
+    /// readable as `Fp32` without a format bump.
+    #[test]
+    fn fp32_codec_id_is_zero() {
+        assert_eq!(RerankCodec::Fp32.codec_id(), 0u8);
+    }
+
+    /// Round-trip every defined variant through `codec_id` /
+    /// `from_codec_id`. Catches accidental enum reordering — the
+    /// discriminator is on-disk so the numeric mapping is part of
+    /// the format contract.
+    #[test]
+    fn codec_id_roundtrips_every_variant() {
+        for c in [
+            RerankCodec::Fp32,
+            RerankCodec::Bf16,
+            RerankCodec::Sq8,
+            RerankCodec::None,
+        ] {
+            assert_eq!(
+                RerankCodec::from_codec_id(c.codec_id()),
+                Some(c),
+                "round-trip mismatch for {c:?}"
+            );
+        }
+    }
+
+    /// Unknown discriminator bytes (any value not currently
+    /// assigned, e.g. `5`, `255`) return `None`. The reader
+    /// upgrades that into a `MalformedVersion` error rather than
+    /// guessing.
+    #[test]
+    fn unknown_codec_id_is_none() {
+        for id in [4u8, 5, 16, 200, 255] {
+            assert_eq!(
+                RerankCodec::from_codec_id(id),
+                None,
+                "unknown id {id} must not map to a codec"
+            );
+        }
+    }
+
+    /// Per-vector body sizes match the on-disk spec. `None`'s
+    /// zero is what lets that codec drop the entire `full[]`
+    /// region.
+    #[test]
+    fn per_vector_bytes_matches_spec() {
+        assert_eq!(RerankCodec::Fp32.per_vector_bytes(384), 1536);
+        assert_eq!(RerankCodec::Bf16.per_vector_bytes(384), 768);
+        assert_eq!(RerankCodec::Sq8.per_vector_bytes(384), 384);
+        assert_eq!(RerankCodec::None.per_vector_bytes(384), 0);
+    }
+
+    /// All four codecs are wired end-to-end (build + open + search).
+    #[test]
+    fn all_codecs_implemented() {
+        assert!(RerankCodec::Fp32.is_implemented());
+        assert!(RerankCodec::Bf16.is_implemented());
+        assert!(RerankCodec::Sq8.is_implemented());
+        assert!(RerankCodec::None.is_implemented());
+    }
+
+    /// Calibration-floor table the bench harness threads into
+    /// its calibration grid. The hard contract is the values +
+    /// the `None`-returns-`None` behaviour; the dim split
+    /// (`> 384`) is one of two load-bearing knobs the bench
+    /// harness reads.
+    #[test]
+    fn recommended_rerank_mult_floor_matches_calibration_table() {
+        // dim ≤ 384 column.
+        assert_eq!(
+            RerankCodec::Fp32.recommended_rerank_mult_floor(384),
+            Some(20)
+        );
+        assert_eq!(
+            RerankCodec::Bf16.recommended_rerank_mult_floor(384),
+            Some(20)
+        );
+        assert_eq!(
+            RerankCodec::Sq8.recommended_rerank_mult_floor(384),
+            Some(50)
+        );
+        assert_eq!(RerankCodec::None.recommended_rerank_mult_floor(384), None);
+        // 384 < dim ≤ 1024 column.
+        assert_eq!(
+            RerankCodec::Fp32.recommended_rerank_mult_floor(1024),
+            Some(50)
+        );
+        assert_eq!(
+            RerankCodec::Bf16.recommended_rerank_mult_floor(1024),
+            Some(50)
+        );
+        assert_eq!(
+            RerankCodec::Sq8.recommended_rerank_mult_floor(1024),
+            Some(100)
+        );
+        assert_eq!(RerankCodec::None.recommended_rerank_mult_floor(1024), None);
+        // Split point: dim == 384 is the low-dim cell; dim == 385
+        // crosses into high-dim.
+        assert_eq!(
+            RerankCodec::Sq8.recommended_rerank_mult_floor(385),
+            Some(100)
+        );
+    }
+
+    /// Sq8's codec_meta size: `8·n_cent·dim` for cosine / negdot,
+    /// `8·n_cent·dim + 4·n_docs` for L2Sq (per-doc decoded-norm
+    /// cache). Fp32 / Bf16 / None always contribute zero bytes.
+    /// Per-cluster scale/offset is the recall-recovery fix
+    /// landed in the Sq8PerCluster patch (see fn-doc above).
+    #[test]
+    fn codec_meta_bytes_matches_layout_spec() {
+        // Fp32 + Bf16 + None never carry codec_meta.
+        for c in [RerankCodec::Fp32, RerankCodec::Bf16, RerankCodec::None] {
+            for m in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+                assert_eq!(
+                    c.codec_meta_bytes(384, 1_000_000, 1024, m),
+                    0,
+                    "{c:?} / {m:?}"
+                );
+            }
+        }
+        // Sq8 cosine / negdot: per-cluster scale + offset arrays.
+        let so_bytes = 2 * 1024 * 384 * 4;
+        assert_eq!(
+            RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::Cosine),
+            so_bytes
+        );
+        assert_eq!(
+            RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
+            so_bytes
+        );
+        // Sq8 L2Sq: per-cluster scale + offset + per-doc norms.
+        assert_eq!(
+            RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::L2Sq),
+            so_bytes + 1_000_000 * 4
+        );
+    }
+}

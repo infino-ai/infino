@@ -106,6 +106,8 @@ pub struct VectorConfig {
     pub n_cent: usize,
     pub rot_seed: u64,
     pub metric: Metric,
+    /// On-disk rerank codec. Defaults to [`RerankCodec::Sq8`].
+    pub rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec,
 }
 
 /// All knobs needed to build a superfile.
@@ -340,6 +342,7 @@ impl SuperfileBuilder {
                     n_cent: vc.n_cent,
                     rot_seed: vc.rot_seed,
                     metric: vc.metric,
+                    rerank_codec: vc.rerank_codec,
                 })?;
             }
             Some(vb)
@@ -945,6 +948,7 @@ mod tests {
             n_cent: 64,
             rot_seed: 99,
             metric: Metric::L2Sq,
+            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
         }];
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""name":"emb""#));

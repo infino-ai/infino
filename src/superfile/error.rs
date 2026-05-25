@@ -36,6 +36,16 @@ pub enum BuildError {
     #[error("vector column {column:?} declares dim={dim}; must be in [16, 4096]")]
     VectorDimOutOfRange { column: String, dim: usize },
 
+    /// The column requested a rerank codec that this build of infino
+    /// does not implement. Supported codecs today: `fp32`, `bf16`,
+    /// `sq8`, `none` (see
+    /// [`crate::superfile::vector::rerank_codec::RerankCodec`]).
+    #[error(
+        "vector column {column:?}: rerank codec {codec:?} is not supported; \
+         supported codecs are fp32, bf16, sq8, none"
+    )]
+    VectorRerankCodecUnimplemented { column: String, codec: &'static str },
+
     #[error(
         "vector column {column:?}: query/added vector dim {actual} does not match declared dim {expected}"
     )]

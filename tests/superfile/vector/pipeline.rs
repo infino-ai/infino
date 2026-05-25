@@ -7,6 +7,7 @@ use bytes::Bytes;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, normalize};
 use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 
 /// Build a 2-column vector blob: text_emb (dim=16, cosine) and
 /// image_emb (dim=24, l2sq), each with `n_docs` deterministic vectors.
@@ -18,6 +19,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         n_cent: 4,
         rot_seed: 11,
         metric: Metric::Cosine,
+        rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
     b.register_column(VectorConfig {
@@ -26,6 +28,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         n_cent: 4,
         rot_seed: 22,
         metric: Metric::L2Sq,
+        rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
 
@@ -144,6 +147,7 @@ fn end_to_end_planted_clusters_recovered() {
         n_cent: 3,
         rot_seed: 42,
         metric: Metric::L2Sq,
+        rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
 
