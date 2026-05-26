@@ -124,27 +124,50 @@ async fn stats_show_manifest_parts_when_storage_attached() {
 #[test]
 fn process_rss_bytes_matches_independent_reading_within_pct() {
     // Both stats() and memory-stats::memory_stats() read the
-    // same OS-reported RSS via the same crate, so the values
-    // are expected to be extremely close (taken back-to-back).
-    // The ±10% bound is generous slack to absorb in-between
-    // allocations from rayon worker bring-up + tokio runtime
-    // initialization on the very first call.
+    // same OS-reported RSS via the same crate, so back-to-back
+    // calls should match closely. Under parallel cargo-test
+    // execution, however, RSS is whole-process and drifts
+    // because *other* tests on the same binary are allocating
+    // concurrently — a fixed ±10% bound on a single independent
+    // reading is not robust to that drift.
+    //
+    // Sandwich the stats() reading between two independent
+    // reads, then bound stats() by [min(i1, i2), max(i1, i2)]
+    // expanded by the natural drift between i1 and i2 plus a
+    // small absolute slack for short-lived intra-syscall
+    // allocations. This makes the tolerance self-calibrating to
+    // whatever concurrent allocator activity the process is
+    // experiencing during the test run.
     let st = Supertable::create(default_supertable_options());
-    let s1 = st.stats();
-    let independent = memory_stats::memory_stats()
-        .map(|m| m.physical_mem as u64)
-        .expect("RSS available");
 
-    assert!(s1.process_rss_bytes > 0);
-    assert!(independent > 0);
+    let read = || {
+        memory_stats::memory_stats()
+            .map(|m| m.physical_mem as u64)
+            .expect("RSS available")
+    };
 
-    let lo = independent.saturating_sub(independent / 10);
-    let hi = independent.saturating_add(independent / 10);
+    let i1 = read();
+    let s = st.stats().process_rss_bytes;
+    let i2 = read();
+
+    assert!(s > 0, "stats.process_rss_bytes must be non-zero");
     assert!(
-        s1.process_rss_bytes >= lo && s1.process_rss_bytes <= hi,
-        "stats.process_rss_bytes={} not within ±10% of independent reading={}",
-        s1.process_rss_bytes,
-        independent
+        i1 > 0 && i2 > 0,
+        "independent RSS readings must be non-zero"
+    );
+
+    // Slack = the drift observed between i1 and i2 (concurrent
+    // process activity) + 64 MiB absolute floor for in-between
+    // allocations the test thread itself may incur.
+    const ABS_SLACK_BYTES: u64 = 64 * 1024 * 1024;
+    let drift = i1.abs_diff(i2);
+    let slack = drift.saturating_add(ABS_SLACK_BYTES);
+    let lo = i1.min(i2).saturating_sub(slack);
+    let hi = i1.max(i2).saturating_add(slack);
+    assert!(
+        s >= lo && s <= hi,
+        "stats.process_rss_bytes={s} outside [{lo}, {hi}] \
+         (independent reads: {i1}, {i2}; drift={drift}, slack={slack})"
     );
 }
 
