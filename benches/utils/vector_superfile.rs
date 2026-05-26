@@ -28,7 +28,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use crate::corpus::{self, Calibrated, DIM};
 use crate::{markdown, rss};
 use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
 
 // ─── Fixtures ────────────────────────────────────────────────────────
 
-static VECTORS: OnceLock<corpus::MmapCorpus> = OnceLock::new();
+static VECTORS: OnceLock<corpus::MmapVectorCorpus> = OnceLock::new();
 static QUERIES_CORRECTNESS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static QUERIES_CALIBRATION: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
@@ -73,7 +73,7 @@ fn vectors() -> &'static [f32] {
             // Raw corpus fixture only. Build/search still exercise Infino's
             // normal vector builder/reader paths; the mmap avoids pinning the
             // synthetic source corpus as heap RAM.
-            corpus::MmapCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
+            corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
         })
         .as_slice()
 }
@@ -117,7 +117,8 @@ fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
     let n_cent = corpus::n_cent(N_DOCS);
     let json =
         format!(r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
-    VectorReader::open(Bytes::from(blob), &json).expect("open VectorReader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open VectorReader")
 }
 
 // ─── Correctness ──────────────────────────────────────────────────────

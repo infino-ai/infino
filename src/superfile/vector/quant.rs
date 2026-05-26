@@ -14,7 +14,7 @@
 //! See `docs/architecture/superfile.md` (Vector index algorithm
 //! subsection) for the full RaBitQ rationale and recall trade-offs.
 
-use wide::f32x8;
+use wide::{CmpGt, f32x8};
 
 /// 1-bit quantizer + estimator for vectors of fixed dimension `dim`.
 /// Construct once per column at index-build time; reuse for both
@@ -51,17 +51,41 @@ impl BitQuantizer {
 
     /// Encode one already-rotated f32 vector into bits. `out` must be
     /// exactly `code_bytes()` long.
+    ///
+    /// Hot dense path at build time: every input vector is bit-packed
+    /// here exactly once. The 8-lane SIMD loop processes one output
+    /// byte per iteration via `f32x8::simd_gt(ZERO).to_bitmask()` —
+    /// lowers to one `_mm256_cmp_ps` + one `_mm256_movemask_ps` on
+    /// AVX2 hosts and falls back to two `_mm_cmpgt_ps` + two
+    /// `_mm_movemask_ps` (combined) on SSE2 hosts via `wide`'s
+    /// `pick!` dispatch. Tail dimensions (`dim % 8 != 0`) go through
+    /// a scalar bit-set loop into the partial last byte.
     #[inline]
     pub fn encode_rotated_into(&self, rotated: &[f32], out: &mut [u8]) {
         debug_assert_eq!(rotated.len(), self.dim);
         debug_assert_eq!(out.len(), self.code_bytes());
-        for b in out.iter_mut() {
-            *b = 0;
+        let zero = f32x8::ZERO;
+        let full_bytes = self.dim / 8;
+        for byte_idx in 0..full_bytes {
+            let lane: [f32; 8] = rotated[byte_idx * 8..byte_idx * 8 + 8]
+                .try_into()
+                .expect("slice [byte_idx*8..byte_idx*8+8] has length 8");
+            let v = f32x8::from(lane);
+            // `to_bitmask` returns one u32 whose low 8 bits are the
+            // sign/comparison bits for each lane, in lane-order — bit
+            // 0 = lane 0 > 0.0, bit 7 = lane 7 > 0.0. Exactly the
+            // bit-order the scalar reference loop produces.
+            out[byte_idx] = v.simd_gt(zero).to_bitmask() as u8;
         }
-        for i in 0..self.dim {
-            if rotated[i] > 0.0 {
-                out[i / 8] |= 1u8 << (i % 8);
+        let tail_start = full_bytes * 8;
+        if tail_start < self.dim {
+            let mut byte: u8 = 0;
+            for i in 0..(self.dim - tail_start) {
+                if rotated[tail_start + i] > 0.0 {
+                    byte |= 1u8 << i;
+                }
             }
+            out[full_bytes] = byte;
         }
     }
 

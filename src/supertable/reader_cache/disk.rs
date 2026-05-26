@@ -332,11 +332,9 @@ impl DiskCacheStore {
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                Err(self
-                    .cold_fetch(uri)
+                self.cold_fetch(uri)
                     .await
-                    .err()
-                    .unwrap_or(DiskCacheError::SuperfileOpen("cold fetch error".into())))
+                    .map(|entry| Arc::clone(&entry.reader))
             }
         }
     }
@@ -379,10 +377,9 @@ impl DiskCacheStore {
                 // BudgetExceeded resolved by an in-flight reservation
                 // rolling back).
                 self.coordinators.remove(uri);
-                match self.cold_fetch_hybrid(uri).await {
-                    Ok(entry) => Ok(Arc::clone(&entry.reader)),
-                    Err(e) => Err(e),
-                }
+                self.cold_fetch_hybrid(uri)
+                    .await
+                    .map(|entry| Arc::clone(&entry.reader))
             }
         }
     }

@@ -178,7 +178,9 @@ pub fn superfiles_sorted_by_centroid_distance(
             _ => (i, f32::INFINITY),
         })
         .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // pdqsort: per-query segment skip ordering. (segment_idx, dist)
+    // tuples are unique by segment_idx, so any tie-break is fine.
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.into_iter().map(|(i, _)| i).collect()
 }
 

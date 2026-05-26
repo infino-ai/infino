@@ -41,7 +41,7 @@ use infino::superfile::builder::{
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, normalize};
-use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 use infino::test_helpers::default_tokenizer;
 
 // ─── Scale constants ──────────────────────────────────────────────────
@@ -150,6 +150,75 @@ pub fn generate_text_corpus(n_docs: usize, seed: u64) -> Vec<String> {
     out
 }
 
+/// Disk-backed Zipfian text corpus for large FTS supertable benches.
+///
+/// At 10M docs, `Vec<String>` pins the full corpus on the heap before the
+/// writer under test starts. This mirrors [`MmapVectorCorpus`]: store UTF-8
+/// bytes in a temp file, keep only an offset table in memory, and materialize
+/// Arrow string arrays one append chunk at a time.
+pub struct MmapTextCorpus {
+    _tmp: TempDir,
+    map: Mmap,
+    offsets: Vec<u64>,
+}
+
+impl MmapTextCorpus {
+    pub fn generate(n_docs: usize, seed: u64) -> Self {
+        let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
+        let path = tmp.path().join("corpus.txt");
+        let file = File::create(&path).expect("create text corpus file");
+        let mut writer = BufWriter::with_capacity(8 << 20, file);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let zipf = ZipfDistribution::new(VOCAB_SIZE);
+        let mut offsets = Vec::with_capacity(n_docs + 1);
+        let mut pos = 0u64;
+        offsets.push(pos);
+
+        for doc_id in 0..n_docs {
+            let token = format!("doc{doc_id:07}");
+            writer.write_all(token.as_bytes()).expect("write doc token");
+            pos += token.len() as u64;
+
+            for _ in 0..TOKENS_PER_DOC {
+                let term = format!(" term{:05}", zipf.sample(&mut rng));
+                writer.write_all(term.as_bytes()).expect("write term");
+                pos += term.len() as u64;
+            }
+
+            offsets.push(pos);
+        }
+
+        let file = writer.into_inner().expect("flush text corpus writer");
+        file.sync_all().expect("sync text corpus");
+        drop(file);
+
+        let file = File::open(&path).expect("reopen text corpus");
+        // SAFETY: this helper owns the temp file and never writes to it after
+        // the fsync above, so the read-only mmap cannot observe mutation.
+        let map = unsafe { Mmap::map(&file).expect("mmap text corpus") };
+        Self {
+            _tmp: tmp,
+            map,
+            offsets,
+        }
+    }
+
+    pub fn n_docs(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn doc(&self, idx: usize) -> &str {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        std::str::from_utf8(&self.map[start..end]).expect("generated corpus is valid UTF-8")
+    }
+
+    pub fn chunk_strs(&self, start: usize, len: usize) -> Vec<&str> {
+        let end = (start + len).min(self.n_docs());
+        (start..end).map(|idx| self.doc(idx)).collect()
+    }
+}
+
 // ─── Vector corpus ────────────────────────────────────────────────────
 
 /// Generate `n_docs` planted-cluster vectors of [`DIM`] dimensions,
@@ -215,16 +284,16 @@ pub fn generate_vector_corpus(
 /// and commit through the same path production callers use. The mmap lets
 /// ingestion, query generation, and brute-force recall share one deterministic
 /// corpus without keeping the whole corpus on the heap.
-pub struct MmapCorpus {
+pub struct MmapVectorCorpus {
     _tmp: TempDir,
     map: Mmap,
     n_docs: usize,
     dim: usize,
 }
 
-impl MmapCorpus {
+impl MmapVectorCorpus {
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
-        let tmp = TempDir::new().expect("create MmapCorpus tempdir");
+        let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
         let file = File::create(&path).expect("create corpus file");
         let mut writer = BufWriter::with_capacity(8 << 20, file);
@@ -544,7 +613,8 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
     let json = format!(
         r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
     );
-    VectorReader::open(Bytes::from(blob), &json).expect("open VectorReader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open VectorReader")
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.

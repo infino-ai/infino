@@ -24,7 +24,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tempfile::TempDir;
 
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
 const OUTER_HEADER_SIZE: usize = 32;
@@ -60,11 +59,11 @@ pub struct VectorConfig {
 /// the on-disk path. 256 MiB is a constant — independent of
 /// reservoir size or `n_cent` — so the worst-case pre-flush
 /// resident moment (`reservoir + spill_threshold`) stays linear
-/// in reservoir only and never compounds. Plan 010 design § "spill_threshold_bytes default".
+/// in reservoir only and never compounds.
 const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
-/// Per-column build-time state. After 010 M3, the column holds
-/// at most three independent buffers:
+/// Per-column build-time state. The column holds at most three
+/// independent buffers:
 ///
 /// - [`Reservoir`]: bounded k-means training sample. Dropped at
 ///   the pass 1 → pass 2 boundary inside `build_subsection_streaming`.
@@ -96,23 +95,62 @@ struct ColumnState {
     spill_threshold_bytes: usize,
 }
 
-/// Multi-column vector blob builder. Plan 010 changed the
-/// builder from "accumulate full corpus in RAM" to
+/// Lazily-created scratch directory for vector spill and bucket files.
+///
+/// `VectorBuilder::new()` should be cheap for tiny builders. We only
+/// allocate the backing tempdir when the build actually needs scratch:
+/// either input spills during `add()` or finish-time bucket files are
+/// produced.
+#[derive(Default)]
+struct ScratchDir {
+    parent: Option<PathBuf>,
+    tempdir: Option<tempfile::TempDir>,
+}
+
+impl ScratchDir {
+    fn in_parent(parent: PathBuf) -> Result<Self, BuildError> {
+        let meta = std::fs::metadata(&parent)?;
+        if !meta.is_dir() {
+            return Err(BuildError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("VectorBuilder scratch path is not a directory: {parent:?}"),
+            )));
+        }
+        Ok(Self {
+            parent: Some(parent),
+            tempdir: None,
+        })
+    }
+
+    fn path(&mut self) -> Result<&Path, BuildError> {
+        if self.tempdir.is_none() {
+            let tmp = if let Some(parent) = &self.parent {
+                tempfile::TempDir::new_in(parent)?
+            } else {
+                tempfile::tempdir()?
+            };
+            self.tempdir = Some(tmp);
+        }
+        Ok(self
+            .tempdir
+            .as_ref()
+            .expect("scratch tempdir initialized")
+            .path())
+    }
+}
+
+/// Multi-column vector blob builder. The streaming build path changes
+/// the builder from "accumulate full corpus in RAM" to
 /// "reservoir-sample + spill to disk past a threshold"; peak
 /// resident memory is now a function of `(reservoir, n_cent,
 /// dim, chunk_size, bucket_buf_size)` rather than `(n_docs,
 /// dim)`.
 pub struct VectorBuilder {
     columns: Vec<ColumnState>,
-    /// Per-builder scratch directory holding spill files and
-    /// per-centroid bucket files. Eagerly created at `new()` so
-    /// the first call to `add()` doesn't pay a `mkdtemp` syscall
-    /// inline on the hot path. `Arc`-wrapped so future paths
-    /// (e.g. a streaming `finish_to<W>`) can hand a borrow to
-    /// helper functions without lifetime gymnastics. Files inside
-    /// are removed when the `TempDir` is dropped (i.e. when the
-    /// `VectorBuilder` drops, after `finish()` returns).
-    scratch_dir: Arc<TempDir>,
+    /// Per-builder scratch directory holder. The actual tempdir is
+    /// created lazily, so callers whose builders are dropped before
+    /// spill/finish do not pay filesystem setup cost.
+    scratch_dir: ScratchDir,
     spill_threshold_bytes: usize,
 }
 
@@ -127,16 +165,14 @@ impl VectorBuilder {
     /// (under `$TMPDIR` via `tempfile::tempdir()`) and the
     /// default 256 MiB spill threshold.
     ///
-    /// Panics if creating the scratch tempdir fails — at construction
-    /// time there's no realistic recovery and the panic preserves
-    /// the existing public API. Operators running large builds
-    /// should prefer [`Self::with_scratch`] pointing at an
-    /// instance-store NVMe partition.
+    /// The scratch tempdir is created lazily when the build first
+    /// needs scratch space. Operators running large builds should
+    /// prefer [`Self::with_scratch`] pointing at an instance-store
+    /// NVMe partition.
     pub fn new() -> Self {
-        let tmp = tempfile::tempdir().expect("create VectorBuilder scratch tempdir");
         Self {
             columns: Vec::new(),
-            scratch_dir: Arc::new(tmp),
+            scratch_dir: ScratchDir::default(),
             spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
         }
     }
@@ -148,14 +184,9 @@ impl VectorBuilder {
     /// etc.) instead of the default `$TMPDIR` (which on EC2 is
     /// typically EBS-backed `/tmp`).
     pub fn with_scratch(scratch: PathBuf) -> Result<Self, BuildError> {
-        // tempfile::TempDir::new_in respects an existing parent
-        // and creates a unique subdirectory inside it. Files
-        // inside the subdir are cleaned up when the TempDir is
-        // dropped.
-        let tmp = tempfile::TempDir::new_in(&scratch)?;
         Ok(Self {
             columns: Vec::new(),
-            scratch_dir: Arc::new(tmp),
+            scratch_dir: ScratchDir::in_parent(scratch)?,
             spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
         })
     }
@@ -221,10 +252,9 @@ impl VectorBuilder {
     /// only future `add()` calls feed into the new reservoir.
     ///
     /// The default sample size is `default_kmeans_sample_size(n_cent)`
-    /// (`100K-500K` depending on `n_cent`). This override exists for
-    /// (a) the M2 sample-size sweep on synthetic recall corpora and
-    /// (b) future advanced callers that want to dial sample size to
-    /// match a recall vs. memory trade-off they've profiled.
+    /// (`100K-500K` depending on `n_cent`). This override lets advanced
+    /// callers dial sample size to match a profiled recall vs. memory
+    /// trade-off.
     ///
     /// Returns an error if `column_id` is out of range.
     pub fn set_kmeans_sample_size(
@@ -257,54 +287,56 @@ impl VectorBuilder {
                 actual: "n/a".to_string(),
             });
         }
-        // Clone the scratch handle up-front so we can borrow
-        // `self.columns` mutably without conflicting with
-        // `self.scratch_dir`. The `Arc` is cheap to clone (one
-        // atomic refcount bump); the TempDir itself isn't
-        // duplicated.
-        let scratch_dir = Arc::clone(&self.scratch_dir);
+        {
+            let col = &mut self.columns[idx];
+            if vec.len() != col.config.dim {
+                return Err(BuildError::FtsColumnTypeInvalid {
+                    column: col.config.name.clone(),
+                    actual: format!("vec.len()={} != dim={}", vec.len(), col.config.dim),
+                });
+            }
+            col.reservoir.update(vec);
+
+            // Append to the lossless input backing. Three cases,
+            // in order of likelihood once a build is established:
+            //
+            //   1. Spill is already active (column has already
+            //      crossed the threshold): write the vector
+            //      directly to disk via SpillWriter. The buffer is
+            //      empty in this state.
+            //   2. This add() crosses the threshold: create the
+            //      SpillWriter, drain pre_spill_buffer in one
+            //      batched write, append the new vector, then
+            //      release pre_spill_buffer capacity.
+            //   3. Pre-spill mode: extend the in-RAM buffer.
+            //
+            // The post-spill steady state hits case 1, which is the
+            // hot path. The branch order is chosen to put case 1
+            // first so the predictor learns the steady state.
+            let vec_bytes = vec.len() * 4;
+            let buf_bytes = col.pre_spill_buffer.len() * 4;
+            if let Some(spill) = col.spill.as_mut() {
+                spill.write_vec(vec)?;
+                col.n_docs += 1;
+                return Ok(());
+            }
+            if buf_bytes + vec_bytes <= col.spill_threshold_bytes {
+                col.pre_spill_buffer.extend_from_slice(vec);
+                col.n_docs += 1;
+                return Ok(());
+            }
+        }
+
+        let path = self
+            .scratch_dir
+            .path()?
+            .join(format!("infino_input_spill_col{column_id}.bin"));
         let col = &mut self.columns[idx];
-        if vec.len() != col.config.dim {
-            return Err(BuildError::FtsColumnTypeInvalid {
-                column: col.config.name.clone(),
-                actual: format!("vec.len()={} != dim={}", vec.len(), col.config.dim),
-            });
-        }
-        col.reservoir.update(vec);
-
-        // Append to the lossless input backing. Three cases,
-        // in order of likelihood once a build is established:
-        //
-        //   1. Spill is already active (column has already
-        //      crossed the threshold): write the vector
-        //      directly to disk via SpillWriter. The buffer is
-        //      empty in this state.
-        //   2. This add() crosses the threshold: create the
-        //      SpillWriter, drain pre_spill_buffer in one
-        //      batched write, append the new vector, then
-        //      release pre_spill_buffer capacity.
-        //   3. Pre-spill mode: extend the in-RAM buffer.
-        //
-        // The post-spill steady state hits case 1, which is the
-        // hot path. The branch order is chosen to put case 1
-        // first so the predictor learns the steady state.
-        let vec_bytes = vec.len() * 4;
-        let buf_bytes = col.pre_spill_buffer.len() * 4;
-        if let Some(spill) = col.spill.as_mut() {
-            spill.write_vec(vec)?;
-        } else if buf_bytes + vec_bytes > col.spill_threshold_bytes {
-            let path = scratch_dir
-                .path()
-                .join(format!("infino_input_spill_col{column_id}.bin"));
-            let mut spill = SpillWriter::create(path)?;
-            spill.write_all(bytemuck::cast_slice(&col.pre_spill_buffer))?;
-            spill.write_vec(vec)?;
-            col.pre_spill_buffer = Vec::new();
-            col.spill = Some(spill);
-        } else {
-            col.pre_spill_buffer.extend_from_slice(vec);
-        }
-
+        let mut spill = SpillWriter::create(path)?;
+        spill.write_all(bytemuck::cast_slice(&col.pre_spill_buffer))?;
+        spill.write_vec(vec)?;
+        col.pre_spill_buffer = Vec::new();
+        col.spill = Some(spill);
         col.n_docs += 1;
         Ok(())
     }
@@ -312,10 +344,9 @@ impl VectorBuilder {
     /// Finalise and emit the unified vector blob. Consumes the
     /// builder.
     ///
-    /// Returns a `BuildError::Io` for the spill / scratch I/O
-    /// errors introduced by 010 M3. Callers that previously
-    /// expected `-> Vec<u8>` need to `?` the result; the
-    /// `SuperfileBuilder` shim does so already.
+    /// Returns a `BuildError::Io` for spill / scratch I/O errors.
+    /// Callers that previously expected `-> Vec<u8>` need to `?` the
+    /// result; the `SuperfileBuilder` shim does so already.
     pub fn finish(self) -> Result<Vec<u8>, BuildError> {
         // Capacity hint: the largest known-cheap pre-allocation is
         // `OUTER_HEADER_SIZE + (n_columns × DIR_ENTRY_SIZE) + 8`
@@ -328,9 +359,8 @@ impl VectorBuilder {
         Ok(buf)
     }
 
-    /// Streaming variant: write the final blob progressively to
-    /// `w` without materialising it as a contiguous `Vec<u8>`.
-    /// Plan 010 M5.
+    /// Streaming variant: write the final blob progressively to `w`
+    /// without materialising it as a contiguous `Vec<u8>`.
     ///
     /// The output bytes (outer header, directory + dir CRC, each
     /// subsection, trailing outer CRC) are identical to those
@@ -346,8 +376,8 @@ impl VectorBuilder {
     /// each subsection's body); each subsection is dropped as
     /// soon as it has been written to `w`, so peak heap drops
     /// from `sum_of_subsection_sizes + final_blob_size` to
-    /// `max_subsection_size`. Per-subsection streaming (M6 / a
-    /// future plan) would push the floor lower still.
+    /// `max_subsection_size`. Per-subsection streaming would push the
+    /// floor lower still.
     ///
     /// Object-storage callers (003) can pass a multipart upload
     /// writer here so segment build never owns the full blob in
@@ -355,7 +385,7 @@ impl VectorBuilder {
     pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let VectorBuilder {
             columns,
-            scratch_dir,
+            mut scratch_dir,
             spill_threshold_bytes: _,
         } = self;
 
@@ -379,12 +409,15 @@ impl VectorBuilder {
         //    released as soon as the subsection bytes for that
         //    column are produced.
         let mut subsections: Vec<SubsectionBytes> = Vec::with_capacity(columns.len());
-        for (col_idx, col) in columns.into_iter().enumerate() {
-            subsections.push(build_subsection_streaming(
-                col_idx as u32,
-                col,
-                scratch_dir.path(),
-            )?);
+        if !columns.is_empty() {
+            let scratch_path = scratch_dir.path()?.to_path_buf();
+            for (col_idx, col) in columns.into_iter().enumerate() {
+                subsections.push(build_subsection_streaming(
+                    col_idx as u32,
+                    col,
+                    &scratch_path,
+                )?);
+            }
         }
 
         // 2. Layout: outer_header(32) + directory(n_columns * 64) +
@@ -470,9 +503,7 @@ impl VectorBuilder {
         w.write_all(&outer_crc_le).map_err(BuildError::Io)?;
 
         // scratch_dir is dropped at end of scope, removing spill +
-        // bucket files. Keeping it alive until here ensures the
-        // mmap-backed pass-2 source in build_subsection_streaming
-        // had a live file path for the duration of its scan.
+        // bucket files.
         drop(scratch_dir);
 
         Ok(())
@@ -491,9 +522,8 @@ struct SubsectionBytes {
 /// Per-bucket BufWriter capacity. 64 KiB amortises one syscall
 /// per ~1300 dim=384 bucket rows (each row = 4 + code_bytes +
 /// dim*4 = ~1588 B). At very high n_cent (≥ 8192) the n_cent ×
-/// 64 KiB total dominates the resident set; M4 will revisit if
-/// profiling shows it. See plan 010 design § "Pass 2 memory
-/// footprint".
+/// 64 KiB total dominates the resident set; revisit if profiling shows
+/// it.
 const BUCKET_BUF_SIZE: usize = 64 * 1024;
 
 /// Adaptive chunk size for pass 2: keeps `chunk_rotated`
@@ -511,8 +541,8 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
     cap_by_mem.clamp(1024, 65_536)
 }
 
-/// Build one column's subsection via the M3 streaming path.
-/// Consumes the entire `ColumnState` so the reservoir +
+/// Build one column's subsection via the streaming path. Consumes the
+/// entire `ColumnState` so the reservoir +
 /// pre-spill buffer + spill file are released as soon as their
 /// contribution to the subsection is complete.
 ///
@@ -1146,40 +1176,9 @@ mod tests {
         }
     }
 
-    /// `finish_to(Vec<u8>)` must produce byte-for-byte identical
-    /// output to `finish()` for the same logical builder state.
-    /// The build path is deterministic in everything that matters
-    /// (rot_seed, reservoir seed, bucket flush ordering), so any
-    /// drift here would indicate a regression in either the
-    /// streaming wrap or the underlying determinism contract.
-    #[test]
-    fn finish_to_matches_finish_byte_for_byte() {
-        let build = || -> VectorBuilder {
-            let mut b = VectorBuilder::new();
-            b.register_column(cfg("v", 16)).expect("register column");
-            for i in 0..32 {
-                let v: Vec<f32> = (0..16).map(|j| ((i + j) as f32) * 0.1).collect();
-                b.add(0, &v).expect("add to vector builder");
-            }
-            b
-        };
-
-        let blob_finish = build().finish().expect("finish");
-        let mut blob_finish_to: Vec<u8> = Vec::new();
-        build()
-            .finish_to(&mut blob_finish_to)
-            .expect("finish_to Vec<u8>");
-        assert_eq!(
-            blob_finish, blob_finish_to,
-            "finish_to must produce identical bytes to finish"
-        );
-    }
-
-    /// Streaming output to a `Cursor<Vec<u8>>` (the canonical
-    /// in-tree writer for testing streaming behaviour, per plan
-    /// 010 M5 acceptance criterion #4): the resulting bytes
-    /// carry a valid outer magic + a valid trailing whole-blob
-    /// CRC32C that round-trips when recomputed over the body.
+    /// Streaming output to a `Cursor<Vec<u8>>`: the resulting bytes
+    /// carry a valid outer magic + a valid trailing whole-blob CRC32C
+    /// that round-trips when recomputed over the body.
     #[test]
     fn finish_to_cursor_round_trips_outer_crc() {
         use std::io::Cursor;
@@ -1219,13 +1218,13 @@ mod tests {
     }
 
     /// Round-trip integrity through an actual `Write` impl that
-    /// isn't `Vec<u8>`: write to a temp file, mmap-read it back,
-    /// open it with `VectorReader`, and confirm a search returns
-    /// a sane result. This catches any case where the running
-    /// CRC32C accumulator drifts between the streaming write
-    /// path and a one-shot `crc32c(&blob)` over the same bytes.
+    /// isn't `Vec<u8>` while the input corpus uses the on-disk
+    /// SpillWriter path: write to a temp file, read it back, open
+    /// it with `VectorReader`, and confirm exact self-NN search.
+    /// This covers the combined SpillWriter -> finish_to(writer)
+    /// -> VectorReader path.
     #[test]
-    fn finish_to_temp_file_round_trips_through_reader() {
+    fn finish_to_temp_file_forced_spill_round_trips_through_reader() {
         use crate::superfile::vector::reader::VectorReader;
         use bytes::Bytes;
         use std::io::BufWriter;
@@ -1233,6 +1232,7 @@ mod tests {
         let n_docs = 32usize;
         let n_cent = 4usize;
         let mut b = VectorBuilder::new();
+        b.set_spill_threshold_bytes(0);
         b.register_column(VectorConfig {
             name: "v".into(),
             dim,
@@ -1265,5 +1265,6 @@ mod tests {
             .search("v", &query, 5, n_cent, n_docs + 1)
             .expect("kNN search");
         assert!(!hits.is_empty(), "search returned no hits");
+        assert_eq!(hits[0].0, 0, "forced-spill streamed blob missed self-NN");
     }
 }

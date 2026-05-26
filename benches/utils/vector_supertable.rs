@@ -59,7 +59,7 @@ const CORRECTNESS_SUPERTABLE_RERANK_MULT: usize = 256;
 
 // ─── Fixtures ────────────────────────────────────────────────────────
 
-static VECTORS: OnceLock<corpus::MmapCorpus> = OnceLock::new();
+static VECTORS: OnceLock<corpus::MmapVectorCorpus> = OnceLock::new();
 static QUERIES_CORRECTNESS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static QUERIES_CALIBRATION: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
@@ -73,7 +73,7 @@ fn vectors() -> &'static [f32] {
             // Raw corpus fixture only. Ingestion below still goes through
             // RecordBatch -> writer.append() -> commit(); the mmap prevents
             // the synthetic 10M x 384 source corpus from living as heap RAM.
-            corpus::MmapCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
+            corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
         })
         .as_slice()
 }

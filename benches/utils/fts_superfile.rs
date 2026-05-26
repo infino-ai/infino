@@ -67,7 +67,7 @@ fn build_infino_blob_1thread(docs: &[String]) -> Vec<u8> {
     for (i, text) in docs.iter().enumerate() {
         builder.add_doc(0, i as u32, text).expect("add doc");
     }
-    builder.finish()
+    builder.finish().expect("finish FTS blob")
 }
 
 /// Rayon-sharded parallel build. Each shard runs its own `FtsBuilder`

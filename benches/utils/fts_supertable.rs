@@ -1,15 +1,14 @@
 //! Infino-only FTS bench for the supertable layer:
 //!
-//!   ingest timing (10M docs sharded into [`SEGMENTS`] commits)
+//!   ingest timing (10M docs streamed through bounded append chunks)
 //! + 7-query search timing (single rare, single common, OR-2,
 //!   wide-3, similar-3, OR-5, prefix-10)
 //! + self-consistency correctness gate
 //!
-//! Multi-segment shape: the corpus is sharded into [`SEGMENTS`]
-//! commits. Infino's `commit()` row-shards into
-//! `min(writer_pool.threads, total_rows)` superfiles — the writer-pool
-//! size doubles as the output-cardinality dial (auto = `cpus/2`;
-//! override with `INFINO_SUPERTABLE__WRITER_THREADS=N`).
+//! Multi-segment shape: the mmap corpus is materialized into bounded
+//! append chunks. Each commit row-shards into
+//! `min(writer_pool.threads, chunk_rows)` superfiles — the writer-pool
+//! size and append-chunk count together control output cardinality.
 //!
 //! ## Invocation
 //!
@@ -39,24 +38,23 @@ use rayon::ThreadPool;
 /// Doc count for every FTS-supertable bench. Pinned to 10M.
 const N_DOCS: usize = 10_000_000;
 
-/// Input chunk count. Drives the `append()`-batching shape; output
-/// superfile count is governed by writer_pool threads, not this knob.
-const SEGMENTS: usize = 4;
+/// Input chunk count. Keeps each LargeStringArray materialization bounded
+/// instead of building one 20GB Arrow payload for the full 10M corpus.
+const APPEND_CHUNKS: usize = 16;
 
 const TOP_K: usize = 10;
 
 // ─── Fixtures ────────────────────────────────────────────────────────
 
-static DOCS: OnceLock<Vec<String>> = OnceLock::new();
+static TEXT_CORPUS: OnceLock<corpus::MmapTextCorpus> = OnceLock::new();
 static INFINO: OnceLock<Supertable> = OnceLock::new();
 
-fn docs() -> &'static [String] {
-    DOCS.get_or_init(|| corpus::generate_text_corpus(N_DOCS, 1))
-        .as_slice()
+fn text_corpus() -> &'static corpus::MmapTextCorpus {
+    TEXT_CORPUS.get_or_init(|| corpus::MmapTextCorpus::generate(N_DOCS, 1))
 }
 
 fn infino_supertable() -> &'static Supertable {
-    INFINO.get_or_init(|| build_supertable_infino(docs(), parallel_pool()))
+    INFINO.get_or_init(|| build_supertable_infino(text_corpus(), parallel_pool()))
 }
 
 // ─── Shared rayon pool ────────────────────────────────────────────────
@@ -100,30 +98,26 @@ fn supertable_options(reader_pool: Arc<ThreadPool>) -> SupertableOptions {
     )
     .expect("opts")
     .with_reader_pool(reader_pool)
-    // Bench raises the commit-threshold sky-high so `append()` doesn't
-    // auto-flush mid-build. With a 1 GiB default at ~4.5 GB / chunk,
-    // default options would auto-commit after every single append — but
-    // the supertable's `commit()` runs per-shard work in parallel only
-    // **within** a commit. By buffering all chunks before the explicit
-    // final commit below, `commit()` row-shards across all writer-pool
-    // threads in one go.
-    .with_commit_threshold_size_mb(0)
+    .with_commit_threshold_size_mb(1024)
 }
 
-/// Build an FTS-only supertable from `docs`. Append-many-then-commit-
-/// once: each chunk is appended to the writer's buffer; a single
-/// `commit()` at the end drains and row-shards across the writer pool.
-/// Output superfile count is `min(writer_pool.threads, total_rows)`.
-fn build_supertable_infino(docs: &[String], reader_pool: Arc<ThreadPool>) -> Supertable {
+/// Build an FTS-only supertable from an mmap-backed text corpus. Each
+/// chunk is materialized into an Arrow array, appended, committed, and
+/// dropped before the next chunk so the bench does not pin all 10M docs in
+/// both the fixture and writer buffer.
+fn build_supertable_infino(
+    corpus: &corpus::MmapTextCorpus,
+    reader_pool: Arc<ThreadPool>,
+) -> Supertable {
     let st = Supertable::create(supertable_options(reader_pool));
     let mut w = st.writer().expect("writer");
-    let chunk_size = docs.len().div_ceil(SEGMENTS);
-    for chunk in docs.chunks(chunk_size) {
-        let titles = LargeStringArray::from(chunk.iter().map(String::as_str).collect::<Vec<_>>());
+    let chunk_size = corpus.n_docs().div_ceil(APPEND_CHUNKS);
+    for start in (0..corpus.n_docs()).step_by(chunk_size) {
+        let titles = LargeStringArray::from(corpus.chunk_strs(start, chunk_size));
         let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
         w.append(&batch).expect("append");
+        w.commit().expect("commit");
     }
-    w.commit().expect("commit");
     drop(w);
     st
 }
@@ -170,7 +164,7 @@ fn assert_infino_self_consistent(st: &Supertable) {
 
 fn bench_ingest(c: &mut Criterion) {
     eprintln!("[supertable_fts_build] correctness: building infino ({N_DOCS} docs)...");
-    let infino = build_supertable_infino(docs(), parallel_pool());
+    let infino = build_supertable_infino(text_corpus(), parallel_pool());
     assert_infino_self_consistent(&infino);
     eprintln!("[supertable_fts_build] correctness OK: infino self-consistent");
     drop(infino);
@@ -185,7 +179,9 @@ fn bench_ingest(c: &mut Criterion) {
     let rss_sample = rss::PeakSampler::start_default();
 
     g.bench_function("infino_auto_writer_pool", |b| {
-        b.iter_with_large_drop(|| build_supertable_infino(black_box(docs()), parallel_pool()));
+        b.iter_with_large_drop(|| {
+            build_supertable_infino(black_box(text_corpus()), parallel_pool())
+        });
     });
 
     g.finish();
@@ -309,11 +305,11 @@ fn emit_ingest_markdown() {
     body.push_str(&format!(
         "| infino_auto_writer_pool | {time:10} | {thrpt:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
     ));
-    body.push_str(
-        "\n*Output cardinality: infino emits `min(writer_pool.threads, total_rows)` superfiles \
-         per commit (auto = cpus/2). Override with `INFINO_SUPERTABLE__WRITER_THREADS=N` for a \
-         specific shard count.*\n",
-    );
+    body.push_str(&format!(
+        "\n*Output cardinality: infino emits `min(writer_pool.threads, chunk_rows)` superfiles \
+         per commit across {APPEND_CHUNKS} bounded append chunks (writer auto = cpus/2). \
+         Override with `INFINO_SUPERTABLE__WRITER_THREADS=N` for a specific shard count.*\n",
+    ));
 
     markdown::emit(&MarkdownSection {
         anchor_id: "bench/fts/supertable/ingest".into(),

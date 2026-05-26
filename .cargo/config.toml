@@ -1,0 +1,30 @@
+# Vectorization baseline for x86_64 Linux builds.
+#
+# `x86-64-v3` (Haswell, 2013) is the conservative AVX2 baseline:
+# unlocks AVX2 + BMI2 + FMA + MOVBE + LZCNT for both the explicit
+# SIMD code (`wide::f32x8` / `wide::f32x4` distance, quantizer,
+# BM25-x4 scoring) and LLVM's auto-vectoriser, which is what turns
+# the tight `for j in 0..dim` loops in
+# `superfile::vector::kmeans` (assignment + update step) and the
+# `for &dl in &col_dls` doc-lengths writer in
+# `superfile::fts::builder::finish_to` into vectorised code paths.
+#
+# Without `target-cpu`, rustc defaults to the SSE2-only x86-64
+# baseline. That keeps explicit `wide::f32x8` calls SIMD (the
+# crate dispatches internally) but caps auto-vectorisation at
+# 128-bit vectors. AWS `c7i.*` (Sapphire Rapids) is AVX-512
+# capable and `c5.*` / `m5.*` / `c6i.*` are AVX2+; the entire
+# bench fleet handles `x86-64-v3` trivially.
+#
+# We deliberately do *not* set `x86-64-v4` (AVX-512) here because
+# some CI runners (and `c6g.*` ARM hosts via QEMU) don't support
+# it, and AVX-512 frequency-throttling on older Intel parts can
+# regress mixed code. AVX-512 is opt-in via
+# `RUSTFLAGS=-C target-cpu=native` on the bench host.
+#
+# Non-x86_64 targets (Apple Silicon dev machines, ARM CI) hit
+# their own `[target.*]` table (none specified → no override) and
+# get rustc's default for their triple, which already enables
+# NEON.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

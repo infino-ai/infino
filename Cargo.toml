@@ -171,6 +171,7 @@ ferroid = { version = "2", features = ["std", "alloc", "snowflake", "basic"] }
 # because builder.rs holds an `Arc<TempDir>` per builder to
 # back per-centroid bucket files and per-column input spills.
 tempfile = "3"
+hashbrown = "0.17.1"
 
 [dev-dependencies]
 # Self-reference with the `test-helpers` feature enabled so
@@ -180,7 +181,6 @@ tempfile = "3"
 infino = { path = ".", features = ["test-helpers"] }
 infino-bench-utils = { path = "benches/utils" }
 
-tempfile = "3"
 proptest = "1"
 criterion = "0.8"
 hdrhistogram = "7"
