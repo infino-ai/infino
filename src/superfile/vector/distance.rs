@@ -235,7 +235,7 @@ pub(crate) struct Sq8Kernel<'a> {
 impl<'a> Sq8Kernel<'a> {
     /// Build the per-query kernel. `scale` + `offset` are the per-dim
     /// quantizer arrays from the column's `codec_meta`. `per_doc_norms`
-    /// is `Some` iff the column metric is L2Sq.
+    /// is `Some` iff the column metric is L2Sq or Cosine.
     pub fn new(
         metric: Metric,
         query: &[f32],
@@ -306,7 +306,17 @@ impl<'a> Sq8Kernel<'a> {
         }
         let dot = cross + self.q_dot_offset;
         match self.metric {
-            Metric::Cosine => 1.0 - dot,
+            Metric::Cosine => {
+                let norms = self
+                    .per_doc_norms
+                    .expect("Sq8Kernel + Cosine requires per_doc_norms");
+                let x_norm = norms[pos as usize].sqrt();
+                if x_norm > 0.0 {
+                    1.0 - dot / x_norm
+                } else {
+                    1.0 - dot
+                }
+            }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
                 let norms = self
@@ -325,7 +335,15 @@ impl<'a> Sq8Kernel<'a> {
 pub(crate) fn distance_bytes_bf16(metric: Metric, query: &[f32], bytes: &[u8]) -> f32 {
     debug_assert_eq!(query.len() * 2, bytes.len());
     match metric {
-        Metric::Cosine => 1.0 - dot_bf16_bytes(query, bytes),
+        Metric::Cosine => {
+            let (dot, norm_sq) = dot_and_norm_sq_bf16_bytes(query, bytes);
+            let norm = norm_sq.sqrt();
+            if norm > 0.0 {
+                1.0 - dot / norm
+            } else {
+                1.0 - dot
+            }
+        }
         Metric::L2Sq => l2_sq_bf16_bytes(query, bytes),
         Metric::NegDot => -dot_bf16_bytes(query, bytes),
     }
@@ -381,6 +399,41 @@ fn dot_bf16_bytes(query: &[f32], bytes: &[u8]) -> f32 {
         i += 1;
     }
     sum
+}
+
+#[inline]
+fn dot_and_norm_sq_bf16_bytes(query: &[f32], bytes: &[u8]) -> (f32, f32) {
+    debug_assert_eq!(query.len() * 2, bytes.len());
+    let mut dot_acc = f32x8::ZERO;
+    let mut norm_acc = f32x8::ZERO;
+    let mut i = 0;
+    while i + 8 <= query.len() {
+        let qc: [f32; 8] = query[i..i + 8]
+            .try_into()
+            .expect("slice [i..i+8] has length 8");
+        let mut bc = [0f32; 8];
+        let off = i * 2;
+        for (j, slot) in bc.iter_mut().enumerate() {
+            let bf = u16::from_le_bytes([bytes[off + j * 2], bytes[off + j * 2 + 1]]);
+            *slot = bf16_to_f32(bf);
+        }
+        let qv = f32x8::from(qc);
+        let bv = f32x8::from(bc);
+        dot_acc += qv * bv;
+        norm_acc += bv * bv;
+        i += 8;
+    }
+    let mut dot_sum = dot_acc.reduce_add();
+    let mut norm_sum = norm_acc.reduce_add();
+    while i < query.len() {
+        let off = i * 2;
+        let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+        let x = bf16_to_f32(bf);
+        dot_sum += query[i] * x;
+        norm_sum += x * x;
+        i += 1;
+    }
+    (dot_sum, norm_sum)
 }
 
 #[inline]
@@ -663,7 +716,13 @@ mod tests {
         let v: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.3).collect();
         let bytes = encode_bf16(&v);
         for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
-            let d_ref = distance(m, &q, &v);
+            let d_ref = match m {
+                Metric::Cosine => {
+                    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    1.0 - dot(&q, &v) / norm
+                }
+                _ => distance(m, &q, &v),
+            };
             let d_bf16 = distance_bytes_bf16(m, &q, &bytes);
             let abs_err = (d_ref - d_bf16).abs();
             let rel_err = abs_err / d_ref.abs().max(1e-6);
@@ -727,9 +786,19 @@ mod tests {
         let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
         let decoded = decode_sq8(&codes, dim, &scale, &offset);
 
+        let decoded_norm: f32 = decoded.iter().map(|x| x * x).sum();
         for m in [Metric::Cosine, Metric::NegDot] {
-            let want = distance(m, &query, &decoded);
-            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, None);
+            let norms = [decoded_norm];
+            let want = match m {
+                Metric::Cosine => 1.0 - dot(&query, &decoded) / decoded_norm.sqrt(),
+                _ => distance(m, &query, &decoded),
+            };
+            let norms_arg = if matches!(m, Metric::Cosine) {
+                Some(&norms[..])
+            } else {
+                None
+            };
+            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms_arg);
             let got = kernel.distance_at(0, &codes);
             let err = (want - got).abs();
             assert!(
@@ -841,7 +910,7 @@ mod tests {
         let codes_all = encode_sq8(&corpus, dim, &scale, &offset);
         let decoded_all = decode_sq8(&codes_all, dim, &scale, &offset);
 
-        // Per-doc norms for the L2Sq branch — indexed by pos
+        // Per-doc norms for the L2Sq/Cosine branches — indexed by pos
         // matching the builder's contract.
         let per_doc_norms: Vec<f32> = decoded_all
             .chunks_exact(dim)
@@ -850,8 +919,8 @@ mod tests {
 
         for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
             let norms_arg: Option<&[f32]> = match m {
-                Metric::L2Sq => Some(&per_doc_norms),
-                _ => None,
+                Metric::L2Sq | Metric::Cosine => Some(&per_doc_norms),
+                Metric::NegDot => None,
             };
             let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms_arg);
             // Probe a handful of doc positions — exercises both
@@ -861,12 +930,21 @@ mod tests {
                 let codes_doc = &codes_all[(pos as usize) * dim..(pos as usize + 1) * dim];
                 let decoded_doc = &decoded_all[(pos as usize) * dim..(pos as usize + 1) * dim];
                 let got = kernel.distance_at(pos, codes_doc);
-                let want_fp32 = distance(
-                    m,
-                    &query,
-                    &corpus[(pos as usize) * dim..(pos as usize + 1) * dim],
-                );
-                let want_decoded = distance(m, &query, decoded_doc);
+                let fp32_doc = &corpus[(pos as usize) * dim..(pos as usize + 1) * dim];
+                let want_fp32 = match m {
+                    Metric::Cosine => {
+                        let norm = fp32_doc.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        1.0 - dot(&query, fp32_doc) / norm
+                    }
+                    _ => distance(m, &query, fp32_doc),
+                };
+                let want_decoded = match m {
+                    Metric::Cosine => {
+                        let norm = per_doc_norms[pos as usize].sqrt();
+                        1.0 - dot(&query, decoded_doc) / norm
+                    }
+                    _ => distance(m, &query, decoded_doc),
+                };
                 // Kernel must match the decoded reference very
                 // tightly — it's doing the same math, just fused
                 // through the per-query precompute. Difference
