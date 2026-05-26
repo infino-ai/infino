@@ -214,12 +214,12 @@ impl RerankCodec {
     ///
     /// - `Fp32` / `Bf16` / `None`: `0` (no codec metadata).
     /// - `Sq8`: **per-cluster** per-dim `(scale, offset)` arrays
-    ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`-metric
+    ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`/`Cosine`-metric
     ///   columns, a per-doc `sum_x_decoded² : f32` table
     ///   (`n_docs × 4` bytes) used to short-circuit the `Σx²`
-    ///   term in the L2Sq distance formula at search time
-    ///   (dim u8-widens + multiplies saved per rerank candidate).
-    ///   Cosine / NegDot columns drop the per-doc norms.
+    ///   term in the L2Sq distance formula or normalize the decoded
+    ///   vector for Cosine at search time. NegDot columns drop the
+    ///   per-doc norms.
     ///
     /// **Why per-cluster, not per-column.** A naive design uses
     /// one `(scale[dim], offset[dim])` pair for the whole
@@ -250,8 +250,8 @@ impl RerankCodec {
             Self::Sq8 => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
-                    Metric::L2Sq => n_docs * 4,
-                    Metric::Cosine | Metric::NegDot => 0,
+                    Metric::L2Sq | Metric::Cosine => n_docs * 4,
+                    Metric::NegDot => 0,
                 };
                 scale_offset_bytes + norms_bytes
             }
@@ -385,8 +385,8 @@ mod tests {
         );
     }
 
-    /// Sq8's codec_meta size: `8·n_cent·dim` for cosine / negdot,
-    /// `8·n_cent·dim + 4·n_docs` for L2Sq (per-doc decoded-norm
+    /// Sq8's codec_meta size: `8·n_cent·dim` for negdot,
+    /// `8·n_cent·dim + 4·n_docs` for L2Sq/Cosine (per-doc decoded-norm
     /// cache). Fp32 / Bf16 / None always contribute zero bytes.
     /// Per-cluster scale/offset is the recall-recovery fix
     /// landed in the Sq8PerCluster patch (see fn-doc above).
@@ -402,17 +402,17 @@ mod tests {
                 );
             }
         }
-        // Sq8 cosine / negdot: per-cluster scale + offset arrays.
+        // Sq8 negdot: per-cluster scale + offset arrays.
         let so_bytes = 2 * 1024 * 384 * 4;
-        assert_eq!(
-            RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::Cosine),
-            so_bytes
-        );
         assert_eq!(
             RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
             so_bytes
         );
-        // Sq8 L2Sq: per-cluster scale + offset + per-doc norms.
+        // Sq8 L2Sq/Cosine: per-cluster scale + offset + per-doc norms.
+        assert_eq!(
+            RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::Cosine),
+            so_bytes + 1_000_000 * 4
+        );
         assert_eq!(
             RerankCodec::Sq8.codec_meta_bytes(384, 1_000_000, 1024, Metric::L2Sq),
             so_bytes + 1_000_000 * 4

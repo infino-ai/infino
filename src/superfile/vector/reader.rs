@@ -533,7 +533,7 @@ impl VectorReader {
             let full_off = read_u32_le(&sub[52..56]) as usize;
             // Fp32 + Bf16 + None all keep zero-byte codec_meta; Sq8
             // emits per-cluster scale/offset (+ per-doc
-            // norms for L2Sq). The per-codec layout check below
+            // norms for L2Sq/Cosine). The per-codec layout check below
             // validates the declared `codec_meta_off` against the
             // codec's expected size once `col_n_docs` is known.
             let codec_meta_required_zero = matches!(
@@ -619,7 +619,7 @@ impl VectorReader {
                 let offset_end = scale_end + so_block_bytes;
                 let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                 let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                let per_doc_norms = if matches!(metric, Metric::L2Sq) {
+                let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
                     let norms_end = offset_end + (col_n_docs as usize) * 4;
                     debug_assert_eq!(norms_end, actual_codec_meta_size);
                     Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
@@ -1732,10 +1732,10 @@ mod tests {
         assert_eq!(norms.len(), col.n_docs as usize);
     }
 
-    /// Cosine Sq8 columns omit per-doc norms because the `sum(x^2)`
-    /// term is not used by cosine or negative-dot rerank.
+    /// Cosine Sq8 columns carry per-doc decoded norms so rerank can
+    /// normalize the decoded vector before computing cosine distance.
     #[test]
-    fn open_sq8_cosine_omits_per_doc_norms() {
+    fn open_sq8_cosine_carries_per_doc_norms() {
         let dim = 16usize;
         let n_cent = 4usize;
         let n_docs = 32u32;
@@ -1765,10 +1765,11 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
         let meta = col.sq8_meta.as_ref().expect("Sq8 must carry sq8_meta");
-        assert!(
-            meta.per_doc_norms.is_none(),
-            "Cosine Sq8 must omit per-doc norms"
-        );
+        let norms = meta
+            .per_doc_norms
+            .as_ref()
+            .expect("Cosine Sq8 must carry per-doc norms");
+        assert_eq!(norms.len(), n_docs as usize);
         assert_eq!(meta.scale.len(), n_cent * dim);
         assert_eq!(meta.offset.len(), n_cent * dim);
     }

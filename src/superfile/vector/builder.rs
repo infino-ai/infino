@@ -1065,7 +1065,7 @@ fn compute_sq8_quantizer_for_cluster(
 ///
 ///   codec_meta: scale[n_cent × dim]
 ///               offset[n_cent × dim]
-///               per_doc_norms[n_docs]  (L2Sq only)
+///               per_doc_norms[n_docs]  (L2Sq/Cosine only)
 ///   full[]:     codes[n_docs × dim]    (u8)
 ///
 /// The `cluster_index` array (provided by pass 3) gives each
@@ -1074,11 +1074,11 @@ fn compute_sq8_quantizer_for_cluster(
 /// shortlist carries, so per-doc norms stay indexed by `pos`
 /// regardless of which cluster the doc lives in.
 ///
-/// For the `L2Sq` metric we cache per-doc
+/// For the `L2Sq` and `Cosine` metrics we cache per-doc
 /// `Σ_d (x_decoded[i,d])²` at encode time so the search-side
-/// distance kernel can skip recomputing it (one `dim` u8 widen
-/// + multiply pass per rerank candidate saved). Cosine + NegDot
-/// don't need per-doc norms (the `Σx²` term cancels out).
+/// distance kernel can skip recomputing it for L2Sq or use it to
+/// normalize the decoded vector for Cosine. NegDot does not need
+/// per-doc norms.
 ///
 /// Per-cluster (not per-column) quantizer recovers recall on
 /// highly clustered cosine corpora; see
@@ -1140,7 +1140,7 @@ fn write_sq8_codec_meta_and_codes(
         }
     }
 
-    if matches!(metric, Metric::L2Sq) {
+    if matches!(metric, Metric::L2Sq | Metric::Cosine) {
         // Per-doc decoded-norm cache, indexed by pos. Each doc
         // lives in exactly one cluster (the IVF assignment from
         // pass 2); we look up the doc's cluster to know which
