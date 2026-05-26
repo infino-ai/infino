@@ -143,7 +143,17 @@ memmap2 = "0.9"
 # Mach task_info on macOS / /proc/self/statm on Linux. We
 # read it once per `stats()` call (cheap syscall) so the
 # observability hook stays allocation-free on the hot path.
-memory-stats = "1.2"
+#
+# `always_use_statm` forces the Linux path to read
+# /proc/self/statm instead of the default /proc/self/smaps.
+# smaps is a multi-page file whose contents the kernel
+# regenerates per-read by walking the process's VMA list;
+# under heavy concurrent allocation (e.g. cargo's parallel
+# test execution) the read can return a partial / malformed
+# buffer, parsing zero `Rss:` lines and surfacing as
+# `physical_mem = 0`. statm is one line of fixed-format
+# integers and doesn't suffer the same race.
+memory-stats = { version = "1.2", features = ["always_use_statm"] }
 
 # Advisory file locks for the LocalFs pointer-rename window
 # (003 D4). The LocalFs `put_if_match` is implemented as
