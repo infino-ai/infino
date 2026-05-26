@@ -1213,17 +1213,19 @@ impl FtsReader {
             if c1.is_exhausted() {
                 break 'outer;
             }
-            if c1.current_doc_id() > c0.current_block_last_doc_id() {
-                // No possible match within leader's current block;
-                // jump leader to (or past) c1's position.
-                c0.skip_to(c1.current_doc_id(), postings);
-                continue;
-            }
-            // Symmetric advance for c0 if c1 sits above c0's pos.
+            // If c1 sits above c0's pos, pull c0 forward to align.
+            // When that pull crosses c0's current block, restart the
+            // outer loop so pruning re-fires on c0's new block;
+            // otherwise fall through and let the flat-merge handle
+            // the within-block divergence inline.
             if c1.current_doc_id() > c0.current_doc_id() {
+                let crossed_block = c1.current_doc_id() > c0.current_block_last_doc_id();
                 c0.skip_to(c1.current_doc_id(), postings);
                 if c0.is_exhausted() {
                     break 'outer;
+                }
+                if crossed_block {
+                    continue;
                 }
             }
 
