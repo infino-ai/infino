@@ -116,7 +116,7 @@ fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
 fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
     let n_cent = corpus::n_cent(N_DOCS);
     let json =
-        format!(r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
+        format!(r#"[{{"column":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
     VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
         .expect("open VectorReader")
 }

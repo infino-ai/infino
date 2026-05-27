@@ -88,16 +88,17 @@ fn build_reader_with_sample_size(
     n_docs: usize,
     n_cent: usize,
     sample_size: usize,
+    rerank_codec: RerankCodec,
 ) -> VectorReader {
     let mut b = VectorBuilder::new();
     let cid = b
         .register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Fp32,
+            rerank_codec,
         })
         .expect("register column");
     b.set_kmeans_sample_size(cid, sample_size)
@@ -107,8 +108,9 @@ fn build_reader_with_sample_size(
             .expect("add to vector builder");
     }
     let bytes = b.finish().expect("finish vector builder");
-    let json =
-        format!(r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
+    let json = format!(
+        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
+    );
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
@@ -125,7 +127,6 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
     let top_k = 10;
 
     let flat = corpus(n_docs, dim, n_cent, /*seed=*/ 42);
-    let reader = build_reader_with_sample_size(&flat, dim, n_docs, n_cent, sample_size);
 
     // Maximal-coverage retrieval: full nprobe sweep and a wide
     // rerank pool. Any recall loss here is k-means-related, not
@@ -134,42 +135,57 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
     let rerank_mult = (n_docs / top_k + 1).max(64);
 
     let queries: [usize; 8] = [0, 137, 251, 503, 911, 1234, 1567, 1999];
-    let mut total_recall = 0.0f32;
-    for q_idx in queries {
-        let query = &flat[q_idx * dim..(q_idx + 1) * dim];
-        let approx: Vec<u32> = reader
-            .search("v", query, top_k, nprobe, rerank_mult)
-            .expect("search")
-            .into_iter()
-            .map(|(d, _)| d)
-            .collect();
-        let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::Cosine, top_k);
 
-        // Self-NN invariant: query is exactly a corpus row, so its
-        // own doc id must be top-1 regardless of training set.
-        assert_eq!(
-            approx[0] as usize, q_idx,
-            "self-NN broken at query {q_idx}: top-1={}",
-            approx[0]
+    // Parameterize across every reranking codec. All three share
+    // the same 0.85 recall floor on this corpus: Fp32 is bit-exact,
+    // Bf16's rounding noise sits at ≤2⁻⁸ per lane (well below the
+    // 1-bit shortlist noise floor), and Sq8's per-cluster quantizer
+    // recovers fp32-equivalent recall at this dim/cluster shape.
+    // `RabitqOnly` is excluded because it skips the rerank step
+    // entirely and is covered separately by
+    // `rabitq_only_self_query_ranks_self_first` in reader.rs.
+    for codec in [RerankCodec::Fp32, RerankCodec::Bf16, RerankCodec::Sq8] {
+        let reader = build_reader_with_sample_size(&flat, dim, n_docs, n_cent, sample_size, codec);
+        let mut total_recall = 0.0f32;
+        for q_idx in queries {
+            let query = &flat[q_idx * dim..(q_idx + 1) * dim];
+            let approx: Vec<u32> = reader
+                .search("v", query, top_k, nprobe, rerank_mult)
+                .expect("search")
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::Cosine, top_k);
+
+            // Self-NN invariant: query is exactly a corpus row, so
+            // its own doc id must be top-1 regardless of codec.
+            // True for every reranking codec because the rerank
+            // step distinguishes the exact-match candidate.
+            assert_eq!(
+                approx[0] as usize, q_idx,
+                "self-NN broken at query {q_idx} under codec {codec:?}: top-1={}",
+                approx[0]
+            );
+
+            let a: HashSet<u32> = approx.iter().copied().collect();
+            let e: HashSet<u32> = exact.iter().copied().collect();
+            let intersect = a.intersection(&e).count() as f32;
+            let recall = intersect / (top_k as f32);
+            total_recall += recall;
+        }
+        let mean_recall = total_recall / queries.len() as f32;
+        // 0.85 is comfortably below what a properly-sampled
+        // reservoir delivers in this regime (empirically ≥ 0.95).
+        // A failure here means either the reservoir is biased,
+        // `assign_to_centroids` produced wrong assignments, or
+        // the codec's rerank kernel regressed — all
+        // implementation bugs.
+        assert!(
+            mean_recall >= 0.85,
+            "reservoir-trained recall@{top_k} = {mean_recall:.3} \
+             under sample_size={sample_size} codec={codec:?}; expected ≥ 0.85"
         );
-
-        let a: HashSet<u32> = approx.iter().copied().collect();
-        let e: HashSet<u32> = exact.iter().copied().collect();
-        let intersect = a.intersection(&e).count() as f32;
-        let recall = intersect / (top_k as f32);
-        total_recall += recall;
     }
-    let mean_recall = total_recall / queries.len() as f32;
-    // 0.85 is comfortably below what a properly-sampled reservoir
-    // delivers in this regime (empirically ≥ 0.95). A failure
-    // here means either the reservoir is biased or
-    // `assign_to_centroids` produced wrong assignments — both
-    // would be implementation bugs.
-    assert!(
-        mean_recall >= 0.85,
-        "reservoir-trained recall@{top_k} = {mean_recall:.3} \
-         under sample_size={sample_size}; expected ≥ 0.85"
-    );
 }
 
 #[test]
@@ -188,7 +204,7 @@ fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
     // holds the full 200-doc corpus.
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
-        name: "v".into(),
+        column: "v".into(),
         dim,
         n_cent,
         rot_seed: 7,
@@ -201,8 +217,9 @@ fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
             .expect("add to vector builder");
     }
     let bytes = b.finish().expect("finish vector builder");
-    let json =
-        format!(r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
+    let json = format!(
+        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
+    );
     let reader = VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader");
 
     for q_idx in [0usize, 73, 142, 199] {

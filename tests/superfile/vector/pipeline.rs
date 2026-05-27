@@ -14,7 +14,7 @@ use infino::superfile::vector::rerank_codec::RerankCodec;
 fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
-        name: "text_emb".into(),
+        column: "text_emb".into(),
         dim: 16,
         n_cent: 4,
         rot_seed: 11,
@@ -23,7 +23,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
     })
     .expect("register column");
     b.register_column(VectorConfig {
-        name: "image_emb".into(),
+        column: "image_emb".into(),
         dim: 24,
         n_cent: 4,
         rot_seed: 22,
@@ -49,8 +49,8 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
 
     let bytes = b.finish().expect("finish vector builder");
     let json = r#"[
-        {"name":"text_emb","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"},
-        {"name":"image_emb","dim":24,"n_cent":4,"rot_seed":22,"metric":"l2sq"}
+        {"column":"text_emb","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"},
+        {"column":"image_emb","dim":24,"n_cent":4,"rot_seed":22,"metric":"l2sq"}
     ]"#;
     (Bytes::from(bytes), json.to_string())
 }
@@ -142,7 +142,7 @@ fn end_to_end_planted_clusters_recovered() {
     let dim = 16;
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
-        name: "v".into(),
+        column: "v".into(),
         dim,
         n_cent: 3,
         rot_seed: 42,
@@ -179,7 +179,7 @@ fn end_to_end_planted_clusters_recovered() {
     assert_eq!(next_doc_id, 60);
 
     let bytes = b.finish().expect("finish vector builder");
-    let json = r#"[{"name":"v","dim":16,"n_cent":3,"rot_seed":42,"metric":"l2sq"}]"#;
+    let json = r#"[{"column":"v","dim":16,"n_cent":3,"rot_seed":42,"metric":"l2sq"}]"#;
     let r = VectorReader::open(Bytes::from(bytes), json).expect("open VectorReader");
 
     // Query at exactly the first cluster's center → top-k should all

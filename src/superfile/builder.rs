@@ -82,7 +82,10 @@ use crate::superfile::format::footer::{ParquetParts, write_parquet_with_blobs};
 use crate::superfile::format::{self, kv};
 use crate::superfile::fts::builder::FtsBuilder;
 use crate::superfile::fts::tokenize::Tokenizer;
-use crate::superfile::vector::builder::{VectorBuilder, VectorConfig as VecBuildConfig};
+use crate::superfile::vector::builder::VectorBuilder;
+// `VectorConfig` lives in `vector::builder` and is re-exported below
+// (single source of truth post-collapse — see the `pub use` line).
+pub use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::vector::distance::Metric;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema};
@@ -96,19 +99,11 @@ pub struct FtsConfig {
     pub column: String,
 }
 
-/// Per-column vector configuration. Mirrors the inner
-/// [`VecBuildConfig`] but uses `column` to match the FTS naming for
-/// API consistency at the superfile level.
-#[derive(Clone)]
-pub struct VectorConfig {
-    pub column: String,
-    pub dim: usize,
-    pub n_cent: usize,
-    pub rot_seed: u64,
-    pub metric: Metric,
-    /// On-disk rerank codec. Defaults to [`RerankCodec::Sq8`].
-    pub rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec,
-}
+// `VectorConfig` (the per-column vector config used by
+// `BuilderOptions.vector_columns`) lives in
+// `crate::superfile::vector::builder` and is re-exported at this
+// module path above. Single source of truth — there's no outer
+// wrapper struct.
 
 /// All knobs needed to build a superfile.
 pub struct BuilderOptions {
@@ -336,14 +331,10 @@ impl SuperfileBuilder {
         } else {
             let mut vb = VectorBuilder::new();
             for vc in &opts.vector_columns {
-                vb.register_column(VecBuildConfig {
-                    name: vc.column.clone(),
-                    dim: vc.dim,
-                    n_cent: vc.n_cent,
-                    rot_seed: vc.rot_seed,
-                    metric: vc.metric,
-                    rerank_codec: vc.rerank_codec,
-                })?;
+                // VectorConfig is now the same type at both layers
+                // (re-exported from vector::builder), so the manual
+                // field-by-field bridge is gone — just clone.
+                vb.register_column(vc.clone())?;
             }
             Some(vb)
         };
@@ -548,7 +539,7 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
 /// `Serialize` needed.
 ///
 /// Output shape per column:
-/// `{"name":"<escaped>","dim":<u>,"n_cent":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
+/// `{"column":"<escaped>","dim":<u>,"n_cent":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
 /// The reader at open time parses this back into
 /// `VectorConfig` to drive distance kernels + IVF probing.
 fn vec_columns_json(cols: &[VectorConfig]) -> String {
@@ -557,7 +548,7 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
         if i > 0 {
             s.push(',');
         }
-        s.push_str(r#"{"name":""#);
+        s.push_str(r#"{"column":""#);
         s.push_str(&escape_json(&c.column));
         s.push_str(r#"","dim":"#);
         s.push_str(&c.dim.to_string());
@@ -951,7 +942,7 @@ mod tests {
             rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
         }];
         let s = vec_columns_json(&cols);
-        assert!(s.contains(r#""name":"emb""#));
+        assert!(s.contains(r#""column":"emb""#));
         assert!(s.contains(r#""dim":384"#));
         assert!(s.contains(r#""n_cent":64"#));
         assert!(s.contains(r#""rot_seed":99"#));

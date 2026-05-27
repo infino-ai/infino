@@ -214,8 +214,9 @@ pub(crate) fn distance_bytes_codec(
         RerankCodec::Sq8 => {
             unreachable!("distance_bytes_codec called with Sq8; Sq8 rerank goes through Sq8Kernel")
         }
-        RerankCodec::None => unreachable!(
-            "distance_bytes_codec called with None; None columns have no full[] region"
+        RerankCodec::RabitqOnly => unreachable!(
+            "distance_bytes_codec called with RabitqOnly; \
+             RabitqOnly columns have no full[] region"
         ),
     }
 }

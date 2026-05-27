@@ -29,10 +29,12 @@ const DIR_ENTRY_SIZE: usize = 64;
 const SUB_HEADER_SIZE: usize = 56;
 
 /// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
-/// value is a JSON array of these in declaration order.
+/// value is a JSON array of these in declaration order. Mirrors
+/// the build-time [`VectorConfig`] but with `metric` as a string
+/// so serde can read it straight from the KV blob.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorColumnConfig {
-    pub name: String,
+    pub column: String,
     pub dim: usize,
     pub n_cent: usize,
     pub rot_seed: u64,
@@ -454,13 +456,13 @@ impl VectorReader {
                 VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
                      (known ids: 0=fp32, 1=bf16, 2=sq8, 3=none)",
-                    cfg.name
+                    cfg.column
                 )))
             })?;
             if !rerank_codec.is_implemented() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' uses rerank codec {} which is not implemented by this version",
-                    cfg.name,
+                    cfg.column,
                     rerank_codec.name()
                 ))));
             }
@@ -469,13 +471,13 @@ impl VectorReader {
             if dim != cfg.dim {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' dim mismatch: dir={dim} json={}",
-                    cfg.name, cfg.dim
+                    cfg.column, cfg.dim
                 ))));
             }
             if rot_seed != cfg.rot_seed {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' rot_seed mismatch",
-                    cfg.name
+                    cfg.column
                 ))));
             }
             let metric = match metric_id {
@@ -485,7 +487,7 @@ impl VectorReader {
                 _ => {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "unknown metric_id {metric_id} for column '{}'",
-                        cfg.name
+                        cfg.column
                     ))));
                 }
             };
@@ -531,20 +533,20 @@ impl VectorReader {
             let cluster_idx_off = read_u64_le(&sub[40..48]) as usize;
             let codes_off = read_u32_le(&sub[48..52]) as usize;
             let full_off = read_u32_le(&sub[52..56]) as usize;
-            // Fp32 + Bf16 + None all keep zero-byte codec_meta; Sq8
+            // Fp32 + Bf16 + RabitqOnly all keep zero-byte codec_meta; Sq8
             // emits per-cluster scale/offset (+ per-doc
             // norms for L2Sq/Cosine). The per-codec layout check below
             // validates the declared `codec_meta_off` against the
             // codec's expected size once `col_n_docs` is known.
             let codec_meta_required_zero = matches!(
                 rerank_codec,
-                RerankCodec::Fp32 | RerankCodec::Bf16 | RerankCodec::None
+                RerankCodec::Fp32 | RerankCodec::Bf16 | RerankCodec::RabitqOnly
             );
             if codec_meta_required_zero && codec_meta_off != 0 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has codec_meta_off={codec_meta_off} for codec {}; \
-                     fp32/bf16/none must write codec_meta_off=0 (zero-byte meta region)",
-                    cfg.name,
+                     fp32/bf16/rabitq_only must write codec_meta_off=0 (zero-byte meta region)",
+                    cfg.column,
                     rerank_codec.name()
                 ))));
             }
@@ -566,7 +568,7 @@ impl VectorReader {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "column '{}' has codec_meta_off={codec_meta_off} outside \
                          (codes_off={codes_off}, full_off={full_off}]",
-                        cfg.name
+                        cfg.column
                     ))));
                 }
                 codec_meta_off
@@ -577,7 +579,7 @@ impl VectorReader {
             if code_bytes == 0 || !codes_size.is_multiple_of(code_bytes) {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' codes size {codes_size} not divisible by {code_bytes}",
-                    cfg.name
+                    cfg.column
                 ))));
             }
             let col_n_docs = (codes_size / code_bytes) as u32;
@@ -601,7 +603,7 @@ impl VectorReader {
                     "column '{}' codec_meta region is {actual_codec_meta_size} bytes \
                      on disk, but codec {} / metric {metric:?} expects \
                      {expected_codec_meta_size} bytes",
-                    cfg.name,
+                    cfg.column,
                     rerank_codec.name()
                 ))));
             }
@@ -644,14 +646,14 @@ impl VectorReader {
             if cluster_idx_end > sub_crc_pos {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' cluster index runs past subsection",
-                    cfg.name
+                    cfg.column
                 ))));
             }
             let doc_ids_size = (col_n_docs as usize) * 4;
             if doc_ids_off + doc_ids_size > sub_crc_pos {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' doc_ids region runs past subsection",
-                    cfg.name
+                    cfg.column
                 ))));
             }
 
@@ -667,12 +669,12 @@ impl VectorReader {
             {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' metric mismatch: dir={metric:?} json={}",
-                    cfg.name, cfg.metric
+                    cfg.column, cfg.metric
                 ))));
             }
 
             columns.push(ColumnReader {
-                name: cfg.name.clone(),
+                name: cfg.column.clone(),
                 dim,
                 n_cent,
                 n_docs: col_n_docs,
@@ -692,7 +694,7 @@ impl VectorReader {
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
-            column_id_by_name.insert(cfg.name.clone(), i as u32);
+            column_id_by_name.insert(cfg.column.clone(), i as u32);
         }
 
         Ok(VectorReader {
@@ -858,7 +860,7 @@ impl VectorReader {
         // the 1-bit shortlist is the final ranking. Return sign-flipped
         // estimates so the public `(doc_id, distance)` convention still
         // means smaller is closer.
-        if matches!(col.rerank_codec, RerankCodec::None) {
+        if !col.rerank_codec.writes_full() {
             let _ = rerank_mult;
             if shortlist.len() > k {
                 shortlist.select_nth_unstable_by(k - 1, |a, b| {
@@ -1110,9 +1112,10 @@ fn rerank_candidates_in_run(
                 })
                 .collect()
         }
-        RerankCodec::None => unreachable!(
-            "rerank_candidates_in_run reached with None codec — None columns \
-             have no full[] region and should short-circuit before the rerank step"
+        RerankCodec::RabitqOnly => unreachable!(
+            "rerank_candidates_in_run reached with RabitqOnly codec — RabitqOnly \
+             columns have no full[] region and should short-circuit before \
+             the rerank step"
         ),
     };
     reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
@@ -1262,7 +1265,7 @@ mod tests {
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent,
             rot_seed: 7,
@@ -1284,7 +1287,7 @@ mod tests {
             Metric::NegDot => "negdot",
         };
         let json = format!(
-            r#"[{{"name":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_s}"}}]"#
+            r#"[{{"column":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_s}"}}]"#
         );
         (Bytes::from(bytes), json)
     }
@@ -1360,7 +1363,7 @@ mod tests {
         let dim = 16;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent: 4,
             rot_seed: 7,
@@ -1377,7 +1380,7 @@ mod tests {
             all_vecs.push(v);
         }
         let bytes = b.finish().expect("finish vector builder");
-        let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let r = VectorReader::open(Bytes::from(bytes), json).expect("open VectorReader");
 
         // Pick a doc, query with its own vector → top-1 is self with distance 0.
@@ -1534,7 +1537,7 @@ mod tests {
     fn open_rejects_columns_json_mismatch() {
         let (blob, _) = build_blob(32, 16, 4, Metric::L2Sq);
         // header says 1 column; pass 2-column JSON.
-        let bad_json = r#"[{"name":"a","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"},{"name":"b","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
+        let bad_json = r#"[{"column":"a","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"},{"column":"b","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let err = VectorReader::open(blob, bad_json).expect_err("expected error");
         assert!(matches!(
             err,
@@ -1578,11 +1581,11 @@ mod tests {
             RerankCodec::Fp32,
             RerankCodec::Bf16,
             RerankCodec::Sq8,
-            RerankCodec::None,
+            RerankCodec::RabitqOnly,
         ] {
             let mut b = VectorBuilder::new();
             b.register_column(VectorConfig {
-                name: "v".into(),
+                column: "v".into(),
                 dim: 16,
                 n_cent: 4,
                 rot_seed: 7,
@@ -1605,7 +1608,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 7,
@@ -1619,7 +1622,8 @@ mod tests {
         }
         let blob = b.finish().expect("finish");
 
-        let json = r#"[{"name":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         assert_eq!(r.columns.len(), 1);
         assert_eq!(
@@ -1650,7 +1654,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 13,
@@ -1672,7 +1676,7 @@ mod tests {
         let blob = b.finish().expect("finish");
 
         let json =
-            r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let hits = r
             .search("v", &all[17], 5, 4, 5)
@@ -1697,7 +1701,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 7,
@@ -1711,7 +1715,8 @@ mod tests {
         }
         let blob = b.finish().expect("finish");
 
-        let json = r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         assert_eq!(r.columns.len(), 1);
         let col = &r.columns[0];
@@ -1741,7 +1746,7 @@ mod tests {
         let n_docs = 32u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 11,
@@ -1761,7 +1766,7 @@ mod tests {
         }
         let blob = b.finish().expect("finish");
         let json =
-            r#"[{"name":"v","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"}]"#.to_string();
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
         let meta = col.sq8_meta.as_ref().expect("Sq8 must carry sq8_meta");
@@ -1788,7 +1793,7 @@ mod tests {
         };
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 23,
@@ -1805,7 +1810,7 @@ mod tests {
         let blob = b.finish().expect("finish");
 
         let json =
-            r#"[{"name":"v","dim":16,"n_cent":4,"rot_seed":23,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":23,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
         let meta = col.sq8_meta.as_ref().expect("Sq8 meta present");
@@ -1850,7 +1855,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 13,
@@ -1872,7 +1877,7 @@ mod tests {
         let blob = b.finish().expect("finish");
 
         let json =
-            r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let hits = r
             .search("v", &all[17], 5, 4, 20)
@@ -1895,7 +1900,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 19,
@@ -1923,7 +1928,7 @@ mod tests {
         let blob = b.finish().expect("finish");
 
         let json =
-            r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":19,"metric":"cosine"}]"#.to_string();
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":19,"metric":"cosine"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let hits = r
             .search("v", &all[42], 5, 4, 20)
@@ -1931,60 +1936,68 @@ mod tests {
         assert_eq!(hits[0].0, 42, "Sq8 cosine self-query must recover self");
     }
 
-    /// Building with `RerankCodec::None` succeeds and the on-disk
-    /// segment carries a zero-length `full[]` region.
+    /// Building with `RerankCodec::RabitqOnly` succeeds and the
+    /// on-disk segment carries a zero-length `full[]` region.
     #[test]
-    fn open_round_trips_none_codec_discriminator() {
+    fn open_round_trips_rabitq_only_codec_discriminator() {
         let dim = 16usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::None,
+            rerank_codec: RerankCodec::RabitqOnly,
         })
-        .expect("register None column");
+        .expect("register RabitqOnly column");
         for i in 0..n_docs {
             let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
             b.add(0, &v).expect("add");
         }
         let blob = b.finish().expect("finish");
 
-        let json = r#"[{"name":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         assert_eq!(r.columns.len(), 1);
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::None);
+        assert_eq!(col.rerank_codec, RerankCodec::RabitqOnly);
         assert_eq!(col.codec_meta_off, 0);
         assert_eq!(
             col.doc_ids_off, col.full_off,
-            "None segments have zero-length full[]"
+            "RabitqOnly segments have zero-length full[]"
         );
         assert_eq!(col.n_docs, n_docs);
     }
 
-    /// A `None`-codec column returns top-K directly from the 1-bit
+    /// A `RabitqOnly` column returns top-K directly from the 1-bit
     /// shortlist. Distances are sign-flipped estimates so smaller is
     /// still closer.
+    ///
+    /// Self-query must rank the planted vector at index 0 — the
+    /// 1-bit shortlist's score for the exact-match query is the
+    /// dot product against itself, which dominates every neighbour
+    /// at this dim/cluster shape. A weaker `.any(== self)` check
+    /// would mask a regression that demoted self into positions
+    /// 1–4.
     #[test]
-    fn none_self_query_in_top_k_via_shortlist_only() {
+    fn rabitq_only_self_query_ranks_self_first() {
         let dim = 128usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 11,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::None,
+            rerank_codec: RerankCodec::RabitqOnly,
         })
-        .expect("register None column");
+        .expect("register RabitqOnly column");
         let make = |i: u32| -> Vec<f32> {
             let raw: Vec<f32> = (0..dim)
                 .map(|j| {
@@ -2004,49 +2017,54 @@ mod tests {
         }
         let blob = b.finish().expect("finish");
         let json =
-            r#"[{"name":"v","dim":128,"n_cent":4,"rot_seed":11,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":128,"n_cent":4,"rot_seed":11,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
 
         let hits = r
             .search("v", &all[17], 5, n_cent, 5)
-            .expect("None-codec search must succeed");
-        assert!(
-            hits.iter().any(|(did, _)| *did == 17),
-            "self-query must surface the planted vector in top-K, got {hits:?}"
+            .expect("RabitqOnly search must succeed");
+        assert!(!hits.is_empty(), "search must return some hits");
+        // Self-query must rank itself at index 0. `.any` masked
+        // demotion regressions — the planted vector's 1-bit
+        // shortlist score against itself is strictly greater than
+        // any neighbour's at this dim/cluster shape.
+        assert_eq!(
+            hits[0].0, 17,
+            "self-query must rank the planted vector at index 0, got {hits:?}"
         );
         assert!(hits.iter().all(|(_, d)| d.is_finite()));
         for w in hits.windows(2) {
             assert!(
                 w[0].1 <= w[1].1,
-                "None-codec hits must be sorted ascending by distance, got {hits:?}"
+                "RabitqOnly hits must be sorted ascending by distance, got {hits:?}"
             );
         }
     }
 
-    /// `None` search must not fetch a `full[]` range because the
-    /// column does not store one.
+    /// `RabitqOnly` search must not fetch a `full[]` range because
+    /// the column does not store one.
     #[test]
-    fn none_search_issues_no_full_region_fetch() {
+    fn rabitq_only_search_issues_no_full_region_fetch() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 32u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "v".into(),
+            column: "v".into(),
             dim,
             n_cent,
             rot_seed: 13,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::None,
+            rerank_codec: RerankCodec::RabitqOnly,
         })
-        .expect("register None column");
+        .expect("register RabitqOnly column");
         for i in 0..n_docs {
             let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
             b.add(0, &v).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
         let json =
-            r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_calls = counting.async_counter();
@@ -2067,12 +2085,12 @@ mod tests {
         let async_count = async_calls.load(AtomicOrdering::Relaxed);
         assert_eq!(
             async_count, 0,
-            "None-codec search on warm lazy must not bridge to async"
+            "RabitqOnly search on warm lazy must not bridge to async"
         );
         let max_expected = 2 + 2 * n_cent;
         assert!(
             sync_count <= max_expected,
-            "None-codec search must issue at most {max_expected} sync fetches; got {sync_count}"
+            "RabitqOnly search must issue at most {max_expected} sync fetches; got {sync_count}"
         );
         assert!(
             sync_count >= 4,
@@ -2230,7 +2248,7 @@ mod tests {
         let build = |codec: RerankCodec| -> Bytes {
             let mut b = VectorBuilder::new();
             b.register_column(VectorConfig {
-                name: "v".into(),
+                column: "v".into(),
                 dim,
                 n_cent: n_cent_ivf,
                 rot_seed: 7,
@@ -2259,7 +2277,7 @@ mod tests {
         );
 
         let json = format!(
-            r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent_ivf},"rot_seed":7,"metric":"cosine"}}]"#
+            r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent_ivf},"rot_seed":7,"metric":"cosine"}}]"#
         );
         let r_fp32 = VectorReader::open(fp32_blob, &json).expect("open fp32");
         let r_bf16 = VectorReader::open(bf16_blob, &json).expect("open bf16");
@@ -2383,7 +2401,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent,
             rot_seed: 7,
@@ -2400,7 +2418,7 @@ mod tests {
             all.push(v);
         }
         let bytes = b.finish().expect("finish vector builder");
-        let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
             .to_string();
         (Bytes::from(bytes), json, all)
     }
@@ -2771,7 +2789,7 @@ mod tests {
 
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent,
             rot_seed: 7,
@@ -2793,7 +2811,7 @@ mod tests {
         b.finish_to(writer).expect("finish_to BufWriter<File>");
 
         format!(
-            r#"[{{"name":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
+            r#"[{{"column":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
         )
     }
 

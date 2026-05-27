@@ -596,7 +596,7 @@ pub fn build_vector_index(
 ) -> VectorBuilder {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
-        name: "v".into(),
+        column: "v".into(),
         dim: DIM,
         n_cent,
         rot_seed: 7,
@@ -621,7 +621,7 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
         Metric::NegDot => "negdot",
     };
     let json = format!(
-        r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
+        r#"[{{"column":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
     );
     VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
         .expect("open VectorReader")

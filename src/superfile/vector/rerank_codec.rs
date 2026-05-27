@@ -12,9 +12,12 @@
 //!   (`scale[dim]`, `offset[dim]`) lives in a sibling
 //!   `codec_meta` region at `codec_meta_off` inside the
 //!   subsection.
-//! - [`RerankCodec::None`]: no rerank column at all. The 1-bit
-//!   shortlist is the final ranking — opt-in, recall-degraded,
-//!   shrinks the segment by ~30× at 1M × 384.
+//! - [`RerankCodec::RabitqOnly`]: no rerank column at all. The
+//!   1-bit RaBitQ shortlist is the final ranking — opt-in,
+//!   recall-degraded, shrinks the segment by ~30× at 1M × 384.
+//!   Named `RabitqOnly` rather than `None` to (a) avoid shadowing
+//!   `Option::None` at every call site and (b) describe the search
+//!   behaviour rather than the absence of a codec.
 //!
 //! ## On-disk discriminator
 //!
@@ -31,7 +34,7 @@
 //! `codec_meta` region between the `codes` region and the
 //! `full[]` region. The region's relative offset within the
 //! subsection is recorded in sub-header bytes 12..16 as
-//! `codec_meta_off: u32`. `Fp32` / `Bf16` / `None` segments
+//! `codec_meta_off: u32`. `Fp32` / `Bf16` / `RabitqOnly` segments
 //! write `codec_meta_off = 0`.
 
 use serde::{Deserialize, Serialize};
@@ -89,12 +92,16 @@ pub enum RerankCodec {
     /// distance kernel fuses dequant with the per-candidate
     /// distance.
     Sq8,
-    /// No rerank column at all. The shortlist (1-bit RaBitQ
-    /// scores) is the final ranking. Opt-in — recall drops
-    /// 0.05–0.15 on typical normalized-Gaussian / image-
-    /// embedding corpora; trade-off is a ~30× segment-size
-    /// shrink at 1M × 384.
-    None,
+    /// No rerank column at all. The 1-bit RaBitQ shortlist is
+    /// the final ranking. Opt-in — recall drops 0.05–0.15 on
+    /// typical normalized-Gaussian / image-embedding corpora;
+    /// trade-off is a ~30× segment-size shrink at 1M × 384.
+    ///
+    /// Spelled `RabitqOnly` rather than `None` so call sites
+    /// don't collide with `Option::None` and the variant name
+    /// describes the search behaviour rather than the absence
+    /// of a codec.
+    RabitqOnly,
 }
 
 impl Default for RerankCodec {
@@ -121,7 +128,7 @@ impl RerankCodec {
             Self::Fp32 => 0,
             Self::Bf16 => 1,
             Self::Sq8 => 2,
-            Self::None => 3,
+            Self::RabitqOnly => 3,
         }
     }
 
@@ -135,7 +142,7 @@ impl RerankCodec {
             0 => Some(Self::Fp32),
             1 => Some(Self::Bf16),
             2 => Some(Self::Sq8),
-            3 => Some(Self::None),
+            3 => Some(Self::RabitqOnly),
             _ => None,
         }
     }
@@ -148,20 +155,30 @@ impl RerankCodec {
             Self::Fp32 => "fp32",
             Self::Bf16 => "bf16",
             Self::Sq8 => "sq8",
-            Self::None => "none",
+            Self::RabitqOnly => "rabitq_only",
         }
     }
 
     /// Per-vector body size in bytes inside the `full[]` region.
-    /// `0` for [`Self::None`] (no rerank bytes at all).
+    /// `0` for [`Self::RabitqOnly`] (no rerank bytes at all).
     #[inline]
     pub const fn per_vector_bytes(self, dim: usize) -> usize {
         match self {
             Self::Fp32 => dim * 4,
             Self::Bf16 => dim * 2,
             Self::Sq8 => dim,
-            Self::None => 0,
+            Self::RabitqOnly => 0,
         }
+    }
+
+    /// Whether this codec writes a per-vector `full[]` region
+    /// to disk. `false` only for [`Self::RabitqOnly`], which
+    /// drops the rerank column entirely. Build + open paths use
+    /// this to skip the `full[]` allocation, the per-row spill
+    /// in pass 2, and the bucket-read load in pass 3.
+    #[inline]
+    pub const fn writes_full(self) -> bool {
+        !matches!(self, Self::RabitqOnly)
     }
 
     /// Whether the build + search paths implement this codec.
@@ -173,13 +190,14 @@ impl RerankCodec {
     /// writing a byte format that the reader can't decode.
     #[inline]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Fp32 | Self::Bf16 | Self::Sq8 | Self::None)
+        matches!(self, Self::Fp32 | Self::Bf16 | Self::Sq8 | Self::RabitqOnly)
     }
 
     /// Recommended **lower bound** on `rerank_mult` for this
     /// codec at the given `dim`. Returns `None` for codecs
-    /// where rerank is meaningless (today: just [`Self::None`],
-    /// which skips the rerank step entirely).
+    /// where rerank is meaningless (today: just
+    /// [`Self::RabitqOnly`], which skips the rerank step
+    /// entirely).
     ///
     /// Sq8 needs more candidates to recover fp32-equivalent
     /// recall because the dequant noise floor is higher than
@@ -204,7 +222,7 @@ impl RerankCodec {
             } else {
                 SQ8_LOW_DIM_RERANK_FLOOR
             }),
-            Self::None => None,
+            Self::RabitqOnly => None,
         }
     }
 
@@ -212,7 +230,7 @@ impl RerankCodec {
     /// for this codec at the given dim + n_docs + n_cent + metric.
     /// Stored immediately before the subsection's `full[]` region.
     ///
-    /// - `Fp32` / `Bf16` / `None`: `0` (no codec metadata).
+    /// - `Fp32` / `Bf16` / `RabitqOnly`: `0` (no codec metadata).
     /// - `Sq8`: **per-cluster** per-dim `(scale, offset)` arrays
     ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`/`Cosine`-metric
     ///   columns, a per-doc `sum_x_decoded² : f32` table
@@ -246,7 +264,7 @@ impl RerankCodec {
         metric: Metric,
     ) -> usize {
         match self {
-            Self::Fp32 | Self::Bf16 | Self::None => 0,
+            Self::Fp32 | Self::Bf16 | Self::RabitqOnly => 0,
             Self::Sq8 => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
@@ -297,7 +315,7 @@ mod tests {
             RerankCodec::Fp32,
             RerankCodec::Bf16,
             RerankCodec::Sq8,
-            RerankCodec::None,
+            RerankCodec::RabitqOnly,
         ] {
             assert_eq!(
                 RerankCodec::from_codec_id(c.codec_id()),
@@ -322,7 +340,7 @@ mod tests {
         }
     }
 
-    /// Per-vector body sizes match the on-disk spec. `None`'s
+    /// Per-vector body sizes match the on-disk spec. `RabitqOnly`'s
     /// zero is what lets that codec drop the entire `full[]`
     /// region.
     #[test]
@@ -330,7 +348,27 @@ mod tests {
         assert_eq!(RerankCodec::Fp32.per_vector_bytes(384), 1536);
         assert_eq!(RerankCodec::Bf16.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::Sq8.per_vector_bytes(384), 384);
-        assert_eq!(RerankCodec::None.per_vector_bytes(384), 0);
+        assert_eq!(RerankCodec::RabitqOnly.per_vector_bytes(384), 0);
+    }
+
+    /// `writes_full` is the inverse of "this codec is
+    /// `RabitqOnly`" — pins the build/open fast-path predicate
+    /// to the codec's identity rather than scattered
+    /// `matches!(_, RabitqOnly)` checks.
+    #[test]
+    fn writes_full_matches_per_vector_bytes() {
+        for c in [
+            RerankCodec::Fp32,
+            RerankCodec::Bf16,
+            RerankCodec::Sq8,
+            RerankCodec::RabitqOnly,
+        ] {
+            assert_eq!(
+                c.writes_full(),
+                c.per_vector_bytes(384) > 0,
+                "writes_full disagrees with per_vector_bytes for {c:?}"
+            );
+        }
     }
 
     /// All four codecs are wired end-to-end (build + open + search).
@@ -339,7 +377,7 @@ mod tests {
         assert!(RerankCodec::Fp32.is_implemented());
         assert!(RerankCodec::Bf16.is_implemented());
         assert!(RerankCodec::Sq8.is_implemented());
-        assert!(RerankCodec::None.is_implemented());
+        assert!(RerankCodec::RabitqOnly.is_implemented());
     }
 
     /// Calibration-floor table the bench harness threads into
@@ -362,7 +400,10 @@ mod tests {
             RerankCodec::Sq8.recommended_rerank_mult_floor(384),
             Some(50)
         );
-        assert_eq!(RerankCodec::None.recommended_rerank_mult_floor(384), None);
+        assert_eq!(
+            RerankCodec::RabitqOnly.recommended_rerank_mult_floor(384),
+            None
+        );
         // 384 < dim ≤ 1024 column.
         assert_eq!(
             RerankCodec::Fp32.recommended_rerank_mult_floor(1024),
@@ -376,7 +417,10 @@ mod tests {
             RerankCodec::Sq8.recommended_rerank_mult_floor(1024),
             Some(100)
         );
-        assert_eq!(RerankCodec::None.recommended_rerank_mult_floor(1024), None);
+        assert_eq!(
+            RerankCodec::RabitqOnly.recommended_rerank_mult_floor(1024),
+            None
+        );
         // Split point: dim == 384 is the low-dim cell; dim == 385
         // crosses into high-dim.
         assert_eq!(
@@ -387,13 +431,17 @@ mod tests {
 
     /// Sq8's codec_meta size: `8·n_cent·dim` for negdot,
     /// `8·n_cent·dim + 4·n_docs` for L2Sq/Cosine (per-doc decoded-norm
-    /// cache). Fp32 / Bf16 / None always contribute zero bytes.
-    /// Per-cluster scale/offset is the recall-recovery fix
-    /// landed in the Sq8PerCluster patch (see fn-doc above).
+    /// cache). Fp32 / Bf16 / RabitqOnly always contribute zero
+    /// bytes. Per-cluster scale/offset is the recall-recovery
+    /// fix landed in the Sq8PerCluster patch (see fn-doc above).
     #[test]
     fn codec_meta_bytes_matches_layout_spec() {
-        // Fp32 + Bf16 + None never carry codec_meta.
-        for c in [RerankCodec::Fp32, RerankCodec::Bf16, RerankCodec::None] {
+        // Fp32 + Bf16 + RabitqOnly never carry codec_meta.
+        for c in [
+            RerankCodec::Fp32,
+            RerankCodec::Bf16,
+            RerankCodec::RabitqOnly,
+        ] {
             for m in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
                 assert_eq!(
                     c.codec_meta_bytes(384, 1_000_000, 1024, m),
