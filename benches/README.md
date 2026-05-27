@@ -67,28 +67,28 @@ which is the structured source of truth the markdown is derived from.
 |----------------|------------|-----------|------------|-----------|------------|
 **OR queries:**
 
-| single_rare    | 256 ns     | 0 B       | 0 B        | 0 B       | —          |
+| single_rare    | 258 ns     | 0 B       | 0 B        | 0 B       | —          |
 | single_df1     | 117 ns     | 0 B       | 0 B        | 0 B       | —          |
-| single_common  | 13.29 µs   | 0 B       | 0 B        | 0 B       | —          |
-| two_term_or    | 99.19 µs   | 0 B       | 0 B        | 0 B       | —          |
-| three_wide_or  | 1.19 ms    | 0 B       | 0 B        | 0 B       | —          |
-| three_similar_or | 5.56 ms    | 0 B       | 0 B        | 0 B       | —          |
-| five_term_or   | 9.70 ms    | 0 B       | 0 B        | 0 B       | —          |
+| single_common  | 14.31 µs   | 0 B       | 0 B        | 0 B       | —          |
+| two_term_or    | 103.78 µs  | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_or  | 1.27 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_or | 5.81 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_or   | 9.90 ms    | 0 B       | 0 B        | 0 B       | —          |
 
 **AND queries:**
 
-| two_term_and   | 113.46 µs  | 0 B       | 0 B        | 0 B       | —          |
-| three_wide_and | 2.45 ms    | 0 B       | 0 B        | 0 B       | —          |
-| three_similar_and | 4.32 ms    | 0 B       | 0 B        | 0 B       | —          |
-| five_term_and  | 4.50 ms    | 0 B       | 0 B        | 0 B       | —          |
+| two_term_and   | 116.57 µs  | 0 B       | 0 B        | 0 B       | —          |
+| three_wide_and | 2.03 ms    | 0 B       | 0 B        | 0 B       | —          |
+| three_similar_and | 3.31 ms    | 0 B       | 0 B        | 0 B       | —          |
+| five_term_and  | 3.97 ms    | 0 B       | 0 B        | 0 B       | —          |
 
 **Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):
 
 | Shape         | WAND+BMW   | MaxScore+BMM |
 |---------------|------------|--------------|
-| wide_3_or     | 4.62 ms    | 1.20 ms      |
-| similar_3_or  | 8.77 ms    | 5.58 ms      |
-| similar_5_or  | 25.06 ms   | 9.68 ms      |
+| wide_3_or     | 4.68 ms    | 1.24 ms      |
+| similar_3_or  | 8.91 ms    | 5.77 ms      |
+| similar_5_or  | 25.16 ms   | 9.88 ms      |
 
 <!-- END: bench/fts/superfile/search -->
 
@@ -101,7 +101,7 @@ which is the structured source of truth the markdown is derived from.
 |-------------------------|------------|------------|-----------|------------|-----------|------------|
 | infino_auto_writer_pool | 41.97 s    | 238.3 K/s  | 0 B       | 0 B        | 0 B       | —          |
 
-*Output cardinality: infino emits `min(writer_pool.threads, total_rows)` superfiles per commit (auto = cpus/2). Override with `INFINO_SUPERTABLE__WRITER_THREADS=N` for a specific shard count.*
+*Output cardinality: infino emits `min(writer_pool.threads, chunk_rows)` superfiles per commit across 16 bounded append chunks (writer auto = cpus/2). Override with `INFINO_SUPERTABLE__WRITER_THREADS=N` for a specific shard count.*
 
 <!-- END: bench/fts/supertable/ingest -->
 

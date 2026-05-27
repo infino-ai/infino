@@ -1092,10 +1092,15 @@ impl FtsReader {
         Ok(out)
     }
 
-    /// General `n >= 2`-term AND path. Block-max-AND prunes whole
-    /// leader blocks whose maximum possible AND score sum can't beat
-    /// the current heap floor; for survivors, runs the leapfrog
-    /// convergence over all cursors per leader doc.
+    /// General `n >= 3`-term AND path. Same shape as the 2-term path:
+    /// block-max pruning at the top, then a flat-merge over the
+    /// leader's decoded `block_doc_ids` against each non-leader's
+    /// decoded `block_doc_ids`. For each leader doc, every non-leader's
+    /// `pos` is advanced with a tight `pos += 1` scan instead of
+    /// `skip_to` — no function-call or within-block linear-scan
+    /// overhead per leader doc, just integer comparisons over the
+    /// already-decoded buffers. When any cursor exhausts its block,
+    /// the outer loop crosses blocks via `next()` and re-aligns.
     fn run_and_intersect_general(
         &self,
         cursors: &mut [TermCursor],
@@ -1130,44 +1135,110 @@ impl FtsReader {
                 }
             }
 
-            let mut candidate = cursors[0].current_doc_id();
+            // Align every non-leader cursor to >= leader's current doc.
+            // Largest landing-doc becomes the new alignment target if
+            // any cursor jumped past leader. If any cursor crossed
+            // leader's current block, restart the outer loop so pruning
+            // re-fires on leader's new block; otherwise the flat-merge
+            // proceeds in the current decoded blocks.
+            let leader_doc = cursors[0].current_doc_id();
+            let leader_block_end = cursors[0].current_block_last_doc_id();
+            let mut max_other = leader_doc;
+            let mut crossed_block = false;
+            for c in cursors[1..].iter_mut() {
+                c.skip_to(leader_doc, postings);
+                if c.is_exhausted() {
+                    break 'outer;
+                }
+                let here = c.current_doc_id();
+                if here > leader_block_end {
+                    crossed_block = true;
+                }
+                if here > max_other {
+                    max_other = here;
+                }
+            }
+            if max_other > leader_doc {
+                cursors[0].skip_to(max_other, postings);
+                if cursors[0].is_exhausted() {
+                    break 'outer;
+                }
+                if crossed_block {
+                    continue;
+                }
+            }
 
-            // Converge: re-skip all cursors until each lands on the
-            // same candidate. A cursor that ends up past candidate
-            // raises the candidate to its position; the next pass
-            // catches up the others.
-            loop {
-                let mut bumped = false;
-                for c in cursors.iter_mut() {
-                    c.skip_to(candidate, postings);
-                    if c.is_exhausted() {
-                        break 'outer;
+            // Flat-merge across decoded blocks. Split leader off so
+            // both leader and others borrow mutably without overlap;
+            // the inner loop reads each cursor's `block_doc_ids` and
+            // updates its `pos` directly.
+            let (leader_slice, others) = cursors.split_at_mut(1);
+            let c0 = &mut leader_slice[0];
+            let lb_n = c0.block_n;
+            let mut i = c0.pos;
+            while i < lb_n {
+                let a = c0.block_doc_ids[i];
+
+                // For each non-leader, walk its `pos` forward through
+                // the decoded block until block_doc_ids[pos] >= a (or
+                // the block exhausts). If any block exhausts, break
+                // out to the outer loop's block-crossing step. If any
+                // cursor lands above `a`, the leader doc isn't in the
+                // intersection — advance leader only.
+                let mut block_exhausted = false;
+                let mut all_match = true;
+                for o in others.iter_mut() {
+                    while o.pos < o.block_n && o.block_doc_ids[o.pos] < a {
+                        o.pos += 1;
                     }
-                    let here = c.current_doc_id();
-                    if here != candidate {
-                        candidate = here;
-                        bumped = true;
+                    if o.pos >= o.block_n {
+                        block_exhausted = true;
+                        break;
+                    }
+                    if o.block_doc_ids[o.pos] != a {
+                        all_match = false;
                         break;
                     }
                 }
-                if !bumped {
+                if block_exhausted {
                     break;
                 }
+                if all_match {
+                    let norm = dl_norm_k1[a as usize];
+                    let mut score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                        c0.idf_x_k1p1,
+                        c0.block_tfs[i],
+                        norm,
+                    );
+                    for o in others.iter() {
+                        score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                            o.idf_x_k1p1,
+                            o.block_tfs[o.pos],
+                            norm,
+                        );
+                    }
+                    and_heap_push(heap, k, score, a);
+                    i += 1;
+                    for o in others.iter_mut() {
+                        o.pos += 1;
+                    }
+                } else {
+                    i += 1;
+                }
             }
+            c0.pos = i;
 
-            // All cursors at `candidate` — sum BM25 contributions.
-            let norm = dl_norm_k1[candidate as usize];
-            let mut score = 0.0_f32;
-            for c in cursors.iter() {
-                score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                    c.idf_x_k1p1,
-                    c.current_tf(),
-                    norm,
-                );
+            // Cross blocks for whichever cursors exhausted. The outer
+            // loop's alignment step re-pulls everyone to the new leader
+            // doc on the next iteration.
+            if c0.pos >= c0.block_n {
+                c0.next(postings);
             }
-            and_heap_push(heap, k, score, candidate);
-
-            cursors[0].next(postings);
+            for o in others.iter_mut() {
+                if o.pos >= o.block_n {
+                    o.next(postings);
+                }
+            }
         }
     }
 
