@@ -925,7 +925,7 @@ fn build_subsection_streaming(
                 bytes.extend_from_slice(&bf.to_le_bytes());
             }
         }
-        RerankCodec::Sq8 => {
+        RerankCodec::Sq8 | RerankCodec::Sq8Residual => {
             let bytes_before_meta = bytes.len();
             write_sq8_codec_meta_and_codes(
                 &mut bytes,
@@ -935,6 +935,7 @@ fn build_subsection_streaming(
                 n_cent,
                 &cluster_index,
                 cfg.metric,
+                codec,
             );
             // Layout invariant: codec_meta_size + full_size bytes
             // appended (pass 2 / pass 3 contract). Cheap to keep
@@ -1093,6 +1094,7 @@ fn write_sq8_codec_meta_and_codes(
     n_cent: usize,
     cluster_index: &[(u32, u32)],
     metric: Metric,
+    codec: RerankCodec,
 ) {
     debug_assert_eq!(cluster_index.len(), n_cent);
     debug_assert_eq!(full_layout.len(), n_docs * dim);
@@ -1109,6 +1111,8 @@ fn write_sq8_codec_meta_and_codes(
         offsets[c * dim..(c + 1) * dim].copy_from_slice(&oc);
     }
 
+    let write_residuals = matches!(codec, RerankCodec::Sq8Residual);
+
     // ---- write codec_meta scale + offset blocks ----
     bytes.extend_from_slice(bytemuck::cast_slice(&scales));
     bytes.extend_from_slice(bytemuck::cast_slice(&offsets));
@@ -1120,6 +1124,11 @@ fn write_sq8_codec_meta_and_codes(
     // the search-side dequant reconstructs (no fp drift from a
     // re-quantize against the original fp32 row).
     let mut codes = vec![0u8; n_docs * dim];
+    let mut residuals = if write_residuals {
+        vec![0u8; n_docs * dim]
+    } else {
+        Vec::new()
+    };
     for (c, &(off, cnt)) in cluster_index.iter().enumerate() {
         if cnt == 0 {
             continue;
@@ -1130,12 +1139,37 @@ fn write_sq8_codec_meta_and_codes(
             let row = (off as usize) + i;
             let src = &full_layout[row * dim..(row + 1) * dim];
             let dst = &mut codes[row * dim..(row + 1) * dim];
-            for d in 0..dim {
-                let q = ((src[d] - offset_c[d]) / scale_c[d]).round();
-                // Clamp to [0, 255]. Anything outside is a fp
-                // rounding artefact at the boundary; the clamp
-                // keeps the cast safe.
-                dst[d] = q.clamp(0.0, 255.0) as u8;
+            let res_dst = if write_residuals {
+                Some(&mut residuals[row * dim..(row + 1) * dim])
+            } else {
+                None
+            };
+            if let Some(res_dst) = res_dst {
+                for d in 0..dim {
+                    let q = ((src[d] - offset_c[d]) / scale_c[d]).round();
+                    // Clamp to [0, 255]. Anything outside is a fp
+                    // rounding artefact at the boundary; the clamp
+                    // keeps the cast safe.
+                    let q = q.clamp(0.0, 255.0) as u8;
+                    dst[d] = q;
+                    let base = (q as f32) * scale_c[d] + offset_c[d];
+                    let step =
+                        scale_c[d] / crate::superfile::vector::distance::SQ8_RESIDUAL_DIVISOR;
+                    let rq = if step > 0.0 {
+                        ((src[d] - base) / step).round().clamp(-127.0, 127.0) as i8
+                    } else {
+                        0
+                    };
+                    res_dst[d] = rq.to_le_bytes()[0];
+                }
+            } else {
+                for d in 0..dim {
+                    let q = ((src[d] - offset_c[d]) / scale_c[d]).round();
+                    // Clamp to [0, 255]. Anything outside is a fp
+                    // rounding artefact at the boundary; the clamp
+                    // keeps the cast safe.
+                    dst[d] = q.clamp(0.0, 255.0) as u8;
+                }
             }
         }
     }
@@ -1155,9 +1189,18 @@ fn write_sq8_codec_meta_and_codes(
             for i in 0..cnt as usize {
                 let row = (off as usize) + i;
                 let code = &codes[row * dim..(row + 1) * dim];
+                let residual = if write_residuals {
+                    Some(&residuals[row * dim..(row + 1) * dim])
+                } else {
+                    None
+                };
                 let mut acc = 0.0f64;
                 for d in 0..dim {
-                    let x = (code[d] as f32) * scale_c[d] + offset_c[d];
+                    let mut x = (code[d] as f32) * scale_c[d] + offset_c[d];
+                    if let Some(residual) = residual {
+                        x += (i8::from_le_bytes([residual[d]]) as f32) * scale_c[d]
+                            / crate::superfile::vector::distance::SQ8_RESIDUAL_DIVISOR;
+                    }
                     acc += (x as f64) * (x as f64);
                 }
                 norms[row] = acc as f32;
@@ -1166,7 +1209,19 @@ fn write_sq8_codec_meta_and_codes(
         bytes.extend_from_slice(bytemuck::cast_slice(&norms));
     }
 
-    bytes.extend_from_slice(&codes);
+    if write_residuals {
+        // Row-interleaved layout: per-row [code dim u8s || residual dim i8s].
+        // The reader's per-candidate stride is `2*dim`, so each row's code and
+        // residual must live contiguously in `full[]`.
+        let mut interleaved = Vec::with_capacity(2 * n_docs * dim);
+        for row in 0..n_docs {
+            interleaved.extend_from_slice(&codes[row * dim..(row + 1) * dim]);
+            interleaved.extend_from_slice(&residuals[row * dim..(row + 1) * dim]);
+        }
+        bytes.extend_from_slice(&interleaved);
+    } else {
+        bytes.extend_from_slice(&codes);
+    }
 }
 
 /// Pass 2 of `build_subsection_streaming`: walk the input

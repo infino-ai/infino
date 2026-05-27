@@ -12,6 +12,9 @@
 //!   (`scale[dim]`, `offset[dim]`) lives in a sibling
 //!   `codec_meta` region at `codec_meta_off` inside the
 //!   subsection.
+//! - [`RerankCodec::Sq8Residual`]: Sq8 plus a signed 8-bit residual
+//!   sidecar, `dim × 2` bytes per vector. Used for a final top-M
+//!   correction pass over Sq8-ranked candidates.
 //! - [`RerankCodec::None`]: no rerank column at all. The 1-bit
 //!   shortlist is the final ranking — opt-in, recall-degraded,
 //!   shrinks the segment by ~30× at 1M × 384.
@@ -89,6 +92,11 @@ pub enum RerankCodec {
     /// distance kernel fuses dequant with the per-candidate
     /// distance.
     Sq8,
+    /// Sq8 plus a signed 8-bit residual sidecar. Per-vector body is
+    /// `dim` u8 Sq8 codes followed by `dim` i8 residual codes. Search
+    /// uses the normal Sq8 score to choose a small final-refine set,
+    /// then applies the residual correction to that set.
+    Sq8Residual,
     /// No rerank column at all. The shortlist (1-bit RaBitQ
     /// scores) is the final ranking. Opt-in — recall drops
     /// 0.05–0.15 on typical normalized-Gaussian / image-
@@ -98,15 +106,13 @@ pub enum RerankCodec {
 }
 
 impl Default for RerankCodec {
-    /// `Sq8` shrinks the `full[]` rerank region to `dim × 1`
-    /// bytes per vector — 4× smaller than fp32, ~3.5× smaller
-    /// overall segment at 1M × 384 — at a typical recall drop
-    /// < 0.005 vs fp32 on normalized embeddings. Callers that
-    /// need bit-exact fp32 (oracles, regression fixtures,
-    /// recall-floor reference runs) opt in to
-    /// [`RerankCodec::Fp32`] explicitly.
+    /// `Sq8Residual` keeps the compressed path as the default while
+    /// correcting the tight top-K swaps that plain Sq8 exhibits on
+    /// production-shaped 384D cosine corpora. Plain Sq8 remains an
+    /// explicit opt-in for callers that prefer the smallest rerank
+    /// body over the higher recall default.
     fn default() -> Self {
-        Self::Sq8
+        Self::Sq8Residual
     }
 }
 
@@ -122,6 +128,7 @@ impl RerankCodec {
             Self::Bf16 => 1,
             Self::Sq8 => 2,
             Self::None => 3,
+            Self::Sq8Residual => 4,
         }
     }
 
@@ -136,6 +143,7 @@ impl RerankCodec {
             1 => Some(Self::Bf16),
             2 => Some(Self::Sq8),
             3 => Some(Self::None),
+            4 => Some(Self::Sq8Residual),
             _ => None,
         }
     }
@@ -148,6 +156,7 @@ impl RerankCodec {
             Self::Fp32 => "fp32",
             Self::Bf16 => "bf16",
             Self::Sq8 => "sq8",
+            Self::Sq8Residual => "sq8_residual",
             Self::None => "none",
         }
     }
@@ -160,6 +169,7 @@ impl RerankCodec {
             Self::Fp32 => dim * 4,
             Self::Bf16 => dim * 2,
             Self::Sq8 => dim,
+            Self::Sq8Residual => dim * 2,
             Self::None => 0,
         }
     }
@@ -173,7 +183,10 @@ impl RerankCodec {
     /// writing a byte format that the reader can't decode.
     #[inline]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Fp32 | Self::Bf16 | Self::Sq8 | Self::None)
+        matches!(
+            self,
+            Self::Fp32 | Self::Bf16 | Self::Sq8 | Self::Sq8Residual | Self::None
+        )
     }
 
     /// Recommended **lower bound** on `rerank_mult` for this
@@ -199,7 +212,7 @@ impl RerankCodec {
             } else {
                 FP32_BF16_LOW_DIM_RERANK_FLOOR
             }),
-            Self::Sq8 => Some(if high_dim {
+            Self::Sq8 | Self::Sq8Residual => Some(if high_dim {
                 SQ8_HIGH_DIM_RERANK_FLOOR
             } else {
                 SQ8_LOW_DIM_RERANK_FLOOR
@@ -247,7 +260,7 @@ impl RerankCodec {
     ) -> usize {
         match self {
             Self::Fp32 | Self::Bf16 | Self::None => 0,
-            Self::Sq8 => {
+            Self::Sq8 | Self::Sq8Residual => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
                     Metric::L2Sq | Metric::Cosine => n_docs * 4,
@@ -269,13 +282,13 @@ impl std::fmt::Display for RerankCodec {
 mod tests {
     use super::*;
 
-    /// Default codec is `Sq8`. Any change here is a load-bearing
+    /// Default codec is `Sq8Residual`. Any change here is a load-bearing
     /// format choice — every caller that uses
     /// `RerankCodec::default()` silently follows this pick, so
     /// the test pins the contract.
     #[test]
-    fn default_is_sq8() {
-        assert_eq!(RerankCodec::default(), RerankCodec::Sq8);
+    fn default_is_sq8_residual() {
+        assert_eq!(RerankCodec::default(), RerankCodec::Sq8Residual);
     }
 
     /// `Fp32`'s codec_id is zero. Pre-012 segments have all-zero
@@ -298,6 +311,7 @@ mod tests {
             RerankCodec::Bf16,
             RerankCodec::Sq8,
             RerankCodec::None,
+            RerankCodec::Sq8Residual,
         ] {
             assert_eq!(
                 RerankCodec::from_codec_id(c.codec_id()),
@@ -313,7 +327,7 @@ mod tests {
     /// guessing.
     #[test]
     fn unknown_codec_id_is_none() {
-        for id in [4u8, 5, 16, 200, 255] {
+        for id in [5u8, 16, 200, 255] {
             assert_eq!(
                 RerankCodec::from_codec_id(id),
                 None,
@@ -330,6 +344,7 @@ mod tests {
         assert_eq!(RerankCodec::Fp32.per_vector_bytes(384), 1536);
         assert_eq!(RerankCodec::Bf16.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::Sq8.per_vector_bytes(384), 384);
+        assert_eq!(RerankCodec::Sq8Residual.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::None.per_vector_bytes(384), 0);
     }
 
@@ -339,6 +354,7 @@ mod tests {
         assert!(RerankCodec::Fp32.is_implemented());
         assert!(RerankCodec::Bf16.is_implemented());
         assert!(RerankCodec::Sq8.is_implemented());
+        assert!(RerankCodec::Sq8Residual.is_implemented());
         assert!(RerankCodec::None.is_implemented());
     }
 
@@ -362,6 +378,10 @@ mod tests {
             RerankCodec::Sq8.recommended_rerank_mult_floor(384),
             Some(50)
         );
+        assert_eq!(
+            RerankCodec::Sq8Residual.recommended_rerank_mult_floor(384),
+            Some(50)
+        );
         assert_eq!(RerankCodec::None.recommended_rerank_mult_floor(384), None);
         // 384 < dim ≤ 1024 column.
         assert_eq!(
@@ -374,6 +394,10 @@ mod tests {
         );
         assert_eq!(
             RerankCodec::Sq8.recommended_rerank_mult_floor(1024),
+            Some(100)
+        );
+        assert_eq!(
+            RerankCodec::Sq8Residual.recommended_rerank_mult_floor(1024),
             Some(100)
         );
         assert_eq!(RerankCodec::None.recommended_rerank_mult_floor(1024), None);

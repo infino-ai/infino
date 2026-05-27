@@ -151,7 +151,10 @@ fn process_rss_bytes_matches_independent_reading_within_pct() {
     let i2 = read();
 
     assert!(s > 0, "stats.process_rss_bytes must be non-zero");
-    assert!(i1 > 0 && i2 > 0, "independent RSS readings must be non-zero");
+    assert!(
+        i1 > 0 && i2 > 0,
+        "independent RSS readings must be non-zero"
+    );
 
     // Slack = the drift observed between i1 and i2 (concurrent
     // process activity) + 64 MiB absolute floor for in-between

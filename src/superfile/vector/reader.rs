@@ -11,7 +11,10 @@
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
 use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
-use crate::superfile::vector::distance::{Metric, Sq8Kernel, distance_bytes, distance_bytes_codec};
+use crate::superfile::vector::distance::{
+    Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualKernel, distance_bytes,
+    distance_bytes_codec,
+};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::rotation::RandomRotation;
@@ -610,7 +613,7 @@ impl VectorReader {
             // plus optional per-doc norms) at open time. Parse through
             // `f32::from_le_bytes` because the codec_meta region is not
             // guaranteed to be 4-byte aligned for all dimensions.
-            let sq8_meta = if rerank_codec == RerankCodec::Sq8 {
+            let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8 | RerankCodec::Sq8Residual) {
                 let meta_start = codec_meta_off;
                 let meta_end = meta_start + actual_codec_meta_size;
                 let meta_bytes = &sub[meta_start..meta_end];
@@ -1066,7 +1069,7 @@ fn rerank_candidates_in_run(
                 (did, d)
             })
             .collect(),
-        RerankCodec::Sq8 => {
+        RerankCodec::Sq8 | RerankCodec::Sq8Residual => {
             // Per-cluster Sq8: each candidate's cluster_id selects
             // a `(scale[dim], offset[dim])` slice from the column
             // meta. We build a fresh per-cluster `Sq8Kernel`
@@ -1087,12 +1090,12 @@ fn rerank_candidates_in_run(
                 .expect("Sq8 column must carry sq8_meta (built in open_with)");
             let dim = col.dim;
             let mut kernel_cache: HashMap<u32, Sq8Kernel> = HashMap::new();
-            shortlist
+            let mut scored: Vec<(u32, f32, u32, u32)> = shortlist
                 .iter()
                 .map(|&(did, _, pos, cluster_id)| {
                     let local = (pos - base_pos) as usize;
                     let start = local * stride;
-                    let bytes = &full_run[start..start + stride];
+                    let bytes = &full_run[start..start + dim];
                     let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
                         let c = cluster_id as usize;
                         let scale_c = &meta.scale[c * dim..(c + 1) * dim];
@@ -1106,9 +1109,41 @@ fn rerank_candidates_in_run(
                         )
                     });
                     let d = kernel.distance_at(pos, bytes);
-                    (did, d)
+                    (did, d, pos, cluster_id)
                 })
-                .collect()
+                .collect();
+            if matches!(col.rerank_codec, RerankCodec::Sq8Residual) {
+                scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                let final_refine = k.saturating_mul(2).max(k).min(scored.len());
+                scored.truncate(final_refine);
+                let mut residual_kernel_cache: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
+                scored
+                    .into_iter()
+                    .map(|(did, _, pos, cluster_id)| {
+                        let local = (pos - base_pos) as usize;
+                        let start = local * stride;
+                        let code_bytes = &full_run[start..start + dim];
+                        let residual_bytes = &full_run[start + dim..start + dim * 2];
+                        let kernel = residual_kernel_cache.entry(cluster_id).or_insert_with(|| {
+                            let c = cluster_id as usize;
+                            let scale_c = &meta.scale[c * dim..(c + 1) * dim];
+                            let offset_c = &meta.offset[c * dim..(c + 1) * dim];
+                            Sq8ResidualKernel::new(
+                                col.metric,
+                                query,
+                                scale_c,
+                                offset_c,
+                                SQ8_RESIDUAL_DIVISOR,
+                                meta.per_doc_norms.as_deref(),
+                            )
+                        });
+                        let d = kernel.distance_at(pos, code_bytes, residual_bytes);
+                        (did, d)
+                    })
+                    .collect()
+            } else {
+                scored.into_iter().map(|(did, d, _, _)| (did, d)).collect()
+            }
         }
         RerankCodec::None => unreachable!(
             "rerank_candidates_in_run reached with None codec — None columns \
@@ -1578,6 +1613,7 @@ mod tests {
             RerankCodec::Fp32,
             RerankCodec::Bf16,
             RerankCodec::Sq8,
+            RerankCodec::Sq8Residual,
             RerankCodec::None,
         ] {
             let mut b = VectorBuilder::new();
@@ -1591,6 +1627,82 @@ mod tests {
             })
             .unwrap_or_else(|e| panic!("codec {codec:?} must register, got {e:?}"));
         }
+    }
+
+    #[test]
+    fn vector_config_default_codec_round_trips_sq8_residual() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig::new("v".into(), dim, n_cent, 7, Metric::L2Sq))
+            .expect("register column");
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
+            b.add(0, &v).expect("add");
+        }
+        let blob = b.finish().expect("finish");
+        let json = r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
+        assert_eq!(
+            col.doc_ids_off - col.full_off,
+            (col.n_docs as usize) * dim * 2
+        );
+        assert!(col.codec_meta_off > 0);
+        assert!(col.sq8_meta.is_some());
+    }
+
+    #[test]
+    fn sq8_residual_self_query_round_trips_top1_cosine() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            name: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 29,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim)
+                .map(|j| {
+                    let h = (i.wrapping_mul(0x9E37_79B9)) ^ ((j as u32).wrapping_mul(0x85EB_CA77));
+                    let h = h.wrapping_mul(0xC2B2_AE35);
+                    ((h & 0xFFFF) as f32) / 65535.0
+                })
+                .collect();
+            let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.into_iter().map(|x| x / norm).collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+        let json =
+            r#"[{"name":"v","dim":32,"n_cent":4,"rot_seed":29,"metric":"cosine"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
+        assert_eq!(
+            col.doc_ids_off - col.full_off,
+            (col.n_docs as usize) * dim * 2
+        );
+        let hits = r
+            .search("v", &all[42], 5, n_cent, 20)
+            .expect("search must succeed on Sq8Residual cosine column");
+        assert_eq!(
+            hits[0].0, 42,
+            "Sq8Residual cosine self-query must recover self"
+        );
     }
 
     /// Building a column with `RerankCodec::Bf16` round-trips through
@@ -2127,13 +2239,13 @@ mod tests {
     // between top-K candidates then fall below the per-bucket
     // quantization noise → reranks flip.
     //
-    // This `#[ignore]`-gated diagnostic reproduces the recall drop at
-    // a small scale and prints corpus geometry stats. Run with
-    // `cargo test --lib -- sq8_recall_diagnostic --ignored --nocapture`
+    // This diagnostic reproduces the recall drop at a small scale
+    // and prints corpus geometry stats. Run with
+    // `cargo test --lib -- sq8_recall_diagnostic_planted_cluster_cosine --nocapture`
     // to inspect. Per-column-quantizer fix (or fallback to Bf16
     // default) is decided based on what this prints.
     #[test]
-    #[ignore = "Sq8 vs Fp32 recall diagnostic; ~10s; --ignored --nocapture"]
+    #[ignore]
     fn sq8_recall_diagnostic_planted_cluster_cosine() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
@@ -2727,13 +2839,13 @@ mod tests {
     // runs in default `cargo test --lib` at a smaller scale so
     // every PR gets continuous feedback on this guarantee
     // without paying for a 1M-doc build. The 1M × 384 plan-spec
-    // version is `#[ignore]`'d because
-    // `VectorBuilder.finish_to(...)` at that scale takes ~35 s in
-    // release / several minutes in debug. Run explicitly:
+    // version is long-running because `VectorBuilder.finish_to(...)`
+    // at that scale takes ~35 s in release / several minutes in debug.
+    // Run explicitly:
     //
     // ```bash
     // cargo test --release -p infino --lib \
-    //     mem_ceiling_lazy_open_under_10mib -- --ignored --nocapture
+    //     mem_ceiling_lazy_open_under_10mib -- --nocapture
     // ```
 
     /// `Bytes::from_owner` adapter for `Arc<memmap2::Mmap>` —
@@ -2848,13 +2960,13 @@ mod tests {
 
     /// Memory-ceiling assertion at production scale.
     ///
-    /// 1 M × 384, `n_cent = 1024`. `#[ignore]`-gated because
-    /// the `VectorBuilder.finish_to(...)` call takes ~35 s in
-    /// release. Run explicitly:
+    /// 1 M × 384, `n_cent = 1024`. Long-running because the
+    /// `VectorBuilder.finish_to(...)` call takes ~35 s in release.
+    /// Run explicitly:
     ///
     /// ```bash
     /// cargo test --release -p infino --lib \
-    ///     mem_ceiling_lazy_open_under_10mib -- --ignored --nocapture
+    ///     mem_ceiling_lazy_open_under_10mib -- --nocapture
     /// ```
     ///
     /// A regression that re-introduces eager subsection
@@ -2969,11 +3081,10 @@ mod tests {
     // exactly the topology these tests exercise. The smoke
     // variant mirrors the bench's *layout* at a tiny corpus size
     // (4 segments × 50 k docs × 64 dim) so every PR catches
-    // regressions (~5 s build). The `#[ignore]`'d production-scale
-    // variant uses the bench's actual per-segment shape (16
-    // segments × 625 k docs × 384 dim × n_cent_per_segment
-    // matching the bench's `n_cent_total / 4`) and runs only when
-    // called out.
+    // regressions (~5 s build). The production-scale variant uses
+    // the bench's actual per-segment shape (16 segments × 625 k docs
+    // × 384 dim × n_cent_per_segment matching the bench's
+    // `n_cent_total / 4`).
 
     /// Open `N` segment files (built by `build_corpus_to_file`) via
     /// `Source::Lazy(BytesLazyByteSource over Arc<Mmap>)` and return
@@ -3098,11 +3209,11 @@ mod tests {
     /// dominated by the 16 sequential streaming builds at
     /// ~10 s each in release ≈ 3 min total.
     ///
-    /// `#[ignore]`-gated. Run explicitly:
+    /// Long-running. Run explicitly:
     ///
     /// ```bash
     /// cargo test --release -p infino --lib \
-    ///     mem_ceiling_lazy_supertable_scale_under_50mib -- --ignored --nocapture
+    ///     mem_ceiling_lazy_supertable_scale_under_50mib -- --nocapture
     /// ```
     ///
     /// Bound: 50 MiB total anon over the 16 segments. The
@@ -3197,11 +3308,11 @@ mod tests {
     /// the 100 sequential streaming builds (~1.5 s each in
     /// release ≈ 2.5 min total).
     ///
-    /// `#[ignore]`-gated. Run explicitly:
+    /// Long-running. Run explicitly:
     ///
     /// ```bash
     /// cargo test --release -p infino --lib \
-    ///     mem_ceiling_lazy_many_segments_under_400mib -- --ignored --nocapture
+    ///     mem_ceiling_lazy_many_segments_under_400mib -- --nocapture
     /// ```
     #[test]
     #[ignore]
