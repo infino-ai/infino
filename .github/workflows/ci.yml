@@ -16,6 +16,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The default github-hosted ubuntu runner has ~14 GB free at job
+      # start; infino's dep graph (datafusion + lance + tantivy + s3s)
+      # plus `cargo llvm-cov`'s separate `target/llvm-cov-target/`
+      # directory (it instruments a second full build of everything)
+      # overflows that, so the coverage step fails with ENOSPC. Free
+      # ~30 GB by removing toolchains the build doesn't need (Android
+      # SDK, .NET, Haskell, ...) before any compile work starts.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
