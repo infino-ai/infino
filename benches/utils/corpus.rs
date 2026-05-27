@@ -581,13 +581,13 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
 
 /// Build a stand-alone vector index. `vectors` is flat `n_docs * DIM`.
 ///
-/// Bench harness picks `Sq8` by default to match the on-disk
-/// default for production segments. Per-cluster scale/offset
-/// quantizer is the active codec (drop ≤ 0.04 on the
-/// pathological planted-cluster synthetic; expected near-zero on
-/// real embeddings). Callers measuring the Fp32 baseline (recall
-/// oracles, bit-exact regression tests) construct their own
-/// `VectorConfig` with `RerankCodec::Fp32`.
+/// Bench harness picks `Sq8Residual` to match the on-disk default
+/// for production segments (per `RerankCodec::default()` as of the
+/// rerank-codec PR). The u8 codes + i8 residual sidecar closes the
+/// recall gap that plain `Sq8` leaves at production shape. Callers
+/// measuring the Fp32 baseline (recall oracles, bit-exact regression
+/// tests) construct their own `VectorConfig` with
+/// `RerankCodec::Fp32`.
 pub fn build_vector_index(
     vectors: &[f32],
     n_docs: usize,
@@ -601,7 +601,7 @@ pub fn build_vector_index(
         n_cent,
         rot_seed: 7,
         metric,
-        rerank_codec: RerankCodec::Sq8,
+        rerank_codec: RerankCodec::Sq8Residual,
     })
     .expect("register column");
     for i in 0..n_docs {
@@ -646,7 +646,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     );

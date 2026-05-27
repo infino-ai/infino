@@ -106,7 +106,7 @@ pub struct VectorConfig {
     pub n_cent: usize,
     pub rot_seed: u64,
     pub metric: Metric,
-    /// On-disk rerank codec. Defaults to [`RerankCodec::Sq8`].
+    /// On-disk rerank codec. Defaults to [`RerankCodec::Sq8Residual`].
     pub rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec,
 }
 
