@@ -45,7 +45,7 @@
 use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
-use crate::superfile::lazy_source::{LazyByteSource, Source};
+use crate::superfile::lazy_source::{LazyByteSource, Source, SubLazyByteSource};
 use crate::superfile::vector::reader::VectorReader;
 use arrow_schema::Schema;
 use bytes::Bytes;
@@ -252,14 +252,30 @@ impl SuperfileReader {
             None
         };
 
-        // Vector blob: same shape as FTS.
+        // Vector blob — 013 PR3 (A2v).
+        //
+        // Unlike FTS, the vector reader takes a `Source` and
+        // tightens its own open-time fetches to only the
+        // per-column sub-header + codec_meta region. So instead
+        // of materialising the full vector blob here, we hand
+        // it a sub-source over `[vec_off, vec_off + vec_len)`:
+        //  - `Source::InMemory(parent)` → zero-copy
+        //    `Bytes::slice` (same cost as before PR3).
+        //  - `Source::Lazy(parent_arc)` → a
+        //    [`SubLazyByteSource`] window over the parent. No
+        //    whole-blob materialisation; the vector reader's
+        //    open-time fetches now scale with codec_meta size,
+        //    not blob size. Search-time fetches continue
+        //    through the same sub-source on demand.
+        //
+        // PR4 will give FTS the same treatment.
         let vec = if all_present(&kv_map, kv::VEC_KEYS) {
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
             let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
-            let blob = fetch_blob_or_err(&source, off, len, "vector")?;
-            Some(VectorReader::open_with(
-                blob,
+            let vec_source = sub_source_for(&source, off, len, "vector")?;
+            Some(VectorReader::open_with_source(
+                vec_source,
                 cols_json,
                 crate::superfile::vector::reader::OpenOptions {
                     verify_crc: opts.verify_crc,
@@ -632,14 +648,20 @@ fn parse_u64(map: &footer::KvMap, key: &'static str) -> Result<u64, ReadError> {
 }
 
 /// Fetch a blob region (`[off, off + len)`) from a [`Source`],
-/// surfacing the typed [`ReadError`] the rest of the open path
-/// expects.
+/// materialising the bytes as a single `Bytes` value.
 ///
 /// On `Source::InMemory` this is a zero-copy `Bytes::slice`;
 /// on `Source::Lazy` it's a single
 /// [`Source::get_range`] call which itself routes through the
 /// underlying source's sync fast path (warm cache / mmap) or
 /// bridges to its async `range` for cold misses.
+///
+/// Used for the FTS blob path today — `FtsReader::open_with`
+/// takes a `Bytes`, so materialising the whole blob is
+/// required until PR4 (013-A2f) gives it the `Source`
+/// abstraction. The vector path uses [`sub_source_for`]
+/// instead so the per-column open can fetch only the open-
+/// time region.
 fn fetch_blob_or_err(
     source: &Source,
     off: u64,
@@ -657,6 +679,47 @@ fn fetch_blob_or_err(
     source
         .get_range(off_usize..end_usize)
         .map_err(|e| ReadError::MalformedKv(format!("{section} blob fetch: {e}")))
+}
+
+/// Carve a [`Source`] over the sub-range `[off, off + len)` of
+/// `parent`, without materialising any bytes up-front.
+///
+/// - `Source::InMemory(parent_bytes)` → `Source::InMemory(
+///   parent_bytes.slice(off..off + len))`. Zero-copy
+///   refcount bump.
+/// - `Source::Lazy(parent_arc)` → `Source::Lazy(Arc::new(
+///   SubLazyByteSource::new(Arc::clone(parent_arc), off,
+///   len)?))`. No range GETs at construction; the resulting
+///   source proxies every byte fetch into the parent at the
+///   translated offset.
+///
+/// The returned `Source` is what downstream readers see as
+/// their "blob". They open against it via `open_with_source`
+/// and drive their own open-time + search-time fetches
+/// through `Source::get_range` exactly as if they owned the
+/// full blob.
+fn sub_source_for(
+    parent: &Source,
+    off: u64,
+    len: u64,
+    section: &'static str,
+) -> Result<Source, ReadError> {
+    let total = parent.len() as u64;
+    if off.saturating_add(len) > total {
+        return Err(ReadError::MalformedKv(format!(
+            "{section} blob offset+len out of range"
+        )));
+    }
+    let off_usize = off as usize;
+    let end_usize = off_usize + len as usize;
+    match parent {
+        Source::InMemory(b) => Ok(Source::InMemory(b.slice(off_usize..end_usize))),
+        Source::Lazy(parent_arc) => {
+            let sub = SubLazyByteSource::new(Arc::clone(parent_arc), off, len)
+                .map_err(|e| ReadError::MalformedKv(format!("{section} sub source ctor: {e}")))?;
+            Ok(Source::Lazy(Arc::new(sub)))
+        }
+    }
 }
 
 // Re-export for convenience: callers want `BoolMode` without diving

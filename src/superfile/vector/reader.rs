@@ -33,6 +33,26 @@ const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
 const SUB_HEADER_SIZE: usize = 56;
 
+/// Speculative tail size for the open-time structural-prefix
+/// fetch: outer header (32 B) + directory (n_cols × 64 B) +
+/// dir-CRC (4 B), all contiguous from offset 0 because the
+/// builder writes the directory immediately after the outer
+/// header (`directory_offset = OUTER_HEADER_SIZE`).
+///
+/// 4 KiB is sized for the headline 1–4-vector-column case
+/// (≤ 32 B + 4 × 64 B + 4 B = 292 B) with a generous slack —
+/// it covers up to 63 vector columns in a single range GET
+/// while staying well under any reasonable S3 minimum-range
+/// floor. On the rare segment with more columns the open
+/// path issues exactly one follow-up GET for the directory
+/// tail; the speculative ceiling never produces a third GET.
+///
+/// On `Source::InMemory` and warm `Source::Lazy` (e.g.
+/// mmap-backed `BytesLazyByteSource`) the prefetch is a
+/// zero-copy `Bytes::slice` so the over-fetch costs a
+/// refcount bump, not bytes on the wire.
+const STRUCTURAL_PREFIX_SPECULATIVE_BYTES: usize = 4096;
+
 /// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
 /// value is a JSON array of these in declaration order. Mirrors
 /// the build-time [`VectorConfig`] but with `metric` as a string
@@ -207,18 +227,40 @@ impl VectorReader {
             )));
         }
 
-        // Pull the fixed-size outer header in one fetch — five small
-        // reads collapse into one `Bytes::slice`.
-        let header = fetch_sync(&source, 0..OUTER_HEADER_SIZE, "outer header")?;
-        if &header[0..8] != format::vec::OUTER_MAGIC {
+        // 013 PR3 (A2v): one speculative range GET covers
+        // outer-header + directory + dir-CRC (and, in the
+        // common single-column case, the per-subsection
+        // sub-header too). The builder lays the directory out
+        // immediately after the outer header
+        // (`directory_offset = OUTER_HEADER_SIZE`) and the
+        // first subsection right after that, so a prefetch
+        // from offset 0 of `STRUCTURAL_PREFIX_SPECULATIVE_BYTES`
+        // bytes is enough to satisfy the structural decode for
+        // any segment with up to 63 vector columns. Wider
+        // segments pay one follow-up GET for the directory
+        // tail; nothing else.
+        //
+        // Subsequent open-time reads (per-subsection
+        // sub-header and Sq8 `codec_meta`) check the prefetch
+        // before falling through to `source.get_range` —
+        // ranges already inside the prefetch are served as
+        // zero-copy `Bytes::slice` instead of issuing a
+        // second range GET against the underlying source.
+        // On `Source::InMemory` / warm `Source::Lazy` the
+        // prefetch itself is also a zero-copy slice, so the
+        // over-fetch costs a refcount bump, not bytes on the
+        // wire.
+        let speculative_end = STRUCTURAL_PREFIX_SPECULATIVE_BYTES.min(source.len());
+        let prefetch = fetch_sync(&source, 0..speculative_end, "header+dir prefetch")?;
+        if &prefetch[0..8] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
                 expected: format::vec::OUTER_MAGIC,
-                actual: header[0..8].to_vec(),
+                actual: prefetch[0..8].to_vec(),
             }));
         }
 
-        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let version = u32::from_le_bytes([prefetch[8], prefetch[9], prefetch[10], prefetch[11]]);
         if version != format::vec::VERSION {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
@@ -226,23 +268,30 @@ impl VectorReader {
         }
 
         let n_columns =
-            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
-        let n_docs = read_u64_le(&header[16..24]);
-        let dir_offset = read_u64_le(&header[24..32]) as usize;
+            u32::from_le_bytes([prefetch[12], prefetch[13], prefetch[14], prefetch[15]]) as usize;
+        let n_docs = read_u64_le(&prefetch[16..24]);
+        let dir_offset = read_u64_le(&prefetch[24..32]) as usize;
 
         // Verify directory CRC.
         let dir_size = n_columns * DIR_ENTRY_SIZE;
-        if dir_offset + dir_size + 4 > source.len() {
+        let dir_end = dir_offset + dir_size + 4;
+        if dir_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "vector directory runs past blob".into(),
             )));
         }
-        let dir_bytes = fetch_sync(&source, dir_offset..dir_offset + dir_size, "directory")?;
-        let dir_crc_bytes = fetch_sync(
+        // Directory + dir-CRC: served from the prefetch when the
+        // speculative window covered them; one follow-up GET
+        // for the tail otherwise. See `fetch_with_prefetch`.
+        let dir_with_crc = fetch_with_prefetch(
             &source,
-            dir_offset + dir_size..dir_offset + dir_size + 4,
-            "directory crc",
+            &prefetch,
+            speculative_end,
+            dir_offset..dir_end,
+            "directory",
         )?;
+        let dir_bytes = dir_with_crc.slice(0..dir_size);
+        let dir_crc_bytes = dir_with_crc.slice(dir_size..dir_size + 4);
         let dir_crc_expected = read_u32_le(&dir_crc_bytes);
         let dir_crc_actual = crc32c(&dir_bytes);
         if dir_crc_expected != dir_crc_actual {
@@ -351,28 +400,54 @@ impl VectorReader {
                 }
             };
 
-            // Validate subsection bounds + magic. Subsection CRCs are
-            // verified above in the parallel CRC pre-pass when requested.
+            // Validate subsection bounds + pull only the open-time
+            // region.
+            //
+            // Open-time region per subsection (013 PR3):
+            //   1. Sub-header (SUB_HEADER_SIZE = 56 bytes) — always.
+            //   2. Codec-meta region (variable) — only for Sq8.
+            //      Fp32 / Bf16 / RabitqOnly have zero-byte codec_meta
+            //      and skip this entirely.
+            //
+            // Centroids, cluster_idx, codes, full, doc_ids are NOT
+            // fetched at open — search lazily reads them through
+            // `self.source` on demand. On `Source::InMemory` this
+            // is a free zero-copy slice; on `Source::Lazy` it's
+            // a cold range GET bridged through `Source::get_range`.
+            //
+            // Subsection CRCs are verified above in the parallel
+            // CRC pre-pass when `opts.verify_crc=true`; that path
+            // *does* pull the full subsection. With the production
+            // fast path (`verify_crc=false`, trusted storage) the
+            // open-time bytes scale with codec_meta only — for
+            // Sq8 ≈ `2 * n_cent * dim * 4 + maybe n_docs * 4`;
+            // for Fp32 / Bf16 / RabitqOnly ≈ 56 bytes per column.
             let sub_end = subsection_off + subsection_len;
             if sub_end > source.len() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} runs past blob"
                 ))));
             }
-            let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
-            if sub.len() < SUB_HEADER_SIZE + 4 {
+            if subsection_len < SUB_HEADER_SIZE + 4 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} too short"
                 ))));
             }
-            if &sub[0..8] != format::vec::SUB_MAGIC {
+            let sub_header = fetch_with_prefetch(
+                &source,
+                &prefetch,
+                speculative_end,
+                subsection_off..subsection_off + SUB_HEADER_SIZE,
+                "sub header",
+            )?;
+            if &sub_header[0..8] != format::vec::SUB_MAGIC {
                 return Err(VectorError::Read(ReadError::BadMagic {
                     section: "vector/subsection",
                     expected: format::vec::SUB_MAGIC,
-                    actual: sub[0..8].to_vec(),
+                    actual: sub_header[0..8].to_vec(),
                 }));
             }
-            let sub_crc_pos = sub.len() - 4;
+            let sub_crc_pos = subsection_len - 4;
 
             // Sub-header parse (SUB_HEADER_SIZE = 56 bytes):
             //   [8..12]  version  (cross-checked against outer header)
@@ -385,13 +460,13 @@ impl VectorReader {
             //   [40..48] cluster_idx_offset
             //   [48..52] codes_offset
             //   [52..56] full_offset
-            let codec_meta_off = read_u32_le(&sub[12..16]) as usize;
-            let summary_off = read_u64_le(&sub[16..24]) as usize;
-            let summary_radius_x100 = read_u32_le(&sub[24..28]);
-            let centroids_off = read_u64_le(&sub[32..40]) as usize;
-            let cluster_idx_off = read_u64_le(&sub[40..48]) as usize;
-            let codes_off = read_u32_le(&sub[48..52]) as usize;
-            let full_off = read_u32_le(&sub[52..56]) as usize;
+            let codec_meta_off = read_u32_le(&sub_header[12..16]) as usize;
+            let summary_off = read_u64_le(&sub_header[16..24]) as usize;
+            let summary_radius_x100 = read_u32_le(&sub_header[24..28]);
+            let centroids_off = read_u64_le(&sub_header[32..40]) as usize;
+            let cluster_idx_off = read_u64_le(&sub_header[40..48]) as usize;
+            let codes_off = read_u32_le(&sub_header[48..52]) as usize;
+            let full_off = read_u32_le(&sub_header[52..56]) as usize;
             // Fp32 + Bf16 + RabitqOnly all keep zero-byte codec_meta; Sq8
             // emits per-cluster scale/offset (+ per-doc
             // norms for L2Sq/Cosine). The per-codec layout check below
@@ -468,13 +543,21 @@ impl VectorReader {
             }
 
             // Materialise Sq8 codec_meta (per-cluster scale + offset
-            // plus optional per-doc norms) at open time. Parse through
-            // `f32::from_le_bytes` because the codec_meta region is not
-            // guaranteed to be 4-byte aligned for all dimensions.
+            // plus optional per-doc norms) at open time. One range
+            // GET against the source; Fp32 / Bf16 / RabitqOnly skip
+            // this entirely. Parse through `f32::from_le_bytes`
+            // because the codec_meta region is not guaranteed to be
+            // 4-byte aligned for all dimensions.
             let sq8_meta = if rerank_codec == RerankCodec::Sq8 {
-                let meta_start = codec_meta_off;
-                let meta_end = meta_start + actual_codec_meta_size;
-                let meta_bytes = &sub[meta_start..meta_end];
+                let meta_abs_start = subsection_off + codec_meta_off;
+                let meta_abs_end = meta_abs_start + actual_codec_meta_size;
+                let meta_bytes = fetch_with_prefetch(
+                    &source,
+                    &prefetch,
+                    speculative_end,
+                    meta_abs_start..meta_abs_end,
+                    "codec_meta",
+                )?;
                 let so_block_bytes = (n_cent as usize) * dim * 4;
                 let scale_end = so_block_bytes;
                 let offset_end = scale_end + so_block_bytes;
@@ -1051,17 +1134,22 @@ fn verify_vector_crcs(
                 "subsection {i} runs past blob"
             ))));
         }
-        let sub = fetch_sync(source, subsection_off..sub_end, "subsection")?;
-        if sub.len() < SUB_HEADER_SIZE + 4 {
+        // Bounds-check from the dir-entry's `subsection_len` rather
+        // than the post-fetch `sub.len()` — keeps the failure
+        // surface independent of the source's behaviour and
+        // mirrors the lazy open path's check at
+        // `open_with_source` (013 PR3 / A2v).
+        if subsection_len < SUB_HEADER_SIZE + 4 {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "subsection {i} too short"
             ))));
         }
-        let sub_crc_pos = sub.len() - 4;
+        let sub = fetch_sync(source, subsection_off..sub_end, "subsection")?;
+        let sub_crc_pos = subsection_len - 4;
         // `Bytes::slice` is zero-copy — no second `try_get_range_sync`
         // round-trip needed since we already hold the subsection.
         let sub_body = sub.slice(0..sub_crc_pos);
-        let sub_crc_bytes = sub.slice(sub_crc_pos..sub.len());
+        let sub_crc_bytes = sub.slice(sub_crc_pos..subsection_len);
         jobs.push(CrcJob {
             idx: i as i32,
             bytes: sub_body,
@@ -1097,23 +1185,86 @@ fn verify_vector_crcs(
     Ok(())
 }
 
-/// Best-effort sync byte fetch with a typed error. Used throughout
-/// `open_with` so every byte access goes through the `Source`
-/// abstraction — the lazy variant plumbs the eager-prefetch
-/// path through the same call sites without a second rewrite.
+/// Sync byte fetch through the [`Source`] abstraction, with
+/// a typed error. Used throughout the open + search paths so
+/// every byte access routes through one call site — eager and
+/// lazy variants share the same call shape.
 ///
-/// Failure mode here means the range is out-of-bounds or not
-/// present in the sync cache. On `Source::InMemory` any in-bounds
-/// range succeeds zero-copy; this only fires on a malformed blob.
+/// On `Source::InMemory` and warm-cache / mmap-backed
+/// `Source::Lazy` sources, `Source::get_range` returns
+/// zero-copy `Bytes::slice` views via the underlying source's
+/// `try_get_range_sync` fast path. Cold `Source::Lazy` misses
+/// (e.g. against `StorageRangeSource`) bridge to the source's
+/// `async fn range` via `block_in_place + Handle::block_on`
+/// — same pattern as
+/// [`crate::supertable::query::superfile_reader::superfile_reader`].
+///
+/// Surfaces both out-of-bounds and real I/O / storage errors
+/// as [`VectorError::Read`] with a `MalformedVersion` payload.
+/// Callers that need to distinguish "cold miss" from "no
+/// runtime" should hit [`Source::try_get_range_sync`] directly
+/// (e.g. [`VectorReader::summary`]).
 #[inline]
 fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, VectorError> {
     let start = range.start;
     let end = range.end;
-    source.try_get_range_sync(range).ok_or_else(|| {
+    source.get_range(range).map_err(|e| {
         VectorError::Read(ReadError::MalformedVersion(format!(
-            "vector {what} range {start}..{end} past blob"
+            "vector {what} range {start}..{end} fetch: {e}"
         )))
     })
+}
+
+/// Open-time fetch helper that prefers a previously-prefetched
+/// `prefetch[0..prefetch_end]` window over re-issuing a range
+/// against `source`.
+///
+/// Three cases:
+/// - `range.end <= prefetch_end`: fully inside the prefetch.
+///   Returns a zero-copy `Bytes::slice` of the prefetch
+///   buffer. **No range GET against `source`.**
+/// - `range.start >= prefetch_end`: fully outside the prefetch
+///   (e.g. an Sq8 `codec_meta` region that lives past the
+///   first 4 KiB of the vector blob in a 1M-doc segment).
+///   Falls through to [`fetch_sync`] — one range GET.
+/// - Straddle (rare): the range starts inside the prefetch
+///   but ends past it. Splits into a sliced head + a follow-up
+///   range GET for the tail and stitches into a single
+///   `Bytes`. One range GET, sized to the missing tail only.
+///
+/// On `Source::Lazy` (e.g. `StorageRangeSource` against an
+/// object store) the speculative-then-slice pattern is
+/// load-bearing: `Source::get_range` doesn't cache, so a
+/// second `fetch_sync` for a range already covered by the
+/// prefetch would still issue a fresh range GET against the
+/// underlying provider. Slicing from the prefetch is the
+/// thing that turns "outer header + dir + sub-header"
+/// reachable at single-column scale into one storage GET
+/// instead of three.
+///
+/// On `Source::InMemory` both paths are zero-copy, but the
+/// helper keeps the call sites identical so the structural
+/// decode looks the same on both sources.
+#[inline]
+fn fetch_with_prefetch(
+    source: &Source,
+    prefetch: &Bytes,
+    prefetch_end: usize,
+    range: Range<usize>,
+    what: &'static str,
+) -> Result<Bytes, VectorError> {
+    if range.end <= prefetch_end {
+        Ok(prefetch.slice(range))
+    } else if range.start >= prefetch_end {
+        fetch_sync(source, range, what)
+    } else {
+        let head = prefetch.slice(range.start..prefetch_end);
+        let tail = fetch_sync(source, prefetch_end..range.end, what)?;
+        let mut buf = Vec::with_capacity(range.len());
+        buf.extend_from_slice(&head);
+        buf.extend_from_slice(&tail);
+        Ok(Bytes::from(buf))
+    }
 }
 
 #[cfg(test)]
