@@ -7,23 +7,48 @@
 //!
 //! ## Threading
 //!
-//! `Send + Sync`. Concurrent searches share the underlying `Bytes`.
+//! `Send + Sync`. Concurrent searches share the underlying byte
+//! source (`Bytes` on the eager path; `Arc<dyn LazyByteSource>` on
+//! the lazy path).
+//!
+//! ## Entry points
+//!
+//! Every entry collapses into one sync decode core,
+//! [`SuperfileReader::open_with_source`], that takes a
+//! [`Source`] (`InMemory(Bytes)` or `Lazy(Arc<dyn LazyByteSource>)`).
+//! The eager [`SuperfileReader::open`] and
+//! [`SuperfileReader::open_with`] wrap the input bytes into
+//! `Source::InMemory`; the async-shaped [`SuperfileReader::open_lazy`]
+//! and [`SuperfileReader::open_lazy_with`] wrap an
+//! `Arc<dyn LazyByteSource>` into `Source::Lazy` and delegate. The
+//! core uses [`Source::get_range`] for every byte fetch, so cold
+//! `Source::Lazy` misses bridge to the source's `async fn range`
+//! through `block_in_place + Handle::block_on` (same pattern as the
+//! supertable's `superfile_reader`).
 //!
 //! ## Section laziness
 //!
-//! Eager at the blob level (both blobs sliced once at `open()`), lazy
-//! within each blob (per-(column,term) postings + per-cluster vector
-//! codes are read on-demand by the underlying readers). The
-//! single-segment SuperfileReader does no I/O after `open()`; a
-//! storage layer can layer cold-fetch heuristics on top.
+//! Eager-source open: full segment is in `Bytes`; both blobs are
+//! sliced once and the whole buffer is retained for
+//! [`SuperfileReader::parquet_bytes`] callers.
+//!
+//! Lazy-source open: only the footer (2 ranges) + the FTS and
+//! vector blob regions are fetched. The full segment is **never**
+//! materialised, so [`SuperfileReader::parquet_bytes`] returns
+//! [`None`] for callers that would otherwise need to register the
+//! Parquet bytes with an external reader (DataFusion, DuckDB, etc.).
+//! Per-(column, term) postings and per-cluster vector codes stay
+//! lazy within each blob — the underlying readers fetch them on
+//! demand through the same `Source` (PR3 / PR4 tighten this to
+//! per-subsection sub-sources).
 
 use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
+use crate::superfile::lazy_source::{LazyByteSource, Source};
 use crate::superfile::vector::reader::VectorReader;
 use arrow_schema::Schema;
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 
 /// Per-open knobs for [`SuperfileReader::open_with`]. Defaults to
@@ -51,7 +76,13 @@ impl Default for OpenOptions {
 }
 
 pub struct SuperfileReader {
-    bytes: Bytes,
+    /// Full superfile bytes — `Some` only on eager-source opens
+    /// (`open`, `open_with`, i.e. `Source::InMemory` entries).
+    /// `None` on lazy-source opens; the lazy path never
+    /// materialises the full segment, only the footer + the
+    /// FTS / vector blob regions. Surfaced via
+    /// [`SuperfileReader::parquet_bytes`].
+    bytes: Option<Bytes>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -66,7 +97,7 @@ impl std::fmt::Debug for SuperfileReader {
             .field("n_docs", &self.n_docs)
             .field("has_fts", &self.fts.is_some())
             .field("has_vec", &self.vec.is_some())
-            .field("bytes_len", &self.bytes.len())
+            .field("bytes_len", &self.bytes.as_ref().map(|b| b.len()))
             .finish()
     }
 }
@@ -76,37 +107,55 @@ impl SuperfileReader {
     /// returned by `SuperfileBuilder::finish`, or read from disk / S3
     /// / etc.). CRC verification on by default; use [`open_with`]
     /// for the fast path on trusted storage.
+    ///
+    /// Thin wrapper over [`open_with_source`] with
+    /// `Source::InMemory(bytes)`.
+    ///
+    /// [`open_with`]: SuperfileReader::open_with
+    /// [`open_with_source`]: SuperfileReader::open_with_source
     pub fn open(bytes: Bytes) -> Result<Self, ReadError> {
         Self::open_with(bytes, OpenOptions::default())
     }
 
-    /// Open a superfile via a [`LazyByteSource`].
+    /// Eager open with explicit options.
+    /// `OpenOptions { verify_crc: false }` skips both the
+    /// whole-blob and per-subsection CRC scans — at 1M × 384
+    /// cold open drops from ~132 ms to ~2 ms. Use this when
+    /// the underlying storage is trusted or CRC verification
+    /// is performed elsewhere.
     ///
-    /// Unlike [`open`], `open_lazy` does not require the caller
-    /// to have materialized the full segment up-front. The
-    /// source pulls bytes on demand. Today's implementation
-    /// issues a single full-range fetch through the source
-    /// (the polymorphism point), then constructs the reader
-    /// through the existing `open()` path — so the per-call
-    /// memory cost still scales with segment size. Per-query
-    /// laziness ("≤ 3 ranges per query" — fetching only the
-    /// footer + the touched FTS posting list + the touched
-    /// vector cluster) requires teaching `FtsReader` +
-    /// `VectorReader` to fetch posting / cluster bytes through
-    /// the source on demand, which the trait shape already
-    /// supports but the inner readers don't yet exercise.
+    /// Thin wrapper over [`open_with_source`] with
+    /// `Source::InMemory(bytes)`.
     ///
-    /// The async signature is what lets the supertable layer
-    /// wrap the source with a broadcast / cold-fetch
+    /// [`open_with_source`]: SuperfileReader::open_with_source
+    pub fn open_with(bytes: Bytes, opts: OpenOptions) -> Result<Self, ReadError> {
+        Self::open_with_source(Source::InMemory(bytes), opts)
+    }
+
+    /// Open a superfile via a [`LazyByteSource`] without
+    /// materialising the full segment up-front.
+    ///
+    /// Pulls only what's needed at open time: a 2-range footer
+    /// fetch + a single range GET each for the FTS and vector
+    /// blob regions. The full segment is **never** loaded into
+    /// memory, so [`parquet_bytes`] returns [`None`] — callers
+    /// that need to register the bytes with an external Parquet
+    /// reader (DataFusion / DuckDB / pyarrow / …) must use the
+    /// eager [`open`] / [`open_with`] entries.
+    ///
+    /// The async signature is preserved so the supertable layer
+    /// can wrap the source with a broadcast / cold-fetch
     /// coordinator (see `ColdFetchMode`) — coalescing multiple
-    /// concurrent cold readers onto a single set of
-    /// range-GETs, or running the foreground reader in
-    /// parallel with a background disk-cache fill.
+    /// concurrent cold readers onto a single set of range-GETs,
+    /// or running the foreground reader in parallel with a
+    /// background disk-cache fill. The decode core itself is
+    /// sync; the async shell exists for the orchestration
+    /// layer's benefit, not because parsing yields.
     ///
     /// [`open`]: SuperfileReader::open
-    pub async fn open_lazy(
-        source: &dyn crate::superfile::LazyByteSource,
-    ) -> Result<Self, ReadError> {
+    /// [`open_with`]: SuperfileReader::open_with
+    /// [`parquet_bytes`]: SuperfileReader::parquet_bytes
+    pub async fn open_lazy(source: Arc<dyn LazyByteSource>) -> Result<Self, ReadError> {
         Self::open_lazy_with(source, OpenOptions::default()).await
     }
 
@@ -114,33 +163,46 @@ impl SuperfileReader {
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
-        source: &dyn crate::superfile::LazyByteSource,
+        source: Arc<dyn LazyByteSource>,
         opts: OpenOptions,
     ) -> Result<Self, ReadError> {
-        let size = source.size();
-        let bytes = source.range(0, size).await.map_err(|e| match e {
-            crate::superfile::LazyByteSourceError::Storage(se) => {
-                ReadError::MalformedKv(format!("lazy source storage: {se}"))
-            }
-            crate::superfile::LazyByteSourceError::OutOfBounds { start, len, size } => {
-                ReadError::MalformedKv(format!(
-                    "lazy source out-of-bounds: start={start} len={len} size={size}"
-                ))
-            }
-        })?;
-        Self::open_with(bytes, opts)
+        Self::open_with_source(Source::Lazy(source), opts)
     }
 
-    /// Open with explicit options. `OpenOptions { verify_crc: false }`
-    /// skips both the whole-blob and per-subsection CRC scans — at
-    /// 1M × 384 cold open drops from ~132 ms to ~2 ms. Use this when
-    /// the underlying storage is trusted or CRC verification is
-    /// performed elsewhere.
-    pub fn open_with(bytes: Bytes, opts: OpenOptions) -> Result<Self, ReadError> {
-        // 1. Read all KV metadata via the footer module.
-        let kv_map = footer::read_kv_metadata(&bytes)?;
+    /// Unified decode core. Every other open entry collapses
+    /// into this. Takes a [`Source`] and drives a sync
+    /// open-time read path:
+    ///
+    /// 1. Footer fetch — 2 range GETs via
+    ///    [`footer::read_footer_from_source`] (8-byte trailer +
+    ///    footer body).
+    /// 2. KV validation (required keys, format magic, format
+    ///    version compatibility).
+    /// 3. FTS blob — 1 range GET via [`Source::get_range`],
+    ///    handed to [`FtsReader::open_with`]. PR4 will tighten
+    ///    this to fetch only the open-time region instead of
+    ///    the full FTS blob.
+    /// 4. Vector blob — same pattern, handed to
+    ///    [`VectorReader::open_with`]. PR3 will tighten this to
+    ///    a [`SubLazyByteSource`] window so the open-time
+    ///    region is the only thing fetched.
+    /// 5. The full bytes are retained in `Self::bytes` only on
+    ///    `Source::InMemory` entries; `Source::Lazy` keeps it
+    ///    [`None`] so the lazy path never holds a
+    ///    segment-sized buffer.
+    ///
+    /// Every byte fetch goes through [`Source::get_range`], so
+    /// cold `Source::Lazy` misses bridge to the source's
+    /// `async fn range` via `block_in_place + Handle::block_on`.
+    /// Warm-cache / mmap-backed `Source::Lazy` sources resolve
+    /// every fetch zero-copy on the sync fast path — same as
+    /// `Source::InMemory`.
+    ///
+    /// [`SubLazyByteSource`]: crate::superfile::lazy_source::SubLazyByteSource
+    pub fn open_with_source(source: Source, opts: OpenOptions) -> Result<Self, ReadError> {
+        let (kv_map, schema) = footer::read_footer_from_source(&source)?;
 
-        // 2. Validate required keys + format version.
+        // Validate required keys + format version.
         for k in kv::REQUIRED {
             if !kv_map.contains_key(*k) {
                 return Err(ReadError::MissingKv(k));
@@ -169,18 +231,12 @@ impl SuperfileReader {
             .parse()
             .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
 
-        // 3. Read Arrow schema from the Parquet metadata via parquet-rs.
-        //    Bytes implements ChunkReader directly, so this is zero-copy.
-        let parq_builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
-        let schema = parq_builder.schema().clone();
-
-        // 4. If FTS keys present, slice + open FtsReader.
+        // FTS blob: slice on eager, range-fetch on lazy.
         let fts = if all_present(&kv_map, kv::FTS_KEYS) {
             let off = parse_u64(&kv_map, kv::FTS_OFFSET)?;
             let len = parse_u64(&kv_map, kv::FTS_LENGTH)?;
             let cols_json = kv_map.get(kv::FTS_COLUMNS).expect("checked");
-            let blob = slice_or_err(&bytes, off, len, "FTS")?;
+            let blob = fetch_blob_or_err(&source, off, len, "FTS")?;
             Some(FtsReader::open_with(
                 blob,
                 cols_json,
@@ -196,12 +252,12 @@ impl SuperfileReader {
             None
         };
 
-        // 5. Vector path mirrors FTS.
+        // Vector blob: same shape as FTS.
         let vec = if all_present(&kv_map, kv::VEC_KEYS) {
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
             let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
-            let blob = slice_or_err(&bytes, off, len, "vector")?;
+            let blob = fetch_blob_or_err(&source, off, len, "vector")?;
             Some(VectorReader::open_with(
                 blob,
                 cols_json,
@@ -215,6 +271,14 @@ impl SuperfileReader {
             ));
         } else {
             None
+        };
+
+        // Retain full bytes only on the eager entry. Lazy entry
+        // keeps `None` so the reader never holds a
+        // segment-sized buffer.
+        let bytes = match source {
+            Source::InMemory(b) => Some(b),
+            Source::Lazy(_) => None,
         };
 
         Ok(Self {
@@ -268,11 +332,32 @@ impl SuperfileReader {
         self.vec.as_ref()
     }
 
-    /// Pass-through to the raw Parquet bytes — the superfile is a
-    /// valid Parquet file, so this works as input to any external
-    /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
-    pub fn parquet_bytes(&self) -> &Bytes {
-        &self.bytes
+    /// Pass-through to the raw Parquet bytes — the superfile is
+    /// a valid Parquet file, so this works as input to any
+    /// external Parquet reader (DataFusion, DuckDB, pyarrow,
+    /// …).
+    ///
+    /// Returns [`Some`] only when the reader was opened from an
+    /// eager byte buffer ([`open`] / [`open_with`]) — those
+    /// entries retain the full segment so callers can register
+    /// it with an external Parquet reader without re-fetching.
+    ///
+    /// Returns [`None`] when the reader was opened lazily
+    /// ([`open_lazy`] / [`open_lazy_with`]). The lazy path
+    /// pulls only the footer + the FTS / vector blob regions,
+    /// so the full Parquet bytes are never materialised.
+    /// Callers that need full Parquet bytes from a lazy reader
+    /// should either (a) take the eager path explicitly via
+    /// `open_with(source.range(0, source.size()).await?, opts)`,
+    /// or (b) drive the source's range API directly and feed
+    /// the bytes to their downstream reader.
+    ///
+    /// [`open`]: SuperfileReader::open
+    /// [`open_with`]: SuperfileReader::open_with
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    /// [`open_lazy_with`]: SuperfileReader::open_lazy_with
+    pub fn parquet_bytes(&self) -> Option<&Bytes> {
+        self.bytes.as_ref()
     }
 
     /// Single-column BM25 search across the unified FTS reader.
@@ -546,20 +631,32 @@ fn parse_u64(map: &footer::KvMap, key: &'static str) -> Result<u64, ReadError> {
         .map_err(|_| ReadError::MalformedKv(format!("{key} not a u64")))
 }
 
-fn slice_or_err(
-    bytes: &Bytes,
+/// Fetch a blob region (`[off, off + len)`) from a [`Source`],
+/// surfacing the typed [`ReadError`] the rest of the open path
+/// expects.
+///
+/// On `Source::InMemory` this is a zero-copy `Bytes::slice`;
+/// on `Source::Lazy` it's a single
+/// [`Source::get_range`] call which itself routes through the
+/// underlying source's sync fast path (warm cache / mmap) or
+/// bridges to its async `range` for cold misses.
+fn fetch_blob_or_err(
+    source: &Source,
     off: u64,
     len: u64,
     section: &'static str,
 ) -> Result<Bytes, ReadError> {
-    let off = off as usize;
-    let len = len as usize;
-    if off.saturating_add(len) > bytes.len() {
+    let total = source.len() as u64;
+    if off.saturating_add(len) > total {
         return Err(ReadError::MalformedKv(format!(
             "{section} blob offset+len out of range"
         )));
     }
-    Ok(bytes.slice(off..off + len))
+    let off_usize = off as usize;
+    let end_usize = off_usize + len as usize;
+    source
+        .get_range(off_usize..end_usize)
+        .map_err(|e| ReadError::MalformedKv(format!("{section} blob fetch: {e}")))
 }
 
 // Re-export for convenience: callers want `BoolMode` without diving
@@ -787,16 +884,57 @@ mod tests {
 
     #[test]
     fn parquet_bytes_round_trips_as_parquet() {
-        // The whole buffer should still be a valid Parquet file.
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
-        let p = r.parquet_bytes().clone();
+        let p = r
+            .parquet_bytes()
+            .expect("eager open retains parquet_bytes")
+            .clone();
         let builder = ParquetRecordBatchReaderBuilder::try_new(p)
             .expect("try_new ParquetRecordBatchReaderBuilder");
         let mut reader = builder.build().expect("build parquet reader");
         let batch = reader.next().expect("one batch").expect("decode batch");
         assert_eq!(batch.num_rows(), 4);
         assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn open_with_source_in_memory_matches_open() {
+        // The unified decode core via Source::InMemory must
+        // produce a reader that's externally indistinguishable
+        // from the eager open() path.
+        let bytes = build_simple_fts_only_superfile();
+        let r_eager = SuperfileReader::open(bytes.clone()).expect("eager open");
+        let r_core =
+            SuperfileReader::open_with_source(Source::InMemory(bytes), OpenOptions::default())
+                .expect("open_with_source InMemory");
+        assert_eq!(r_eager.n_docs(), r_core.n_docs());
+        assert_eq!(r_eager.id_column(), r_core.id_column());
+        assert_eq!(r_eager.fts_columns(), r_core.fts_columns());
+        assert_eq!(r_eager.vector_columns(), r_core.vector_columns());
+        assert!(r_core.parquet_bytes().is_some());
+    }
+
+    #[tokio::test]
+    async fn open_lazy_drops_parquet_bytes() {
+        // open_lazy must never materialize the full segment —
+        // parquet_bytes() returns None — while still producing
+        // an FTS reader that finds the expected docs.
+        use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource};
+        let bytes = build_simple_fts_only_superfile();
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes.clone()));
+        let r = SuperfileReader::open_lazy(source).await.expect("open_lazy");
+        assert!(
+            r.parquet_bytes().is_none(),
+            "lazy reader must not retain bytes"
+        );
+        let hits = r
+            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .expect("bm25 search on lazy reader");
+        let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(doc_ids.contains(&0));
+        assert!(doc_ids.contains(&2));
     }
 
     #[test]

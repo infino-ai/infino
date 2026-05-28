@@ -79,10 +79,8 @@ async fn open_lazy_via_bytes_source_matches_open() {
     let bytes = build_test_bytes();
     let eager = SuperfileReader::open(bytes.clone()).expect("eager open");
 
-    let source = BytesLazyByteSource::new(bytes);
-    let lazy = SuperfileReader::open_lazy(&source)
-        .await
-        .expect("lazy open");
+    let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+    let lazy = SuperfileReader::open_lazy(source).await.expect("lazy open");
 
     assert_eq!(lazy.schema(), eager.schema());
     assert_eq!(lazy.id_column(), eager.id_column());
@@ -151,7 +149,11 @@ impl StorageProvider for CountingProxy {
     }
 }
 
-#[tokio::test]
+// `StorageRangeSource` doesn't override `try_get_range_sync`, so
+// every `Source::get_range` cold-misses and bridges via
+// `block_in_place + Handle::block_on` — which requires the
+// multi-threaded tokio flavor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn storage_range_source_drives_open_lazy_against_localfs() {
     let dir = TempDir::new().expect("tempdir");
     let local: Arc<dyn StorageProvider> =
@@ -166,18 +168,18 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     // driving I/O (not a hidden path).
     let proxy = CountingProxy::new(local);
 
-    let source = StorageRangeSource::new(Arc::clone(&proxy) as Arc<dyn StorageProvider>, uri)
-        .await
-        .expect("source");
+    let source: Arc<dyn LazyByteSource> = Arc::new(
+        StorageRangeSource::new(Arc::clone(&proxy) as Arc<dyn StorageProvider>, uri)
+            .await
+            .expect("source"),
+    );
     let head_after_construct = proxy.head_calls.load(Ordering::Acquire);
     assert_eq!(
         head_after_construct, 1,
         "StorageRangeSource::new must HEAD the object once"
     );
 
-    let reader = SuperfileReader::open_lazy(&source)
-        .await
-        .expect("open_lazy");
+    let reader = SuperfileReader::open_lazy(source).await.expect("open_lazy");
     let range_after_open = proxy.get_range_calls.load(Ordering::Acquire);
     assert!(
         range_after_open >= 1,
@@ -192,7 +194,7 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_lazy_via_storage_matches_open_via_bytes() {
     let dir = TempDir::new().expect("tempdir");
     let local: Arc<dyn StorageProvider> =
@@ -202,10 +204,12 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let eager = SuperfileReader::open(bytes).expect("eager");
-    let source = StorageRangeSource::new(Arc::clone(&local), uri)
-        .await
-        .expect("source");
-    let lazy = SuperfileReader::open_lazy(&source).await.expect("lazy");
+    let source: Arc<dyn LazyByteSource> = Arc::new(
+        StorageRangeSource::new(Arc::clone(&local), uri)
+            .await
+            .expect("source"),
+    );
+    let lazy = SuperfileReader::open_lazy(source).await.expect("lazy");
 
     // Schema + identity metadata identical.
     assert_eq!(lazy.id_column(), eager.id_column());

@@ -182,7 +182,26 @@ fn build_mem_table(
             &entry.uri,
         )
         .map_err(|e| QueryError::Store(e.to_string()))?;
-        let batches = read_all_batches(reader.parquet_bytes().clone())?;
+        // SQL readback needs the full Parquet bytes to drain row
+        // groups into RecordBatches. After superfile PR2 (013-A1)
+        // `parquet_bytes()` returns `None` on lazy-source readers
+        // (which never materialize the segment). The supertable's
+        // `superfile_reader` only ever returns eager readers today
+        // (in-memory tier publishes Bytes; disk-cache mmaps full
+        // segments and opens eagerly), so this `expect` is a hard
+        // invariant — surface a clear error rather than papering
+        // over the unexpected source if that ever changes.
+        let parquet = reader
+            .parquet_bytes()
+            .ok_or_else(|| {
+                QueryError::Store(format!(
+                    "SQL readback for {:?} requires eager SuperfileReader (parquet_bytes is None); \
+                     supertable::superfile_reader returned a lazy reader",
+                    entry.uri
+                ))
+            })?
+            .clone();
+        let batches = read_all_batches(parquet)?;
         partitions.push(batches);
     }
     if partitions.is_empty() {

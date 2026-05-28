@@ -270,7 +270,10 @@ reader.schema();             // &Arc<Schema>
 reader.n_docs();             // u64
 reader.fts();                // Option<&FtsReader>
 reader.vec();                // Option<&VectorReader>
-reader.parquet_bytes();      // &Bytes — sub-slice that DataFusion can register as-is
+reader.parquet_bytes();      // Option<&Bytes> — Some on eager open(), None on open_lazy()
+                             // (the lazy path never materialises the full segment, so
+                             // callers that want to feed bytes to DataFusion / DuckDB /
+                             // pyarrow must take the eager entry point)
 ```
 
 ### Top-level search wrappers

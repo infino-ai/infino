@@ -21,7 +21,7 @@
 //! rebuilding the `ParquetMetaData` around it.
 
 use crate::superfile::format::kv;
-use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
+use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError, Source};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use parquet::arrow::{ArrowWriter, parquet_to_arrow_schema};
@@ -222,7 +222,7 @@ pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
     Ok(out)
 }
 
-/// Lazy-open variant of [`read_kv_metadata`] + Arrow-schema
+/// Async-only variant of [`read_kv_metadata`] + Arrow-schema
 /// extraction. Issues two range GETs against `source`:
 ///
 /// 1. Trailing 8 bytes (`[footer_len:u32 LE][PAR1]`) to learn
@@ -234,28 +234,86 @@ pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
 /// one call avoids re-decoding (or re-fetching) the footer
 /// on the caller's behalf.
 ///
-/// This is the polymorphism point for the lazy
-/// [`crate::superfile::reader::SuperfileReader::open_lazy_with`]
-/// flow: callers hand a [`LazyByteSource`] (e.g. an object-
-/// store range-fetcher, a broadcast coalescer, or a mmap-
-/// backed [`crate::superfile::lazy_source::BytesLazyByteSource`])
-/// and pay only the footer cost up-front — not the full
-/// segment.
-///
 /// Total bytes pulled: `8 + footer_len`, typically a few KB
 /// at default Parquet writer settings.
+///
+/// Most callers should prefer the sync
+/// [`read_footer_from_source`] over a [`Source`], which is
+/// what [`crate::superfile::reader::SuperfileReader::open_with_source`]
+/// uses as the unified decode-core entry. The async variant
+/// here is preserved as a building block for futures-driven
+/// cold-fetch pipelines that want to await the trailer + body
+/// directly.
 pub async fn read_footer_lazy(
     source: &dyn LazyByteSource,
 ) -> Result<(KvMap, Arc<Schema>), FooterError> {
     let size = source.size();
+    let footer_start = locate_footer_start(size, &fetch_trailer_async(source, size).await?)?;
+    let footer_len = size - 8 - footer_start;
+    let footer_bytes = source.range(footer_start, footer_len).await?;
+    decode_footer_metadata(&footer_bytes)
+}
+
+/// Sync companion to [`read_footer_lazy`] that takes a
+/// [`Source`] instead of a raw [`LazyByteSource`]. Used by
+/// [`crate::superfile::reader::SuperfileReader::open_with_source`]
+/// — the unified decode core that fronts both eager
+/// (`open`, `open_with`) and async-lazy (`open_lazy`,
+/// `open_lazy_with`) entry points.
+///
+/// On `Source::InMemory` every fetch is a zero-copy
+/// `Bytes::slice`. On `Source::Lazy` the underlying source's
+/// `try_get_range_sync` fast path covers the warm /
+/// mmap-backed cases; cold misses bridge to the source's
+/// `async fn range` via `block_in_place + Handle::block_on`
+/// (see [`Source::get_range`] for the exact bridge shape).
+///
+/// Same 2-range fetch pattern as [`read_footer_lazy`]:
+/// trailing 8 bytes for the footer length + magic, then the
+/// footer body. Returns the same `(KvMap, Arc<Schema>)` pair
+/// — same decoder shared via [`decode_footer_metadata`].
+pub fn read_footer_from_source(source: &Source) -> Result<(KvMap, Arc<Schema>), FooterError> {
+    let size = source.len() as u64;
+    let trailer = fetch_trailer_sync(source, size)?;
+    let footer_start = locate_footer_start(size, &trailer)?;
+    let footer_len = (size - 8 - footer_start) as usize;
+    let footer_bytes = source
+        .get_range(footer_start as usize..footer_start as usize + footer_len)
+        .map_err(FooterError::Lazy)?;
+    decode_footer_metadata(&footer_bytes)
+}
+
+/// Pull the 8-byte trailer (`[footer_len:u32 LE][PAR1]`) via
+/// the async source. Factored out so the two `read_footer_*`
+/// entries share the bounds check + fetch shape.
+async fn fetch_trailer_async(
+    source: &dyn LazyByteSource,
+    size: u64,
+) -> Result<bytes::Bytes, FooterError> {
     if size < 12 {
         return Err(FooterError::Malformed(
             "file smaller than minimum Parquet trailer",
         ));
     }
+    Ok(source.range(size - 8, 8).await?)
+}
 
-    // Step 1: trailing 8 bytes carry the footer length + PAR1 magic.
-    let trailer = source.range(size - 8, 8).await?;
+/// Sync sibling of [`fetch_trailer_async`] over a [`Source`].
+fn fetch_trailer_sync(source: &Source, size: u64) -> Result<bytes::Bytes, FooterError> {
+    if size < 12 {
+        return Err(FooterError::Malformed(
+            "file smaller than minimum Parquet trailer",
+        ));
+    }
+    source
+        .get_range((size - 8) as usize..size as usize)
+        .map_err(FooterError::Lazy)
+}
+
+/// Pure decode: parse `[footer_len:u32 LE][PAR1]` and return
+/// the absolute `footer_start` offset within a file of total
+/// size `size`. Shared between async + sync paths.
+fn locate_footer_start(size: u64, trailer: &[u8]) -> Result<u64, FooterError> {
     if &trailer[4..8] != b"PAR1" {
         return Err(FooterError::Malformed("not a Parquet file (missing PAR1)"));
     }
@@ -266,14 +324,24 @@ pub async fn read_footer_lazy(
     if size < 8 + footer_len {
         return Err(FooterError::Malformed("footer length out of range"));
     }
-    let footer_start = size - 8 - footer_len;
+    Ok(size - 8 - footer_len)
+}
 
-    // Step 2: pull the footer body (no PAR1, no length suffix —
-    // `decode_metadata` wants just the thrift-encoded metadata).
-    let footer_bytes = source.range(footer_start, footer_len).await?;
-    let metadata = ParquetMetaDataReader::decode_metadata(&footer_bytes)?;
-
-    // Extract KVs.
+/// Pure decode: take an already-fetched footer body (no PAR1,
+/// no length suffix — just thrift-encoded metadata) and
+/// return the `(KvMap, Arc<Schema>)` pair. Shared between the
+/// async [`read_footer_lazy`] and sync
+/// [`read_footer_from_source`] entries so the two paths can't
+/// drift on KV extraction or schema-inference semantics.
+///
+/// Schema extraction goes through `parquet_to_arrow_schema`
+/// — same logic as `ParquetRecordBatchReaderBuilder::try_new`'s
+/// `.schema()`, but without requiring the full file as a
+/// `ChunkReader`. Honours the `ARROW:schema` KV when present
+/// and falls back to inference from the Parquet schema
+/// descriptor otherwise.
+fn decode_footer_metadata(footer_body: &[u8]) -> Result<(KvMap, Arc<Schema>), FooterError> {
+    let metadata = ParquetMetaDataReader::decode_metadata(footer_body)?;
     let mut kvs: KvMap = HashMap::new();
     if let Some(entries) = metadata.file_metadata().key_value_metadata() {
         for entry in entries {
@@ -282,13 +350,6 @@ pub async fn read_footer_lazy(
             }
         }
     }
-
-    // Extract Arrow schema. parquet-rs honours the
-    // arrow-encoded schema KV (`ARROW:schema`) when present
-    // and falls back to inference from the Parquet schema
-    // descriptor — same semantics as
-    // `ParquetRecordBatchReaderBuilder::try_new`'s schema(),
-    // without needing the full file as a ChunkReader.
     let arrow_schema = parquet_to_arrow_schema(
         metadata.file_metadata().schema_descr(),
         metadata.file_metadata().key_value_metadata(),
@@ -558,6 +619,129 @@ mod tests {
         assert_eq!(start + len, total - 8);
         // Total bytes pulled must be strictly less than the file
         // (proves we're not materializing the row groups).
+        let pulled: u64 = ranges.iter().map(|(_, l)| *l).sum();
+        assert!(pulled < total, "pulled {pulled} of {total}");
+    }
+
+    /// `read_footer_from_source` is the sync companion that the
+    /// `SuperfileReader::open_with_source` decode core uses.
+    /// Must produce a `(KvMap, Arc<Schema>)` byte-equivalent to
+    /// the async `read_footer_lazy` and to the eager
+    /// `read_kv_metadata` + Parquet schema-builder path.
+    #[test]
+    fn read_footer_from_source_matches_eager_kv_and_schema() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let schema = small_schema();
+        let batch = small_batch(&schema);
+        let extra = vec![
+            ("inf.format".to_string(), "infino-superfile".to_string()),
+            ("inf.format_version".to_string(), "1.0.0".to_string()),
+            ("inf.id_column".to_string(), "id".to_string()),
+            ("inf.fts.columns".to_string(), "[\"category\"]".to_string()),
+        ];
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &[batch],
+            &[],
+            &[],
+            &extra,
+            Compression::SNAPPY,
+            1024,
+        )
+        .expect("write parquet with blobs");
+
+        let eager_kv = read_kv_metadata(&parts.bytes).expect("eager kv");
+        let eager_schema =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parts.bytes.clone()))
+                .expect("eager builder")
+                .schema()
+                .clone();
+
+        let source = Source::InMemory(Bytes::from(parts.bytes));
+        let (sync_kv, sync_schema) =
+            read_footer_from_source(&source).expect("sync footer from source");
+
+        assert_eq!(sync_kv, eager_kv);
+        assert_eq!(sync_schema.fields(), eager_schema.fields());
+    }
+
+    /// On `Source::Lazy`, `read_footer_from_source` must take
+    /// the same 2-range footer suffix path as `read_footer_lazy`
+    /// — the sync bridge in `Source::get_range` is the only
+    /// difference, and the byte-fetch shape must match.
+    ///
+    /// Requires the multi-threaded flavor because
+    /// `Source::get_range`'s cold path calls
+    /// `tokio::task::block_in_place`, which panics on
+    /// `current_thread` runtimes (the default `#[tokio::test]`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_footer_from_source_lazy_fetches_only_footer_suffix() {
+        use crate::superfile::lazy_source::{
+            BytesLazyByteSource, LazyByteSource, LazyByteSourceError,
+        };
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use std::sync::Mutex;
+
+        struct Counting {
+            inner: BytesLazyByteSource,
+            ranges: Mutex<Vec<(u64, u64)>>,
+        }
+        #[async_trait]
+        impl LazyByteSource for Counting {
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+                self.ranges
+                    .lock()
+                    .expect("ranges mutex poisoned")
+                    .push((start, len));
+                self.inner.range(start, len).await
+            }
+            // Force fallthrough to async `range` so we can count
+            // every fetch — same shape as the async test above.
+            // The default trait impl returns None, which is what
+            // we want here.
+        }
+
+        let schema = small_schema();
+        let batches: Vec<_> = (0..8).map(|_| small_batch(&schema)).collect();
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &batches,
+            &[],
+            &[],
+            &[("inf.format".to_string(), "infino-superfile".to_string())],
+            Compression::SNAPPY,
+            1024,
+        )
+        .expect("write parquet");
+        let total = parts.bytes.len() as u64;
+
+        let counting: Arc<Counting> = Arc::new(Counting {
+            inner: BytesLazyByteSource::new(Bytes::from(parts.bytes)),
+            ranges: Mutex::new(Vec::new()),
+        });
+        let source = Source::Lazy(Arc::clone(&counting) as Arc<dyn LazyByteSource>);
+
+        // Sync call from an async context: Source::get_range
+        // bridges via block_in_place + Handle::block_on against
+        // the ambient runtime that #[tokio::test] provides.
+        let (_kv, _schema) =
+            read_footer_from_source(&source).expect("sync footer from lazy source");
+
+        let ranges = counting
+            .ranges
+            .lock()
+            .expect("ranges mutex poisoned")
+            .clone();
+        assert_eq!(ranges.len(), 2, "ranges: {ranges:?}");
+        assert_eq!(ranges[0], (total - 8, 8));
+        let (start, len) = ranges[1];
+        assert_eq!(start + len, total - 8);
         let pulled: u64 = ranges.iter().map(|(_, l)| *l).sum();
         assert!(pulled < total, "pulled {pulled} of {total}");
     }
