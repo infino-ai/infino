@@ -268,3 +268,385 @@ fn downcast_i64(
         ),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+    use arrow_array::{
+        ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // ---- Helpers --------------------------------------------------------
+
+    fn empty_seg() -> SuperfileEntry {
+        SuperfileEntry {
+            superfile_id: uuid::Uuid::nil(),
+            uri: SuperfileUri(uuid::Uuid::nil()),
+            n_docs: 0,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: ScalarStatsTable::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+        }
+    }
+
+    fn seg_with_i64(column: &str, min: i64, max: i64) -> SuperfileEntry {
+        let mut s = empty_seg();
+        let mn: ArrayRef = Arc::new(Int64Array::from(vec![min]));
+        let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
+        s.scalar_stats.cols.insert(column.to_string(), (mn, mx));
+        s
+    }
+
+    fn assert_spans_partition(err: CommitError, needle: &str) {
+        match err {
+            CommitError::SuperfileSpansPartition { detail } => assert!(
+                detail.contains(needle),
+                "expected `{needle}` in detail; got: {detail}"
+            ),
+            other => panic!("expected SuperfileSpansPartition; got {other:?}"),
+        }
+    }
+
+    // ---- encode_partition_key ------------------------------------------
+
+    #[test]
+    fn encode_partition_key_time_range_emits_le_u64() {
+        let bytes = encode_partition_key(&PartitionKey::TimeRange(0x01_02_03_04_05_06_07_08));
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(bytes, 0x01_02_03_04_05_06_07_08u64.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_partition_key_hash_emits_le_u32() {
+        let bytes = encode_partition_key(&PartitionKey::Hash(0xCAFEBABE));
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes, 0xCAFEBABEu32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_partition_key_column_range_emits_le_u16() {
+        let bytes = encode_partition_key(&PartitionKey::ColumnRange(0xDEAD));
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes, 0xDEADu16.to_le_bytes().to_vec());
+    }
+
+    // ---- decode_partition_key — success roundtrip ----------------------
+
+    #[test]
+    fn decode_partition_key_round_trips_time_range() {
+        let original = PartitionKey::TimeRange(42);
+        let bytes = encode_partition_key(&original);
+        let strategy = PartitionStrategy::TimeRange {
+            column: "_id".into(),
+            granularity_secs: 86_400,
+        };
+        let decoded = decode_partition_key(&bytes, &strategy).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_partition_key_round_trips_hash() {
+        let original = PartitionKey::Hash(5);
+        let bytes = encode_partition_key(&original);
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 16,
+        };
+        let decoded = decode_partition_key(&bytes, &strategy).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_partition_key_round_trips_column_range() {
+        let original = PartitionKey::ColumnRange(3);
+        let bytes = encode_partition_key(&original);
+        let strategy = PartitionStrategy::ColumnRange {
+            column: "_id".into(),
+            boundaries: vec![vec![]],
+        };
+        let decoded = decode_partition_key(&bytes, &strategy).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    // ---- decode_partition_key — size mismatch errors -------------------
+
+    #[test]
+    fn decode_partition_key_rejects_wrong_size_time_range() {
+        let strategy = PartitionStrategy::TimeRange {
+            column: "_id".into(),
+            granularity_secs: 1,
+        };
+        let err = decode_partition_key(&[1, 2, 3], &strategy).expect_err("must error");
+        match err {
+            CommitError::PointerParse(msg) => {
+                assert!(msg.contains("TimeRange"), "{msg}");
+                assert!(msg.contains("8 bytes"), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_partition_key_rejects_wrong_size_hash() {
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 4,
+        };
+        let err = decode_partition_key(&[1, 2, 3], &strategy).expect_err("must error");
+        match err {
+            CommitError::PointerParse(msg) => {
+                assert!(msg.contains("Hash"), "{msg}");
+                assert!(msg.contains("4 bytes"), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_partition_key_rejects_wrong_size_column_range() {
+        let strategy = PartitionStrategy::ColumnRange {
+            column: "_id".into(),
+            boundaries: vec![vec![]],
+        };
+        let err = decode_partition_key(&[1, 2, 3], &strategy).expect_err("must error");
+        match err {
+            CommitError::PointerParse(msg) => {
+                assert!(msg.contains("ColumnRange"), "{msg}");
+                assert!(msg.contains("2 bytes"), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // ---- assign_partition: TimeRange -----------------------------------
+
+    #[test]
+    fn assign_partition_time_range_single_bucket() {
+        // min and max sit in the same daily bucket → success.
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 86_400,
+        };
+        // 100 .. 90_000 → both buckets are 0..1 → same bucket 0.
+        let seg = seg_with_i64("ts", 100, 80_000);
+        let key = assign_partition(&seg, &strategy).expect("assign");
+        assert_eq!(key, PartitionKey::TimeRange(0));
+    }
+
+    #[test]
+    fn assign_partition_time_range_rejects_segment_spanning_buckets() {
+        // min in bucket 0, max in bucket 1 → SuperfileSpansPartition.
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 86_400,
+        };
+        let seg = seg_with_i64("ts", 100, 100_000);
+        let err = assign_partition(&seg, &strategy).expect_err("must span");
+        assert_spans_partition(err, "spans buckets");
+    }
+
+    #[test]
+    fn assign_partition_time_range_rejects_zero_granularity() {
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 0,
+        };
+        let seg = seg_with_i64("ts", 0, 0);
+        let err = assign_partition(&seg, &strategy).expect_err("must reject");
+        assert_spans_partition(err, "granularity_secs must be > 0");
+    }
+
+    #[test]
+    fn assign_partition_time_range_rejects_negative_granularity() {
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: -1,
+        };
+        let seg = seg_with_i64("ts", 0, 0);
+        let err = assign_partition(&seg, &strategy).expect_err("must reject");
+        assert_spans_partition(err, "granularity_secs must be > 0");
+    }
+
+    #[test]
+    fn assign_partition_time_range_rejects_missing_column_stats() {
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 86_400,
+        };
+        let seg = empty_seg(); // no scalar_stats at all
+        let err = assign_partition(&seg, &strategy).expect_err("missing stats");
+        assert_spans_partition(err, "no scalar_stats");
+    }
+
+    #[test]
+    fn assign_partition_time_range_supports_timestamp_columns() {
+        // Each timestamp width must downcast cleanly so users can
+        // configure granularity_secs against the column's actual
+        // unit. Covers Second/Milli/Micro/Nano arms in downcast_i64.
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 86_400,
+        };
+        let cases: Vec<(ArrayRef, ArrayRef)> = vec![
+            (
+                Arc::new(TimestampSecondArray::from(vec![100])),
+                Arc::new(TimestampSecondArray::from(vec![200])),
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![100])),
+                Arc::new(TimestampMillisecondArray::from(vec![200])),
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![100])),
+                Arc::new(TimestampMicrosecondArray::from(vec![200])),
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![100])),
+                Arc::new(TimestampNanosecondArray::from(vec![200])),
+            ),
+        ];
+        for (mn, mx) in cases {
+            let mut seg = empty_seg();
+            seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+            let key = assign_partition(&seg, &strategy).expect("assign");
+            assert_eq!(key, PartitionKey::TimeRange(0));
+        }
+    }
+
+    #[test]
+    fn assign_partition_time_range_rejects_unsupported_column_type() {
+        // Int32 isn't supported (only Int64 + Timestamp widths).
+        // Surfaces as SuperfileSpansPartition with a type-name hint.
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 86_400,
+        };
+        let mut seg = empty_seg();
+        let mn: ArrayRef = Arc::new(Int32Array::from(vec![100]));
+        let mx: ArrayRef = Arc::new(Int32Array::from(vec![200]));
+        seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+        let err = assign_partition(&seg, &strategy).expect_err("unsupported");
+        assert_spans_partition(err, "unsupported type");
+    }
+
+    #[test]
+    fn assign_partition_time_range_rejects_null_stats_array() {
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 86_400,
+        };
+        let mut seg = empty_seg();
+        // Length-1 array with a single null value.
+        let nulls: Vec<Option<i64>> = vec![None];
+        let mn: ArrayRef = Arc::new(Int64Array::from(nulls.clone()));
+        let mx: ArrayRef = Arc::new(Int64Array::from(nulls));
+        seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+        let err = assign_partition(&seg, &strategy).expect_err("null stats");
+        assert_spans_partition(err, "empty or null at index 0");
+    }
+
+    #[test]
+    fn assign_partition_time_range_handles_negative_values_with_div_euclid() {
+        // `div_euclid` (not bare `/`) ensures negative timestamps
+        // bucket consistently — same-bucket pairs across the
+        // negative range must succeed. Catches an accidental
+        // `min / g != max / g` regression that breaks at the
+        // sign flip.
+        let strategy = PartitionStrategy::TimeRange {
+            column: "ts".into(),
+            granularity_secs: 10,
+        };
+        // -25 div_euclid 10 = -3; -21 div_euclid 10 = -3.
+        let seg = seg_with_i64("ts", -25, -21);
+        let key = assign_partition(&seg, &strategy).expect("assign");
+        assert_eq!(key, PartitionKey::TimeRange(-3i64 as u64));
+    }
+
+    // ---- assign_partition: Hash ----------------------------------------
+
+    #[test]
+    fn assign_partition_hash_single_bucket_short_circuits() {
+        // n_buckets=1 → always bucket 0, no partition_hint needed.
+        // This is the M15a default; tests rely on it staying
+        // hint-less.
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 1,
+        };
+        let seg = empty_seg();
+        let key = assign_partition(&seg, &strategy).expect("assign");
+        assert_eq!(key, PartitionKey::Hash(0));
+    }
+
+    #[test]
+    fn assign_partition_hash_zero_buckets_treats_as_one() {
+        // Defensive: n_buckets=0 falls into the <=1 short-circuit
+        // rather than panicking on a later modulo.
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 0,
+        };
+        let seg = empty_seg();
+        let key = assign_partition(&seg, &strategy).expect("assign");
+        assert_eq!(key, PartitionKey::Hash(0));
+    }
+
+    #[test]
+    fn assign_partition_hash_uses_partition_hint() {
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 4,
+        };
+        let mut seg = empty_seg();
+        seg.partition_hint = Some(2);
+        let key = assign_partition(&seg, &strategy).expect("assign");
+        assert_eq!(key, PartitionKey::Hash(2));
+    }
+
+    #[test]
+    fn assign_partition_hash_requires_hint_when_multi_bucket() {
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 4,
+        };
+        let seg = empty_seg(); // hint = None
+        let err = assign_partition(&seg, &strategy).expect_err("must reject");
+        assert_spans_partition(err, "requires pre-sharded");
+    }
+
+    #[test]
+    fn assign_partition_hash_rejects_out_of_range_hint() {
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 4,
+        };
+        let mut seg = empty_seg();
+        seg.partition_hint = Some(4); // == n_buckets, off-by-one
+        let err = assign_partition(&seg, &strategy).expect_err("out of range");
+        assert_spans_partition(err, "out of range");
+    }
+
+    // ---- assign_partition: ColumnRange (currently unimplemented) -------
+
+    #[test]
+    fn assign_partition_column_range_is_not_yet_supported() {
+        // The implementation explicitly bails on ColumnRange until
+        // M15a follow-up. Locking the message keeps it visible
+        // when the follow-up lands.
+        let strategy = PartitionStrategy::ColumnRange {
+            column: "_id".into(),
+            boundaries: vec![vec![]],
+        };
+        let seg = empty_seg();
+        let err = assign_partition(&seg, &strategy).expect_err("not impl");
+        assert_spans_partition(err, "ColumnRange partition assignment lands");
+    }
+}
