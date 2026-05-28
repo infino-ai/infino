@@ -544,7 +544,9 @@ fn oracle_and_multi_block_two_term_matches_brute_force() {
     // path to cross blocks on both cursors.
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
-    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta", 200).into_iter().collect();
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta", 200)
+        .into_iter()
+        .collect();
     let truth = multi_block_and_truth(&["alpha", "beta"]);
     assert_eq!(
         infino_set, truth,
