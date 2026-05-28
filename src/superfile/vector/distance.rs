@@ -12,7 +12,7 @@
 use wide::f32x8;
 
 use crate::superfile::vector::rerank_codec::RerankCodec;
-use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled, has_bf16_dot};
+use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
 /// Distance metric for a vector column. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
@@ -298,12 +298,7 @@ fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
 }
 
 /// Distance against a vector stored in the column's `rerank_codec`
-/// representation. The fast path for `Fp32` reuses [`distance_bytes`];
-/// `Bf16` widens 8 × bf16 → 8 × f32 per inner step and reuses the same
-/// `f32x8` math. The bf16 widening is exact (a left-shift by 16 of the
-/// u16 bit pattern reinterpreted as fp32), so the only error vs. an
-/// fp32 store is the round-to-nearest-even at encode time — bounded by
-/// `relative_eps ≈ 2⁻⁸ ≈ 4 × 10⁻³` per lane.
+/// representation. The fast path for `Fp32` reuses [`distance_bytes`].
 ///
 /// Centroid scoring NEVER comes through here — centroids are always
 /// stored as fp32 regardless of the column's rerank codec.
@@ -322,7 +317,6 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Bf16 => distance_bytes_bf16(metric, query, bytes),
         RerankCodec::Sq8 => {
             unreachable!(
                 "distance_bytes_codec called with Sq8 — Sq8 rerank goes through \
@@ -622,406 +616,6 @@ unsafe fn sq8_cross_product_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usiz
     }
 }
 
-/// Distance against a vector stored as little-endian bf16 bytes
-/// (2 bytes per dim). See [`distance_bytes_codec`] for context.
-#[inline]
-pub(crate) fn distance_bytes_bf16(metric: Metric, query: &[f32], bytes: &[u8]) -> f32 {
-    debug_assert_eq!(query.len() * 2, bytes.len());
-    match metric {
-        Metric::Cosine => 1.0 - dot_bf16_bytes(query, bytes),
-        Metric::L2Sq => l2_sq_bf16_bytes(query, bytes),
-        Metric::NegDot => -dot_bf16_bytes(query, bytes),
-    }
-}
-
-/// Encode an fp32 value as bf16 (the upper 16 bits of the fp32
-/// representation, with round-to-nearest-even on the low 16). NaN
-/// inputs return a canonical bf16 NaN (sign-preserving). The
-/// widening `bf16 → f32` is exact: read the u16 as the high 16
-/// bits of an fp32, low 16 bits zero. So a value that round-trips
-/// `fp32 → bf16 → fp32` differs from the input by at most one ULP
-/// of bf16, i.e. relative error ≤ 2⁻⁸.
-#[inline]
-pub(crate) fn fp32_to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        // NaN — keep the sign + exponent and ensure the bf16 mantissa
-        // is non-zero so it stays a NaN.
-        ((bits >> 16) | 0x0040) as u16
-    } else {
-        // Round-to-nearest-even: add 0x7FFF, plus the LSB of the
-        // truncated high half so exact midpoints round to even.
-        let lsb = (bits >> 16) & 1;
-        let bias = 0x7FFF_u32 + lsb;
-        (bits.wrapping_add(bias) >> 16) as u16
-    }
-}
-
-/// Widening `bf16 → f32`. Exact: reads the bf16 bit pattern as the
-/// top 16 bits of an fp32, low 16 bits zero. NaN/Inf/Subnormals
-/// pass through cleanly because the fp32 exponent field maps 1:1.
-#[inline]
-pub(crate) fn bf16_to_f32(bf: u16) -> f32 {
-    f32::from_bits((bf as u32) << 16)
-}
-
-/// bf16 dot product. Dispatches to the AVX-512 BF16 16-lane
-/// `vdpbf16ps` kernel when the runtime gate passes (Sapphire Rapids+,
-/// Zen 4+); otherwise the `wide::f32x8` widen-and-FMA kernel that
-/// has shipped since 012.
-#[inline]
-fn dot_bf16_bytes(query: &[f32], bytes: &[u8]) -> f32 {
-    debug_assert_eq!(query.len() * 2, bytes.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_bf16_dot() {
-            // SAFETY: `has_bf16_dot()` returns true only on hosts with
-            // both `avx512f` (foundation) and `avx512bf16` (VDPBF16PS).
-            return unsafe { dot_bf16_bytes_avx512(query, bytes) };
-        }
-        if avx2_enabled() {
-            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-            return unsafe { dot_bf16_bytes_avx2(query, bytes) };
-        }
-    }
-    dot_bf16_bytes_wide(query, bytes)
-}
-
-/// Portable `wide::f32x8` (256-bit) bf16-bytes dot product. Same
-/// per-element math as `dot_bf16_bytes_avx512`, processed 8 lanes
-/// at a time with a manual bf16 → f32 widen per lane. Universal
-/// fallback for non-AVX-512BF16 hosts.
-#[inline]
-fn dot_bf16_bytes_wide(query: &[f32], bytes: &[u8]) -> f32 {
-    let mut acc = f32x8::ZERO;
-    let mut i = 0;
-    while i + 8 <= query.len() {
-        let qc: [f32; 8] = query[i..i + 8]
-            .try_into()
-            .expect("slice [i..i+8] has length 8");
-        let mut bc = [0f32; 8];
-        let off = i * 2;
-        for (j, slot) in bc.iter_mut().enumerate() {
-            let bf = u16::from_le_bytes([bytes[off + j * 2], bytes[off + j * 2 + 1]]);
-            *slot = bf16_to_f32(bf);
-        }
-        let qv = f32x8::from(qc);
-        let bv = f32x8::from(bc);
-        acc += qv * bv;
-        i += 8;
-    }
-    let mut sum = acc.reduce_add();
-    while i < query.len() {
-        let off = i * 2;
-        let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        sum += query[i] * bf16_to_f32(bf);
-        i += 1;
-    }
-    sum
-}
-
-/// AVX2 bf16 dot. 8 lanes per iteration via 256-bit FMA, with the
-/// bf16 → f32 widen done as `vpmovzxwd` (8 u16 → 8 u32) +
-/// `vpslld(_, 16)` (shift-left by 16 = the bf16 → fp32 widen). One
-/// 128-bit unaligned load + two vector ops replace the 8 scalar
-/// `u16::from_le_bytes` + `bf16_to_f32` calls per inner iteration.
-/// Lifts every AVX2 host that lacks AVX-512 BF16.
-///
-/// # Safety
-///
-/// Callers must ensure the target supports `avx2`. `avx2_enabled()`
-/// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn dot_bf16_bytes_avx2(query: &[f32], bytes: &[u8]) -> f32 {
-    use std::arch::x86_64::*;
-    let n = query.len();
-    debug_assert_eq!(bytes.len(), n * 2);
-
-    // SAFETY: each iteration reads 8 f32s from `query` and 16
-    // bytes (= 8 bf16) from `bytes`. The `i + 8 <= n` predicate
-    // keeps both windows in bounds. Loads are unaligned.
-    unsafe {
-        let mut acc = _mm256_setzero_ps();
-        let mut i = 0;
-        while i + 8 <= n {
-            // Load 8 bf16 lanes (16 bytes) into an xmm.
-            let bf16_u16 = _mm_loadu_si128(bytes.as_ptr().add(i * 2) as *const __m128i);
-            // Zero-extend 8 u16 → 8 u32 (VPMOVZXWD), then bf16 →
-            // fp32 widen is shift-left-by-16 (place the bf16 bit
-            // pattern into the upper 16 bits of fp32; the lower
-            // 16 bits stay zero, which is exactly the bf16 →
-            // fp32 round-trip identity).
-            let u32_lanes = _mm256_cvtepu16_epi32(bf16_u16);
-            let shifted = _mm256_slli_epi32::<16>(u32_lanes);
-            let d = _mm256_castsi256_ps(shifted);
-            let q = _mm256_loadu_ps(query.as_ptr().add(i));
-            acc = _mm256_fmadd_ps(q, d, acc);
-            i += 8;
-        }
-        let lo = _mm256_castps256_ps128(acc);
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let sum128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let sums2 = _mm_add_ss(sums, shuf2);
-        let mut sum = _mm_cvtss_f32(sums2);
-        while i < n {
-            let off = i * 2;
-            let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-            sum += query[i] * bf16_to_f32(bf);
-            i += 1;
-        }
-        sum
-    }
-}
-
-/// AVX-512 BF16 bf16-bytes dot product via `_mm512_dpbf16_ps`
-/// (VDPBF16PS). One instruction performs 32 bf16-pair multiply-adds
-/// into 16 f32 accumulator lanes — both the doubled vector width
-/// **and** the native bf16 dot product motivate moving here.
-///
-/// The fp32 query side has to be packed down to bf16 inside the
-/// loop because the natively-stored representation is bf16 on the
-/// document side, and `vdpbf16ps` expects `__m512bh` for both
-/// operands. We pack via `_mm512_cvtne2ps_pbh` (round-to-nearest-
-/// even — exactly the same rounding the `fp32_to_bf16` encoder
-/// uses, so the parity-with-fp32 tolerance is unchanged from the
-/// `wide` kernel).
-///
-/// Reference implementations: oneDNN's `bf16_dot_kernel`, faer's
-/// `pulp::Pulp::vsr_dpbf16_ps` (which we re-derive directly
-/// because `pulp` doesn't expose VDPBF16PS without a feature
-/// gate).
-///
-/// # Safety
-///
-/// Callers must ensure the target supports `avx512f` + `avx512bf16`
-/// (the `_mm512_dpbf16_ps` and `_mm512_cvtne2ps_pbh` intrinsics).
-/// `has_bf16_dot()` guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bf16")]
-unsafe fn dot_bf16_bytes_avx512(query: &[f32], bytes: &[u8]) -> f32 {
-    use std::arch::x86_64::*;
-    let n = query.len();
-    debug_assert_eq!(bytes.len(), n * 2);
-
-    // SAFETY: each iteration reads 32 fp32s from `query` (= 16 from
-    // each `q_lo`/`q_hi` load) and 32 bf16s = 64 bytes from `bytes`
-    // (one `_mm512_loadu_si512`). Both loads are gated by
-    // `i + 32 <= n`, which keeps both windows inside their slices.
-    // Loads are unaligned (`loadu` / `loadu_si512`) so we make no
-    // alignment assumption on the caller's buffers. The bytes load
-    // is treated as 32 × i16 (bf16 bit patterns), which is valid
-    // because every bit pattern is a defined bf16 value (no
-    // illegal encodings).
-    unsafe {
-        let mut acc = _mm512_setzero_ps();
-        let mut i = 0;
-        while i + 32 <= n {
-            // 32 fp32 query lanes → two 16-lane vectors.
-            let q_lo = _mm512_loadu_ps(query.as_ptr().add(i));
-            let q_hi = _mm512_loadu_ps(query.as_ptr().add(i + 16));
-            // Pack the two fp32 vectors into one bf16 register.
-            // `_mm512_cvtne2ps_pbh(hi, lo)` rounds 32 fp32s to bf16
-            // (round-to-nearest-even) and concatenates them lo-then-
-            // hi. This matches `fp32_to_bf16`'s rounding mode so
-            // the AVX-512 path has the same per-lane bf16-encoding
-            // error as the wide / scalar reference.
-            let q_bf16 = _mm512_cvtne2ps_pbh(q_hi, q_lo);
-            // 64 bytes of doc-side bf16 = 32 bf16 lanes. The on-disk
-            // layout is little-endian u16 per lane (encoded by
-            // `fp32_to_bf16`), which is exactly the in-register
-            // layout `__m512bh` expects on little-endian x86_64.
-            let d_bits = _mm512_loadu_si512(bytes.as_ptr().add(i * 2) as *const __m512i);
-            let d_bf16 = std::mem::transmute::<__m512i, __m512bh>(d_bits);
-            acc = _mm512_dpbf16_ps(acc, q_bf16, d_bf16);
-            i += 32;
-        }
-        let mut sum = _mm512_reduce_add_ps(acc);
-        // Tail < 32: fall back to scalar bf16 widen. The longest
-        // possible tail is 31 lanes; this is fast in practice
-        // because callers' dims (384, 768, 1024, 1536) are all
-        // multiples of 32.
-        while i < n {
-            let off = i * 2;
-            let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-            sum += query[i] * bf16_to_f32(bf);
-            i += 1;
-        }
-        sum
-    }
-}
-
-/// bf16 squared-L2. Dispatches to the AVX-512 BF16 kernel when
-/// available; otherwise the `wide` widen-and-FMA kernel.
-///
-/// Unlike `dot_bf16_bytes`, this kernel does not use VDPBF16PS
-/// directly — `vdpbf16ps` is a fused multiply-add of bf16 pairs,
-/// which doesn't fit the `(q − d)²` shape. The AVX-512 path
-/// widens the doc bf16 to two fp32 vectors (cheap: one
-/// `_mm512_cvtpbh_ps` per half-batch), subtracts the query, and
-/// uses two `vfmadd231ps` to square-accumulate. Still ~1.7× faster
-/// than the `wide::f32x8` baseline because the loop body
-/// processes 16 lanes per FMA instead of 8 and the bf16 widen is
-/// a single vector instruction instead of a per-lane scalar
-/// `u16::from_le_bytes` + `bf16_to_f32`.
-#[inline]
-fn l2_sq_bf16_bytes(query: &[f32], bytes: &[u8]) -> f32 {
-    debug_assert_eq!(query.len() * 2, bytes.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_bf16_dot() {
-            // SAFETY: `has_bf16_dot()` guarantees `avx512f` + `avx512bf16`.
-            return unsafe { l2_sq_bf16_bytes_avx512(query, bytes) };
-        }
-        if avx2_enabled() {
-            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-            return unsafe { l2_sq_bf16_bytes_avx2(query, bytes) };
-        }
-    }
-    l2_sq_bf16_bytes_wide(query, bytes)
-}
-
-/// Portable `wide::f32x8` (256-bit) bf16-bytes squared-L2. See
-/// [`dot_bf16_bytes_wide`] for kernel shape; same widen, different
-/// inner math.
-#[inline]
-fn l2_sq_bf16_bytes_wide(query: &[f32], bytes: &[u8]) -> f32 {
-    let mut acc = f32x8::ZERO;
-    let mut i = 0;
-    while i + 8 <= query.len() {
-        let qc: [f32; 8] = query[i..i + 8]
-            .try_into()
-            .expect("slice [i..i+8] has length 8");
-        let mut bc = [0f32; 8];
-        let off = i * 2;
-        for (j, slot) in bc.iter_mut().enumerate() {
-            let bf = u16::from_le_bytes([bytes[off + j * 2], bytes[off + j * 2 + 1]]);
-            *slot = bf16_to_f32(bf);
-        }
-        let qv = f32x8::from(qc);
-        let bv = f32x8::from(bc);
-        let d = qv - bv;
-        acc += d * d;
-        i += 8;
-    }
-    let mut sum = acc.reduce_add();
-    while i < query.len() {
-        let off = i * 2;
-        let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        let d = query[i] - bf16_to_f32(bf);
-        sum += d * d;
-        i += 1;
-    }
-    sum
-}
-
-/// AVX2 bf16 squared-L2. Same bf16 → f32 widen shape as
-/// [`dot_bf16_bytes_avx2`] (VPMOVZXWD + shift-left-by-16),
-/// but with `(q − d)²` inside the FMA. Lifts the AVX2 fallback
-/// equally with the bf16 dot path.
-///
-/// # Safety
-///
-/// Callers must ensure the target supports `avx2`. `avx2_enabled()`
-/// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn l2_sq_bf16_bytes_avx2(query: &[f32], bytes: &[u8]) -> f32 {
-    use std::arch::x86_64::*;
-    let n = query.len();
-    debug_assert_eq!(bytes.len(), n * 2);
-
-    // SAFETY: bounds match `dot_bf16_bytes_avx2`.
-    unsafe {
-        let mut acc = _mm256_setzero_ps();
-        let mut i = 0;
-        while i + 8 <= n {
-            let bf16_u16 = _mm_loadu_si128(bytes.as_ptr().add(i * 2) as *const __m128i);
-            let u32_lanes = _mm256_cvtepu16_epi32(bf16_u16);
-            let shifted = _mm256_slli_epi32::<16>(u32_lanes);
-            let d = _mm256_castsi256_ps(shifted);
-            let q = _mm256_loadu_ps(query.as_ptr().add(i));
-            let diff = _mm256_sub_ps(q, d);
-            acc = _mm256_fmadd_ps(diff, diff, acc);
-            i += 8;
-        }
-        let lo = _mm256_castps256_ps128(acc);
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let sum128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let sums2 = _mm_add_ss(sums, shuf2);
-        let mut sum = _mm_cvtss_f32(sums2);
-        while i < n {
-            let off = i * 2;
-            let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-            let d = query[i] - bf16_to_f32(bf);
-            sum += d * d;
-            i += 1;
-        }
-        sum
-    }
-}
-
-/// AVX-512 BF16 bf16-bytes squared-L2. Widens the doc bf16 to two
-/// fp32 `__m512` halves via `_mm512_cvtpbh_ps` (exact widen — bf16
-/// is the upper 16 bits of fp32), subtracts the matching query
-/// halves, and FMAs the squared difference into the accumulator.
-///
-/// # Safety
-///
-/// Same contract as [`dot_bf16_bytes_avx512`].
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bf16")]
-unsafe fn l2_sq_bf16_bytes_avx512(query: &[f32], bytes: &[u8]) -> f32 {
-    use std::arch::x86_64::*;
-    let n = query.len();
-    debug_assert_eq!(bytes.len(), n * 2);
-
-    // SAFETY: bounds reasoning matches `dot_bf16_bytes_avx512`.
-    // The bf16-as-i16 transmute is sound because every bit pattern
-    // is a valid bf16 (no illegal encodings); the widen is just a
-    // bit reinterpretation (low 16 bits of fp32 zeroed).
-    unsafe {
-        let mut acc = _mm512_setzero_ps();
-        let mut i = 0;
-        while i + 32 <= n {
-            // 32 doc bf16 lanes split into two fp32 halves (16 each).
-            let d_bits = _mm512_loadu_si512(bytes.as_ptr().add(i * 2) as *const __m512i);
-            // Bottom 256 bits → bf16 lanes 0..16 → fp32 vector (lo)
-            let d_lo_bh = std::mem::transmute::<__m256i, __m256bh>(_mm512_castsi512_si256(d_bits));
-            // Top 256 bits → bf16 lanes 16..32 → fp32 vector (hi)
-            let d_hi_bh =
-                std::mem::transmute::<__m256i, __m256bh>(_mm512_extracti64x4_epi64(d_bits, 1));
-            let d_lo = _mm512_cvtpbh_ps(d_lo_bh);
-            let d_hi = _mm512_cvtpbh_ps(d_hi_bh);
-
-            let q_lo = _mm512_loadu_ps(query.as_ptr().add(i));
-            let q_hi = _mm512_loadu_ps(query.as_ptr().add(i + 16));
-
-            let diff_lo = _mm512_sub_ps(q_lo, d_lo);
-            let diff_hi = _mm512_sub_ps(q_hi, d_hi);
-            acc = _mm512_fmadd_ps(diff_lo, diff_lo, acc);
-            acc = _mm512_fmadd_ps(diff_hi, diff_hi, acc);
-
-            i += 32;
-        }
-        let mut sum = _mm512_reduce_add_ps(acc);
-        while i < n {
-            let off = i * 2;
-            let bf = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-            let d = query[i] - bf16_to_f32(bf);
-            sum += d * d;
-            i += 1;
-        }
-        sum
-    }
-}
-
 /// In-place L2-normalize. Zero vectors stay zero (no division).
 pub fn normalize(v: &mut [f32]) {
     let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1181,92 +775,6 @@ mod tests {
                 "metric {m:?}: near {d_near} should be < far {d_far}"
             );
         }
-    }
-
-    // --- bf16 round-trip + distance ------------------------------------
-
-    fn encode_bf16(values: &[f32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(values.len() * 2);
-        for &x in values {
-            out.extend_from_slice(&fp32_to_bf16(x).to_le_bytes());
-        }
-        out
-    }
-
-    #[test]
-    fn bf16_round_trip_exact_for_representable_values() {
-        // Values whose low 16 mantissa bits are already zero round-trip
-        // exactly through bf16: 0, 1, integers with bf16 mantissa
-        // precision, powers of two.
-        for &x in &[0.0f32, 1.0, -1.0, 2.0, 4.0, 0.5, -0.5] {
-            let bf = fp32_to_bf16(x);
-            assert_eq!(bf16_to_f32(bf), x, "value {x} did not round-trip");
-        }
-    }
-
-    #[test]
-    fn bf16_round_trip_within_relative_tolerance() {
-        // Arbitrary fp32s round-trip within ~2⁻⁸ relative error.
-        for &x in &[1.234e-3f32, 0.123_456_7, 1.5e3, -7.7e-2, 42.0] {
-            let bf = fp32_to_bf16(x);
-            let r = bf16_to_f32(bf);
-            let err = ((r - x) / x).abs();
-            assert!(err <= 1.0 / 128.0, "value {x}: round-trip err {err}");
-        }
-    }
-
-    #[test]
-    fn bf16_ties_round_to_even() {
-        // Midpoint between two bf16 values: exact-half mantissa.
-        // 1.0 has bits 0x3F80_0000. A midpoint is 0x3F80_8000 (the
-        // mantissa LSB-of-bf16 is 0, low 16 = 0x8000). Tie should
-        // round DOWN to 1.0 (even mantissa), not up.
-        let mid_down = f32::from_bits(0x3F80_8000);
-        assert_eq!(bf16_to_f32(fp32_to_bf16(mid_down)), 1.0);
-        // Next bf16 is 0x3F81 → 1.0078125; midpoint at 0x3F81_8000
-        // rounds UP to 1.015625 because 0x3F81's mantissa LSB is 1
-        // (so down would be odd, up is even).
-        let mid_up = f32::from_bits(0x3F81_8000);
-        assert_eq!(
-            bf16_to_f32(fp32_to_bf16(mid_up)),
-            f32::from_bits(0x3F82_0000)
-        );
-    }
-
-    #[test]
-    fn distance_bytes_bf16_matches_fp32_within_tolerance() {
-        let q: Vec<f32> = (0..16).map(|i| (i as f32) * 0.1 - 0.7).collect();
-        let v: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.3).collect();
-        let bytes = encode_bf16(&v);
-        for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
-            let d_ref = distance(m, &q, &v);
-            let d_bf16 = distance_bytes_bf16(m, &q, &bytes);
-            let abs_err = (d_ref - d_bf16).abs();
-            let rel_err = abs_err / d_ref.abs().max(1e-6);
-            // bf16 has 8 bits of mantissa → per-lane relative error
-            // ~2⁻⁸ ≈ 4e-3. Sum-of-products amplifies by √dim ≈ 4.
-            assert!(
-                rel_err <= 2e-2 || abs_err <= 1e-3,
-                "metric {m:?}: bf16 {d_bf16} vs fp32 {d_ref} (rel {rel_err})"
-            );
-        }
-    }
-
-    #[test]
-    fn distance_bytes_codec_dispatches_correctly() {
-        let q: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
-        let v: Vec<f32> = (0..8).map(|i| (i as f32) * 0.2 - 0.5).collect();
-        let bytes_fp32: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes().into_iter()).collect();
-        let bytes_bf16 = encode_bf16(&v);
-
-        let d_fp32 = distance_bytes_codec(Metric::L2Sq, RerankCodec::Fp32, &q, &bytes_fp32);
-        let d_bf16 = distance_bytes_codec(Metric::L2Sq, RerankCodec::Bf16, &q, &bytes_bf16);
-
-        // fp32 path must equal the plain f32 reference exactly.
-        assert_eq!(d_fp32, distance(Metric::L2Sq, &q, &v));
-        // bf16 path must be within tolerance of the reference.
-        let err = (d_bf16 - d_fp32).abs();
-        assert!(err <= 5e-3, "bf16 dispatch err {err}");
     }
 
     // --- sq8 kernel -----------------------------------------------------
@@ -1460,24 +968,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn distance_bytes_bf16_handles_tail_dim_not_multiple_of_8() {
-        // Dim 11: 1 SIMD chunk of 8 + scalar tail of 3. Both branches
-        // must round-trip values consistently; the test catches a tail
-        // path that skipped bf16 widening (would surface as an
-        // order-of-magnitude error, not the ~0.3 % bf16 round-trip
-        // error we tolerate here).
-        let q: Vec<f32> = (0..11).map(|i| (i as f32) * 0.1).collect();
-        let v: Vec<f32> = (0..11).map(|i| (i as f32) * 0.2 + 0.1).collect();
-        let bytes = encode_bf16(&v);
-        let d_ref = distance(Metric::L2Sq, &q, &v);
-        let d_bf16 = distance_bytes_bf16(Metric::L2Sq, &q, &bytes);
-        let rel = (d_ref - d_bf16).abs() / d_ref.abs().max(1e-6);
-        assert!(
-            rel <= 1e-2,
-            "tail-dim bf16 {d_bf16} vs fp32 {d_ref} (rel {rel})"
-        );
-    }
 
     // --- AVX-512 parity (plan 014 Phase 1, fp32) ------------------------
 
@@ -1614,79 +1104,7 @@ mod tests {
         assert!(!parse("yes")); // pinned: we only accept 1 / true
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1, bf16) ------------------------
-
-    /// AVX-512 BF16 `dot_bf16_bytes` agrees with the `wide` baseline
-    /// across length sweep covering the 32-lane unroll boundary
-    /// and a representative span of tail sizes (the AVX-512 kernel's
-    /// tail is anything `< 32`, fairly large compared to the 16-lane
-    /// fp32 kernel).
-    ///
-    /// Tolerance: looser than the fp32 parity bound because the
-    /// AVX-512 kernel and the wide kernel both round the query side
-    /// to bf16 differently — the wide kernel doesn't (it does the
-    /// FMA in fp32 against widened bf16 doc lanes), the AVX-512
-    /// kernel does (VDPBF16PS expects both operands as bf16, so the
-    /// fp32 query is packed via `vcvtne2ps2bf16` round-to-nearest-
-    /// even on every iteration). Net per-lane error: bounded by
-    /// one bf16 ULP (~2⁻⁸ relative) on top of the doc-side
-    /// quantization that already exists in both paths.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dot_bf16_bytes_avx512_matches_wide_across_lengths() {
-        if !has_bf16_dot() {
-            eprintln!(
-                "dot_bf16_bytes_avx512_matches_wide_across_lengths: skipped, no AVX-512 BF16"
-            );
-            return;
-        }
-        for dim in [1usize, 7, 16, 31, 32, 33, 64, 95, 96, 97, 128, 384] {
-            let query = fake_vec(dim, 0xB16F);
-            let doc_f32 = fake_vec(dim, 0xD0C0);
-            let bytes = encode_bf16(&doc_f32);
-            let want = dot_bf16_bytes_wide(&query, &bytes);
-            // SAFETY: gated on has_bf16_dot() above.
-            let got = unsafe { dot_bf16_bytes_avx512(&query, &bytes) };
-            // Tolerance: 1 bf16 ULP per lane (≈ 2⁻⁸ relative) on
-            // the query-side rounding, accumulated √dim ways.
-            let tol = 5e-3 * want.abs().max(1.0) + 1e-5 * (dim as f32).sqrt();
-            assert!(
-                (want - got).abs() <= tol,
-                "dim {dim}: bf16 avx512 {got} vs bf16 wide {want} (tol {tol})"
-            );
-        }
-    }
-
-    /// AVX-512 BF16 `l2_sq_bf16_bytes` agrees with the `wide`
-    /// baseline. The AVX-512 path widens bf16 doc lanes to fp32
-    /// before subtracting (exact widen — bf16 IS the upper 16 bits
-    /// of fp32, low 16 bits zero), so the only difference vs the
-    /// wide kernel is reduction order. Tolerance accordingly is
-    /// the same √dim-scaled ULP bound as the fp32 `l2_sq_avx512`
-    /// parity test.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn l2_sq_bf16_bytes_avx512_matches_wide_across_lengths() {
-        if !has_bf16_dot() {
-            eprintln!(
-                "l2_sq_bf16_bytes_avx512_matches_wide_across_lengths: skipped, no AVX-512 BF16"
-            );
-            return;
-        }
-        for dim in [1usize, 7, 16, 31, 32, 33, 64, 95, 96, 97, 128, 384] {
-            let query = fake_vec(dim, 0xE2C5);
-            let doc_f32 = fake_vec(dim, 0x9501);
-            let bytes = encode_bf16(&doc_f32);
-            let want = l2_sq_bf16_bytes_wide(&query, &bytes);
-            // SAFETY: gated on has_bf16_dot() above.
-            let got = unsafe { l2_sq_bf16_bytes_avx512(&query, &bytes) };
-            let tol = 1e-5 * want.abs().max(1.0);
-            assert!(
-                (want - got).abs() <= tol,
-                "dim {dim}: bf16 l2_sq avx512 {got} vs bf16 l2_sq wide {want} (tol {tol})"
-            );
-        }
-    }
+    // --- AVX-512 parity (plan 014 Phase 1) ------------------------------
 
     /// AVX-512 `sq8_cross_product` agrees with the `wide` baseline
     /// across a length sweep. The cross product is `Σ q_prime[d] *
@@ -1716,65 +1134,6 @@ mod tests {
 
     // --- AVX2 parity (plan 014 Phase 2) ---------------------------------
 
-    /// AVX2 `dot_bf16_bytes_avx2` agrees with the portable wide
-    /// kernel across a length sweep. Same arithmetic identity as
-    /// the AVX-512 BF16 path but uses the 256-bit VPMOVZXWD +
-    /// shift-left-16 widen on every AVX2 host (no AVX-512 needed).
-    /// Tolerance the same as the AVX-512 parity test: tens of bf16
-    /// ULPs across a 768-dim accumulator stays well within recall
-    /// test bands.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dot_bf16_bytes_avx2_matches_wide_across_lengths() {
-        if !avx2_enabled() {
-            eprintln!("dot_bf16_bytes_avx2_matches_wide_across_lengths: skipped, no AVX2");
-            return;
-        }
-        for dim in [
-            1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 384, 768,
-        ] {
-            let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let doc_f32: Vec<f32> = (0..dim).map(|i| ((i * 7) as f32) * 0.021 - 0.2).collect();
-            let bytes = encode_bf16(&doc_f32);
-            let want = dot_bf16_bytes_wide(&query, &bytes);
-            // SAFETY: gated on avx2_enabled() above.
-            let got = unsafe { dot_bf16_bytes_avx2(&query, &bytes) };
-            let tol = 1e-5 * want.abs().max(1.0) + 1e-6 * (dim as f32).sqrt();
-            assert!(
-                (want - got).abs() <= tol,
-                "dim {dim}: dot_bf16 avx2 {got} vs wide {want} (tol {tol})"
-            );
-        }
-    }
-
-    /// AVX2 `l2_sq_bf16_bytes_avx2` agrees with the portable wide
-    /// kernel across a length sweep. Same `(q − d)²` math as the
-    /// AVX-512 BF16 L2 path; the per-pair multiplies are
-    /// bit-identical and only the reduction tree shape differs.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn l2_sq_bf16_bytes_avx2_matches_wide_across_lengths() {
-        if !avx2_enabled() {
-            eprintln!("l2_sq_bf16_bytes_avx2_matches_wide_across_lengths: skipped, no AVX2");
-            return;
-        }
-        for dim in [
-            1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 384, 768,
-        ] {
-            let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let doc_f32: Vec<f32> = (0..dim).map(|i| ((i * 7) as f32) * 0.021 - 0.2).collect();
-            let bytes = encode_bf16(&doc_f32);
-            let want = l2_sq_bf16_bytes_wide(&query, &bytes);
-            // SAFETY: gated on avx2_enabled() above.
-            let got = unsafe { l2_sq_bf16_bytes_avx2(&query, &bytes) };
-            let tol = 1e-5 * want.abs().max(1.0) + 1e-6 * (dim as f32).sqrt();
-            assert!(
-                (want - got).abs() <= tol,
-                "dim {dim}: l2_sq_bf16 avx2 {got} vs wide {want} (tol {tol})"
-            );
-        }
-    }
-
     /// AVX2 `sq8_cross_product_avx2` agrees with the portable wide
     /// kernel across a length sweep. Inner math is identical (FMA
     /// of q_prime against the u8-widened doc codes); the only
@@ -1800,26 +1159,6 @@ mod tests {
             assert!(
                 (want - got).abs() <= tol,
                 "dim {dim}: sq8 avx2 {got} vs wide {want} (tol {tol})"
-            );
-        }
-    }
-
-    /// Public `dot_bf16_bytes` dispatches transparently — returns
-    /// the same numeric value on this host regardless of whether
-    /// the AVX-512 path is taken. Within the same parity tolerance
-    /// as the direct-call test above.
-    #[test]
-    fn public_dot_bf16_bytes_dispatches_consistently() {
-        for &dim in &[7usize, 32, 33, 384] {
-            let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01 - 0.5).collect();
-            let doc_f32: Vec<f32> = (0..dim).map(|i| ((i * 3) as f32) * 0.02 - 0.1).collect();
-            let bytes = encode_bf16(&doc_f32);
-            let public_result = dot_bf16_bytes(&query, &bytes);
-            let wide_result = dot_bf16_bytes_wide(&query, &bytes);
-            let tol = 5e-3 * wide_result.abs().max(1.0) + 1e-5 * (dim as f32).sqrt();
-            assert!(
-                (public_result - wide_result).abs() <= tol,
-                "dim {dim}: dot_bf16_bytes() {public_result} vs dot_bf16_bytes_wide() {wide_result} (tol {tol})"
             );
         }
     }
@@ -1919,55 +1258,6 @@ mod tests {
     #[test]
     #[ignore]
     #[cfg(target_arch = "x86_64")]
-    fn avx512_microbench_bf16_kernels() {
-        if !has_bf16_dot() {
-            eprintln!("avx512_microbench: skipped, no AVX-512 BF16 on this host");
-            return;
-        }
-        eprintln!();
-        eprintln!("### bf16 distance kernel — AVX-512 BF16 (VDPBF16PS) vs wide (ns per call)\n");
-        eprintln!("| kernel | dim | wide ns | avx512_bf16 ns | speedup |");
-        eprintln!("|--------|----:|--------:|---------------:|--------:|");
-
-        use std::hint::black_box;
-        for &dim in realistic_dims() {
-            let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001 - 0.5).collect();
-            let doc: Vec<f32> = (0..dim).map(|i| ((i + 7) as f32) * 0.0017 - 0.3).collect();
-            let bytes = encode_bf16(&doc);
-            let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
-
-            let wide_ns = time_ns(iters, || {
-                dot_bf16_bytes_wide(black_box(&query), black_box(&bytes))
-            });
-            // SAFETY: gated on has_bf16_dot() above.
-            let avx_ns = time_ns(iters, || unsafe {
-                dot_bf16_bytes_avx512(black_box(&query), black_box(&bytes))
-            });
-            eprintln!(
-                "| `distance::dot_bf16_bytes` | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
-                wide_ns,
-                avx_ns,
-                wide_ns / avx_ns,
-            );
-
-            let wide_ns = time_ns(iters, || {
-                l2_sq_bf16_bytes_wide(black_box(&query), black_box(&bytes))
-            });
-            let avx_ns = time_ns(iters, || unsafe {
-                l2_sq_bf16_bytes_avx512(black_box(&query), black_box(&bytes))
-            });
-            eprintln!(
-                "| `distance::l2_sq_bf16_bytes` | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
-                wide_ns,
-                avx_ns,
-                wide_ns / avx_ns,
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    #[cfg(target_arch = "x86_64")]
     fn avx512_microbench_sq8_kernel() {
         if !avx512_enabled() {
             eprintln!("avx512_microbench: skipped, no AVX-512 on this host");
@@ -2013,11 +1303,10 @@ mod tests {
     //   avx2_microbench -- --ignored --nocapture
     // ```
     //
-    // On hosts with AVX-512, the AVX2 paths in `dot_bf16_bytes_avx2`
-    // etc. are not the runtime default (the dispatch chain picks
-    // AVX-512 first), but the parity tests + this microbench still
-    // exercise them via direct call to keep the AVX2 baseline a
-    // first-class measurable tier.
+    // On hosts with AVX-512, the AVX2 widen path is not the runtime
+    // default (the dispatch chain picks AVX-512 first), but the
+    // parity tests + this microbench still exercise it via direct
+    // call to keep the AVX2 baseline a first-class measurable tier.
 
     // --- Unified 4-tier per-kernel microbench (plan 014) --------------
     //
@@ -2060,35 +1349,6 @@ mod tests {
         s
     }
 
-    /// Scalar bf16-bytes-vs-fp32 dot. Per-lane bf16→f32 then mul-add.
-    fn dot_bf16_bytes_scalar(query: &[f32], bytes: &[u8]) -> f32 {
-        let dim = query.len();
-        let mut s = 0.0f32;
-        for i in 0..dim {
-            let lo = bytes[i * 2] as u16;
-            let hi = bytes[i * 2 + 1] as u16;
-            let bf = lo | (hi << 8);
-            let f = f32::from_bits((bf as u32) << 16);
-            s += query[i] * f;
-        }
-        s
-    }
-
-    /// Scalar bf16-bytes-vs-fp32 L2².
-    fn l2_sq_bf16_bytes_scalar(query: &[f32], bytes: &[u8]) -> f32 {
-        let dim = query.len();
-        let mut s = 0.0f32;
-        for i in 0..dim {
-            let lo = bytes[i * 2] as u16;
-            let hi = bytes[i * 2 + 1] as u16;
-            let bf = lo | (hi << 8);
-            let f = f32::from_bits((bf as u32) << 16);
-            let d = query[i] - f;
-            s += d * d;
-        }
-        s
-    }
-
     /// Scalar Sq8 cross-product kernel core: `Σ q'[d] * code[d]`
     /// after per-lane u8→f32 widening. Used inside `Sq8Kernel::
     /// distance_at`; this is the part the SIMD paths accelerate.
@@ -2111,9 +1371,8 @@ mod tests {
     /// `wide(=AVX2)` followed by the wide ns to make it clear that
     /// the dispatch chain on an AVX2-only host actually runs at the
     /// wide column's number. Kernels that *do* have a separate AVX2
-    /// path (the bf16 + Sq8 widen kernels — wide had per-lane scalar
-    /// widen, AVX2 has VPMOVZXBD / VPMOVZXWD + shift) show the
-    /// dedicated AVX2 timing.
+    /// path (the Sq8 widen kernel — wide had per-lane scalar widen,
+    /// AVX2 has VPMOVZXBD + shift) shows the dedicated AVX2 timing.
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     #[cfg(target_arch = "x86_64")]
@@ -2121,12 +1380,11 @@ mod tests {
         use std::hint::black_box;
         let avx2 = avx2_enabled();
         let avx512 = avx512_enabled();
-        let bf16 = has_bf16_dot();
         eprintln!();
         eprintln!(
             "### vector distance kernels — per-tier ns / call on this host (single thread, release)\n"
         );
-        eprintln!("host caps: avx2={avx2}, avx512f={avx512}, avx512_bf16 (VDPBF16PS)={bf16}");
+        eprintln!("host caps: avx2={avx2}, avx512f={avx512}");
         eprintln!(
             "build:     `target-cpu=x86-64-v3` (Haswell+AVX2+FMA baseline) from .cargo/config.toml\n"
         );
@@ -2156,7 +1414,6 @@ mod tests {
         for &dim in realistic_dims() {
             let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001 - 0.5).collect();
             let b: Vec<f32> = (0..dim).map(|i| ((i + 7) as f32) * 0.0017 - 0.3).collect();
-            let bytes = encode_bf16(&b);
             let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
             let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
             let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
@@ -2203,64 +1460,6 @@ mod tests {
                 avx512_cell(a5),
             );
 
-            // --- distance::dot_bf16_bytes ---
-            let s = time_ns(iters, || {
-                dot_bf16_bytes_scalar(black_box(&a), black_box(&bytes))
-            });
-            let w = time_ns(iters, || {
-                dot_bf16_bytes_wide(black_box(&a), black_box(&bytes))
-            });
-            let a2 = if avx2 {
-                Some(time_ns(iters, || unsafe {
-                    dot_bf16_bytes_avx2(black_box(&a), black_box(&bytes))
-                }))
-            } else {
-                None
-            };
-            let a5 = if avx512 {
-                Some(time_ns(iters, || unsafe {
-                    dot_bf16_bytes_avx512(black_box(&a), black_box(&bytes))
-                }))
-            } else {
-                None
-            };
-            eprintln!(
-                "| `distance::dot_bf16_bytes` | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
-                s,
-                w,
-                avx2_cell(a2, w),
-                avx512_cell(a5),
-            );
-
-            // --- distance::l2_sq_bf16_bytes ---
-            let s = time_ns(iters, || {
-                l2_sq_bf16_bytes_scalar(black_box(&a), black_box(&bytes))
-            });
-            let w = time_ns(iters, || {
-                l2_sq_bf16_bytes_wide(black_box(&a), black_box(&bytes))
-            });
-            let a2 = if avx2 {
-                Some(time_ns(iters, || unsafe {
-                    l2_sq_bf16_bytes_avx2(black_box(&a), black_box(&bytes))
-                }))
-            } else {
-                None
-            };
-            let a5 = if avx512 {
-                Some(time_ns(iters, || unsafe {
-                    l2_sq_bf16_bytes_avx512(black_box(&a), black_box(&bytes))
-                }))
-            } else {
-                None
-            };
-            eprintln!(
-                "| `distance::l2_sq_bf16_bytes` | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
-                s,
-                w,
-                avx2_cell(a2, w),
-                avx512_cell(a5),
-            );
-
             // --- sq8_cross_product (the Sq8Kernel hot loop core) ---
             let s = time_ns(iters, || {
                 sq8_cross_product_scalar(black_box(&q_prime), black_box(&codes), black_box(dim))
@@ -2299,15 +1498,15 @@ mod tests {
              the fp32 `dot` / `l2_sq` kernels because `wide::f32x8` on \
              `target-cpu=x86-64-v3` lowers to `__m256` + `vfmadd*ps`, \
              which is what a hand-written AVX2 kernel would emit. The \
-             bf16 + Sq8 widen kernels have dedicated AVX2 paths (visible \
+             Sq8 widen kernel has a dedicated AVX2 path (visible \
              above) because the wide path previously did per-lane scalar \
              widening; the dedicated AVX2 path replaces that with \
              VPMOVZXBD / VPMOVZXWD + shift."
         );
     }
 
-    /// AVX2 fp32-equivalent bf16 / Sq8 widen paths vs the portable
-    /// scalar-widen `_wide` kernels. Captures the "lift the AVX2
+    /// AVX2 fp32-equivalent Sq8 widen path vs the portable
+    /// scalar-widen `_wide` kernel. Captures the "lift the AVX2
     /// fallback path" half of the Phase 2 win (the other half is
     /// the Sq8Kernel rerank cache, which is a data-structure
     /// change exercised by the IVF rerank benches end-to-end).
@@ -2326,40 +1525,9 @@ mod tests {
 
         use std::hint::black_box;
         for &dim in realistic_dims() {
-            let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let doc_f32: Vec<f32> = (0..dim).map(|i| ((i * 7) as f32) * 0.021 - 0.2).collect();
-            let bytes = encode_bf16(&doc_f32);
             let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
             let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
             let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
-
-            let wide_dot_ns = time_ns(iters, || {
-                dot_bf16_bytes_wide(black_box(&query), black_box(&bytes))
-            });
-            // SAFETY: gated on avx2_enabled() above.
-            let avx2_dot_ns = time_ns(iters, || unsafe {
-                dot_bf16_bytes_avx2(black_box(&query), black_box(&bytes))
-            });
-            eprintln!(
-                "| `distance::dot_bf16_bytes` | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
-                wide_dot_ns,
-                avx2_dot_ns,
-                wide_dot_ns / avx2_dot_ns,
-            );
-
-            let wide_l2_ns = time_ns(iters, || {
-                l2_sq_bf16_bytes_wide(black_box(&query), black_box(&bytes))
-            });
-            // SAFETY: gated on avx2_enabled() above.
-            let avx2_l2_ns = time_ns(iters, || unsafe {
-                l2_sq_bf16_bytes_avx2(black_box(&query), black_box(&bytes))
-            });
-            eprintln!(
-                "| `distance::l2_sq_bf16_bytes` | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
-                wide_l2_ns,
-                avx2_l2_ns,
-                wide_l2_ns / avx2_l2_ns,
-            );
 
             let wide_sq8_ns = time_ns(iters, || {
                 sq8_cross_product_wide(black_box(&q_prime), black_box(&codes), black_box(dim))

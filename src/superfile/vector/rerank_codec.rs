@@ -4,9 +4,6 @@
 //!
 //! - [`RerankCodec::Fp32`]: little-endian fp32, `dim × 4` bytes
 //!   per vector. Zero-copy on the rerank distance kernel.
-//! - [`RerankCodec::Bf16`]: top 16 bits of the fp32 bit pattern,
-//!   `dim × 2` bytes per vector. SIMD widen via `u16 → u32 → fp32`
-//!   shift.
 //! - [`RerankCodec::Sq8`]: per-column per-dim 8-bit scalar
 //!   quantization, `dim × 1` bytes per vector. The quantizer
 //!   (`scale[dim]`, `offset[dim]`) lives in a sibling
@@ -34,8 +31,17 @@
 //! `codec_meta` region between the `codes` region and the
 //! `full[]` region. The region's relative offset within the
 //! subsection is recorded in sub-header bytes 12..16 as
-//! `codec_meta_off: u32`. `Fp32` / `Bf16` / `RabitqOnly` segments
+//! `codec_meta_off: u32`. `Fp32` / `RabitqOnly` segments
 //! write `codec_meta_off = 0`.
+//!
+//! ## Retired codec ids
+//!
+//! `codec_id = 1` was assigned to a `Bf16` codec that shipped in an
+//! experimental branch and was removed before the codec spec was
+//! stabilized. The byte stays reserved — [`RerankCodec::from_codec_id`]
+//! returns `None` for it, which the reader surfaces as a
+//! `MalformedVersion` error so any pre-removal segment fails loud
+//! rather than mis-decoding.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,27 +53,25 @@ use crate::superfile::vector::distance::Metric;
 /// match the dominant embedding-model bucket (e5, MiniLM, etc.).
 const LOW_DIM_RERANK_FLOOR_THRESHOLD: usize = 384;
 
-/// Recommended floor on `rerank_mult` for `Fp32` / `Bf16` columns
-/// at `dim ≤ 384`. Fp32 and Bf16 share the same floor — bf16's
-/// rounding noise sits well below the 1-bit shortlist's noise
-/// floor, so the recall-driven candidate budget is the same.
-const FP32_BF16_LOW_DIM_RERANK_FLOOR: usize = 20;
+/// Recommended floor on `rerank_mult` for `Fp32` columns at
+/// `dim ≤ 384`.
+const FP32_LOW_DIM_RERANK_FLOOR: usize = 20;
 
-/// Recommended floor on `rerank_mult` for `Fp32` / `Bf16` columns
-/// at `dim > 384`. Higher dim widens the gap between the 1-bit
+/// Recommended floor on `rerank_mult` for `Fp32` columns at
+/// `dim > 384`. Higher dim widens the gap between the 1-bit
 /// shortlist score and the true distance; more candidates are
 /// needed to recover the same recall.
-const FP32_BF16_HIGH_DIM_RERANK_FLOOR: usize = 50;
+const FP32_HIGH_DIM_RERANK_FLOOR: usize = 50;
 
 /// Recommended floor on `rerank_mult` for `Sq8` columns at
-/// `dim ≤ 384`. Sq8 needs more candidates than fp32 / bf16 to
+/// `dim ≤ 384`. Sq8 needs more candidates than fp32 to
 /// recover equivalent recall because the dequant noise floor is
 /// higher.
 const SQ8_LOW_DIM_RERANK_FLOOR: usize = 50;
 
 /// Recommended floor on `rerank_mult` for `Sq8` columns at
 /// `dim > 384`. See [`SQ8_LOW_DIM_RERANK_FLOOR`] and
-/// [`FP32_BF16_HIGH_DIM_RERANK_FLOOR`] for the underlying
+/// [`FP32_HIGH_DIM_RERANK_FLOOR`] for the underlying
 /// calibration rationale.
 const SQ8_HIGH_DIM_RERANK_FLOOR: usize = 100;
 
@@ -82,10 +86,6 @@ pub enum RerankCodec {
     /// The rerank distance kernel reads it via
     /// `bytemuck::try_cast_slice` → zero-copy SIMD.
     Fp32,
-    /// bf16 — top 16 bits of the fp32 bit pattern. `dim × 2`
-    /// bytes per vector. SIMD widen via `(u16 → u32 → f32 shift)`
-    /// in front of the distance kernel.
-    Bf16,
     /// 8-bit scalar quantization. Per-column per-dim
     /// `(scale[dim], offset[dim])` arrays live in the sibling
     /// `codec_meta` region; per-vector body is `dim` u8s. The
@@ -124,9 +124,9 @@ impl RerankCodec {
     /// zero round-trip identically.
     #[inline]
     pub const fn codec_id(self) -> u8 {
+        // codec_id = 1 is retired (was `Bf16`); see module docs.
         match self {
             Self::Fp32 => 0,
-            Self::Bf16 => 1,
             Self::Sq8 => 2,
             Self::RabitqOnly => 3,
         }
@@ -138,9 +138,9 @@ impl RerankCodec {
     /// fails loud rather than mis-decoding.
     #[inline]
     pub const fn from_codec_id(id: u8) -> Option<Self> {
+        // codec_id = 1 is retired (was `Bf16`); see module docs.
         match id {
             0 => Some(Self::Fp32),
-            1 => Some(Self::Bf16),
             2 => Some(Self::Sq8),
             3 => Some(Self::RabitqOnly),
             _ => None,
@@ -153,7 +153,6 @@ impl RerankCodec {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Fp32 => "fp32",
-            Self::Bf16 => "bf16",
             Self::Sq8 => "sq8",
             Self::RabitqOnly => "rabitq_only",
         }
@@ -165,7 +164,6 @@ impl RerankCodec {
     pub const fn per_vector_bytes(self, dim: usize) -> usize {
         match self {
             Self::Fp32 => dim * 4,
-            Self::Bf16 => dim * 2,
             Self::Sq8 => dim,
             Self::RabitqOnly => 0,
         }
@@ -182,7 +180,7 @@ impl RerankCodec {
     }
 
     /// Whether the build + search paths implement this codec.
-    /// All four enum variants are currently implemented; this
+    /// All three enum variants are currently implemented; this
     /// hook exists so future codecs can be added to the enum
     /// (and the on-disk discriminator table) before their build
     /// path lands — call sites use it to fail fast with a
@@ -190,7 +188,7 @@ impl RerankCodec {
     /// writing a byte format that the reader can't decode.
     #[inline]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Fp32 | Self::Bf16 | Self::Sq8 | Self::RabitqOnly)
+        matches!(self, Self::Fp32 | Self::Sq8 | Self::RabitqOnly)
     }
 
     /// Recommended **lower bound** on `rerank_mult` for this
@@ -201,21 +199,19 @@ impl RerankCodec {
     ///
     /// Sq8 needs more candidates to recover fp32-equivalent
     /// recall because the dequant noise floor is higher than
-    /// fp32 / bf16. Bf16's rounding noise at ~2⁻⁸ per lane is
-    /// well below the 1-bit shortlist's noise floor — same
-    /// recommended floor as fp32. The bench harness uses this
-    /// as the calibration-grid lower bound; direct
-    /// `search(.., rerank_mult)` callers are unaffected.
+    /// fp32. The bench harness uses this as the calibration-grid
+    /// lower bound; direct `search(.., rerank_mult)` callers are
+    /// unaffected.
     ///
     /// Numbers calibrated against FAISS-doc peer benchmarks.
     #[inline]
     pub const fn recommended_rerank_mult_floor(self, dim: usize) -> Option<usize> {
         let high_dim = dim > LOW_DIM_RERANK_FLOOR_THRESHOLD;
         match self {
-            Self::Fp32 | Self::Bf16 => Some(if high_dim {
-                FP32_BF16_HIGH_DIM_RERANK_FLOOR
+            Self::Fp32 => Some(if high_dim {
+                FP32_HIGH_DIM_RERANK_FLOOR
             } else {
-                FP32_BF16_LOW_DIM_RERANK_FLOOR
+                FP32_LOW_DIM_RERANK_FLOOR
             }),
             Self::Sq8 => Some(if high_dim {
                 SQ8_HIGH_DIM_RERANK_FLOOR
@@ -230,7 +226,7 @@ impl RerankCodec {
     /// for this codec at the given dim + n_docs + n_cent + metric.
     /// Stored immediately before the subsection's `full[]` region.
     ///
-    /// - `Fp32` / `Bf16` / `RabitqOnly`: `0` (no codec metadata).
+    /// - `Fp32` / `RabitqOnly`: `0` (no codec metadata).
     /// - `Sq8`: **per-cluster** per-dim `(scale, offset)` arrays
     ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`/`Cosine`-metric
     ///   columns, a per-doc `sum_x_decoded² : f32` table
@@ -264,7 +260,7 @@ impl RerankCodec {
         metric: Metric,
     ) -> usize {
         match self {
-            Self::Fp32 | Self::Bf16 | Self::RabitqOnly => 0,
+            Self::Fp32 | Self::RabitqOnly => 0,
             Self::Sq8 => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
@@ -313,7 +309,6 @@ mod tests {
     fn codec_id_roundtrips_every_variant() {
         for c in [
             RerankCodec::Fp32,
-            RerankCodec::Bf16,
             RerankCodec::Sq8,
             RerankCodec::RabitqOnly,
         ] {
@@ -325,6 +320,14 @@ mod tests {
         }
     }
 
+    /// Codec id `1` is retired (was `Bf16`). Any segment ever
+    /// written with that discriminator must fail to decode
+    /// rather than silently mis-map onto an adjacent codec.
+    #[test]
+    fn retired_bf16_codec_id_is_none() {
+        assert_eq!(RerankCodec::from_codec_id(1), None);
+    }
+
     /// Unknown discriminator bytes (any value not currently
     /// assigned, e.g. `5`, `255`) return `None`. The reader
     /// upgrades that into a `MalformedVersion` error rather than
@@ -332,6 +335,7 @@ mod tests {
     #[test]
     fn unknown_codec_id_is_none() {
         for id in [4u8, 5, 16, 200, 255] {
+            // id=1 is also unmapped but covered by `retired_bf16_codec_id_is_none`.
             assert_eq!(
                 RerankCodec::from_codec_id(id),
                 None,
@@ -346,7 +350,6 @@ mod tests {
     #[test]
     fn per_vector_bytes_matches_spec() {
         assert_eq!(RerankCodec::Fp32.per_vector_bytes(384), 1536);
-        assert_eq!(RerankCodec::Bf16.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::Sq8.per_vector_bytes(384), 384);
         assert_eq!(RerankCodec::RabitqOnly.per_vector_bytes(384), 0);
     }
@@ -359,7 +362,6 @@ mod tests {
     fn writes_full_matches_per_vector_bytes() {
         for c in [
             RerankCodec::Fp32,
-            RerankCodec::Bf16,
             RerankCodec::Sq8,
             RerankCodec::RabitqOnly,
         ] {
@@ -371,11 +373,10 @@ mod tests {
         }
     }
 
-    /// All four codecs are wired end-to-end (build + open + search).
+    /// All three codecs are wired end-to-end (build + open + search).
     #[test]
     fn all_codecs_implemented() {
         assert!(RerankCodec::Fp32.is_implemented());
-        assert!(RerankCodec::Bf16.is_implemented());
         assert!(RerankCodec::Sq8.is_implemented());
         assert!(RerankCodec::RabitqOnly.is_implemented());
     }
@@ -393,10 +394,6 @@ mod tests {
             Some(20)
         );
         assert_eq!(
-            RerankCodec::Bf16.recommended_rerank_mult_floor(384),
-            Some(20)
-        );
-        assert_eq!(
             RerankCodec::Sq8.recommended_rerank_mult_floor(384),
             Some(50)
         );
@@ -407,10 +404,6 @@ mod tests {
         // 384 < dim ≤ 1024 column.
         assert_eq!(
             RerankCodec::Fp32.recommended_rerank_mult_floor(1024),
-            Some(50)
-        );
-        assert_eq!(
-            RerankCodec::Bf16.recommended_rerank_mult_floor(1024),
             Some(50)
         );
         assert_eq!(
@@ -431,15 +424,14 @@ mod tests {
 
     /// Sq8's codec_meta size: `8·n_cent·dim` for negdot,
     /// `8·n_cent·dim + 4·n_docs` for L2Sq/Cosine (per-doc decoded-norm
-    /// cache). Fp32 / Bf16 / RabitqOnly always contribute zero
+    /// cache). Fp32 / RabitqOnly always contribute zero
     /// bytes. Per-cluster scale/offset is the recall-recovery
     /// fix landed in the Sq8PerCluster patch (see fn-doc above).
     #[test]
     fn codec_meta_bytes_matches_layout_spec() {
-        // Fp32 + Bf16 + RabitqOnly never carry codec_meta.
+        // Fp32 + RabitqOnly never carry codec_meta.
         for c in [
             RerankCodec::Fp32,
-            RerankCodec::Bf16,
             RerankCodec::RabitqOnly,
         ] {
             for m in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {

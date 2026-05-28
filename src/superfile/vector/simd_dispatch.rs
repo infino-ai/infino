@@ -4,9 +4,8 @@
 //! codebase want to query the same per-feature gates — `distance::dot`
 //! / `distance::l2_sq` (AVX-512F or AVX2), `quant::estimate_dot_rotated`
 //! (AVX-512 VPOPCNTDQ), `supertable::manifest::bloom::contains`
-//! (AVX-512F + DQ for `vpternlogq` / `kortestz`), the bf16 distance
-//! kernels (AVX-512 BF16 / VDPBF16PS or AVX2 widen-FMA), and the
-//! Sq8 cross-product kernel (AVX-512 VPMOVZXBD or AVX2 VPMOVZXBD).
+//! (AVX-512F + DQ for `vpternlogq` / `kortestz`), and the Sq8
+//! cross-product kernel (AVX-512 VPMOVZXBD or AVX2 VPMOVZXBD).
 //!
 //! Each gate is a `OnceLock<bool>` cached on first call. The cost
 //! per call after the first is one relaxed atomic load (~1 ns)
@@ -27,9 +26,9 @@ use std::sync::OnceLock;
 /// codebase relies on: F (foundation), BW (byte/word), DQ
 /// (doubleword/quadword), VL (vector length).
 ///
-/// Per-instruction extensions (VPOPCNTDQ, BF16) live in their own
-/// gates ([`has_vpopcntdq`], [`has_bf16_dot`]) because a kernel that
-/// uses only those needs them in addition to F — and there's a small
+/// Per-instruction extensions (VPOPCNTDQ) live in their own
+/// gates ([`has_vpopcntdq`]) because a kernel that uses only
+/// those needs them in addition to F — and there's a small
 /// but real population of AVX-512F-only hosts (Knights Landing —
 /// not in our fleet but cheap to be correct about) that lack the
 /// extensions.
@@ -79,30 +78,6 @@ pub fn has_vpopcntdq() -> bool {
         #[cfg(target_arch = "x86_64")]
         {
             std::arch::is_x86_feature_detected!("avx512vpopcntdq")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    })
-}
-
-/// True iff the host supports AVX-512 BF16 (VDPBF16PS — 32 bf16
-/// multiply-adds into 16 f32 accumulators in one instruction).
-/// Required by the AVX-512 rewrite of `distance::dot_bf16_bytes`
-/// / `distance::l2_sq_bf16_bytes`.
-///
-/// Implies [`avx512_enabled`].
-#[inline]
-pub fn has_bf16_dot() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        if !avx512_enabled() {
-            return false;
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            std::arch::is_x86_feature_detected!("avx512bf16")
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -205,12 +180,6 @@ mod tests {
             assert!(
                 avx512_enabled(),
                 "has_vpopcntdq() returned true but avx512_enabled() is false"
-            );
-        }
-        if has_bf16_dot() {
-            assert!(
-                avx512_enabled(),
-                "has_bf16_dot() returned true but avx512_enabled() is false"
             );
         }
     }
