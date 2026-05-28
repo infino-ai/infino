@@ -1,18 +1,20 @@
-//! Runtime AVX-512 dispatch gates for the SIMD kernels.
+//! Runtime SIMD dispatch gates for the vector + bloom kernels.
 //!
 //! Sibling to `distance.rs` because multiple kernels across the
 //! codebase want to query the same per-feature gates — `distance::dot`
-//! / `distance::l2_sq` (AVX-512F), `quant::estimate_dot_rotated`
+//! / `distance::l2_sq` (AVX-512F or AVX2), `quant::estimate_dot_rotated`
 //! (AVX-512 VPOPCNTDQ), `supertable::manifest::bloom::contains`
-//! (AVX-512F + DQ for `vpternlogq` / `kortestz`), and the bf16
-//! distance kernels (AVX-512 BF16 / VDPBF16PS).
+//! (AVX-512F + DQ for `vpternlogq` / `kortestz`), the bf16 distance
+//! kernels (AVX-512 BF16 / VDPBF16PS or AVX2 widen-FMA), and the
+//! Sq8 cross-product kernel (AVX-512 VPMOVZXBD or AVX2 VPMOVZXBD).
 //!
 //! Each gate is a `OnceLock<bool>` cached on first call. The cost
 //! per call after the first is one relaxed atomic load (~1 ns)
 //! and an inlined `&*` deref — negligible next to the kernel work
-//! it gates. Initialization reads `INFINO_DISABLE_AVX512` first
-//! (the env override for A/B perf / regression isolation), then
-//! runs the appropriate `is_x86_feature_detected!` chain.
+//! it gates. Initialization reads `INFINO_DISABLE_AVX512` (or
+//! `INFINO_DISABLE_AVX2`) first (the env overrides for A/B perf /
+//! regression isolation), then runs the appropriate
+//! `is_x86_feature_detected!` chain.
 //!
 //! Flipping the env var after the first call has **no effect** —
 //! gates are sticky once cached. Plan + rationale in plan 014
@@ -109,6 +111,40 @@ pub fn has_bf16_dot() -> bool {
     })
 }
 
+/// True iff this binary should use AVX2 fast-path kernels in the
+/// "wide" tier. Checks `is_x86_feature_detected!("avx2")` at
+/// runtime; near-universally true on production x86_64 hosts (Intel
+/// Haswell+ / AMD Excavator+) but not assumed by the build target.
+///
+/// Sits between [`avx512_enabled`] (the fastest tier — 512-bit) and
+/// the portable scalar-widen fallback. Hosts that have AVX-512
+/// always also have AVX2, but [`avx512_enabled`] gets checked first
+/// at every dispatch site, so the AVX2 gate is only consulted when
+/// AVX-512 is off (either no AVX-512 silicon, or
+/// `INFINO_DISABLE_AVX512=1`).
+///
+/// Set `INFINO_DISABLE_AVX2=1` to force the portable scalar-widen
+/// path on hosts that *do* support AVX2 — for A/B perf comparison
+/// or pinning the universal fallback path under test without
+/// rebuilding. Reads the env var exactly once on the first call.
+#[inline]
+pub fn avx2_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if disable_avx2_env_set() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
 /// Parses `INFINO_DISABLE_AVX512` from the environment. Accepts `1`
 /// or `true` (case-insensitive); everything else (including unset)
 /// is false. Pulled into its own helper so the parsing logic is
@@ -116,6 +152,15 @@ pub fn has_bf16_dot() -> bool {
 #[inline]
 fn disable_env_set() -> bool {
     std::env::var("INFINO_DISABLE_AVX512")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Parses `INFINO_DISABLE_AVX2` from the environment. Same accepted
+/// values as [`disable_env_set`]; see that function for the contract.
+#[inline]
+fn disable_avx2_env_set() -> bool {
+    std::env::var("INFINO_DISABLE_AVX2")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

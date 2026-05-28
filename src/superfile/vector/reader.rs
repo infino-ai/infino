@@ -1097,15 +1097,28 @@ fn rerank_candidates_in_run(
                 .as_ref()
                 .expect("Sq8 column must carry sq8_meta (built in open_with)");
             let dim = col.dim;
-            let mut kernel_cache: HashMap<u32, Sq8Kernel> = HashMap::new();
+            // Cache the per-cluster `Sq8Kernel` indexed by
+            // `cluster_id` so sibling candidates in the same
+            // cluster (most of the shortlist at typical nprobe
+            // values) reuse the kernel rather than rebuilding the
+            // O(dim) per-query precompute. `cluster_id` is bounded
+            // by `col.n_cent` (which is what built the column's
+            // IVF index), so a flat `Vec<Option<Sq8Kernel>>` of
+            // that length indexes in O(1) — no hash, no
+            // hashbrown bucket walk — and at typical
+            // `n_cent = 1024` costs ~16 KiB of `Option<Box<…>>`
+            // slots which is negligible against the per-query
+            // working set.
+            let n_cent = col.n_cent as usize;
+            let mut kernel_cache: Vec<Option<Sq8Kernel>> = (0..n_cent).map(|_| None).collect();
             shortlist
                 .iter()
                 .map(|&(did, _, pos, cluster_id)| {
                     let local = (pos - base_pos) as usize;
                     let start = local * stride;
                     let bytes = &full_run[start..start + stride];
-                    let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
-                        let c = cluster_id as usize;
+                    let c = cluster_id as usize;
+                    let kernel = kernel_cache[c].get_or_insert_with(|| {
                         let scale_c = &meta.scale[c * dim..(c + 1) * dim];
                         let offset_c = &meta.offset[c * dim..(c + 1) * dim];
                         Sq8Kernel::new(
