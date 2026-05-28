@@ -57,6 +57,8 @@ use std::sync::Arc;
 use wide::u64x4;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::superfile::vector::simd_dispatch::avx512_enabled;
+
 /// Block size in bytes — one cache line on x86_64 / aarch64.
 pub const BLOCK_BYTES: usize = 64;
 /// Block size in bits.
@@ -133,21 +135,10 @@ impl Bloom {
         let h = xxh3_64(key);
         let (block_idx, mask) = block_and_mask(h, self.n_blocks_mask);
         let block_offset = block_idx * BLOCK_WORDS;
-        let block = &self.words[block_offset..block_offset + BLOCK_WORDS];
-        // SIMD path: `(mask & ~block) == 0` ⟺ every bit set in
-        // mask is also set in block ⟺ all K positions are present.
-        // wide::u64x4 lowers to AVX2 on x86_64-with-avx2 and NEON
-        // on aarch64; on platforms without SIMD it lowers to plain
-        // u64 ops, equivalent to the scalar path.
-        let block_lo = u64x4::new([block[0], block[1], block[2], block[3]]);
-        let block_hi = u64x4::new([block[4], block[5], block[6], block[7]]);
-        let mask_lo = u64x4::new([mask[0], mask[1], mask[2], mask[3]]);
-        let mask_hi = u64x4::new([mask[4], mask[5], mask[6], mask[7]]);
-        let r_lo = !block_lo & mask_lo;
-        let r_hi = !block_hi & mask_hi;
-        let combined = r_lo | r_hi;
-        let parts = combined.to_array();
-        (parts[0] | parts[1] | parts[2] | parts[3]) == 0
+        let block: &[u64; BLOCK_WORDS] = (&self.words[block_offset..block_offset + BLOCK_WORDS])
+            .try_into()
+            .expect("BLOCK_WORDS-sized slice");
+        contains_block(block, &mask)
     }
 
     /// Number of blocks. Always a power of two.
@@ -228,6 +219,78 @@ impl BloomBuilder {
 impl Default for BloomBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Block-level "all K positions present" check. `true` iff every bit
+/// set in `mask` is also set in `block` (equivalently, `mask & !block == 0`
+/// over the 512-bit lane).
+///
+/// Dispatches to a single `vpandnq` + `vptestmq` AVX-512 kernel when
+/// the runtime gate passes (Sapphire Rapids+ / Zen 4+); otherwise the
+/// `wide::u64x4` AVX2 / NEON kernel.
+#[inline]
+fn contains_block(block: &[u64; BLOCK_WORDS], mask: &[u64; BLOCK_WORDS]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if avx512_enabled() {
+        // SAFETY: gated on avx512_enabled() which requires `avx512f`.
+        // `_mm512_andnot_si512` and `_mm512_test_epi64_mask` are both
+        // AVX-512F intrinsics.
+        return unsafe { contains_block_avx512(block, mask) };
+    }
+    contains_block_wide(block, mask)
+}
+
+/// Portable `wide::u64x4` (256-bit) AND-NOT-OR-reduce kernel. The
+/// universal fallback: lowers to two 256-bit `vpandn` / `vpor` pairs
+/// on AVX2 x86_64, four 128-bit NEON ops on aarch64, scalar everywhere
+/// else.
+#[inline]
+fn contains_block_wide(block: &[u64; BLOCK_WORDS], mask: &[u64; BLOCK_WORDS]) -> bool {
+    let block_lo = u64x4::new([block[0], block[1], block[2], block[3]]);
+    let block_hi = u64x4::new([block[4], block[5], block[6], block[7]]);
+    let mask_lo = u64x4::new([mask[0], mask[1], mask[2], mask[3]]);
+    let mask_hi = u64x4::new([mask[4], mask[5], mask[6], mask[7]]);
+    let r_lo = !block_lo & mask_lo;
+    let r_hi = !block_hi & mask_hi;
+    let combined = r_lo | r_hi;
+    let parts = combined.to_array();
+    (parts[0] | parts[1] | parts[2] | parts[3]) == 0
+}
+
+/// AVX-512 block-bloom contains. Computes `mask & ~block` over the
+/// whole 64-byte cache line in one 512-bit `vpandnq`, then folds
+/// "is any qword non-zero?" into one `vptestmq` + a mask-register
+/// zero check.
+///
+/// Three instructions in the inner work (`vmovdqu64` × 2 + `vpandnq`)
+/// plus a `vptestmq` + zero-mask check, vs roughly 8 ALU ops in the
+/// AVX2 `wide::u64x4` path. The win is larger than the headline ~2.5×
+/// when the cache line is already hot.
+///
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`. The
+/// `avx512_enabled()` gate guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn contains_block_avx512(block: &[u64; BLOCK_WORDS], mask: &[u64; BLOCK_WORDS]) -> bool {
+    use std::arch::x86_64::*;
+    // SAFETY: both inputs are arrays of exactly 8 × u64 = 64 bytes,
+    // which is the load width of `_mm512_loadu_si512`. The loads
+    // are unaligned, so no alignment guarantee is needed on the
+    // pointers.
+    unsafe {
+        let b = _mm512_loadu_si512(block.as_ptr() as *const __m512i);
+        let m = _mm512_loadu_si512(mask.as_ptr() as *const __m512i);
+        // r[i] = !block[i] & mask[i] (per qword) — Intel's
+        // `_mm512_andnot_si512(a, b)` computes `(NOT a) AND b`, so
+        // passing block as `a` and mask as `b` gives exactly the
+        // bloom-contains residual.
+        let r = _mm512_andnot_si512(b, m);
+        // `_mm512_test_epi64_mask(r, r)`: bit i = (r[i] & r[i]) != 0.
+        // We want "all zero" ⇔ resulting __mmask8 == 0.
+        _mm512_test_epi64_mask(r, r) == 0
     }
 }
 
@@ -503,5 +566,153 @@ mod tests {
         let b = build_with(&[b"x"]);
         let s = format!("{:?}", b);
         assert!(s.contains("Bloom"));
+    }
+
+    // ---- AVX-512 parity (plan 014 Phase 1) -------------------------
+
+    /// AVX-512 `contains_block` agrees with the `wide` baseline on
+    /// random and edge-case (block, mask) inputs. Both kernels do
+    /// exactly the same boolean reduction (`(mask & ~block) == 0`),
+    /// so this is a bit-exact equality check — no tolerance band.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn contains_block_avx512_matches_wide() {
+        if !avx512_enabled() {
+            eprintln!("contains_block_avx512_matches_wide: skipped, no AVX-512");
+            return;
+        }
+        // Edge cases first: all-zero, all-ones, mask ⊂ block,
+        // mask ⊄ block, single-bit, full-line.
+        let zeros = [0u64; BLOCK_WORDS];
+        let ones = [u64::MAX; BLOCK_WORDS];
+        let half = [0xAAAA_AAAA_AAAA_AAAA_u64; BLOCK_WORDS];
+
+        // Always-true: mask ⊂ block
+        let cases: &[(&[u64; BLOCK_WORDS], &[u64; BLOCK_WORDS], bool)] = &[
+            (&zeros, &zeros, true),
+            (&ones, &zeros, true),
+            (&ones, &ones, true),
+            (&zeros, &ones, false),
+            (&half, &half, true),
+            (&ones, &half, true),
+            (&half, &ones, false),
+        ];
+        for (block, mask, expected) in cases {
+            let want = contains_block_wide(block, mask);
+            // SAFETY: gated on avx512_enabled() above.
+            let got = unsafe { contains_block_avx512(block, mask) };
+            assert_eq!(
+                got, want,
+                "block {:016x?} mask {:016x?}: avx512 {got} vs wide {want}",
+                block, mask
+            );
+            assert_eq!(got, *expected);
+        }
+
+        // Pseudo-random sweep across 100 (block, mask) pairs.
+        // Deterministic so a regression reproduces locally.
+        for seed in 0u64..100 {
+            let mut block = [0u64; BLOCK_WORDS];
+            let mut mask = [0u64; BLOCK_WORDS];
+            for i in 0..BLOCK_WORDS {
+                block[i] = seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                // Mask is mostly a strict subset of block (the
+                // common "key present" case), with the occasional
+                // extra bit to exercise the "miss" path too.
+                mask[i] = block[i].wrapping_mul(0xDEAD_BEEF_CAFE_BABE) & block[i];
+                if seed % 3 == 0 {
+                    mask[i] |= 1u64 << (seed as u32 % 64);
+                }
+            }
+            let want = contains_block_wide(&block, &mask);
+            // SAFETY: gated on avx512_enabled() above.
+            let got = unsafe { contains_block_avx512(&block, &mask) };
+            assert_eq!(got, want, "seed {seed}: avx512 {got} vs wide {want}");
+        }
+    }
+
+    /// AVX-512 vs wide block-bloom contains microbench. Per-call
+    /// time at the inner reduction; doesn't include the
+    /// `block_and_mask` hash work (which is identical across both
+    /// paths). Run with:
+    ///
+    /// ```text
+    /// cargo test --release --lib supertable::manifest::bloom::tests::\
+    ///   avx512_microbench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn avx512_microbench_contains_block() {
+        if !avx512_enabled() {
+            eprintln!("avx512_microbench: skipped, no AVX-512 on this host");
+            return;
+        }
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Build a realistic bloom + a batch of (block, mask) pairs by
+        // hashing 1024 keys against it. Each iteration exercises one
+        // block-level check, matching the inner loop of `contains`.
+        let mut b = BloomBuilder::new();
+        for i in 0..10_000usize {
+            b.insert(format!("term{i}").as_bytes());
+        }
+        let bloom = b.finish();
+        let pairs: Vec<([u64; BLOCK_WORDS], [u64; BLOCK_WORDS])> = (0..1024usize)
+            .map(|i| {
+                let key = format!("probe{i}").into_bytes();
+                let h = xxh3_64(&key);
+                let (block_idx, mask) = block_and_mask(h, bloom.n_blocks_mask);
+                let off = block_idx * BLOCK_WORDS;
+                let block: [u64; BLOCK_WORDS] = bloom.words[off..off + BLOCK_WORDS]
+                    .try_into()
+                    .expect("block-sized slice");
+                (block, mask)
+            })
+            .collect();
+        let iters: u32 = 200_000;
+
+        // Wide
+        for p in &pairs {
+            black_box(contains_block_wide(&p.0, &p.1));
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            for p in &pairs {
+                black_box(contains_block_wide(&p.0, &p.1));
+            }
+        }
+        let wide_total = t.elapsed();
+        let wide_ns = wide_total.as_secs_f64() * 1e9 / (iters as f64 * pairs.len() as f64);
+
+        // AVX-512
+        // SAFETY: gated on avx512_enabled() above.
+        for p in &pairs {
+            black_box(unsafe { contains_block_avx512(&p.0, &p.1) });
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            for p in &pairs {
+                black_box(unsafe { contains_block_avx512(&p.0, &p.1) });
+            }
+        }
+        let avx_total = t.elapsed();
+        let avx_ns = avx_total.as_secs_f64() * 1e9 / (iters as f64 * pairs.len() as f64);
+
+        eprintln!();
+        eprintln!(
+            "### bloom contains_block — AVX-512 vpandnq + vptestmq vs wide u64x4 (ns per call)\n"
+        );
+        eprintln!("| kernel | block size | wide ns | avx512 ns | speedup |");
+        eprintln!("|--------|-----------:|--------:|----------:|--------:|");
+        eprintln!(
+            "| `bloom::Bloom::contains` (inner) | 512 bits / 64 B | {:>7.2} | {:>7.2} | {:>5.2}× |",
+            wide_ns,
+            avx_ns,
+            wide_ns / avx_ns,
+        );
     }
 }

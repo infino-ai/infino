@@ -993,9 +993,18 @@ fn score_cluster_codes(
     shortlist: &mut Vec<(u32, f32, u32, u32)>,
 ) {
     let cb = quant.code_bytes();
+    // Per-query precompute for the AVX-512 RaBitQ estimator: the
+    // estimate is `2 * Σ_{bit=1} q_rot[d] − q_total`; the second
+    // term is constant across every candidate scored against
+    // this query, so we hoist it out of the per-doc loop. Cost
+    // ≪ 1 % across the typical IVF probe (thousands of candidates).
+    // Non-AVX-512 hosts ignore the precomputed value and fall
+    // back to the original sign-table kernel, so the numeric
+    // result is identical regardless.
+    let q_total: f32 = q_rot.iter().sum();
     for i in 0..cnt as usize {
         let code = &cluster_codes[i * cb..(i + 1) * cb];
-        let est = quant.estimate_dot_rotated(q_rot, code);
+        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         let did = u32::from_le_bytes([
             cluster_doc_ids[i * 4],
             cluster_doc_ids[i * 4 + 1],
