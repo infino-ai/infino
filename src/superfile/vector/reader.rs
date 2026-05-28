@@ -10,7 +10,13 @@
 
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
-use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
+// Re-export the shared `Source` enum so existing
+// `crate::superfile::vector::reader::Source` import sites
+// (tests, supertable query paths) keep working after 013-A0
+// promoted the enum to `superfile::lazy_source`. New code
+// should prefer the canonical path
+// `crate::superfile::Source`.
+pub use crate::superfile::lazy_source::Source;
 use crate::superfile::vector::distance::{Metric, Sq8Kernel, distance_bytes, distance_bytes_codec};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
@@ -22,7 +28,6 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
@@ -128,152 +133,6 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self { verify_crc: true }
-    }
-}
-
-/// Backing for a [`VectorReader`].
-///
-/// Two variants, plumbed through every byte-fetch point:
-///
-/// - `InMemory(Bytes)`: caller materialised the full
-///   subsection before opening. Every byte fetch is a
-///   zero-copy `Bytes::slice` against the buffer.
-/// - `Lazy(Arc<dyn LazyByteSource>)`: a range-fetching source
-///   (mmap, object-store range GET, broadcast subscription).
-///   Every byte access in the open + search paths routes
-///   through the same call sites so swapping the backing in
-///   doesn't require a second rewrite.
-///
-/// Both variants expose **sync-only** byte access — every
-/// public surface in `src/` is sync. The
-/// `LazyByteSource::range` trait method is async because
-/// production impls (object store, network sources) are;
-/// [`Source::get_range`] hides that under the same
-/// `block_in_place + Handle::block_on` / one-shot
-/// `current_thread` `Runtime` bridge the supertable's
-/// per-segment reader uses for the disk-cache fetch path.
-/// Hot-path callers (`Source::InMemory`, mmap-backed
-/// `BytesLazyByteSource`) never hit the bridge — both override
-/// `try_get_range_sync` to return zero-copy slices, so
-/// `get_range` resolves on the sync fast path.
-///
-/// `Source: Clone` so `Arc`-shared instances can be handed to
-/// multiple readers / supertable segments without forking the
-/// underlying state. Lazy variant clones the `Arc`; in-memory
-/// clones the `Bytes` (refcount bump).
-#[derive(Clone)]
-pub enum Source {
-    InMemory(Bytes),
-    Lazy(Arc<dyn LazyByteSource>),
-}
-
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
-            Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
-        }
-    }
-}
-
-impl Source {
-    /// Total backing size in bytes — matches what a single
-    /// `get_range(0..len())` would cover.
-    pub fn len(&self) -> usize {
-        match self {
-            Self::InMemory(b) => b.len(),
-            Self::Lazy(s) => s.size() as usize,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Sync best-effort fetch. Always succeeds on
-    /// `Source::InMemory` (zero-copy `Bytes::slice`); on
-    /// `Source::Lazy` returns `Some` only if the range is
-    /// already resident in the source's in-process cache.
-    ///
-    /// Returns `None` for out-of-bounds ranges so callers can
-    /// distinguish "not available sync" from a hard error;
-    /// callers that need a typed error should fall through to
-    /// [`Self::get_range`].
-    pub fn try_get_range_sync(&self, range: Range<usize>) -> Option<Bytes> {
-        let start = range.start as u64;
-        let len = range.len() as u64;
-        match self {
-            Self::InMemory(b) => {
-                if range.end > b.len() {
-                    return None;
-                }
-                Some(b.slice(range))
-            }
-            Self::Lazy(s) => s.try_get_range_sync(start, len),
-        }
-    }
-
-    /// Sync range fetch with internal async bridging on cold
-    /// `Source::Lazy` misses.
-    ///
-    /// Fast path: `try_get_range_sync` (zero-copy `Bytes::slice`
-    /// on `InMemory`; same on `BytesLazyByteSource` / mmap-
-    /// backed sources). This covers every production caller
-    /// today and every hot-path read at default open
-    /// (`Source::Lazy(BytesLazyByteSource over
-    /// Bytes::from_owner(mmap))`).
-    ///
-    /// Cold path (`Source::Lazy` and `try_get_range_sync`
-    /// returned `None`): bridge to the source's `async fn
-    /// range(...)` via `block_in_place + Handle::block_on`
-    /// when there's an ambient tokio runtime, or build a
-    /// throwaway `current_thread` `Runtime` when there isn't.
-    /// This is the same pattern `supertable::query::
-    /// segment_reader` uses for its sync disk-cache fetch path
-    /// (see `segment_reader::segment_reader` for the canonical
-    /// reference). The runtime-build cost on the no-ambient
-    /// fallback is ≈ 1 ms — negligible vs the network
-    /// round-trip the source is about to issue. In production
-    /// the supertable always has an ambient runtime, so the
-    /// no-ambient branch fires only in standalone tests /
-    /// scripts.
-    ///
-    /// Convention: every public surface in `src/` stays sync,
-    /// async is hidden behind well-defined bridge points.
-    /// `Source::get_range` is one of those bridge points.
-    pub fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
-        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
-            return Ok(bytes);
-        }
-        let Self::Lazy(s) = self else {
-            // `Source::InMemory` always satisfies `try_get_range_sync`
-            // for in-bounds ranges. Reaching this arm means the
-            // request was out of bounds.
-            return Err(LazyByteSourceError::OutOfBounds {
-                start: range.start as u64,
-                len: range.len() as u64,
-                size: self.len() as u64,
-            });
-        };
-        let start = range.start as u64;
-        let len = range.len() as u64;
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(s.range(start, len))),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
-                            uri: "lazy-source://vector-reader".to_string(),
-                            source: Box::new(std::io::Error::other(format!(
-                                "tokio runtime build for lazy source fetch: {e}"
-                            ))),
-                        })
-                    })?;
-                rt.block_on(s.range(start, len))
-            }
-        }
     }
 }
 
@@ -1260,7 +1119,9 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
     use crate::superfile::vector::builder::{VectorBuilder, VectorConfig};
+    use std::sync::Arc;
 
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
         let mut b = VectorBuilder::new();
@@ -2460,7 +2321,7 @@ mod tests {
     // disabled) — exposes any silent fallthrough that would
     // bypass the block_on bridge.
 
-    use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
+    use crate::superfile::lazy_source::BytesLazyByteSource;
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
