@@ -17,6 +17,7 @@ use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::reservoir::{Reservoir, default_kmeans_sample_size};
 use crate::superfile::vector::rotation::RandomRotation;
+use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
 };
@@ -716,6 +717,22 @@ fn build_subsection_streaming(
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
+    // Per-cluster (min, max) accumulators for the Sq8 quantizer.
+    // Pass 2 folds each row's per-dim extrema into the destination
+    // cluster's slice as it routes the row to a bucket — the result
+    // is the per-cluster (scale, offset) that pass 3 used to derive
+    // by re-scanning the cluster's fp32 rows. Allocated only for
+    // Sq8 columns (~`2 * n_cent * dim * 4` bytes; e.g. 3 MiB at
+    // `n_cent = 1024, dim = 384`).
+    let codec = cfg.rerank_codec;
+    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if codec == RerankCodec::Sq8 {
+        (
+            vec![f32::INFINITY; n_cent * dim],
+            vec![f32::NEG_INFINITY; n_cent * dim],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if n_docs > 0 {
         let mut source: Box<dyn ChunkedVectorSource> = if let Some(spill) = spill {
             // Crossed the threshold during add(): close the
@@ -740,6 +757,11 @@ fn build_subsection_streaming(
             ))
         };
 
+        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if codec == RerankCodec::Sq8 {
+            Some((&mut sq8_min_arr, &mut sq8_max_arr))
+        } else {
+            None
+        };
         run_pass2(
             source.as_mut(),
             dim,
@@ -752,9 +774,31 @@ fn build_subsection_streaming(
             &mut bucket_writers,
             &mut bucket_counts,
             &mut summary_radius_sq_max,
-            cfg.rerank_codec,
+            codec,
+            sq8_acc,
         )?;
     }
+
+    // Pre-derive every cluster's `(scale, offset)` from the
+    // (min, max) accumulators populated by pass 2. Pass 3 then
+    // becomes a single streaming encode per row instead of the old
+    // "buffer the whole cluster, scan for min/max, encode" sequence
+    // that needed `sq8_scratch` of `max_cluster_rows * dim * f32`.
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if codec == RerankCodec::Sq8 {
+        (0..n_cent)
+            .map(|c| {
+                let off = c * dim;
+                derive_sq8_quantizer_from_min_max(
+                    &sq8_min_arr[off..off + dim],
+                    &sq8_max_arr[off..off + dim],
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    drop(sq8_min_arr);
+    drop(sq8_max_arr);
 
     // Flush + close every bucket writer before pass 3 reads the
     // files. The Drop of `bucket_writers` would do this, but
@@ -780,7 +824,6 @@ fn build_subsection_streaming(
     // directly into their final on-disk slots — eliminates the
     // O(n_docs · dim · 4) `full_layout` round-trip the old pipeline
     // did between bucket-read and codec-encode.
-    let codec = cfg.rerank_codec;
     let summary_size = dim * 4;
     let centroids_size = n_cent * dim * 4;
     let cluster_idx_size = n_cent * 8;
@@ -871,25 +914,6 @@ fn build_subsection_streaming(
         debug_assert_eq!(acc_off as usize, n_docs);
     }
 
-    // ---- Per-cluster streaming pass ----
-    //
-    // Replaces the old two-step "stage every row in
-    // full_layout/codes_layout/doc_ids_layout, then assemble into
-    // bytes" pipeline. For each cluster `c` we read its bucket file
-    // exactly once and write each row's fields directly into the
-    // correct on-disk slots:
-    //
-    //   doc_id    → bytes[doc_ids_off + pos * 4 ..]
-    //   rabitq    → bytes[codes_off   + pos * code_bytes ..]
-    //   full[]    → codec-dependent slot in bytes (see match below)
-    //
-    // The only resident scratch is the cluster's `full_block`
-    // (`cluster_count * dim * 4` bytes when the codec writes a
-    // full[] payload), reused across clusters. Sq8 needs the whole
-    // cluster's fp32 rows in hand before it can derive `(scale,
-    // offset)`, which is exactly what `full_block` already contains
-    // after the bulk read.
-    //
     // Sq8 codec_meta region layout (when present):
     //   [scale_block | offset_block | per_doc_norms?]
     //   scale_block  = n_cent * dim * 4 bytes
@@ -904,12 +928,55 @@ fn build_subsection_streaming(
             None
         };
 
+    // Write every cluster's (scale, offset) into the codec_meta
+    // blocks up front — these were derived from pass 2's per-cluster
+    // (min, max) accumulators and are independent of pass 3's row
+    // ordering. Bulk copy keeps the slow per-byte assembly out of
+    // the per-cluster loop below.
+    //
+    // At the same time pre-derive each cluster's `(inv_scale, c2)`
+    // Sq8 encode constants — pass 3's per-row encode collapses to
+    // a single FMA + clamp + cast against these arrays (see
+    // `sq8_encode_row`).
+    let sq8_encode_consts: Vec<Sq8EncodeConsts> = if codec == RerankCodec::Sq8 {
+        sq8_quantizers
+            .iter()
+            .map(|(scale_c, offset_c)| Sq8EncodeConsts::from_scale_offset(scale_c, offset_c))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if codec == RerankCodec::Sq8 {
+        for (c, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate() {
+            let sc_off = sq8_scale_block_off + c * dim * 4;
+            bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
+            let oc_off = sq8_offset_block_off + c * dim * 4;
+            bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
+        }
+    }
+
+    // ---- Per-cluster streaming pass ----
+    //
+    // Replaces the old two-step "stage every row in
+    // full_layout/codes_layout/doc_ids_layout, then assemble into
+    // bytes" pipeline. For each cluster `c` we read its bucket file
+    // exactly once and write each row's fields directly into the
+    // correct on-disk slots:
+    //
+    //   doc_id    → bytes[doc_ids_off + pos * 4 ..]
+    //   rabitq    → bytes[codes_off   + pos * code_bytes ..]
+    //   full[]    → codec-dependent slot in bytes (see match below)
+    //
     // Per-cluster bucket payload is row-major
     //   [doc_id u32 | code(code_bytes) | full_row?]
     // and pass 2 wrote each row in one shot. In final assembly we
     // mirror that on the read side: read all doc_ids, all codes, and
     // (when present) all full-row payload as three contiguous block
     // reads — one `read_exact` per block instead of three per row.
+    // Sq8 reuses the `full_block` directly (cluster's fp32 rows are
+    // already there post-bulk-read) and encodes against the
+    // pre-derived `(inv_scale, c2)` constants in
+    // `sq8_encode_consts[c]`.
     let full_row_bytes_in_bucket = if codec.writes_full() { dim * 4 } else { 0 };
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
@@ -987,19 +1054,25 @@ fn build_subsection_streaming(
             }
             RerankCodec::Sq8 => {
                 // The cluster's fp32 rows are already in `full_block`
-                // (one bulk read above). Hand the slice to the
-                // per-cluster encode helper below.
+                // (one bulk read above). Encode them in place against
+                // the pre-derived `(inv_scale, c2)` FMA constants via
+                // the SIMD encoder; also fill the per-doc norms slot
+                // when the column needs decoded `Σ x²` at search
+                // time (L2Sq / Cosine).
                 let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
-                encode_sq8_cluster(
+                let (scale_c, offset_c) = &sq8_quantizers[c];
+                let ec = &sq8_encode_consts[c];
+                encode_sq8_cluster_simd(
                     cluster_rows,
                     dim,
                     cluster_count,
                     cluster_off,
-                    c,
                     full_off,
-                    sq8_scale_block_off,
-                    sq8_offset_block_off,
                     sq8_norms_block_off,
+                    &ec.inv_scale,
+                    &ec.c2,
+                    scale_c,
+                    offset_c,
                     &mut bytes,
                 );
             }
@@ -1016,153 +1089,520 @@ fn build_subsection_streaming(
     })
 }
 
-/// Sq8 per-cluster encode for the final-assembly pass.
+/// Sq8 per-cluster SIMD encode for the final-assembly pass.
 ///
 /// Given the cluster's fp32 rows (already loaded into the
-/// caller's `full_block` scratch and reinterpreted as `&[f32]`),
-/// derive `(scale_c, offset_c)`, write them into the codec_meta
-/// scale/offset blocks for cluster `c`, and emit u8 codes into
-/// the on-disk full[] region. When the column carries decoded
-/// per-doc `Σ x²` (L2Sq/Cosine), also fill the per-doc norms
-/// block — the search-side kernel reads it directly to skip
-/// recomputing the decoded norm at rerank time.
+/// caller's `full_block` scratch and reinterpreted as `&[f32]`)
+/// and the pre-derived `(inv_scale, c2)` FMA constants for this
+/// cluster (built once before pass 3 from pass 2's per-cluster
+/// (min, max) accumulators), emit u8 codes into the on-disk
+/// full[] region via `sq8_encode_row` — a single FMA + clamp +
+/// truncating-cast per lane, dispatched through AVX-512 / AVX2 /
+/// `wide::f32x8` tiers.
+///
+/// When the column carries decoded per-doc `Σ x²` (L2Sq /
+/// Cosine), also fill the per-doc norms block. Norms accumulation
+/// stays scalar with an f64 accumulator so the on-disk byte
+/// pattern of the norms block is independent of which SIMD tier
+/// the encoder dispatched into.
+///
+/// Codec_meta (scale, offset) blocks are written separately, once,
+/// before pass 3 starts — they're pure functions of pass 2's
+/// (min, max) and don't need to be re-emitted per cluster here.
 #[allow(clippy::too_many_arguments)]
-fn encode_sq8_cluster(
+fn encode_sq8_cluster_simd(
     cluster_rows: &[f32],
     dim: usize,
     cluster_count: usize,
     cluster_off: usize,
-    c: usize,
     full_off: usize,
-    sq8_scale_block_off: usize,
-    sq8_offset_block_off: usize,
     sq8_norms_block_off: Option<usize>,
+    inv_scale_c: &[f32],
+    c2_c: &[f32],
+    scale_c: &[f32],
+    offset_c: &[f32],
     bytes: &mut [u8],
 ) {
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
-
-    let (scale_c, offset_c) = compute_sq8_quantizer_for_cluster(cluster_rows, dim, cluster_count);
-
-    let sc_off = sq8_scale_block_off + c * dim * 4;
-    bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(&scale_c));
-    let oc_off = sq8_offset_block_off + c * dim * 4;
-    bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(&offset_c));
 
     for i in 0..cluster_count {
         let src = &cluster_rows[i * dim..(i + 1) * dim];
         let pos = cluster_off + i;
         let code_off = full_off + pos * dim;
-        let mut acc = 0.0f64;
-        for d in 0..dim {
-            let q = ((src[d] - offset_c[d]) / scale_c[d]).round();
-            // Clamp on the boundary handles fp rounding artefacts at
-            // the min/max ends; the cast is then in-range by
-            // construction.
-            let qc = q.clamp(0.0, 255.0) as u8;
-            bytes[code_off + d] = qc;
-            if sq8_norms_block_off.is_some() {
+        sq8_encode_row(src, inv_scale_c, c2_c, &mut bytes[code_off..code_off + dim]);
+        if let Some(norms_off) = sq8_norms_block_off {
+            let mut acc = 0.0f64;
+            for d in 0..dim {
+                let qc = bytes[code_off + d];
                 let x = (qc as f32) * scale_c[d] + offset_c[d];
                 acc += (x as f64) * (x as f64);
             }
-        }
-        if let Some(norms_off) = sq8_norms_block_off {
             let n_off = norms_off + pos * 4;
             bytes[n_off..n_off + 4].copy_from_slice(&(acc as f32).to_le_bytes());
         }
     }
 }
 
-/// Scan one cluster's rows for per-dim min/max and derive the
-/// Sq8 quantizer `(scale[dim], offset[dim])` for that cluster.
+/// Sq8 per-cluster (min, max) → (scale, offset) derivation.
 ///
-/// Quantization scheme: `q = clamp(round((x − offset[d]) /
-/// scale[d]), 0, 255)`. With `offset[d] = min_x[d]` and
-/// `scale[d] = (max_x[d] − min_x[d]) / 255`, this maps the
-/// cluster's observed range onto the full u8 grid. When a dim
-/// is constant within the cluster (`max == min`) we set
-/// `scale = 1.0` and `offset = min` — every code in that dim
-/// lands at 0 and the decoder recovers the constant exactly.
+/// `min` and `max` are the per-dim extrema observed across this
+/// cluster's rows; produced by `update_min_max` during pass 2.
+/// Quantization scheme:
+///     `q[d] = clamp(round((x[d] − offset[d]) / scale[d]), 0, 255)`
+/// with `offset[d] = min[d]` and `scale[d] = (max[d] − min[d]) / 255`.
+/// When a dim is constant across the cluster (`max == min`) we set
+/// `scale = 1.0` and `offset = min` — every code lands at 0 and the
+/// decoder recovers the constant exactly.
 ///
-/// Per-cluster (not per-column) quantizers preserve recall on
-/// highly-clustered cosine corpora; see
-/// `RerankCodec::codec_meta_bytes` for the per-column failure mode.
-///
-/// Parallel reduce over `cluster_rows.chunks(dim)` for n_rows
-/// ≥ 64; sequential fallback for smaller clusters where
-/// rayon's fork-join overhead would dominate.
-fn compute_sq8_quantizer_for_cluster(
-    cluster_rows: &[f32],
-    dim: usize,
-    n_rows: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    debug_assert_eq!(cluster_rows.len(), n_rows * dim);
-
-    let (min_vec, max_vec) = if n_rows == 0 {
-        // Empty cluster — emit an identity quantizer. No doc
-        // ever encodes through this slot, but the reader still
-        // reads `dim` floats of each from disk so we must write
-        // something well-defined. scale=1, offset=0 makes the
-        // decoder a no-op on the all-zero codes (which the
-        // builder also never emits) and keeps the codec_meta
-        // arrays free of NaN sentinels that would break the
-        // float bit-pattern equality used in some tests.
-        (vec![0.0f32; dim], vec![0.0f32; dim])
-    } else if n_rows < 64 {
-        let mut min_vec = cluster_rows[..dim].to_vec();
-        let mut max_vec = cluster_rows[..dim].to_vec();
-        for row in 1..n_rows {
-            for d in 0..dim {
-                let x = cluster_rows[row * dim + d];
-                if x < min_vec[d] {
-                    min_vec[d] = x;
-                }
-                if x > max_vec[d] {
-                    max_vec[d] = x;
-                }
-            }
-        }
-        (min_vec, max_vec)
-    } else {
-        cluster_rows
-            .par_chunks(dim)
-            .fold(
-                || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
-                |(mut mn, mut mx), row| {
-                    for (d, &x) in row.iter().enumerate() {
-                        if x < mn[d] {
-                            mn[d] = x;
-                        }
-                        if x > mx[d] {
-                            mx[d] = x;
-                        }
-                    }
-                    (mn, mx)
-                },
-            )
-            .reduce(
-                || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
-                |(mut a_min, mut a_max), (b_min, b_max)| {
-                    for d in 0..dim {
-                        if b_min[d] < a_min[d] {
-                            a_min[d] = b_min[d];
-                        }
-                        if b_max[d] > a_max[d] {
-                            a_max[d] = b_max[d];
-                        }
-                    }
-                    (a_min, a_max)
-                },
-            )
-    };
-
+/// Empty clusters (no rows assigned) carry `min = +inf, max = -inf`
+/// from the initial fill; the caller passes those through here and
+/// gets `scale = 1.0, offset = +inf` which is well-defined (no
+/// row ever encodes through the slot) and avoids NaN bit patterns
+/// that would break codec_meta byte-pattern equality.
+#[inline]
+fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(min.len(), max.len());
+    let dim = min.len();
     let mut scale = vec![0.0f32; dim];
     let mut offset = vec![0.0f32; dim];
     for d in 0..dim {
-        offset[d] = min_vec[d];
-        let span = max_vec[d] - min_vec[d];
-        scale[d] = if span > 0.0 { span / 255.0 } else { 1.0 };
+        // Initial-fill sentinels stay well-defined: an empty
+        // cluster has `min[d] = +inf, max[d] = -inf` → `span < 0`
+        // → we collapse to the identity-quantizer branch below
+        // (`scale = 1.0`, `offset` carries the sentinel which is
+        // never decoded because no doc was assigned).
+        let span = max[d] - min[d];
+        if span > 0.0 && span.is_finite() {
+            offset[d] = min[d];
+            scale[d] = span / 255.0;
+        } else {
+            offset[d] = if min[d].is_finite() { min[d] } else { 0.0 };
+            scale[d] = 1.0;
+        }
     }
     (scale, offset)
+}
+
+/// Per-row, per-cluster `(min, max)` update for the Sq8 quantizer.
+/// Called from pass 2 for every fp32 row routed to its bucket: takes
+/// the row and the destination cluster's `min[dim]` / `max[dim]`
+/// slices and updates them in-place with the per-dim element-wise
+/// `min`/`max`.
+///
+/// Folds what used to be pass 3's per-cluster min/max scan into the
+/// pass that already touches every row anyway, eliminating one
+/// full re-read of the cluster's fp32 bytes after pass 2 spills them.
+/// Three-tier dispatch: AVX-512 (16-lane `vminps` + `vmaxps`) →
+/// AVX2 (8-lane `vminps` + `vmaxps`) → portable `wide::f32x8`.
+#[inline]
+fn update_min_max(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
+    debug_assert_eq!(row.len(), min_slice.len());
+    debug_assert_eq!(row.len(), max_slice.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on avx512_enabled() which requires `avx512f`.
+            unsafe { update_min_max_avx512(row, min_slice, max_slice) };
+            return;
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on avx2_enabled() which requires `avx2`.
+            unsafe { update_min_max_avx2(row, min_slice, max_slice) };
+            return;
+        }
+    }
+    update_min_max_wide(row, min_slice, max_slice);
+}
+
+/// Portable `wide::f32x8` (256-bit) per-dim min/max update. Universal
+/// fallback for aarch64 / SSE-only x86_64 / `INFINO_DISABLE_AVX2=1`.
+#[inline]
+fn update_min_max_wide(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
+    use wide::f32x8;
+    let dim = row.len();
+    let full = dim - dim % 8;
+    let mut i = 0;
+    while i < full {
+        let r: [f32; 8] = row[i..i + 8].try_into().expect("len 8");
+        let mn: [f32; 8] = min_slice[i..i + 8].try_into().expect("len 8");
+        let mx: [f32; 8] = max_slice[i..i + 8].try_into().expect("len 8");
+        let r_v = f32x8::from(r);
+        let new_min = r_v.fast_min(f32x8::from(mn)).to_array();
+        let new_max = r_v.fast_max(f32x8::from(mx)).to_array();
+        min_slice[i..i + 8].copy_from_slice(&new_min);
+        max_slice[i..i + 8].copy_from_slice(&new_max);
+        i += 8;
+    }
+    while i < dim {
+        let x = row[i];
+        if x < min_slice[i] {
+            min_slice[i] = x;
+        }
+        if x > max_slice[i] {
+            max_slice[i] = x;
+        }
+        i += 1;
+    }
+}
+
+/// AVX2 per-dim min/max update. 8 lanes per iteration with
+/// `_mm256_min_ps` + `_mm256_max_ps` (single-instruction parallel
+/// reduce). Lifts every AVX2 host that lacks AVX-512.
+///
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn update_min_max_avx2(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let dim = row.len();
+    let full = dim - dim % 8;
+    let mut i = 0;
+    // SAFETY: each iteration reads 24 bytes (one f32 lane of row,
+    // min, max each at offset `i`) and writes 16 bytes (min, max
+    // at the same offset). `i + 8 <= dim` keeps every load/store
+    // in bounds; loads/stores are all unaligned.
+    unsafe {
+        while i < full {
+            let r = _mm256_loadu_ps(row.as_ptr().add(i));
+            let mn = _mm256_loadu_ps(min_slice.as_ptr().add(i));
+            let mx = _mm256_loadu_ps(max_slice.as_ptr().add(i));
+            let new_mn = _mm256_min_ps(r, mn);
+            let new_mx = _mm256_max_ps(r, mx);
+            _mm256_storeu_ps(min_slice.as_mut_ptr().add(i), new_mn);
+            _mm256_storeu_ps(max_slice.as_mut_ptr().add(i), new_mx);
+            i += 8;
+        }
+    }
+    while i < dim {
+        let x = row[i];
+        if x < min_slice[i] {
+            min_slice[i] = x;
+        }
+        if x > max_slice[i] {
+            max_slice[i] = x;
+        }
+        i += 1;
+    }
+}
+
+/// AVX-512 per-dim min/max update. 16 lanes per iteration with
+/// `_mm512_min_ps` + `_mm512_max_ps`. Strictly faster than the AVX2
+/// path on Sapphire Rapids / Granite Rapids / Zen 4+ because every
+/// reduction step processes twice the lanes per cycle.
+///
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn update_min_max_avx512(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let dim = row.len();
+    let full16 = dim - dim % 16;
+    let mut i = 0;
+    // SAFETY: per-iteration windows of 16 f32s in each of row /
+    // min / max; bounded by `i + 16 <= dim`. Unaligned loads /
+    // stores.
+    unsafe {
+        while i < full16 {
+            let r = _mm512_loadu_ps(row.as_ptr().add(i));
+            let mn = _mm512_loadu_ps(min_slice.as_ptr().add(i));
+            let mx = _mm512_loadu_ps(max_slice.as_ptr().add(i));
+            let new_mn = _mm512_min_ps(r, mn);
+            let new_mx = _mm512_max_ps(r, mx);
+            _mm512_storeu_ps(min_slice.as_mut_ptr().add(i), new_mn);
+            _mm512_storeu_ps(max_slice.as_mut_ptr().add(i), new_mx);
+            i += 16;
+        }
+        // 8-lane half-tail for `dim % 16 == 8` (rare but
+        // possible — keeps the kernel correct without falling to
+        // scalar on the same iteration count).
+        if i + 8 <= dim {
+            let r = _mm256_loadu_ps(row.as_ptr().add(i));
+            let mn = _mm256_loadu_ps(min_slice.as_ptr().add(i));
+            let mx = _mm256_loadu_ps(max_slice.as_ptr().add(i));
+            let new_mn = _mm256_min_ps(r, mn);
+            let new_mx = _mm256_max_ps(r, mx);
+            _mm256_storeu_ps(min_slice.as_mut_ptr().add(i), new_mn);
+            _mm256_storeu_ps(max_slice.as_mut_ptr().add(i), new_mx);
+            i += 8;
+        }
+    }
+    while i < dim {
+        let x = row[i];
+        if x < min_slice[i] {
+            min_slice[i] = x;
+        }
+        if x > max_slice[i] {
+            max_slice[i] = x;
+        }
+        i += 1;
+    }
+}
+
+/// Per-cluster Sq8 encode constants. Each cluster contributes one
+/// `(inv_scale[dim], c2[dim])` pair where
+///     `c2[d] = (-offset[d]) * inv_scale[d] + 0.5`
+/// so the per-row encode collapses to a single FMA:
+///     `q = x * inv_scale + c2 = (x - offset) * inv_scale + 0.5`
+/// followed by `clamp(0, 255)` and a truncating cast to `u8`. The
+/// `+ 0.5` is what turns the truncating cast into round-half-up,
+/// which equals round-half-away on the non-negative domain that
+/// the Sq8 encoder operates in (the float result is in `[0, 255]`
+/// for in-cluster values; clamp catches the fp-noise overshoot at
+/// both ends).
+///
+/// Precomputing per cluster (rather than per row) hoists `1/scale`
+/// and the constant fold out of the dim-axis inner loop, so the
+/// SIMD encoder loops over a single FMA + cast + narrow per lane.
+struct Sq8EncodeConsts {
+    inv_scale: Vec<f32>,
+    c2: Vec<f32>,
+}
+
+impl Sq8EncodeConsts {
+    fn from_scale_offset(scale: &[f32], offset: &[f32]) -> Self {
+        debug_assert_eq!(scale.len(), offset.len());
+        let dim = scale.len();
+        let mut inv_scale = vec![0.0f32; dim];
+        let mut c2 = vec![0.0f32; dim];
+        for d in 0..dim {
+            inv_scale[d] = 1.0 / scale[d];
+            c2[d] = (-offset[d]).mul_add(inv_scale[d], 0.5);
+        }
+        Self { inv_scale, c2 }
+    }
+}
+
+/// SIMD f32 → u8 Sq8 encode. Writes one row's `dim` codes to
+/// `dst[0..dim]` from `row[0..dim]` and the cluster's precomputed
+/// `inv_scale` / `c2` arrays.
+///
+/// All three tiers use the same FMA + clamp + truncating-int-cast
+/// sequence so the byte output is bit-identical across paths:
+///
+///   q = FMA(x, inv_scale, c2)
+///   q_clamped = max(0, min(255, q))
+///   dst[d] = (q_clamped) as u8     // truncating cast
+///
+/// The scalar fallback in the tail loop uses `f32::mul_add` to keep
+/// FMA semantics consistent with the SIMD lanes — `(x * inv) + c2`
+/// without FMA would double-round and produce a ≤1 ulp drift from
+/// the SIMD result, which is enough to flip a quantization boundary
+/// and change the on-disk byte for that lane.
+#[inline]
+fn sq8_encode_row(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &mut [u8]) {
+    debug_assert_eq!(row.len(), inv_scale.len());
+    debug_assert_eq!(row.len(), c2.len());
+    debug_assert_eq!(row.len(), dst.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512f` feature detection.
+            unsafe { sq8_encode_row_avx512(row, inv_scale, c2, dst) };
+            return;
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2` feature detection.
+            unsafe { sq8_encode_row_avx2(row, inv_scale, c2, dst) };
+            return;
+        }
+    }
+    sq8_encode_row_wide(row, inv_scale, c2, dst);
+}
+
+/// Portable Sq8 encode. `wide::f32x8` handles the FMA + clamp in
+/// SIMD; the narrow to u8 falls back to a per-lane scalar cast
+/// because `wide` doesn't expose a saturating u8 narrow. Still
+/// vectorizes the dominant fp work.
+//
+// `q.max(0).min(255)` instead of `q.clamp(0, 255)`: matches the
+// SIMD `_mm{256,512}_max_ps(_mm{256,512}_min_ps(q, 255), 0)` NaN
+// handling exactly so the wide and AVX{2,512} tiers produce
+// bit-identical bytes. clamp() returns NaN for NaN input where
+// the SIMD intrinsics return one of the limits; FMA on finite
+// inputs is always finite so the difference is unreachable in
+// the encode pipeline, but the parity tests assert byte-equality
+// across all tiers and the two-step formulation keeps that
+// pre-condition independent of the input domain.
+#[allow(clippy::manual_clamp)]
+fn sq8_encode_row_wide(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &mut [u8]) {
+    use wide::f32x8;
+    let dim = row.len();
+    let zero = f32x8::splat(0.0);
+    let max255 = f32x8::splat(255.0);
+    let mut i = 0;
+    while i + 8 <= dim {
+        let r: [f32; 8] = row[i..i + 8].try_into().expect("len 8");
+        let inv: [f32; 8] = inv_scale[i..i + 8].try_into().expect("len 8");
+        let c: [f32; 8] = c2[i..i + 8].try_into().expect("len 8");
+        let q = f32x8::from(r).mul_add(f32x8::from(inv), f32x8::from(c));
+        let q_clamped = q.fast_max(zero).fast_min(max255).to_array();
+        for k in 0..8 {
+            dst[i + k] = q_clamped[k] as u8;
+        }
+        i += 8;
+    }
+    while i < dim {
+        let q = row[i].mul_add(inv_scale[i], c2[i]);
+        let q_clamped = q.max(0.0).min(255.0);
+        dst[i] = q_clamped as u8;
+        i += 1;
+    }
+}
+
+/// AVX2 Sq8 encode. 8 lanes per iteration: `VFMADD213PS` →
+/// `VMINPS`/`VMAXPS` clamp → `VCVTTPS2DQ` truncate-to-i32 →
+/// `VPACKUSDW` (i32 → u16 saturating) → `VPACKUSWB`
+/// (u16 → u8 saturating) → 8-byte store. The saturating narrow
+/// is a no-op because we already clamped to `[0, 255]` in float
+/// space; it's the cheapest path that produces packed u8.
+///
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::manual_clamp)] // see sq8_encode_row_wide note
+unsafe fn sq8_encode_row_avx2(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let dim = row.len();
+    let zero = _mm256_setzero_ps();
+    let max255 = _mm256_set1_ps(255.0);
+    let mut i = 0;
+    // SAFETY: each iteration reads 8 f32 lanes from `row`,
+    // `inv_scale`, `c2` at offset `i` and writes 8 bytes to
+    // `dst[i..i+8]`. `i + 8 <= dim` bounds every load and store.
+    unsafe {
+        while i + 8 <= dim {
+            let r = _mm256_loadu_ps(row.as_ptr().add(i));
+            let inv = _mm256_loadu_ps(inv_scale.as_ptr().add(i));
+            let c = _mm256_loadu_ps(c2.as_ptr().add(i));
+            // q = x * inv + c  (single rounding)
+            let q = _mm256_fmadd_ps(r, inv, c);
+            // clamp to [0, 255]
+            let q_clamped = _mm256_max_ps(_mm256_min_ps(q, max255), zero);
+            // truncate-to-i32; lanes are in [0, 255] so the i32
+            // values are non-negative and PACKUSDW interprets them
+            // as unsigned correctly.
+            let q_i32 = _mm256_cvttps_epi32(q_clamped);
+            // Narrow 8 × i32 → 8 × u8 via two saturating packs.
+            let lo = _mm256_castsi256_si128(q_i32);
+            let hi = _mm256_extracti128_si256::<1>(q_i32);
+            let packed_u16 = _mm_packus_epi32(lo, hi); // 8 × u16
+            let packed_u8 = _mm_packus_epi16(packed_u16, packed_u16); // low 8 bytes valid
+            // Store the low 64 bits (8 bytes). Unaligned.
+            let dst_ptr = dst.as_mut_ptr().add(i) as *mut i64;
+            std::ptr::write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
+            i += 8;
+        }
+    }
+    while i < dim {
+        let q = row[i].mul_add(inv_scale[i], c2[i]);
+        let q_clamped = q.max(0.0).min(255.0);
+        dst[i] = q_clamped as u8;
+        i += 1;
+    }
+}
+
+/// AVX-512 Sq8 encode. 16 lanes per iteration: `VFMADD213PS` →
+/// `VMINPS`/`VMAXPS` clamp → `VCVTTPS2DQ` truncate-to-i32 →
+/// `VPMOVUSDB` (single-instruction unsigned-saturating narrow
+/// i32 → u8) → 16-byte store. The narrow is one instruction
+/// instead of the two pack steps the AVX2 path needs, which is
+/// where the AVX-512 path picks up its extra factor over AVX2
+/// on top of the 2× lane count.
+///
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::manual_clamp)] // see sq8_encode_row_wide note
+unsafe fn sq8_encode_row_avx512(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let dim = row.len();
+    let zero = _mm512_setzero_ps();
+    let max255 = _mm512_set1_ps(255.0);
+    let mut i = 0;
+    // SAFETY: each iteration reads 16 f32 lanes from `row`,
+    // `inv_scale`, `c2` at offset `i` and writes 16 bytes to
+    // `dst[i..i+16]`. `i + 16 <= dim` bounds every load and store.
+    unsafe {
+        while i + 16 <= dim {
+            let r = _mm512_loadu_ps(row.as_ptr().add(i));
+            let inv = _mm512_loadu_ps(inv_scale.as_ptr().add(i));
+            let c = _mm512_loadu_ps(c2.as_ptr().add(i));
+            let q = _mm512_fmadd_ps(r, inv, c);
+            let q_clamped = _mm512_max_ps(_mm512_min_ps(q, max255), zero);
+            let q_i32 = _mm512_cvttps_epi32(q_clamped);
+            // Single-instruction unsigned-saturating narrow i32 → u8.
+            // Result lanes are guaranteed in [0, 255] so the
+            // saturation is a no-op; we use the unsigned variant
+            // because it interprets the source as u32 (the i32
+            // values are non-negative so the bit pattern matches).
+            let packed_u8 = _mm512_cvtusepi32_epi8(q_i32); // __m128i (16 bytes)
+            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed_u8);
+            i += 16;
+        }
+    }
+    // 8-lane half-tail for `dim % 16 == 8`.
+    #[cfg(target_arch = "x86_64")]
+    if i + 8 <= dim {
+        // SAFETY: target_feature `avx512f` implies `avx2` + `fma`
+        // are available; we just call the AVX2 path on the
+        // remaining 8 lanes (no need to re-emit the same code).
+        unsafe { sq8_encode_row_avx2_unsafe_tail8(row, inv_scale, c2, dst, &mut i) };
+    }
+    while i < dim {
+        let q = row[i].mul_add(inv_scale[i], c2[i]);
+        let q_clamped = q.max(0.0).min(255.0);
+        dst[i] = q_clamped as u8;
+        i += 1;
+    }
+}
+
+/// 8-lane Sq8 encode tail used by the AVX-512 kernel when
+/// `dim % 16 == 8`. Same FMA + clamp + pack sequence as
+/// `sq8_encode_row_avx2` but inlined so the AVX-512 entry point
+/// keeps target_feature("avx512f") and we don't pay a tail call.
+///
+/// # Safety
+///
+/// Callers must ensure `avx2` + `fma` are available, and that
+/// `*i + 8 <= row.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sq8_encode_row_avx2_unsafe_tail8(
+    row: &[f32],
+    inv_scale: &[f32],
+    c2: &[f32],
+    dst: &mut [u8],
+    i: &mut usize,
+) {
+    use std::arch::x86_64::*;
+    let zero = _mm256_setzero_ps();
+    let max255 = _mm256_set1_ps(255.0);
+    // SAFETY: caller-guaranteed `*i + 8 <= row.len()`.
+    unsafe {
+        let r = _mm256_loadu_ps(row.as_ptr().add(*i));
+        let inv = _mm256_loadu_ps(inv_scale.as_ptr().add(*i));
+        let c = _mm256_loadu_ps(c2.as_ptr().add(*i));
+        let q = _mm256_fmadd_ps(r, inv, c);
+        let q_clamped = _mm256_max_ps(_mm256_min_ps(q, max255), zero);
+        let q_i32 = _mm256_cvttps_epi32(q_clamped);
+        let lo = _mm256_castsi256_si128(q_i32);
+        let hi = _mm256_extracti128_si256::<1>(q_i32);
+        let packed_u16 = _mm_packus_epi32(lo, hi);
+        let packed_u8 = _mm_packus_epi16(packed_u16, packed_u16);
+        let dst_ptr = dst.as_mut_ptr().add(*i) as *mut i64;
+        std::ptr::write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
+        *i += 8;
+    }
 }
 
 /// Pass 2 of `build_subsection_streaming`: walk the input
@@ -1189,6 +1629,14 @@ fn run_pass2(
     bucket_counts: &mut [u32],
     summary_radius_sq_max: &mut f32,
     codec: RerankCodec,
+    // Optional per-cluster (min, max) accumulators for the Sq8
+    // quantizer. When `Some`, pass 2 folds each routed row's per-dim
+    // extrema into the destination cluster's `min[dim]` / `max[dim]`
+    // slices via the SIMD `update_min_max` helper — eliminating the
+    // separate per-cluster min/max scan that pass 3 used to do after
+    // re-reading the bucket files. When `None` (any non-Sq8 codec),
+    // pass 2 skips the update entirely.
+    mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
     let chunk_rows_cap = source.chunk_rows();
     // Pre-allocate per-chunk scratch reused across iterations to
@@ -1248,6 +1696,17 @@ fn run_pass2(
         // anyway. `RabitqOnly` columns skip the fp32 vector spill
         // because they have no `full[]` region on disk.
         let write_full = codec.writes_full();
+        // Split `sq8_min_max` once per chunk into Some/None so the
+        // hot loop doesn't pay a per-row `Option` match. Pull the
+        // two `&mut [f32]` out and stash them as raw pointers; the
+        // routing loop owns the only mutable references for the
+        // duration of the chunk, so the borrow checker would let us
+        // do this with split_at_mut + tracked slices but the pointer
+        // form keeps the per-row work to one indexed slice slice
+        // each, which is what we want for the SIMD inner-loop call.
+        // Per-chunk reborrow of the option-of-mutable-pair into the
+        // routing loop. Cheap.
+        let mut sq8_acc = sq8_min_max.as_mut();
         for r in 0..actual_rows {
             let cid = asgn[r] as usize;
             let local_doc_id = global_doc_id + r as u32;
@@ -1256,6 +1715,15 @@ fn run_pass2(
             writer.write_all(&chunk_codes[r * code_bytes..(r + 1) * code_bytes])?;
             if write_full {
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
+            }
+            // Fold this row into the destination cluster's (min, max)
+            // accumulator when the column is Sq8. Per-cluster slice
+            // indexing is `cid * dim`; the SIMD update is up to 16
+            // f32 lanes per iteration.
+            if let Some((mn, mx)) = sq8_acc.as_deref_mut() {
+                let row = &chunk[r * dim..(r + 1) * dim];
+                let off = cid * dim;
+                update_min_max(row, &mut mn[off..off + dim], &mut mx[off..off + dim]);
             }
             bucket_counts[cid] += 1;
         }
@@ -1276,6 +1744,221 @@ mod tests {
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
+        }
+    }
+
+    /// Deterministic synthetic Sq8 encode inputs spanning a
+    /// realistic dynamic range: per-dim mins / maxes drawn from
+    /// distinct centroid offsets so `(x - offset) / scale` exercises
+    /// the full `[0, 255]` quantization range and the boundary
+    /// rounding behaviour where SIMD and scalar paths could
+    /// disagree by 1 ulp.
+    fn synth_sq8_inputs(dim: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as u32) as f32 / (u32::MAX as f32)
+        };
+        let mut scale = vec![0.0f32; dim];
+        let mut offset = vec![0.0f32; dim];
+        let mut row = vec![0.0f32; dim];
+        for d in 0..dim {
+            offset[d] = -2.0 + 4.0 * next();
+            let span = 0.1 + 4.0 * next();
+            scale[d] = span / 255.0;
+            // Mix of in-range, low-tail, and high-tail samples to
+            // exercise clamp + rounding boundaries.
+            let pick = next();
+            row[d] = if pick < 0.05 {
+                offset[d] - 0.5
+            } else if pick > 0.95 {
+                offset[d] + span + 0.5
+            } else {
+                offset[d] + span * next()
+            };
+        }
+        (row, scale, offset)
+    }
+
+    /// Scalar reference Sq8 encode using the exact same FMA + clamp
+    /// + truncating-cast sequence that `sq8_encode_row_*` use. This
+    /// is the byte-pattern oracle the SIMD parity tests assert
+    /// against — the on-disk Sq8 format is what this function
+    /// produces, regardless of which tier the runtime picks.
+    #[allow(clippy::manual_clamp)] // bit-match SIMD NaN handling
+    fn sq8_encode_row_reference(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &mut [u8]) {
+        debug_assert_eq!(row.len(), dst.len());
+        for d in 0..row.len() {
+            let q = row[d].mul_add(inv_scale[d], c2[d]);
+            let q_clamped = q.max(0.0).min(255.0);
+            dst[d] = q_clamped as u8;
+        }
+    }
+
+    /// Update-min/max parity: every tier converges on the same
+    /// per-dim (min, max) across a sweep of dims that hits the
+    /// 16-, 8-, and scalar-tail paths.
+    #[test]
+    fn update_min_max_simd_paths_match_scalar() {
+        let dims = [
+            1, 7, 8, 15, 16, 17, 24, 31, 32, 33, 47, 48, 96, 384, 512, 1023,
+        ];
+        for &dim in &dims {
+            let (row, _scale, _offset) = synth_sq8_inputs(dim, dim as u64 * 13);
+            let mut mn_ref = vec![f32::INFINITY; dim];
+            let mut mx_ref = vec![f32::NEG_INFINITY; dim];
+            for d in 0..dim {
+                if row[d] < mn_ref[d] {
+                    mn_ref[d] = row[d];
+                }
+                if row[d] > mx_ref[d] {
+                    mx_ref[d] = row[d];
+                }
+            }
+
+            for tier in ["wide", "avx2", "avx512"] {
+                let mut mn = vec![f32::INFINITY; dim];
+                let mut mx = vec![f32::NEG_INFINITY; dim];
+                match tier {
+                    "wide" => update_min_max_wide(&row, &mut mn, &mut mx),
+                    #[cfg(target_arch = "x86_64")]
+                    "avx2" if std::is_x86_feature_detected!("avx2") => {
+                        unsafe { update_min_max_avx2(&row, &mut mn, &mut mx) };
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    "avx512" if std::is_x86_feature_detected!("avx512f") => {
+                        unsafe { update_min_max_avx512(&row, &mut mn, &mut mx) };
+                    }
+                    _ => continue,
+                };
+                assert_eq!(mn, mn_ref, "tier {} min mismatch at dim {}", tier, dim);
+                assert_eq!(mx, mx_ref, "tier {} max mismatch at dim {}", tier, dim);
+            }
+        }
+    }
+
+    /// Sq8 SIMD encode parity: every tier produces byte-identical
+    /// codes to the FMA-based scalar reference across a sweep of
+    /// dims that hits all per-tier tail paths.
+    #[test]
+    fn sq8_encode_row_simd_paths_match_scalar() {
+        let dims = [
+            1, 7, 8, 15, 16, 17, 24, 31, 32, 33, 47, 48, 96, 384, 512, 1023,
+        ];
+        for &dim in &dims {
+            let (row, scale, offset) = synth_sq8_inputs(dim, dim as u64 * 17 + 1);
+            let consts = Sq8EncodeConsts::from_scale_offset(&scale, &offset);
+            let mut dst_ref = vec![0u8; dim];
+            sq8_encode_row_reference(&row, &consts.inv_scale, &consts.c2, &mut dst_ref);
+
+            // Wide tier — universally available.
+            let mut dst_wide = vec![0u8; dim];
+            sq8_encode_row_wide(&row, &consts.inv_scale, &consts.c2, &mut dst_wide);
+            assert_eq!(dst_wide, dst_ref, "wide path mismatch at dim {}", dim);
+
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                let mut dst_avx2 = vec![0u8; dim];
+                unsafe {
+                    sq8_encode_row_avx2(&row, &consts.inv_scale, &consts.c2, &mut dst_avx2);
+                }
+                assert_eq!(dst_avx2, dst_ref, "avx2 path mismatch at dim {}", dim);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx512f") {
+                let mut dst_avx512 = vec![0u8; dim];
+                unsafe {
+                    sq8_encode_row_avx512(&row, &consts.inv_scale, &consts.c2, &mut dst_avx512);
+                }
+                assert_eq!(dst_avx512, dst_ref, "avx512 path mismatch at dim {}", dim);
+            }
+        }
+    }
+
+    /// Microbench: per-tier Sq8 encode throughput across the same
+    /// dim grid the AVX-512 / AVX2 distance microbenches use. Gated
+    /// `#[ignore]` so `cargo test --release` skips it; run via
+    /// `cargo test --release --lib sq8_encode_microbench --
+    /// --ignored --nocapture` to print a markdown table.
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn sq8_encode_microbench() {
+        use std::time::Instant;
+        let dims: &[usize] = &[128, 384, 768, 1024, 1536];
+        let iters: usize = 200_000;
+
+        println!("\n### Sq8 f32 → u8 encode per-tier ns / row (dim sweep)\n");
+        println!("| dim | scalar ns | wide ns | avx2 ns | avx512 ns |");
+        println!("|----:|----------:|--------:|--------:|----------:|");
+
+        for &dim in dims {
+            let (row, scale, offset) = synth_sq8_inputs(dim, dim as u64 * 23 + 5);
+            let consts = Sq8EncodeConsts::from_scale_offset(&scale, &offset);
+            let mut dst = vec![0u8; dim];
+
+            // Scalar reference — what the on-disk encode would
+            // be without any of this commit's SIMD work.
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                sq8_encode_row_reference(&row, &consts.inv_scale, &consts.c2, &mut dst);
+                std::hint::black_box(&dst);
+            }
+            let scalar_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                sq8_encode_row_wide(&row, &consts.inv_scale, &consts.c2, &mut dst);
+                std::hint::black_box(&dst);
+            }
+            let wide_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+
+            #[cfg(target_arch = "x86_64")]
+            let avx2_ns =
+                if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        unsafe {
+                            sq8_encode_row_avx2(&row, &consts.inv_scale, &consts.c2, &mut dst);
+                        }
+                        std::hint::black_box(&dst);
+                    }
+                    Some(t0.elapsed().as_nanos() as f64 / iters as f64)
+                } else {
+                    None
+                };
+            #[cfg(not(target_arch = "x86_64"))]
+            let avx2_ns: Option<f64> = None;
+
+            #[cfg(target_arch = "x86_64")]
+            let avx512_ns = if std::is_x86_feature_detected!("avx512f") {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    unsafe {
+                        sq8_encode_row_avx512(&row, &consts.inv_scale, &consts.c2, &mut dst);
+                    }
+                    std::hint::black_box(&dst);
+                }
+                Some(t0.elapsed().as_nanos() as f64 / iters as f64)
+            } else {
+                None
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let avx512_ns: Option<f64> = None;
+
+            let fmt = |x: Option<f64>| match x {
+                Some(v) => format!("{:>7.1}", v),
+                None => "    n/a".to_string(),
+            };
+            println!(
+                "| {:>3} | {:>9.1} | {:>7.1} | {} | {} |",
+                dim,
+                scalar_ns,
+                wide_ns,
+                fmt(avx2_ns),
+                fmt(avx512_ns),
+            );
         }
     }
 

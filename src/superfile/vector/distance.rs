@@ -2019,6 +2019,293 @@ mod tests {
     // exercise them via direct call to keep the AVX2 baseline a
     // first-class measurable tier.
 
+    // --- Unified 4-tier per-kernel microbench (plan 014) --------------
+    //
+    // One run, every kernel × every SIMD tier × every realistic dim,
+    // emitted as a single markdown table. Replaces ad-hoc per-tier
+    // microbenches that only ever showed two columns side-by-side
+    // (wide vs avx512, or wide vs avx2). Run with:
+    //
+    // ```text
+    // cargo test --release --lib simd_microbench_all_tiers \
+    //   -- --ignored --nocapture
+    // ```
+    //
+    // Columns mean exactly what they say: ns/call for that kernel
+    // routed through that specific implementation, irrespective of
+    // what the runtime dispatch chain would have picked. Columns
+    // without a dedicated path (e.g. `dot` fp32 has no separate
+    // AVX2 kernel — the wide path *is* the AVX2 path via `wide`)
+    // are printed as `—` so the table doesn't lie about coverage.
+
+    /// Scalar fp32 dot. No SIMD types — the absolute baseline.
+    /// Compiler will autovectorize this on most x86_64 targets but
+    /// the scalar source is what we measure, so the result is
+    /// representative of "what you get with no hand-tuned SIMD".
+    fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+        let mut s = 0.0f32;
+        for i in 0..a.len() {
+            s += a[i] * b[i];
+        }
+        s
+    }
+
+    /// Scalar fp32 L2².
+    fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+        let mut s = 0.0f32;
+        for i in 0..a.len() {
+            let d = a[i] - b[i];
+            s += d * d;
+        }
+        s
+    }
+
+    /// Scalar bf16-bytes-vs-fp32 dot. Per-lane bf16→f32 then mul-add.
+    fn dot_bf16_bytes_scalar(query: &[f32], bytes: &[u8]) -> f32 {
+        let dim = query.len();
+        let mut s = 0.0f32;
+        for i in 0..dim {
+            let lo = bytes[i * 2] as u16;
+            let hi = bytes[i * 2 + 1] as u16;
+            let bf = lo | (hi << 8);
+            let f = f32::from_bits((bf as u32) << 16);
+            s += query[i] * f;
+        }
+        s
+    }
+
+    /// Scalar bf16-bytes-vs-fp32 L2².
+    fn l2_sq_bf16_bytes_scalar(query: &[f32], bytes: &[u8]) -> f32 {
+        let dim = query.len();
+        let mut s = 0.0f32;
+        for i in 0..dim {
+            let lo = bytes[i * 2] as u16;
+            let hi = bytes[i * 2 + 1] as u16;
+            let bf = lo | (hi << 8);
+            let f = f32::from_bits((bf as u32) << 16);
+            let d = query[i] - f;
+            s += d * d;
+        }
+        s
+    }
+
+    /// Scalar Sq8 cross-product kernel core: `Σ q'[d] * code[d]`
+    /// after per-lane u8→f32 widening. Used inside `Sq8Kernel::
+    /// distance_at`; this is the part the SIMD paths accelerate.
+    fn sq8_cross_product_scalar(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+        let mut s = 0.0f32;
+        for d in 0..dim {
+            s += q_prime[d] * (code_bytes[d] as f32);
+        }
+        s
+    }
+
+    /// Single-pane microbench: every kernel × scalar/wide/AVX2/AVX-512
+    /// at every realistic dim, one markdown table.
+    ///
+    /// When a kernel has no dedicated AVX2 implementation (e.g. fp32
+    /// `dot`/`l2_sq` — the `wide::f32x8` path already lowers to
+    /// `__m256` + `vfmadd*ps` under the `x86-64-v3` target this crate
+    /// pins via `.cargo/config.toml`, so a hand-written AVX2 kernel
+    /// would emit the same instructions), the AVX2 column shows
+    /// `wide(=AVX2)` followed by the wide ns to make it clear that
+    /// the dispatch chain on an AVX2-only host actually runs at the
+    /// wide column's number. Kernels that *do* have a separate AVX2
+    /// path (the bf16 + Sq8 widen kernels — wide had per-lane scalar
+    /// widen, AVX2 has VPMOVZXBD / VPMOVZXWD + shift) show the
+    /// dedicated AVX2 timing.
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_microbench_all_tiers() {
+        use std::hint::black_box;
+        let avx2 = avx2_enabled();
+        let avx512 = avx512_enabled();
+        let bf16 = has_bf16_dot();
+        eprintln!();
+        eprintln!(
+            "### vector distance kernels — per-tier ns / call on this host (single thread, release)\n"
+        );
+        eprintln!("host caps: avx2={avx2}, avx512f={avx512}, avx512_bf16 (VDPBF16PS)={bf16}");
+        eprintln!(
+            "build:     `target-cpu=x86-64-v3` (Haswell+AVX2+FMA baseline) from .cargo/config.toml\n"
+        );
+        eprintln!("| kernel | dim | scalar ns | wide ns | avx2 ns | avx512 ns |");
+        eprintln!("|--------|----:|----------:|--------:|--------:|----------:|");
+
+        /// Format an AVX2 cell: `Some(ns)` for a dedicated AVX2
+        /// kernel, `None` for a kernel whose AVX2 dispatch falls
+        /// through to wide (the wide ns is passed so the cell
+        /// shows the actual runtime cost on an AVX2-only host).
+        fn avx2_cell(v: Option<f64>, wide_ns: f64) -> String {
+            match v {
+                Some(x) => format!("{:>7.1}", x),
+                None => format!("wide(={:>5.1})", wide_ns),
+            }
+        }
+
+        /// Format an AVX-512 cell: `Some(ns)` for a dedicated kernel,
+        /// `None` when AVX-512 isn't enabled on this host.
+        fn avx512_cell(v: Option<f64>) -> String {
+            match v {
+                Some(x) => format!("{:>7.1}", x),
+                None => "      —".to_string(),
+            }
+        }
+
+        for &dim in realistic_dims() {
+            let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001 - 0.5).collect();
+            let b: Vec<f32> = (0..dim).map(|i| ((i + 7) as f32) * 0.0017 - 0.3).collect();
+            let bytes = encode_bf16(&b);
+            let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
+            let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
+            let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
+
+            // --- distance::dot (fp32) ---
+            let s = time_ns(iters, || dot_scalar(black_box(&a), black_box(&b)));
+            let w = time_ns(iters, || dot_wide(black_box(&a), black_box(&b)));
+            // No dedicated AVX2 path — `wide::f32x8` on x86-64-v3
+            // lowers straight to `__m256` + `vfmadd*ps`, so the wide
+            // path *is* the AVX2 path for this kernel. AVX2 column
+            // prints `wide(=<wide ns>)` to make that explicit.
+            let a2 = None::<f64>;
+            let a5 = if avx512 {
+                Some(time_ns(iters, || unsafe {
+                    dot_avx512(black_box(&a), black_box(&b))
+                }))
+            } else {
+                None
+            };
+            eprintln!(
+                "| `distance::dot` (fp32) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
+                s,
+                w,
+                avx2_cell(a2, w),
+                avx512_cell(a5),
+            );
+
+            // --- distance::l2_sq (fp32) ---
+            let s = time_ns(iters, || l2_sq_scalar(black_box(&a), black_box(&b)));
+            let w = time_ns(iters, || l2_sq_wide(black_box(&a), black_box(&b)));
+            let a2 = None::<f64>;
+            let a5 = if avx512 {
+                Some(time_ns(iters, || unsafe {
+                    l2_sq_avx512(black_box(&a), black_box(&b))
+                }))
+            } else {
+                None
+            };
+            eprintln!(
+                "| `distance::l2_sq` (fp32) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
+                s,
+                w,
+                avx2_cell(a2, w),
+                avx512_cell(a5),
+            );
+
+            // --- distance::dot_bf16_bytes ---
+            let s = time_ns(iters, || {
+                dot_bf16_bytes_scalar(black_box(&a), black_box(&bytes))
+            });
+            let w = time_ns(iters, || {
+                dot_bf16_bytes_wide(black_box(&a), black_box(&bytes))
+            });
+            let a2 = if avx2 {
+                Some(time_ns(iters, || unsafe {
+                    dot_bf16_bytes_avx2(black_box(&a), black_box(&bytes))
+                }))
+            } else {
+                None
+            };
+            let a5 = if avx512 {
+                Some(time_ns(iters, || unsafe {
+                    dot_bf16_bytes_avx512(black_box(&a), black_box(&bytes))
+                }))
+            } else {
+                None
+            };
+            eprintln!(
+                "| `distance::dot_bf16_bytes` | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
+                s,
+                w,
+                avx2_cell(a2, w),
+                avx512_cell(a5),
+            );
+
+            // --- distance::l2_sq_bf16_bytes ---
+            let s = time_ns(iters, || {
+                l2_sq_bf16_bytes_scalar(black_box(&a), black_box(&bytes))
+            });
+            let w = time_ns(iters, || {
+                l2_sq_bf16_bytes_wide(black_box(&a), black_box(&bytes))
+            });
+            let a2 = if avx2 {
+                Some(time_ns(iters, || unsafe {
+                    l2_sq_bf16_bytes_avx2(black_box(&a), black_box(&bytes))
+                }))
+            } else {
+                None
+            };
+            let a5 = if avx512 {
+                Some(time_ns(iters, || unsafe {
+                    l2_sq_bf16_bytes_avx512(black_box(&a), black_box(&bytes))
+                }))
+            } else {
+                None
+            };
+            eprintln!(
+                "| `distance::l2_sq_bf16_bytes` | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
+                s,
+                w,
+                avx2_cell(a2, w),
+                avx512_cell(a5),
+            );
+
+            // --- sq8_cross_product (the Sq8Kernel hot loop core) ---
+            let s = time_ns(iters, || {
+                sq8_cross_product_scalar(black_box(&q_prime), black_box(&codes), black_box(dim))
+            });
+            let w = time_ns(iters, || {
+                sq8_cross_product_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
+            });
+            let a2 = if avx2 {
+                Some(time_ns(iters, || unsafe {
+                    sq8_cross_product_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
+                }))
+            } else {
+                None
+            };
+            let a5 = if avx512 {
+                Some(time_ns(iters, || unsafe {
+                    sq8_cross_product_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
+                }))
+            } else {
+                None
+            };
+            eprintln!(
+                "| `Sq8Kernel::distance_at` (xprod) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
+                s,
+                w,
+                avx2_cell(a2, w),
+                avx512_cell(a5),
+            );
+        }
+
+        eprintln!();
+        eprintln!(
+            "Notes: `wide(=N.N)` in the AVX2 column means there is no \
+             dedicated AVX2 kernel — the dispatch on an AVX2-only host \
+             actually runs the wide kernel at that timing. This applies to \
+             the fp32 `dot` / `l2_sq` kernels because `wide::f32x8` on \
+             `target-cpu=x86-64-v3` lowers to `__m256` + `vfmadd*ps`, \
+             which is what a hand-written AVX2 kernel would emit. The \
+             bf16 + Sq8 widen kernels have dedicated AVX2 paths (visible \
+             above) because the wide path previously did per-lane scalar \
+             widening; the dedicated AVX2 path replaces that with \
+             VPMOVZXBD / VPMOVZXWD + shift."
+        );
+    }
+
     /// AVX2 fp32-equivalent bf16 / Sq8 widen paths vs the portable
     /// scalar-widen `_wide` kernels. Captures the "lift the AVX2
     /// fallback path" half of the Phase 2 win (the other half is
