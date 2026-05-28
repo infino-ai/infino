@@ -453,3 +453,212 @@ fn oracle_long_doc_vs_short_doc_dl_norm() {
     let oracle_top2: HashSet<u64> = oracle_hits.into_iter().take(2).collect();
     assert_eq!(infino_top2, oracle_top2, "framework top-2 sets disagree");
 }
+
+// ─── Multi-block AND oracles ──────────────────────────────────────────
+//
+// The 60-doc corpus above holds every term in a single PFOR block
+// (BLOCK_LEN = 128). Block-crossing paths in `run_and_intersect_*` —
+// the inner-loop `next()` cross-block walk, the alignment step that
+// fires when a non-leader cursor lands in a new block, and the
+// block-max-AND pruning that skips a whole leader block — only fire
+// when terms span multiple blocks. This section plants a 1000-doc
+// corpus with deterministic-frequency terms chosen so the common
+// terms span 2–4 blocks each, then runs AND across 2/3/4 terms and
+// compares against the brute-force oracle.
+
+const MULTI_BLOCK_N_DOCS: u64 = 1_000;
+
+/// Deterministic-frequency planted corpus. Each doc is identified
+/// by its position 0..N-1 and seeded with terms based on simple
+/// mod predicates so the resulting posting list lengths are
+/// predictable:
+///
+/// * `alpha` — every 3rd doc        → ~334 postings → 3 blocks
+/// * `beta`  — every 4th doc        → ~250 postings → 2 blocks
+/// * `gamma` — every 5th doc        → ~200 postings → 2 blocks
+/// * `delta` — every 7th doc        → ~143 postings → 2 blocks
+/// * `epsilon` — every 20th doc     → ~50 postings  → 1 block
+/// * `noXXX` — per-doc filler tokens to vary doc lengths
+fn build_multi_block_corpus() -> Vec<(u64, String)> {
+    let mut out: Vec<(u64, String)> = Vec::with_capacity(MULTI_BLOCK_N_DOCS as usize);
+    for d in 0..MULTI_BLOCK_N_DOCS {
+        let mut toks: Vec<&'static str> = Vec::new();
+        if d % 3 == 0 {
+            toks.push("alpha");
+        }
+        if d % 4 == 0 {
+            toks.push("beta");
+        }
+        if d % 5 == 0 {
+            toks.push("gamma");
+        }
+        if d % 7 == 0 {
+            toks.push("delta");
+        }
+        if d % 20 == 0 {
+            toks.push("epsilon");
+        }
+        // Filler keeps every doc non-empty and gives a few different
+        // doc lengths so dl-norm isn't a constant. Using mod-50 yields
+        // 50 distinct filler terms across 1000 docs.
+        let filler = format!("no{:02}", d % 50);
+        let mut s = toks.join(" ");
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(&filler);
+        out.push((d, s));
+    }
+    out
+}
+
+fn build_multi_block_reader(owned: &[(u64, String)]) -> SuperfileReader {
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    build_infino_superfile(&refs)
+}
+
+/// Compute the expected AND intersection for the multi-block corpus
+/// using the same planting predicates as `build_multi_block_corpus`.
+/// Returns the set of doc-ids in the intersection.
+fn multi_block_and_truth(terms: &[&str]) -> HashSet<u64> {
+    let predicate = |d: u64, t: &str| -> bool {
+        match t {
+            "alpha" => d % 3 == 0,
+            "beta" => d % 4 == 0,
+            "gamma" => d % 5 == 0,
+            "delta" => d % 7 == 0,
+            "epsilon" => d % 20 == 0,
+            _ => false,
+        }
+    };
+    (0..MULTI_BLOCK_N_DOCS)
+        .filter(|d| terms.iter().all(|t| predicate(*d, t)))
+        .collect()
+}
+
+#[test]
+fn oracle_and_multi_block_two_term_matches_brute_force() {
+    // alpha ∧ beta: both span >1 block (3 + 2). Intersection is
+    // docs where d % lcm(3,4) == 0, i.e., d % 12 == 0 → 84 matches
+    // distributed across the corpus, forcing the 2-term flat-merge
+    // path to cross blocks on both cursors.
+    let corp = build_multi_block_corpus();
+    let r = build_multi_block_reader(&corp);
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta", 200).into_iter().collect();
+    let truth = multi_block_and_truth(&["alpha", "beta"]);
+    assert_eq!(
+        infino_set, truth,
+        "AND(alpha, beta) over multi-block corpus disagrees with planted truth"
+    );
+}
+
+#[test]
+fn oracle_and_multi_block_three_term_matches_brute_force() {
+    // alpha ∧ beta ∧ gamma: all span >1 block. Intersection is docs
+    // where d % lcm(3,4,5) == 0, i.e., d % 60 == 0. Exercises the
+    // n>=3 flat-merge `for o in others.iter_mut()` inner loop with
+    // both branches of the match/no-match split and the block
+    // crossings on three cursors simultaneously.
+    let corp = build_multi_block_corpus();
+    let r = build_multi_block_reader(&corp);
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma", 200)
+        .into_iter()
+        .collect();
+    let truth = multi_block_and_truth(&["alpha", "beta", "gamma"]);
+    assert_eq!(
+        infino_set, truth,
+        "AND(alpha, beta, gamma) over multi-block corpus disagrees with planted truth"
+    );
+}
+
+#[test]
+fn oracle_and_multi_block_four_term_matches_brute_force() {
+    // alpha ∧ beta ∧ gamma ∧ delta: all four span >1 block.
+    // Intersection is d % lcm(3,4,5,7) == 0, i.e., d % 420 == 0 →
+    // 3 matches at most {0, 420, 840} in a 1000-doc corpus.
+    // Drives the cursor-alignment + flat-merge over four cursors
+    // and tests the `block_exhausted` early-break path.
+    let corp = build_multi_block_corpus();
+    let r = build_multi_block_reader(&corp);
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma delta", 200)
+        .into_iter()
+        .collect();
+    let truth = multi_block_and_truth(&["alpha", "beta", "gamma", "delta"]);
+    assert_eq!(
+        infino_set, truth,
+        "AND(alpha, beta, gamma, delta) over multi-block corpus disagrees with planted truth"
+    );
+}
+
+#[test]
+fn oracle_and_multi_block_with_rare_term_short_circuits() {
+    // alpha (common, multi-block) ∧ epsilon (rare, single block).
+    // The leapfrog picks the rarer (epsilon) as leader and walks
+    // its single block; the alpha cursor must cross several blocks
+    // as alignment proceeds, exercising the leader-side alignment
+    // path that crosses block_last_doc_id.
+    let corp = build_multi_block_corpus();
+    let r = build_multi_block_reader(&corp);
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha epsilon", 100)
+        .into_iter()
+        .collect();
+    let truth = multi_block_and_truth(&["alpha", "epsilon"]);
+    assert_eq!(
+        infino_set, truth,
+        "AND(alpha, epsilon) over multi-block corpus disagrees with planted truth"
+    );
+}
+
+#[test]
+fn oracle_and_multi_block_top_k_smaller_than_match_count() {
+    // top-k=5 against an AND that has ~84 matches. Once the heap
+    // fills, the block-max-AND pruning check at the top of the
+    // outer loop fires on every subsequent leader block whose UB
+    // can't beat the kth-best score. Verifies the top-K matches
+    // are a subset of the planted truth (every returned doc is a
+    // real match; ranking-tie tail may differ from any specific
+    // brute-force order).
+    let corp = build_multi_block_corpus();
+    let r = build_multi_block_reader(&corp);
+    let infino_hits = infino_top_k_and(&r, "alpha beta", 5);
+    assert_eq!(infino_hits.len(), 5, "top-k=5 should fill");
+    let truth = multi_block_and_truth(&["alpha", "beta"]);
+    for d in &infino_hits {
+        assert!(
+            truth.contains(d),
+            "top-5 AND returned doc {d} that isn't in the planted intersection {truth:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_and_multi_block_score_matches_brute_force() {
+    // Cross-check scores against the brute-force scorer on the
+    // multi-block corpus. The two-term AND has 84 matches and the
+    // top-10 list must agree on doc-id sets with brute force (ties
+    // may reorder within a single score class). Catches scoring
+    // drift introduced by the block-crossing code paths in the
+    // flat-merge (e.g. wrong `block_tfs[pos]` index after a block
+    // boundary, or a stale `idf_x_k1p1` if the cursor was
+    // reconstructed mid-walk).
+    let corp_owned = build_multi_block_corpus();
+    let corp_refs: Vec<(u64, &str)> = corp_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+
+    let mut terms: Vec<String> = Vec::new();
+    tok.tokenize_each("alpha beta", &mut |t| terms.push(t.to_owned()));
+    let infino_hits = infino_top_k_and(&r, "alpha beta", 10);
+    let oracle_hits: Vec<u64> = oracle
+        .top_k_terms_and(&terms, 10)
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    let infino_set: HashSet<u64> = infino_hits.iter().copied().collect();
+    let oracle_set: HashSet<u64> = oracle_hits.iter().copied().collect();
+    assert_eq!(
+        infino_set, oracle_set,
+        "multi-block AND top-10 sets disagree: infino={infino_hits:?} oracle={oracle_hits:?}"
+    );
+}
