@@ -483,19 +483,19 @@ fn build_multi_block_corpus() -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = Vec::with_capacity(MULTI_BLOCK_N_DOCS as usize);
     for d in 0..MULTI_BLOCK_N_DOCS {
         let mut toks: Vec<&'static str> = Vec::new();
-        if d % 3 == 0 {
+        if d.is_multiple_of(3) {
             toks.push("alpha");
         }
-        if d % 4 == 0 {
+        if d.is_multiple_of(4) {
             toks.push("beta");
         }
-        if d % 5 == 0 {
+        if d.is_multiple_of(5) {
             toks.push("gamma");
         }
-        if d % 7 == 0 {
+        if d.is_multiple_of(7) {
             toks.push("delta");
         }
-        if d % 20 == 0 {
+        if d.is_multiple_of(20) {
             toks.push("epsilon");
         }
         // Filler keeps every doc non-empty and gives a few different
@@ -523,11 +523,11 @@ fn build_multi_block_reader(owned: &[(u64, String)]) -> SuperfileReader {
 fn multi_block_and_truth(terms: &[&str]) -> HashSet<u64> {
     let predicate = |d: u64, t: &str| -> bool {
         match t {
-            "alpha" => d % 3 == 0,
-            "beta" => d % 4 == 0,
-            "gamma" => d % 5 == 0,
-            "delta" => d % 7 == 0,
-            "epsilon" => d % 20 == 0,
+            "alpha" => d.is_multiple_of(3),
+            "beta" => d.is_multiple_of(4),
+            "gamma" => d.is_multiple_of(5),
+            "delta" => d.is_multiple_of(7),
+            "epsilon" => d.is_multiple_of(20),
             _ => false,
         }
     };
