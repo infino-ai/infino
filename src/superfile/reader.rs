@@ -231,14 +231,24 @@ impl SuperfileReader {
             .parse()
             .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
 
-        // FTS blob: slice on eager, range-fetch on lazy.
+        // FTS blob — 013 PR4 (A2f).
+        //
+        // Like the vector reader, `FtsReader` now takes a `Source`
+        // and drives its own open-time + search-time fetches through
+        // it. So instead of materialising the whole FTS blob here, we
+        // hand it a sub-source over `[fts_off, fts_off + fts_len)`:
+        //  - `Source::InMemory(parent)` → zero-copy `Bytes::slice`.
+        //  - `Source::Lazy(parent_arc)` → a [`SubLazyByteSource`]
+        //    window over the parent. No whole-blob materialisation;
+        //    open-time reads scale with the doc-lengths region, and
+        //    the FST + postings regions are fetched lazily per query.
         let fts = if all_present(&kv_map, kv::FTS_KEYS) {
             let off = parse_u64(&kv_map, kv::FTS_OFFSET)?;
             let len = parse_u64(&kv_map, kv::FTS_LENGTH)?;
             let cols_json = kv_map.get(kv::FTS_COLUMNS).expect("checked");
-            let blob = fetch_blob_or_err(&source, off, len, "FTS")?;
-            Some(FtsReader::open_with(
-                blob,
+            let fts_source = sub_source_for(&source, off, len, "FTS")?;
+            Some(FtsReader::open_with_source(
+                fts_source,
                 cols_json,
                 crate::superfile::fts::reader::OpenOptions {
                     verify_crc: opts.verify_crc,
@@ -268,7 +278,7 @@ impl SuperfileReader {
         //    not blob size. Search-time fetches continue
         //    through the same sub-source on demand.
         //
-        // PR4 will give FTS the same treatment.
+        // FTS gets the same treatment above (013 PR4 / A2f).
         let vec = if all_present(&kv_map, kv::VEC_KEYS) {
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
@@ -449,7 +459,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -516,7 +526,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -645,40 +655,6 @@ fn parse_u64(map: &footer::KvMap, key: &'static str) -> Result<u64, ReadError> {
         .ok_or(ReadError::MissingKv(key))?
         .parse()
         .map_err(|_| ReadError::MalformedKv(format!("{key} not a u64")))
-}
-
-/// Fetch a blob region (`[off, off + len)`) from a [`Source`],
-/// materialising the bytes as a single `Bytes` value.
-///
-/// On `Source::InMemory` this is a zero-copy `Bytes::slice`;
-/// on `Source::Lazy` it's a single
-/// [`Source::get_range`] call which itself routes through the
-/// underlying source's sync fast path (warm cache / mmap) or
-/// bridges to its async `range` for cold misses.
-///
-/// Used for the FTS blob path today — `FtsReader::open_with`
-/// takes a `Bytes`, so materialising the whole blob is
-/// required until PR4 (013-A2f) gives it the `Source`
-/// abstraction. The vector path uses [`sub_source_for`]
-/// instead so the per-column open can fetch only the open-
-/// time region.
-fn fetch_blob_or_err(
-    source: &Source,
-    off: u64,
-    len: u64,
-    section: &'static str,
-) -> Result<Bytes, ReadError> {
-    let total = source.len() as u64;
-    if off.saturating_add(len) > total {
-        return Err(ReadError::MalformedKv(format!(
-            "{section} blob offset+len out of range"
-        )));
-    }
-    let off_usize = off as usize;
-    let end_usize = off_usize + len as usize;
-    source
-        .get_range(off_usize..end_usize)
-        .map_err(|e| ReadError::MalformedKv(format!("{section} blob fetch: {e}")))
 }
 
 /// Carve a [`Source`] over the sub-range `[off, off + len)` of

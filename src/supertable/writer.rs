@@ -521,7 +521,9 @@ fn prepare_segment(
     let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
         for fc in &inner.options.fts_columns {
-            let terms = fts_reader.iter_column_terms(&fc.column);
+            let terms = fts_reader
+                .iter_column_terms(&fc.column)
+                .map_err(|e| BuildError::Store(format!("reading FTS column terms: {e}")))?;
             let n_terms_distinct = terms.len() as u32;
             let (min_term, max_term) = match (terms.first(), terms.last()) {
                 (Some(min), Some(max)) => (min.clone(), max.clone()),

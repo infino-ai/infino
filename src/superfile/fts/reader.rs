@@ -17,6 +17,7 @@ use crate::superfile::format::{self, FST_SEPARATOR};
 use crate::superfile::fts::dict::DictReader;
 use crate::superfile::fts::fst_value::FstValue;
 use crate::superfile::fts::posting::{BLOCK_LEN, decode_block};
+use crate::superfile::lazy_source::Source;
 use crate::superfile::{ReadError, error::FtsError};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -111,11 +112,23 @@ impl Default for OpenOptions {
     }
 }
 
-/// FTS blob reader. Self-contained — owns its `Bytes` (which the storage
-/// layer assembled from mmap / range-fetch / full-read).
+/// FTS blob reader. Backed by a polymorphic [`Source`] (013 PR4 /
+/// A2f): `Source::InMemory` for eager opens (zero-copy `Bytes::slice`
+/// on every fetch) and `Source::Lazy` for object-store cold opens
+/// (range GETs, served warm from the disk-cache mmap). Every byte
+/// access — header, doc-lengths arrays, FST dictionary, postings
+/// blocks — routes through [`Source::get_range`], so the warm BM25
+/// hot loop stays zero-copy while the cold path fetches only the
+/// bytes a query touches.
+///
+/// `fst_range` / `postings_range` carry **absolute** offsets into the
+/// source (i.e. into the FTS blob window the supertable hands the
+/// reader). `postings_range.start` is the postings region's absolute
+/// start; per-term / per-block offsets are added to it via
+/// [`PostingsRegion`].
 #[derive(Debug)]
 pub struct FtsReader {
-    blob: Bytes,
+    source: Source,
     n_docs: u32,
     n_terms_total: u32,
     fst_range: Range<usize>,
@@ -124,50 +137,127 @@ pub struct FtsReader {
     column_id_by_name: HashMap<String, u32>,
 }
 
+/// A cheap, `Copy` handle over the FTS [`Source`] scoped to the
+/// postings region. Carries the source plus the region's absolute
+/// start + length so per-block decode can fetch on demand
+/// (013 PR4 / A2f). Replaces the pre-PR4 `postings: &[u8]` slice
+/// that every search routine and [`TermCursor`] method took.
+///
+/// `fetch(rel)` resolves `[region_start + rel.start, region_start +
+/// rel.end)` against the source. On `Source::InMemory` and warm
+/// `Source::Lazy` this is a zero-copy `Bytes::slice` via
+/// `try_get_range_sync` — no allocation, no async bridge, no
+/// regression on the warm hot loop. On a cold object-store source
+/// it's a per-range GET, which is exactly the per-block granularity
+/// the cold-search budget wants (BMW-pruned blocks are never
+/// fetched).
+#[derive(Clone, Copy)]
+struct PostingsRegion<'a> {
+    source: &'a Source,
+    region_start: usize,
+    region_len: usize,
+}
+
+impl PostingsRegion<'_> {
+    /// Postings-region length in bytes — mirrors the old
+    /// `postings.len()` used by the bounds checks.
+    #[inline]
+    fn len(&self) -> usize {
+        self.region_len
+    }
+
+    /// Fetch `[rel.start, rel.end)` relative to the postings region
+    /// start, surfacing a typed [`FtsError`] on storage / OOB error.
+    #[inline]
+    fn fetch(&self, rel: Range<usize>) -> Result<Bytes, FtsError> {
+        let abs = self.region_start + rel.start..self.region_start + rel.end;
+        self.source.get_range(abs).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "fts postings fetch {}..{}: {e}",
+                rel.start, rel.end
+            )))
+        })
+    }
+}
+
 impl FtsReader {
     /// Open with default options (CRC verification on).
     pub fn open(blob: Bytes, columns_json: &str) -> Result<Self, FtsError> {
         Self::open_with(blob, columns_json, OpenOptions::default())
     }
 
-    /// Open with explicit options. Pass
-    /// `OpenOptions { verify_crc: false }` to skip the
-    /// four per-section CRC scans on trusted-storage cold
-    /// opens.
+    /// Open an already-materialised FTS blob with explicit options.
+    /// Thin wrapper over [`Self::open_with_source`] on
+    /// `Source::InMemory` (013 PR4 / A2f) — the single decode core
+    /// handles both eager and lazy opens.
+    ///
+    /// Pass `OpenOptions { verify_crc: false }` to skip the four
+    /// per-section CRC scans on trusted-storage cold opens.
     pub fn open_with(blob: Bytes, columns_json: &str, opts: OpenOptions) -> Result<Self, FtsError> {
-        if blob.len() < 48 {
+        Self::open_with_source(Source::InMemory(blob), columns_json, opts)
+    }
+
+    /// Structural decode core (013 PR4 / A2f). Parses the FTS blob
+    /// out of a polymorphic [`Source`]:
+    ///
+    /// - `Source::InMemory` — eager open; every fetch is a zero-copy
+    ///   `Bytes::slice`.
+    /// - `Source::Lazy` — object-store cold open; open-time reads
+    ///   (header, doc-lengths directory, per-column doc-lengths
+    ///   arrays) come as range GETs. The FST + postings regions stay
+    ///   as `Range<usize>` metadata and are fetched lazily at query
+    ///   time (`fst_bytes` / [`PostingsRegion`]).
+    ///
+    /// CRC verification (`verify_crc=true`) fetches the full FST and
+    /// postings regions to checksum them — on a cold `Source::Lazy`
+    /// that defeats the cold-open byte budget, so the object-store
+    /// path runs with `verify_crc=false` and trusts the storage
+    /// layer's wire checksums (see plan 013).
+    pub fn open_with_source(
+        source: Source,
+        columns_json: &str,
+        opts: OpenOptions,
+    ) -> Result<Self, FtsError> {
+        if source.len() < 48 {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
+        let source_len = source.len();
+
+        // One fetch for the fixed 48-byte header.
+        let header = source
+            .get_range(0..48)
+            .map_err(|e| FtsError::Read(ReadError::MalformedVersion(format!("fts header: {e}"))))?;
 
         // Magic check.
-        if &blob[0..8] != format::fts::MAGIC {
+        if &header[0..8] != format::fts::MAGIC {
             return Err(FtsError::Read(ReadError::BadMagic {
                 section: "fts",
                 expected: format::fts::MAGIC,
-                actual: blob[0..8].to_vec(),
+                actual: header[0..8].to_vec(),
             }));
         }
 
         // Version check.
-        let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
+        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         if version != format::fts::VERSION {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
         }
 
-        let n_columns = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
-        let n_docs = read_u32_le(&blob[16..20]);
-        let n_terms_total = read_u32_le(&blob[20..24]);
-        let fst_offset = read_u64_le(&blob[24..32]) as usize;
-        let postings_offset = read_u64_le(&blob[32..40]) as usize;
-        let doc_lengths_table_offset = read_u64_le(&blob[40..48]) as usize;
+        let n_columns =
+            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        let n_docs = read_u32_le(&header[16..20]);
+        let n_terms_total = read_u32_le(&header[20..24]);
+        let fst_offset = read_u64_le(&header[24..32]) as usize;
+        let postings_offset = read_u64_le(&header[32..40]) as usize;
+        let doc_lengths_table_offset = read_u64_le(&header[40..48]) as usize;
 
-        // Bounds-check every offset against the blob length before
-        // any slice indexing. A single byte flip in the header can
+        // Bounds-check every offset against the source length before
+        // any range fetch. A single byte flip in the header can
         // corrupt these into multi-GB values; without this check
-        // they propagate as out-of-range slice indices and panic
-        // before the CRC verification can reject the corruption.
+        // they propagate as out-of-range fetches before the CRC
+        // verification can reject the corruption.
         //
         // The `< +4` checks (rather than `<= +4`) admit the legal
         // empty-region case: when every term takes the df=1 inline-FST
@@ -177,12 +267,11 @@ impl FtsReader {
         if fst_offset < 48
             || postings_offset < fst_offset + 4
             || doc_lengths_table_offset < postings_offset + 4
-            || doc_lengths_table_offset > blob.len()
+            || doc_lengths_table_offset > source_len
         {
             return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
-                 doc_lengths={doc_lengths_table_offset}, blob_len={}",
-                blob.len()
+                 doc_lengths={doc_lengths_table_offset}, source_len={source_len}"
             ))));
         }
 
@@ -193,25 +282,36 @@ impl FtsReader {
         let fst_range = fst_offset..postings_offset.saturating_sub(4); // strip CRC
         let postings_range = postings_offset..doc_lengths_table_offset.saturating_sub(4); // strip CRC
 
-        // Verify FST CRC32C (4 bytes after fst body).
+        // Verify FST + postings CRC32C. Each pulls the whole region
+        // — on a cold `Source::Lazy` this is the full-segment fetch
+        // the lazy path exists to avoid, so it's gated on the opt-in
+        // flag. The FST CRC (4 B) trails the body at
+        // `postings_offset - 4`; the postings CRC trails at
+        // `doc_lengths_table_offset - 4`.
         if opts.verify_crc {
-            let fst_crc_expected =
-                read_u32_le(&blob[postings_offset.saturating_sub(4)..postings_offset]);
-            let fst_crc_actual = crc32c(&blob[fst_range.clone()]);
+            let fst_with_crc = source.get_range(fst_offset..postings_offset).map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!("fts dict region: {e}")))
+            })?;
+            let body_len = fst_with_crc.len().saturating_sub(4);
+            let fst_crc_expected = read_u32_le(&fst_with_crc[body_len..]);
+            let fst_crc_actual = crc32c(&fst_with_crc[..body_len]);
             if fst_crc_expected != fst_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
                     section: "fts/dict",
                     column: String::new(),
                 }));
             }
-        }
 
-        // Verify postings region CRC32C.
-        if opts.verify_crc {
-            let postings_crc_pos = doc_lengths_table_offset.saturating_sub(4);
-            let postings_crc_expected =
-                read_u32_le(&blob[postings_crc_pos..doc_lengths_table_offset]);
-            let postings_crc_actual = crc32c(&blob[postings_range.clone()]);
+            let postings_with_crc = source
+                .get_range(postings_offset..doc_lengths_table_offset)
+                .map_err(|e| {
+                    FtsError::Read(ReadError::MalformedVersion(format!(
+                        "fts postings region: {e}"
+                    )))
+                })?;
+            let body_len = postings_with_crc.len().saturating_sub(4);
+            let postings_crc_expected = read_u32_le(&postings_with_crc[body_len..]);
+            let postings_crc_actual = crc32c(&postings_with_crc[..body_len]);
             if postings_crc_expected != postings_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
                     section: "fts/postings",
@@ -236,11 +336,16 @@ impl FtsReader {
 
         // Read doc-lengths directory: n_columns × 16-byte entries + 4-byte CRC.
         let dir_size = n_columns * 16;
-        let dir_bytes = &blob[doc_lengths_table_offset..doc_lengths_table_offset + dir_size];
+        let dir_with_crc = source
+            .get_range(doc_lengths_table_offset..doc_lengths_table_offset + dir_size + 4)
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts doc-lengths directory: {e}"
+                )))
+            })?;
+        let dir_bytes = &dir_with_crc[..dir_size];
         if opts.verify_crc {
-            let dir_crc_expected = read_u32_le(
-                &blob[doc_lengths_table_offset + dir_size..doc_lengths_table_offset + dir_size + 4],
-            );
+            let dir_crc_expected = read_u32_le(&dir_with_crc[dir_size..dir_size + 4]);
             let dir_crc_actual = crc32c(dir_bytes);
             if dir_crc_expected != dir_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
@@ -273,16 +378,27 @@ impl FtsReader {
             }
 
             // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte CRC.
+            // This is the open-time region the `dl_norm_k1` BM25
+            // precompute needs random-access to in the scoring loop,
+            // so it's materialised at open even on the lazy path.
             let array_byte_len = 4 * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
-            if array_end + 4 > blob.len() {
+            if array_end + 4 > source_len {
                 return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                     "doc-lengths array {i} runs past blob end"
                 ))));
             }
+            let array_with_crc = source
+                .get_range(doc_lengths_offset..array_end + 4)
+                .map_err(|e| {
+                    FtsError::Read(ReadError::MalformedVersion(format!(
+                        "fts doc-lengths array {i}: {e}"
+                    )))
+                })?;
+            let array_bytes = &array_with_crc[..array_byte_len];
             if opts.verify_crc {
-                let array_crc_expected = read_u32_le(&blob[array_end..array_end + 4]);
-                let array_crc_actual = crc32c(&blob[doc_lengths_offset..array_end]);
+                let array_crc_expected = read_u32_le(&array_with_crc[array_byte_len..]);
+                let array_crc_actual = crc32c(array_bytes);
                 if array_crc_expected != array_crc_actual {
                     return Err(FtsError::Read(ReadError::ChecksumMismatch {
                         section: "fts/doc_lengths_array",
@@ -300,9 +416,7 @@ impl FtsReader {
             if avgdl > 0.0 {
                 let inv_avgdl = 1.0_f32 / avgdl;
                 for d in 0..(n_docs as usize) {
-                    let dl = read_u32_le(
-                        &blob[doc_lengths_offset + d * 4..doc_lengths_offset + d * 4 + 4],
-                    ) as f32;
+                    let dl = read_u32_le(&array_bytes[d * 4..d * 4 + 4]) as f32;
                     let norm = 1.0 - crate::superfile::fts::bm25::B
                         + crate::superfile::fts::bm25::B * dl * inv_avgdl;
                     dl_norm_k1.push(crate::superfile::fts::bm25::K1 * norm);
@@ -318,7 +432,7 @@ impl FtsReader {
         }
 
         Ok(FtsReader {
-            blob,
+            source,
             n_docs,
             n_terms_total,
             fst_range,
@@ -341,9 +455,28 @@ impl FtsReader {
         self.columns.iter().map(|c| c.name.as_str())
     }
 
-    fn dict(&self) -> DictReader<'_> {
-        DictReader::open(&self.blob[self.fst_range.clone()])
-            .expect("FST CRC verified at open(); bytes must be a valid FST")
+    /// Fetch the FST dictionary region from the source (013 PR4 /
+    /// A2f). On `Source::InMemory` / warm `Source::Lazy` this is a
+    /// zero-copy `Bytes::slice`; on a cold object-store source it's
+    /// one range GET of the whole FST region — the cold first-query
+    /// "FST lookup region" GET in the plan's budget. The returned
+    /// `Bytes` must outlive the [`DictReader`] borrowed from it, so
+    /// callers bind it to a local before opening the dict.
+    fn fst_bytes(&self) -> Result<Bytes, FtsError> {
+        self.source.get_range(self.fst_range.clone()).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!("fts dict region: {e}")))
+        })
+    }
+
+    /// Postings-region handle for per-block lazy fetches
+    /// (013 PR4 / A2f). See [`PostingsRegion`].
+    #[inline]
+    fn postings_region(&self) -> PostingsRegion<'_> {
+        PostingsRegion {
+            source: &self.source,
+            region_start: self.postings_range.start,
+            region_len: self.postings_range.len(),
+        }
     }
 
     /// Walk the FST and collect every term registered under
@@ -355,7 +488,7 @@ impl FtsReader {
     /// an FTS column in this segment. Cost is O(terms in column)
     /// FST decodes; intended to be called once per (segment,
     /// column) at commit time, not on the query hot path.
-    pub fn iter_column_terms(&self, column: &str) -> Vec<Vec<u8>> {
+    pub fn iter_column_terms(&self, column: &str) -> Result<Vec<Vec<u8>>, FtsError> {
         self.iter_terms_with_prefix(column, b"")
     }
 
@@ -373,20 +506,26 @@ impl FtsReader {
     /// (e.g. ASCII-lowercasing for the v1 tokenizer). Returns an
     /// empty `Vec` if `column` is not registered or no terms match
     /// the prefix.
-    pub fn iter_terms_with_prefix(&self, column: &str, term_prefix: &[u8]) -> Vec<Vec<u8>> {
+    pub fn iter_terms_with_prefix(
+        &self,
+        column: &str,
+        term_prefix: &[u8],
+    ) -> Result<Vec<Vec<u8>>, FtsError> {
         if !self.column_id_by_name.contains_key(column) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut full_prefix = column.as_bytes().to_vec();
         full_prefix.push(0x1F);
         let column_prefix_len = full_prefix.len();
         full_prefix.extend_from_slice(term_prefix);
-        let dict = self.dict();
+        let fst = self.fst_bytes()?;
+        let dict =
+            DictReader::open(&fst).expect("FST CRC verified at open(); bytes must be a valid FST");
         let pairs = dict.iter_prefix(&full_prefix);
-        pairs
+        Ok(pairs
             .into_iter()
             .map(|(key, _)| key[column_prefix_len..].to_vec())
-            .collect()
+            .collect())
     }
 
     /// Single-column BM25 search.
@@ -538,7 +677,9 @@ impl FtsReader {
         term: &str,
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let dict = self.dict();
+        let fst = self.fst_bytes()?;
+        let dict =
+            DictReader::open(&fst).expect("FST CRC verified at open(); bytes must be a valid FST");
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
@@ -558,23 +699,19 @@ impl FtsReader {
             }
             FstValue::Pfor { metadata_offset } => metadata_offset as usize,
         };
-        let postings = &self.blob[self.postings_range.clone()];
+        let postings = self.postings_region();
 
         if metadata_offset + 20 > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "term metadata offset out of postings region".into(),
             )));
         }
-        let df = read_u32_le(&postings[metadata_offset..metadata_offset + 4]) as u64;
+        // One range GET for the 20-byte term metadata (013 PR4 / A2f).
+        let meta = postings.fetch(metadata_offset..metadata_offset + 20)?;
+        let df = read_u32_le(&meta[0..4]) as u64;
         // bytes [4..12] = self-offset (redundant; u64); skip
-        let postings_length =
-            read_u32_le(&postings[metadata_offset + 12..metadata_offset + 16]) as usize;
-        let num_blocks = u32::from_le_bytes([
-            postings[metadata_offset + 16],
-            postings[metadata_offset + 17],
-            postings[metadata_offset + 18],
-            postings[metadata_offset + 19],
-        ]) as usize;
+        let postings_length = read_u32_le(&meta[12..16]) as usize;
+        let num_blocks = u32::from_le_bytes([meta[16], meta[17], meta[18], meta[19]]) as usize;
 
         let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, df);
         let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
@@ -582,7 +719,10 @@ impl FtsReader {
 
         // Skip-table sits immediately after the 20-byte metadata. Each
         // entry is 16 bytes: (last_doc_id, block_offset, max_bm25_x1000,
-        // reserved). We only need (block_offset, max_bm25) here.
+        // reserved). We only need (block_offset, max_bm25) here. One
+        // range GET pulls the whole skip table; block bytes are then
+        // fetched per non-skipped block in the loop below — BMW-pruned
+        // blocks are never fetched on the cold path.
         let skip_start = metadata_offset + 20;
         let skip_end = skip_start + num_blocks * 16;
         if skip_end > postings.len() {
@@ -590,6 +730,7 @@ impl FtsReader {
                 "skip table runs past postings region".into(),
             )));
         }
+        let skip = postings.fetch(skip_start..skip_end)?;
 
         // Min-heap keyed by (score, doc_id) with reversed ordering so
         // `peek()` returns the smallest-score entry. When the heap is
@@ -626,21 +767,13 @@ impl FtsReader {
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
         for i in 0..num_blocks {
-            let entry_off = skip_start + i * 16;
+            // Skip-table entry `i` lives at `i * 16` inside the fetched
+            // `skip` buffer (which starts at `skip_start`).
+            let entry_off = i * 16;
             // bytes[entry_off..entry_off+4] = last_doc_id (unused here;
             // useful for AND-merge seek which we don't do single-term)
-            let block_offset_in_term = u32::from_le_bytes([
-                postings[entry_off + 4],
-                postings[entry_off + 5],
-                postings[entry_off + 6],
-                postings[entry_off + 7],
-            ]) as usize;
-            let max_bm25_x1000 = u32::from_le_bytes([
-                postings[entry_off + 8],
-                postings[entry_off + 9],
-                postings[entry_off + 10],
-                postings[entry_off + 11],
-            ]);
+            let block_offset_in_term = read_u32_le(&skip[entry_off + 4..entry_off + 8]) as usize;
+            let max_bm25_x1000 = read_u32_le(&skip[entry_off + 8..entry_off + 12]);
             let block_max_bm25 = (max_bm25_x1000 as f32) / 1000.0;
 
             // BMW skip: heap full AND this block can't beat the kth-best.
@@ -653,18 +786,16 @@ impl FtsReader {
 
             // Locate the block's bytes.
             let block_end_in_term = if i + 1 < num_blocks {
-                u32::from_le_bytes([
-                    postings[entry_off + 16 + 4],
-                    postings[entry_off + 16 + 5],
-                    postings[entry_off + 16 + 6],
-                    postings[entry_off + 16 + 7],
-                ]) as usize
+                read_u32_le(&skip[entry_off + 16 + 4..entry_off + 16 + 8]) as usize
             } else {
                 postings_length
             };
-            let block_bytes = &postings
-                [metadata_offset + block_offset_in_term..metadata_offset + block_end_in_term];
-            let n = decode_block(block_bytes, &mut buf_d, &mut buf_t);
+            // Per-block range GET (013 PR4 / A2f): zero-copy on
+            // warm/`InMemory`, one cold range GET on `Source::Lazy`.
+            let block_bytes = postings.fetch(
+                metadata_offset + block_offset_in_term..metadata_offset + block_end_in_term,
+            )?;
+            let n = decode_block(&block_bytes, &mut buf_d, &mut buf_t);
 
             for j in 0..n {
                 let doc_id = buf_d[j];
@@ -707,9 +838,11 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
     ) -> Result<Vec<TermCursor>, FtsError> {
-        let dict = self.dict();
+        let fst = self.fst_bytes()?;
+        let dict =
+            DictReader::open(&fst).expect("FST CRC verified at open(); bytes must be a valid FST");
         let col_meta = &self.columns[column_id as usize];
-        let postings = &self.blob[self.postings_range.clone()];
+        let postings = self.postings_region();
 
         let mut cursors: Vec<TermCursor> = Vec::with_capacity(terms.len());
         for term in terms {
@@ -770,7 +903,7 @@ impl FtsReader {
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
-        let postings = &self.blob[self.postings_range.clone()];
+        let postings = self.postings_region();
 
         // Min-heap of (score, doc_id) for top-k. Same shape as
         // `search_single_term_bmw`'s heap entry.
@@ -894,7 +1027,7 @@ impl FtsReader {
                         effective_target = d;
                     }
                 }
-                cursors[idx[0]].skip_to(effective_target, postings);
+                cursors[idx[0]].skip_to(effective_target, postings)?;
                 continue;
             }
 
@@ -911,7 +1044,7 @@ impl FtsReader {
             let mut aligned = true;
             for &ci in &idx[..=pivot_j] {
                 if cursors[ci].current_doc_id() < pivot_doc {
-                    cursors[ci].skip_to(pivot_doc, postings);
+                    cursors[ci].skip_to(pivot_doc, postings)?;
                     if cursors[ci].current_doc_id() != pivot_doc {
                         aligned = false;
                         break;
@@ -967,7 +1100,7 @@ impl FtsReader {
             // cursors past the prefix that happened to be at it).
             for cursor in cursors.iter_mut() {
                 if cursor.current_doc_id() == pivot_doc {
-                    cursor.next(postings);
+                    cursor.next(postings)?;
                 }
             }
         }
@@ -1058,7 +1191,7 @@ impl FtsReader {
         }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
-        let postings = &self.blob[self.postings_range.clone()];
+        let postings = self.postings_region();
 
         // Smallest-df cursor at index 0 = leader. The remaining order
         // doesn't matter for correctness but ascending-df reduces the
@@ -1078,9 +1211,9 @@ impl FtsReader {
         // straightforwardly generalize and the per-doc leapfrog still
         // amortizes well with the block-max pruning below.
         if cursors.len() == 2 {
-            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, postings, k, &mut heap);
+            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, postings, k, &mut heap)?;
         } else {
-            self.run_and_intersect_general(&mut cursors, dl_norm_k1, postings, k, &mut heap);
+            self.run_and_intersect_general(&mut cursors, dl_norm_k1, postings, k, &mut heap)?;
         }
 
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
@@ -1105,10 +1238,10 @@ impl FtsReader {
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
-        postings: &[u8],
+        postings: PostingsRegion<'_>,
         k: usize,
         heap: &mut BinaryHeap<AndHeapEntry>,
-    ) {
+    ) -> Result<(), FtsError> {
         'outer: loop {
             if cursors[0].is_exhausted() {
                 break;
@@ -1130,7 +1263,7 @@ impl FtsReader {
                     other_ub += c.block_max_in_range(range_start, range_end);
                 }
                 if leader_block_max + other_ub <= heap_min {
-                    cursors[0].skip_to(range_end.saturating_add(1), postings);
+                    cursors[0].skip_to(range_end.saturating_add(1), postings)?;
                     continue;
                 }
             }
@@ -1146,7 +1279,7 @@ impl FtsReader {
             let mut max_other = leader_doc;
             let mut crossed_block = false;
             for c in cursors[1..].iter_mut() {
-                c.skip_to(leader_doc, postings);
+                c.skip_to(leader_doc, postings)?;
                 if c.is_exhausted() {
                     break 'outer;
                 }
@@ -1159,7 +1292,7 @@ impl FtsReader {
                 }
             }
             if max_other > leader_doc {
-                cursors[0].skip_to(max_other, postings);
+                cursors[0].skip_to(max_other, postings)?;
                 if cursors[0].is_exhausted() {
                     break 'outer;
                 }
@@ -1232,14 +1365,15 @@ impl FtsReader {
             // loop's alignment step re-pulls everyone to the new leader
             // doc on the next iteration.
             if c0.pos >= c0.block_n {
-                c0.next(postings);
+                c0.next(postings)?;
             }
             for o in others.iter_mut() {
                 if o.pos >= o.block_n {
-                    o.next(postings);
+                    o.next(postings)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// 2-term specialization. While both cursors share a doc-id region
@@ -1253,10 +1387,10 @@ impl FtsReader {
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
-        postings: &[u8],
+        postings: PostingsRegion<'_>,
         k: usize,
         heap: &mut BinaryHeap<AndHeapEntry>,
-    ) {
+    ) -> Result<(), FtsError> {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
         // can read both cursors' decoded buffers and update both
@@ -1278,7 +1412,7 @@ impl FtsReader {
                 let ub =
                     c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
                 if ub <= heap_min {
-                    c0.skip_to(range_end.saturating_add(1), postings);
+                    c0.skip_to(range_end.saturating_add(1), postings)?;
                     continue;
                 }
             }
@@ -1287,7 +1421,7 @@ impl FtsReader {
             // call both cursors are positioned on doc_ids >= leader.
             // If c1 jumped past the leader's current block we'll bump
             // the leader via the outer loop's next iteration.
-            c1.skip_to(c0.current_doc_id(), postings);
+            c1.skip_to(c0.current_doc_id(), postings)?;
             if c1.is_exhausted() {
                 break 'outer;
             }
@@ -1298,7 +1432,7 @@ impl FtsReader {
             // the within-block divergence inline.
             if c1.current_doc_id() > c0.current_doc_id() {
                 let crossed_block = c1.current_doc_id() > c0.current_block_last_doc_id();
-                c0.skip_to(c1.current_doc_id(), postings);
+                c0.skip_to(c1.current_doc_id(), postings)?;
                 if c0.is_exhausted() {
                     break 'outer;
                 }
@@ -1346,12 +1480,13 @@ impl FtsReader {
             // block; the other holds. The outer loop re-checks
             // is_exhausted and re-aligns on the next iteration.
             if i >= lb_n {
-                c0.next(postings);
+                c0.next(postings)?;
             }
             if j >= rb_n {
-                c1.next(postings);
+                c1.next(postings)?;
             }
         }
+        Ok(())
     }
 
     /// MaxScore+BMM constrained to the doc_id half-open range
@@ -1384,7 +1519,7 @@ impl FtsReader {
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
-        let postings = &self.blob[self.postings_range.clone()];
+        let postings = self.postings_region();
 
         // Sub-range seek: jump every cursor past any doc_id below
         // the lower bound. Cursors already past the bound stay where
@@ -1394,7 +1529,7 @@ impl FtsReader {
         // never score.
         if doc_id_start > 0 {
             for cursor in &mut cursors {
-                cursor.skip_to(doc_id_start, postings);
+                cursor.skip_to(doc_id_start, postings)?;
             }
         }
 
@@ -1483,7 +1618,7 @@ impl FtsReader {
                     + (total_term_ub - cursors[0].term_max_bm25);
                 if block_ub <= threshold {
                     let end = cursors[0].current_block_last_doc_id();
-                    cursors[0].skip_to(end.saturating_add(1), postings);
+                    cursors[0].skip_to(end.saturating_add(1), postings)?;
                     continue;
                 }
 
@@ -1512,7 +1647,7 @@ impl FtsReader {
                         // No combination of non-essential
                         // contributions at `candidate` can push it
                         // above threshold. Skip lookup + heap.
-                        cursors[0].next(postings);
+                        cursors[0].next(postings)?;
                         continue;
                     }
                     // SIMD-pack non-essentials at `candidate`.
@@ -1521,7 +1656,7 @@ impl FtsReader {
                     let mut packed = 1;
                     let mut score: f32 = 0.0;
                     for cursor in cursors.iter_mut().skip(1) {
-                        cursor.skip_to(candidate, postings);
+                        cursor.skip_to(candidate, postings)?;
                         if cursor.current_doc_id() == candidate {
                             idfs[packed] = cursor.idf_x_k1p1;
                             tfs[packed] = cursor.current_tf() as f32;
@@ -1560,7 +1695,7 @@ impl FtsReader {
                         }
                     }
 
-                    cursors[0].next(postings);
+                    cursors[0].next(postings)?;
 
                     if f_changed {
                         break;
@@ -1621,7 +1756,7 @@ impl FtsReader {
             let others_ub = total_term_ub - leftmost_term_ub;
             if leftmost_block_ub + others_ub <= threshold {
                 let last_in_block = cursors[leftmost_essential].current_block_last_doc_id();
-                cursors[leftmost_essential].skip_to(last_in_block.saturating_add(1), postings);
+                cursors[leftmost_essential].skip_to(last_in_block.saturating_add(1), postings)?;
                 continue;
             }
 
@@ -1679,7 +1814,7 @@ impl FtsReader {
                         if score + remaining_block_ub <= threshold {
                             break;
                         }
-                        cursor.skip_to(candidate, postings);
+                        cursor.skip_to(candidate, postings)?;
                         if cursor.current_doc_id() == candidate {
                             score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
                                 cursor.idf_x_k1p1,
@@ -1718,7 +1853,7 @@ impl FtsReader {
             // needed for the next candidate.)
             for cursor in cursors.iter_mut().take(f_essential) {
                 if cursor.current_doc_id() == candidate {
-                    cursor.next(postings);
+                    cursor.next(postings)?;
                 }
             }
         }
@@ -1797,7 +1932,7 @@ impl FtsReader {
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
-        let postings = &self.blob[self.postings_range.clone()];
+        let postings = self.postings_region();
 
         #[derive(Debug, Copy, Clone)]
         struct HeapEntry(f32, u32);
@@ -1862,7 +1997,7 @@ impl FtsReader {
                         tfs = [0.0; 4];
                         packed = 0;
                     }
-                    cursor.next(postings);
+                    cursor.next(postings)?;
                 }
             }
             if packed > 0 {
@@ -2162,22 +2297,22 @@ struct TermCursor {
 impl TermCursor {
     /// Parse one term's metadata + skip table out of the FTS postings
     /// region and decode its first block.
-    fn new(postings: &[u8], metadata_offset: usize, n_docs: u64) -> Result<Self, FtsError> {
+    fn new(
+        postings: PostingsRegion<'_>,
+        metadata_offset: usize,
+        n_docs: u64,
+    ) -> Result<Self, FtsError> {
         if metadata_offset + 20 > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "term metadata offset out of postings region".into(),
             )));
         }
-        let df = read_u32_le(&postings[metadata_offset..metadata_offset + 4]) as u64;
+        // One range GET for the 20-byte term metadata (013 PR4 / A2f).
+        let meta = postings.fetch(metadata_offset..metadata_offset + 20)?;
+        let df = read_u32_le(&meta[0..4]) as u64;
         // bytes [4..12] = self-offset (redundant; u64); skip
-        let postings_length =
-            read_u32_le(&postings[metadata_offset + 12..metadata_offset + 16]) as usize;
-        let num_blocks = u32::from_le_bytes([
-            postings[metadata_offset + 16],
-            postings[metadata_offset + 17],
-            postings[metadata_offset + 18],
-            postings[metadata_offset + 19],
-        ]) as usize;
+        let postings_length = read_u32_le(&meta[12..16]) as usize;
+        let num_blocks = u32::from_le_bytes([meta[16], meta[17], meta[18], meta[19]]) as usize;
 
         let idf = crate::superfile::fts::bm25::idf(n_docs, df);
 
@@ -2188,24 +2323,29 @@ impl TermCursor {
                 "skip table runs past postings region".into(),
             )));
         }
+        // One range GET for the whole skip table — parsed into
+        // `blocks` here so search-time access is RAM-resident; only
+        // the block bytes themselves are fetched lazily per block.
+        let skip = postings.fetch(skip_start..skip_end)?;
 
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(num_blocks);
         let mut term_max_bm25: f32 = 0.0;
         for i in 0..num_blocks {
-            let entry_off = skip_start + i * 16;
-            let last_doc_id = read_u32_le(&postings[entry_off..entry_off + 4]);
-            let block_offset_in_term =
-                read_u32_le(&postings[entry_off + 4..entry_off + 8]) as usize;
-            let max_bm25_x1000 = read_u32_le(&postings[entry_off + 8..entry_off + 12]);
+            // Entry `i` lives at `i * 16` inside the fetched `skip`
+            // buffer (which starts at `skip_start`).
+            let entry_off = i * 16;
+            let last_doc_id = read_u32_le(&skip[entry_off..entry_off + 4]);
+            let block_offset_in_term = read_u32_le(&skip[entry_off + 4..entry_off + 8]) as usize;
+            let max_bm25_x1000 = read_u32_le(&skip[entry_off + 8..entry_off + 12]);
             let block_max_bm25 = (max_bm25_x1000 as f32) / 1000.0;
             // bytes [12..16] = reserved.
             term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
             let block_byte_offset = metadata_offset + block_offset_in_term;
             let block_byte_end = if i + 1 < num_blocks {
-                let next_entry_off = skip_start + (i + 1) * 16;
+                let next_entry_off = (i + 1) * 16;
                 let next_block_offset_in_term =
-                    read_u32_le(&postings[next_entry_off + 4..next_entry_off + 8]) as usize;
+                    read_u32_le(&skip[next_entry_off + 4..next_entry_off + 8]) as usize;
                 metadata_offset + next_block_offset_in_term
             } else {
                 metadata_offset + postings_length
@@ -2230,7 +2370,7 @@ impl TermCursor {
             inspect_block: 0,
         };
         if !cursor.blocks.is_empty() {
-            cursor.decode_current_block(postings);
+            cursor.decode_current_block(postings)?;
         }
         Ok(cursor)
     }
@@ -2276,11 +2416,14 @@ impl TermCursor {
         }
     }
 
-    fn decode_current_block(&mut self, postings: &[u8]) {
-        let block = &self.blocks[self.current_block];
-        let bytes = &postings[block.block_byte_offset..block.block_byte_end];
-        self.block_n = decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs);
+    fn decode_current_block(&mut self, postings: PostingsRegion<'_>) -> Result<(), FtsError> {
+        let block = self.blocks[self.current_block];
+        // Per-block range GET (013 PR4 / A2f): zero-copy slice on
+        // warm / `InMemory`, one cold range GET on `Source::Lazy`.
+        let bytes = postings.fetch(block.block_byte_offset..block.block_byte_end)?;
+        self.block_n = decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs);
         self.pos = 0;
+        Ok(())
     }
 
     fn is_exhausted(&self) -> bool {
@@ -2421,9 +2564,9 @@ impl TermCursor {
 
     /// Advance one position. Crosses block boundaries automatically;
     /// decodes the next block on demand.
-    fn next(&mut self, postings: &[u8]) {
+    fn next(&mut self, postings: PostingsRegion<'_>) -> Result<(), FtsError> {
         if self.is_exhausted() {
-            return;
+            return Ok(());
         }
         self.pos += 1;
         if self.pos >= self.block_n {
@@ -2432,9 +2575,10 @@ impl TermCursor {
                 self.inspect_block = self.current_block;
             }
             if self.current_block < self.blocks.len() {
-                self.decode_current_block(postings);
+                self.decode_current_block(postings)?;
             }
         }
+        Ok(())
     }
 
     /// Skip forward so `current_doc_id() >= target`. Uses the skip
@@ -2443,9 +2587,9 @@ impl TermCursor {
     /// already-decoded current block) is just an inlined `pos++`
     /// scan — no re-decode, no `is_exhausted` rechecks.
     #[inline(always)]
-    fn skip_to(&mut self, target: u32, postings: &[u8]) {
+    fn skip_to(&mut self, target: u32, postings: PostingsRegion<'_>) -> Result<(), FtsError> {
         if self.is_exhausted() {
-            return;
+            return Ok(());
         }
         let cur_block = self.current_block;
         let cur_block_last = self.blocks[cur_block].last_doc_id;
@@ -2459,12 +2603,12 @@ impl TermCursor {
                 self.pos += 1;
             }
             if self.pos < n {
-                return;
+                return Ok(());
             }
             // Walked off the end of the decoded block (rare under
             // skip-table invariants); fall through to cross-block.
         }
-        self.skip_to_cross_block(target, postings);
+        self.skip_to_cross_block(target, postings)
     }
 
     /// Cross-block path of `skip_to`: target is past the current
@@ -2473,7 +2617,11 @@ impl TermCursor {
     /// Pulled out so the within-block fast path stays small enough
     /// to inline at every call site.
     #[cold]
-    fn skip_to_cross_block(&mut self, target: u32, postings: &[u8]) {
+    fn skip_to_cross_block(
+        &mut self,
+        target: u32,
+        postings: PostingsRegion<'_>,
+    ) -> Result<(), FtsError> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < target
         {
@@ -2483,9 +2631,9 @@ impl TermCursor {
             self.inspect_block = self.current_block;
         }
         if self.is_exhausted() {
-            return;
+            return Ok(());
         }
-        self.decode_current_block(postings);
+        self.decode_current_block(postings)?;
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < target {
             self.pos += 1;
         }
@@ -2495,9 +2643,10 @@ impl TermCursor {
                 self.inspect_block = self.current_block;
             }
             if self.current_block < self.blocks.len() {
-                self.decode_current_block(postings);
+                self.decode_current_block(postings)?;
             }
         }
+        Ok(())
     }
 }
 
