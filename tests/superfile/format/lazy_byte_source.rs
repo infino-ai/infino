@@ -527,6 +527,269 @@ async fn vector_open_lazy_sq8_pulls_only_open_time_region() {
     assert!(!hits.is_empty(), "lazy vector search should return hits");
 }
 
+// ============================================================
+// 013 PR5 (A3f): FTS lazy open-time region tightening.
+//
+// Asserts that lazy-opening an FTS-bearing superfile over a
+// real range-fetching source pulls only the open-time region
+// of the FTS blob — the 48-byte header plus the doc-lengths
+// region (directory + per-column arrays, contiguous at the
+// blob tail) — and never the FST or postings, which are
+// query-time only.
+//
+// Plan target (single text column, `verify_crc = false`):
+//   - 2 GETs for the Parquet footer (trailer + body).
+//   - 1 GET for the FTS header (48 B at the blob start).
+//   - 1 GET for the doc-lengths region (dir + dir-CRC + every
+//     per-column array + CRC, all contiguous — one GET
+//     regardless of column count after PR5; pre-PR5 this was
+//     one GET per column array on top of the dir).
+//
+// So the cold-open ceiling is **4 GETs** at single text
+// column, independent of `n_docs`. A cold first single-term
+// BM25 query then pulls the FST + only the touched postings
+// blocks on top — never the whole blob.
+// ============================================================
+
+/// `n_docs` for the PR5 FTS cold-open budget fixture. Large
+/// enough that the FST + postings dominate the segment so an
+/// open that touched them would blow the byte ceiling, and so
+/// the per-doc doc-lengths array (`4 × n_docs` = 16 KiB at
+/// 4096) is itself a non-trivial slice of the open-time
+/// region.
+const PR5_FTS_FIXTURE_N_DOCS: u32 = 4096;
+
+/// FTS-only superfile fixture for the PR5 open-time region
+/// tests. Single text column, `n_docs` rows over a *tiny*
+/// vocabulary so the FST stays small relative to the postings
+/// (the cold-search test wants the FST fetch to be cheap and
+/// the dominant cost to be the postings the cursor touches):
+///   - every doc carries the high-frequency `common` term, so
+///     its postings list spans many blocks and is the largest
+///     single region of the blob;
+///   - every 7th doc additionally carries the sparse `special`
+///     term used by the cold single-term search test.
+///
+/// A single-term `special` query must therefore pull the FST +
+/// only `special`'s (sparse) postings blocks — never the big
+/// `common` postings list.
+fn build_fts_superfile_bytes(n_docs: u32) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("builder");
+    let ids = decimal128_ids(0..n_docs as u64);
+    let titles: Vec<String> = (0..n_docs)
+        .map(|i| {
+            if i % 7 == 0 {
+                "common special".to_string()
+            } else {
+                "common".to_string()
+            }
+        })
+        .collect();
+    let title_strs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
+    let titles_arr = LargeStringArray::from(title_strs);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles_arr)]).expect("batch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    Bytes::from(b.finish().expect("finish"))
+}
+
+/// Lazy-open with a single FTS text column. Cold-open budget:
+/// ≤ 4 range GETs at the underlying source — 2 Parquet footer
+/// GETs (trailer + body) + 1 FTS header + 1 doc-lengths region
+/// (dir + per-column arrays, collapsed into a single tail GET
+/// by PR5). The FST and postings regions must NOT be touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_open_lazy_pulls_only_open_time_region() {
+    let dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+    let bytes = build_fts_superfile_bytes(PR5_FTS_FIXTURE_N_DOCS);
+    let uri = "data/fts-seg.sf";
+    local.put_atomic(uri, bytes.clone()).await.expect("seed");
+
+    let proxy = ByteCountingProxy::new(local);
+    let source: Arc<dyn LazyByteSource> = Arc::new(
+        StorageRangeSource::new(Arc::clone(&proxy) as Arc<dyn StorageProvider>, uri)
+            .await
+            .expect("source"),
+    );
+    let opts = infino::superfile::reader::OpenOptions { verify_crc: false };
+    let reader = SuperfileReader::open_lazy_with(source, opts)
+        .await
+        .expect("lazy open");
+
+    let calls = proxy.get_range_calls.load(Ordering::Acquire);
+    let ranges = proxy.ranges();
+    // Exact cold-open shape: 2 Parquet footer GETs (trailer +
+    // body) + 1 FTS header + 1 doc-lengths region. Pinned, not
+    // a ceiling — a regression that re-introduced per-column
+    // array GETs or touched the FST/postings would change this.
+    assert_eq!(
+        calls, 4,
+        "FTS cold-open should be exactly 4 range GETs (2 footer + 1 FTS \
+         header + 1 doc-lengths region); got {calls} ranges {ranges:?}"
+    );
+
+    // The doc-lengths region is the single largest open-time
+    // fetch: directory (n_cols × 16) + dir CRC (4) + per column
+    // (4 × n_docs array + 4 CRC). For 1 column / 4096 docs that
+    // is exactly 16408 B. The FST + postings (the bulk of the
+    // FTS blob) sit *before* it and must never be pulled at
+    // open, so no single GET may exceed the doc-lengths region.
+    let n_cols = 1u64;
+    let n_docs = PR5_FTS_FIXTURE_N_DOCS as u64;
+    let dl_region_bytes = (n_cols * 16 + 4) + n_cols * (4 * n_docs + 4);
+    let max_get = ranges.iter().map(|(_, len)| *len).max().unwrap_or(0);
+    assert_eq!(
+        max_get, dl_region_bytes,
+        "largest cold-open GET should be the {dl_region_bytes} B doc-lengths \
+         region; got {max_get} B — a larger GET means the FST/postings or a \
+         Parquet row group was pulled. ranges={ranges:?}"
+    );
+    // And exactly one GET of exactly 48 B: the FTS header.
+    let header_gets = ranges.iter().filter(|(_, len)| *len == 48).count();
+    assert_eq!(
+        header_gets, 1,
+        "expected exactly one 48 B FTS-header GET; ranges={ranges:?}"
+    );
+
+    // Reader functions: FTS reader present, no vector.
+    assert!(reader.fts().is_some());
+    assert!(reader.vec().is_none());
+}
+
+/// Open a fresh lazy `SuperfileReader` over `uri` through its
+/// own [`ByteCountingProxy`], so each call gets a cold source
+/// with independent range accounting.
+async fn open_lazy_fts_with_proxy(
+    local: Arc<dyn StorageProvider>,
+    uri: &str,
+) -> (SuperfileReader, Arc<ByteCountingProxy>) {
+    let proxy = ByteCountingProxy::new(local);
+    let source: Arc<dyn LazyByteSource> = Arc::new(
+        StorageRangeSource::new(Arc::clone(&proxy) as Arc<dyn StorageProvider>, uri)
+            .await
+            .expect("source"),
+    );
+    let opts = infino::superfile::reader::OpenOptions { verify_crc: false };
+    let reader = SuperfileReader::open_lazy_with(source, opts)
+        .await
+        .expect("lazy open");
+    (reader, proxy)
+}
+
+/// A cold first single-term BM25 query on a lazily-opened FTS
+/// reader pulls the FST + only the postings blocks the cursor
+/// actually touches — never the whole blob, and in particular
+/// never the dense `common` postings list when querying the
+/// sparse `special` term.
+///
+/// Strict assertions (pin the actual behavior, not a ceiling):
+///  - the sparse `special` query returns the full top-k;
+///  - every search-time GET is block-granular (no single fetch
+///    is large enough to be a whole region / the segment);
+///  - the FST is fetched exactly once;
+///  - a `special` query reads strictly fewer postings bytes
+///    than a `common` query — i.e. it provably skips the big
+///    `common` postings list rather than scanning the blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_cold_single_term_search_pulls_only_touched_postings() {
+    let dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+    let bytes = build_fts_superfile_bytes(PR5_FTS_FIXTURE_N_DOCS);
+    let total = bytes.len() as u64;
+    let uri = "data/fts-seg-search.sf";
+    local.put_atomic(uri, bytes.clone()).await.expect("seed");
+
+    // Sums the byte lengths of a slice of recorded ranges.
+    fn sum_bytes(rs: &[(u64, u64)]) -> u64 {
+        rs.iter().map(|(_, len)| *len).sum()
+    }
+
+    // --- Sparse term `special` (every 7th doc). ---
+    let (reader, proxy) = open_lazy_fts_with_proxy(Arc::clone(&local), uri).await;
+    let open_ranges = proxy.ranges().len();
+    let hits = reader
+        .bm25_search("title", "special", 10, BoolMode::Or)
+        .expect("bm25 search on lazy reader");
+    let all_ranges = proxy.ranges();
+    let special_search = &all_ranges[open_ranges..];
+
+    // 586 docs match `special` (ceil(4096 / 7)); top-k = 10.
+    assert_eq!(
+        hits.len(),
+        10,
+        "expected the full top-10 for the sparse `special` term; got {}",
+        hits.len()
+    );
+
+    // Block-granular: the cursor fetches the FST, per-term
+    // metadata, the skip table, and individual postings blocks
+    // — each a small fetch. No single search GET may be large
+    // enough to be a whole region pull. 1 KiB is comfortably
+    // above the per-block size while well below any region.
+    let max_search_get = special_search
+        .iter()
+        .map(|(_, len)| *len)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_search_get <= 1024,
+        "every cold-search GET should be block-granular (≤ 1 KiB); largest \
+         was {max_search_get} B — that looks like a bulk region fetch. \
+         search ranges={special_search:?}"
+    );
+
+    let special_search_bytes = sum_bytes(special_search);
+    assert!(
+        special_search_bytes < total / 8,
+        "cold `special` search pulled {special_search_bytes} B (segment \
+         {total} B) — should be a small fraction. ranges={special_search:?}"
+    );
+
+    // --- Dense term `common` (every doc) on a fresh cold reader. ---
+    let (reader2, proxy2) = open_lazy_fts_with_proxy(Arc::clone(&local), uri).await;
+    let open_ranges2 = proxy2.ranges().len();
+    let common_hits = reader2
+        .bm25_search("title", "common", 10, BoolMode::Or)
+        .expect("bm25 search on lazy reader");
+    assert_eq!(
+        common_hits.len(),
+        10,
+        "dense `common` term should fill top-10"
+    );
+    let all_ranges2 = proxy2.ranges();
+    let common_search = &all_ranges2[open_ranges2..];
+    let common_search_bytes = sum_bytes(common_search);
+
+    // The headline property: querying the sparse `special` term
+    // reads strictly fewer postings bytes than querying the
+    // dense `common` term. If the search ignored term locality
+    // and pulled the whole postings region (or the blob), the
+    // two would be equal. The gap proves `special` genuinely
+    // skips the large `common` postings list.
+    assert!(
+        special_search_bytes < common_search_bytes,
+        "sparse `special` ({special_search_bytes} B) should read fewer \
+         postings bytes than dense `common` ({common_search_bytes} B); \
+         special={special_search:?} common={common_search:?}"
+    );
+}
+
 #[tokio::test]
 async fn storage_range_source_out_of_bounds_surfaces_typed_error() {
     let dir = TempDir::new().expect("tempdir");

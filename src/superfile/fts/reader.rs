@@ -334,18 +334,42 @@ impl FtsReader {
             ))));
         }
 
-        // Read doc-lengths directory: n_columns × 16-byte entries + 4-byte CRC.
+        // Doc-lengths region — 013 PR5 (A3f). The directory and every
+        // per-column doc-lengths array are contiguous at the tail of
+        // the FTS blob (`[doc_lengths_table_offset, blob_end)`), so a
+        // single range GET covers the whole open-time region:
+        //
+        //   [dir: n_cols × 16][dir CRC: 4] then,
+        //   per column: [dl array: 4 × n_docs][array CRC: 4]
+        //
+        // On a cold `Source::Lazy` this is exactly **one** GET
+        // regardless of column count (the per-column arrays were
+        // separate GETs before PR5); on `Source::InMemory` / warm it's
+        // a zero-copy `Bytes::slice`. The FST + postings regions that
+        // sit before it are never fetched at open — they're
+        // query-time only. So FTS cold open is header (1 GET) +
+        // doc-lengths region (1 GET) against the FTS sub-source,
+        // independent of `n_columns`.
         let dir_size = n_columns * 16;
-        let dir_with_crc = source
-            .get_range(doc_lengths_table_offset..doc_lengths_table_offset + dir_size + 4)
+        let dl_region = source
+            .get_range(doc_lengths_table_offset..source_len)
             .map_err(|e| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts doc-lengths directory: {e}"
+                    "fts doc-lengths region: {e}"
                 )))
             })?;
-        let dir_bytes = &dir_with_crc[..dir_size];
+        if dir_size + 4 > dl_region.len() {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "fts doc-lengths directory runs past blob end".into(),
+            )));
+        }
+        // All slices below index into `dl_region`, which starts at
+        // `doc_lengths_table_offset` in the blob's coordinate space —
+        // hence the `- doc_lengths_table_offset` translation for the
+        // per-column array offsets recorded (absolute) in the dir.
+        let dir_bytes = &dl_region[..dir_size];
         if opts.verify_crc {
-            let dir_crc_expected = read_u32_le(&dir_with_crc[dir_size..dir_size + 4]);
+            let dir_crc_expected = read_u32_le(&dl_region[dir_size..dir_size + 4]);
             let dir_crc_actual = crc32c(dir_bytes);
             if dir_crc_expected != dir_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
@@ -377,27 +401,23 @@ impl FtsReader {
                 ))));
             }
 
-            // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte CRC.
-            // This is the open-time region the `dl_norm_k1` BM25
+            // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte
+            // CRC. This is the open-time region the `dl_norm_k1` BM25
             // precompute needs random-access to in the scoring loop,
-            // so it's materialised at open even on the lazy path.
+            // so it's materialised at open even on the lazy path —
+            // sliced here out of the single `dl_region` fetch above.
             let array_byte_len = 4 * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
-            if array_end + 4 > source_len {
+            if doc_lengths_offset < doc_lengths_table_offset || array_end + 4 > source_len {
                 return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                     "doc-lengths array {i} runs past blob end"
                 ))));
             }
-            let array_with_crc = source
-                .get_range(doc_lengths_offset..array_end + 4)
-                .map_err(|e| {
-                    FtsError::Read(ReadError::MalformedVersion(format!(
-                        "fts doc-lengths array {i}: {e}"
-                    )))
-                })?;
-            let array_bytes = &array_with_crc[..array_byte_len];
+            let rel = doc_lengths_offset - doc_lengths_table_offset;
+            let array_bytes = &dl_region[rel..rel + array_byte_len];
             if opts.verify_crc {
-                let array_crc_expected = read_u32_le(&array_with_crc[array_byte_len..]);
+                let array_crc_expected =
+                    read_u32_le(&dl_region[rel + array_byte_len..rel + array_byte_len + 4]);
                 let array_crc_actual = crc32c(array_bytes);
                 if array_crc_expected != array_crc_actual {
                     return Err(FtsError::Read(ReadError::ChecksumMismatch {
