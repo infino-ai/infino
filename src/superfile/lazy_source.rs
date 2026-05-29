@@ -394,6 +394,94 @@ impl Source {
             }
         }
     }
+
+    /// Batch range fetch — resolves a set of **data-independent**
+    /// ranges, returning one [`Bytes`] per input range in input
+    /// order (013 PR6 / A4v).
+    ///
+    /// Each range first tries the [`Self::try_get_range_sync`]
+    /// zero-copy fast path. Any ranges that miss on a cold
+    /// `Source::Lazy` are fetched **concurrently** via
+    /// `try_join_all` under a *single* `block_on` bridge, turning
+    /// N sequential cold round-trips into one batched fan-out
+    /// (e.g. the `2 × nprobe` per-cluster codes + doc_ids GETs in
+    /// vector search). The async surface stays hidden behind the
+    /// same bridge points [`Self::get_range`] uses, so callers
+    /// remain sync.
+    ///
+    /// On `Source::InMemory` and warm `Source::Lazy` every range
+    /// hits the sync path and no bridge fires — identical cost to
+    /// calling [`Self::get_range`] in a loop, with the same
+    /// zero-copy slices. The parallel path engages only for
+    /// genuine cold misses.
+    pub fn get_ranges(&self, ranges: &[Range<usize>]) -> Result<Vec<Bytes>, LazyByteSourceError> {
+        // First pass: try the sync fast path for every range and
+        // record which ones miss.
+        let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut misses: Vec<usize> = Vec::new();
+        for (i, r) in ranges.iter().enumerate() {
+            match self.try_get_range_sync(r.clone()) {
+                Some(b) => out.push(Some(b)),
+                None => {
+                    out.push(None);
+                    misses.push(i);
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(out
+                .into_iter()
+                .map(|b| b.expect("every range hit the sync fast path"))
+                .collect());
+        }
+
+        // Cold misses can only happen on `Source::Lazy`:
+        // `Source::InMemory` satisfies `try_get_range_sync` for
+        // every in-bounds range, so a miss there is out-of-bounds.
+        let Self::Lazy(s) = self else {
+            let r = &ranges[misses[0]];
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: r.start as u64,
+                len: r.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+
+        // Fan the misses out concurrently and join under one
+        // bridge. `try_join_all` preserves input order of the
+        // `misses` slice, so we can scatter the results back.
+        let fetch_all = async {
+            let futs = misses
+                .iter()
+                .map(|&i| s.range(ranges[i].start as u64, ranges[i].len() as u64));
+            futures::future::try_join_all(futs).await
+        };
+        let fetched = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fetch_all)),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
+                            uri: "lazy-source://superfile".to_string(),
+                            source: Box::new(std::io::Error::other(format!(
+                                "tokio runtime build for lazy source batch fetch: {e}"
+                            ))),
+                        })
+                    })?;
+                rt.block_on(fetch_all)
+            }
+        }?;
+
+        for (slot, bytes) in misses.iter().zip(fetched) {
+            out[*slot] = Some(bytes);
+        }
+        Ok(out
+            .into_iter()
+            .map(|b| b.expect("every miss filled by the batch fetch"))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -561,5 +649,95 @@ mod tests {
         }
         // sync path same shape.
         assert!(sub.try_get_range_sync(6, 4).is_none());
+    }
+
+    /// Async-only test source: `try_get_range_sync` always
+    /// returns `None`, so every `get_ranges` fetch is forced
+    /// through the async/parallel path. Records the ranges its
+    /// async `range()` is asked for.
+    struct AsyncOnlySource {
+        inner: BytesLazyByteSource,
+        ranges: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl AsyncOnlySource {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                inner: BytesLazyByteSource::new(bytes),
+                ranges: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LazyByteSource for AsyncOnlySource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.ranges
+                .lock()
+                .expect("ranges mutex poisoned")
+                .push((start, len));
+            self.inner.range(start, len).await
+        }
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// `Source::get_ranges` on `Source::InMemory` returns one
+    /// `Bytes` per input range, in input order, each a zero-copy
+    /// slice — every range hits the sync fast path (no bridge).
+    #[test]
+    fn get_ranges_in_memory_preserves_order() {
+        let payload = Bytes::from((0u8..32).collect::<Vec<u8>>());
+        let src = Source::InMemory(payload.clone());
+        let got = src
+            .get_ranges(&[4..8, 0..2, 20..24])
+            .expect("in-memory batch always succeeds for in-bounds ranges");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref(), &payload[4..8]);
+        assert_eq!(got[1].as_ref(), &payload[0..2]);
+        assert_eq!(got[2].as_ref(), &payload[20..24]);
+    }
+
+    /// An out-of-bounds range in the batch surfaces a typed
+    /// `OutOfBounds` error (from the `InMemory` sync miss arm).
+    #[test]
+    fn get_ranges_in_memory_out_of_bounds_errors() {
+        let src = Source::InMemory(Bytes::from(vec![0u8; 8]));
+        let err = src
+            .get_ranges(&[0..4, 6..100])
+            .expect_err("batch with an OOB range must error");
+        assert!(
+            matches!(err, LazyByteSourceError::OutOfBounds { .. }),
+            "expected OutOfBounds, got {err:?}"
+        );
+    }
+
+    /// `Source::get_ranges` over a cold async-only `Source::Lazy`
+    /// returns the correct bytes in input order, issuing one
+    /// `range()` per input range through the batched bridge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_ranges_cold_lazy_preserves_order_and_values() {
+        let payload = Bytes::from((0u8..64).collect::<Vec<u8>>());
+        let inner = Arc::new(AsyncOnlySource::new(payload.clone()));
+        let src = Source::Lazy(Arc::clone(&inner) as Arc<dyn LazyByteSource>);
+
+        let req = [10..14, 0..4, 60..64, 32..40];
+        let got =
+            tokio::task::block_in_place(|| src.get_ranges(&req)).expect("cold batch must succeed");
+
+        assert_eq!(got.len(), req.len());
+        for (g, r) in got.iter().zip(req.iter()) {
+            assert_eq!(g.as_ref(), &payload[r.clone()]);
+        }
+        // Every range was fetched via the async path (sync
+        // disabled), one `range()` call each.
+        let recorded = inner.ranges.lock().expect("ranges mutex poisoned").clone();
+        assert_eq!(recorded.len(), req.len());
+        assert!(recorded.contains(&(10, 4)));
+        assert!(recorded.contains(&(32, 8)));
     }
 }

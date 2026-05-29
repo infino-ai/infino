@@ -707,6 +707,19 @@ impl VectorReader {
     /// `(off, cnt)` is the cluster's entry and `i` is the
     /// in-cluster index), so there is no `doc_to_pos` lookup
     /// table at all.
+    ///
+    /// The `2 × nprobe` per-cluster ranges are data-independent
+    /// (all offsets are known from `cluster_idx`), so they are
+    /// fetched in one **parallel batch** via
+    /// [`Source::get_ranges`] (013 PR6 / A4v): on a cold
+    /// `Source::Lazy` the `2 × nprobe` GETs fan out concurrently
+    /// under a single `block_on` bridge rather than serially,
+    /// turning `2 × nprobe` round-trips into one. The range
+    /// *count* is unchanged — the win is cold-search wall-clock
+    /// (≈ `2 × nprobe × RTT` → ≈ `1 × RTT` for the cluster
+    /// stage). The centroid + cluster_idx prefetch and the
+    /// rerank fat range remain separate sequential stages
+    /// because they are data-dependent on each other.
     pub fn search(
         &self,
         column: &str,
@@ -764,27 +777,44 @@ impl VectorReader {
         //    pick each candidate's quantizer; Fp32/Bf16/None
         //    rerank paths ignore it.
         let cb = col.quant.code_bytes();
-        let mut shortlist: Vec<(u32, f32, u32, u32)> = Vec::new();
-        for &(c, _) in &centroid_scores {
-            let (off, cnt) = read_cluster_entry(&cluster_idx, c);
-            if cnt == 0 {
-                continue;
-            }
+
+        // Collect the non-empty probed clusters, then fetch their
+        // codes + doc_ids regions in one **parallel batch**
+        // (013 PR6 / A4v). These `2 × nprobe` ranges are
+        // data-independent — every `(off, cnt)` is already known
+        // from `cluster_idx` — so `Source::get_ranges` fans them
+        // out concurrently under a single `block_on` bridge on a
+        // cold `Source::Lazy`, collapsing `2 × nprobe` sequential
+        // round-trips into one. On `Source::InMemory` / warm
+        // sources each range still resolves zero-copy with no
+        // bridge. The GET count is unchanged; the win is
+        // cold-search wall-clock.
+        let probed: Vec<(usize, u32, u32)> = centroid_scores
+            .iter()
+            .filter_map(|&(c, _)| {
+                let (off, cnt) = read_cluster_entry(&cluster_idx, c);
+                (cnt != 0).then_some((c, off, cnt))
+            })
+            .collect();
+        let mut cluster_ranges: Vec<Range<usize>> = Vec::with_capacity(probed.len() * 2);
+        for &(_, off, cnt) in &probed {
             let codes_start = sub_start + col.codes_off + (off as usize) * cb;
-            let codes_end = codes_start + (cnt as usize) * cb;
-            let codes = self
-                .source
-                .get_range(codes_start..codes_end)
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            cluster_ranges.push(codes_start..codes_start + (cnt as usize) * cb);
             let did_start = sub_start + col.doc_ids_off + (off as usize) * 4;
-            let did_end = did_start + (cnt as usize) * 4;
-            let doc_ids = self
-                .source
-                .get_range(did_start..did_end)
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            cluster_ranges.push(did_start..did_start + (cnt as usize) * 4);
+        }
+        let cluster_bufs = self
+            .source
+            .get_ranges(&cluster_ranges)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        let mut shortlist: Vec<(u32, f32, u32, u32)> = Vec::new();
+        for (i, &(c, off, cnt)) in probed.iter().enumerate() {
+            let codes = &cluster_bufs[i * 2];
+            let doc_ids = &cluster_bufs[i * 2 + 1];
             score_cluster_codes(
-                &codes,
-                &doc_ids,
+                codes,
+                doc_ids,
                 cnt,
                 off,
                 c as u32,
@@ -2698,6 +2728,126 @@ mod tests {
             "per-cluster path: cold first search expected to issue \
              3..=11 ranges (centroids + cluster_idx + per-cluster \
              codes/doc_ids + 1 fat rerank range). Got {async_calls_for_first_search}."
+        );
+    }
+
+    /// Test-only [`LazyByteSource`] that tracks the **peak number
+    /// of concurrently in-flight `range()` calls**. Each `range`
+    /// bumps an in-flight counter, records the running peak, holds
+    /// for `delay`, then releases. `try_get_range_sync` always
+    /// returns `None` so every fetch is forced onto the async
+    /// path — the only place concurrency can show up.
+    ///
+    /// Serial fetches (pre-PR6) peak at 1; the PR6 parallel
+    /// per-cluster batch (`Source::get_ranges` → `try_join_all`)
+    /// drives the peak above 1.
+    #[derive(Debug)]
+    struct ConcurrencyTrackingSource {
+        bytes: Bytes,
+        in_flight: StdArc<AtomicU64>,
+        peak: StdArc<AtomicU64>,
+        delay: std::time::Duration,
+    }
+
+    impl ConcurrencyTrackingSource {
+        fn new(bytes: Bytes, delay: std::time::Duration) -> Self {
+            Self {
+                bytes,
+                in_flight: StdArc::new(AtomicU64::new(0)),
+                peak: StdArc::new(AtomicU64::new(0)),
+                delay,
+            }
+        }
+
+        fn peak_counter(&self) -> StdArc<AtomicU64> {
+            StdArc::clone(&self.peak)
+        }
+
+        fn reset_peak(&self) {
+            self.peak.store(0, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for ConcurrencyTrackingSource {
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.peak.fetch_max(now, AtomicOrdering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            let total = self.bytes.len() as u64;
+            if start.saturating_add(len) > total {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: total,
+                });
+            }
+            let s = start as usize;
+            Ok(self.bytes.slice(s..s + len as usize))
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// 013 PR6 (A4v): the per-cluster codes + doc_ids fetches in
+    /// `search` are issued as one **parallel batch** rather than
+    /// serially. A serial implementation can only ever have one
+    /// `range()` in flight at a time (peak == 1); the parallel
+    /// fan-out through `Source::get_ranges` drives multiple
+    /// concurrent `range()` calls (peak > 1).
+    ///
+    /// Uses a multi-thread runtime so `Source::get_ranges` takes
+    /// the `block_in_place + Handle::block_on` bridge (the
+    /// production path), and a `ConcurrencyTrackingSource` whose
+    /// `range()` holds briefly so overlapping fetches are
+    /// observable. Results are checked against the `InMemory`
+    /// baseline so the reordering into a batch can't silently
+    /// change answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_fans_out_per_cluster_fetches_concurrently() {
+        let (blob, json, all) = build_search_corpus();
+        let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
+        let src = StdArc::new(ConcurrencyTrackingSource::new(
+            blob,
+            std::time::Duration::from_millis(20),
+        ));
+        let peak = src.peak_counter();
+        let r = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&src) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("lazy open");
+
+        // The open path issues only sequential single-range
+        // fetches, so reset the peak to isolate what `search`
+        // does.
+        src.reset_peak();
+
+        let q = &all[7];
+        let hits = tokio::task::block_in_place(|| r.search("embedding", q, 5, 4, 5))
+            .expect("sync search via block_on bridge");
+        let hits_mem = r_mem
+            .search("embedding", q, 5, 4, 5)
+            .expect("InMemory search");
+        assert_eq!(
+            hits, hits_mem,
+            "parallel per-cluster batch must not change results vs InMemory"
+        );
+
+        let observed_peak = peak.load(AtomicOrdering::SeqCst);
+        assert!(
+            observed_peak >= 2,
+            "per-cluster codes + doc_ids fetches should fan out concurrently \
+             (PR6 parallel batch); peak in-flight range() calls was \
+             {observed_peak} — that looks serial"
         );
     }
 
