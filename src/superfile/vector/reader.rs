@@ -538,10 +538,8 @@ impl VectorReader {
             // norms for L2Sq/Cosine). The per-codec layout check below
             // validates the declared `codec_meta_off` against the
             // codec's expected size once `col_n_docs` is known.
-            let codec_meta_required_zero = matches!(
-                rerank_codec,
-                RerankCodec::Fp32 | RerankCodec::RabitqOnly
-            );
+            let codec_meta_required_zero =
+                matches!(rerank_codec, RerankCodec::Fp32 | RerankCodec::RabitqOnly);
             if codec_meta_required_zero && codec_meta_off != 0 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has codec_meta_off={codec_meta_off} for codec {}; \
@@ -1599,11 +1597,7 @@ mod tests {
     /// Every exposed rerank codec is wired end-to-end.
     #[test]
     fn register_column_accepts_every_codec() {
-        for codec in [
-            RerankCodec::Fp32,
-            RerankCodec::Sq8,
-            RerankCodec::RabitqOnly,
-        ] {
+        for codec in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
             let mut b = VectorBuilder::new();
             b.register_column(VectorConfig {
                 column: "v".into(),
@@ -2249,10 +2243,7 @@ mod tests {
         );
         let r_fp = recall_of(&r_fp32, "fp32");
         let r_sq = recall_of(&r_sq8, "sq8 ");
-        eprintln!(
-            "drop (fp32 - sq8 ): {:.4}",
-            r_fp - r_sq
-        );
+        eprintln!("drop (fp32 - sq8 ): {:.4}", r_fp - r_sq);
         eprintln!("(target acceptance: drop must be \u{2264} 0.01)");
 
         // -- Probe: vary rerank_mult to isolate shortlist depth vs rerank noise --

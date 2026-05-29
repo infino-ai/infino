@@ -307,11 +307,7 @@ mod tests {
     /// the format contract.
     #[test]
     fn codec_id_roundtrips_every_variant() {
-        for c in [
-            RerankCodec::Fp32,
-            RerankCodec::Sq8,
-            RerankCodec::RabitqOnly,
-        ] {
+        for c in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
             assert_eq!(
                 RerankCodec::from_codec_id(c.codec_id()),
                 Some(c),
@@ -360,11 +356,7 @@ mod tests {
     /// `matches!(_, RabitqOnly)` checks.
     #[test]
     fn writes_full_matches_per_vector_bytes() {
-        for c in [
-            RerankCodec::Fp32,
-            RerankCodec::Sq8,
-            RerankCodec::RabitqOnly,
-        ] {
+        for c in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
             assert_eq!(
                 c.writes_full(),
                 c.per_vector_bytes(384) > 0,
@@ -430,10 +422,7 @@ mod tests {
     #[test]
     fn codec_meta_bytes_matches_layout_spec() {
         // Fp32 + RabitqOnly never carry codec_meta.
-        for c in [
-            RerankCodec::Fp32,
-            RerankCodec::RabitqOnly,
-        ] {
+        for c in [RerankCodec::Fp32, RerankCodec::RabitqOnly] {
             for m in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
                 assert_eq!(
                     c.codec_meta_bytes(384, 1_000_000, 1024, m),

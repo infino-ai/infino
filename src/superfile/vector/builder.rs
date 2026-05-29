@@ -17,10 +17,10 @@ use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::reservoir::{Reservoir, default_kmeans_sample_size};
 use crate::superfile::vector::rotation::RandomRotation;
-use crate::superfile::vector::sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max};
 use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
 };
+use crate::superfile::vector::sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -1160,7 +1160,6 @@ fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec
     }
     (scale, offset)
 }
-
 
 /// Pass 2 of `build_subsection_streaming`: walk the input
 /// corpus chunk-by-chunk, assign each row to its centroid,

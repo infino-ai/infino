@@ -968,7 +968,6 @@ mod tests {
         }
     }
 
-
     // --- AVX-512 parity (plan 014 Phase 1, fp32) ------------------------
 
     /// Generate a pseudo-random `f32` vector. Deterministic — uses the
