@@ -38,6 +38,7 @@
 
 use wide::{CmpGt, f32x8};
 
+#[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::avx512_enabled;
 
 /// 1-bit quantizer + estimator for vectors of fixed dimension `dim`.

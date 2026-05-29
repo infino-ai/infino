@@ -33,15 +33,6 @@
 //! subsection is recorded in sub-header bytes 12..16 as
 //! `codec_meta_off: u32`. `Fp32` / `RabitqOnly` segments
 //! write `codec_meta_off = 0`.
-//!
-//! ## Retired codec ids
-//!
-//! `codec_id = 1` was assigned to a `Bf16` codec that shipped in an
-//! experimental branch and was removed before the codec spec was
-//! stabilized. The byte stays reserved — [`RerankCodec::from_codec_id`]
-//! returns `None` for it, which the reader surfaces as a
-//! `MalformedVersion` error so any pre-removal segment fails loud
-//! rather than mis-decoding.
 
 use serde::{Deserialize, Serialize};
 
@@ -124,11 +115,10 @@ impl RerankCodec {
     /// zero round-trip identically.
     #[inline]
     pub const fn codec_id(self) -> u8 {
-        // codec_id = 1 is retired (was `Bf16`); see module docs.
         match self {
             Self::Fp32 => 0,
-            Self::Sq8 => 2,
-            Self::RabitqOnly => 3,
+            Self::Sq8 => 1,
+            Self::RabitqOnly => 2,
         }
     }
 
@@ -138,11 +128,10 @@ impl RerankCodec {
     /// fails loud rather than mis-decoding.
     #[inline]
     pub const fn from_codec_id(id: u8) -> Option<Self> {
-        // codec_id = 1 is retired (was `Bf16`); see module docs.
         match id {
             0 => Some(Self::Fp32),
-            2 => Some(Self::Sq8),
-            3 => Some(Self::RabitqOnly),
+            1 => Some(Self::Sq8),
+            2 => Some(Self::RabitqOnly),
             _ => None,
         }
     }
@@ -316,22 +305,13 @@ mod tests {
         }
     }
 
-    /// Codec id `1` is retired (was `Bf16`). Any segment ever
-    /// written with that discriminator must fail to decode
-    /// rather than silently mis-map onto an adjacent codec.
-    #[test]
-    fn retired_bf16_codec_id_is_none() {
-        assert_eq!(RerankCodec::from_codec_id(1), None);
-    }
-
     /// Unknown discriminator bytes (any value not currently
     /// assigned, e.g. `5`, `255`) return `None`. The reader
     /// upgrades that into a `MalformedVersion` error rather than
     /// guessing.
     #[test]
     fn unknown_codec_id_is_none() {
-        for id in [4u8, 5, 16, 200, 255] {
-            // id=1 is also unmapped but covered by `retired_bf16_codec_id_is_none`.
+        for id in [3u8, 5, 16, 200, 255] {
             assert_eq!(
                 RerankCodec::from_codec_id(id),
                 None,

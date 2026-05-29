@@ -455,7 +455,7 @@ impl VectorReader {
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
                 VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
-                     (known ids: 0=fp32, 2=sq8, 3=none; id 1 retired)",
+                     (known ids: 0=fp32, 1=sq8, 2=rabitq_only)",
                     cfg.column
                 )))
             })?;

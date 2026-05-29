@@ -12,6 +12,7 @@
 use wide::f32x8;
 
 use crate::superfile::vector::rerank_codec::RerankCodec;
+#[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
 /// Distance metric for a vector column. Stored per-column in
@@ -426,12 +427,12 @@ impl<'a> Sq8Kernel<'a> {
         // Dispatches to AVX-512 (16-lane FMA with VPMOVZXBD widen)
         // when the runtime gate passes; otherwise the f32x8 widen-
         // and-FMA kernel that has shipped since 012.
-        let cross = sq8_cross_product(&self.q_prime, code_bytes, self.dim);
-        // `dot(query, x_decoded) = cross + q_dot_offset` because
+        let qp_code_dot = sq8_dot(&self.q_prime, code_bytes, self.dim);
+        // `dot(query, x_decoded) = qp_code_dot + q_dot_offset` because
         // x_decoded[d] = code[d] * scale[d] + offset[d], so
         // Σ_d q[d] * x_decoded[d] = Σ_d q_prime[d] * code[d]
         //                         + Σ_d q[d] * offset[d].
-        let dot = cross + self.q_dot_offset;
+        let dot = qp_code_dot + self.q_dot_offset;
         match self.metric {
             Metric::Cosine => 1.0 - dot,
             Metric::NegDot => -dot,
@@ -450,9 +451,13 @@ impl<'a> Sq8Kernel<'a> {
     }
 }
 
-/// Cross-product reduction for `Sq8Kernel::distance_at`:
+/// Dot-product reduction for `Sq8Kernel::distance_at`:
 /// `Σ_d q_prime[d] * (code_bytes[d] as f32)` over the first `dim`
-/// dimensions. Three-tier dispatch:
+/// dimensions. This is the `q_prime · code` half of the Sq8 distance
+/// expansion — the `Σ q[d] * offset[d]` half is folded into
+/// `Sq8Kernel::q_dot_offset` once at query-prep time.
+///
+/// Three-tier dispatch:
 ///
 /// 1. AVX-512 (16-lane FMA + `vpmovzxbd` u8 → i32 widen)
 /// 2. AVX2 (8-lane FMA + `vpmovzxbd` u8 → i32 widen — same widen
@@ -472,28 +477,28 @@ impl<'a> Sq8Kernel<'a> {
 /// `debug_assert_eq!(code_bytes.len(), self.dim)`. `q_prime.len()`
 /// is guaranteed `== dim` by `Sq8Kernel::new`.
 #[inline]
-fn sq8_cross_product(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if avx512_enabled() {
             // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
-            return unsafe { sq8_cross_product_avx512(q_prime, code_bytes, dim) };
+            return unsafe { sq8_dot_avx512(q_prime, code_bytes, dim) };
         }
         if avx2_enabled() {
             // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-            return unsafe { sq8_cross_product_avx2(q_prime, code_bytes, dim) };
+            return unsafe { sq8_dot_avx2(q_prime, code_bytes, dim) };
         }
     }
-    sq8_cross_product_wide(q_prime, code_bytes, dim)
+    sq8_dot_wide(q_prime, code_bytes, dim)
 }
 
-/// Portable `wide::f32x8` (256-bit) Sq8 cross product. Same per-
+/// Portable `wide::f32x8` (256-bit) Sq8 dot product. Same per-
 /// element math as the AVX-512 path, processed 8 lanes at a time
 /// with a per-lane scalar `u8 as f32` widen. Universal fallback
 /// for aarch64, SSE-only x86_64 hosts, and
 /// `INFINO_DISABLE_AVX2=1` / `INFINO_DISABLE_AVX512=1` A/B runs.
 #[inline]
-fn sq8_cross_product_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     let mut acc = f32x8::ZERO;
     let mut i = 0;
     while i + 8 <= dim {
@@ -507,15 +512,15 @@ fn sq8_cross_product_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32
         acc += qv * bv;
         i += 8;
     }
-    let mut cross = acc.reduce_add();
+    let mut dot = acc.reduce_add();
     while i < dim {
-        cross += q_prime[i] * (code_bytes[i] as f32);
+        dot += q_prime[i] * (code_bytes[i] as f32);
         i += 1;
     }
-    cross
+    dot
 }
 
-/// AVX2 Sq8 cross product. Same shape as the AVX-512 path but
+/// AVX2 Sq8 dot product. Same shape as the AVX-512 path but
 /// 8 lanes per iteration via 256-bit registers. The win vs the
 /// portable wide kernel is the u8 → f32 widen: a single
 /// `vpmovzxbd` (zero-extend 8 u8 to 8 i32) + `vcvtdq2ps` (convert
@@ -530,7 +535,7 @@ fn sq8_cross_product_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32
 /// guarantees this at the dispatch site.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sq8_cross_product_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(q_prime.len(), dim);
     debug_assert_eq!(code_bytes.len(), dim);
@@ -564,16 +569,16 @@ unsafe fn sq8_cross_product_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize)
         let sums = _mm_add_ps(sum128, shuf);
         let shuf2 = _mm_movehl_ps(sums, sums);
         let sums2 = _mm_add_ss(sums, shuf2);
-        let mut cross = _mm_cvtss_f32(sums2);
+        let mut dot = _mm_cvtss_f32(sums2);
         while i < dim {
-            cross += q_prime[i] * (code_bytes[i] as f32);
+            dot += q_prime[i] * (code_bytes[i] as f32);
             i += 1;
         }
-        cross
+        dot
     }
 }
 
-/// AVX-512 Sq8 cross product. The win vs the `wide` kernel is two
+/// AVX-512 Sq8 dot product. The win vs the `wide` kernel is two
 /// stacked sources of speedup: the f32 FMA is 16-wide instead of
 /// 8, **and** the u8 → f32 widen is a single `vpmovzxbd` +
 /// `vcvtdq2ps` pair instead of 8 scalar `as f32` casts.
@@ -584,7 +589,7 @@ unsafe fn sq8_cross_product_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize)
 /// guarantees this at the dispatch site.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn sq8_cross_product_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(q_prime.len(), dim);
     debug_assert_eq!(code_bytes.len(), dim);
@@ -607,21 +612,53 @@ unsafe fn sq8_cross_product_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usiz
             acc = _mm512_fmadd_ps(q, codes_f32, acc);
             i += 16;
         }
-        let mut cross = _mm512_reduce_add_ps(acc);
+        let mut dot = _mm512_reduce_add_ps(acc);
         while i < dim {
-            cross += q_prime[i] * (code_bytes[i] as f32);
+            dot += q_prime[i] * (code_bytes[i] as f32);
             i += 1;
         }
-        cross
+        dot
     }
 }
 
 /// In-place L2-normalize. Zero vectors stay zero (no division).
+///
+/// Portable `wide::f32x8` SIMD: 8-lane FMA for the magnitude reduction
+/// and 8-lane multiply for the per-element scale, with a scalar tail
+/// for inputs whose length isn't a multiple of 8. Faster than the
+/// readable `iter().map().sum().sqrt()` scalar form on every host
+/// the codebase compiles for, which matters whenever a caller
+/// pre-normalizes a large corpus (e.g. cosine-test fixtures
+/// pre-normalize multi-thousand-vector inputs as setup).
 pub fn normalize(v: &mut [f32]) {
-    let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag = {
+        let mut acc = f32x8::ZERO;
+        let mut tail_acc: f32 = 0.0;
+        let chunks = v.chunks_exact(8);
+        let tail = chunks.remainder();
+        for c in chunks {
+            let lane = f32x8::from(
+                <[f32; 8]>::try_from(c).expect("chunks_exact(8) yields slices of length 8"),
+            );
+            acc += lane * lane;
+        }
+        for &x in tail {
+            tail_acc += x * x;
+        }
+        (acc.reduce_add() + tail_acc).sqrt()
+    };
     if mag > 0.0 {
         let inv = 1.0 / mag;
-        for x in v.iter_mut() {
+        let inv_v = f32x8::splat(inv);
+        let mut chunks = v.chunks_exact_mut(8);
+        for c in chunks.by_ref() {
+            let lane = f32x8::from(
+                <[f32; 8]>::try_from(&*c).expect("chunks_exact_mut(8) yields slices of length 8"),
+            );
+            let scaled = lane * inv_v;
+            c.copy_from_slice(&scaled.to_array());
+        }
+        for x in chunks.into_remainder() {
             *x *= inv;
         }
     }
@@ -1105,24 +1142,24 @@ mod tests {
 
     // --- AVX-512 parity (plan 014 Phase 1) ------------------------------
 
-    /// AVX-512 `sq8_cross_product` agrees with the `wide` baseline
-    /// across a length sweep. The cross product is `Σ q_prime[d] *
+    /// AVX-512 `sq8_dot` agrees with the `wide` baseline
+    /// across a length sweep. The dot product is `Σ q_prime[d] *
     /// (code[d] as f32)` so values are integer-magnitude on the
     /// doc side — exact widen, reduction-order is the only divergence.
     /// Tolerance is correspondingly tight.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn sq8_cross_product_avx512_matches_wide_across_lengths() {
+    fn sq8_dot_avx512_matches_wide_across_lengths() {
         if !avx512_enabled() {
-            eprintln!("sq8_cross_product_avx512_matches_wide_across_lengths: skipped, no AVX-512");
+            eprintln!("sq8_dot_avx512_matches_wide_across_lengths: skipped, no AVX-512");
             return;
         }
         for dim in [1usize, 7, 15, 16, 17, 31, 32, 33, 64, 96, 128, 384, 768] {
             let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
             let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let want = sq8_cross_product_wide(&q_prime, &codes, dim);
+            let want = sq8_dot_wide(&q_prime, &codes, dim);
             // SAFETY: gated on avx512_enabled() above.
-            let got = unsafe { sq8_cross_product_avx512(&q_prime, &codes, dim) };
+            let got = unsafe { sq8_dot_avx512(&q_prime, &codes, dim) };
             let tol = 1e-5 * want.abs().max(1.0);
             assert!(
                 (want - got).abs() <= tol,
@@ -1133,7 +1170,7 @@ mod tests {
 
     // --- AVX2 parity (plan 014 Phase 2) ---------------------------------
 
-    /// AVX2 `sq8_cross_product_avx2` agrees with the portable wide
+    /// AVX2 `sq8_dot_avx2` agrees with the portable wide
     /// kernel across a length sweep. Inner math is identical (FMA
     /// of q_prime against the u8-widened doc codes); the only
     /// difference is how the widen happens. Tolerance is one
@@ -1141,9 +1178,9 @@ mod tests {
     /// constant `1e-5 * |result|` more than covers that.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn sq8_cross_product_avx2_matches_wide_across_lengths() {
+    fn sq8_dot_avx2_matches_wide_across_lengths() {
         if !avx2_enabled() {
-            eprintln!("sq8_cross_product_avx2_matches_wide_across_lengths: skipped, no AVX2");
+            eprintln!("sq8_dot_avx2_matches_wide_across_lengths: skipped, no AVX2");
             return;
         }
         for dim in [
@@ -1151,9 +1188,9 @@ mod tests {
         ] {
             let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
             let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let want = sq8_cross_product_wide(&q_prime, &codes, dim);
+            let want = sq8_dot_wide(&q_prime, &codes, dim);
             // SAFETY: gated on avx2_enabled() above.
-            let got = unsafe { sq8_cross_product_avx2(&q_prime, &codes, dim) };
+            let got = unsafe { sq8_dot_avx2(&q_prime, &codes, dim) };
             let tol = 1e-5 * want.abs().max(1.0);
             assert!(
                 (want - got).abs() <= tol,
@@ -1276,14 +1313,14 @@ mod tests {
             let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
 
             let wide_ns = time_ns(iters, || {
-                sq8_cross_product_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
+                sq8_dot_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
             });
             // SAFETY: gated on avx512_enabled() above.
             let avx_ns = time_ns(iters, || unsafe {
-                sq8_cross_product_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
+                sq8_dot_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
             });
             eprintln!(
-                "| `Sq8Kernel::distance_at` (cross-product) | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
+                "| `Sq8Kernel::distance_at` (dot) | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
                 wide_ns,
                 avx_ns,
                 wide_ns / avx_ns,
@@ -1348,10 +1385,10 @@ mod tests {
         s
     }
 
-    /// Scalar Sq8 cross-product kernel core: `Σ q'[d] * code[d]`
+    /// Scalar Sq8 dot-product kernel core: `Σ q'[d] * code[d]`
     /// after per-lane u8→f32 widening. Used inside `Sq8Kernel::
     /// distance_at`; this is the part the SIMD paths accelerate.
-    fn sq8_cross_product_scalar(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+    fn sq8_dot_scalar(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
         let mut s = 0.0f32;
         for d in 0..dim {
             s += q_prime[d] * (code_bytes[d] as f32);
@@ -1459,29 +1496,29 @@ mod tests {
                 avx512_cell(a5),
             );
 
-            // --- sq8_cross_product (the Sq8Kernel hot loop core) ---
+            // --- sq8_dot (the Sq8Kernel hot loop core) ---
             let s = time_ns(iters, || {
-                sq8_cross_product_scalar(black_box(&q_prime), black_box(&codes), black_box(dim))
+                sq8_dot_scalar(black_box(&q_prime), black_box(&codes), black_box(dim))
             });
             let w = time_ns(iters, || {
-                sq8_cross_product_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
+                sq8_dot_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
             });
             let a2 = if avx2 {
                 Some(time_ns(iters, || unsafe {
-                    sq8_cross_product_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
+                    sq8_dot_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
                 }))
             } else {
                 None
             };
             let a5 = if avx512 {
                 Some(time_ns(iters, || unsafe {
-                    sq8_cross_product_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
+                    sq8_dot_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
                 }))
             } else {
                 None
             };
             eprintln!(
-                "| `Sq8Kernel::distance_at` (xprod) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
+                "| `Sq8Kernel::distance_at` (dot) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
                 s,
                 w,
                 avx2_cell(a2, w),
@@ -1529,14 +1566,14 @@ mod tests {
             let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
 
             let wide_sq8_ns = time_ns(iters, || {
-                sq8_cross_product_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
+                sq8_dot_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
             });
             // SAFETY: gated on avx2_enabled() above.
             let avx2_sq8_ns = time_ns(iters, || unsafe {
-                sq8_cross_product_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
+                sq8_dot_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
             });
             eprintln!(
-                "| `Sq8Kernel::distance_at` (cross-product) | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
+                "| `Sq8Kernel::distance_at` (dot) | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
                 wide_sq8_ns,
                 avx2_sq8_ns,
                 wide_sq8_ns / avx2_sq8_ns,

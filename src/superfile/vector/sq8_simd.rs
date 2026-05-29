@@ -27,6 +27,7 @@
 //! which equals round-half-away on the non-negative `[0, 255]`
 //! domain.
 
+#[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
 /// Per-cluster Sq8 encode constants. Each cluster contributes one

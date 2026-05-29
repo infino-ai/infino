@@ -928,33 +928,6 @@ fn build_subsection_streaming(
             None
         };
 
-    // Write every cluster's (scale, offset) into the codec_meta
-    // blocks up front — these were derived from pass 2's per-cluster
-    // (min, max) accumulators and are independent of pass 3's row
-    // ordering. Bulk copy keeps the slow per-byte assembly out of
-    // the per-cluster loop below.
-    //
-    // At the same time pre-derive each cluster's `(inv_scale, c2)`
-    // Sq8 encode constants — pass 3's per-row encode collapses to
-    // a single FMA + clamp + cast against these arrays (see
-    // `sq8_encode_row`).
-    let sq8_encode_consts: Vec<Sq8EncodeConsts> = if codec == RerankCodec::Sq8 {
-        sq8_quantizers
-            .iter()
-            .map(|(scale_c, offset_c)| Sq8EncodeConsts::from_scale_offset(scale_c, offset_c))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if codec == RerankCodec::Sq8 {
-        for (c, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate() {
-            let sc_off = sq8_scale_block_off + c * dim * 4;
-            bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
-            let oc_off = sq8_offset_block_off + c * dim * 4;
-            bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
-        }
-    }
-
     // ---- Per-cluster streaming pass ----
     //
     // Replaces the old two-step "stage every row in
@@ -975,14 +948,27 @@ fn build_subsection_streaming(
     // reads — one `read_exact` per block instead of three per row.
     // Sq8 reuses the `full_block` directly (cluster's fp32 rows are
     // already there post-bulk-read) and encodes against the
-    // pre-derived `(inv_scale, c2)` constants in
-    // `sq8_encode_consts[c]`.
+    // `(inv_scale, c2)` FMA constants derived inline from this
+    // cluster's `(scale, offset)` quantizer.
     let full_row_bytes_in_bucket = if codec.writes_full() { dim * 4 } else { 0 };
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
     let mut full_block: Vec<u8> = Vec::new();
 
     for (c, &(cluster_off_u32, cluster_count_u32)) in cluster_index.iter().enumerate() {
+        // Sq8 codec_meta: write this cluster's (scale, offset) byte
+        // pair into the codec_meta region. Done *before* the empty-
+        // cluster skip so empty clusters still carry their sentinel
+        // quantizer bytes — keeps the on-disk byte pattern stable
+        // regardless of pass-2 assignment outcomes.
+        if codec == RerankCodec::Sq8 {
+            let (scale_c, offset_c) = &sq8_quantizers[c];
+            let sc_off = sq8_scale_block_off + c * dim * 4;
+            bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
+            let oc_off = sq8_offset_block_off + c * dim * 4;
+            bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
+        }
+
         if cluster_count_u32 == 0 {
             continue;
         }
@@ -1032,14 +1018,15 @@ fn build_subsection_streaming(
             }
             RerankCodec::Sq8 => {
                 // The cluster's fp32 rows are already in `full_block`
-                // (one bulk read above). Encode them in place against
-                // the pre-derived `(inv_scale, c2)` FMA constants via
+                // (one bulk read above). Derive this cluster's
+                // `(inv_scale, c2)` FMA constants from its
+                // `(scale, offset)` quantizer and encode in place via
                 // the SIMD encoder; also fill the per-doc norms slot
                 // when the column needs decoded `Σ x²` at search
                 // time (L2Sq / Cosine).
                 let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                 let (scale_c, offset_c) = &sq8_quantizers[c];
-                let ec = &sq8_encode_consts[c];
+                let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
                 encode_sq8_cluster_simd(
                     cluster_rows,
                     dim,
