@@ -178,6 +178,25 @@ impl PostingsRegion<'_> {
             )))
         })
     }
+
+    /// Batch variant of [`Self::fetch`] — fetch a set of
+    /// **data-independent** postings-region-relative ranges in one
+    /// call (013 PR7 / A4f). Routes through [`Source::get_ranges`],
+    /// so cold `Source::Lazy` misses fan out concurrently under a
+    /// single `block_on` bridge while warm / `InMemory` ranges stay
+    /// zero-copy. Returns one [`Bytes`] per input range, in order.
+    #[inline]
+    fn fetch_many(&self, rels: &[Range<usize>]) -> Result<Vec<Bytes>, FtsError> {
+        let abs: Vec<Range<usize>> = rels
+            .iter()
+            .map(|r| self.region_start + r.start..self.region_start + r.end)
+            .collect();
+        self.source.get_ranges(&abs).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "fts postings batch fetch: {e}"
+            )))
+        })
+    }
 }
 
 impl FtsReader {
@@ -863,8 +882,17 @@ impl FtsReader {
             DictReader::open(&fst).expect("FST CRC verified at open(); bytes must be a valid FST");
         let col_meta = &self.columns[column_id as usize];
         let postings = self.postings_region();
+        let n_docs = self.n_docs as u64;
 
-        let mut cursors: Vec<TermCursor> = Vec::with_capacity(terms.len());
+        // A cursor slot is either already-ready (inline term — no
+        // postings fetch needed, or a PFOR cursor once assembled) or a
+        // PFOR term still awaiting its batched fetch. Slots preserve
+        // input term order; FST misses are dropped.
+        enum Slot {
+            Ready(TermCursor),
+            Pfor { metadata_offset: usize },
+        }
+        let mut slots: Vec<Slot> = Vec::with_capacity(terms.len());
         for term in terms {
             let key = make_key(&col_meta.name, term);
             let Some(packed) = dict.lookup(&key) else {
@@ -873,23 +901,131 @@ impl FtsReader {
             match FstValue::unpack(packed) {
                 FstValue::Inline { doc_id, tf } => {
                     let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
-                    cursors.push(TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        self.n_docs as u64,
-                        dl_norm_k1,
-                    ));
+                    slots.push(Slot::Ready(TermCursor::new_inline(
+                        doc_id, tf, n_docs, dl_norm_k1,
+                    )));
                 }
                 FstValue::Pfor { metadata_offset } => {
-                    cursors.push(TermCursor::new(
-                        postings,
-                        metadata_offset as usize,
-                        self.n_docs as u64,
-                    )?);
+                    let metadata_offset = metadata_offset as usize;
+                    if metadata_offset + 20 > postings.len() {
+                        return Err(FtsError::Read(ReadError::MalformedVersion(
+                            "term metadata offset out of postings region".into(),
+                        )));
+                    }
+                    slots.push(Slot::Pfor { metadata_offset });
                 }
             }
         }
-        Ok(cursors)
+
+        // Slot indices + metadata offsets of the PFOR terms, in order.
+        // These cursors are built from postings-region fetches, which
+        // on a cold `Source::Lazy` are network round-trips — so rather
+        // than the pre-PR7 per-term serial chain (each term:
+        // metadata → skip → first block), fetch each phase for *all*
+        // PFOR terms in one parallel batch (013 PR7 / A4f). Cursor
+        // construct latency goes from `O(T)` sequential round-trips to
+        // `O(1)` batched ones; per-block decode in the search hot loop
+        // stays sequential (BMW skip is per-block by design).
+        let pfor: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| matches!(s, Slot::Pfor { .. }).then_some(i))
+            .collect();
+
+        if !pfor.is_empty() {
+            let offsets: Vec<usize> = pfor
+                .iter()
+                .map(|&i| match &slots[i] {
+                    Slot::Pfor { metadata_offset } => *metadata_offset,
+                    Slot::Ready(_) => unreachable!("pfor index points at a pfor slot"),
+                })
+                .collect();
+
+            // Phase 1 — 20-byte term metadata for every PFOR term.
+            let meta_ranges: Vec<Range<usize>> = offsets.iter().map(|&mo| mo..mo + 20).collect();
+            let metas = postings.fetch_many(&meta_ranges)?;
+
+            // Parse (postings_length, num_blocks) and bound-check each
+            // skip table before issuing phase 2.
+            let mut parsed: Vec<(usize, usize)> = Vec::with_capacity(pfor.len());
+            for (&mo, meta) in offsets.iter().zip(metas.iter()) {
+                let postings_length = read_u32_le(&meta[12..16]) as usize;
+                let num_blocks =
+                    u32::from_le_bytes([meta[16], meta[17], meta[18], meta[19]]) as usize;
+                if mo + 20 + num_blocks * 16 > postings.len() {
+                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                        "skip table runs past postings region".into(),
+                    )));
+                }
+                parsed.push((postings_length, num_blocks));
+            }
+
+            // Phase 2 — skip tables for every PFOR term.
+            let skip_ranges: Vec<Range<usize>> = offsets
+                .iter()
+                .zip(parsed.iter())
+                .map(|(&mo, &(_, num_blocks))| {
+                    let s = mo + 20;
+                    s..s + num_blocks * 16
+                })
+                .collect();
+            let skips = postings.fetch_many(&skip_ranges)?;
+
+            // Compute each term's first-block range from its skip
+            // table (block 0 spans `[block_offset, next_block_offset)`,
+            // or `[block_offset, postings_length)` for a single-block
+            // term). Terms with zero blocks have no first block.
+            let mut first_block_ranges: Vec<Range<usize>> = Vec::with_capacity(pfor.len());
+            let mut first_block_slot: Vec<Option<usize>> = Vec::with_capacity(pfor.len());
+            for ((&mo, &(postings_length, num_blocks)), skip) in
+                offsets.iter().zip(parsed.iter()).zip(skips.iter())
+            {
+                if num_blocks == 0 {
+                    first_block_slot.push(None);
+                    continue;
+                }
+                let block0_offset = read_u32_le(&skip[4..8]) as usize;
+                let block0_start = mo + block0_offset;
+                let block0_end = if num_blocks > 1 {
+                    let next_block_offset = read_u32_le(&skip[16 + 4..16 + 8]) as usize;
+                    mo + next_block_offset
+                } else {
+                    mo + postings_length
+                };
+                first_block_slot.push(Some(first_block_ranges.len()));
+                first_block_ranges.push(block0_start..block0_end);
+            }
+
+            // Phase 3 — first block of every (non-empty) PFOR term.
+            let first_blocks = postings.fetch_many(&first_block_ranges)?;
+
+            // Assemble each PFOR cursor from its fetched parts and place
+            // it back into its slot, preserving order.
+            let empty = Bytes::new();
+            for (idx, &slot_i) in pfor.iter().enumerate() {
+                let first_block = match first_block_slot[idx] {
+                    Some(fb) => &first_blocks[fb],
+                    None => &empty,
+                };
+                let cursor = TermCursor::from_parts(
+                    offsets[idx],
+                    n_docs,
+                    &metas[idx],
+                    &skips[idx],
+                    first_block,
+                )?;
+                slots[slot_i] = Slot::Ready(cursor);
+            }
+        }
+
+        // Every slot is now a ready cursor.
+        Ok(slots
+            .into_iter()
+            .map(|s| match s {
+                Slot::Ready(c) => c,
+                Slot::Pfor { .. } => unreachable!("all PFOR slots assembled above"),
+            })
+            .collect())
     }
 
     /// Multi-term OR via WAND + BlockMaxWAND.
@@ -2315,20 +2451,27 @@ struct TermCursor {
 }
 
 impl TermCursor {
-    /// Parse one term's metadata + skip table out of the FTS postings
-    /// region and decode its first block.
-    fn new(
-        postings: PostingsRegion<'_>,
+    /// Assemble a cursor from **already-fetched** metadata + skip-
+    /// table + first-block bytes (013 PR7 / A4f).
+    ///
+    /// `build_term_cursors` fetches these regions for *all* query
+    /// terms in parallel batches (one batched round-trip per phase:
+    /// metadata, then skip tables, then first blocks) and hands each
+    /// cursor its slices here — so per-term cursor construction is
+    /// no longer a serial chain of `T × 3` round-trips. The parsing
+    /// is identical to the pre-PR7 per-term `new`; only the byte
+    /// sourcing moved up into the batched caller.
+    ///
+    /// `first_block` must hold block 0's bytes (`[block_byte_offset,
+    /// block_byte_end)` of the first skip entry), or be empty when
+    /// `num_blocks == 0`.
+    fn from_parts(
         metadata_offset: usize,
         n_docs: u64,
+        meta: &[u8],
+        skip: &[u8],
+        first_block: &[u8],
     ) -> Result<Self, FtsError> {
-        if metadata_offset + 20 > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "term metadata offset out of postings region".into(),
-            )));
-        }
-        // One range GET for the 20-byte term metadata (013 PR4 / A2f).
-        let meta = postings.fetch(metadata_offset..metadata_offset + 20)?;
         let df = read_u32_le(&meta[0..4]) as u64;
         // bytes [4..12] = self-offset (redundant; u64); skip
         let postings_length = read_u32_le(&meta[12..16]) as usize;
@@ -2336,23 +2479,10 @@ impl TermCursor {
 
         let idf = crate::superfile::fts::bm25::idf(n_docs, df);
 
-        let skip_start = metadata_offset + 20;
-        let skip_end = skip_start + num_blocks * 16;
-        if skip_end > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "skip table runs past postings region".into(),
-            )));
-        }
-        // One range GET for the whole skip table — parsed into
-        // `blocks` here so search-time access is RAM-resident; only
-        // the block bytes themselves are fetched lazily per block.
-        let skip = postings.fetch(skip_start..skip_end)?;
-
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(num_blocks);
         let mut term_max_bm25: f32 = 0.0;
         for i in 0..num_blocks {
-            // Entry `i` lives at `i * 16` inside the fetched `skip`
-            // buffer (which starts at `skip_start`).
+            // Entry `i` lives at `i * 16` inside the `skip` buffer.
             let entry_off = i * 16;
             let last_doc_id = read_u32_le(&skip[entry_off..entry_off + 4]);
             let block_offset_in_term = read_u32_le(&skip[entry_off + 4..entry_off + 8]) as usize;
@@ -2389,8 +2519,16 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
         };
+        // First block was pre-fetched in the batched caller; decode it
+        // directly. Subsequent blocks are fetched lazily per-block in
+        // the search hot loop via `decode_current_block`.
         if !cursor.blocks.is_empty() {
-            cursor.decode_current_block(postings)?;
+            cursor.block_n = decode_block(
+                first_block,
+                &mut cursor.block_doc_ids,
+                &mut cursor.block_tfs,
+            );
+            cursor.pos = 0;
         }
         Ok(cursor)
     }
@@ -3069,6 +3207,152 @@ mod tests {
         assert!(
             postings_size_pfor > 20 * 36,
             "PFOR postings region should be hundreds of bytes; got {postings_size_pfor}"
+        );
+    }
+
+    // --------------------------------------------------------------
+    // 013 PR7 (A4f): parallel per-term cursor construction.
+    // --------------------------------------------------------------
+
+    use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// Corpus with several PFOR terms (df ≥ 2), so a multi-term query
+    /// builds multiple `TermCursor`s — the thing PR7 fans out. Every
+    /// listed term appears in many docs, so all take the PFOR path
+    /// (not the inline df=1 shortcut).
+    fn build_multiterm_pfor_blob() -> (Bytes, String) {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register column");
+        for d in 0..128u32 {
+            let mut words: Vec<&str> = vec!["alpha"]; // df = 128
+            if d % 2 == 0 {
+                words.push("beta");
+            }
+            if d % 3 == 0 {
+                words.push("gamma");
+            }
+            if d % 5 == 0 {
+                words.push("delta");
+            }
+            if d % 7 == 0 {
+                words.push("epsilon");
+            }
+            b.add_doc(0, d, &words.join(" ")).expect("add doc");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        (Bytes::from(bytes), json.to_string())
+    }
+
+    /// Test-only [`LazyByteSource`] that tracks the **peak number of
+    /// concurrently in-flight `range()` calls**. `try_get_range_sync`
+    /// always returns `None` so every fetch is forced onto the async
+    /// path, and `range` holds briefly so overlapping fetches are
+    /// observable. Serial fetches peak at 1; PR7's parallel per-term
+    /// cursor batch drives the peak above 1.
+    #[derive(Debug)]
+    struct ConcurrencyTrackingSource {
+        bytes: Bytes,
+        in_flight: Arc<AtomicU64>,
+        peak: Arc<AtomicU64>,
+        delay: std::time::Duration,
+    }
+
+    impl ConcurrencyTrackingSource {
+        fn new(bytes: Bytes, delay: std::time::Duration) -> Self {
+            Self {
+                bytes,
+                in_flight: Arc::new(AtomicU64::new(0)),
+                peak: Arc::new(AtomicU64::new(0)),
+                delay,
+            }
+        }
+        fn peak_counter(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.peak)
+        }
+        fn reset_peak(&self) {
+            self.peak.store(0, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for ConcurrencyTrackingSource {
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.peak.fetch_max(now, AtomicOrdering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            let total = self.bytes.len() as u64;
+            if start.saturating_add(len) > total {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: total,
+                });
+            }
+            let s = start as usize;
+            Ok(self.bytes.slice(s..s + len as usize))
+        }
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// PR7 (A4f): the per-term `TermCursor` builds in
+    /// `build_term_cursors` issue their metadata / skip-table /
+    /// first-block fetches as parallel batches across terms rather
+    /// than a serial per-term chain. A serial impl can only have one
+    /// `range()` in flight at a time (peak == 1); the parallel batch
+    /// drives multiple concurrent `range()` calls (peak > 1).
+    ///
+    /// Multi-thread runtime so `Source::get_ranges` takes the
+    /// production `block_in_place + Handle::block_on` bridge, and a
+    /// `ConcurrencyTrackingSource` whose `range()` holds briefly so
+    /// overlaps are observable. Results are checked against the
+    /// `InMemory` baseline so the batched reordering can't change
+    /// answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_term_cursors_fetches_terms_concurrently() {
+        let (blob, json) = build_multiterm_pfor_blob();
+        let r_mem = FtsReader::open(blob.clone(), &json).expect("InMemory baseline");
+        let src = Arc::new(ConcurrencyTrackingSource::new(
+            blob,
+            std::time::Duration::from_millis(20),
+        ));
+        let peak = src.peak_counter();
+        let r = FtsReader::open_with_source(
+            Source::Lazy(Arc::clone(&src) as Arc<dyn LazyByteSource>),
+            &json,
+            OpenOptions { verify_crc: false },
+        )
+        .expect("lazy open");
+
+        // Isolate what the search does: the open path issues only
+        // sequential single-range fetches.
+        src.reset_peak();
+
+        let terms = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let hits = tokio::task::block_in_place(|| r.search("body", &terms, 10, BoolMode::Or))
+            .expect("sync FTS search via block_on bridge");
+        let hits_mem = r_mem
+            .search("body", &terms, 10, BoolMode::Or)
+            .expect("InMemory FTS search");
+        assert_eq!(
+            hits, hits_mem,
+            "parallel per-term cursor batch must not change results vs InMemory"
+        );
+
+        let observed_peak = peak.load(AtomicOrdering::SeqCst);
+        assert!(
+            observed_peak >= 2,
+            "per-term cursor builds should fan out concurrently (PR7 parallel \
+             batch); peak in-flight range() calls was {observed_peak} — that \
+             looks serial"
         );
     }
 }
