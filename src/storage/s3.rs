@@ -257,3 +257,155 @@ impl StorageProvider for S3StorageProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the parts of `s3.rs` that don't need a
+    //! real HTTP backend: error translation, path parsing,
+    //! the with-endpoint constructor, and the `from_object_store`
+    //! escape hatch. The trait impls (`head`, `get`, `put_*`,
+    //! `delete`, `get_range`) are exercised end-to-end by the
+    //! `supertable_smoke_via_s3_wire_protocol` integration
+    //! test against an in-process `s3s-fs` server.
+    use super::*;
+
+    // ---- translate -----------------------------------------------------
+
+    #[test]
+    fn translate_not_found_to_typed_variant() {
+        let err = translate(
+            "some/key",
+            ObjError::NotFound {
+                path: "some/key".into(),
+                source: "raw".into(),
+            },
+        );
+        match err {
+            StorageError::NotFound { uri } => assert_eq!(uri, "some/key"),
+            other => panic!("expected NotFound; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_already_exists_to_precondition_failed() {
+        let err = translate(
+            "k",
+            ObjError::AlreadyExists {
+                path: "k".into(),
+                source: "raw".into(),
+            },
+        );
+        assert!(matches!(err, StorageError::PreconditionFailed { uri } if uri == "k"));
+    }
+
+    #[test]
+    fn translate_precondition_to_precondition_failed() {
+        let err = translate(
+            "k",
+            ObjError::Precondition {
+                path: "k".into(),
+                source: "raw".into(),
+            },
+        );
+        assert!(matches!(err, StorageError::PreconditionFailed { uri } if uri == "k"));
+    }
+
+    #[test]
+    fn translate_generic_to_transient_exhausted() {
+        let err = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "boom".into(),
+            },
+        );
+        match err {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_other_variant_to_permanent() {
+        // Any object_store error variant that isn't one of the
+        // explicit arms above maps to Permanent. UnknownConfigurationKey
+        // is a stable variant we can construct without an API quirk.
+        let err = translate(
+            "k",
+            ObjError::UnknownConfigurationKey {
+                store: "S3",
+                key: "foo".into(),
+            },
+        );
+        match err {
+            StorageError::Permanent { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected Permanent; got {other:?}"),
+        }
+    }
+
+    // ---- path ----------------------------------------------------------
+
+    #[test]
+    fn path_parses_simple_uri() {
+        let p = S3StorageProvider::path("foo/bar.txt").expect("parse");
+        assert_eq!(p.to_string(), "foo/bar.txt");
+    }
+
+    #[test]
+    fn path_parses_nested_uri() {
+        let p = S3StorageProvider::path("manifest-lists/list-000042.json").expect("parse");
+        assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
+    }
+
+    // ---- constructors --------------------------------------------------
+
+    fn endpoint_provider() -> S3StorageProvider {
+        // Pure construction — no I/O. Builds the inner
+        // AmazonS3 with explicit credentials targeting a
+        // fake endpoint. Useful for testing `bucket()` and
+        // `path()` without spinning up the s3s-fs harness.
+        S3StorageProvider::new_with_endpoint(
+            "http://127.0.0.1:1",
+            "test-bucket",
+            "AKIATESTKEY",
+            "secret/example",
+            "us-east-1",
+        )
+        .expect("construct with endpoint")
+    }
+
+    #[test]
+    fn new_with_endpoint_builds_succeeds_and_exposes_bucket() {
+        let p = endpoint_provider();
+        assert_eq!(p.bucket(), "test-bucket");
+    }
+
+    #[test]
+    fn from_object_store_preserves_bucket() {
+        // Construct an AmazonS3 directly and wrap it via the
+        // escape-hatch constructor. Exercises the wrapping
+        // path without going through `new_with_endpoint`'s
+        // builder.
+        let store = AmazonS3Builder::new()
+            .with_endpoint("http://127.0.0.1:1")
+            .with_bucket_name("hatch-bucket")
+            .with_access_key_id("AKIATESTKEY")
+            .with_secret_access_key("secret")
+            .with_region("us-east-1")
+            .with_allow_http(true)
+            .with_virtual_hosted_style_request(false)
+            .build()
+            .expect("build AmazonS3");
+        let p = S3StorageProvider::from_object_store("hatch-bucket", store);
+        assert_eq!(p.bucket(), "hatch-bucket");
+    }
+
+    #[test]
+    fn debug_impl_does_not_panic() {
+        // S3StorageProvider derives Debug; print it to ensure
+        // the impl block isn't dropped accidentally.
+        let p = endpoint_provider();
+        let s = format!("{p:?}");
+        assert!(s.contains("S3StorageProvider"));
+    }
+}
