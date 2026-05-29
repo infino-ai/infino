@@ -189,6 +189,7 @@ mod tests {
     use super::*;
     use crate::superfile::builder::{FtsConfig, VectorConfig};
     use crate::superfile::vector::distance::Metric;
+    use crate::superfile::vector::rerank_codec::RerankCodec;
     use crate::supertable::manifest::list::PartitionStrategy;
     use crate::supertable::manifest::part::ContentHash;
     use crate::supertable::options::SupertableOptions;
@@ -383,6 +384,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 0,
                 metric: Metric::Cosine,
+                rerank_codec: RerankCodec::default(),
             }],
             Some(default_tokenizer()),
         )
@@ -408,6 +410,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 0,
                     metric,
+                    rerank_codec: RerankCodec::default(),
                 }],
                 Some(default_tokenizer()),
             )
