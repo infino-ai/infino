@@ -262,3 +262,8 @@ name = "vector"
 path = "benches/vector/main.rs"
 harness = false
 
+[[bench]]
+name = "vector-object-store"
+path = "benches/vector/object_store.rs"
+harness = false
+

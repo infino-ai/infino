@@ -33,6 +33,28 @@ pub enum ColdFetchMode {
     ///
     /// [`StorageRangeSource`]: crate::supertable::StorageRangeSource
     RangeOnly,
+    /// Plan 013 M4 — foreground returns immediately with a
+    /// [`SuperfileReader::open_lazy`]-built reader over a
+    /// [`StorageRangeSource`]; pays only the M1-M3 cold-open
+    /// + cold-search byte budget against object storage
+    /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB segment).
+    /// A background task concurrently downloads the full
+    /// segment to NVMe + mmaps it + replaces the cache entry;
+    /// any subsequent `reader(uri)` call returns the
+    /// mmap-backed reader and the corresponding search issues
+    /// **zero** S3 GETs.
+    ///
+    /// **2× bandwidth per cold miss** — foreground per-query
+    /// ranges + background full-segment GET run concurrently.
+    /// The tradeoff: minimal cold-query latency (one-segment
+    /// hot working set fits in a few range-GETs) at the cost
+    /// of doubled cold-fetch bandwidth vs. `HybridWithPrefetch`.
+    /// Pick this mode for object-storage-native deployments
+    /// where cold-query p50 latency is the primary objective.
+    ///
+    /// [`SuperfileReader::open_lazy`]: crate::superfile::reader::SuperfileReader::open_lazy
+    /// [`StorageRangeSource`]: crate::supertable::StorageRangeSource
+    LazyForegroundWithBackgroundFill,
 }
 
 /// Runtime configuration for [`super::DiskCacheStore`].

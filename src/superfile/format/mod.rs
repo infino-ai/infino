@@ -27,8 +27,65 @@ pub mod vec {
     pub const OUTER_MAGIC: &[u8; 8] = b"INFVEC01";
     /// 8-byte magic at the start of each per-column subsection.
     pub const SUB_MAGIC: &[u8; 8] = b"INFVECC1";
-    /// Numeric version emitted in both outer and sub headers.
+    /// Outer-blob version. Written at bytes [8..12] of the outer
+    /// header. Bump on outer-blob-shape changes (currently 1).
     pub const VERSION: u32 = 1;
+
+    /// Plan 013 M1 — subsection layout version stamped at
+    /// bytes [8..12] of each per-column sub-header.
+    ///
+    /// On-disk shape:
+    ///
+    /// ```text
+    /// [sub_header][summary_centroid][centroids][cluster_idx]
+    ///   [codec_meta]                              ← open-time region
+    ///   [per-cluster blocks: each = codes_chunk + doc_ids_chunk]
+    ///   [full]                                    ← rerank column
+    ///   [crc]
+    /// ```
+    ///
+    /// Two wins land together because they ride on the same
+    /// layout (no version skew to manage):
+    ///
+    /// 1. **Open-time region contiguous** at the head of the
+    ///    subsection. One range fetch covers everything search
+    ///    needs before picking a cluster (~1.5 MB at 1M × 384
+    ///    sq8, ~16 MB at 10M × 1024 sq8).
+    /// 2. **Per-cluster `codes + doc_ids` interleave.** One range
+    ///    fetch per probed cluster covers both. Each block is
+    ///    `count[c] * (code_bytes + 4)` bytes; the existing
+    ///    `cluster_index[c] = (doc_off, count)` is enough to
+    ///    address it (block byte offset =
+    ///    `doc_off * (code_bytes + 4)`).
+    ///
+    /// Sub-header byte layout (56 bytes):
+    ///
+    /// ```text
+    /// [ 0.. 8] SUB_MAGIC
+    /// [ 8..12] SUBSECTION_VERSION
+    /// [12..16] codec_meta_size (u32 LE) — 0 when no codec_meta
+    ///                                     (Fp32 / Bf16 / None)
+    /// [16..24] summary_centroid_offset (u64 LE)
+    /// [24..28] summary_radius_x100 (u32 LE)
+    /// [28..32] reserved (u32)
+    /// [32..40] centroids_off (u64 LE)
+    /// [40..48] cluster_idx_off (u64 LE)
+    /// [48..56] per_cluster_blocks_off (u64 LE)
+    /// ```
+    ///
+    /// Derived offsets (computed by the reader at open):
+    /// - `codec_meta_off = cluster_idx_off + n_cent * 8`
+    ///   when `codec_meta_size > 0`, else unused.
+    /// - `full_off = per_cluster_blocks_off + n_docs * (code_bytes + 4)`.
+    /// - per-cluster block at byte offset
+    ///   `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`,
+    ///   block size `count[c] * (code_bytes + 4)`.
+    ///
+    /// The format is **new-service-only** — there are no pre-013
+    /// segments in production, so the reader rejects every other
+    /// value at this slot as malformed rather than carrying a v0
+    /// parse path.
+    pub const SUBSECTION_VERSION: u32 = 2;
 }
 
 /// Parquet KV metadata keys, all prefixed `inf.` to match the project magic.

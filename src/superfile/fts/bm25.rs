@@ -1,7 +1,7 @@
 //! BM25 scoring math.
 //!
-//! Pure functions — no allocation, no I/O. Lucene defaults: `k1 = 1.2`,
-//! `b = 0.75`. The formula is the standard "BM25-with-Lucene-IDF":
+//! Pure functions — no allocation, no I/O. Standard BM25 defaults:
+//! `k1 = 1.2`, `b = 0.75`. The formula is the canonical BM25-with-IDF:
 //!
 //! ```text
 //!   idf(N, df)            = ln( 1 + (N - df + 0.5) / (df + 0.5) )
@@ -27,10 +27,10 @@
 
 use wide::f32x4;
 
-/// Lucene default `k1` — term-frequency saturation parameter.
+/// Standard BM25 default `k1` — term-frequency saturation parameter.
 pub const K1: f32 = 1.2;
 
-/// Lucene default `b` — length-normalization parameter.
+/// Standard BM25 default `b` — length-normalization parameter.
 pub const B: f32 = 0.75;
 
 /// BM25 inverse-document-frequency. Plus-half smoothing keeps the log

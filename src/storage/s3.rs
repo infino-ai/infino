@@ -38,7 +38,8 @@ use bytes::Bytes;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    Error as ObjError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    PutPayload, UpdateVersion,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider};
@@ -52,9 +53,10 @@ pub struct S3StorageProvider {
 }
 
 impl S3StorageProvider {
-    /// Construct an S3 provider from the standard AWS credential chain
-    /// (env vars / instance profile / etc.) + an explicit bucket. The
-    /// supertable's URIs are keyed off `<bucket>/<uri>`.
+    /// Construct an S3 provider from the standard AWS
+    /// credential chain (env vars / instance profile / etc.)
+    /// + an explicit bucket. The supertable's URIs are
+    /// keyed off `<bucket>/<uri>`.
     pub fn new(bucket: impl Into<String>) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let store = AmazonS3Builder::from_env()
@@ -71,10 +73,12 @@ impl S3StorageProvider {
         })
     }
 
-    /// Construct an S3 provider pointed at a custom endpoint + explicit
-    /// credentials. Used by `tests/supertable_smoke_s3.rs` for the s3s-fs
-    /// integration test (`endpoint = "http://127.0.0.1:<port>"`) and by
-    /// callers using a self-hosted S3-compatible service (MinIO etc.).
+    /// Construct an S3 provider pointed at a custom endpoint
+    /// + explicit credentials. Used by
+    /// `tests/supertable_smoke_s3.rs` for the s3s-fs
+    /// integration test (`endpoint = "http://127.0.0.1:<port>"`)
+    /// and by callers using a self-hosted S3-compatible
+    /// service (MinIO etc.).
     ///
     /// `allow_http` is enabled so plain-HTTP endpoints
     /// (typical for in-process test harnesses) don't get
@@ -186,6 +190,39 @@ impl StorageProvider for S3StorageProvider {
             .get_range(&path, range)
             .await
             .map_err(|e| translate(uri, e))
+    }
+
+    /// Plan 013 M5 — single-RTT tail fetch via S3's native
+    /// `Range: bytes=-len` suffix-range form. The response
+    /// carries the total object size in `GetResult::meta.size`,
+    /// so callers don't need a separate HEAD round-trip just
+    /// to learn the size.
+    ///
+    /// Compared to the default trait impl (HEAD + bounded
+    /// GET = 2 RTTs), this collapses to 1 RTT — on a typical
+    /// in-region AWS S3 path that's a ~25-50 ms saving per
+    /// cold open.
+    async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+        if len == 0 {
+            // Suffix-range of 0 isn't well-defined in HTTP;
+            // fall through to a HEAD so we still return the
+            // size for consistency with the default impl.
+            let meta = self.head(uri).await?;
+            return Ok((Bytes::new(), meta.size));
+        }
+        let path = Self::path(uri)?;
+        let opts = GetOptions {
+            range: Some(GetRange::Suffix(len)),
+            ..Default::default()
+        };
+        let result = self
+            .store
+            .get_opts(&path, opts)
+            .await
+            .map_err(|e| translate(uri, e))?;
+        let size = result.meta.size as u64;
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, size))
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {

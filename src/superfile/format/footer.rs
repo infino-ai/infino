@@ -58,6 +58,12 @@ pub enum FooterError {
     Arrow(#[from] arrow::error::ArrowError),
     #[error("malformed parquet: {0}")]
     Malformed(&'static str),
+    /// Plan 013 M4 — surfaces a `LazyByteSource` failure during
+    /// async-tail footer reading. The string carries the upstream
+    /// `LazyByteSourceError`'s `Display` so the chain is visible
+    /// even after the layer translation.
+    #[error("lazy source: {0}")]
+    LazySource(String),
 }
 
 /// Write `batches` (matching `schema`) as Parquet, then splice the
@@ -202,7 +208,92 @@ pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
     }
     let footer_start = n - 8 - footer_len;
     let metadata = ParquetMetaDataReader::decode_metadata(&bytes[footer_start..n - 8])?;
+    extract_kv_map(&metadata)
+}
 
+/// Plan 013 M4 — read the decoded Parquet metadata from a
+/// superfile footer via a [`LazyByteSource`], bounded to
+/// **≤ 2 range GETs**:
+///
+/// 1. Speculative tail GET of `tail_speculative_bytes` (default
+///    64 KiB). Covers the typical superfile footer in one
+///    round-trip (Parquet footer is usually a few KiB to a few
+///    tens of KiB).
+/// 2. Follow-up GET only if the speculative tail didn't reach
+///    the footer's start.
+///
+/// Returns the decoded `ParquetMetaData`; callers extract the
+/// KV map via [`extract_kv_map`] or the Arrow schema via
+/// `parquet::arrow::schema::parquet_to_arrow_schema`.
+pub async fn read_parquet_metadata_lazy(
+    source: &dyn crate::superfile::LazyByteSource,
+    tail_speculative_bytes: u64,
+) -> Result<parquet::file::metadata::ParquetMetaData, FooterError> {
+    // Plan 013 M5 — route the parquet tail fetch through
+    // `LazyByteSource::tail`. On a `StorageRangeSource` with
+    // unknown size this is a single suffix-range GET that
+    // returns both the bytes AND the total object size, so
+    // we skip the upfront HEAD round-trip cold-open used to
+    // pay. On sources that already know their size (in-memory,
+    // mmap, pre-HEAD'd `StorageRangeSource`), the default
+    // `tail` impl reduces to `size() + range(size - n, n)`,
+    // which is exactly what this function used to do
+    // explicitly — so no extra work on the warm path.
+    let (tail, total) = source
+        .tail(tail_speculative_bytes)
+        .await
+        .map_err(footer_lazy_err)?;
+    if total < 12 {
+        return Err(FooterError::Malformed("not a Parquet file (too short)"));
+    }
+    let spec_len = tail.len() as u64;
+    let spec_start = total - spec_len;
+
+    let n = tail.len();
+    if &tail[n - 4..n] != b"PAR1" {
+        return Err(FooterError::Malformed("not a Parquet file (missing PAR1)"));
+    }
+    let footer_len_bytes: [u8; 4] = tail[n - 8..n - 4]
+        .try_into()
+        .map_err(|_| FooterError::Malformed("footer length not 4 bytes"))?;
+    let footer_len = u32::from_le_bytes(footer_len_bytes) as usize;
+    let footer_end_abs = total - 8;
+    let footer_start_abs = (total as usize)
+        .checked_sub(8 + footer_len)
+        .ok_or(FooterError::Malformed("footer length out of range"))?;
+
+    let footer_bytes: bytes::Bytes = if (footer_start_abs as u64) >= spec_start {
+        let off_in_tail = footer_start_abs - (spec_start as usize);
+        tail.slice(off_in_tail..off_in_tail + footer_len)
+    } else {
+        source
+            .range(footer_start_abs as u64, footer_len as u64)
+            .await
+            .map_err(footer_lazy_err)?
+    };
+    debug_assert_eq!(footer_start_abs + footer_len, footer_end_abs as usize);
+
+    ParquetMetaDataReader::decode_metadata(&footer_bytes).map_err(FooterError::from)
+}
+
+/// Plan 013 M4 — convenience wrapper around
+/// [`read_parquet_metadata_lazy`] for the common case where
+/// callers only need the `inf.*` KV map (e.g. tests + the eager
+/// open path mirroring the legacy [`read_kv_metadata`]).
+pub async fn read_kv_metadata_lazy(
+    source: &dyn crate::superfile::LazyByteSource,
+    tail_speculative_bytes: u64,
+) -> Result<KvMap, FooterError> {
+    let metadata = read_parquet_metadata_lazy(source, tail_speculative_bytes).await?;
+    extract_kv_map(&metadata)
+}
+
+/// Shared extractor — pulls every KV (key, value) pair out of
+/// a decoded `ParquetMetaData` into a HashMap. Used by both the
+/// eager and lazy footer-readers above.
+pub fn extract_kv_map(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+) -> Result<KvMap, FooterError> {
     let mut out: KvMap = HashMap::new();
     if let Some(kvs) = metadata.file_metadata().key_value_metadata() {
         for kv in kvs {
@@ -212,6 +303,14 @@ pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
         }
     }
     Ok(out)
+}
+
+/// Translate a `LazyByteSourceError` to a `FooterError` for the
+/// async-tail readers. Storage failures become `Parquet`-shaped
+/// errors via the existing `Malformed` channel — the variant
+/// shape exists for both signal and source-chain preservation.
+fn footer_lazy_err(e: crate::superfile::LazyByteSourceError) -> FooterError {
+    FooterError::LazySource(e.to_string())
 }
 
 #[cfg(test)]
@@ -368,5 +467,126 @@ mod tests {
     fn read_kv_metadata_rejects_non_parquet_input() {
         let err = read_kv_metadata(&[0u8; 16]).expect_err("expected error");
         assert!(matches!(err, FooterError::Malformed(_)));
+    }
+
+    /// Plan 013 M4 — counting lazy source used by the
+    /// `read_kv_metadata_lazy` tests below. Records every
+    /// `range()` invocation so the test can assert the
+    /// speculative-tail vs. follow-up GET budget.
+    use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Debug)]
+    struct CountingFooterSource {
+        inner: BytesLazyByteSource,
+        async_calls: Arc<AtomicU64>,
+    }
+
+    impl CountingFooterSource {
+        fn new(bytes: bytes::Bytes) -> Self {
+            Self {
+                inner: BytesLazyByteSource::new(bytes),
+                async_calls: Arc::new(AtomicU64::new(0)),
+            }
+        }
+        fn counter(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.async_calls)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for CountingFooterSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<bytes::Bytes, LazyByteSourceError> {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.range(start, len).await
+        }
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<bytes::Bytes> {
+            None
+        }
+    }
+
+    /// Plan 013 M4 — `read_kv_metadata_lazy` recovers the same
+    /// KV map as the eager [`read_kv_metadata`] when the
+    /// speculative tail (default 64 KiB) fully contains the
+    /// Parquet footer. Range budget: **exactly 1 GET**.
+    #[tokio::test]
+    async fn lazy_kv_metadata_one_range_when_tail_covers_footer() {
+        let schema = small_schema();
+        let batch = small_batch(&schema);
+        let extra = vec![
+            ("inf.format".to_string(), "infino-superfile".to_string()),
+            ("inf.format_version".to_string(), "1.0.0".to_string()),
+            ("inf.id_column".to_string(), "id".to_string()),
+        ];
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &[batch],
+            &[],
+            &[],
+            &extra,
+            Compression::SNAPPY,
+            1024,
+        )
+        .expect("write parquet with blobs");
+
+        let eager = read_kv_metadata(&parts.bytes).expect("eager kv");
+        let source = CountingFooterSource::new(bytes::Bytes::from(parts.bytes));
+        let counter = source.counter();
+        let lazy = read_kv_metadata_lazy(&source, 64 * 1024)
+            .await
+            .expect("lazy kv");
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "tail wholly contains footer ⇒ exactly 1 range GET",
+        );
+        assert_eq!(eager, lazy, "lazy + eager KV maps must agree");
+    }
+
+    /// Plan 013 M4 — when the speculative tail is too small to
+    /// cover the footer, `read_kv_metadata_lazy` issues a
+    /// **second** GET for the footer body. Total range budget:
+    /// **exactly 2 GETs**. KV map still matches the eager path.
+    #[tokio::test]
+    async fn lazy_kv_metadata_two_ranges_when_followup_needed() {
+        let schema = small_schema();
+        let batch = small_batch(&schema);
+        let extra = vec![
+            ("inf.format".to_string(), "infino-superfile".to_string()),
+            ("inf.format_version".to_string(), "1.0.0".to_string()),
+            ("inf.id_column".to_string(), "id".to_string()),
+        ];
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &[batch],
+            &[],
+            &[],
+            &extra,
+            Compression::SNAPPY,
+            1024,
+        )
+        .expect("write parquet with blobs");
+        let eager = read_kv_metadata(&parts.bytes).expect("eager kv");
+
+        let source = CountingFooterSource::new(bytes::Bytes::from(parts.bytes));
+        let counter = source.counter();
+        // Force the speculative tail to be ridiculously small
+        // (just the trailing 16 bytes — enough for `PAR1` +
+        // footer-length, but never for the footer body).
+        let lazy = read_kv_metadata_lazy(&source, 16)
+            .await
+            .expect("lazy kv (followup)");
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "tail < footer ⇒ 1 tail GET + 1 follow-up GET",
+        );
+        assert_eq!(eager, lazy, "lazy + eager KV maps must agree");
     }
 }

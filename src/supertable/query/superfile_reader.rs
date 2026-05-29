@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
-use crate::supertable::manifest::SuperfileUri;
+use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
 use crate::supertable::reader_cache::DiskCacheStore;
 use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 
@@ -40,10 +40,19 @@ use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 /// memory tier and falling back to the disk cache when
 /// configured. See the module-level docs for the precise
 /// policy.
+///
+/// Plan 013 M6 — `offsets` is an optional pre-known layout hint
+/// pulled from the manifest's [`SubsectionOffsets`]. When `Some`
+/// the disk-cache cold-fetch path fires the parquet-footer,
+/// vector subsection, and FTS subsection GETs **in parallel**
+/// (1 RTT cold open) instead of doing the parquet footer first
+/// and the subsection fetches second (2 RTTs). `None` falls back
+/// to the pre-M6 2-RTT path — same shape, slower.
 pub fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
     uri: &SuperfileUri,
+    offsets: Option<&SubsectionOffsets>,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
     // 1. In-memory tier.
     match store.reader(uri) {
@@ -61,12 +70,15 @@ pub fn superfile_reader(
     };
 
     let uri_copy = *uri;
+    let offsets_copy = offsets.copied();
     let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // Ambient tokio runtime — block_in_place + block_on
             // is the same pattern the writer's commit path uses
             // for its sync→async bridge.
-            tokio::task::block_in_place(|| handle.block_on(cache.reader(&uri_copy)))
+            tokio::task::block_in_place(|| {
+                handle.block_on(cache.reader_with_hints(&uri_copy, offsets_copy.as_ref()))
+            })
         }
         Err(_) => {
             // No ambient runtime. Build a tiny one just for
@@ -88,7 +100,7 @@ pub fn superfile_reader(
                     });
                 }
             };
-            rt.block_on(cache.reader(&uri_copy))
+            rt.block_on(cache.reader_with_hints(&uri_copy, offsets_copy.as_ref()))
         }
     };
 

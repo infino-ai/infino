@@ -170,7 +170,10 @@ fn end_to_end_parquet_round_trip() {
     // parquet-rs must read them and recover all rows + columns.
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes.clone()).expect("open superfile");
-    let parquet = r.parquet_bytes().clone();
+    let parquet = r
+        .parquet_bytes()
+        .expect("eager open retains parquet bytes")
+        .clone();
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet)
         .expect("try_new ParquetRecordBatchReaderBuilder");
     let mut reader = builder.build().expect("build parquet reader");
@@ -220,7 +223,10 @@ fn end_to_end_no_indexes_still_valid_parquet() {
     assert!(r.vec().is_none());
     assert!(r.fts_columns().is_empty());
     assert!(r.vector_columns().is_empty());
-    let p = r.parquet_bytes().clone();
+    let p = r
+        .parquet_bytes()
+        .expect("eager open retains parquet bytes")
+        .clone();
     let builder = ParquetRecordBatchReaderBuilder::try_new(p)
         .expect("try_new ParquetRecordBatchReaderBuilder");
     let mut reader = builder.build().expect("build parquet reader");

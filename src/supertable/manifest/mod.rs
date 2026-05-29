@@ -353,6 +353,48 @@ pub struct SuperfileEntry {
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
     pub partition_hint: Option<u32>,
+    /// Plan 013 M6 — precomputed superfile layout offsets so the
+    /// cold-open path can fire the parquet-footer, vector
+    /// subsection, and FTS subsection GETs **in parallel** in a
+    /// single round-trip, without first reading the parquet KV
+    /// metadata to learn where each subsection lives.
+    ///
+    /// Populated by the writer at commit time from the
+    /// `ParquetParts` returned by `write_parquet_with_blobs` (so
+    /// the values are by construction consistent with what the
+    /// parquet KV metadata would later say).
+    ///
+    /// `None` on segments produced by pre-M6 writers; the cold
+    /// open path falls back to the 2-RTT shape (parquet tail
+    /// then vec/fts in parallel) — see
+    /// `DiskCacheStore::reader_with_hints`.
+    pub subsection_offsets: Option<SubsectionOffsets>,
+}
+
+/// Plan 013 M6 — superfile layout offsets cached on the manifest.
+///
+/// Knowing these up-front lets the cold-open path issue every
+/// subsection GET in parallel against the same superfile object,
+/// turning the canonical 2-RTT cold open (parquet tail → vec+fts
+/// in parallel) into a single round-trip.
+///
+/// All offsets are absolute byte positions within the superfile
+/// blob (matching `inf.vec.offset` / `inf.fts.offset` parquet KV
+/// values), and `total_size` matches what an S3 `HEAD` would
+/// return. Cheap to clone (it's `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsectionOffsets {
+    /// Total byte count of the superfile blob. Lets the cold-open
+    /// path skip the upfront `HEAD` round-trip too — the same
+    /// information the suffix-range tail would otherwise return,
+    /// but available without any I/O.
+    pub total_size: u64,
+    /// Absolute `(offset, length)` of the vector subsection. `None`
+    /// when the segment carries no vector subsection.
+    pub vec: Option<(u64, u64)>,
+    /// Absolute `(offset, length)` of the FTS subsection. `None`
+    /// when the segment carries no FTS subsection.
+    pub fts: Option<(u64, u64)>,
 }
 
 /// Opaque store key — wraps a UUID v4. The segment store treats
@@ -594,6 +636,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         })
     }
 

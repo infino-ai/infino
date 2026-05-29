@@ -38,7 +38,7 @@
 //! BM25's IDF is computed from per-segment `n_docs` and `df`,
 //! so a rare term in a small segment can score higher than the
 //! same term in a larger segment. This is the classical sharded-
-//! BM25 problem (Lucene, Elasticsearch all face it):
+//! BM25 problem:
 //! treating per-segment scores as comparable is a documented
 //! approximation, accepted in v1 because (a) global IDF would
 //! require either a manifest-wide df table or a two-pass query
@@ -381,8 +381,13 @@ fn open_reader(
     disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(store, disk_cache, &entry.uri)
-        .map_err(|e| QueryError::Store(e.to_string()))
+    crate::supertable::query::superfile_reader::superfile_reader(
+        store,
+        disk_cache,
+        &entry.uri,
+        entry.subsection_offsets.as_ref(),
+    )
+    .map_err(|e| QueryError::Store(e.to_string()))
 }
 
 fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {

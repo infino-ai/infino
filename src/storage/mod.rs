@@ -119,6 +119,35 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// Range-fetch. `range.end` is exclusive.
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 
+    /// Plan 013 M5 — fetch the last `len` bytes of `uri` AND
+    /// return the total object size from the same response.
+    ///
+    /// Lets cold-open callers (parquet footer / format trailer
+    /// readers) skip an upfront `head()` round-trip: a single
+    /// suffix-range GET pulls the bytes and discloses the
+    /// object size at once.
+    ///
+    /// Implementations backed by HTTP range-GETs (S3, GCS)
+    /// should use `Range: bytes=-len` so the response's
+    /// Content-Range header carries the total size. The
+    /// default impl falls back to a `head()` + bounded
+    /// `get_range()` pair (one HEAD + one GET = 2 RTTs) for
+    /// providers that can't directly issue a suffix range.
+    ///
+    /// `len` is clamped to the object size: callers requesting
+    /// more bytes than the object holds receive the whole
+    /// object plus `size == object_size`.
+    async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+        let meta = self.head(uri).await?;
+        let len = len.min(meta.size);
+        if len == 0 {
+            return Ok((Bytes::new(), meta.size));
+        }
+        let start = meta.size - len;
+        let bytes = self.get_range(uri, start..meta.size).await?;
+        Ok((bytes, meta.size))
+    }
+
     /// Atomic write — succeeds only if the target doesn't
     /// exist. Maps to `If-None-Match: *` on S3,
     /// `x-goog-if-generation-match: 0` on GCS, `O_EXCL` on

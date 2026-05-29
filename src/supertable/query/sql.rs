@@ -180,9 +180,21 @@ fn build_mem_table(
             &store,
             disk_cache.as_ref(),
             &entry.uri,
+            entry.subsection_offsets.as_ref(),
         )
         .map_err(|e| QueryError::Store(e.to_string()))?;
-        let batches = read_all_batches(reader.parquet_bytes().clone())?;
+        let parquet = reader
+            .parquet_bytes()
+            .ok_or_else(|| {
+                QueryError::Plan(format!(
+                    "SQL pass-through requires eager-opened superfile bytes; \
+                     reader for {:?} was opened via the lazy path which does \
+                     not materialize the full segment",
+                    entry.uri
+                ))
+            })?
+            .clone();
+        let batches = read_all_batches(parquet)?;
         partitions.push(batches);
     }
     if partitions.is_empty() {

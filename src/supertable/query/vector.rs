@@ -143,8 +143,13 @@ fn open_reader(
     disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(store, disk_cache, &entry.uri)
-        .map_err(|e| QueryError::Store(e.to_string()))
+    crate::supertable::query::superfile_reader::superfile_reader(
+        store,
+        disk_cache,
+        &entry.uri,
+        entry.subsection_offsets.as_ref(),
+    )
+    .map_err(|e| QueryError::Store(e.to_string()))
 }
 
 fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {

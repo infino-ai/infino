@@ -51,7 +51,13 @@ impl Default for OpenOptions {
 }
 
 pub struct SuperfileReader {
-    bytes: Bytes,
+    /// Full Parquet bytes, `Some` only for the eager [`open`]
+    /// path. The lazy [`open_lazy`] path (013 M4) drops the
+    /// whole-segment hold — pass-through SQL / external-Parquet
+    /// callers (`parquet_bytes`) see `None` and must take a
+    /// different path. Vector + FTS queries work on either,
+    /// since each carries its own source under the inner readers.
+    bytes: Option<Bytes>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -66,7 +72,7 @@ impl std::fmt::Debug for SuperfileReader {
             .field("n_docs", &self.n_docs)
             .field("has_fts", &self.fts.is_some())
             .field("has_vec", &self.vec.is_some())
-            .field("bytes_len", &self.bytes.len())
+            .field("bytes_len", &self.bytes.as_ref().map(|b| b.len()))
             .finish()
     }
 }
@@ -80,32 +86,32 @@ impl SuperfileReader {
         Self::open_with(bytes, OpenOptions::default())
     }
 
-    /// Open a superfile via a [`LazyByteSource`].
+    /// Open a superfile via a shared [`LazyByteSource`] (013 M4).
     ///
-    /// Unlike [`open`], `open_lazy` does not require the caller
-    /// to have materialized the full segment up-front. The
-    /// source pulls bytes on demand. Today's implementation
-    /// issues a single full-range fetch through the source
-    /// (the polymorphism point), then constructs the reader
-    /// through the existing `open()` path — so the per-call
-    /// memory cost still scales with segment size. Per-query
-    /// laziness ("≤ 3 ranges per query" — fetching only the
-    /// footer + the touched FTS posting list + the touched
-    /// vector cluster) requires teaching `FtsReader` +
-    /// `VectorReader` to fetch posting / cluster bytes through
-    /// the source on demand, which the trait shape already
-    /// supports but the inner readers don't yet exercise.
+    /// Cold-open range budget:
     ///
-    /// The async signature is what lets the supertable layer
-    /// wrap the source with a broadcast / cold-fetch
-    /// coordinator (see `ColdFetchMode`) — coalescing multiple
-    /// concurrent cold readers onto a single set of
-    /// range-GETs, or running the foreground reader in
-    /// parallel with a background disk-cache fill.
+    /// 1. **1-2 GETs** for the Parquet footer (`inf.*` KV
+    ///    metadata + Arrow schema), via
+    ///    `format::footer::read_parquet_metadata_lazy`.
+    /// 2. **2-3 GETs** for the embedded vector subsection, via
+    ///    `VectorReader::open_lazy` (M2 budget: outer header
+    ///    + directory + speculative open-time tail).
+    /// 3. **1 GET** for the embedded FTS subsection (until
+    ///    `FtsReader::open_lazy` exists; FTS today is small
+    ///    relative to vectors so a single bounded range is fine).
+    ///
+    /// Total open budget: ≤ 6 GETs / ~2-3 MiB on a typical
+    /// 1.5 GiB segment. Subsequent vector queries fetch
+    /// per-cluster blocks on demand via the source.
+    ///
+    /// The returned reader does **not** hold the full segment;
+    /// `parquet_bytes()` returns `None`. Callers that need the
+    /// full Parquet bytes (DataFusion register, DuckDB,
+    /// pyarrow) must use the eager [`open`] path.
     ///
     /// [`open`]: SuperfileReader::open
     pub async fn open_lazy(
-        source: &dyn crate::superfile::LazyByteSource,
+        source: Arc<dyn crate::superfile::LazyByteSource>,
     ) -> Result<Self, ReadError> {
         Self::open_lazy_with(source, OpenOptions::default()).await
     }
@@ -114,21 +120,146 @@ impl SuperfileReader {
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
-        source: &dyn crate::superfile::LazyByteSource,
+        source: Arc<dyn crate::superfile::LazyByteSource>,
         opts: OpenOptions,
     ) -> Result<Self, ReadError> {
-        let size = source.size();
-        let bytes = source.range(0, size).await.map_err(|e| match e {
-            crate::superfile::LazyByteSourceError::Storage(se) => {
-                ReadError::MalformedKv(format!("lazy source storage: {se}"))
+        use parquet::arrow::parquet_to_arrow_schema;
+
+        // 1. Fetch the Parquet footer (≤ 2 GETs).
+        let metadata = footer::read_parquet_metadata_lazy(
+            source.as_ref(),
+            // 64 KiB is plenty for typical superfile footers
+            // (the footer carries `inf.*` KVs + a single row
+            // group's worth of column metadata; a few KiB to
+            // a few tens of KiB).
+            64 * 1024,
+        )
+        .await
+        .map_err(ReadError::Footer)?;
+        let kv_map = footer::extract_kv_map(&metadata).map_err(ReadError::Footer)?;
+
+        // 2. Validate required KVs + format version (same
+        //    checks as the eager `open_with` path).
+        for k in kv::REQUIRED {
+            if !kv_map.contains_key(*k) {
+                return Err(ReadError::MissingKv(k));
             }
-            crate::superfile::LazyByteSourceError::OutOfBounds { start, len, size } => {
-                ReadError::MalformedKv(format!(
-                    "lazy source out-of-bounds: start={start} len={len} size={size}"
-                ))
+        }
+        let format_value = kv_map.get(kv::FORMAT).expect("checked above");
+        if format_value != kv::FORMAT_VALUE {
+            return Err(ReadError::MalformedKv(format!(
+                "{} expected {:?}, got {:?}",
+                kv::FORMAT,
+                kv::FORMAT_VALUE,
+                format_value
+            )));
+        }
+        let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
+        let version = format::Version::parse(version_str)
+            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        if !version.is_compatible_with_current() {
+            return Err(ReadError::UnsupportedVersion(version_str.clone()));
+        }
+
+        let id_column = kv_map.get(kv::ID_COLUMN).expect("checked above").clone();
+        let n_docs: u64 = kv_map
+            .get(kv::N_DOCS)
+            .expect("checked above")
+            .parse()
+            .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
+
+        // 3. Arrow schema from decoded Parquet metadata — no
+        //    extra range GET.
+        let file_meta = metadata.file_metadata();
+        let schema = Arc::new(
+            parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata())
+                .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?,
+        );
+
+        // 4 + 5. Vector + FTS subsections — Plan 013 M5
+        //   fires both subsection fetches **concurrently** via
+        //   `futures::try_join!`. The two subsections live at
+        //   disjoint offsets (parquet body → fts → vec → footer
+        //   in the layout produced by `write_parquet_with_blobs`)
+        //   so neither depends on the other; on a network-backed
+        //   `LazyByteSource` this collapses two serial RTTs
+        //   into one parallel RTT. On warm/in-memory sources
+        //   both branches resolve through the sync zero-copy
+        //   path with no extra cost.
+        //
+        // Each branch validates its `inf.{fts,vec}.*` KV
+        // shape before starting any I/O so partial-KV
+        // misconfigurations fail fast (and don't trigger a
+        // wasted range GET).
+        let vec_present = all_present(&kv_map, kv::VEC_KEYS);
+        if !vec_present && any_present(&kv_map, kv::VEC_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.vec.* keys present".into(),
+            ));
+        }
+        let fts_present = all_present(&kv_map, kv::FTS_KEYS);
+        if !fts_present && any_present(&kv_map, kv::FTS_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.fts.* keys present".into(),
+            ));
+        }
+
+        let vec_fut = async {
+            if !vec_present {
+                return Ok::<_, ReadError>(None);
             }
-        })?;
-        Self::open_with(bytes, opts)
+            let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
+            let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
+            let sub: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(
+                crate::superfile::LazySubSource::new(Arc::clone(&source), off, len),
+            );
+            let reader = VectorReader::open_lazy(
+                sub,
+                cols_json,
+                crate::superfile::vector::reader::OpenOptions::for_object_store(),
+            )
+            .await?;
+            Ok(Some(reader))
+        };
+
+        let fts_fut = async {
+            if !fts_present {
+                return Ok::<_, ReadError>(None);
+            }
+            let off = parse_u64(&kv_map, kv::FTS_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::FTS_LENGTH)?;
+            let cols_json = kv_map.get(kv::FTS_COLUMNS).expect("checked");
+            let blob = source.range(off, len).await.map_err(|e| match e {
+                crate::superfile::LazyByteSourceError::Storage(se) => {
+                    ReadError::MalformedKv(format!("lazy source storage (FTS): {se}"))
+                }
+                crate::superfile::LazyByteSourceError::OutOfBounds { start, len, size } => {
+                    ReadError::MalformedKv(format!(
+                        "FTS subsection out-of-bounds: start={start} len={len} size={size}"
+                    ))
+                }
+            })?;
+            let reader = FtsReader::open_with(
+                blob,
+                cols_json,
+                crate::superfile::fts::reader::OpenOptions {
+                    verify_crc: opts.verify_crc,
+                },
+            )?;
+            Ok(Some(reader))
+        };
+
+        let (vec, fts) = futures::try_join!(vec_fut, fts_fut)?;
+
+        Ok(Self {
+            bytes: None,
+            schema,
+            id_column,
+            n_docs,
+            fts,
+            vec,
+        })
     }
 
     /// Open with explicit options. `OpenOptions { verify_crc: false }`
@@ -207,6 +338,7 @@ impl SuperfileReader {
                 cols_json,
                 crate::superfile::vector::reader::OpenOptions {
                     verify_crc: opts.verify_crc,
+                    ..Default::default()
                 },
             )?)
         } else if any_present(&kv_map, kv::VEC_KEYS) {
@@ -218,7 +350,7 @@ impl SuperfileReader {
         };
 
         Ok(Self {
-            bytes,
+            bytes: Some(bytes),
             schema,
             id_column,
             n_docs,
@@ -271,8 +403,17 @@ impl SuperfileReader {
     /// Pass-through to the raw Parquet bytes — the superfile is a
     /// valid Parquet file, so this works as input to any external
     /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
-    pub fn parquet_bytes(&self) -> &Bytes {
-        &self.bytes
+    ///
+    /// Returns `None` for readers opened via [`open_lazy`] — the
+    /// lazy path (013 M4) does not materialize the full segment,
+    /// so external-Parquet pass-throughs need either the eager
+    /// [`open`] path or an explicit `LazyByteSource::range(0, size)`
+    /// against the source.
+    ///
+    /// [`open`]: SuperfileReader::open
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    pub fn parquet_bytes(&self) -> Option<&Bytes> {
+        self.bytes.as_ref()
     }
 
     /// Single-column BM25 search across the unified FTS reader.
@@ -448,17 +589,18 @@ impl SuperfileReader {
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
     ///
-    /// Sync — every public surface in `src/` is sync. Per-range
-    /// byte access routes through
+    /// Sync — matches plan 002 Q9 (commit `2e351ba`)'s
+    /// resolution that every public surface in `src/` is sync.
+    /// Per-range byte access routes through
     /// [`crate::superfile::vector::reader::Source::get_range`],
     /// which is itself sync and bridges to the underlying
     /// async `LazyByteSource::range` only on cold
     /// `Source::Lazy` misses (via `block_in_place +
-    /// Handle::block_on`, same pattern as the
-    /// supertable query path's per-segment reader). On
-    /// `Source::InMemory` and on warm-cache `Source::Lazy`
-    /// (`BytesLazyByteSource`, mmap-backed) every fetch
-    /// resolves zero-copy on the sync fast path.
+    /// Handle::block_on`, same pattern as
+    /// `supertable::query::segment_reader::segment_reader`).
+    /// On `Source::InMemory` and on warm-cache
+    /// `Source::Lazy` (`BytesLazyByteSource`, mmap-backed)
+    /// every fetch resolves zero-copy on the sync fast path.
     pub fn vector_search(
         &self,
         column: &str,
@@ -790,7 +932,10 @@ mod tests {
         // The whole buffer should still be a valid Parquet file.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
-        let p = r.parquet_bytes().clone();
+        let p = r
+            .parquet_bytes()
+            .expect("eager open should retain parquet bytes")
+            .clone();
         let builder = ParquetRecordBatchReaderBuilder::try_new(p)
             .expect("try_new ParquetRecordBatchReaderBuilder");
         let mut reader = builder.build().expect("build parquet reader");

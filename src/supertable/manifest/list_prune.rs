@@ -335,6 +335,7 @@ mod tests {
             vector_summary: vec_summary,
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         })
     }
 
@@ -419,6 +420,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         });
 
         let aggs = aggregates::compute(&[s_a, s_b, s_c]);
@@ -451,6 +453,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         });
 
         let aggs = aggregates::compute(&[s]);
@@ -518,6 +521,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
+                subsection_offsets: None,
             })
         }
         let segs = vec![make(0, 100, 200), make(1, 50, 150), make(2, 300, 400)];
@@ -563,6 +567,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
+                subsection_offsets: None,
             })
         }
         let segs = vec![make(0, 99), make(100, 199), make(200, 299)];

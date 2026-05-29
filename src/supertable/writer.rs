@@ -59,7 +59,9 @@ use crate::superfile::builder::SuperfileBuilder;
 use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
-use super::manifest::{FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary};
+use super::manifest::{
+    FtsSummary, ScalarStatsTable, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
+};
 use super::options::SupertableOptions;
 use super::utils::vector_split::split_vectors;
 
@@ -473,6 +475,30 @@ fn build_one_shard(
     })
 }
 
+/// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`
+/// out of the freshly-written parquet KV metadata so the manifest
+/// can carry it forward as a [`SubsectionOffsets`]. Returns `None`
+/// if the bytes don't parse — that path falls back to the pre-M6
+/// 2-RTT cold open shape rather than failing the publish.
+fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
+    use crate::superfile::format::{footer::read_kv_metadata, kv};
+    let kvs = read_kv_metadata(bytes).ok()?;
+    let get = |k: &str| -> Option<u64> { kvs.get(k).and_then(|s| s.parse::<u64>().ok()) };
+    let vec = match (get(kv::VEC_OFFSET), get(kv::VEC_LENGTH)) {
+        (Some(o), Some(l)) if l > 0 => Some((o, l)),
+        _ => None,
+    };
+    let fts = match (get(kv::FTS_OFFSET), get(kv::FTS_LENGTH)) {
+        (Some(o), Some(l)) if l > 0 => Some((o, l)),
+        _ => None,
+    };
+    Some(SubsectionOffsets {
+        total_size: bytes.len() as u64,
+        vec,
+        fts,
+    })
+}
+
 /// Per-shard publish artifacts produced in parallel before the
 /// serial manifest swap. One entry per non-empty shard.
 struct PreparedSegment {
@@ -551,6 +577,13 @@ fn prepare_segment(
         }
     }
 
+    // Plan 013 M6 — capture `(total_size, vec_off/len, fts_off/len)`
+    // from the freshly-written bytes' parquet KV metadata. Caching
+    // these on the manifest lets `DiskCacheStore::reader_with_hints`
+    // fire the parquet-footer, vector, and FTS subsection GETs in
+    // parallel on cold open (1 RTT instead of 2 sequential).
+    let subsection_offsets = build_subsection_offsets(&shard.bytes);
+
     let entry = Arc::new(SuperfileEntry {
         superfile_id: uuid::Uuid::new_v4(),
         uri,
@@ -565,6 +598,7 @@ fn prepare_segment(
         // emitted here remain unpartitioned (default).
         partition_key: Vec::new(),
         partition_hint: None,
+        subsection_offsets,
     });
 
     Ok(Some(PreparedSegment {

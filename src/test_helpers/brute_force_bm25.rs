@@ -3,7 +3,7 @@
 //! index, no skip table, no WAND. Used as the correctness oracle
 //! for the FTS pipeline's optimized BMW / BMM walks.
 //!
-//! Formula matches infino's production scoring (Lucene-form IDF +
+//! Formula matches infino's production scoring (standard BM25 IDF +
 //! standard BM25 tf factor):
 //!
 //! ```text
@@ -11,7 +11,7 @@
 //!   tf_factor   = tf · (K1 + 1) / (tf + K1 · (1 - B + B · dl/avgdl))
 //!   score(d, q) = Σ_{t ∈ q} idf(t) · tf_factor(tf(t, d), dl(d), avgdl)
 //!
-//!   K1 = 1.2,  B = 0.75            (Lucene defaults)
+//!   K1 = 1.2,  B = 0.75            (standard BM25 defaults)
 //! ```
 //!
 //! Tokenization runs through whatever `Tokenizer` the caller
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::superfile::fts::tokenize::Tokenizer;
 
-/// Lucene-default BM25 parameters. Match the constants used by
+/// Standard BM25 default parameters. Match the constants used by
 /// the production scoring path.
 const K1: f32 = 1.2;
 const B: f32 = 0.75;

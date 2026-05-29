@@ -18,7 +18,7 @@ use tokio::sync::OnceCell;
 use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate};
 use crate::storage::{StorageError, StorageProvider};
 use crate::superfile::reader::{OpenOptions, SuperfileReader};
-use crate::supertable::manifest::SuperfileUri;
+use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
@@ -38,8 +38,6 @@ pub enum DiskCacheError {
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
 }
-
-type ChunkSlot = Arc<tokio::sync::Mutex<Vec<Option<(u64, Bytes)>>>>;
 
 /// Live cache entry. Holds the cached `Arc<SuperfileReader>`
 /// (constructed once on cache fill); the `Bytes` inside the
@@ -295,6 +293,27 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        self.reader_with_hints(uri, None).await
+    }
+
+    /// Plan 013 M6 — like [`Self::reader`] but takes a precomputed
+    /// [`SubsectionOffsets`] hint (sourced from the manifest's
+    /// [`crate::supertable::manifest::SuperfileEntry::subsection_offsets`]).
+    /// On a cold miss in the
+    /// `LazyForegroundWithBackgroundFill` mode the hint lets the
+    /// cold-fetch path fire the parquet-footer, vector subsection,
+    /// and FTS subsection GETs **in parallel** (1 RTT cold open)
+    /// instead of doing the parquet footer first and the
+    /// subsection fetches second (2 RTTs).
+    ///
+    /// `None` falls back to the pre-M6 2-RTT shape — same shape,
+    /// slower. The other cold-fetch modes (`HybridWithPrefetch`,
+    /// `RangeOnly`) ignore the hint today.
+    pub async fn reader_with_hints(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        offsets: Option<&SubsectionOffsets>,
+    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         match self.config.cold_fetch_mode {
             ColdFetchMode::HybridWithPrefetch => self.reader_hybrid(uri).await,
             ColdFetchMode::RangeOnly => Err(DiskCacheError::SuperfileOpen(
@@ -302,13 +321,17 @@ impl DiskCacheStore {
                  construct StorageRangeSource + open_lazy directly"
                     .into(),
             )),
+            ColdFetchMode::LazyForegroundWithBackgroundFill => {
+                self.reader_lazy_with_bg_fill_hinted(uri, offsets.copied())
+                    .await
+            }
         }
     }
 
-    /// Strictly-cached cold-fetch path — waits for all pwrites + fsync +
-    /// mmap before returning. Public for integration tests that want this
-    /// deterministic behavior; the production reader path uses
-    /// `reader_hybrid`.
+    /// Strictly-cached cold-fetch path — waits for all pwrites
+    /// + fsync + mmap before returning. Public for integration
+    /// tests that want this deterministic behavior; the
+    /// production reader path uses `reader_hybrid`.
     pub async fn reader_synchronous(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -332,9 +355,11 @@ impl DiskCacheStore {
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                self.cold_fetch(uri)
+                Err(self
+                    .cold_fetch(uri)
                     .await
-                    .map(|entry| Arc::clone(&entry.reader))
+                    .err()
+                    .unwrap_or(DiskCacheError::SuperfileOpen("cold fetch error".into())))
             }
         }
     }
@@ -368,18 +393,10 @@ impl DiskCacheStore {
         match result {
             Ok(entry) => Ok(Arc::clone(&entry.reader)),
             Err(_e) => {
-                // The cached coordinator's first attempt failed; remove
-                // it so a retry doesn't observe a stale poisoned cell,
-                // then try once more. Propagate the retry's actual
-                // outcome — an earlier version always returned Err here,
-                // which surfaced a synthetic "hybrid cold fetch error"
-                // even when the retry succeeded (e.g. a transient
-                // BudgetExceeded resolved by an in-flight reservation
-                // rolling back).
                 self.coordinators.remove(uri);
-                self.cold_fetch_hybrid(uri)
-                    .await
-                    .map(|entry| Arc::clone(&entry.reader))
+                Err(self.cold_fetch_hybrid(uri).await.err().unwrap_or(
+                    DiskCacheError::SuperfileOpen("hybrid cold fetch error".into()),
+                ))
             }
         }
     }
@@ -701,7 +718,8 @@ impl DiskCacheStore {
         let file = Arc::new(tokio::sync::Mutex::new(file));
 
         // Per-chunk slot for the foreground buffer assembly.
-        let chunks: ChunkSlot = Arc::new(tokio::sync::Mutex::new(vec![None; n_chunks as usize]));
+        let chunks: Arc<tokio::sync::Mutex<Vec<Option<(u64, Bytes)>>>> =
+            Arc::new(tokio::sync::Mutex::new(vec![None; n_chunks as usize]));
 
         let mut fetch_handles = Vec::with_capacity(n_chunks as usize);
         let mut write_handles = Vec::with_capacity(n_chunks as usize);
@@ -801,17 +819,323 @@ impl DiskCacheStore {
         let final_owned = final_path.clone();
         let file_owned = Arc::clone(&file);
         tokio::spawn(async move {
-            let _ = finalize_to_mmap(FinalizationParams {
+            let _ = finalize_to_mmap(
                 store,
-                uri: uri_owned,
-                tmp_path: tmp_owned,
-                final_path: final_owned,
-                file: file_owned,
-                pwrite_handles: write_handles,
+                uri_owned,
+                tmp_owned,
+                final_owned,
+                file_owned,
+                write_handles,
                 size,
                 reserved_bytes,
-            })
+            )
             .await;
+        });
+
+        Ok(entry)
+    }
+
+    /// Plan 013 M4 — lazy-foreground cold-fetch coordinator.
+    /// Returns immediately with a
+    /// [`SuperfileReader::open_lazy`]-built reader over a
+    /// [`crate::supertable::StorageRangeSource`]; spawns a
+    /// background task to fetch the full segment, mmap it,
+    /// and replace the cached entry. Subsequent `reader(uri)`
+    /// calls return the mmap-backed reader (zero S3 GETs for
+    /// any subsequent search).
+    /// Plan 013 M6 — lazy cold-fetch coordinator, hinted shape.
+    /// When `offsets` is `Some` the underlying cold-fetch runs
+    /// in 1-RTT parallel-prefetch mode via
+    /// [`Self::cold_fetch_lazy_with_hints`]; when `None` it
+    /// falls back to the pre-M6 2-RTT
+    /// [`Self::cold_fetch_lazy`] shape.
+    async fn reader_lazy_with_bg_fill_hinted(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        offsets: Option<SubsectionOffsets>,
+    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        if let Some(entry) = self.cached.get(uri) {
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
+            return Ok(Arc::clone(&entry.reader));
+        }
+        let cell = self
+            .coordinators
+            .entry(*uri)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
+        let result = cell
+            .get_or_init(|| async { self.cold_fetch_lazy_hinted(uri, offsets).await })
+            .await;
+        match result {
+            Ok(entry) => Ok(Arc::clone(&entry.reader)),
+            Err(_e) => {
+                self.coordinators.remove(uri);
+                Err(self
+                    .cold_fetch_lazy_hinted(uri, offsets)
+                    .await
+                    .err()
+                    .unwrap_or(DiskCacheError::SuperfileOpen(
+                        "lazy cold fetch error".into(),
+                    )))
+            }
+        }
+    }
+
+    /// Plan 013 M4 — lazy cold-fetch path. Foreground builds a
+    /// reader via `SuperfileReader::open_lazy(StorageRangeSource)`
+    /// (paying only the M1-M3 cold-open + cold-search byte
+    /// budget); background task downloads the full segment to
+    /// NVMe + mmaps it + replaces the cache entry in
+    /// `cached`. Concurrent `reader(uri)` callers observing
+    /// the in-flight OnceCell get the lazy reader; once the
+    /// background promotion completes they hit the
+    /// mmap-backed entry on the next call.
+    /// Plan 013 M6 cold-fetch entry point. If `offsets` is
+    /// `Some`, the parquet-footer + vector + FTS subsection
+    /// fetches run in **one parallel batch** (1 RTT cold open).
+    /// If `None`, falls back to the pre-M6 [`Self::cold_fetch_lazy`]
+    /// path (parquet footer → vec/fts in parallel, 2 RTTs cold
+    /// open).
+    async fn cold_fetch_lazy_hinted(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        offsets: Option<SubsectionOffsets>,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        match offsets {
+            Some(o) => self.cold_fetch_lazy_with_hints(uri, &o).await,
+            None => self.cold_fetch_lazy(uri).await,
+        }
+    }
+
+    /// Plan 013 M6 — single-RTT cold open. Issues the parquet
+    /// footer tail, vector subsection combined head, and FTS
+    /// subsection GETs **in parallel** against the storage
+    /// provider, then installs every fetched byte range into a
+    /// [`crate::superfile::PrefetchedSource`] overlay so every
+    /// subsequent read inside `SuperfileReader::open_lazy_with`
+    /// resolves zero-copy from the overlay with no extra GETs.
+    ///
+    /// `offsets.total_size` lets us skip the suffix-range
+    /// HEAD-discovery dance entirely — the
+    /// [`crate::supertable::StorageRangeSource`] inner source
+    /// starts with a known size, and the parquet tail GET fires
+    /// as a plain `get_range` instead of a suffix range.
+    ///
+    /// Bandwidth shape on a typical 1.5 GiB segment:
+    ///   - parquet tail: 64 KiB
+    ///   - vec subsection head: ≤ 6 MiB (matches
+    ///     `DEFAULT_OPEN_TIME_SPECULATIVE_BYTES`)
+    ///   - fts subsection: full length (today FTS subsections
+    ///     are small; M7 may add an FTS combined head)
+    async fn cold_fetch_lazy_with_hints(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        offsets: &SubsectionOffsets,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        use crate::superfile::PrefetchedSource;
+
+        let storage_uri = Self::storage_path(uri);
+        let total_size = offsets.total_size;
+
+        // Match `SuperfileReader::open_lazy_with`'s parquet tail
+        // speculation length so the overlay covers the entire
+        // upcoming `source.tail()` call.
+        let parquet_tail_spec: u64 = 64 * 1024;
+        let parquet_tail_len = parquet_tail_spec.min(total_size);
+        let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
+
+        // Match `VectorReader::open_lazy`'s combined-head spec
+        // length so the overlay covers the vec subsection's
+        // outer header + directory + open-time region.
+        let vec_head_target: u64 = 6 * 1024 * 1024;
+
+        // Fire all three GETs concurrently. The futures are
+        // independent of one another (parquet tail, vec head,
+        // fts) — `try_join!` schedules them on the runtime
+        // simultaneously so the wall clock is the **max** of the
+        // three latencies, not the sum.
+        let storage = Arc::clone(&self.storage);
+        let storage_uri_a = storage_uri.clone();
+        let storage_uri_b = storage_uri.clone();
+        let storage_uri_c = storage_uri.clone();
+        let vec_hint = offsets.vec;
+        let fts_hint = offsets.fts;
+        let storage_for_vec = Arc::clone(&storage);
+        let storage_for_fts = Arc::clone(&storage);
+
+        let parquet_fut = async move {
+            let end = total_size;
+            let start = parquet_tail_start;
+            if end == start {
+                return Ok::<_, StorageError>(Bytes::new());
+            }
+            storage.get_range(&storage_uri_a, start..end).await
+        };
+        let vec_fut = async move {
+            match vec_hint {
+                Some((off, len)) if len > 0 => {
+                    let take = vec_head_target.min(len);
+                    let bytes = storage_for_vec
+                        .get_range(&storage_uri_b, off..off + take)
+                        .await?;
+                    Ok::<_, StorageError>(Some((off, bytes)))
+                }
+                _ => Ok(None),
+            }
+        };
+        let fts_fut = async move {
+            match fts_hint {
+                Some((off, len)) if len > 0 => {
+                    let bytes = storage_for_fts
+                        .get_range(&storage_uri_c, off..off + len)
+                        .await?;
+                    Ok::<_, StorageError>(Some((off, bytes)))
+                }
+                _ => Ok(None),
+            }
+        };
+
+        let (parquet_bytes, vec_pre, fts_pre) = futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
+
+        // Build the lazy source: a `StorageRangeSource` with the
+        // size baked in (no HEAD, no suffix-range discovery)
+        // wrapped in a `PrefetchedSource` overlay carrying the
+        // three pre-fetched byte ranges at their absolute
+        // offsets.
+        let inner: Arc<dyn crate::superfile::LazyByteSource> =
+            Arc::new(crate::supertable::StorageRangeSource::with_known_size(
+                Arc::clone(&self.storage),
+                storage_uri.clone(),
+                total_size,
+            ));
+        let mut overlay = PrefetchedSource::new(inner);
+        if !parquet_bytes.is_empty() {
+            overlay.install(parquet_tail_start, parquet_bytes);
+        }
+        if let Some((off, bytes)) = vec_pre {
+            overlay.install(off, bytes);
+        }
+        if let Some((off, bytes)) = fts_pre {
+            overlay.install(off, bytes);
+        }
+        let source: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(overlay);
+
+        // Every internal read inside `open_lazy_with` (parquet
+        // tail, vec subsection head, fts subsection) hits the
+        // overlay sync — zero additional GETs against storage.
+        let lazy_reader = SuperfileReader::open_lazy_with(
+            Arc::clone(&source),
+            OpenOptions {
+                verify_crc: self.config.verify_crc_on_open,
+            },
+        )
+        .await
+        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+
+        self.reserve_manual(total_size).await?;
+        let reserved_bytes = total_size;
+
+        let lazy_reader = Arc::new(lazy_reader);
+        let entry = Arc::new(CachedEntry {
+            reader: Arc::clone(&lazy_reader),
+            mmap: None,
+            size_bytes: total_size,
+            last_access_us: AtomicU64::new(self.now_us()),
+        });
+        self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
+        self.cached.insert(*uri, Arc::clone(&entry));
+
+        let store = Arc::clone(self);
+        let uri_owned = *uri;
+        let storage_uri_owned = storage_uri;
+        tokio::spawn(async move {
+            let _ = lazy_background_fill(
+                store,
+                uri_owned,
+                storage_uri_owned,
+                total_size,
+                reserved_bytes,
+            )
+            .await;
+        });
+
+        Ok(entry)
+    }
+
+    async fn cold_fetch_lazy(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let storage_uri = Self::storage_path(uri);
+
+        // Plan 013 M5 — drop the cold-open HEAD round-trip.
+        //
+        // Previously: `storage.head(uri)` to learn `size`,
+        // then `with_known_size(size)`. That HEAD was a
+        // pure RTT cost — we never used the etag or any
+        // other field, just the size.
+        //
+        // Now: construct a `StorageRangeSource` with the
+        // size unset. The first call to its `tail()` (issued
+        // by `read_parquet_metadata_lazy` inside
+        // `open_lazy_with`) is a native S3 suffix-range GET
+        // that returns both the footer bytes AND the total
+        // object size in one round-trip. The size is patched
+        // into the source's atomic so subsequent `range()`
+        // bounds checks work. Net saving: 1 RTT per cold
+        // open on the real S3 wire (~25-50 ms in-region).
+        let range_src: Arc<dyn crate::superfile::LazyByteSource> =
+            Arc::new(crate::supertable::StorageRangeSource::with_unknown_size(
+                Arc::clone(&self.storage),
+                storage_uri.clone(),
+            ));
+        let lazy_reader = SuperfileReader::open_lazy_with(
+            Arc::clone(&range_src),
+            OpenOptions {
+                verify_crc: self.config.verify_crc_on_open,
+            },
+        )
+        .await
+        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+
+        // `open_lazy_with` calls `source.tail(...)` first thing,
+        // which patches the size atomic on the
+        // `StorageRangeSource`. We can read it back now to size
+        // the disk-budget reservation + background fill —
+        // still one HEAD-less cold open total.
+        //
+        // If `reserve_manual` fails, `lazy_reader` drops at
+        // end-of-scope; no GETs leaked since the lazy reader
+        // owns only the cold-open metadata it already paid
+        // for above.
+        let size = range_src.size();
+        self.reserve_manual(size).await?;
+        let reserved_bytes = size;
+
+        let lazy_reader = Arc::new(lazy_reader);
+
+        let entry = Arc::new(CachedEntry {
+            reader: Arc::clone(&lazy_reader),
+            // Lazy entry — no mmap yet. The background
+            // promotion replaces this entry with one carrying
+            // `Some(mmap)` once the disk file is finalized.
+            mmap: None,
+            size_bytes: size,
+            last_access_us: AtomicU64::new(self.now_us()),
+        });
+        self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
+        self.cached.insert(*uri, Arc::clone(&entry));
+
+        // 2. Spawn the background full-segment fetch + mmap
+        //    promotion. Decoupled from the foreground response
+        //    — the foreground returns the lazy reader
+        //    immediately.
+        let store = Arc::clone(self);
+        let uri_owned = *uri;
+        let storage_uri_owned = storage_uri;
+        tokio::spawn(async move {
+            let _ = lazy_background_fill(store, uri_owned, storage_uri_owned, size, reserved_bytes)
+                .await;
         });
 
         Ok(entry)
@@ -1040,34 +1364,23 @@ impl<'a> Drop for Reservation<'a> {
     }
 }
 
-struct FinalizationParams {
-    store: Arc<DiskCacheStore>,
-    uri: SuperfileUri,
-    tmp_path: std::path::PathBuf,
-    final_path: std::path::PathBuf,
-    file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
-    pwrite_handles:
-        Vec<tokio::sync::oneshot::Receiver<tokio::task::JoinHandle<Result<(), DiskCacheError>>>>,
-    size: u64,
-    reserved_bytes: u64,
-}
-
 /// Background finalizer for the hybrid cold-fetch. Awaits
 /// all pwrites, fsyncs + renames the destination file, mmaps
 /// it, and atomically replaces the cache entry with a
 /// mmap-backed reader. On failure, releases the disk
 /// reservation back to the pool and removes the entry.
-async fn finalize_to_mmap(params: FinalizationParams) -> Result<(), DiskCacheError> {
-    let FinalizationParams {
-        store,
-        uri,
-        tmp_path,
-        final_path,
-        file,
-        pwrite_handles,
-        size,
-        reserved_bytes,
-    } = params;
+async fn finalize_to_mmap(
+    store: Arc<DiskCacheStore>,
+    uri: SuperfileUri,
+    tmp_path: std::path::PathBuf,
+    final_path: std::path::PathBuf,
+    file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
+    pwrite_handles: Vec<
+        tokio::sync::oneshot::Receiver<tokio::task::JoinHandle<Result<(), DiskCacheError>>>,
+    >,
+    size: u64,
+    reserved_bytes: u64,
+) -> Result<(), DiskCacheError> {
     let res: Result<(), DiskCacheError> = async {
         // 1. Resolve every pwrite handle through its oneshot,
         //    then await the underlying join.
@@ -1140,6 +1453,83 @@ async fn finalize_to_mmap(params: FinalizationParams) -> Result<(), DiskCacheErr
     // (e.g., observability counters); the bytes accounting is
     // entirely driven by `cached.remove` gating now.
     let _ = reserved_bytes;
+    res
+}
+
+/// Plan 013 M4 — background promotion path for the
+/// `LazyForegroundWithBackgroundFill` cold-fetch mode.
+/// Downloads the full segment via `cold_fetch_to_disk`
+/// (parallel range-GETs to NVMe), mmaps the resulting file,
+/// and atomically replaces the lazy cache entry with a
+/// mmap-backed reader. Subsequent `reader(uri)` calls hit
+/// the promoted entry — every query resolves from mmap (zero
+/// S3 GETs).
+async fn lazy_background_fill(
+    store: Arc<DiskCacheStore>,
+    uri: SuperfileUri,
+    storage_uri: String,
+    size: u64,
+    reserved_bytes: u64,
+) -> Result<(), DiskCacheError> {
+    let tmp = store.tmp_path(&uri);
+    let final_path = store.cache_path(&uri);
+
+    let res: Result<(), DiskCacheError> = async {
+        // 1. Parallel range-GETs into the temp file (existing
+        //    cold_fetch_to_disk helper).
+        store.cold_fetch_to_disk(&storage_uri, &tmp, size).await?;
+
+        // 2. Promote to final path + mmap.
+        tokio::fs::rename(&tmp, &final_path).await?;
+        let mmap = open_readonly_mmap(&final_path)?;
+        let mmap_arc = Arc::new(mmap);
+        let bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
+        let reader = SuperfileReader::open_with(
+            bytes,
+            OpenOptions {
+                verify_crc: store.config.verify_crc_on_open,
+            },
+        )
+        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+
+        // 3. Atomically replace the lazy entry with the
+        //    mmap-backed one — but only if it's still
+        //    present (a racing eviction may have removed it
+        //    + released the reservation in the meantime).
+        use dashmap::mapref::entry::Entry;
+        match store.cached.entry(uri) {
+            Entry::Occupied(mut occ) => {
+                *occ.get_mut() = Arc::new(CachedEntry {
+                    reader: Arc::new(reader),
+                    mmap: Some(mmap_arc),
+                    size_bytes: size,
+                    last_access_us: AtomicU64::new(store.now_us()),
+                });
+            }
+            Entry::Vacant(_) => {
+                let _ = std::fs::remove_file(&final_path);
+            }
+        }
+        store.coordinators.remove(&uri);
+        Ok::<(), DiskCacheError>(())
+    }
+    .await;
+
+    if res.is_err() {
+        // Rollback — same atomic gate as eviction so we don't
+        // double-decrement when a racing eviction already
+        // removed this entry + released its bytes.
+        if let Some((_, entry)) = store.cached.remove(&uri) {
+            store
+                .current_bytes
+                .fetch_sub(entry.size_bytes, Ordering::Release);
+        }
+        store.coordinators.remove(&uri);
+        // Clean up the temp file if cold_fetch_to_disk failed
+        // mid-way.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let _ = reserved_bytes; // retained for future observability
     res
 }
 

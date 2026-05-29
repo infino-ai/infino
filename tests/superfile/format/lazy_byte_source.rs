@@ -79,10 +79,8 @@ async fn open_lazy_via_bytes_source_matches_open() {
     let bytes = build_test_bytes();
     let eager = SuperfileReader::open(bytes.clone()).expect("eager open");
 
-    let source = BytesLazyByteSource::new(bytes);
-    let lazy = SuperfileReader::open_lazy(&source)
-        .await
-        .expect("lazy open");
+    let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+    let lazy = SuperfileReader::open_lazy(source).await.expect("lazy open");
 
     assert_eq!(lazy.schema(), eager.schema());
     assert_eq!(lazy.id_column(), eager.id_column());
@@ -166,18 +164,18 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     // driving I/O (not a hidden path).
     let proxy = CountingProxy::new(local);
 
-    let source = StorageRangeSource::new(Arc::clone(&proxy) as Arc<dyn StorageProvider>, uri)
-        .await
-        .expect("source");
+    let source: Arc<dyn LazyByteSource> = Arc::new(
+        StorageRangeSource::new(Arc::clone(&proxy) as Arc<dyn StorageProvider>, uri)
+            .await
+            .expect("source"),
+    );
     let head_after_construct = proxy.head_calls.load(Ordering::Acquire);
     assert_eq!(
         head_after_construct, 1,
         "StorageRangeSource::new must HEAD the object once"
     );
 
-    let reader = SuperfileReader::open_lazy(&source)
-        .await
-        .expect("open_lazy");
+    let reader = SuperfileReader::open_lazy(source).await.expect("open_lazy");
     let range_after_open = proxy.get_range_calls.load(Ordering::Acquire);
     assert!(
         range_after_open >= 1,
@@ -202,10 +200,12 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let eager = SuperfileReader::open(bytes).expect("eager");
-    let source = StorageRangeSource::new(Arc::clone(&local), uri)
-        .await
-        .expect("source");
-    let lazy = SuperfileReader::open_lazy(&source).await.expect("lazy");
+    let source: Arc<dyn LazyByteSource> = Arc::new(
+        StorageRangeSource::new(Arc::clone(&local), uri)
+            .await
+            .expect("source"),
+    );
+    let lazy = SuperfileReader::open_lazy(source).await.expect("lazy");
 
     // Schema + identity metadata identical.
     assert_eq!(lazy.id_column(), eager.id_column());
@@ -225,6 +225,145 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
     let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| *d).collect();
     let lazy_ids: Vec<_> = lazy_hits.iter().map(|(d, _)| *d).collect();
     assert_eq!(lazy_ids, eager_ids);
+}
+
+// ============================================================
+// Plan 013 M4 — end-to-end cold-open range budget at the
+// superfile layer. The new `SuperfileReader::open_lazy`
+// routes through:
+//   1. `format::footer::read_parquet_metadata_lazy` — 1-2 GETs
+//      for the Parquet footer.
+//   2. `VectorReader::open_lazy` over a `LazySubSource` for
+//      the vector subsection — 2-3 GETs (M2 budget).
+//   3. One range GET for the FTS subsection (until
+//      `FtsReader::open_lazy` exists; the FTS sub-blob is
+//      bounded — typically << vector subsection).
+// Total cold-open budget: ≤ 6 GETs / ≲ 2-3 MiB on a typical
+// 1.5 GiB segment.
+// ============================================================
+
+use infino::superfile::vector::distance::normalize;
+use infino::test_helpers::default_vector_config;
+
+/// Build a small superfile that exercises both the vector and
+/// FTS sub-blobs so the M4 cold-open test can observe both
+/// sub-source paths in `open_lazy`. 4 docs × 16-dim vectors
+/// keeps the segment small but representative of the actual
+/// layout produced by `SuperfileBuilder`.
+fn build_vec_plus_fts_bytes() -> Bytes {
+    let dim = 16usize;
+    let n = 4usize;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+
+    let titles_v: Vec<String> = (0..n)
+        .map(|i| format!("doc {} alpha special bravo charlie", i))
+        .collect();
+    let titles_refs: Vec<&str> = titles_v.iter().map(String::as_str).collect();
+    let ids = decimal128_ids((1u64..=n as u64).collect::<Vec<u64>>());
+    let titles = LargeStringArray::from(titles_refs);
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+
+    // 4 unit-norm vectors so cosine is well-defined.
+    let mut flat: Vec<f32> = Vec::new();
+    for i in 0..n {
+        let mut v = vec![0.0f32; dim];
+        v[i % dim] = 1.0;
+        v[(i + 3) % dim] = 0.5;
+        normalize(&mut v);
+        flat.extend_from_slice(&v);
+    }
+
+    let opts = BuilderOptions::new(
+        schema,
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![default_vector_config("emb", 11)],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("builder");
+    b.add_batch(&batch, &[flat.as_slice()]).expect("add_batch");
+    Bytes::from(b.finish().expect("finish"))
+}
+
+/// Plan 013 M4 — superfile-level cold-open via `open_lazy`
+/// stays within the documented byte budget. Asserts the upper
+/// bound (≤ 6 GETs) so adding small per-subsection follow-ups
+/// (e.g. a future codec-metadata range) doesn't silently inflate
+/// the budget — this is the failure mode we want to catch.
+#[tokio::test]
+async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
+    let bytes = build_vec_plus_fts_bytes();
+    let total = bytes.len();
+    let inner: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+
+    // Wrap in a counting proxy so we can assert the budget.
+    struct CountingLazy {
+        inner: Arc<dyn LazyByteSource>,
+        n_async: AtomicUsize,
+    }
+    impl std::fmt::Debug for CountingLazy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CountingLazy")
+                .field("n_async", &self.n_async)
+                .finish()
+        }
+    }
+    #[async_trait]
+    impl LazyByteSource for CountingLazy {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.n_async.fetch_add(1, Ordering::AcqRel);
+            self.inner.range(start, len).await
+        }
+        fn try_get_range_sync(&self, _: u64, _: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    let counting = Arc::new(CountingLazy {
+        inner,
+        n_async: AtomicUsize::new(0),
+    });
+    let reader = SuperfileReader::open_lazy(counting.clone() as Arc<dyn LazyByteSource>)
+        .await
+        .expect("open_lazy");
+
+    let n_get = counting.n_async.load(Ordering::Acquire);
+    let documented_max = 6usize; // 2 (footer) + 3 (vector M2 max) + 1 (FTS)
+    assert!(
+        n_get <= documented_max,
+        "cold-open issued {n_get} GETs against a {total}-byte segment; \
+         documented superfile cold-open budget is ≤ {documented_max} GETs",
+    );
+
+    // Sanity: the lazy reader is usable for both vector and
+    // FTS queries — the budget guarantee is meaningless if
+    // the readers themselves don't function.
+    assert_eq!(reader.n_docs(), 4);
+    assert!(reader.vec().is_some());
+    assert!(reader.fts().is_some());
+    let fts_hits = reader
+        .fts()
+        .expect("fts")
+        .search("title", &["special"], 5, BoolMode::Or)
+        .expect("bm25");
+    assert!(
+        !fts_hits.is_empty(),
+        "BM25 must return matches for 'special'"
+    );
+
+    // The lazy reader never materializes the full segment, so
+    // `parquet_bytes()` must be `None`.
+    assert!(reader.parquet_bytes().is_none());
 }
 
 #[tokio::test]

@@ -127,6 +127,27 @@ impl BitQuantizer {
         }
         sum
     }
+
+    /// Like [`estimate_dot_rotated`] but takes a precomputed
+    /// `q_total = Σ_d q_rot[d]`, which the caller hoists out of
+    /// the per-candidate loop (constant across every doc scored
+    /// against one query).
+    ///
+    /// main's estimator is the `wide` `f32x8` sign-table kernel,
+    /// which computes `Σ q·sign` directly; the precomputed total
+    /// is the hook for the AVX-512 fast path (`2·Σ_{bit=1} q −
+    /// q_total`, plan 014) and is unused on this path. Both forms
+    /// are algebraically identical — `Σ q·sign = 2·Σ_{bit=1} q −
+    /// Σ_d q` — so the result matches regardless of host.
+    #[inline]
+    pub fn estimate_dot_rotated_with_total(
+        &self,
+        q_rot: &[f32],
+        code: &[u8],
+        _q_total: f32,
+    ) -> f32 {
+        self.estimate_dot_rotated(q_rot, code)
+    }
 }
 
 #[cfg(test)]

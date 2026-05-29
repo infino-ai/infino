@@ -17,11 +17,11 @@ use apache_avro::{from_avro_datum, to_avro_datum};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::manifest::encoding::{
     self, DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
     encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
 };
+use crate::supertable::manifest::{SubsectionOffsets, SuperfileEntry};
 
 /// The format version stamped into every emitted part.
 ///
@@ -164,7 +164,8 @@ fn schema() -> &'static AvroSchema {
                 {"name": "partition_hint", "type": ["null", "int"], "default": null},
                 {"name": "scalar_stats", "type": "bytes"},
                 {"name": "fts_summary", "type": "bytes"},
-                {"name": "vector_summary", "type": "bytes"}
+                {"name": "vector_summary", "type": "bytes"},
+                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null}
               ]
             }}}
           ]
@@ -229,6 +230,16 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                 ("scalar_stats".into(), AvroValue::Bytes(scalar_bytes)),
                 ("fts_summary".into(), AvroValue::Bytes(fts_bytes)),
                 ("vector_summary".into(), AvroValue::Bytes(vector_bytes)),
+                (
+                    "subsection_offsets".into(),
+                    match &seg.subsection_offsets {
+                        Some(off) => AvroValue::Union(
+                            1,
+                            Box::new(AvroValue::Bytes(encode_subsection_offsets(off))),
+                        ),
+                        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    },
+                ),
             ])
         })
         .collect();
@@ -326,6 +337,14 @@ fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let fts_bytes = take_bytes(&mut map, "fts_summary")?;
     let vector_bytes = take_bytes(&mut map, "vector_summary")?;
 
+    // Plan 013 M6 — `subsection_offsets` lands as a separate
+    // optional bytes field below. Parsed if present; defaulted to
+    // None for pre-M6 manifests so old parts decode losslessly
+    // (the cold-open path falls back to the 2-RTT shape).
+    let subsection_offsets = take_optional_bytes(&mut map, "subsection_offsets")?
+        .map(|b| decode_subsection_offsets(&b))
+        .transpose()?;
+
     Ok(SuperfileEntry {
         superfile_id,
         uri: crate::supertable::manifest::SuperfileUri(uri),
@@ -337,6 +356,7 @@ fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         vector_summary: decode_vector_summary_map(&vector_bytes)?,
         partition_key,
         partition_hint,
+        subsection_offsets,
     })
 }
 
@@ -416,6 +436,107 @@ fn take_optional_int(
     }
 }
 
+/// Pull an optional bytes field. Missing-key returns `Ok(None)` so
+/// new schema fields stay backward-compatible with parts emitted
+/// before they were added (plan 013 M6 `subsection_offsets`).
+fn take_optional_bytes(
+    map: &mut HashMap<String, AvroValue>,
+    name: &'static str,
+) -> Result<Option<Vec<u8>>, PartParseError> {
+    match map.remove(name) {
+        None => Ok(None),
+        Some(AvroValue::Union(_, boxed)) => match *boxed {
+            AvroValue::Null => Ok(None),
+            AvroValue::Bytes(b) => Ok(Some(b)),
+            _ => Err(PartParseError::WrongFieldType(name)),
+        },
+        Some(AvroValue::Null) => Ok(None),
+        Some(AvroValue::Bytes(b)) => Ok(Some(b)),
+        Some(_) => Err(PartParseError::WrongFieldType(name)),
+    }
+}
+
+/// Encode [`SubsectionOffsets`] as a flat byte string: a 1-byte
+/// version tag, then `total_size`, optional `(vec_off, vec_len)`,
+/// optional `(fts_off, fts_len)`. Optionality is a 1-byte flag
+/// per pair — keeps the encoding tiny (≤ 41 bytes) without
+/// dragging another Avro record schema in.
+///
+/// Stays in lock-step with [`decode_subsection_offsets`].
+fn encode_subsection_offsets(off: &SubsectionOffsets) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 8 + 1 + 16 + 1 + 16);
+    out.push(1u8); // version
+    out.extend_from_slice(&off.total_size.to_le_bytes());
+    match off.vec {
+        Some((o, l)) => {
+            out.push(1);
+            out.extend_from_slice(&o.to_le_bytes());
+            out.extend_from_slice(&l.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    match off.fts {
+        Some((o, l)) => {
+            out.push(1);
+            out.extend_from_slice(&o.to_le_bytes());
+            out.extend_from_slice(&l.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartParseError> {
+    let mut cur = bytes;
+    let take = |cur: &mut &[u8], n: usize| -> Result<Vec<u8>, PartParseError> {
+        if cur.len() < n {
+            return Err(PartParseError::SchemaMismatch(
+                "subsection_offsets truncated".into(),
+            ));
+        }
+        let (head, tail) = cur.split_at(n);
+        let out = head.to_vec();
+        *cur = tail;
+        Ok(out)
+    };
+    let read_u64 = |cur: &mut &[u8]| -> Result<u64, PartParseError> {
+        let b = take(cur, 8)?;
+        let arr: [u8; 8] = b
+            .as_slice()
+            .try_into()
+            .map_err(|_| PartParseError::SchemaMismatch("subsection_offsets u64 read".into()))?;
+        Ok(u64::from_le_bytes(arr))
+    };
+    let ver = take(&mut cur, 1)?[0];
+    if ver != 1 {
+        return Err(PartParseError::SchemaMismatch(format!(
+            "subsection_offsets unknown version {ver}"
+        )));
+    }
+    let total_size = read_u64(&mut cur)?;
+    let vec_flag = take(&mut cur, 1)?[0];
+    let vec = if vec_flag == 1 {
+        let o = read_u64(&mut cur)?;
+        let l = read_u64(&mut cur)?;
+        Some((o, l))
+    } else {
+        None
+    };
+    let fts_flag = take(&mut cur, 1)?[0];
+    let fts = if fts_flag == 1 {
+        let o = read_u64(&mut cur)?;
+        let l = read_u64(&mut cur)?;
+        Some((o, l))
+    } else {
+        None
+    };
+    Ok(SubsectionOffsets {
+        total_size,
+        vec,
+        fts,
+    })
+}
+
 // Silence "unused" if Schema isn't consumed yet on its
 // type-only path during cfg(test) gates.
 #[allow(dead_code)]
@@ -465,6 +586,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         })
     }
 
@@ -559,6 +681,11 @@ mod tests {
             vector_summary: vec_summary,
             partition_key: vec![0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             partition_hint: Some(13),
+            subsection_offsets: Some(SubsectionOffsets {
+                total_size: 12_345_678,
+                vec: Some((123_456, 78_910)),
+                fts: Some((11_111, 22_222)),
+            }),
         })
     }
 
@@ -718,6 +845,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
             partition_hint: Some(0xdead_beef),
+            subsection_offsets: None,
         });
         let id2 = Uuid::new_v4();
         let seg_without = Arc::new(SuperfileEntry {
@@ -731,6 +859,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         });
         let part = fresh_part(vec![seg_with.clone(), seg_without.clone()]);
         let bytes = encode(&part, 3);
