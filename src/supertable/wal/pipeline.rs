@@ -1,4 +1,17 @@
-//! Append-phase orchestrator for the update / delete pipelines.
+//! WAL pipeline orchestrators for the update / delete state machines.
+//!
+//! Two phases live here:
+//!
+//! - [`run_append_phase`] — drives one UPDATE WAL through
+//!   `Intent → Appended` by building the new superfile and
+//!   CAS-swapping it into the manifest.
+//! - [`run_tombstone_phase`] — drives one UPDATE or DELETE WAL
+//!   through `Appended → Complete` (UPDATE) or `Intent → Complete`
+//!   (DELETE) by resolving each `target_id` to a `(superfile_id,
+//!   doc_id)` pair and CAS-PUT-ing the bit into the per-superfile
+//!   tombstone sidecar.
+//!
+//! ## Append phase
 //!
 //! Drives one WAL through the state transition `Intent → Appended`:
 //!
@@ -576,6 +589,208 @@ fn build_vector_summary(
     out
 }
 
+// ============================================================
+// Tombstone phase
+// ============================================================
+//
+// Drives one WAL through `Appended → Complete` (UPDATE) or
+// `Intent → Complete` (DELETE). Per `tombstone_progress` entry
+// still at `Pending`:
+//
+// 1. **Resolve** `target_id → (superfile_id, doc_id)` against the
+//    current manifest by iterating the `[id_min, id_max]`-pruned
+//    superfile candidates and scanning their `_id` column. No
+//    hit → outcome flips to `NotFound`.
+// 2. **CAS-PUT the tombstone sidecar** under
+//    `superfiles/<superfile_id>.tombstones`: GET (etag), union
+//    the new doc-id bit, PUT with `If-Match`. Loops on CAS-loss.
+//    A `seal.is_some()` response means a compactor is mid-flight;
+//    the writer must re-read the manifest and re-resolve against
+//    the merged target.
+// 3. **Per-target WAL state CAS:** the entry flips to `Tombstoned`
+//    or `NotFound`, with `tombstoned_in_superfile` recorded for
+//    audit.
+//
+// Once every entry is non-`Pending`, the WAL itself is advanced to
+// `Complete`. The state-doc and IPC sidecar deletions in plan
+// step 6/7 are best-effort and live outside this function — they
+// stay with the recovery sweep.
+//
+// ## Recovery & idempotency
+//
+// Replay safety relies on three facts:
+//
+// - The sidecar bitmap is a set union — re-issuing the same bit is
+//   a no-op (the bitmap stays bit-identical on re-PUT after a CAS
+//   refresh).
+// - Per-target progress is persisted in `tombstone_progress` on the
+//   WAL state doc. A crash mid-loop resumes at the first remaining
+//   `Pending` entry.
+// - The final `Complete` transition is one CAS on the state doc;
+//   either it lands and the WAL is done, or it doesn't and recovery
+//   re-runs the (already-no-op) tombstone loop and re-attempts.
+
+/// Outcome of one tombstone-phase invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstonePhaseOutcome {
+    /// The WAL was already in `Complete` on entry. We didn't touch
+    /// any sidecar or state doc. `n_tombstoned` + `n_not_found`
+    /// are read straight off the state doc's existing
+    /// `tombstone_progress` so callers see the same counts as
+    /// they would from a fresh apply.
+    AlreadyComplete {
+        n_tombstoned: usize,
+        n_not_found: usize,
+    },
+
+    /// We ran (or finished running) the tombstone loop, advanced
+    /// the WAL state to `Complete`, and report the per-outcome
+    /// counts the caller will surface to its `OperationOutcome`.
+    Applied {
+        n_tombstoned: usize,
+        n_not_found: usize,
+    },
+}
+
+/// Typed failures from `run_tombstone_phase`. As with the append
+/// phase, the WAL stays at whatever state was durable when the
+/// error surfaced; recovery on a fresh process picks up at the
+/// first remaining `Pending` entry.
+#[derive(Debug, thiserror::Error)]
+pub enum TombstonePhaseError {
+    /// State doc is in a phase that disallows running the
+    /// tombstone loop. The orchestrator only runs from
+    /// `Appended` (UPDATE) or `Intent` (DELETE). An UPDATE in
+    /// `Intent` means the append phase hasn't completed; calling
+    /// this entry point is a builder bug.
+    #[error(
+        "tombstone phase invoked on WAL in state {state:?} for op {op_kind:?}; expected \
+         Appended (UPDATE) or Intent (DELETE)"
+    )]
+    InvalidPreState { op_kind: OpKind, state: WalState },
+
+    /// The supertable handle this orchestrator was given doesn't
+    /// have a storage backend attached. Sidecar CAS-PUTs need
+    /// durable storage; there's no in-process fallback.
+    #[error("supertable has no storage attached; tombstone phase requires durable storage")]
+    NoStorageAttached,
+
+    /// The compactor sealed every candidate sidecar for one
+    /// target and the writer's bounded backoff loop didn't see
+    /// the manifest swap that would route the target elsewhere.
+    /// Surfaces only if the implementation's retry budget is
+    /// exhausted; in practice the unbounded sealed-retry loop
+    /// (see plan § Sidecar write protocol) blocks indefinitely.
+    /// Reserved for the bounded form used in tests.
+    #[error("tombstone sidecar for target {target_id:?} remained sealed past retry budget")]
+    SealedSidecarRetryExhausted { target_id: String },
+
+    /// Failure scanning a superfile's `_id` column when resolving
+    /// `target_id → (superfile_id, doc_id)`. The underlying error
+    /// is preserved as a string because the resolve path crosses
+    /// crate-internal Parquet error types we don't re-export.
+    #[error("failed to scan _id column for target {target_id:?}: {message}")]
+    IdLookupFailed { target_id: String, message: String },
+
+    /// Tombstone codec error from the sidecar layer.
+    #[error("tombstone sidecar codec error: {0}")]
+    SidecarCodec(#[from] crate::supertable::wal::tombstones_codec::SidecarCodecError),
+
+    /// Underlying storage error.
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+
+    /// WAL state-document I/O error from the persistence layer.
+    #[error("WAL store error: {0}")]
+    WalStore(#[from] WalStoreError),
+}
+
+/// Drive one WAL through the tombstone phase to `Complete`.
+///
+/// **Pre-conditions** (caller responsibility):
+/// - `wal_doc.op_kind == Update` AND `wal_doc.state == Appended`, OR
+/// - `wal_doc.op_kind == Delete` AND `wal_doc.state == Intent`, OR
+/// - `wal_doc.state == Complete` (re-running on a finished WAL is
+///   the idempotent no-op path; the orchestrator just reports the
+///   existing counts).
+///
+/// **Post-conditions** on `Ok`:
+/// - For `Applied`: `wal_doc.state == Complete` durably; every
+///   `tombstone_progress` entry is non-`Pending`; per-superfile
+///   sidecars reflect the union of all tombstoned `doc_id`s.
+/// - For `AlreadyComplete`: nothing was touched; counts reflect
+///   the state-doc's existing `tombstone_progress`.
+///
+/// **What happens on intermediate failure:** the WAL stays at
+/// whatever state was durable when the failure occurred. Per-target
+/// progress is the recovery cursor — a fresh process re-runs this
+/// function and picks up at the first `Pending` entry. The sidecar
+/// bitmap union is a set so re-issuing is bit-identical; per-target
+/// state CAS is one atomic write that either landed or didn't.
+pub async fn run_tombstone_phase(
+    supertable: &Supertable,
+    wal_store: &WalStore,
+    wal_doc: &WalStateDoc,
+    wal_etag: &Etag,
+) -> Result<(TombstonePhaseOutcome, WalStateDoc, Etag), TombstonePhaseError> {
+    // Pre-condition: state ↔ op-kind compatibility. The valid
+    // entry states are pinned by the state machine in plan
+    // § State machine; reject anything else as a builder bug.
+    match (wal_doc.op_kind, wal_doc.state) {
+        (OpKind::Update, WalState::Appended) => {}
+        (OpKind::Delete, WalState::Intent) => {}
+        (_, WalState::Complete) => {
+            let (n_tombstoned, n_not_found) = count_outcomes(&wal_doc.tombstone_progress);
+            return Ok((
+                TombstonePhaseOutcome::AlreadyComplete {
+                    n_tombstoned,
+                    n_not_found,
+                },
+                wal_doc.clone(),
+                wal_etag.clone(),
+            ));
+        }
+        (op_kind, state) => {
+            return Err(TombstonePhaseError::InvalidPreState { op_kind, state });
+        }
+    }
+
+    do_tombstone_apply(supertable, wal_store, wal_doc, wal_etag).await
+}
+
+/// Sum the per-outcome counts off a `tombstone_progress` slice.
+/// Pulled out so [`run_tombstone_phase`] and the eventual
+/// `do_tombstone_apply` can use the same accounting.
+fn count_outcomes(
+    progress: &[crate::supertable::wal::state_doc::TombstoneEntry],
+) -> (usize, usize) {
+    use crate::supertable::wal::state_doc::TombstoneOutcome;
+    let mut n_tombstoned = 0usize;
+    let mut n_not_found = 0usize;
+    for entry in progress {
+        match entry.outcome {
+            TombstoneOutcome::Tombstoned => n_tombstoned += 1,
+            TombstoneOutcome::NotFound => n_not_found += 1,
+            TombstoneOutcome::Pending => {}
+        }
+    }
+    (n_tombstoned, n_not_found)
+}
+
+/// The non-idempotent fast path for the tombstone loop. Resolves
+/// each remaining `Pending` target, CAS-PUTs the bit into the
+/// matching sidecar (looping on CAS-loss and on seal-detected
+/// retries), and advances the WAL state to `Complete` once every
+/// target is non-`Pending`.
+async fn do_tombstone_apply(
+    _supertable: &Supertable,
+    _wal_store: &WalStore,
+    _wal_doc: &WalStateDoc,
+    _wal_etag: &Etag,
+) -> Result<(TombstonePhaseOutcome, WalStateDoc, Etag), TombstonePhaseError> {
+    unimplemented!("tombstone phase do_apply not yet wired up");
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for the append-phase orchestrator. This commit
@@ -962,5 +1177,156 @@ mod tests {
         ];
         let flat = flatten_spans(&spans);
         assert_eq!(flat, vec![10i128, 11, 12, 100]);
+    }
+
+    // ---- Tombstone phase: pre-condition checks ---------------------------
+    //
+    // These exercise the outer-shape behaviour of
+    // `run_tombstone_phase`: invalid (op_kind, state) pairs
+    // surface a typed `InvalidPreState`, and a WAL already at
+    // `Complete` returns `AlreadyComplete` with the outcome
+    // counts read straight off the existing `tombstone_progress`.
+    //
+    // The full resolve + sidecar-CAS loop is exercised by the
+    // end-to-end tests that land alongside `do_tombstone_apply`.
+
+    /// Build a tombstone-phase fixture starting from the `fixture()`
+    /// base and tweaking the WAL into the requested state. The
+    /// supertable + WalStore + initial state doc are otherwise
+    /// the same as the append-phase tests use.
+    async fn tombstone_fixture(
+        op_kind: OpKind,
+        state: WalState,
+        progress: Vec<crate::supertable::wal::state_doc::TombstoneEntry>,
+    ) -> (TempDir, Supertable, WalStore, WalStateDoc, Etag) {
+        let (dir, st, ws, mut wal, etag) = fixture().await;
+        wal.op_kind = op_kind;
+        wal.state = state;
+        wal.tombstone_progress = progress;
+        // The base fixture is created in `Intent`; when we want
+        // a different state we have to CAS-update so the WAL on
+        // disk matches what we'll pass to `run_tombstone_phase`.
+        let new_etag = if wal.state != WalState::Intent
+            || wal.op_kind != OpKind::Update
+            || wal.tombstone_progress.len() != 1
+        {
+            ws.update_with_etag(wal.wal_id, &etag, &wal)
+                .await
+                .expect("re-cas fixture")
+        } else {
+            etag
+        };
+        (dir, st, ws, wal, new_etag)
+    }
+
+    fn ts_entry(
+        target_id: i128,
+        outcome: TombstoneOutcome,
+    ) -> crate::supertable::wal::state_doc::TombstoneEntry {
+        crate::supertable::wal::state_doc::TombstoneEntry {
+            target_id: WalId(target_id),
+            outcome,
+            tombstoned_in_superfile: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tombstone_phase_rejects_update_wal_in_intent_state() {
+        // UPDATE pre-condition: append phase must have completed.
+        // `Intent` is a builder bug — surface the typed error.
+        let (_dir, st, ws, wal, etag) = tombstone_fixture(
+            OpKind::Update,
+            WalState::Intent,
+            vec![ts_entry(1, TombstoneOutcome::Pending)],
+        )
+        .await;
+        let err = run_tombstone_phase(&st, &ws, &wal, &etag)
+            .await
+            .expect_err("must error");
+        assert!(
+            matches!(
+                err,
+                TombstonePhaseError::InvalidPreState {
+                    op_kind: OpKind::Update,
+                    state: WalState::Intent
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tombstone_phase_rejects_delete_wal_in_appended_state() {
+        // DELETE has no append phase; an `Appended` DELETE WAL is
+        // structurally impossible from the writer side, so we
+        // reject the bogus pre-state instead of silently running
+        // the loop.
+        let (_dir, st, ws, wal, etag) = tombstone_fixture(
+            OpKind::Delete,
+            WalState::Appended,
+            vec![ts_entry(2, TombstoneOutcome::Pending)],
+        )
+        .await;
+        let err = run_tombstone_phase(&st, &ws, &wal, &etag)
+            .await
+            .expect_err("must error");
+        assert!(
+            matches!(
+                err,
+                TombstonePhaseError::InvalidPreState {
+                    op_kind: OpKind::Delete,
+                    state: WalState::Appended
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tombstone_phase_on_complete_wal_is_noop_with_existing_counts() {
+        // Re-running a finished WAL surfaces the existing
+        // outcome counts and leaves both the state doc and the
+        // etag untouched. The orchestrator is supposed to be
+        // safely re-callable as part of recovery; this test
+        // pins that promise.
+        let progress = vec![
+            ts_entry(10, TombstoneOutcome::Tombstoned),
+            ts_entry(11, TombstoneOutcome::Tombstoned),
+            ts_entry(12, TombstoneOutcome::NotFound),
+        ];
+        let (_dir, st, ws, wal, etag) =
+            tombstone_fixture(OpKind::Update, WalState::Complete, progress).await;
+        let (outcome, returned_wal, returned_etag) = run_tombstone_phase(&st, &ws, &wal, &etag)
+            .await
+            .expect("ok");
+        assert_eq!(
+            outcome,
+            TombstonePhaseOutcome::AlreadyComplete {
+                n_tombstoned: 2,
+                n_not_found: 1,
+            }
+        );
+        assert_eq!(returned_wal.state, WalState::Complete);
+        assert_eq!(returned_etag, etag, "etag must not advance on no-op");
+        // The on-disk state doc is unchanged too.
+        let (read_back, read_etag) = ws.read(wal.wal_id).await.expect("read back");
+        assert_eq!(read_back.state, WalState::Complete);
+        assert_eq!(read_etag, etag);
+    }
+
+    // ---- count_outcomes property ----------------------------------------
+
+    #[test]
+    fn count_outcomes_sums_tombstoned_and_not_found_only() {
+        let progress = vec![
+            ts_entry(1, TombstoneOutcome::Pending),
+            ts_entry(2, TombstoneOutcome::Tombstoned),
+            ts_entry(3, TombstoneOutcome::NotFound),
+            ts_entry(4, TombstoneOutcome::Tombstoned),
+            ts_entry(5, TombstoneOutcome::Pending),
+        ];
+        let (n_tombstoned, n_not_found) = count_outcomes(&progress);
+        assert_eq!(n_tombstoned, 2);
+        assert_eq!(n_not_found, 1);
     }
 }
