@@ -68,6 +68,19 @@ uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 num_cpus = "1"
 
+# Updates / deletes (plan 005): tombstone bitmaps are stored as a
+# `RoaringBitmap` per superfile in a sidecar object. Sparse-set
+# representation matches our "updates infrequent" assumption — a
+# heavily-tombstoned superfile still serializes to a few KB. The
+# bitmap is the only third-party binary format added; the sidecar
+# header that wraps it is hand-rolled.
+roaring = "0.10"
+
+# RFC3339 timestamps in the WAL state doc (plan 005). The
+# `serde` feature wires `DateTime<Utc>` directly into the JSON
+# encoder/decoder we use for the state doc.
+chrono = { version = "0.4", features = ["serde"] }
+
 # Hierarchical config (YAML defaults + file overrides + env). Used by
 # the `config` module; see infino/src/config/mod.rs.
 figment = { version = "0.10", features = ["yaml", "env"] }

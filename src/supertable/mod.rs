@@ -29,6 +29,7 @@ pub mod query;
 pub mod reader_cache;
 pub mod stats;
 pub mod utils;
+pub mod wal;
 pub mod writer;
 
 /// Re-export of [`crate::storage`] under the
