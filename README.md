@@ -53,7 +53,7 @@ Absolute runtime numbers come from the in-tree criterion harness
 under `benches/`. Run `cargo bench` after any change to the FTS or
 vector pipeline. The architecture docs in `docs/architecture/`
 describe where the wins come from — BM25 with the BMW / BMM walks
-and the per-doc bail, IVF + 1-bit RaBitQ + Sq8/Bf16/Fp32 rerank,
+and the per-doc bail, IVF + 1-bit RaBitQ + Sq8/Fp32 rerank,
 the mimalloc-backed per-term `Vec<(u32, u32)>`, cluster-contiguous
 vector storage, the ArcSwap reader-writer split.
 

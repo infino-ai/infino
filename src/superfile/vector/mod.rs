@@ -16,4 +16,6 @@ pub mod reader;
 pub mod rerank_codec;
 pub mod reservoir;
 pub mod rotation;
+pub mod simd_dispatch;
 pub mod spill;
+pub mod sq8_simd;

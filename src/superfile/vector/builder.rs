@@ -20,6 +20,7 @@ use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
 };
+use crate::superfile::vector::sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::fs::File;
@@ -60,12 +61,32 @@ pub struct VectorConfig {
     pub n_cent: usize,
     pub rot_seed: u64,
     pub metric: Metric,
-    /// Plan 012 — per-column on-disk rerank codec. Defaults to
-    /// [`RerankCodec::Fp32`] (today's behaviour, byte-identical
-    /// to pre-012 segments). M5 flips the default to
-    /// [`RerankCodec::Sq8`] once that codec is implemented and
-    /// recall-validated.
+    /// On-disk rerank codec for this column. See [`RerankCodec`]
+    /// for the supported codecs and their size/recall trade-offs.
     pub rerank_codec: RerankCodec,
+}
+
+impl VectorConfig {
+    /// Construct a config with the default rerank codec
+    /// ([`RerankCodec::default()`]). Use [`Self::with_rerank_codec`]
+    /// to override.
+    pub fn new(column: String, dim: usize, n_cent: usize, rot_seed: u64, metric: Metric) -> Self {
+        Self {
+            column,
+            dim,
+            n_cent,
+            rot_seed,
+            metric,
+            rerank_codec: RerankCodec::default(),
+        }
+    }
+
+    /// Override the rerank codec.
+    #[must_use]
+    pub fn with_rerank_codec(mut self, codec: RerankCodec) -> Self {
+        self.rerank_codec = codec;
+        self
+    }
 }
 
 /// Default spill threshold: total bytes the in-memory pre-spill
@@ -667,6 +688,15 @@ fn build_subsection_streaming(
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
+    let codec = cfg.rerank_codec;
+    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if codec == RerankCodec::Sq8 {
+        (
+            vec![f32::INFINITY; n_cent * dim],
+            vec![f32::NEG_INFINITY; n_cent * dim],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if n_docs > 0 {
         let mut source: Box<dyn ChunkedVectorSource> = if let Some(spill) = spill {
             // Crossed the threshold during add(): close the
@@ -691,6 +721,11 @@ fn build_subsection_streaming(
             ))
         };
 
+        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if codec == RerankCodec::Sq8 {
+            Some((&mut sq8_min_arr, &mut sq8_max_arr))
+        } else {
+            None
+        };
         run_pass2(
             source.as_mut(),
             dim,
@@ -703,9 +738,26 @@ fn build_subsection_streaming(
             &mut bucket_writers,
             &mut bucket_counts,
             &mut summary_radius_sq_max,
-            cfg.rerank_codec,
+            codec,
+            sq8_acc,
         )?;
     }
+
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if codec == RerankCodec::Sq8 {
+        (0..n_cent)
+            .map(|c| {
+                let off = c * dim;
+                derive_sq8_quantizer_from_min_max(
+                    &sq8_min_arr[off..off + dim],
+                    &sq8_max_arr[off..off + dim],
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    drop(sq8_min_arr);
+    drop(sq8_max_arr);
 
     // Flush + close every bucket writer before pass 3 reads the
     // files. The Drop of `bucket_writers` would do this, but
@@ -723,65 +775,17 @@ fn build_subsection_streaming(
         .max(0.0)
         .min(u32::MAX as f32) as u32;
 
-    // ---- Pass 3: read each bucket sequentially, materialise the
-    // cluster-contiguous regions and the cluster index ----
+    // ---- Pass 3: stream buckets into the final subsection bytes ----
     //
-    // Plan 012 M4: `RerankCodec::RabitqOnly` segments have no `full[]`
-    // region on disk and pass 2 didn't spill the fp32 vectors at
-    // all, so we skip the `full_layout` allocation and the
-    // per-row `full_vec` read. At dim=384 / n_docs=1M this saves
-    // 1.5 GiB of RAM during build.
-    let codec = cfg.rerank_codec;
-    let has_full = !matches!(codec, RerankCodec::RabitqOnly);
+    // Plan 013 layout with main's streaming assembly: allocate the
+    // subsection up front, write the open-time region, then per-
+    // cluster bulk-read each bucket into `[codes_chunk | doc_ids_chunk
+    // | full_chunk]` without a `full_layout` staging buffer.
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
     let mut centroids_layout = Vec::with_capacity(centroids.len());
     for &old_c in &cluster_order {
         centroids_layout.extend_from_slice(&centroids[old_c * dim..(old_c + 1) * dim]);
     }
-
-    let mut codes_layout = vec![0u8; n_docs * code_bytes];
-    let mut full_layout: Vec<f32> = if has_full {
-        vec![0f32; n_docs * dim]
-    } else {
-        Vec::new()
-    };
-    let mut doc_ids_layout = vec![0u32; n_docs];
-    let mut cluster_index: Vec<(u32, u32)> = Vec::with_capacity(n_cent);
-    let mut write_cursor: usize = 0;
-    // For each bucket file, read each row's fields directly into
-    // their destination slots in the cluster-contiguous layout
-    // arrays. Reading each field into its destination avoids the
-    // alignment trap of a single `row_buf: Vec<u8>` cast (the
-    // `full_vec` field starts at offset `4 + code_bytes` which is
-    // not 4-aligned for the common dim=16/code_bytes=2 case).
-    // The `dst_full` slice is `&mut [f32]` from the `full_layout`
-    // Vec; `cast_slice_mut` gives `&mut [u8]` aligned to the f32
-    // ABI alignment (4), which `read_exact` fills from BufReader.
-    let mut id_buf = [0u8; 4];
-    for &old_c in &cluster_order {
-        let cluster_count = bucket_counts[old_c];
-        let cluster_off = write_cursor as u32;
-        cluster_index.push((cluster_off, cluster_count));
-        if cluster_count == 0 {
-            continue;
-        }
-        let path = scratch.join(format!("infino_bucket_col{column_id}_c{old_c}.bin"));
-        let mut reader = BufReader::with_capacity(BUCKET_BUF_SIZE, File::open(&path)?);
-        for _ in 0..cluster_count {
-            reader.read_exact(&mut id_buf)?;
-            doc_ids_layout[write_cursor] = u32::from_le_bytes(id_buf);
-            let dst_code =
-                &mut codes_layout[write_cursor * code_bytes..(write_cursor + 1) * code_bytes];
-            reader.read_exact(dst_code)?;
-            if has_full {
-                let dst_full = &mut full_layout[write_cursor * dim..(write_cursor + 1) * dim];
-                let dst_full_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_full);
-                reader.read_exact(dst_full_bytes)?;
-            }
-            write_cursor += 1;
-        }
-    }
-    debug_assert_eq!(write_cursor, n_docs);
 
     // 6. Build the subsection bytes.
     //    Plan 013 M1 subsection layout
@@ -807,10 +811,6 @@ fn build_subsection_streaming(
     //    Codec-specific shape:
     //      Fp32: empty codec_meta; full[] is the fp32 buffer
     //            byte-for-byte.
-    //      Bf16: empty codec_meta; full[] is each fp32 encoded
-    //            to bf16 via round-to-nearest-even
-    //            (`fp32_to_bf16`). Halves disk footprint with
-    //            bounded relative error ≤ 2⁻⁸ per lane.
     //      Sq8:  codec_meta = `scale[n_cent × dim] +
     //            offset[n_cent × dim] + (per-doc norms[n_docs]
     //            for L2Sq)`. full[] is n_docs × dim u8 codes
@@ -854,7 +854,7 @@ fn build_subsection_streaming(
         + codec_meta_size
         + per_cluster_blocks_size;
 
-    let mut bytes: Vec<u8> = Vec::with_capacity(total_size_before_crc + 4);
+    let mut bytes = vec![0u8; total_size_before_crc];
 
     // Sub-header (56 bytes). See `format::vec::SUBSECTION_VERSION`
     // for the byte-level spec.
@@ -867,121 +867,131 @@ fn build_subsection_streaming(
     //   [32..40] centroids_off (u64 LE)
     //   [40..48] cluster_idx_off (u64 LE)
     //   [48..56] per_cluster_blocks_off (u64 LE)
-    bytes.extend_from_slice(format::vec::SUB_MAGIC); // 8
-    bytes.extend_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes()); // 4
-    bytes.extend_from_slice(&(codec_meta_size as u32).to_le_bytes()); // 4
-    bytes.extend_from_slice(&(summary_off as u64).to_le_bytes()); // 8
-    bytes.extend_from_slice(&summary_radius_x100.to_le_bytes()); // 4
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved (4)
-    bytes.extend_from_slice(&(centroids_off as u64).to_le_bytes()); // 8
-    bytes.extend_from_slice(&(cluster_idx_off as u64).to_le_bytes()); // 8
-    bytes.extend_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes()); // 8
-    debug_assert_eq!(bytes.len(), SUB_HEADER_SIZE);
+    bytes[0..8].copy_from_slice(format::vec::SUB_MAGIC);
+    bytes[8..12].copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
+    bytes[16..24].copy_from_slice(&(summary_off as u64).to_le_bytes());
+    bytes[24..28].copy_from_slice(&summary_radius_x100.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(centroids_off as u64).to_le_bytes());
+    bytes[40..48].copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
+    bytes[48..56].copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
 
-    // Summary centroid (dim f32s).
-    bytes.extend_from_slice(bytemuck::cast_slice(&summary_centroid));
-    // Centroids in the same physical order as cluster blocks.
-    bytes.extend_from_slice(bytemuck::cast_slice(&centroids_layout));
-    // Cluster index — same `(doc_off, count)` shape as v0; the
-    // doc_off field still indexes into the cluster-contiguous
-    // codes / full ordering. v1 uses it both as the per-cluster
-    // doc index (for full[] addressing) and as the per-cluster
-    // block byte offset divider (block_byte_off =
-    // doc_off * (code_bytes + 4)).
-    for (off, count) in &cluster_index {
-        bytes.extend_from_slice(&off.to_le_bytes());
-        bytes.extend_from_slice(&count.to_le_bytes());
+    bytes[summary_off..summary_off + summary_size]
+        .copy_from_slice(bytemuck::cast_slice(&summary_centroid));
+    bytes[centroids_off..centroids_off + centroids_size]
+        .copy_from_slice(bytemuck::cast_slice(&centroids_layout));
+
+    // Cluster index in cluster-contiguous doc order (centroid storage order).
+    let mut cluster_index: Vec<(u32, u32)> = Vec::with_capacity(n_cent);
+    {
+        let mut acc_off = 0u32;
+        let mut idx_cursor = cluster_idx_off;
+        for &centroid_id in &cluster_order {
+            let cnt = bucket_counts[centroid_id];
+            cluster_index.push((acc_off, cnt));
+            bytes[idx_cursor..idx_cursor + 4].copy_from_slice(&acc_off.to_le_bytes());
+            bytes[idx_cursor + 4..idx_cursor + 8].copy_from_slice(&cnt.to_le_bytes());
+            acc_off += cnt;
+            idx_cursor += 8;
+        }
+        debug_assert_eq!(acc_off as usize, n_docs);
     }
 
-    // ---- Codec-specific build ----
-    // Sq8 needs `Sq8Built` (scales + offsets + codes + optional
-    // L2Sq norms) computed up-front because the codec_meta
-    // region and the `full[]` codes region both live in it.
-    // Compute once, write to both positions; no re-quantize.
-    let sq8_built: Option<Sq8Built> = match codec {
-        RerankCodec::Sq8 => Some(compute_sq8_built(
-            &full_layout,
-            dim,
-            n_docs,
-            n_cent,
-            &cluster_index,
-            cfg.metric,
-        )),
-        _ => None,
-    };
+    let sq8_scale_block_off = codec_meta_off;
+    let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
+    let sq8_norms_block_off =
+        if codec == RerankCodec::Sq8 && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
+            Some(sq8_offset_block_off + n_cent * dim * 4)
+        } else {
+            None
+        };
 
-    // codec_meta region (open-time). Empty for Fp32 / Bf16 / None.
-    let bytes_before_codec_meta = bytes.len();
-    debug_assert_eq!(bytes_before_codec_meta, codec_meta_off);
-    if let Some(s) = &sq8_built {
-        bytes.extend_from_slice(bytemuck::cast_slice(&s.scales));
-        bytes.extend_from_slice(bytemuck::cast_slice(&s.offsets));
-        if let Some(norms) = &s.per_doc_norms {
-            bytes.extend_from_slice(bytemuck::cast_slice(norms));
+    if codec == RerankCodec::Sq8 {
+        for cid in 0..n_cent {
+            let (scale_c, offset_c) = &sq8_quantizers[cid];
+            let sc_off = sq8_scale_block_off + cid * dim * 4;
+            bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
+            let oc_off = sq8_offset_block_off + cid * dim * 4;
+            bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
         }
     }
-    debug_assert_eq!(bytes.len() - bytes_before_codec_meta, codec_meta_size);
 
-    // Full-precision rerank bytes in cluster-contiguous order
-    // (stride `per_vec_bytes`), codec-encoded. Built once here so
-    // the per-cluster loop below can splice each cluster's slice
-    // into its block. Empty for the `None` codec (no rerank).
-    let full_bytes: Vec<u8> = match codec {
-        RerankCodec::Fp32 => bytemuck::cast_slice(&full_layout).to_vec(),
-        RerankCodec::Bf16 => {
-            let mut v = Vec::with_capacity(full_layout.len() * 2);
-            for &x in &full_layout {
-                let bf = crate::superfile::vector::distance::fp32_to_bf16(x);
-                v.extend_from_slice(&bf.to_le_bytes());
-            }
-            v
-        }
-        RerankCodec::Sq8 => sq8_built
-            .as_ref()
-            .expect("sq8_built set above")
-            .codes
-            .clone(),
-        RerankCodec::RabitqOnly => Vec::new(),
-    };
-    debug_assert_eq!(full_bytes.len(), per_vec_bytes * n_docs);
+    let full_row_bytes_in_bucket = if codec.writes_full() { dim * 4 } else { 0 };
+    let mut id_block: Vec<u8> = Vec::new();
+    let mut code_block: Vec<u8> = Vec::new();
+    let mut full_block: Vec<u8> = Vec::new();
+    let cluster_stride = code_bytes + 4 + per_vec_bytes;
 
-    // Per-cluster blocks: for each cluster, `codes_chunk`
-    // (count × code_bytes), then `doc_ids_chunk` (count × u32 LE),
-    // then `full_chunk` (count × per_vec_bytes) — all in that
-    // cluster's contiguous doc order. Interleaving full[] here
-    // (rather than a separate trailing region) is what lets one
-    // range GET per probed cluster cover the estimate codes, the
-    // doc-ids, AND the rerank vectors in a single fetch on the
-    // lazy / object-store path.
-    debug_assert_eq!(bytes.len(), per_cluster_blocks_off);
-    for &(off, cnt) in &cluster_index {
-        if cnt == 0 {
+    let mut block_cursor = 0usize;
+    for (slot, &(cluster_off_u32, cluster_count_u32)) in cluster_index.iter().enumerate() {
+        let centroid_id = cluster_order[slot];
+        if cluster_count_u32 == 0 {
             continue;
         }
-        let cs = (off as usize) * code_bytes;
-        let ce = cs + (cnt as usize) * code_bytes;
-        bytes.extend_from_slice(&codes_layout[cs..ce]);
-        let ds = off as usize;
-        let de = ds + cnt as usize;
-        bytes.extend_from_slice(bytemuck::cast_slice(&doc_ids_layout[ds..de]));
-        if per_vec_bytes != 0 {
-            let fs = (off as usize) * per_vec_bytes;
-            let fe = fs + (cnt as usize) * per_vec_bytes;
-            bytes.extend_from_slice(&full_bytes[fs..fe]);
+        let cluster_off = cluster_off_u32 as usize;
+        let cluster_count = cluster_count_u32 as usize;
+
+        let path = scratch.join(format!("infino_bucket_col{column_id}_c{centroid_id}.bin"));
+        let mut reader = BufReader::with_capacity(BUCKET_BUF_SIZE, File::open(&path)?);
+
+        id_block.resize(cluster_count * 4, 0);
+        code_block.resize(cluster_count * code_bytes, 0);
+        if full_row_bytes_in_bucket > 0 {
+            full_block.resize(cluster_count * full_row_bytes_in_bucket, 0);
         }
+        for i in 0..cluster_count {
+            reader.read_exact(&mut id_block[i * 4..(i + 1) * 4])?;
+            reader.read_exact(&mut code_block[i * code_bytes..(i + 1) * code_bytes])?;
+            if full_row_bytes_in_bucket > 0 {
+                let off = i * full_row_bytes_in_bucket;
+                reader.read_exact(&mut full_block[off..off + full_row_bytes_in_bucket])?;
+            }
+        }
+
+        let block_base = per_cluster_blocks_off + block_cursor;
+        let codes_len = cluster_count * code_bytes;
+        let ids_len = cluster_count * 4;
+        bytes[block_base..block_base + codes_len].copy_from_slice(&code_block);
+        bytes[block_base + codes_len..block_base + codes_len + ids_len].copy_from_slice(&id_block);
+
+        match codec {
+            RerankCodec::RabitqOnly => {}
+            RerankCodec::Fp32 => {
+                let full_base = block_base + codes_len + ids_len;
+                bytes[full_base..full_base + cluster_count * dim * 4].copy_from_slice(&full_block);
+            }
+            RerankCodec::Sq8 => {
+                let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
+                let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
+                let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
+                let full_chunk_base = block_base + codes_len + ids_len;
+                encode_sq8_cluster_simd(
+                    cluster_rows,
+                    dim,
+                    cluster_count,
+                    cluster_off,
+                    full_chunk_base,
+                    sq8_norms_block_off,
+                    &ec.inv_scale,
+                    &ec.c2,
+                    scale_c,
+                    offset_c,
+                    &mut bytes,
+                );
+            }
+        }
+
+        block_cursor += cluster_count * cluster_stride;
     }
-    debug_assert_eq!(
-        bytes.len() - per_cluster_blocks_off,
-        per_cluster_blocks_size
-    );
+    debug_assert_eq!(block_cursor, per_cluster_blocks_size);
     debug_assert_eq!(bytes.len(), total_size_before_crc);
 
-    // Trailing CRC over the subsection body.
     let crc = crc32c(&bytes);
-    bytes.extend_from_slice(&crc.to_le_bytes());
+    let mut out = bytes;
+    out.extend_from_slice(&crc.to_le_bytes());
 
     Ok(SubsectionBytes {
-        bytes,
+        bytes: out,
         n_cent,
         summary_offset_in_sub: summary_off,
         codec_meta_offset_in_sub: if codec_meta_size == 0 {
@@ -991,6 +1001,62 @@ fn build_subsection_streaming(
         },
         codec_meta_size,
     })
+}
+
+/// Sq8 SIMD encode into a cluster's `full_chunk` within plan-013
+/// per-cluster blocks (`full_chunk_base + i * dim` per row).
+#[allow(clippy::too_many_arguments)]
+fn encode_sq8_cluster_simd(
+    cluster_rows: &[f32],
+    dim: usize,
+    cluster_count: usize,
+    cluster_doc_off: usize,
+    full_chunk_base: usize,
+    sq8_norms_block_off: Option<usize>,
+    inv_scale_c: &[f32],
+    c2_c: &[f32],
+    scale_c: &[f32],
+    offset_c: &[f32],
+    bytes: &mut [u8],
+) {
+    debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
+
+    for i in 0..cluster_count {
+        let src = &cluster_rows[i * dim..(i + 1) * dim];
+        let pos = cluster_doc_off + i;
+        let code_off = full_chunk_base + i * dim;
+        sq8_encode_row(src, inv_scale_c, c2_c, &mut bytes[code_off..code_off + dim]);
+        if let Some(norms_off) = sq8_norms_block_off {
+            let mut acc = 0.0f64;
+            for d in 0..dim {
+                let qc = bytes[code_off + d];
+                let x = (qc as f32) * scale_c[d] + offset_c[d];
+                acc += (x as f64) * (x as f64);
+            }
+            let n_off = norms_off + pos * 4;
+            bytes[n_off..n_off + 4].copy_from_slice(&(acc as f32).to_le_bytes());
+        }
+    }
+}
+
+/// Sq8 per-cluster (min, max) → (scale, offset) derivation.
+#[inline]
+fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(min.len(), max.len());
+    let dim = min.len();
+    let mut scale = vec![0.0f32; dim];
+    let mut offset = vec![0.0f32; dim];
+    for d in 0..dim {
+        let span = max[d] - min[d];
+        if span > 0.0 && span.is_finite() {
+            offset[d] = min[d];
+            scale[d] = span / 255.0;
+        } else {
+            offset[d] = if min[d].is_finite() { min[d] } else { 0.0 };
+            scale[d] = 1.0;
+        }
+    }
+    (scale, offset)
 }
 
 fn centroid_storage_order(centroids: &[f32], n_cent: usize, dim: usize) -> Vec<usize> {
@@ -1034,235 +1100,6 @@ fn order_centroids_recursive(order: &mut [usize], centroids: &[f32], dim: usize)
     order_centroids_recursive(right, centroids, dim);
 }
 
-/// Scan one cluster's rows for per-dim min/max and derive the
-/// Sq8 quantizer `(scale[dim], offset[dim])` for that cluster.
-///
-/// Quantization scheme: `q = clamp(round((x − offset[d]) /
-/// scale[d]), 0, 255)`. With `offset[d] = min_x[d]` and
-/// `scale[d] = (max_x[d] − min_x[d]) / 255`, this maps the
-/// cluster's observed range onto the full u8 grid. When a dim
-/// is constant within the cluster (`max == min`) we set
-/// `scale = 1.0` and `offset = min` — every code in that dim
-/// lands at 0 and the decoder recovers the constant exactly.
-///
-/// Per-cluster (not per-column) is the Sq8PerCluster fix: see
-/// `RerankCodec::codec_meta_bytes` doc for why per-column
-/// collapsed recall on highly-clustered cosine corpora.
-///
-/// Parallel reduce over `cluster_rows.chunks(dim)` for n_rows
-/// ≥ 64; sequential fallback for smaller clusters where
-/// rayon's fork-join overhead would dominate.
-fn compute_sq8_quantizer_for_cluster(
-    cluster_rows: &[f32],
-    dim: usize,
-    n_rows: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    debug_assert_eq!(cluster_rows.len(), n_rows * dim);
-
-    let (min_vec, max_vec) = if n_rows == 0 {
-        // Empty cluster — emit an identity quantizer. No doc
-        // ever encodes through this slot, but the reader still
-        // reads `dim` floats of each from disk so we must write
-        // something well-defined. scale=1, offset=0 makes the
-        // decoder a no-op on the all-zero codes (which the
-        // builder also never emits) and keeps the codec_meta
-        // arrays free of NaN sentinels that would break the
-        // float bit-pattern equality used in some tests.
-        (vec![0.0f32; dim], vec![0.0f32; dim])
-    } else if n_rows < 64 {
-        let mut min_vec = cluster_rows[..dim].to_vec();
-        let mut max_vec = cluster_rows[..dim].to_vec();
-        for row in 1..n_rows {
-            for d in 0..dim {
-                let x = cluster_rows[row * dim + d];
-                if x < min_vec[d] {
-                    min_vec[d] = x;
-                }
-                if x > max_vec[d] {
-                    max_vec[d] = x;
-                }
-            }
-        }
-        (min_vec, max_vec)
-    } else {
-        cluster_rows
-            .par_chunks(dim)
-            .fold(
-                || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
-                |(mut mn, mut mx), row| {
-                    for (d, &x) in row.iter().enumerate() {
-                        if x < mn[d] {
-                            mn[d] = x;
-                        }
-                        if x > mx[d] {
-                            mx[d] = x;
-                        }
-                    }
-                    (mn, mx)
-                },
-            )
-            .reduce(
-                || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
-                |(mut a_min, mut a_max), (b_min, b_max)| {
-                    for d in 0..dim {
-                        if b_min[d] < a_min[d] {
-                            a_min[d] = b_min[d];
-                        }
-                        if b_max[d] > a_max[d] {
-                            a_max[d] = b_max[d];
-                        }
-                    }
-                    (a_min, a_max)
-                },
-            )
-    };
-
-    let mut scale = vec![0.0f32; dim];
-    let mut offset = vec![0.0f32; dim];
-    for d in 0..dim {
-        offset[d] = min_vec[d];
-        let span = max_vec[d] - min_vec[d];
-        scale[d] = if span > 0.0 { span / 255.0 } else { 1.0 };
-    }
-    (scale, offset)
-}
-
-/// All bytes the Sq8 codec needs to emit, computed in one
-/// pass over `full_layout` so the codec_meta region (scale +
-/// offset + per-doc norms) and the `full[]` codes region stay
-/// bit-consistent.
-///
-/// Used by both subsection layouts:
-/// - v0 packs `[scale][offset][norms?][codes]` contiguously
-///   after the 1-bit codes (writer at the bottom of
-///   `build_subsection_streaming`).
-/// - v1 (013 M1) writes `[scale][offset][norms?]` into the
-///   open-time region (immediately after `cluster_idx`) and
-///   writes `[codes]` into the rerank `full[]` region at the
-///   subsection tail.
-///
-/// Producing both regions from one call avoids re-quantizing
-/// — the per-doc norms in `per_doc_norms` are derived from the
-/// exact u8 codes we ship to disk, so search-side decode
-/// produces the same `Σ x_decoded²` the encoder cached.
-struct Sq8Built {
-    /// Per-cluster, per-dim scale array. Layout: row-major
-    /// `[n_cent][dim]` f32. Same layout as on disk.
-    scales: Vec<f32>,
-    /// Per-cluster, per-dim offset array (cluster min). Layout
-    /// matches `scales`.
-    offsets: Vec<f32>,
-    /// `n_docs` u8 codes per dim, cluster-contiguous (matches
-    /// `full_layout`'s row ordering). Length `n_docs * dim`.
-    codes: Vec<u8>,
-    /// Per-doc decoded-norm cache (`Σ_d x_decoded²`) — emitted
-    /// for `Metric::L2Sq` (short-circuits the `Σx²` term in the
-    /// L2 distance) and `Metric::Cosine` (normalizes the decoded
-    /// vector at rerank time). `None` for `NegDot`, where the
-    /// `Σx²` term cancels out of the distance formula.
-    per_doc_norms: Option<Vec<f32>>,
-}
-
-/// Compute the Sq8 codec_meta + codes for a column.
-///
-/// Per-cluster (not per-column) quantizer recovers recall on
-/// highly clustered cosine corpora; see
-/// `RerankCodec::codec_meta_bytes` doc for the failure-mode
-/// analysis that motivated the switch.
-///
-/// For `L2Sq` we cache per-doc `Σ_d (x_decoded[i,d])²` at
-/// encode time so the search-side distance kernel can skip
-/// recomputing it (one `dim` u8 widen + multiply pass per
-/// rerank candidate saved).
-#[allow(clippy::too_many_arguments)]
-fn compute_sq8_built(
-    full_layout: &[f32],
-    dim: usize,
-    n_docs: usize,
-    n_cent: usize,
-    cluster_index: &[(u32, u32)],
-    metric: Metric,
-) -> Sq8Built {
-    debug_assert_eq!(cluster_index.len(), n_cent);
-    debug_assert_eq!(full_layout.len(), n_docs * dim);
-
-    let mut scales = vec![0.0f32; n_cent * dim];
-    let mut offsets = vec![0.0f32; n_cent * dim];
-    for (c, &(off, cnt)) in cluster_index.iter().enumerate() {
-        let start = (off as usize) * dim;
-        let end = start + (cnt as usize) * dim;
-        let (sc, oc) =
-            compute_sq8_quantizer_for_cluster(&full_layout[start..end], dim, cnt as usize);
-        scales[c * dim..(c + 1) * dim].copy_from_slice(&sc);
-        offsets[c * dim..(c + 1) * dim].copy_from_slice(&oc);
-    }
-
-    // Encode codes against each doc's cluster quantizer. Codes
-    // is materialised once (n_docs × dim bytes) so the L2Sq
-    // norm computation rereads the exact bytes we'll write to
-    // disk — keeps the cached norm bit-consistent with what
-    // the search-side dequant reconstructs (no fp drift from
-    // a re-quantize against the original fp32 row).
-    let mut codes = vec![0u8; n_docs * dim];
-    for (c, &(off, cnt)) in cluster_index.iter().enumerate() {
-        if cnt == 0 {
-            continue;
-        }
-        let scale_c = &scales[c * dim..(c + 1) * dim];
-        let offset_c = &offsets[c * dim..(c + 1) * dim];
-        for i in 0..cnt as usize {
-            let row = (off as usize) + i;
-            let src = &full_layout[row * dim..(row + 1) * dim];
-            let dst = &mut codes[row * dim..(row + 1) * dim];
-            for d in 0..dim {
-                let q = ((src[d] - offset_c[d]) / scale_c[d]).round();
-                // Clamp to [0, 255]. Anything outside is a fp
-                // rounding artefact at the boundary; the clamp
-                // keeps the cast safe.
-                dst[d] = q.clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-
-    let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
-        // Per-doc decoded-norm cache (`Σ_d x_decoded²`), indexed
-        // by pos. Cached for L2Sq (short-circuits the `Σx²` term)
-        // and Cosine (normalizes the decoded vector at rerank).
-        // Each doc
-        // lives in exactly one cluster (the IVF assignment from
-        // pass 2); we look up the doc's cluster to know which
-        // scale/offset slice to dequant with.
-        let mut norms = vec![0.0f32; n_docs];
-        for (c, &(off, cnt)) in cluster_index.iter().enumerate() {
-            if cnt == 0 {
-                continue;
-            }
-            let scale_c = &scales[c * dim..(c + 1) * dim];
-            let offset_c = &offsets[c * dim..(c + 1) * dim];
-            for i in 0..cnt as usize {
-                let row = (off as usize) + i;
-                let code = &codes[row * dim..(row + 1) * dim];
-                let mut acc = 0.0f64;
-                for d in 0..dim {
-                    let x = (code[d] as f32) * scale_c[d] + offset_c[d];
-                    acc += (x as f64) * (x as f64);
-                }
-                norms[row] = acc as f32;
-            }
-        }
-        Some(norms)
-    } else {
-        None
-    };
-
-    Sq8Built {
-        scales,
-        offsets,
-        codes,
-        per_doc_norms,
-    }
-}
-
 /// Pass 2 of `build_subsection_streaming`: walk the input
 /// corpus chunk-by-chunk, assign each row to its centroid,
 /// rotate + 1-bit encode it, fold its un-rotated distance into
@@ -1287,6 +1124,7 @@ fn run_pass2(
     bucket_counts: &mut [u32],
     summary_radius_sq_max: &mut f32,
     codec: RerankCodec,
+    mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
     let chunk_rows_cap = source.chunk_rows();
     // Pre-allocate per-chunk scratch reused across iterations to
@@ -1355,7 +1193,8 @@ fn run_pass2(
         // bucket file would be pure wasted I/O. At dim=384 this
         // drops the per-row bucket write from 1 588 B to 52 B
         // (4 doc_id + 48 code), a ~30× pass-2 I/O reduction.
-        let write_full = !matches!(codec, RerankCodec::RabitqOnly);
+        let write_full = codec.writes_full();
+        let mut sq8_acc = sq8_min_max.as_mut();
         for r in 0..actual_rows {
             let cid = asgn[r] as usize;
             let local_doc_id = global_doc_id + r as u32;
@@ -1364,6 +1203,11 @@ fn run_pass2(
             writer.write_all(&chunk_codes[r * code_bytes..(r + 1) * code_bytes])?;
             if write_full {
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
+            }
+            if let Some((mn, mx)) = sq8_acc.as_deref_mut() {
+                let row = &chunk[r * dim..(r + 1) * dim];
+                let off = cid * dim;
+                update_min_max(row, &mut mn[off..off + dim], &mut mx[off..off + dim]);
             }
             bucket_counts[cid] += 1;
         }

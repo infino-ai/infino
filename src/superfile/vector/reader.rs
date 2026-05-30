@@ -65,13 +65,13 @@ pub struct ColumnReader {
     pub metric: Metric,
     pub rot_seed: u64,
     /// Plan 012 — on-disk rerank codec for this column. Today
-    /// admits Fp32 (M1), Bf16 (M2), Sq8 (M3); the parser rejects
+    /// admits Fp32, Sq8, and RabitqOnly; the parser rejects
     /// every other codec at open time with a `MalformedVersion`
     /// until the corresponding milestone lands (None: M4).
     pub rerank_codec: RerankCodec,
     /// Plan 012 M3 — `Sq8`-only quantizer metadata, materialised
     /// at open time from the `codec_meta` region. `None` for
-    /// every other codec (Fp32 / Bf16 / None). At dim=384 the
+    /// every other codec (Fp32 / RabitqOnly). At dim=384 the
     /// scale + offset arrays are 3 KB total; for L2Sq columns
     /// the per-doc norms add `n_docs × 4` bytes (4 MB at 1M
     /// docs / column). Materialising here amortizes the parse
@@ -86,7 +86,7 @@ pub struct ColumnReader {
     cluster_idx_off: usize,
     /// Plan 012 M1 — relative offset of the per-column
     /// `codec_meta` region inside the subsection. `0` means
-    /// "no codec_meta" (Fp32 / Bf16 / None); non-zero is only
+    /// "no codec_meta" (Fp32 / RabitqOnly); non-zero is only
     /// produced by codecs whose `codec_meta_bytes(...) > 0`
     /// (`Sq8` is the only one today). In the 013 layout
     /// `codec_meta` sits between `cluster_idx` and the
@@ -663,14 +663,14 @@ impl VectorReader {
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
                 VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
-                     (plan 012: 0=fp32, 1=bf16, 2=sq8, 3=none)",
+                     (known ids: 0=fp32, 1=sq8, 2=rabitq_only)",
                     cfg.column
                 )))
             })?;
             if !rerank_codec.is_implemented() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' uses rerank codec {} which is not implemented yet \
-                     (plan 012 — `fp32`, `bf16`, `sq8`, `none` are wired through M4)",
+                     (`fp32`, `sq8`, `rabitq_only` are the supported codecs)",
                     cfg.column,
                     rerank_codec.name()
                 ))));
@@ -790,7 +790,7 @@ impl VectorReader {
             let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
             let codec_meta_required_zero = matches!(
                 rerank_codec,
-                RerankCodec::Fp32 | RerankCodec::Bf16 | RerankCodec::RabitqOnly
+                RerankCodec::Fp32 | RerankCodec::RabitqOnly
             );
 
             let codec_meta_size = read_u32_le(&sub_header[12..16]) as usize;
@@ -803,7 +803,7 @@ impl VectorReader {
             if codec_meta_required_zero && codec_meta_size != 0 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has codec_meta_size={codec_meta_size} for codec {}; \
-                     fp32/bf16/none must write codec_meta_size=0",
+                     fp32/rabitq_only must write codec_meta_size=0",
                     cfg.column,
                     rerank_codec.name()
                 ))));
@@ -1069,7 +1069,7 @@ impl VectorReader {
         //    pos = off + i and cluster_id are captured inline at
         //    no extra fetch cost. cluster_id is consumed by the
         //    Sq8PerCluster rerank dispatch to pick each
-        //    candidate's quantizer; Fp32/Bf16/None rerank paths
+        //    candidate's quantizer; Fp32/RabitqOnly rerank paths
         //    ignore it.
         //
         //    Plan 013 M3 — codes and doc_ids per cluster live in
@@ -1217,7 +1217,7 @@ impl VectorReader {
         //    pre-build a per-query kernel that folds the per-dim
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
-        //    + SIMD dot. Fp32/Bf16 take the flat dispatch.
+        //    + SIMD dot. Fp32 takes the flat dispatch.
         rerank_candidates_packed(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
@@ -1291,7 +1291,7 @@ fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) ->
 /// rerank step doesn't need any lookup table. `cluster_id` is
 /// captured for the Sq8PerCluster rerank dispatch: each candidate
 /// knows which cluster's `(scale, offset)` quantizer to dequant
-/// against. For Fp32/Bf16/None the cluster_id is recorded but
+/// against. For Fp32/RabitqOnly the cluster_id is recorded but
 /// ignored by the rerank step (kept for layout simplicity — the
 /// extra 4 bytes per shortlist entry are noise next to the
 /// `k × rerank_mult` heap traffic).
@@ -1364,8 +1364,8 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 /// for the Sq8 per-doc-norm lookup.
 ///
 /// Dispatches on `col.rerank_codec`:
-/// - **Fp32 / Bf16**: flat dispatch via [`distance_bytes_codec`]
-///   (fp32 zero-copy SIMD or bf16-widen SIMD).
+/// - **Fp32**: flat dispatch via [`distance_bytes_codec`]
+///   (fp32 zero-copy SIMD).
 /// - **Sq8**: builds a per-query [`Sq8Kernel`] from the column's
 ///   `codec_meta` once (folds scale/offset into the query so the
 ///   per-doc inner step is a plain u8→f32 widen + SIMD dot;
@@ -1383,7 +1383,7 @@ async fn rerank_candidates_packed(
 ) -> Result<Vec<(u32, f32)>, crate::superfile::lazy_source::LazyByteSourceError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
-        RerankCodec::Fp32 | RerankCodec::Bf16 => shortlist
+        RerankCodec::Fp32 => shortlist
             .iter()
             .enumerate()
             .map(|(i, &(did, _, _, _))| {
@@ -2044,7 +2044,7 @@ mod tests {
     // The codec discriminator rides as byte 52 of the per-column
     // directory entry; the codec_meta region offset rides as bytes
     // 12..16 of the sub-header. Both are zero on pre-012 fp32
-    // segments. M2 wires `Fp32` + `Bf16` end-to-end — `Sq8` / `None`
+    // segments. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
     // must still round-trip as a typed `MalformedVersion` at open
     // time so a future segment built by an M3+ binary fails loud
     // against an M2 binary rather than mis-decoding.
@@ -2073,18 +2073,13 @@ mod tests {
     }
 
     /// Plan 012 M4: every codec the enum exposes is now wired end-
-    /// to-end (`Fp32` M1, `Bf16` M2, `Sq8` M3, `None` M4), so
+    /// to-end (`Fp32`, `Sq8`, `RabitqOnly`), so
     /// `register_column` must accept all of them. The check exists
     /// so adding a *new* unimplemented variant in the future
     /// surfaces here loud and fast.
     #[test]
     fn register_column_accepts_every_codec() {
-        for codec in [
-            RerankCodec::Fp32,
-            RerankCodec::Bf16,
-            RerankCodec::Sq8,
-            RerankCodec::RabitqOnly,
-        ] {
+        for codec in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
             let mut b = VectorBuilder::new();
             b.register_column(VectorConfig {
                 column: "v".into(),
@@ -2096,116 +2091,6 @@ mod tests {
             })
             .unwrap_or_else(|e| panic!("codec {codec:?} must register, got {e:?}"));
         }
-    }
-
-    /// Plan 012 M2: building a column with `RerankCodec::Bf16`
-    /// round-trips through the reader. The codec discriminator
-    /// surfaces on `ColumnReader.rerank_codec`, the
-    /// codec_meta region stays zero-bytes (bf16 has no per-column
-    /// metadata), and the on-disk `full[]` region halves to
-    /// `n_docs × dim × 2` bytes.
-    #[test]
-    fn open_round_trips_bf16_codec_discriminator() {
-        let dim = 16usize;
-        let n_cent = 4usize;
-        let n_docs = 64u32;
-        let mut b = VectorBuilder::new();
-        b.register_column(VectorConfig {
-            column: "v".into(),
-            dim,
-            n_cent,
-            rot_seed: 7,
-            metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Bf16,
-        })
-        .expect("register column");
-        for i in 0..n_docs {
-            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
-            b.add(0, &v).expect("add");
-        }
-        let blob = b.finish().expect("finish");
-
-        let json =
-            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
-        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
-        assert_eq!(r.columns.len(), 1);
-        assert_eq!(
-            r.columns[0].rerank_codec,
-            RerankCodec::Bf16,
-            "Bf16 build must surface as RerankCodec::Bf16 on the reader"
-        );
-        assert_eq!(
-            r.columns[0].codec_meta_off, 0,
-            "Bf16 segments must write codec_meta_off = 0 (zero-byte meta region)"
-        );
-        // bf16 = 2 bytes/dim. full[] is interleaved into the
-        // per-cluster blocks region; the full portion of that
-        // region is `region_size - n_docs × (code_bytes + 4)` and
-        // must equal `n_docs × dim × 2`.
-        let col = &r.columns[0];
-        let cb = col.quant.code_bytes();
-        let region_size = (col.subsection_range.len() - 4) - col.per_cluster_blocks_off;
-        let actual_full_size = region_size - (col.n_docs as usize) * (cb + 4);
-        assert_eq!(
-            actual_full_size,
-            (col.n_docs as usize) * dim * 2,
-            "Bf16 full vectors must be n_docs × dim × 2 bytes",
-        );
-    }
-
-    /// Plan 012 M2: a Bf16 build + open + self-query recovers the
-    /// planted self-vector at top-1, end-to-end through the
-    /// codec-aware rerank dispatch. Confirms the encode (build) +
-    /// widen-to-fp32 (search) paths agree on the bf16 layout —
-    /// any byte-order or stride mismatch would surface as
-    /// wrong-doc-id or out-of-bounds.
-    #[tokio::test]
-    async fn bf16_self_query_round_trips_top1() {
-        let dim = 32usize;
-        let n_cent = 4usize;
-        let n_docs = 64u32;
-        let mut b = VectorBuilder::new();
-        b.register_column(VectorConfig {
-            column: "v".into(),
-            dim,
-            n_cent,
-            rot_seed: 13,
-            metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Bf16,
-        })
-        .expect("register column");
-        // Use values that survive bf16 rounding exactly so the rerank
-        // distance is 0.0 for the self-query — sidesteps tolerance
-        // noise on the assertion.
-        let make = |i: u32| -> Vec<f32> {
-            (0..dim)
-                .map(|j| ((i.wrapping_mul(17) + j as u32 * 3) % 64) as f32 * 0.5)
-                .collect()
-        };
-        let mut all = Vec::with_capacity(n_docs as usize);
-        for i in 0..n_docs {
-            let v = make(i);
-            b.add(0, &v).expect("add");
-            all.push(v);
-        }
-        let blob = b.finish().expect("finish");
-
-        let json =
-            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
-        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
-        let hits = r
-            .search("v", &all[17], 5, 4, 5)
-            .await
-            .expect("search must succeed on Bf16 column");
-        assert_eq!(hits[0].0, 17, "Bf16 self-query must recover self at top-1");
-        // The L2Sq distance back to self is bounded by the bf16
-        // round-trip error of the planted vector (zero on
-        // half-integers below 64, so this is exact).
-        assert!(
-            hits[0].1.abs() <= 1e-3,
-            "Bf16 self-query distance {} should be ~0",
-            hits[0].1
-        );
     }
 
     /// Plan 012 M3: building a column with `RerankCodec::Sq8`
@@ -2790,7 +2675,7 @@ mod tests {
         // + per-cluster doc_ids (≤ n_cent)
         // = at most 2 + 2·n_cent = 10
         //
-        // The Fp32/Bf16/Sq8 paths would add one more fat
+        // The Fp32/Sq8 paths would add one more fat
         // `full[]` get_range on top — that's the leak this
         // test guards against. Empty clusters reduce the
         // upper bound (per-cluster fetches skip on cnt == 0)
@@ -2891,7 +2776,7 @@ mod tests {
     // 16k × 384 (1/64 scale) and prints corpus geometry stats. Run
     // with `cargo test --lib -- sq8_recall_diagnostic --ignored
     // --nocapture` to inspect. Per-column-quantizer fix (or fallback
-    // to Bf16 default) is decided based on what this prints.
+    // to Sq8 default) is decided based on what this prints.
     #[tokio::test]
     #[ignore = "Plan 012 M5 recall diagnostic; ~10s; --ignored --nocapture"]
     async fn sq8_recall_diagnostic_planted_cluster_cosine() {
@@ -3004,16 +2889,12 @@ mod tests {
             Bytes::from(b.finish().expect("finish"))
         };
         let fp32_blob = build(RerankCodec::Fp32);
-        let bf16_blob = build(RerankCodec::Bf16);
         let sq8_blob = build(RerankCodec::Sq8);
         eprintln!(
             "--- segment sizes ---\n\
              fp32: {:.2} MiB (1.00x)\n\
-             bf16: {:.2} MiB ({:.2}x)\n\
              sq8:  {:.2} MiB ({:.2}x)",
             fp32_blob.len() as f64 / 1024.0 / 1024.0,
-            bf16_blob.len() as f64 / 1024.0 / 1024.0,
-            bf16_blob.len() as f64 / fp32_blob.len() as f64,
             sq8_blob.len() as f64 / 1024.0 / 1024.0,
             sq8_blob.len() as f64 / fp32_blob.len() as f64
         );
@@ -3022,7 +2903,6 @@ mod tests {
             r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent_ivf},"rot_seed":7,"metric":"cosine"}}]"#
         );
         let r_fp32 = VectorReader::open(fp32_blob, &json).expect("open fp32");
-        let r_bf16 = VectorReader::open(bf16_blob, &json).expect("open bf16");
         let r_sq8 = VectorReader::open(sq8_blob, &json).expect("open sq8");
 
         // 4. Brute-force ground truth (cosine sim descending = neg-dot
@@ -3051,7 +2931,7 @@ mod tests {
             "--- recall@{k} on {n_queries} self-queries (nprobe={nprobe}, rerank_mult={rerank_mult}) ---"
         );
         let mut recalls = Vec::new();
-        for (reader, label) in [(&r_fp32, "fp32"), (&r_bf16, "bf16"), (&r_sq8, "sq8 ")] {
+        for (reader, label) in [(&r_fp32, "fp32"), (&r_sq8, "sq8 ")] {
             let mut total_match = 0usize;
             for qi in 0..n_queries {
                 let hits = reader
@@ -3068,13 +2948,8 @@ mod tests {
             recalls.push(recall);
         }
         let r_fp = recalls[0];
-        let r_bf = recalls[1];
-        let r_sq = recalls[2];
-        eprintln!(
-            "drop (fp32 - bf16): {:.4}\ndrop (fp32 - sq8 ): {:.4}",
-            r_fp - r_bf,
-            r_fp - r_sq
-        );
+        let r_sq = recalls[1];
+        eprintln!("drop (fp32 - sq8 ): {:.4}", r_fp - r_sq);
         eprintln!(
             "(plan acceptance #2: drop must be \u{2264} 0.01; bench measured 0.10 drop at 1M scale)"
         );
@@ -4166,11 +4041,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_lazy_small_segment_fetches_no_codec_meta_for_non_sq8() {
-        for codec in [
-            RerankCodec::Fp32,
-            RerankCodec::Bf16,
-            RerankCodec::RabitqOnly,
-        ] {
+        for codec in [RerankCodec::Fp32, RerankCodec::RabitqOnly] {
             let (blob, json, _) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
             let counting = StdArc::new(CountingLazyByteSource::new(blob));
             let async_counter = counting.async_counter();
@@ -4200,12 +4071,7 @@ mod tests {
     /// metadata field.
     #[tokio::test]
     async fn open_lazy_search_matches_eager_open_per_codec() {
-        for codec in [
-            RerankCodec::Fp32,
-            RerankCodec::Bf16,
-            RerankCodec::Sq8,
-            RerankCodec::RabitqOnly,
-        ] {
+        for codec in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
             let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
             let r_eager = VectorReader::open(blob.clone(), &json)
                 .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
@@ -4381,12 +4247,7 @@ mod tests {
     /// from two separate ranges to one combined block).
     #[tokio::test]
     async fn m3_combined_cluster_fetch_matches_eager_open_per_codec() {
-        for codec in [
-            RerankCodec::Fp32,
-            RerankCodec::Bf16,
-            RerankCodec::Sq8,
-            RerankCodec::RabitqOnly,
-        ] {
+        for codec in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
             let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
             let r_eager = VectorReader::open(blob.clone(), &json)
                 .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));

@@ -133,21 +133,10 @@ impl Bloom {
         let h = xxh3_64(key);
         let (block_idx, mask) = block_and_mask(h, self.n_blocks_mask);
         let block_offset = block_idx * BLOCK_WORDS;
-        let block = &self.words[block_offset..block_offset + BLOCK_WORDS];
-        // SIMD path: `(mask & ~block) == 0` ⟺ every bit set in
-        // mask is also set in block ⟺ all K positions are present.
-        // wide::u64x4 lowers to AVX2 on x86_64-with-avx2 and NEON
-        // on aarch64; on platforms without SIMD it lowers to plain
-        // u64 ops, equivalent to the scalar path.
-        let block_lo = u64x4::new([block[0], block[1], block[2], block[3]]);
-        let block_hi = u64x4::new([block[4], block[5], block[6], block[7]]);
-        let mask_lo = u64x4::new([mask[0], mask[1], mask[2], mask[3]]);
-        let mask_hi = u64x4::new([mask[4], mask[5], mask[6], mask[7]]);
-        let r_lo = !block_lo & mask_lo;
-        let r_hi = !block_hi & mask_hi;
-        let combined = r_lo | r_hi;
-        let parts = combined.to_array();
-        (parts[0] | parts[1] | parts[2] | parts[3]) == 0
+        let block: &[u64; BLOCK_WORDS] = (&self.words[block_offset..block_offset + BLOCK_WORDS])
+            .try_into()
+            .expect("BLOCK_WORDS-sized slice");
+        contains_block(block, &mask)
     }
 
     /// Number of blocks. Always a power of two.
@@ -229,6 +218,38 @@ impl Default for BloomBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Block-level "all K positions present" check. `true` iff every bit
+/// set in `mask` is also set in `block` (equivalently, `mask & !block == 0`
+/// over the 512-bit lane).
+///
+/// Single-tier `wide::u64x4` AND-NOT-OR-reduce kernel. Lowers to two
+/// 256-bit `vpandn` / `vpor` pairs on AVX2 x86_64 (the
+/// `target-cpu=x86-64-v3` baseline), four 128-bit NEON ops on aarch64,
+/// scalar elsewhere.
+///
+/// We deliberately do *not* dispatch to an AVX-512 kernel here even
+/// on hosts that support it. The block is exactly 64 B = one ZMM
+/// register, so AVX-512 only saves a single 256-bit iteration; at the
+/// ~1 ns per-call regime this kernel runs in, that saving is
+/// dominated by the per-instruction frequency-licensing cost on
+/// Sapphire Rapids / Ice Lake (a 5% regression vs `wide` on the
+/// `avx512_microbench_contains_block` benchmark before it was
+/// removed). The AVX-512 win factor scales with bytes-per-call; this
+/// kernel doesn't have enough of them to overcome the license cost
+/// in isolation.
+#[inline]
+fn contains_block(block: &[u64; BLOCK_WORDS], mask: &[u64; BLOCK_WORDS]) -> bool {
+    let block_lo = u64x4::new([block[0], block[1], block[2], block[3]]);
+    let block_hi = u64x4::new([block[4], block[5], block[6], block[7]]);
+    let mask_lo = u64x4::new([mask[0], mask[1], mask[2], mask[3]]);
+    let mask_hi = u64x4::new([mask[4], mask[5], mask[6], mask[7]]);
+    let r_lo = !block_lo & mask_lo;
+    let r_hi = !block_hi & mask_hi;
+    let combined = r_lo | r_hi;
+    let parts = combined.to_array();
+    (parts[0] | parts[1] | parts[2] | parts[3]) == 0
 }
 
 /// Derive (block_index, K-bit mask spread across BLOCK_WORDS u64s)

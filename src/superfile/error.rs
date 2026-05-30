@@ -37,12 +37,12 @@ pub enum BuildError {
     VectorDimOutOfRange { column: String, dim: usize },
 
     /// The column requested a rerank codec that this build of infino
-    /// does not implement. Supported codecs today: `fp32`, `bf16`,
+    /// does not implement. Supported codecs today: `fp32`,
     /// `sq8`, `none` (see
     /// [`crate::superfile::vector::rerank_codec::RerankCodec`]).
     #[error(
         "vector column {column:?}: rerank codec {codec:?} is not supported; \
-         supported codecs are fp32, bf16, sq8, none"
+         supported codecs are fp32, sq8, none"
     )]
     VectorRerankCodecUnimplemented { column: String, codec: &'static str },
 

@@ -64,7 +64,7 @@ pub mod vec {
     /// [ 0.. 8] SUB_MAGIC
     /// [ 8..12] SUBSECTION_VERSION
     /// [12..16] codec_meta_size (u32 LE) — 0 when no codec_meta
-    ///                                     (Fp32 / Bf16 / None)
+    ///                                     (Fp32 / RabitqOnly)
     /// [16..24] summary_centroid_offset (u64 LE)
     /// [24..28] summary_radius_x100 (u32 LE)
     /// [28..32] reserved (u32)

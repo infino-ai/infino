@@ -138,13 +138,12 @@ async fn recall_under_undersized_reservoir_matches_brute_force() {
 
     // Parameterize across every reranking codec. All three share
     // the same 0.85 recall floor on this corpus: Fp32 is bit-exact,
-    // Bf16's rounding noise sits at ≤2⁻⁸ per lane (well below the
-    // 1-bit shortlist noise floor), and Sq8's per-cluster quantizer
-    // recovers fp32-equivalent recall at this dim/cluster shape.
-    // `RabitqOnly` is excluded because it skips the rerank step
-    // entirely and is covered separately by
-    // `rabitq_only_self_query_ranks_self_first` in reader.rs.
-    for codec in [RerankCodec::Fp32, RerankCodec::Bf16, RerankCodec::Sq8] {
+    // and Sq8's per-cluster quantizer recovers fp32-equivalent
+    // recall at this dim/cluster shape. `RabitqOnly` is excluded
+    // because it skips the rerank step entirely and is covered
+    // separately by `rabitq_only_self_query_ranks_self_first` in
+    // reader.rs.
+    for codec in [RerankCodec::Fp32, RerankCodec::Sq8] {
         let reader = build_reader_with_sample_size(&flat, dim, n_docs, n_cent, sample_size, codec);
         let mut total_recall = 0.0f32;
         for q_idx in queries {
