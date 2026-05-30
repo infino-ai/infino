@@ -1010,6 +1010,7 @@ mod tests {
     /// Generate a pseudo-random `f32` vector. Deterministic — uses the
     /// same monotone-noise pattern as the planted-cluster test fixtures
     /// elsewhere in this file so failures are reproducible.
+    #[cfg(target_arch = "x86_64")]
     fn fake_vec(dim: usize, seed: u32) -> Vec<f32> {
         (0..dim)
             .map(|i| {
@@ -1367,6 +1368,7 @@ mod tests {
     /// Compiler will autovectorize this on most x86_64 targets but
     /// the scalar source is what we measure, so the result is
     /// representative of "what you get with no hand-tuned SIMD".
+    #[cfg(target_arch = "x86_64")]
     fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
         let mut s = 0.0f32;
         for i in 0..a.len() {
@@ -1376,6 +1378,7 @@ mod tests {
     }
 
     /// Scalar fp32 L2².
+    #[cfg(target_arch = "x86_64")]
     fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
         let mut s = 0.0f32;
         for i in 0..a.len() {
@@ -1388,6 +1391,7 @@ mod tests {
     /// Scalar Sq8 dot-product kernel core: `Σ q'[d] * code[d]`
     /// after per-lane u8→f32 widening. Used inside `Sq8Kernel::
     /// distance_at`; this is the part the SIMD paths accelerate.
+    #[cfg(target_arch = "x86_64")]
     fn sq8_dot_scalar(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
         let mut s = 0.0f32;
         for d in 0..dim {
