@@ -491,14 +491,11 @@ impl FtsReader {
             }
             head_ranges.push(base + m..base + m + 20);
         }
-        let heads = self
-            .source
-            .get_ranges_parallel(&head_ranges)
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/postings term metadata range fetch failed: {e}"
-                )))
-            })?;
+        let heads = self.source.get_ranges_parallel(&head_ranges).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "fts/postings term metadata range fetch failed: {e}"
+            )))
+        })?;
 
         let mut body_ranges: Vec<Range<usize>> = Vec::with_capacity(metadata_offsets.len());
         for (&m, head) in metadata_offsets.iter().zip(&heads) {
@@ -941,9 +938,7 @@ impl FtsReader {
                     ));
                 }
                 Resolved::Pfor => {
-                    let term_bytes = pfor_iter
-                        .next()
-                        .expect("one fetched range per PFOR term");
+                    let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
                     cursors.push(TermCursor::new(term_bytes, self.n_docs as u64)?);
                 }
             }
@@ -2523,7 +2518,9 @@ impl TermCursor {
 
     fn decode_current_block(&mut self) {
         let block = self.blocks[self.current_block];
-        let bytes = self.bytes.slice(block.block_byte_offset..block.block_byte_end);
+        let bytes = self
+            .bytes
+            .slice(block.block_byte_offset..block.block_byte_end);
         self.block_n = decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs);
         self.pos = 0;
     }

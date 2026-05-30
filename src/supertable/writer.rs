@@ -496,7 +496,111 @@ fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
         total_size: bytes.len() as u64,
         vec,
         fts,
+        vec_open_ranges: vec
+            .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+            .unwrap_or_default(),
+        fts_open_ranges: fts
+            .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
+            .unwrap_or_default(),
     })
+}
+
+fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+    const OUTER_HEADER_SIZE: usize = 32;
+    const DIR_ENTRY_SIZE: usize = 64;
+    const SUB_HEADER_SIZE: usize = 56;
+    let start = off as usize;
+    let end = start.checked_add(len as usize)?;
+    let blob = bytes.get(start..end)?;
+    if blob.len() < OUTER_HEADER_SIZE + 4 {
+        return None;
+    }
+    let n_columns = read_u32_le(blob.get(12..16)?) as usize;
+    let dir_offset = read_u64_le(blob.get(24..32)?) as usize;
+    let dir_size = n_columns.checked_mul(DIR_ENTRY_SIZE)?;
+    let dir_end = dir_offset.checked_add(dir_size)?.checked_add(4)?;
+    let dir = blob.get(dir_offset..dir_offset + dir_size)?;
+
+    let mut ranges = vec![(off + dir_offset as u64, (dir_size + 4) as u64)];
+    ranges.push((off, OUTER_HEADER_SIZE as u64));
+    for i in 0..n_columns {
+        let entry = i * DIR_ENTRY_SIZE;
+        let subsection_off = read_u64_le(dir.get(entry + 24..entry + 32)?) as usize;
+        let subsection_len = read_u64_le(dir.get(entry + 32..entry + 40)?) as usize;
+        let codec_meta_off = read_u32_le(dir.get(entry + 56..entry + 60)?) as usize;
+        let codec_meta_size = read_u32_le(dir.get(entry + 60..entry + 64)?) as usize;
+        if subsection_off.checked_add(SUB_HEADER_SIZE)? > blob.len()
+            || subsection_off.checked_add(subsection_len)? > blob.len()
+        {
+            return None;
+        }
+        ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+        if codec_meta_size > 0 {
+            let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
+            if meta_end > subsection_len {
+                return None;
+            }
+            ranges.push((
+                off + subsection_off as u64 + codec_meta_off as u64,
+                codec_meta_size as u64,
+            ));
+        }
+    }
+    if dir_end > blob.len() {
+        return None;
+    }
+    Some(merge_ranges(ranges))
+}
+
+fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+    const FTS_HEADER_SIZE: usize = 48;
+    let start = off as usize;
+    let end = start.checked_add(len as usize)?;
+    let blob = bytes.get(start..end)?;
+    if blob.len() < FTS_HEADER_SIZE {
+        return None;
+    }
+    let postings_offset = read_u64_le(blob.get(32..40)?) as usize;
+    let doc_lengths_offset = read_u64_le(blob.get(40..48)?) as usize;
+    if postings_offset > blob.len()
+        || doc_lengths_offset > blob.len()
+        || postings_offset > doc_lengths_offset
+    {
+        return None;
+    }
+    Some(merge_ranges(vec![
+        (off, postings_offset as u64),
+        (
+            off + doc_lengths_offset as u64,
+            (blob.len() - doc_lengths_offset) as u64,
+        ),
+    ]))
+}
+
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.retain(|&(_, len)| len > 0);
+    ranges.sort_unstable_by_key(|&(off, _)| off);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (off, len) in ranges {
+        let end = off + len;
+        if let Some((last_off, last_len)) = merged.last_mut() {
+            let last_end = *last_off + *last_len;
+            if off <= last_end {
+                *last_len = (*last_len).max(end - *last_off);
+                continue;
+            }
+        }
+        merged.push((off, len));
+    }
+    merged
+}
+
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("u32 slice length"))
+}
+
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().expect("u64 slice length"))
 }
 
 /// Per-shard publish artifacts produced in parallel before the

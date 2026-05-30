@@ -381,8 +381,8 @@ pub struct SuperfileEntry {
 /// All offsets are absolute byte positions within the superfile
 /// blob (matching `inf.vec.offset` / `inf.fts.offset` parquet KV
 /// values), and `total_size` matches what an S3 `HEAD` would
-/// return. Cheap to clone (it's `Copy`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// return.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubsectionOffsets {
     /// Total byte count of the superfile blob. Lets the cold-open
     /// path skip the upfront `HEAD` round-trip too — the same
@@ -395,6 +395,15 @@ pub struct SubsectionOffsets {
     /// Absolute `(offset, length)` of the FTS subsection. `None`
     /// when the segment carries no FTS subsection.
     pub fts: Option<(u64, u64)>,
+    /// Absolute ranges that fully cover vector open-time metadata.
+    /// The hinted cache path prefetches these in the first network
+    /// batch so `VectorReader::open_lazy` can resolve header,
+    /// directory, subheaders, and codec metadata from the overlay.
+    pub vec_open_ranges: Vec<(u64, u64)>,
+    /// Absolute ranges that fully cover FTS open-time metadata:
+    /// header+dictionary and doc-length tables. Query-time postings
+    /// stay lazy.
+    pub fts_open_ranges: Vec<(u64, u64)>,
 }
 
 /// Opaque store key — wraps a UUID v4. The segment store treats

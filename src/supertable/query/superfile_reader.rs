@@ -70,7 +70,7 @@ pub fn superfile_reader(
     };
 
     let uri_copy = *uri;
-    let offsets_copy = offsets.copied();
+    let offsets_copy = offsets.cloned();
     let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // Ambient tokio runtime — block_in_place + block_on

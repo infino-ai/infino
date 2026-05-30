@@ -78,9 +78,7 @@ use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::SuperfileUri;
-use infino::supertable::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-};
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
 use infino::test_helpers::default_tokenizer;
 use s3s::auth::SimpleAuth;
@@ -215,8 +213,11 @@ fn build_superfile_bytes() -> Bytes {
             .collect::<Decimal128Array>()
             .with_precision_and_scale(38, 0)
             .expect("decimal128 with_precision_and_scale");
-        let titles =
-            LargeStringArray::from((start..start + len).map(|i| text.doc(i)).collect::<Vec<_>>());
+        let titles = LargeStringArray::from(
+            (start..start + len)
+                .map(|i| text.doc(i))
+                .collect::<Vec<_>>(),
+        );
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
             .expect("build RecordBatch");
         builder
@@ -265,6 +266,14 @@ fn build_superfile_bytes() -> Bytes {
 //                                  cold-read floor; aggregate multi-
 //                                  key throughput is far higher but
 //                                  irrelevant to one cold object)
+//
+//   INFINO_S3_COST_HEAD_PER_1000=<f64>  request cost for HEAD calls
+//                                      (default $0.0004 / 1K)
+//   INFINO_S3_COST_GET_PER_1000=<f64>   request cost for GET/range calls
+//                                      (default $0.0004 / 1K)
+//   INFINO_S3_COST_DATA_PER_GIB=<f64>   optional transfer/read byte cost
+//                                      (default $0.0 / GiB; same-region
+//                                      S3→EC2 transfer is usually free)
 #[derive(Debug, Clone, Copy)]
 struct S3LatencyModel {
     ttfb: Duration,
@@ -291,6 +300,60 @@ impl S3LatencyModel {
 
     fn delay_for(&self, bytes: u64) -> Duration {
         self.ttfb + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct S3CostModel {
+    head_per_1000: f64,
+    get_per_1000: f64,
+    data_per_gib: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct S3CostBreakdown {
+    request_usd: f64,
+    data_usd: f64,
+}
+
+impl S3CostBreakdown {
+    fn total_usd(self) -> f64 {
+        self.request_usd + self.data_usd
+    }
+}
+
+impl S3CostModel {
+    fn from_env_or_default() -> Self {
+        Self {
+            head_per_1000: std::env::var("INFINO_S3_COST_HEAD_PER_1000")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0004),
+            get_per_1000: std::env::var("INFINO_S3_COST_GET_PER_1000")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0004),
+            data_per_gib: std::env::var("INFINO_S3_COST_DATA_PER_GIB")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0),
+        }
+    }
+
+    fn request_cost(&self, head_count: u64, get_count: u64) -> f64 {
+        (head_count as f64 * self.head_per_1000 + get_count as f64 * self.get_per_1000) / 1000.0
+    }
+
+    fn data_cost(&self, bytes: u64) -> f64 {
+        let gib = bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        gib * self.data_per_gib
+    }
+
+    fn cost_for(&self, head_count: u64, get_count: u64, bytes: u64) -> S3CostBreakdown {
+        S3CostBreakdown {
+            request_usd: self.request_cost(head_count, get_count),
+            data_usd: self.data_cost(bytes),
+        }
     }
 }
 
@@ -359,9 +422,7 @@ async fn setup_s3_fixture(
         .put_atomic(&path, superfile.clone())
         .await
         .expect("upload superfile to s3s-fs");
-    eprintln!(
-        "[object_store_bench] s3s-fs spawned on {endpoint}, superfile uploaded to {path}"
-    );
+    eprintln!("[object_store_bench] s3s-fs spawned on {endpoint}, superfile uploaded to {path}");
     (addr, fs_root, storage, uri)
 }
 
@@ -496,14 +557,8 @@ fn bench(c: &mut Criterion) {
                     let _hits = rt.block_on(async {
                         let reader = cache.reader(&uri).await.expect("cold reader");
                         let vec = reader.vec().expect("vector reader present");
-                        vec.search(
-                            "v",
-                            &q,
-                            TOP_K,
-                            DEFAULT_NPROBE,
-                            DEFAULT_RERANK_MULT,
-                        )
-                        .expect("cold vector_search")
+                        vec.search("v", &q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
+                            .expect("cold vector_search")
                     });
                     total += t0.elapsed();
                     drop(cache);
@@ -574,13 +629,7 @@ fn bench(c: &mut Criterion) {
                     .expect("warm reader");
                 let vec = reader.vec().expect("vector reader present");
                 let hits = vec
-                    .search(
-                        "v",
-                        &q,
-                        TOP_K,
-                        DEFAULT_NPROBE,
-                        DEFAULT_RERANK_MULT,
-                    )
+                    .search("v", &q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
                     .expect("warm vector_search");
                 std::hint::black_box(hits)
             });
@@ -632,10 +681,7 @@ fn emit_object_store_markdown() {
     let dim = crate::corpus::DIM;
     let superfile_mib = superfile_bytes().len() as f64 / (1024.0 * 1024.0);
 
-    let cold_open_ns = read_mean_ns(
-        "object_store_cold_lazy_open",
-        &format!("n={n}_s3s_fs"),
-    );
+    let cold_open_ns = read_mean_ns("object_store_cold_lazy_open", &format!("n={n}_s3s_fs"));
     let cold_search_ns = read_mean_ns(
         "object_store_cold_first_search",
         &format!("n={n}_s3s_fs_top{TOP_K}"),
@@ -804,6 +850,10 @@ mod diag {
                 range_log: log,
             }
         }
+
+        fn range_bytes(&self) -> u64 {
+            self.range_log.iter().map(|e| e.len).sum()
+        }
     }
 
     #[async_trait]
@@ -821,11 +871,7 @@ mod diag {
             self.inner.get(uri).await
         }
 
-        async fn get_range(
-            &self,
-            uri: &str,
-            range: Range<u64>,
-        ) -> Result<Bytes, StorageError> {
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
             let len = range.end - range.start;
             let t0 = Instant::now();
             let start_us = self.origin.elapsed().as_micros();
@@ -833,8 +879,7 @@ mod diag {
             let end_us = self.origin.elapsed().as_micros();
             let us = t0.elapsed().as_micros();
             self.range_count.fetch_add(1, Ordering::Relaxed);
-            self.range_total_us
-                .fetch_add(us as u64, Ordering::Relaxed);
+            self.range_total_us.fetch_add(us as u64, Ordering::Relaxed);
             self.range_log.lock().unwrap().push(RequestEvent {
                 len,
                 start_us,
@@ -850,11 +895,7 @@ mod diag {
         // splitting one S3 `bytes=-len` suffix-range GET into a
         // (HEAD + bounded GET) pair on the wire and totally
         // erasing the optimization the cold-open path relies on.
-        async fn tail(
-            &self,
-            uri: &str,
-            len: u64,
-        ) -> Result<(Bytes, u64), StorageError> {
+        async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
             let t0 = Instant::now();
             let start_us = self.origin.elapsed().as_micros();
             let r = self.inner.tail(uri, len).await;
@@ -863,24 +904,17 @@ mod diag {
             // Count as a single get_range against the wire (which
             // it literally is — one suffix-range GET).
             self.range_count.fetch_add(1, Ordering::Relaxed);
-            self.range_total_us
-                .fetch_add(us as u64, Ordering::Relaxed);
+            self.range_total_us.fetch_add(us as u64, Ordering::Relaxed);
             // Log with the actual bytes returned so per-range
             // size reporting reflects what came back. On a
             // success the returned `Bytes::len()` is the truth
             // (may be less than `len` if the object is smaller).
-            let logged_len = r
-                .as_ref()
-                .map(|(b, _)| b.len() as u64)
-                .unwrap_or(len);
-            self.range_log
-                .lock()
-                .unwrap()
-                .push(RequestEvent {
-                    len: logged_len,
-                    start_us,
-                    end_us,
-                });
+            let logged_len = r.as_ref().map(|(b, _)| b.len() as u64).unwrap_or(len);
+            self.range_log.lock().unwrap().push(RequestEvent {
+                len: logged_len,
+                start_us,
+                end_us,
+            });
             r
         }
 
@@ -964,14 +998,20 @@ mod diag {
             snap.range_total_us / snap.range_count
         };
         let model = S3LatencyModel::from_env_or_default();
+        let cost_model = S3CostModel::from_env_or_default();
         let (raw_blocking, model_blocking, batches) =
             request_blocking_spans(&snap.range_log, model);
-        let adjusted_wall = wall.checked_sub(raw_blocking).unwrap_or(Duration::ZERO) + model_blocking;
+        let adjusted_wall =
+            wall.checked_sub(raw_blocking).unwrap_or(Duration::ZERO) + model_blocking;
+        let range_bytes = snap.range_bytes();
+        let cost = cost_model.cost_for(snap.head_count, snap.range_count, range_bytes);
         eprintln!(
             "[diag] {name}: wall={:>7.1} ms | adjusted_s3_model={:>7.1} ms \
              (ttfb={:>5.1} ms, {:>5.0} MB/s, batches={:>2}, raw_s3s_block={:>7.1} ms, \
              model_block={:>7.1} ms) | HEAD {:>3} calls ({:>5} us avg) | \
-             GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms)",
+             GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms) | \
+             bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
+             (requests=${:.9}, data=${:.9})",
             wall.as_secs_f64() * 1e3,
             adjusted_wall.as_secs_f64() * 1e3,
             model.ttfb.as_secs_f64() * 1e3,
@@ -984,19 +1024,31 @@ mod diag {
             snap.range_count,
             range_avg_us,
             (snap.range_total_us as f64) / 1e3,
+            range_bytes,
+            range_bytes as f64 / 1024.0 / 1024.0,
+            cost.total_usd(),
+            cost.request_usd,
+            cost.data_usd,
+        );
+        eprintln!(
+            "[diag] {name}:   cost_model HEAD=${:.7}/1K GET=${:.7}/1K DATA=${:.4}/GiB",
+            cost_model.head_per_1000, cost_model.get_per_1000, cost_model.data_per_gib,
         );
         // Range breakdown — log each (len, latency) so we can
         // see e.g. "2 MiB GET took 800ms while 32 B GET took 5ms".
         for (i, event) in snap.range_log.iter().enumerate() {
             let us = event.end_us.saturating_sub(event.start_us);
             let model_us = model.delay_for(event.len).as_micros();
+            let event_cost = cost_model.cost_for(0, 1, event.len);
             eprintln!(
                 "[diag] {name}:   range[{i:>2}] len={:>10} B  ({:>5.1} KiB)  \
-                 raw_lat={:>7} us  model_lat={:>7} us  start={:>10} us  end={:>10} us",
+                 raw_lat={:>7} us  model_lat={:>7} us  cost=${:.9}  \
+                 start={:>10} us  end={:>10} us",
                 event.len,
                 (event.len as f64) / 1024.0,
                 us,
                 model_us,
+                event_cost.total_usd(),
                 event.start_us,
                 event.end_us,
             );
@@ -1014,11 +1066,10 @@ mod diag {
         let n = n_docs();
         let query = query_vector().to_vec();
 
-        let (_addr, _fs_root, raw_storage, uri) =
-            rt.block_on(setup_s3_fixture(superfile));
+        let (_addr, _fs_root, raw_storage, uri) = rt.block_on(setup_s3_fixture(superfile));
         let storage = Arc::new(CountingStorage::new(raw_storage));
-        let storage_dyn: Arc<dyn StorageProvider> = Arc::clone(&storage)
-            as Arc<dyn StorageProvider>;
+        let storage_dyn: Arc<dyn StorageProvider> =
+            Arc::clone(&storage) as Arc<dyn StorageProvider>;
         let path = format!("data/seg-{}.sf", uri.0);
 
         // ── Phase 1: raw RTT probes ─────────────────────────────────
@@ -1063,9 +1114,7 @@ mod diag {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
             let t0 = Instant::now();
-            let _reader = rt
-                .block_on(cache.reader(&uri))
-                .expect("cold reader");
+            let _reader = rt.block_on(cache.reader(&uri)).expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
             report(&format!("cold_open_unhinted[{i}]"), &snap, wall);
@@ -1086,7 +1135,7 @@ mod diag {
         for i in 0..3 {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
-            let off_ref = offsets;
+            let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _reader = rt
                 .block_on(cache.reader_with_hints(&uri, Some(&off_ref)))
@@ -1123,14 +1172,12 @@ mod diag {
         }
 
         // ── Phase 3b: cold first search HINTED ──────────────────────
-        eprintln!(
-            "[diag] === cold first search HINTED (nprobe={DEFAULT_NPROBE}, top={TOP_K}) ==="
-        );
+        eprintln!("[diag] === cold first search HINTED (nprobe={DEFAULT_NPROBE}, top={TOP_K}) ===");
         for i in 0..3 {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
             let q = query.clone();
-            let off_ref = offsets;
+            let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
@@ -1149,7 +1196,10 @@ mod diag {
             drop(cache_dir);
         }
 
-        eprintln!("[diag] === scale: n_docs={n}, superfile_size={} MiB ===", superfile.len() / (1024 * 1024));
+        eprintln!(
+            "[diag] === scale: n_docs={n}, superfile_size={} MiB ===",
+            superfile.len() / (1024 * 1024)
+        );
     }
 
     /// Synthesize the [`SubsectionOffsets`] the writer would have
@@ -1172,6 +1222,110 @@ mod diag {
             total_size: bytes.len() as u64,
             vec,
             fts,
+            vec_open_ranges: vec
+                .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+                .unwrap_or_default(),
+            fts_open_ranges: fts
+                .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
+                .unwrap_or_default(),
         }
+    }
+
+    fn vector_open_ranges(bytes: &[u8], off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+        const OUTER_HEADER_SIZE: usize = 32;
+        const DIR_ENTRY_SIZE: usize = 64;
+        const SUB_HEADER_SIZE: usize = 56;
+        let start = off as usize;
+        let end = start.checked_add(len as usize)?;
+        let blob = bytes.get(start..end)?;
+        if blob.len() < OUTER_HEADER_SIZE + 4 {
+            return None;
+        }
+        let n_columns = read_u32_le(blob.get(12..16)?) as usize;
+        let dir_offset = read_u64_le(blob.get(24..32)?) as usize;
+        let dir_size = n_columns.checked_mul(DIR_ENTRY_SIZE)?;
+        let dir_end = dir_offset.checked_add(dir_size)?.checked_add(4)?;
+        let dir = blob.get(dir_offset..dir_offset + dir_size)?;
+
+        let mut ranges = vec![(off, OUTER_HEADER_SIZE as u64)];
+        ranges.push((off + dir_offset as u64, (dir_size + 4) as u64));
+        for i in 0..n_columns {
+            let entry = i * DIR_ENTRY_SIZE;
+            let subsection_off = read_u64_le(dir.get(entry + 24..entry + 32)?) as usize;
+            let subsection_len = read_u64_le(dir.get(entry + 32..entry + 40)?) as usize;
+            let codec_meta_off = read_u32_le(dir.get(entry + 56..entry + 60)?) as usize;
+            let codec_meta_size = read_u32_le(dir.get(entry + 60..entry + 64)?) as usize;
+            if subsection_off.checked_add(SUB_HEADER_SIZE)? > blob.len()
+                || subsection_off.checked_add(subsection_len)? > blob.len()
+            {
+                return None;
+            }
+            ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+            if codec_meta_size > 0 {
+                let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
+                if meta_end > subsection_len {
+                    return None;
+                }
+                ranges.push((
+                    off + subsection_off as u64 + codec_meta_off as u64,
+                    codec_meta_size as u64,
+                ));
+            }
+        }
+        if dir_end > blob.len() {
+            return None;
+        }
+        Some(merge_ranges(ranges))
+    }
+
+    fn fts_open_ranges(bytes: &[u8], off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+        const FTS_HEADER_SIZE: usize = 48;
+        let start = off as usize;
+        let end = start.checked_add(len as usize)?;
+        let blob = bytes.get(start..end)?;
+        if blob.len() < FTS_HEADER_SIZE {
+            return None;
+        }
+        let postings_offset = read_u64_le(blob.get(32..40)?) as usize;
+        let doc_lengths_offset = read_u64_le(blob.get(40..48)?) as usize;
+        if postings_offset > blob.len()
+            || doc_lengths_offset > blob.len()
+            || postings_offset > doc_lengths_offset
+        {
+            return None;
+        }
+        Some(merge_ranges(vec![
+            (off, postings_offset as u64),
+            (
+                off + doc_lengths_offset as u64,
+                (blob.len() - doc_lengths_offset) as u64,
+            ),
+        ]))
+    }
+
+    fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        ranges.retain(|&(_, len)| len > 0);
+        ranges.sort_unstable_by_key(|&(off, _)| off);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (off, len) in ranges {
+            let end = off + len;
+            if let Some((last_off, last_len)) = merged.last_mut() {
+                let last_end = *last_off + *last_len;
+                if off <= last_end {
+                    *last_len = (*last_len).max(end - *last_off);
+                    continue;
+                }
+            }
+            merged.push((off, len));
+        }
+        merged
+    }
+
+    fn read_u32_le(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes.try_into().expect("u32 slice length"))
+    }
+
+    fn read_u64_le(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes.try_into().expect("u64 slice length"))
     }
 }

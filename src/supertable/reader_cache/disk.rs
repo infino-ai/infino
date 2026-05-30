@@ -322,7 +322,7 @@ impl DiskCacheStore {
                     .into(),
             )),
             ColdFetchMode::LazyForegroundWithBackgroundFill => {
-                self.reader_lazy_with_bg_fill_hinted(uri, offsets.copied())
+                self.reader_lazy_with_bg_fill_hinted(uri, offsets.cloned())
                     .await
             }
         }
@@ -864,7 +864,7 @@ impl DiskCacheStore {
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
         let result = cell
-            .get_or_init(|| async { self.cold_fetch_lazy_hinted(uri, offsets).await })
+            .get_or_init(|| async { self.cold_fetch_lazy_hinted(uri, offsets.clone()).await })
             .await;
         match result {
             Ok(entry) => Ok(Arc::clone(&entry.reader)),
@@ -941,10 +941,25 @@ impl DiskCacheStore {
         let parquet_tail_len = parquet_tail_spec.min(total_size);
         let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
 
-        // Seed the inner lazy readers with just the fixed headers.
-        // They parse those headers and fetch exact metadata ranges.
-        let vec_head_target: u64 = 32;
-        let fts_head_target: u64 = 48;
+        // Seed the inner lazy readers with exact open-time metadata
+        // when the manifest carries it. Older/incomplete hints fall
+        // back to fixed headers; the readers then discover the rest.
+        let vec_ranges = if !offsets.vec_open_ranges.is_empty() {
+            offsets.vec_open_ranges.clone()
+        } else {
+            match offsets.vec {
+                Some((off, len)) if len > 0 => vec![(off, 32u64.min(len))],
+                _ => Vec::new(),
+            }
+        };
+        let fts_ranges = if !offsets.fts_open_ranges.is_empty() {
+            offsets.fts_open_ranges.clone()
+        } else {
+            match offsets.fts {
+                Some((off, len)) if len > 0 => vec![(off, 48u64.min(len))],
+                _ => Vec::new(),
+            }
+        };
 
         // Fire the footer tail and fixed subsection headers concurrently.
         // Larger vector / FTS metadata ranges are discovered and fetched
@@ -953,8 +968,6 @@ impl DiskCacheStore {
         let storage_uri_a = storage_uri.clone();
         let storage_uri_b = storage_uri.clone();
         let storage_uri_c = storage_uri.clone();
-        let vec_hint = offsets.vec;
-        let fts_hint = offsets.fts;
         let storage_for_vec = Arc::clone(&storage);
         let storage_for_fts = Arc::clone(&storage);
 
@@ -966,30 +979,10 @@ impl DiskCacheStore {
             }
             storage.get_range(&storage_uri_a, start..end).await
         };
-        let vec_fut = async move {
-            match vec_hint {
-                Some((off, len)) if len > 0 => {
-                    let take = vec_head_target.min(len);
-                    let bytes = storage_for_vec
-                        .get_range(&storage_uri_b, off..off + take)
-                        .await?;
-                    Ok::<_, StorageError>(Some((off, bytes)))
-                }
-                _ => Ok(None),
-            }
-        };
-        let fts_fut = async move {
-            match fts_hint {
-                Some((off, len)) if len > 0 => {
-                    let take = fts_head_target.min(len);
-                    let bytes = storage_for_fts
-                        .get_range(&storage_uri_c, off..off + take)
-                        .await?;
-                    Ok::<_, StorageError>(Some((off, bytes)))
-                }
-                _ => Ok(None),
-            }
-        };
+        let vec_fut =
+            async move { fetch_hint_ranges(storage_for_vec, storage_uri_b, vec_ranges).await };
+        let fts_fut =
+            async move { fetch_hint_ranges(storage_for_fts, storage_uri_c, fts_ranges).await };
 
         let (parquet_bytes, vec_pre, fts_pre) = futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
 
@@ -1008,10 +1001,10 @@ impl DiskCacheStore {
         if !parquet_bytes.is_empty() {
             overlay.install(parquet_tail_start, parquet_bytes);
         }
-        if let Some((off, bytes)) = vec_pre {
+        for (off, bytes) in vec_pre {
             overlay.install(off, bytes);
         }
-        if let Some((off, bytes)) = fts_pre {
+        for (off, bytes) in fts_pre {
             overlay.install(off, bytes);
         }
         let source: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(overlay);
@@ -1450,6 +1443,24 @@ async fn finalize_to_mmap(
     // entirely driven by `cached.remove` gating now.
     let _ = reserved_bytes;
     res
+}
+
+async fn fetch_hint_ranges(
+    storage: Arc<dyn StorageProvider>,
+    storage_uri: String,
+    ranges: Vec<(u64, u64)>,
+) -> Result<Vec<(u64, Bytes)>, StorageError> {
+    futures::future::try_join_all(ranges.into_iter().filter(|&(_, len)| len > 0).map(
+        |(off, len)| {
+            let storage = Arc::clone(&storage);
+            let storage_uri = storage_uri.clone();
+            async move {
+                let bytes = storage.get_range(&storage_uri, off..off + len).await?;
+                Ok::<_, StorageError>((off, bytes))
+            }
+        },
+    ))
+    .await
 }
 
 /// Plan 013 M4 — background promotion path for the

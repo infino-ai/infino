@@ -924,7 +924,11 @@ fn build_subsection_streaming(
             }
             v
         }
-        RerankCodec::Sq8 => sq8_built.as_ref().expect("sq8_built set above").codes.clone(),
+        RerankCodec::Sq8 => sq8_built
+            .as_ref()
+            .expect("sq8_built set above")
+            .codes
+            .clone(),
         RerankCodec::RabitqOnly => Vec::new(),
     };
     debug_assert_eq!(full_bytes.len(), per_vec_bytes * n_docs);

@@ -10,8 +10,8 @@
 
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
-use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource};
 pub use crate::superfile::lazy_source::Source;
+use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource};
 use crate::superfile::vector::distance::{Metric, Sq8Kernel, distance_bytes, distance_bytes_codec};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
@@ -393,8 +393,8 @@ impl VectorReader {
             subheader_ranges.push((i, subsection_off));
         }
 
-        let subheaders_fut = futures::future::try_join_all(subheader_ranges.iter().map(
-            |&(i, subsection_off)| {
+        let subheaders_fut =
+            futures::future::try_join_all(subheader_ranges.iter().map(|&(i, subsection_off)| {
                 let source = Arc::clone(&source);
                 async move {
                     let bytes = source
@@ -407,8 +407,7 @@ impl VectorReader {
                         })?;
                     Ok::<_, VectorError>((i, subsection_off, bytes))
                 }
-            },
-        ));
+            }));
         let codec_meta_chunks_fut = futures::future::try_join_all(codec_meta_ranges.iter().map(
             |&(i, codec_meta_abs_off, codec_meta_size, _)| {
                 let source = Arc::clone(&source);
@@ -437,15 +436,8 @@ impl VectorReader {
                     actual: sub_header[0..8].to_vec(),
                 }));
             }
-            let (
-                _,
-                entry_off,
-                _,
-                subsection_len,
-                sub_end,
-                dir_codec_meta_off,
-                dir_codec_meta_size,
-            ) = subsection_meta[i];
+            let (_, entry_off, _, subsection_len, sub_end, dir_codec_meta_off, dir_codec_meta_size) =
+                subsection_meta[i];
             let per_cluster_blocks_off = read_u64_le(&sub_header[48..56]) as usize;
             let open_time_abs_end = subsection_off + per_cluster_blocks_off;
             if open_time_abs_end > sub_end {
@@ -1111,38 +1103,33 @@ impl VectorReader {
         let centroid_stride = col.dim * 4;
         let sub_start = col.subsection_range.start;
 
-        // 1. Centroids region. `n_cent × dim × 4` bytes,
-        //    ~1.5 MB at default shape. Source::InMemory
-        //    returns a zero-copy Bytes::slice; warm-cache
-        //    Source::Lazy returns the same; cold-miss
-        //    Source::Lazy bridges to async range() via the
-        //    sync→async pattern in Source::get_range.
+        // 1. Centroids + cluster_idx region. These are contiguous
+        //    in the subsection, and search needs both before it can
+        //    issue per-cluster range requests. Fetching them as one
+        //    span saves one request and one foreground RTT batch on
+        //    cold object-store search.
         let centroids_start = sub_start + col.centroids_off;
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
-        let centroids = self
-            .source
-            .get_range(centroids_start..centroids_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
-
-        // 2. Cluster_idx header. `n_cent × 8` bytes, 8 KB at
-        //    default shape. Cheap.
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * 8;
-        let cluster_idx = self
+        let centroid_idx_region = self
             .source
-            .get_range(idx_start..idx_end)
+            .get_range(centroids_start..idx_end)
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
+        let cluster_idx =
+            centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        // 3. Score centroids → top `nprobe` clusters.
+        // 2. Score centroids → top `nprobe` clusters.
         let mut centroid_scores = score_centroids(&centroids, col, query);
         let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
         centroid_scores.truncate(nprobe_eff);
 
-        // 4. Rotate query once for the 1-bit code estimator.
+        // 3. Rotate query once for the 1-bit code estimator.
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
 
-        // 5. Per-cluster fetches and shortlist build. Shortlist
+        // 4. Per-cluster fetches and shortlist build. Shortlist
         //    tuple is (doc_id, estimate, pos, cluster_id);
         //    pos = off + i and cluster_id are captured inline at
         //    no extra fetch cost. cluster_id is consumed by the
@@ -2606,11 +2593,10 @@ mod tests {
              full[] fetch"
         );
         // A search that probed at least one non-empty cluster
-        // must issue ≥ 4 fetches (centroids + idx + ≥1 cluster's
-        // codes + doc_ids); below that and we'd be testing a
-        // pathological corpus, not the None codec.
+        // must issue ≥ 3 fetches: centroids+idx plus at least
+        // two cluster blocks in this well-populated corpus.
         assert!(
-            sync_count >= 4,
+            sync_count >= 3,
             "test corpus produced only empty clusters? got sync_count={sync_count}"
         );
     }
@@ -3280,16 +3266,14 @@ mod tests {
 
         let async_calls_for_first_search =
             async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
-        // Worst-case at nprobe=4, all clusters non-empty:
-        //   centroids + cluster_idx + nprobe*(codes + doc_ids) + 1 fat full[] = 11.
-        // Lower bound is 3 (centroids + cluster_idx + fat full[]) when
-        // every probed cluster is empty, but for this corpus every
-        // cluster has docs.
+        // At nprobe=4 with this corpus, all probed clusters are
+        // non-empty: centroids+cluster_idx plus one interleaved
+        // cluster block per probed cluster.
         assert!(
-            (3..=11).contains(&(async_calls_for_first_search as usize)),
+            (3..=5).contains(&(async_calls_for_first_search as usize)),
             "per-cluster path: cold first search expected to issue \
-             3..=11 ranges (centroids + cluster_idx + per-cluster \
-             codes/doc_ids + 1 fat rerank range). Got {async_calls_for_first_search}."
+             3..=5 ranges (centroids+cluster_idx + interleaved \
+             cluster blocks). Got {async_calls_for_first_search}."
         );
     }
 
@@ -4072,17 +4056,17 @@ mod tests {
 
         let after_search = async_counter.load(AtomicOrdering::Relaxed);
         let search_calls = after_search - after_open;
-        let max_expected = (nprobe + 2) as u64;
+        let max_expected = (nprobe + 1) as u64;
         assert!(
             search_calls <= max_expected,
             "cold first search at nprobe={nprobe} must issue ≤ {max_expected} async \
-             range GETs (centroids + cluster_idx + one interleaved block per probed \
+             range GETs (centroids+cluster_idx + one interleaved block per probed \
              cluster); observed {search_calls}",
         );
         assert!(
             search_calls >= 3,
-            "cold first search must issue at least 3 async range GETs (centroids + \
-             cluster_idx + ≥1 cluster block); observed {search_calls} suggests \
+            "cold first search must issue at least 3 async range GETs (centroids+ \
+             cluster_idx + ≥2 cluster blocks); observed {search_calls} suggests \
              search accidentally short-circuited the cold fetch paths",
         );
     }

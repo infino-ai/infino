@@ -458,14 +458,22 @@ fn take_optional_bytes(
 
 /// Encode [`SubsectionOffsets`] as a flat byte string: a 1-byte
 /// version tag, then `total_size`, optional `(vec_off, vec_len)`,
-/// optional `(fts_off, fts_len)`. Optionality is a 1-byte flag
-/// per pair — keeps the encoding tiny (≤ 41 bytes) without
-/// dragging another Avro record schema in.
+/// optional `(fts_off, fts_len)`, and exact open-time range lists.
 ///
 /// Stays in lock-step with [`decode_subsection_offsets`].
 fn encode_subsection_offsets(off: &SubsectionOffsets) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 8 + 1 + 16 + 1 + 16);
-    out.push(1u8); // version
+    let mut out = Vec::with_capacity(
+        1 + 8
+            + 1
+            + 16
+            + 1
+            + 16
+            + 4
+            + off.vec_open_ranges.len() * 16
+            + 4
+            + off.fts_open_ranges.len() * 16,
+    );
+    out.push(2u8); // version
     out.extend_from_slice(&off.total_size.to_le_bytes());
     match off.vec {
         Some((o, l)) => {
@@ -483,7 +491,17 @@ fn encode_subsection_offsets(off: &SubsectionOffsets) -> Vec<u8> {
         }
         None => out.push(0),
     }
+    encode_range_list(&mut out, &off.vec_open_ranges);
+    encode_range_list(&mut out, &off.fts_open_ranges);
     out
+}
+
+fn encode_range_list(out: &mut Vec<u8>, ranges: &[(u64, u64)]) {
+    out.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
+    for &(off, len) in ranges {
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+    }
 }
 
 fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartParseError> {
@@ -508,7 +526,7 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
         Ok(u64::from_le_bytes(arr))
     };
     let ver = take(&mut cur, 1)?[0];
-    if ver != 1 {
+    if ver != 2 {
         return Err(PartParseError::SchemaMismatch(format!(
             "subsection_offsets unknown version {ver}"
         )));
@@ -530,11 +548,36 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
     } else {
         None
     };
+    let vec_open_ranges = decode_range_list(&mut cur, &read_u64, &take)?;
+    let fts_open_ranges = decode_range_list(&mut cur, &read_u64, &take)?;
+    if !cur.is_empty() {
+        return Err(PartParseError::SchemaMismatch(
+            "subsection_offsets has trailing bytes".into(),
+        ));
+    }
     Ok(SubsectionOffsets {
         total_size,
         vec,
         fts,
+        vec_open_ranges,
+        fts_open_ranges,
     })
+}
+
+fn decode_range_list(
+    cur: &mut &[u8],
+    read_u64: &impl Fn(&mut &[u8]) -> Result<u64, PartParseError>,
+    take: &impl Fn(&mut &[u8], usize) -> Result<Vec<u8>, PartParseError>,
+) -> Result<Vec<(u64, u64)>, PartParseError> {
+    let count_bytes = take(cur, 4)?;
+    let count = u32::from_le_bytes(count_bytes.as_slice().try_into().map_err(|_| {
+        PartParseError::SchemaMismatch("subsection_offsets range count read".into())
+    })?) as usize;
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        ranges.push((read_u64(cur)?, read_u64(cur)?));
+    }
+    Ok(ranges)
 }
 
 // Silence "unused" if Schema isn't consumed yet on its
@@ -685,6 +728,8 @@ mod tests {
                 total_size: 12_345_678,
                 vec: Some((123_456, 78_910)),
                 fts: Some((11_111, 22_222)),
+                vec_open_ranges: vec![(123_456, 96), (200_000, 4096)],
+                fts_open_ranges: vec![(11_111, 1024), (30_000, 2048)],
             }),
         })
     }
