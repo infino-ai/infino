@@ -280,3 +280,8 @@ name = "tombstone-overhead"
 path = "benches/tombstone_overhead/main.rs"
 harness = false
 
+[[bench]]
+name = "supertable-update"
+path = "benches/supertable_update/main.rs"
+harness = false
+

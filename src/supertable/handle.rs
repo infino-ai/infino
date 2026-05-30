@@ -316,6 +316,11 @@ impl Supertable {
         // `open` because the supertable is still functional —
         // the next sweep gets another shot.
         let _ = st.run_recovery_sweep_once().await;
+        // GC sweep follows recovery on the same LIST: reaps
+        // Complete WALs past `T_wal_grace` and orphan arrow
+        // sidecars past `T_sidecar_grace`. Best-effort; same
+        // sweep budget.
+        let _ = st.run_gc_sweep_once().await;
         Ok(st)
     }
 
@@ -528,6 +533,35 @@ impl Supertable {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
             Err(_) => self.inner.sql_runtime().block_on(drive),
         }
+    }
+
+    /// Operator hatch: run one GC sweep over this supertable's
+    /// `wal/mutations/` prefix. Reaps `Complete` WALs older
+    /// than the wal-grace window + orphan `.arrow` sidecars
+    /// older than the sidecar-grace window. Tests pass custom
+    /// grace windows via [`run_gc_sweep_with_grace`].
+    pub async fn run_gc_sweep_once(
+        &self,
+    ) -> Result<crate::supertable::wal::gc::GcReport, crate::supertable::wal::gc::GcError> {
+        crate::supertable::wal::gc::run_sweep(
+            self,
+            chrono::Utc::now(),
+            crate::supertable::wal::gc::DEFAULT_WAL_GRACE,
+            crate::supertable::wal::gc::DEFAULT_SIDECAR_GRACE,
+        )
+        .await
+    }
+
+    /// Same as [`run_gc_sweep_once`] but with caller-supplied
+    /// `now` + grace windows. Useful for deterministic tests
+    /// that simulate grace-window crossings without sleeping.
+    pub async fn run_gc_sweep_with_grace(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        wal_grace: std::time::Duration,
+        sidecar_grace: std::time::Duration,
+    ) -> Result<crate::supertable::wal::gc::GcReport, crate::supertable::wal::gc::GcError> {
+        crate::supertable::wal::gc::run_sweep(self, now, wal_grace, sidecar_grace).await
     }
 
     /// Current manifest's id, without pinning a reader. Useful for
