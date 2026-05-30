@@ -72,6 +72,14 @@ pub(super) struct SupertableInner {
     /// first use rather than at `create()` so supertables that
     /// never run SQL don't pay the runtime cost.
     pub(super) sql_runtime: OnceLock<Arc<Runtime>>,
+    /// Per-process reader-side cache of per-superfile tombstone
+    /// bitmaps. `Some` when storage is attached (the cache
+    /// fetches sidecars from `superfiles/<id>.tombstones`);
+    /// `None` for in-memory-only supertables where no sidecars
+    /// can exist. Query paths read through this cache before
+    /// returning per-superfile hits; writers invalidate cached
+    /// entries after each successful sidecar CAS-PUT.
+    pub(super) tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 }
 
 impl SupertableInner {
@@ -104,12 +112,14 @@ impl Supertable {
     pub fn create(options: SupertableOptions) -> Self {
         let options = Arc::new(options);
         let initial = Manifest::empty(options.clone());
+        let tombstone_cache = build_tombstone_cache(&options);
         let inner = Arc::new(SupertableInner {
             options,
             manifest: ArcSwap::new(Arc::new(initial)),
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
             sql_runtime: OnceLock::new(),
+            tombstone_cache,
         });
         install_disk_cache_pinning(&inner);
         Self { inner }
@@ -262,6 +272,7 @@ impl Supertable {
             loader: Some(loader),
         };
 
+        let tombstone_cache = build_tombstone_cache(&options_arc);
         let inner = Arc::new(SupertableInner {
             options: options_arc,
             manifest: ArcSwap::new(Arc::new(manifest)),
@@ -275,6 +286,7 @@ impl Supertable {
             // further insulating restarts from collisions.
             id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
             sql_runtime: OnceLock::new(),
+            tombstone_cache,
         });
         install_disk_cache_pinning(&inner);
         Ok(Self { inner })
@@ -418,6 +430,7 @@ impl Supertable {
     pub fn reader(&self) -> SupertableReader {
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
+            tombstone_cache: self.inner.tombstone_cache.clone(),
         }
     }
 
@@ -494,6 +507,21 @@ impl Supertable {
 /// has already dropped (cache outlived it), returns the
 /// empty set — eviction proceeds without pinning, which is
 /// the safe fallback.
+/// Build the tombstone-sidecar cache when storage is attached.
+/// Returns `None` for in-memory-only supertables — no sidecars
+/// can exist there, so the query paths skip the filter hook
+/// entirely.
+fn build_tombstone_cache(
+    options: &Arc<SupertableOptions>,
+) -> Option<Arc<crate::supertable::tombstones::SidecarCache>> {
+    let storage = options.storage.as_ref()?.clone();
+    let wal_store = crate::supertable::wal::WalStore::new(storage);
+    Some(Arc::new(crate::supertable::tombstones::SidecarCache::new(
+        wal_store,
+        crate::supertable::tombstones::cache::DEFAULT_REFRESH_TTL,
+    )))
+}
+
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
     let cache = match inner.options.disk_cache.as_ref() {
         Some(c) => c,
@@ -538,6 +566,11 @@ impl std::fmt::Debug for Supertable {
 /// modules on top of this handle.
 pub struct SupertableReader {
     manifest: Arc<Manifest>,
+    /// Per-process tombstone-bitmap cache shared with the parent
+    /// `Supertable`. Query paths read through this before
+    /// returning per-superfile hits so tombstoned rows never
+    /// reach callers. `None` for in-memory-only supertables.
+    pub(crate) tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 }
 
 impl SupertableReader {

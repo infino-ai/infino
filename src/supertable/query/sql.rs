@@ -99,8 +99,9 @@ impl Supertable {
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
+        let tombstone_cache = reader.tombstone_cache.clone();
 
-        let table = build_mem_table(scalar_schema, manifest, store, disk_cache)?;
+        let table = build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)?;
         let sql = sql.to_owned();
 
         let drive = async move {
@@ -159,6 +160,7 @@ fn build_mem_table(
     manifest: Arc<Manifest>,
     store: Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 ) -> Result<MemTable, QueryError> {
     // M15c: route through the hierarchical iterator when
     // the manifest has a persisted list (which includes
@@ -174,6 +176,10 @@ fn build_mem_table(
             manifest.as_ref(),
         ),
     };
+    // One `Instant::now()` for the entire SQL query so each
+    // per-superfile tombstone lookup shares the same TTL
+    // reference. Matches the FTS / vector hot-path budget.
+    let now = std::time::Instant::now();
     let mut partitions: Vec<Vec<RecordBatch>> = Vec::with_capacity(superfiles.len().max(1));
     for entry in &superfiles {
         let reader = crate::supertable::query::superfile_reader::superfile_reader(
@@ -182,13 +188,60 @@ fn build_mem_table(
             &entry.uri,
         )
         .map_err(|e| QueryError::Store(e.to_string()))?;
-        let batches = read_all_batches(reader.parquet_bytes().clone())?;
+        let mut batches = read_all_batches(reader.parquet_bytes().clone())?;
+        if let Some(cache) = tombstone_cache.as_ref() {
+            apply_tombstone_filter_to_batches(cache, entry.superfile_id, &mut batches, now)?;
+        }
         partitions.push(batches);
     }
     if partitions.is_empty() {
         partitions.push(Vec::new());
     }
     MemTable::try_new(schema, partitions).map_err(|e| QueryError::Plan(e.to_string()))
+}
+
+/// Drop tombstoned rows from one superfile's batches before they
+/// reach DataFusion's `MemTable`. The local doc-id of row `i` in
+/// batch `b` is `row_offset(b) + i`, where `row_offset(b)` sums
+/// the lengths of all batches preceding `b` within the superfile.
+///
+/// Empty-bitmap short-circuits the entire loop so a tombstone-free
+/// superfile pays nothing beyond the cache lookup.
+fn apply_tombstone_filter_to_batches(
+    cache: &Arc<crate::supertable::tombstones::SidecarCache>,
+    superfile_id: uuid::Uuid,
+    batches: &mut Vec<RecordBatch>,
+    now: std::time::Instant,
+) -> Result<(), QueryError> {
+    let bitmap = cache
+        .bitmap_for(superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    let mut row_offset: u32 = 0;
+    let mut filtered: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    for batch in batches.drain(..) {
+        let n = batch.num_rows() as u32;
+        // Build a boolean mask. `true` keeps the row; `false`
+        // drops it. We allocate once per batch — the typical
+        // batch is row-group-sized (~64K rows) so this is one
+        // small allocation per superfile-batch combination.
+        let mask: Vec<bool> = (0..n).map(|i| !bitmap.contains(row_offset + i)).collect();
+        // Fast-path: every row keeps → no filter call needed.
+        if mask.iter().all(|b| *b) {
+            row_offset += n;
+            filtered.push(batch);
+            continue;
+        }
+        let mask_array = arrow_array::BooleanArray::from(mask);
+        let kept = arrow::compute::filter_record_batch(&batch, &mask_array)
+            .map_err(|e| QueryError::Parquet(format!("filter_record_batch: {e}")))?;
+        row_offset += n;
+        filtered.push(kept);
+    }
+    *batches = filtered;
+    Ok(())
 }
 
 /// Eagerly drain a parquet file into `Vec<RecordBatch>`.

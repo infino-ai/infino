@@ -867,6 +867,14 @@ async fn do_tombstone_apply(
         wal_cur.tombstone_progress[idx].outcome = outcome;
         wal_cur.tombstone_progress[idx].tombstoned_in_superfile = in_sf;
 
+        // Invalidate this process's tombstone-cache entry for
+        // the touched superfile so the very next query in this
+        // process sees the bit we just landed, without waiting
+        // for the cache's TTL window to close.
+        if let (Some(sf), Some(cache)) = (in_sf, inner.tombstone_cache.as_ref()) {
+            cache.invalidate(sf);
+        }
+
         // Per-target WAL state CAS. We persist after each
         // target so recovery has a fresh cursor and a crash
         // never wastes more than one target's work.

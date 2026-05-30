@@ -275,3 +275,8 @@ name = "vector"
 path = "benches/vector/main.rs"
 harness = false
 
+[[bench]]
+name = "tombstone-overhead"
+path = "benches/tombstone_overhead/main.rs"
+harness = false
+

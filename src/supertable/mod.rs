@@ -28,6 +28,7 @@ pub mod options;
 pub mod query;
 pub mod reader_cache;
 pub mod stats;
+pub mod tombstones;
 pub mod utils;
 pub mod wal;
 pub mod writer;

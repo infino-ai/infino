@@ -93,6 +93,8 @@ impl SupertableReader {
         let pool = Arc::clone(&manifest.options.reader_pool);
         let column_owned = column.to_owned();
         let query_owned: Vec<f32> = query.to_vec();
+        let tombstone_cache = self.tombstone_cache.clone();
+        let now = std::time::Instant::now();
 
         // M15c: hierarchical pruning. Vector list-prune
         // (`prune_parts_for_vector`) needs an upper-bound
@@ -129,7 +131,9 @@ impl SupertableReader {
                     let hits = r
                         .vector_search(&column_owned, &query_owned, k, options)
                         .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    Ok(tag_hits(entry, hits))
+                    let mut tagged = tag_hits(entry, hits);
+                    apply_tombstone_filter(tombstone_cache.as_ref(), entry, &mut tagged, now)?;
+                    Ok(tagged)
                 })
                 .collect()
         });
@@ -155,6 +159,28 @@ fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> 
             score,
         })
         .collect()
+}
+
+/// Drop tombstoned `local_doc_id`s from one superfile's vector hits.
+/// Same shape + perf properties as the FTS path's filter — see
+/// `query::fts::apply_tombstone_filter` for the design rationale.
+fn apply_tombstone_filter(
+    cache: Option<&Arc<crate::supertable::tombstones::SidecarCache>>,
+    entry: &SuperfileEntry,
+    hits: &mut Vec<SuperfileHit>,
+    now: std::time::Instant,
+) -> Result<(), QueryError> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let bitmap = cache
+        .bitmap_for(entry.superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    hits.retain(|h| !bitmap.contains(h.local_doc_id));
+    Ok(())
 }
 
 /// Concatenate per-segment hits and return the top-k by *ascending*
@@ -496,5 +522,118 @@ mod tests {
             .vector_search("nope", &q, 5, VectorSearchOptions::new())
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+    }
+
+    // ---- Tombstone filter helper: direct-call coverage --------------
+    //
+    // Exercises `apply_tombstone_filter` against a synthesized
+    // bitmap + hit list without going through the full IVF +
+    // lazy-source vector search path. The hook logic is identical
+    // to the FTS path (both drop hits whose `local_doc_id` is in
+    // the per-superfile bitmap); this direct test pins the
+    // contract for the vector side.
+
+    use crate::storage::{LocalFsStorageProvider, StorageProvider};
+    use crate::supertable::SuperfileUri;
+    use crate::supertable::manifest::SuperfileEntry;
+    use crate::supertable::query::SuperfileHit;
+    use crate::supertable::tombstones::SidecarCache;
+    use crate::supertable::tombstones::cache::DEFAULT_REFRESH_TTL;
+    use crate::supertable::wal::WalStore;
+    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
+        SuperfileEntry {
+            superfile_id,
+            uri: SuperfileUri(superfile_id),
+            n_docs: 100,
+            id_min: 0,
+            id_max: 99,
+            scalar_stats: crate::supertable::manifest::ScalarStatsTable::default(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_tombstone_filter_drops_set_bits() {
+        // Build a SidecarCache backed by a real (LocalFs) storage so
+        // the hook exercises the same cache machinery that the
+        // production query path uses.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let ws = WalStore::new(Arc::clone(&storage));
+        let cache = Arc::new(SidecarCache::new(ws.clone(), DEFAULT_REFRESH_TTL));
+
+        let sf_id = Uuid::from_u128(0xFEEDFACE);
+        // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
+        let mut bitmap = roaring::RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(3);
+        bitmap.insert(5);
+        ws.put_tombstones(sf_id, None, &TombstonesSidecar { seal: None, bitmap })
+            .await
+            .expect("put sidecar");
+
+        let entry = synthetic_entry(sf_id);
+        let mut hits: Vec<SuperfileHit> = (0..8u32)
+            .map(|d| SuperfileHit {
+                segment: entry.uri,
+                local_doc_id: d,
+                score: d as f32,
+            })
+            .collect();
+
+        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
+            .expect("filter");
+
+        let remaining: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
+        assert_eq!(remaining, vec![0u32, 2, 4, 6, 7]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_tombstone_filter_is_no_op_without_cache() {
+        let entry = synthetic_entry(Uuid::from_u128(0xABCD));
+        let mut hits: Vec<SuperfileHit> = (0..4u32)
+            .map(|d| SuperfileHit {
+                segment: entry.uri,
+                local_doc_id: d,
+                score: 0.0,
+            })
+            .collect();
+        let original = hits.clone();
+        super::apply_tombstone_filter(None, &entry, &mut hits, std::time::Instant::now())
+            .expect("no-cache");
+        assert_eq!(hits, original);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_tombstone_filter_short_circuits_on_empty_bitmap() {
+        // No sidecar at all → cache populates the "known 404"
+        // sentinel and `bitmap.is_empty()` short-circuits the
+        // filter loop. Hit list is unchanged.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let ws = WalStore::new(Arc::clone(&storage));
+        let cache = Arc::new(SidecarCache::new(ws, DEFAULT_REFRESH_TTL));
+
+        let entry = synthetic_entry(Uuid::from_u128(0x1111));
+        let mut hits: Vec<SuperfileHit> = (0..4u32)
+            .map(|d| SuperfileHit {
+                segment: entry.uri,
+                local_doc_id: d,
+                score: 0.0,
+            })
+            .collect();
+        let original = hits.clone();
+        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
+            .expect("filter");
+        assert_eq!(hits, original);
     }
 }
