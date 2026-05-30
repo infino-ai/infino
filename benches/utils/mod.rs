@@ -16,6 +16,6 @@ pub mod rss;
 
 pub mod fts_superfile;
 pub mod fts_supertable;
-pub mod vector_object_store;
+pub mod unified_object_store;
 pub mod vector_superfile;
 pub mod vector_supertable;

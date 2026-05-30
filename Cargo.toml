@@ -9,6 +9,18 @@ edition = "2024"
 # binaries.
 autobenches = false
 
+# Declare an explicit workspace so the bench-utils crate is a
+# first-class member rather than only a dev-dependency path
+# package. Without this, `infino` (root) dev-depends on
+# `infino-bench-utils`, which depends back on `infino` — a
+# dev-dependency cycle that makes the v2/v3 feature resolver
+# panic ("did not find features for …") on any
+# `cargo … -p infino-bench-utils`. Listing it as a member lets
+# the resolver compute its features as a member, so the crate
+# can be checked/built/tested directly.
+[workspace]
+members = ["benches/utils"]
+
 [lib]
 path = "src/lib.rs"
 
@@ -263,7 +275,7 @@ path = "benches/vector/main.rs"
 harness = false
 
 [[bench]]
-name = "vector-object-store"
-path = "benches/vector/object_store.rs"
+name = "object-store"
+path = "benches/object_store/main.rs"
 harness = false
 

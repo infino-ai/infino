@@ -1,32 +1,38 @@
-//! Plan 013 M5 — cold-open / cold-first-search / warm-search
-//! against an in-process S3 server (`s3s-fs`).
+//! Plan 013 M5 — unified vector + FTS cold-open / cold-first-search
+//! / warm-search against an in-process S3 server (`s3s-fs`).
 //!
 //! Spawns `s3s-fs` on a random port, points an
-//! `S3StorageProvider` at it, uploads a real superfile
-//! (vector subsection only — FTS adds no signal to the
-//! object-store path; vectors are the byte-volume), and
-//! runs three latency rows through `DiskCacheStore` in
-//! `ColdFetchMode::LazyForegroundWithBackgroundFill`:
+//! `S3StorageProvider` at it, uploads a real **unified**
+//! superfile (one Parquet file carrying both a vector
+//! subsection and an FTS subsection — the "consolidated
+//! vector / fts data layer" shape), and runs the cold-open /
+//! cold-first-search / warm-search rows for *both* structures
+//! through the *same* `DiskCacheStore` +
+//! `ColdFetchMode::LazyForegroundWithBackgroundFill` path:
 //!
 //! 1. **Cold open via S3** — `cache.reader(uri)` against an
-//!    empty cache; pays the Plan 013 cold-open budget
-//!    (~2-3 GETs through the M2 path + ≤ 1 FTS GET; FTS is
-//!    absent here, so just the vector + footer path).
-//! 2. **Cold first search after S3 open** — cold open +
-//!    `vector_search` at the default `(nprobe, rerank_mult)`;
+//!    empty cache; pays the Plan 013 cold-open budget (Parquet
+//!    footer + per-subsection open-time-region GETs). One open
+//!    serves both the vector and FTS readers.
+//! 2. **Cold first vector search after S3 open** — cold open +
+//!    `vec.search` at the default `(nprobe, rerank_mult)`;
 //!    pays the M3 cold-search budget (~nprobe + 1 cluster
 //!    GETs).
-//! 3. **Warm subsequent search after S3 open** — after the
+//! 3. **Cold first BM25 search after S3 open** — cold open +
+//!    `bm25_search`; pays the FTS lazy open-time fetch
+//!    (header + doc-lengths) plus per-term dict/postings range
+//!    GETs (`FtsReader::open_lazy` mirroring the vector path).
+//! 4. **Warm subsequent search after S3 open** — after the
 //!    background promotion completes, the cache returns the
-//!    mmap-backed reader and the search resolves entirely
-//!    from mmap (zero S3 GETs).
+//!    mmap-backed reader and both vector + BM25 searches
+//!    resolve entirely from mmap (zero S3 GETs).
 //!
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench vector -- object_store                      # default scale (100k)
-//! INFINO_BENCH_FULL=1 cargo bench --bench vector -- object_store  # 1M scale (README row)
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector -- object_store  # also rewrite README
+//! cargo bench --bench object-store                      # default scale (100k)
+//! INFINO_BENCH_FULL=1 cargo bench --bench object-store  # 1M scale (README row)
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench object-store  # also rewrite README
 //! ```
 //!
 //! Default scale is 100k × 384 (fast iteration, ~150 MiB
@@ -39,7 +45,7 @@
 //! additionally rewrites the matching section in
 //! `benches/vector/README.md`.
 //!
-//! ## Why s3s-fs (not LocalFs, not real S3)
+//! ## Why s3s-fs (plus adjusted reporting, not LocalFs-only)
 //!
 //! - `LocalFsStorageProvider`'s `get_range` is a `pread64`;
 //!   the request never crosses an HTTP boundary, so the
@@ -49,10 +55,12 @@
 //! - Real AWS S3 has region-dependent + time-dependent p50
 //!   tails that distort a regression bench.
 //! - `s3s-fs` gives us the full S3 wire path (path-style URL
-//!   + SigV4 + HTTP/1.1 range headers) at ~constant latency
-//!   (~150 μs per range on loopback), so changes in our
-//!   range-fetch shape map cleanly to changes in the bench
-//!   numbers.
+//!   + SigV4 + HTTP/1.1 range headers), so it is useful for
+//!   validating request shape: GET count, byte ranges, and
+//!   overlap. Its loopback latency is not treated as S3 latency;
+//!   the diagnostic prints an adjusted model line that replaces
+//!   the observed s3s-fs blocking span with a configurable S3
+//!   TTFB + throughput model.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -61,19 +69,20 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use arrow_array::{Decimal128Array, RecordBatch};
+use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group};
-use infino::superfile::format::footer::write_parquet_with_blobs;
-use infino::superfile::format::{self, kv};
+use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
+use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::vector::distance::Metric;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::SuperfileUri;
 use infino::supertable::reader_cache::{
     ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
 };
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
-use parquet::basic::Compression;
+use infino::test_helpers::default_tokenizer;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
@@ -107,6 +116,23 @@ const DEFAULT_NPROBE: usize = 8;
 const DEFAULT_RERANK_MULT: usize = 20;
 const TOP_K: usize = 10;
 
+/// Primary-key column. `SuperfileBuilder` requires the id column
+/// to be `Decimal128(38, 0)` (the supertable's snowflake id type).
+const ID_COLUMN: &str = "doc_id";
+/// Vector column logical name (lives only in the embedded vector
+/// blob, not the Parquet schema).
+const VEC_COLUMN: &str = "v";
+/// FTS column registered on the unified fixture. Single `title`
+/// column — same shape `benches/utils/fts_superfile.rs` builds.
+/// It stays in the Parquet body (SQL-visible) *and* is indexed
+/// into the FTS blob, which is the whole point of the unified
+/// layout.
+const FTS_COLUMN: &str = "title";
+/// Zipfian-common term (`MmapTextCorpus` plants `term00001` as
+/// the highest-frequency term), so the cold BM25 row exercises a
+/// real multi-block postings fetch rather than a df=1 sliver.
+const FTS_QUERY_TERM: &str = "term00001";
+
 // ─── Fixtures (built once per `cargo bench` invocation) ──────────────
 
 static SUPERFILE_BYTES: OnceLock<Bytes> = OnceLock::new();
@@ -129,82 +155,143 @@ fn query_vector() -> &'static [f32] {
         .as_slice()
 }
 
-/// Build a real superfile carrying the cached vector subsection,
-/// the minimum-required `inf.*` KVs, and a trivial `doc_id`-only
-/// Arrow body. Costs the same one-time IVF + RaBitQ build as
-/// `superfile.rs`'s `INFINO_BLOB`; cached in `SUPERFILE_BYTES`
-/// for the bench's lifetime.
+/// Build a real **unified** superfile (one vector column + one FTS
+/// column over the same docs) by driving the production
+/// [`SuperfileBuilder`] — the exact path the supertable writer takes
+/// at commit. The bench owns **no** format logic: it only feeds Arrow
+/// batches + vector slices and lets the builder produce the FTS index,
+/// the IVF/RaBitQ vector blob, the Parquet body, the blob splice, and
+/// the `inf.*` KV metadata. Cached in `SUPERFILE_BYTES` for the
+/// bench's lifetime so every row shares one fixture.
 fn build_superfile_bytes() -> Bytes {
     let n = n_docs();
     let n_cent = crate::corpus::n_cent(n);
+    let dim = crate::corpus::DIM;
+
     let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, 1, true);
     let vectors = vectors_mmap.as_slice();
+    let text = crate::corpus::MmapTextCorpus::generate(n, 1);
 
-    // 1. Build the vector subsection (this is the slow step
-    //    — IVF training + RaBitQ + Sq8 quant rerank).
+    // Schema = id (Decimal128, as the supertable injects) + the FTS
+    // text column. The vector column is a logical name only; its f32
+    // buffer is passed alongside each batch, not as a schema field.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
+        Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        ID_COLUMN,
+        vec![FtsConfig {
+            column: FTS_COLUMN.into(),
+        }],
+        vec![VectorConfig {
+            column: VEC_COLUMN.into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8,
+        }],
+        Some(default_tokenizer()),
+    );
+    let mut builder = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
     eprintln!(
-        "[object_store_bench] building {n}-doc vector subsection (n_cent={n_cent}); \
-         this is the same cost as `superfile.rs`'s INFINO_BLOB build."
+        "[object_store_bench] building {n}-doc unified superfile \
+         (vector n_cent={n_cent} + FTS `{FTS_COLUMN}`) via SuperfileBuilder"
     );
     let t0 = Instant::now();
-    let vec_blob: Vec<u8> = crate::corpus::build_vector_index(vectors, n, n_cent, Metric::Cosine)
-        .finish()
-        .expect("finish vector builder");
-    let vec_build = t0.elapsed();
 
-    // 2. Build a trivial Arrow body (just `doc_id`) — the
-    //    embedded vector blob carries everything the vector
-    //    reader needs; the Parquet body exists for the
-    //    superfile format invariant + SQL passthroughs
-    //    (which the lazy path doesn't take anyway).
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "doc_id",
-        DataType::Decimal128(38, 0),
-        false,
-    )]));
-    let ids: Decimal128Array = (0u64..n as u64)
-        .map(|i| Some(i as i128))
-        .collect::<Decimal128Array>()
-        .with_precision_and_scale(38, 0)
-        .expect("decimal128 with_precision_and_scale");
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).expect("build RecordBatch");
+    // Feed the corpus in row-group-sized chunks so neither a 1M-row
+    // Arrow batch nor a whole-corpus `Vec<String>` is ever resident —
+    // the mmap corpora stay the only large allocation.
+    const CHUNK: usize = 65_536;
+    let mut start = 0;
+    while start < n {
+        let len = CHUNK.min(n - start);
+        let ids: Decimal128Array = (start as u64..(start + len) as u64)
+            .map(|i| Some(i as i128))
+            .collect::<Decimal128Array>()
+            .with_precision_and_scale(38, 0)
+            .expect("decimal128 with_precision_and_scale");
+        let titles =
+            LargeStringArray::from((start..start + len).map(|i| text.doc(i)).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
+            .expect("build RecordBatch");
+        builder
+            .add_batch(&batch, &[&vectors[start * dim..(start + len) * dim]])
+            .expect("add_batch");
+        start += len;
+    }
 
-    // 3. Assemble the `inf.*` KV map matching what
-    //    `SuperfileBuilder` would emit — required to satisfy
-    //    `SuperfileReader::open_with`'s validation.
-    let dim = crate::corpus::DIM;
-    let vec_columns_json = format!(
-        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
-    );
-    let kvs: Vec<(String, String)> = vec![
-        (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
-        (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
-        (kv::ID_COLUMN.into(), "doc_id".into()),
-        (kv::N_DOCS.into(), n.to_string()),
-        (kv::BUILDER.into(), infino::BUILDER_ID.to_string()),
-        (kv::VEC_COLUMNS.into(), vec_columns_json),
-    ];
-
-    let parts = write_parquet_with_blobs(
-        &schema,
-        &[batch],
-        &[],
-        &vec_blob,
-        &kvs,
-        Compression::SNAPPY,
-        1024,
-    )
-    .expect("write_parquet_with_blobs");
-
-    let bytes_len = parts.bytes.len();
+    let bytes = builder.finish().expect("finish SuperfileBuilder");
     eprintln!(
-        "[object_store_bench] superfile built: {} MiB (vec build {:.1}s + Parquet wrap {:.1}ms)",
-        bytes_len / (1024 * 1024),
-        vec_build.as_secs_f32(),
-        t0.elapsed().as_secs_f32() * 1e3 - vec_build.as_secs_f32() * 1e3,
+        "[object_store_bench] unified superfile built: {} MiB in {:.1}s",
+        bytes.len() / (1024 * 1024),
+        t0.elapsed().as_secs_f32(),
     );
-    Bytes::from(parts.bytes)
+    Bytes::from(bytes)
+}
+
+// ─── S3 latency model (Plan 013 #1: adjusted diagnostic) ────────────
+//
+// `s3s-fs` over loopback faithfully reproduces the S3 *request
+// count* and *byte volume* (the things Plan 013's GET-minimization
+// optimizes), but not S3's *wall-clock* — its per-request RTT in
+// this sandbox is dominated by a fixed ~650 ms artifact that has
+// nothing to do with real S3. To get a meaningful cold-open /
+// cold-search wall-clock signal while iterating (before the gated
+// real-S3 suite in PR9 gives the ground truth), the diagnostic
+// reports a synthetic AWS-S3-in-region timing model on top of the
+// real request shape:
+//
+//   wall(req) = TTFB + bytes / throughput
+//
+// TTFB models the round-trip + first-byte latency S3 charges per
+// request regardless of size; the throughput term models single-
+// stream transfer bandwidth. The diagnostic does not sleep in
+// the measured path. It records actual s3s-fs request intervals,
+// subtracts their observed blocking span from wall-clock, and adds
+// back this model grouped by the same observed parallel batches.
+//
+// These knobs affect only the diagnostic's adjusted/modelled line;
+// they never alter the code under measurement.
+//
+//   INFINO_S3_MODEL_TTFB_MS=<f64>  per-request first-byte latency
+//                                  (default 100 ms)
+//   INFINO_S3_MODEL_MBPS=<f64>     single-stream throughput in MB/s
+//                                  (default 100 MB/s — single-object
+//                                  cold-read floor; aggregate multi-
+//                                  key throughput is far higher but
+//                                  irrelevant to one cold object)
+#[derive(Debug, Clone, Copy)]
+struct S3LatencyModel {
+    ttfb: Duration,
+    bytes_per_sec: f64,
+}
+
+impl S3LatencyModel {
+    /// Read the model used for adjusted diagnostic reporting.
+    /// This never changes the measured code path.
+    fn from_env_or_default() -> Self {
+        let ttfb_ms = std::env::var("INFINO_S3_MODEL_TTFB_MS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(100.0);
+        let mbps = std::env::var("INFINO_S3_MODEL_MBPS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(100.0);
+        Self {
+            ttfb: Duration::from_secs_f64(ttfb_ms / 1000.0),
+            bytes_per_sec: mbps * 1_000_000.0,
+        }
+    }
+
+    fn delay_for(&self, bytes: u64) -> Duration {
+        self.ttfb + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec)
+    }
 }
 
 // ─── s3s-fs harness ──────────────────────────────────────────────────
@@ -266,6 +353,8 @@ async fn setup_s3_fixture(
     );
     let uri = SuperfileUri::new_v4();
     let path = format!("data/seg-{}.sf", uri.0);
+    // Upload against the raw provider — fixture-setup latency is
+    // not part of the measured cold path.
     storage
         .put_atomic(&path, superfile.clone())
         .await
@@ -426,7 +515,41 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    // ── Row 3: warm subsequent search (post-promotion). ─────────────
+    // ── Row 3: cold lazy open + first BM25 search. ──────────────────
+    // Same fresh-cache cold cycle as Row 2, but drives the FTS
+    // subsection through `FtsReader::open_lazy`: open-time fetch
+    // (header + doc-lengths) followed by per-term dict + postings
+    // range GETs. Measures the FTS half of the unified cold path
+    // against the same S3 wire.
+    {
+        let mut g = c.benchmark_group("object_store_cold_first_bm25");
+        g.sample_size(10);
+        g.measurement_time(Duration::from_secs(30));
+
+        let storage_for_bench = Arc::clone(&storage);
+        g.bench_function(format!("n={n}_s3s_fs_top{TOP_K}"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
+                    let t0 = Instant::now();
+                    let _hits = rt.block_on(async {
+                        let reader = cache.reader(&uri).await.expect("cold reader");
+                        reader
+                            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                            .expect("cold bm25_search")
+                    });
+                    total += t0.elapsed();
+                    drop(cache);
+                    drop(cache_dir);
+                }
+                total
+            });
+        });
+        g.finish();
+    }
+
+    // ── Row 4: warm subsequent search (post-promotion). ─────────────
     // Pre-warm the cache once via a cold cycle + wait for
     // the background promotion. Subsequent iterations hit
     // the mmap-backed reader; zero S3 GETs per iteration.
@@ -463,6 +586,28 @@ fn bench(c: &mut Criterion) {
             });
         });
         g.finish();
+
+        // Warm BM25 on the *same* promoted cache — the unified
+        // segment is fully mmap'd, so the FTS subsection resolves
+        // from mmap too (zero S3 GETs), no second promotion wait.
+        let mut g = c.benchmark_group("object_store_warm_bm25");
+        g.sample_size(50);
+        g.measurement_time(Duration::from_secs(10));
+
+        let cache_ref = Arc::clone(&warm_cache);
+        g.bench_function(format!("n={n}_mmap_post_promotion_top{TOP_K}"), |b| {
+            b.iter(|| {
+                let reader = rt
+                    .block_on(async { cache_ref.reader(&uri).await })
+                    .expect("warm reader");
+                let hits = reader
+                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .expect("warm bm25_search");
+                std::hint::black_box(hits)
+            });
+        });
+        g.finish();
+
         drop(warm_cache);
         drop(warm_dir);
     }
@@ -473,9 +618,9 @@ fn bench(c: &mut Criterion) {
 // ─── Markdown summary emitter ────────────────────────────────────────
 
 /// Pull criterion's measured `mean.point_estimate` (ns) for
-/// each of the three rows out of
+/// each of the cold/warm rows out of
 /// `target/criterion/<group>/<bench>/new/estimates.json`,
-/// format a single 3-row markdown table, and `markdown::emit()`
+/// format a single markdown table, and `markdown::emit()`
 /// it (stderr unconditionally + README rewrite when
 /// `INFINO_BENCH_UPDATE_README=1` is set). The anchor
 /// `bench/vector/object_store/cold_warm` matches the
@@ -495,38 +640,57 @@ fn emit_object_store_markdown() {
         "object_store_cold_first_search",
         &format!("n={n}_s3s_fs_top{TOP_K}"),
     );
+    let cold_bm25_ns = read_mean_ns(
+        "object_store_cold_first_bm25",
+        &format!("n={n}_s3s_fs_top{TOP_K}"),
+    );
     let warm_search_ns = read_mean_ns(
         "object_store_warm_search",
+        &format!("n={n}_mmap_post_promotion_top{TOP_K}"),
+    );
+    let warm_bm25_ns = read_mean_ns(
+        "object_store_warm_bm25",
         &format!("n={n}_mmap_post_promotion_top{TOP_K}"),
     );
 
     let mut body = String::new();
     body.push_str(&format!(
-        "### Superfile vector — object-store cold/warm via s3s-fs \
-         ({n} docs × dim={dim}, ~{superfile_mib:.0} MiB superfile, Sq8 rerank)\n\n",
+        "### Superfile vector + FTS — object-store cold/warm via s3s-fs \
+         ({n} docs × dim={dim}, ~{superfile_mib:.0} MiB unified superfile, Sq8 rerank + \
+         `title` FTS)\n\n",
     ));
     body.push_str(
-        "In-process `s3s-fs` standing in for AWS S3 (full SigV4 + HTTP/1.1 \
-         path-style range GETs over loopback; constant ~150 µs per range, \
-         no region-dependent tail noise). `DiskCacheStore` in \
+        "One unified superfile (vector subsection + FTS subsection in a single \
+         Parquet file) served through one `DiskCacheStore`. In-process `s3s-fs` \
+         exercises the full SigV4 + HTTP/1.1 path-style range-GET path for \
+         request shape; the diagnostic separately reports an adjusted S3 model \
+         wall-clock because loopback latency is environment-dependent. \
          `ColdFetchMode::LazyForegroundWithBackgroundFill`: cold foreground \
-         returns immediately via `SuperfileReader::open_lazy`, background \
-         downloads the full segment to NVMe + mmaps it, warm calls \
+         returns immediately via `SuperfileReader::open_lazy` (both readers), \
+         background downloads the full segment to NVMe + mmaps it, warm calls \
          resolve from mmap (0 S3 GETs).\n\n",
     );
     body.push_str("| Phase | p50 |\n");
     body.push_str("|-------|-----|\n");
     body.push_str(&format!(
-        "| Cold open via s3s-fs (Plan 013 M2: footer + vector open-time region) | {} |\n",
+        "| Cold open via s3s-fs (Plan 013 M2: footer + per-subsection open-time region) | {} |\n",
         cold_open_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
-        "| Cold first search after S3 open (Plan 013 M3: nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE}) | {} |\n",
+        "| Cold first vector search after S3 open (Plan 013 M3: nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE}) | {} |\n",
         cold_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
-        "| Warm subsequent search after S3 open (Plan 013 M4: mmap, 0 S3 GETs) | {} |\n",
+        "| Cold first BM25 search after S3 open (`FtsReader::open_lazy`: header + doc-lengths + dict/postings GETs) | {} |\n",
+        cold_bm25_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
+    ));
+    body.push_str(&format!(
+        "| Warm subsequent vector search after S3 open (Plan 013 M4: mmap, 0 S3 GETs) | {} |\n",
         warm_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
+    ));
+    body.push_str(&format!(
+        "| Warm subsequent BM25 search after S3 open (mmap, 0 S3 GETs) | {} |\n",
+        warm_bm25_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
 
     crate::markdown::emit(&MarkdownSection {
@@ -549,7 +713,7 @@ criterion_group!(benches, bench);
 // Invocation:
 //
 //   INFINO_DIAG_COLD_PATH=1 cargo bench --no-default-features \
-//     --bench vector -- object_store --warm-up-time 1
+//     --bench object-store --warm-up-time 1
 //
 // to localize where cold-path time is going (raw s3s-fs RTT vs.
 // our cold-fetch path's range count). When the env var is set,
@@ -573,17 +737,19 @@ mod diag {
     #[derive(Debug)]
     struct CountingStorage {
         inner: Arc<dyn StorageProvider>,
+        origin: Instant,
         head_count: AtomicU64,
         head_total_us: AtomicU64,
         range_count: AtomicU64,
         range_total_us: AtomicU64,
-        range_log: Mutex<Vec<(u64, u128)>>,
+        range_log: Mutex<Vec<RequestEvent>>,
     }
 
     impl CountingStorage {
         fn new(inner: Arc<dyn StorageProvider>) -> Self {
             Self {
                 inner,
+                origin: Instant::now(),
                 head_count: AtomicU64::new(0),
                 head_total_us: AtomicU64::new(0),
                 range_count: AtomicU64::new(0),
@@ -611,13 +777,20 @@ mod diag {
         }
     }
 
+    #[derive(Debug, Default, Clone)]
+    struct RequestEvent {
+        len: u64,
+        start_us: u128,
+        end_us: u128,
+    }
+
     #[derive(Default, Clone)]
     struct CountingSnapshot {
         head_count: u64,
         head_total_us: u64,
         range_count: u64,
         range_total_us: u64,
-        range_log: Vec<(u64, u128)>,
+        range_log: Vec<RequestEvent>,
     }
 
     impl CountingSnapshot {
@@ -655,12 +828,18 @@ mod diag {
         ) -> Result<Bytes, StorageError> {
             let len = range.end - range.start;
             let t0 = Instant::now();
+            let start_us = self.origin.elapsed().as_micros();
             let r = self.inner.get_range(uri, range).await;
+            let end_us = self.origin.elapsed().as_micros();
             let us = t0.elapsed().as_micros();
             self.range_count.fetch_add(1, Ordering::Relaxed);
             self.range_total_us
                 .fetch_add(us as u64, Ordering::Relaxed);
-            self.range_log.lock().unwrap().push((len, us));
+            self.range_log.lock().unwrap().push(RequestEvent {
+                len,
+                start_us,
+                end_us,
+            });
             r
         }
 
@@ -677,7 +856,9 @@ mod diag {
             len: u64,
         ) -> Result<(Bytes, u64), StorageError> {
             let t0 = Instant::now();
+            let start_us = self.origin.elapsed().as_micros();
             let r = self.inner.tail(uri, len).await;
+            let end_us = self.origin.elapsed().as_micros();
             let us = t0.elapsed().as_micros();
             // Count as a single get_range against the wire (which
             // it literally is — one suffix-range GET).
@@ -695,7 +876,11 @@ mod diag {
             self.range_log
                 .lock()
                 .unwrap()
-                .push((logged_len, us));
+                .push(RequestEvent {
+                    len: logged_len,
+                    start_us,
+                    end_us,
+                });
             r
         }
 
@@ -724,6 +909,49 @@ mod diag {
         }
     }
 
+    fn duration_from_us(us: u128) -> Duration {
+        Duration::from_micros(us.min(u64::MAX as u128) as u64)
+    }
+
+    fn request_blocking_spans(
+        events: &[RequestEvent],
+        model: S3LatencyModel,
+    ) -> (Duration, Duration, usize) {
+        if events.is_empty() {
+            return (Duration::ZERO, Duration::ZERO, 0);
+        }
+
+        let mut sorted = events.to_vec();
+        sorted.sort_unstable_by_key(|e| (e.start_us, e.end_us));
+
+        let mut batches = 0usize;
+        let mut raw_blocking = Duration::ZERO;
+        let mut model_blocking = Duration::ZERO;
+
+        let mut batch_start = sorted[0].start_us;
+        let mut batch_end = sorted[0].end_us;
+        let mut batch_model = model.delay_for(sorted[0].len);
+        batches += 1;
+
+        for event in sorted.iter().skip(1) {
+            if event.start_us <= batch_end {
+                batch_end = batch_end.max(event.end_us);
+                batch_model = batch_model.max(model.delay_for(event.len));
+            } else {
+                raw_blocking += duration_from_us(batch_end.saturating_sub(batch_start));
+                model_blocking += batch_model;
+                batch_start = event.start_us;
+                batch_end = event.end_us;
+                batch_model = model.delay_for(event.len);
+                batches += 1;
+            }
+        }
+
+        raw_blocking += duration_from_us(batch_end.saturating_sub(batch_start));
+        model_blocking += batch_model;
+        (raw_blocking, model_blocking, batches)
+    }
+
     fn report(name: &str, snap: &CountingSnapshot, wall: Duration) {
         let head_avg_us = if snap.head_count == 0 {
             0
@@ -735,10 +963,22 @@ mod diag {
         } else {
             snap.range_total_us / snap.range_count
         };
+        let model = S3LatencyModel::from_env_or_default();
+        let (raw_blocking, model_blocking, batches) =
+            request_blocking_spans(&snap.range_log, model);
+        let adjusted_wall = wall.checked_sub(raw_blocking).unwrap_or(Duration::ZERO) + model_blocking;
         eprintln!(
-            "[diag] {name}: wall={:>7.1} ms | HEAD {:>3} calls ({:>5} μs avg) | \
-             GET_RANGE {:>3} calls ({:>5} μs avg, total {:>7.1} ms)",
+            "[diag] {name}: wall={:>7.1} ms | adjusted_s3_model={:>7.1} ms \
+             (ttfb={:>5.1} ms, {:>5.0} MB/s, batches={:>2}, raw_s3s_block={:>7.1} ms, \
+             model_block={:>7.1} ms) | HEAD {:>3} calls ({:>5} us avg) | \
+             GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms)",
             wall.as_secs_f64() * 1e3,
+            adjusted_wall.as_secs_f64() * 1e3,
+            model.ttfb.as_secs_f64() * 1e3,
+            model.bytes_per_sec / 1_000_000.0,
+            batches,
+            raw_blocking.as_secs_f64() * 1e3,
+            model_blocking.as_secs_f64() * 1e3,
             snap.head_count,
             head_avg_us,
             snap.range_count,
@@ -747,12 +987,18 @@ mod diag {
         );
         // Range breakdown — log each (len, latency) so we can
         // see e.g. "2 MiB GET took 800ms while 32 B GET took 5ms".
-        for (i, (len, us)) in snap.range_log.iter().enumerate() {
+        for (i, event) in snap.range_log.iter().enumerate() {
+            let us = event.end_us.saturating_sub(event.start_us);
+            let model_us = model.delay_for(event.len).as_micros();
             eprintln!(
-                "[diag] {name}:   range[{i:>2}] len={:>10} B  ({:>5.1} KiB)  lat={:>6} μs",
-                len,
-                (*len as f64) / 1024.0,
+                "[diag] {name}:   range[{i:>2}] len={:>10} B  ({:>5.1} KiB)  \
+                 raw_lat={:>7} us  model_lat={:>7} us  start={:>10} us  end={:>10} us",
+                event.len,
+                (event.len as f64) / 1024.0,
                 us,
+                model_us,
+                event.start_us,
+                event.end_us,
             );
         }
     }

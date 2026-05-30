@@ -93,16 +93,17 @@ impl SuperfileReader {
     /// 1. **1-2 GETs** for the Parquet footer (`inf.*` KV
     ///    metadata + Arrow schema), via
     ///    `format::footer::read_parquet_metadata_lazy`.
-    /// 2. **2-3 GETs** for the embedded vector subsection, via
-    ///    `VectorReader::open_lazy` (M2 budget: outer header
-    ///    + directory + speculative open-time tail).
-    /// 3. **1 GET** for the embedded FTS subsection (until
-    ///    `FtsReader::open_lazy` exists; FTS today is small
-    ///    relative to vectors so a single bounded range is fine).
+    /// 2. **3-4 GETs** for the embedded vector subsection, via
+    ///    `VectorReader::open_lazy` (outer header, directory + CRC,
+    ///    subsection headers, and Sq8 codec_meta when present).
+    /// 3. **3 GETs** for the embedded FTS subsection, via
+    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
+    ///    tail; postings stay lazy until search).
     ///
-    /// Total open budget: ≤ 6 GETs / ~2-3 MiB on a typical
-    /// 1.5 GiB segment. Subsequent vector queries fetch
-    /// per-cluster blocks on demand via the source.
+    /// Total open budget is small exact metadata ranges rather than
+    /// whole-subsection/speculative slabs. Subsequent vector queries
+    /// fetch centroids, cluster indexes, and per-cluster blocks on
+    /// demand via the source.
     ///
     /// The returned reader does **not** hold the full segment;
     /// `parquet_bytes()` returns `None`. Callers that need the
@@ -121,7 +122,7 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
         source: Arc<dyn crate::superfile::LazyByteSource>,
-        opts: OpenOptions,
+        _opts: OpenOptions,
     ) -> Result<Self, ReadError> {
         use parquet::arrow::parquet_to_arrow_schema;
 
@@ -230,23 +231,15 @@ impl SuperfileReader {
             let off = parse_u64(&kv_map, kv::FTS_OFFSET)?;
             let len = parse_u64(&kv_map, kv::FTS_LENGTH)?;
             let cols_json = kv_map.get(kv::FTS_COLUMNS).expect("checked");
-            let blob = source.range(off, len).await.map_err(|e| match e {
-                crate::superfile::LazyByteSourceError::Storage(se) => {
-                    ReadError::MalformedKv(format!("lazy source storage (FTS): {se}"))
-                }
-                crate::superfile::LazyByteSourceError::OutOfBounds { start, len, size } => {
-                    ReadError::MalformedKv(format!(
-                        "FTS subsection out-of-bounds: start={start} len={len} size={size}"
-                    ))
-                }
-            })?;
-            let reader = FtsReader::open_with(
-                blob,
+            let sub: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(
+                crate::superfile::LazySubSource::new(Arc::clone(&source), off, len),
+            );
+            let reader = FtsReader::open_lazy(
+                sub,
                 cols_json,
-                crate::superfile::fts::reader::OpenOptions {
-                    verify_crc: opts.verify_crc,
-                },
-            )?;
+                crate::superfile::fts::reader::OpenOptions::for_object_store(),
+            )
+            .await?;
             Ok(Some(reader))
         };
 

@@ -28,4 +28,4 @@ s3s = "0.13"
 s3s-fs = "0.13"
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }

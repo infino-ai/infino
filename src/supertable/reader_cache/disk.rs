@@ -907,13 +907,12 @@ impl DiskCacheStore {
         }
     }
 
-    /// Plan 013 M6 — single-RTT cold open. Issues the parquet
-    /// footer tail, vector subsection combined head, and FTS
-    /// subsection GETs **in parallel** against the storage
-    /// provider, then installs every fetched byte range into a
-    /// [`crate::superfile::PrefetchedSource`] overlay so every
-    /// subsequent read inside `SuperfileReader::open_lazy_with`
-    /// resolves zero-copy from the overlay with no extra GETs.
+    /// Plan 013 M6 — hinted cold open. Issues the parquet footer
+    /// tail plus each present subsection's fixed header in parallel,
+    /// then installs those bytes in a [`crate::superfile::PrefetchedSource`]
+    /// overlay. The inner vector / FTS lazy readers use those headers to
+    /// fetch only their exact open metadata ranges; no 6 MiB vector
+    /// speculation and no whole-FTS-subsection prefetch.
     ///
     /// `offsets.total_size` lets us skip the suffix-range
     /// HEAD-discovery dance entirely — the
@@ -921,12 +920,10 @@ impl DiskCacheStore {
     /// starts with a known size, and the parquet tail GET fires
     /// as a plain `get_range` instead of a suffix range.
     ///
-    /// Bandwidth shape on a typical 1.5 GiB segment:
+    /// Initial hinted bandwidth shape:
     ///   - parquet tail: 64 KiB
-    ///   - vec subsection head: ≤ 6 MiB (matches
-    ///     `DEFAULT_OPEN_TIME_SPECULATIVE_BYTES`)
-    ///   - fts subsection: full length (today FTS subsections
-    ///     are small; M7 may add an FTS combined head)
+    ///   - vec fixed header: 32 B
+    ///   - FTS fixed header: 48 B
     async fn cold_fetch_lazy_with_hints(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -944,16 +941,14 @@ impl DiskCacheStore {
         let parquet_tail_len = parquet_tail_spec.min(total_size);
         let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
 
-        // Match `VectorReader::open_lazy`'s combined-head spec
-        // length so the overlay covers the vec subsection's
-        // outer header + directory + open-time region.
-        let vec_head_target: u64 = 6 * 1024 * 1024;
+        // Seed the inner lazy readers with just the fixed headers.
+        // They parse those headers and fetch exact metadata ranges.
+        let vec_head_target: u64 = 32;
+        let fts_head_target: u64 = 48;
 
-        // Fire all three GETs concurrently. The futures are
-        // independent of one another (parquet tail, vec head,
-        // fts) — `try_join!` schedules them on the runtime
-        // simultaneously so the wall clock is the **max** of the
-        // three latencies, not the sum.
+        // Fire the footer tail and fixed subsection headers concurrently.
+        // Larger vector / FTS metadata ranges are discovered and fetched
+        // by the inner readers after this seeded open.
         let storage = Arc::clone(&self.storage);
         let storage_uri_a = storage_uri.clone();
         let storage_uri_b = storage_uri.clone();
@@ -986,8 +981,9 @@ impl DiskCacheStore {
         let fts_fut = async move {
             match fts_hint {
                 Some((off, len)) if len > 0 => {
+                    let take = fts_head_target.min(len);
                     let bytes = storage_for_fts
-                        .get_range(&storage_uri_c, off..off + len)
+                        .get_range(&storage_uri_c, off..off + take)
                         .await?;
                     Ok::<_, StorageError>(Some((off, bytes)))
                 }

@@ -38,6 +38,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Source of byte ranges from an arbitrary backing.
@@ -134,6 +135,201 @@ pub enum LazyByteSourceError {
     /// Caller requested a range outside `size()`.
     #[error("range out of bounds: start={start} len={len} size={size}")]
     OutOfBounds { start: u64, len: u64, size: u64 },
+}
+
+/// Backing for source-aware superfile sub-readers.
+///
+/// `InMemory` is the eager path: callers already hold the complete
+/// subsection and every access is a zero-copy [`Bytes::slice`].
+/// `Lazy` is a range-fetching source: mmap, object storage, or a
+/// foreground cold-fetch subscriber.
+#[derive(Clone)]
+pub enum Source {
+    InMemory(Bytes),
+    Lazy(Arc<dyn LazyByteSource>),
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
+            Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Source {
+    /// Total backing size in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InMemory(b) => b.len(),
+            Self::Lazy(s) => s.size() as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Best-effort sync fetch. Always succeeds for in-bounds
+    /// `InMemory` ranges; `Lazy` sources may return `Some` for
+    /// already-resident ranges.
+    pub fn try_get_range_sync(&self, range: Range<usize>) -> Option<Bytes> {
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        match self {
+            Self::InMemory(b) => {
+                if range.end > b.len() {
+                    return None;
+                }
+                Some(b.slice(range))
+            }
+            Self::Lazy(s) => s.try_get_range_sync(start, len),
+        }
+    }
+
+    /// Sync range fetch with an internal async bridge for cold lazy
+    /// misses. Hot in-memory and mmap-backed paths resolve through
+    /// [`Self::try_get_range_sync`] and do not enter a runtime.
+    pub fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
+            return Ok(bytes);
+        }
+        let Self::Lazy(s) = self else {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: range.start as u64,
+                len: range.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if matches!(
+                    handle.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                tokio::task::block_in_place(|| handle.block_on(s.range(start, len)))
+            }
+            _ => {
+                let src = Arc::clone(s);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
+                                uri: "lazy-source://superfile-reader".to_string(),
+                                source: Box::new(std::io::Error::other(format!(
+                                    "tokio runtime build for lazy source fetch: {e}"
+                                ))),
+                            })
+                        })?;
+                    rt.block_on(src.range(start, len))
+                })
+                .join()
+                .map_err(|_| {
+                    LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
+                        uri: "lazy-source://superfile-reader".to_string(),
+                        source: Box::new(std::io::Error::other(
+                            "lazy source fetch thread panicked",
+                        )),
+                    })
+                })?
+            }
+        }
+    }
+
+    /// Concurrent multi-range fetch. Sync-resident ranges are served
+    /// immediately; cold lazy misses are dispatched under one async
+    /// bridge and returned in input order.
+    pub fn get_ranges_parallel(
+        &self,
+        ranges: &[Range<usize>],
+    ) -> Result<Vec<Bytes>, LazyByteSourceError> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut pending: Vec<(usize, u64, u64)> = Vec::new();
+        for (i, r) in ranges.iter().enumerate() {
+            if let Some(b) = self.try_get_range_sync(r.clone()) {
+                out.push(Some(b));
+                continue;
+            }
+            if !matches!(self, Self::Lazy(_)) {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start: r.start as u64,
+                    len: r.len() as u64,
+                    size: self.len() as u64,
+                });
+            }
+            pending.push((i, r.start as u64, r.len() as u64));
+            out.push(None);
+        }
+
+        if !pending.is_empty() {
+            let Self::Lazy(s) = self else {
+                unreachable!("pending non-empty implies Source::Lazy");
+            };
+            let src = Arc::clone(s);
+            let order: Vec<usize> = pending.iter().map(|(i, _, _)| *i).collect();
+            let fut = async move {
+                let futs = pending
+                    .into_iter()
+                    .map(|(_i, start, len)| {
+                        let s = Arc::clone(&src);
+                        async move { s.range(start, len).await }
+                    })
+                    .collect::<Vec<_>>();
+                futures::future::try_join_all(futs).await
+            };
+            let bytes: Vec<Bytes> = match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if matches!(
+                        handle.runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    ) =>
+                {
+                    tokio::task::block_in_place(|| handle.block_on(fut))?
+                }
+                _ => std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
+                                uri: "lazy-source://superfile-reader-parallel".to_string(),
+                                source: Box::new(std::io::Error::other(format!(
+                                    "tokio runtime build for parallel lazy fetch: {e}"
+                                ))),
+                            })
+                        })?;
+                    rt.block_on(fut)
+                })
+                .join()
+                .map_err(|_| {
+                    LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
+                        uri: "lazy-source://superfile-reader-parallel".to_string(),
+                        source: Box::new(std::io::Error::other(
+                            "parallel lazy source fetch thread panicked",
+                        )),
+                    })
+                })??,
+            };
+            for (slot, b) in order.into_iter().zip(bytes) {
+                out[slot] = Some(b);
+            }
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|b| b.expect("every slot filled by sync or async path"))
+            .collect())
+    }
 }
 
 /// In-memory `LazyByteSource` adapter — useful for tests and

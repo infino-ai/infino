@@ -338,7 +338,17 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
         .expect("open_lazy");
 
     let n_get = counting.n_async.load(Ordering::Acquire);
-    let documented_max = 6usize; // 2 (footer) + 3 (vector M2 max) + 1 (FTS)
+    // Exact lazy open:
+    //   1 footer tail
+    //   3 vector metadata ranges (outer header, directory+crc, subheader;
+    //     +1 more for Sq8 codec_meta on Sq8 segments)
+    //   3 FTS metadata ranges (header, FST directory, doc-length tail)
+    //
+    // This tiny fixture uses a non-Sq8 vector segment, so the expected
+    // combined budget is 7. The production latency target is governed by
+    // serial batches and bytes; this assertion pins that open does not
+    // drift back to whole-subsection/speculative reads.
+    let documented_max = 7usize;
     assert!(
         n_get <= documented_max,
         "cold-open issued {n_get} GETs against a {total}-byte segment; \

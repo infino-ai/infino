@@ -26,5 +26,6 @@ pub mod vector;
 pub use error::{BuildError, FtsError, ReadError, VectorError};
 pub use lazy_source::{
     BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, PrefetchedSource,
+    Source,
 };
 pub use reader::{OpenOptions, SuperfileReader, VectorSearchOptions};

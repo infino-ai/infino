@@ -25,7 +25,7 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
+use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -637,8 +637,11 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
 /// Build a full superfile (FTS + vector) for end-to-end benches.
 pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u8> {
     let n = docs.len();
+    // `SuperfileBuilder` requires the id column to be
+    // `Decimal128(38, 0)` (the supertable's snowflake id type), not
+    // `UInt64` — match it so this helper actually builds.
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::UInt64, false),
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -659,7 +662,11 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
     );
 
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-    let ids = UInt64Array::from((0..n as u64).collect::<Vec<_>>());
+    let ids: Decimal128Array = (0..n as u64)
+        .map(|i| Some(i as i128))
+        .collect::<Decimal128Array>()
+        .with_precision_and_scale(38, 0)
+        .expect("decimal128 with_precision_and_scale");
     let titles = LargeStringArray::from(docs.iter().map(String::as_str).collect::<Vec<_>>());
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
         .expect("build RecordBatch");

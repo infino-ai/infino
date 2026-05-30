@@ -417,11 +417,10 @@ impl VectorBuilder {
             directory_offset + directory_size as u64 + 4 /* dir CRC */;
 
         // 3. Assemble directory entries with absolute offsets.
-        //    Plan 012 M1: byte 52 of each 64-byte entry carries the
-        //    rerank-codec discriminator; bytes 53..56 stay reserved.
-        //    Existing pre-012 fp32 segments had all-zero bytes here,
-        //    which maps to `RerankCodec::Fp32` (`codec_id() = 0`) —
-        //    round-trips identically.
+        //    Byte 52 carries the rerank-codec discriminator.
+        //    Bytes 56..64 carry codec_meta offset/length within the
+        //    subsection so lazy open can fetch subsection headers and
+        //    Sq8 metadata in the same network batch.
         let mut directory: Vec<u8> = Vec::with_capacity(directory_size);
         for (i, sub) in subsections.iter().enumerate() {
             let (cfg, _) = &column_configs[i];
@@ -438,7 +437,8 @@ impl VectorBuilder {
             // bytes 52..56 — codec_id (1) + reserved (3)
             directory.push(cfg.rerank_codec.codec_id()); // codec_id (1)
             directory.extend_from_slice(&[0u8; 3]); // reserved (3)
-            directory.extend_from_slice(&0u64.to_le_bytes()); // future_reserved (8)
+            directory.extend_from_slice(&(sub.codec_meta_offset_in_sub as u32).to_le_bytes());
+            directory.extend_from_slice(&(sub.codec_meta_size as u32).to_le_bytes());
             debug_assert_eq!(directory.len() % DIR_ENTRY_SIZE, 0);
 
             subsection_start_off += sub.bytes.len() as u64;
@@ -515,6 +515,10 @@ struct SubsectionBytes {
     /// start (matches the directory entry's `summary_offset` after
     /// translation to absolute).
     summary_offset_in_sub: usize,
+    /// Byte offset / length of codec_meta relative to the subsection
+    /// start. Both are zero when the subsection has no codec_meta.
+    codec_meta_offset_in_sub: usize,
+    codec_meta_size: usize,
 }
 
 /// Per-bucket BufWriter capacity. 64 KiB amortises one syscall
@@ -809,27 +813,34 @@ fn build_subsection_streaming(
     let centroids_size = n_cent * dim * 4;
     let cluster_idx_size = n_cent * 8;
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
-    let per_cluster_blocks_size = n_docs * (code_bytes + 4);
-    let full_size = codec.per_vector_bytes(dim) * n_docs;
+    let per_vec_bytes = codec.per_vector_bytes(dim);
+    // v2 layout: each per-cluster block carries `codes_chunk +
+    // doc_ids_chunk + full_chunk` for that cluster's docs, so one
+    // range GET per probed cluster pulls the 1-bit estimate codes,
+    // the doc-ids, AND the full-precision rerank vectors together.
+    // There is no separate trailing `full[]` region — the rerank
+    // bytes a query needs ride along with the cluster block it
+    // already fetches, dropping cold first-search from
+    // `nprobe + 1 fat-range` GETs (which over-fetched the whole
+    // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
+    let per_cluster_blocks_size = n_docs * (code_bytes + 4 + per_vec_bytes);
 
-    // Offsets relative to subsection start. v1 layout: open-time
-    // region (everything before `per_cluster_blocks`) lands
-    // contiguously at the subsection head; `full[]` lives at the
-    // tail (immediately before the CRC).
+    // Offsets relative to subsection start. Open-time region
+    // (everything before `per_cluster_blocks`) lands contiguously
+    // at the subsection head; the per-cluster blocks (codes +
+    // doc_ids + full, interleaved) fill the rest before the CRC.
     let summary_off = SUB_HEADER_SIZE;
     let centroids_off = summary_off + summary_size;
     let cluster_idx_off = centroids_off + centroids_size;
     let codec_meta_off = cluster_idx_off + cluster_idx_size;
     let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
-    let full_off = per_cluster_blocks_off + per_cluster_blocks_size;
 
     let total_size_before_crc = SUB_HEADER_SIZE
         + summary_size
         + centroids_size
         + cluster_idx_size
         + codec_meta_size
-        + per_cluster_blocks_size
-        + full_size;
+        + per_cluster_blocks_size;
 
     let mut bytes: Vec<u8> = Vec::with_capacity(total_size_before_crc + 4);
 
@@ -899,12 +910,33 @@ fn build_subsection_streaming(
     }
     debug_assert_eq!(bytes.len() - bytes_before_codec_meta, codec_meta_size);
 
+    // Full-precision rerank bytes in cluster-contiguous order
+    // (stride `per_vec_bytes`), codec-encoded. Built once here so
+    // the per-cluster loop below can splice each cluster's slice
+    // into its block. Empty for the `None` codec (no rerank).
+    let full_bytes: Vec<u8> = match codec {
+        RerankCodec::Fp32 => bytemuck::cast_slice(&full_layout).to_vec(),
+        RerankCodec::Bf16 => {
+            let mut v = Vec::with_capacity(full_layout.len() * 2);
+            for &x in &full_layout {
+                let bf = crate::superfile::vector::distance::fp32_to_bf16(x);
+                v.extend_from_slice(&bf.to_le_bytes());
+            }
+            v
+        }
+        RerankCodec::Sq8 => sq8_built.as_ref().expect("sq8_built set above").codes.clone(),
+        RerankCodec::RabitqOnly => Vec::new(),
+    };
+    debug_assert_eq!(full_bytes.len(), per_vec_bytes * n_docs);
+
     // Per-cluster blocks: for each cluster, `codes_chunk`
-    // (count × code_bytes) immediately followed by
-    // `doc_ids_chunk` (count × u32 LE). The block layout is
-    // what makes `read range` for one cluster cover both
-    // regions in a single range fetch on the lazy/object-
-    // store path (013 M3).
+    // (count × code_bytes), then `doc_ids_chunk` (count × u32 LE),
+    // then `full_chunk` (count × per_vec_bytes) — all in that
+    // cluster's contiguous doc order. Interleaving full[] here
+    // (rather than a separate trailing region) is what lets one
+    // range GET per probed cluster cover the estimate codes, the
+    // doc-ids, AND the rerank vectors in a single fetch on the
+    // lazy / object-store path.
     debug_assert_eq!(bytes.len(), per_cluster_blocks_off);
     for &(off, cnt) in &cluster_index {
         if cnt == 0 {
@@ -916,36 +948,16 @@ fn build_subsection_streaming(
         let ds = off as usize;
         let de = ds + cnt as usize;
         bytes.extend_from_slice(bytemuck::cast_slice(&doc_ids_layout[ds..de]));
+        if per_vec_bytes != 0 {
+            let fs = (off as usize) * per_vec_bytes;
+            let fe = fs + (cnt as usize) * per_vec_bytes;
+            bytes.extend_from_slice(&full_bytes[fs..fe]);
+        }
     }
     debug_assert_eq!(
         bytes.len() - per_cluster_blocks_off,
         per_cluster_blocks_size
     );
-
-    // full[] region (rerank column) — at the subsection tail
-    // for v1 so layout reorder doesn't disturb cluster-block
-    // contiguity. Codec-specific encoding.
-    debug_assert_eq!(bytes.len(), full_off);
-    match codec {
-        RerankCodec::Fp32 => {
-            bytes.extend_from_slice(bytemuck::cast_slice(&full_layout));
-        }
-        RerankCodec::Bf16 => {
-            bytes.reserve(full_layout.len() * 2);
-            for &x in &full_layout {
-                let bf = crate::superfile::vector::distance::fp32_to_bf16(x);
-                bytes.extend_from_slice(&bf.to_le_bytes());
-            }
-        }
-        RerankCodec::Sq8 => {
-            let s = sq8_built.as_ref().expect("sq8_built set above");
-            bytes.extend_from_slice(&s.codes);
-        }
-        RerankCodec::RabitqOnly => {
-            debug_assert_eq!(full_size, 0);
-        }
-    }
-    debug_assert_eq!(bytes.len() - full_off, full_size);
     debug_assert_eq!(bytes.len(), total_size_before_crc);
 
     // Trailing CRC over the subsection body.
@@ -955,6 +967,12 @@ fn build_subsection_streaming(
     Ok(SubsectionBytes {
         bytes,
         summary_offset_in_sub: summary_off,
+        codec_meta_offset_in_sub: if codec_meta_size == 0 {
+            0
+        } else {
+            codec_meta_off
+        },
+        codec_meta_size,
     })
 }
 
