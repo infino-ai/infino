@@ -478,6 +478,250 @@ impl SupertableWriter {
         }
     }
 
+    /// 1:1-cardinality replacement: every row whose `_id`
+    /// matches `predicate` is tombstoned, and `new_rows` is
+    /// appended to the supertable as the replacement payload.
+    ///
+    /// Runs the full WAL pipeline synchronously:
+    ///
+    /// 1. Storage pre-flight.
+    /// 2. `new_rows.schema()` must match the supertable's user
+    ///    schema (no `_id` column).
+    /// 3. Flush buffered appends so the resolve sees a complete
+    ///    view of this writer's outstanding work.
+    /// 4. Resolve `predicate` → target_ids.
+    /// 5. Enforce match cap + cardinality
+    ///    (`matched == new_rows.num_rows()`).
+    /// 6. Reserve a contiguous `_id` range + preallocate a
+    ///    superfile UUID.
+    /// 7. IPC-encode `new_rows`, compute blake3, persist as the
+    ///    WAL's `.arrow` sidecar.
+    /// 8. Create the Intent UPDATE WAL state doc.
+    /// 9. Drive append-phase (Intent → Appended) +
+    ///    tombstone-phase (Appended → Complete).
+    ///
+    /// **Order at commit time: append-first, then tombstone.**
+    /// During the transient window between the manifest swap
+    /// landing the new rows and the tombstones taking effect,
+    /// queries see BOTH old and new rows — never zero rows for
+    /// the predicate's logical key. Eventually consistent, never
+    /// *eventually empty*.
+    pub fn update(
+        &mut self,
+        predicate: datafusion::prelude::Expr,
+        new_rows: arrow_array::RecordBatch,
+    ) -> Result<
+        crate::supertable::mutations::OperationOutcome,
+        crate::supertable::mutations::MutationError,
+    > {
+        use crate::supertable::mutations::{
+            MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+        };
+        use crate::supertable::wal::WalStore;
+        use crate::supertable::wal::state_doc::{
+            IdSpan, OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+            WalStateDoc,
+        };
+        use chrono::Utc;
+
+        // Pre-flight: storage attached.
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        // Schema check (no _id column on the user-facing path).
+        if new_rows.schema().as_ref() != self.inner.options.schema.as_ref() {
+            return Err(MutationError::SchemaMismatch(format!(
+                "expected {:?}, got {:?}",
+                self.inner.options.schema.fields(),
+                new_rows.schema().fields()
+            )));
+        }
+
+        // Flush buffered appends so the predicate sees a
+        // complete view.
+        if !self.buffer.is_empty() {
+            self.commit().map_err(|e| {
+                MutationError::Storage(crate::storage::StorageError::Permanent {
+                    uri: "writer.commit() for update pre-flush".into(),
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                })
+            })?;
+        }
+
+        // Resolve predicate + cap + cardinality.
+        let supertable = Supertable::from_inner(Arc::clone(&self.inner));
+        let target_ids = supertable
+            .scan_ids_matching(predicate)
+            .map_err(MutationError::PredicateEval)?;
+        let matched = target_ids.len();
+        if matched > MAX_TARGETS_PER_MUTATION {
+            return Err(MutationError::MatchCountExceedsCap {
+                matched,
+                cap: MAX_TARGETS_PER_MUTATION,
+            });
+        }
+        let new_row_count = new_rows.num_rows();
+        if matched != new_row_count {
+            return Err(MutationError::CardinalityMismatch {
+                matched,
+                new_rows: new_row_count,
+            });
+        }
+        // Cardinality 0 is a no-op shortcut — no WAL, no
+        // superfile.
+        if matched == 0 {
+            let wal_id_value = self
+                .inner
+                .id_generator
+                .lock()
+                .expect("idgen mutex")
+                .next_id();
+            return Ok(OperationOutcome {
+                wal_id: WalId(wal_id_value),
+                matched: 0,
+                n_tombstoned: 0,
+                n_not_found: 0,
+            });
+        }
+
+        // Reserve _id range + preallocate superfile id + mint
+        // wal_id. All under one lock so the relative ordering
+        // is deterministic.
+        let (wal_id_value, minted_id_spans, preallocated_superfile_id) = {
+            let idgen = self.inner.id_generator.lock().expect("idgen mutex");
+            let spans = idgen
+                .reserve_range(matched as u32)
+                .into_iter()
+                .map(|(first, last)| IdSpan {
+                    first: WalId(first),
+                    last: WalId(last),
+                })
+                .collect::<Vec<_>>();
+            let wal_id_value = idgen.next_id();
+            let preallocated = uuid::Uuid::new_v4();
+            (wal_id_value, spans, preallocated)
+        };
+
+        // IPC-encode the new_rows batch + blake3.
+        let ipc_bytes = encode_record_batch_ipc(&new_rows).map_err(|e| {
+            MutationError::Storage(crate::storage::StorageError::Permanent {
+                uri: "ipc encode".into(),
+                source: Box::new(std::io::Error::other(e)),
+            })
+        })?;
+        let content_hash = blake3::hash(&ipc_bytes).to_hex().to_string();
+
+        let wal_doc = WalStateDoc {
+            wal_id: WalId(wal_id_value),
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Update,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "writer.update()".into(),
+            target_ids: target_ids.iter().map(|&v| WalId(v)).collect(),
+            new_row_count: Some(matched as u32),
+            new_row_content_hash: Some(content_hash),
+            preallocated_superfile_id: Some(preallocated_superfile_id),
+            minted_id_spans,
+            appended_pair_range: None,
+            tombstone_progress: target_ids
+                .iter()
+                .map(|&v| TombstoneEntry {
+                    target_id: WalId(v),
+                    outcome: TombstoneOutcome::Pending,
+                    tombstoned_in_superfile: None,
+                })
+                .collect(),
+        };
+
+        let wal_store = WalStore::new(Arc::clone(&storage));
+        let (n_tombstoned, n_not_found) =
+            self.drive_update_wal(&wal_store, &wal_doc, &supertable, ipc_bytes)?;
+
+        Ok(OperationOutcome {
+            wal_id: WalId(wal_id_value),
+            matched,
+            n_tombstoned,
+            n_not_found,
+        })
+    }
+
+    /// Synchronously drive an UPDATE WAL through its full
+    /// pipeline: persist the IPC sidecar, create the state doc,
+    /// run the append phase, run the tombstone phase, best-effort
+    /// delete the WAL artifacts on completion.
+    fn drive_update_wal(
+        &self,
+        wal_store: &crate::supertable::wal::WalStore,
+        wal_doc: &crate::supertable::wal::state_doc::WalStateDoc,
+        supertable: &Supertable,
+        ipc_bytes: Bytes,
+    ) -> Result<(usize, usize), crate::supertable::mutations::MutationError> {
+        use crate::supertable::mutations::MutationError;
+        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
+        let wal_id = wal_doc.wal_id;
+        let wal_doc_clone = wal_doc.clone();
+        let wal_store_clone = wal_store.clone();
+        let supertable_clone = Supertable::from_inner(Arc::clone(supertable.inner()));
+        let drive = async move {
+            // Step 0b: persist the arrow sidecar BEFORE the
+            // state doc. The state-doc's content_hash pins the
+            // sidecar bytes, so any recovery sweep that reads
+            // the state doc can re-verify the sidecar.
+            wal_store_clone
+                .put_arrow(wal_id, ipc_bytes)
+                .await
+                .map_err(MutationError::WalStore)?;
+            let etag = wal_store_clone
+                .create(&wal_doc_clone)
+                .await
+                .map_err(MutationError::WalStore)?;
+
+            // Step 1: append phase.
+            let (_outcome, doc_after_append, etag_after_append) = pipeline::run_append_phase(
+                &supertable_clone,
+                &wal_store_clone,
+                &wal_doc_clone,
+                &etag,
+            )
+            .await?;
+
+            // Step 2: tombstone phase.
+            let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
+                &supertable_clone,
+                &wal_store_clone,
+                &doc_after_append,
+                &etag_after_append,
+            )
+            .await?;
+            let (n_t, n_nf) = match outcome {
+                TombstonePhaseOutcome::Applied {
+                    n_tombstoned,
+                    n_not_found,
+                }
+                | TombstonePhaseOutcome::AlreadyComplete {
+                    n_tombstoned,
+                    n_not_found,
+                } => (n_tombstoned, n_not_found),
+            };
+
+            // Best-effort cleanup.
+            let _ = wal_store_clone.delete_arrow(wal_id).await;
+            let _ = wal_store_clone.delete_state(wal_id).await;
+            Ok::<_, MutationError>((n_t, n_nf))
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.inner.sql_runtime().block_on(drive),
+        }
+    }
+
     pub fn commit(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -1411,6 +1655,23 @@ async fn refresh_inner_state_async(
 
 /// Storage path for a segment's bytes. Lives under `data/`
 /// alongside the `_supertable/` manifest hierarchy.
+/// IPC-encode a `RecordBatch` to a byte buffer. Mirrors the
+/// shape the WAL's arrow sidecar carries: an
+/// `arrow_ipc::writer::StreamWriter` writes one batch followed
+/// by a finish marker. The recovery / append-phase reader
+/// decodes the same way.
+fn encode_record_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Bytes, String> {
+    use arrow::ipc::writer::StreamWriter;
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut out, &batch.schema())
+            .map_err(|e| format!("ipc writer init: {e}"))?;
+        writer.write(batch).map_err(|e| format!("ipc write: {e}"))?;
+        writer.finish().map_err(|e| format!("ipc finish: {e}"))?;
+    }
+    Ok(Bytes::from(out))
+}
+
 fn segment_storage_path(uri: &SuperfileUri) -> String {
     format!("data/seg-{}.sf", uri.0)
 }

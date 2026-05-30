@@ -136,3 +136,86 @@ async fn writer_delete_requires_storage() {
         .expect_err("must error");
     assert!(matches!(err, MutationError::NoStorageAttached));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_update_replaces_matching_rows() {
+    // Insert 3 rows, then update the row whose title is "bravo"
+    // to "bravo-prime". Post-update: 3 rows total visible; "bravo"
+    // is gone; "bravo-prime" is present.
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    );
+
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+        .expect("append");
+    w.commit().expect("commit");
+
+    let new_rows = build_title_batch(&["bravo-prime"]);
+    let outcome = w
+        .update(col("title").eq(lit("bravo")), new_rows)
+        .expect("update");
+    assert_eq!(outcome.matched, 1);
+    assert_eq!(outcome.n_tombstoned, 1);
+    assert_eq!(outcome.n_not_found, 0);
+    drop(w);
+
+    let batches = st
+        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .expect("sql");
+    let titles: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .expect("title col");
+            (0..col.len()).map(move |i| col.value(i).to_string())
+        })
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["alpha".to_string(), "bravo-prime".into(), "charlie".into(),]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_update_cardinality_mismatch_is_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    );
+
+    let mut w = st.writer().expect("writer");
+    // Insert 3 rows.
+    w.append(&build_title_batch(&["a", "b", "c"]))
+        .expect("append");
+    w.commit().expect("commit");
+
+    // Predicate matches 1 row; provide 2 new rows → mismatch.
+    let new_rows = build_title_batch(&["one", "two"]);
+    let err = w
+        .update(col("title").eq(lit("a")), new_rows)
+        .expect_err("must mismatch");
+    assert!(matches!(
+        err,
+        MutationError::CardinalityMismatch {
+            matched: 1,
+            new_rows: 2
+        }
+    ));
+}
