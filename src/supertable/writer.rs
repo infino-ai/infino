@@ -535,15 +535,23 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
             return None;
         }
         ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+        let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
+        let centroids_off = read_u64_le(sub.get(32..40)?) as usize;
+        let cluster_idx_off = read_u64_le(sub.get(40..48)?) as usize;
+        let cluster_idx_end = cluster_idx_off
+            .checked_add(8 * read_u32_le(dir.get(entry + 8..entry + 12)?) as usize)?;
+        if centroids_off < SUB_HEADER_SIZE || cluster_idx_end > subsection_len {
+            return None;
+        }
+        ranges.push((
+            off + subsection_off as u64 + centroids_off as u64,
+            (cluster_idx_end - centroids_off) as u64,
+        ));
         if codec_meta_size > 0 {
             let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
             if meta_end > subsection_len {
                 return None;
             }
-            ranges.push((
-                off + subsection_off as u64 + codec_meta_off as u64,
-                codec_meta_size as u64,
-            ));
         }
     }
     if dir_end > blob.len() {

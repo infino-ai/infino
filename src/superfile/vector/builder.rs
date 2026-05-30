@@ -21,6 +21,7 @@ use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
 };
 use rayon::prelude::*;
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -728,6 +729,12 @@ fn build_subsection_streaming(
     // 1.5 GiB of RAM during build.
     let codec = cfg.rerank_codec;
     let has_full = !matches!(codec, RerankCodec::RabitqOnly);
+    let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
+    let mut centroids_layout = Vec::with_capacity(centroids.len());
+    for &old_c in &cluster_order {
+        centroids_layout.extend_from_slice(&centroids[old_c * dim..(old_c + 1) * dim]);
+    }
+
     let mut codes_layout = vec![0u8; n_docs * code_bytes];
     let mut full_layout: Vec<f32> = if has_full {
         vec![0f32; n_docs * dim]
@@ -747,13 +754,14 @@ fn build_subsection_streaming(
     // Vec; `cast_slice_mut` gives `&mut [u8]` aligned to the f32
     // ABI alignment (4), which `read_exact` fills from BufReader.
     let mut id_buf = [0u8; 4];
-    for (c, &cluster_count) in bucket_counts.iter().enumerate() {
+    for &old_c in &cluster_order {
+        let cluster_count = bucket_counts[old_c];
         let cluster_off = write_cursor as u32;
         cluster_index.push((cluster_off, cluster_count));
         if cluster_count == 0 {
             continue;
         }
-        let path = scratch.join(format!("infino_bucket_col{column_id}_c{c}.bin"));
+        let path = scratch.join(format!("infino_bucket_col{column_id}_c{old_c}.bin"));
         let mut reader = BufReader::with_capacity(BUCKET_BUF_SIZE, File::open(&path)?);
         for _ in 0..cluster_count {
             reader.read_exact(&mut id_buf)?;
@@ -868,8 +876,8 @@ fn build_subsection_streaming(
 
     // Summary centroid (dim f32s).
     bytes.extend_from_slice(bytemuck::cast_slice(&summary_centroid));
-    // Centroids.
-    bytes.extend_from_slice(bytemuck::cast_slice(&centroids));
+    // Centroids in the same physical order as cluster blocks.
+    bytes.extend_from_slice(bytemuck::cast_slice(&centroids_layout));
     // Cluster index — same `(doc_off, count)` shape as v0; the
     // doc_off field still indexes into the cluster-contiguous
     // codes / full ordering. v1 uses it both as the per-cluster
@@ -978,6 +986,47 @@ fn build_subsection_streaming(
         },
         codec_meta_size,
     })
+}
+
+fn centroid_storage_order(centroids: &[f32], n_cent: usize, dim: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n_cent).collect();
+    order_centroids_recursive(&mut order, centroids, dim);
+    order
+}
+
+fn order_centroids_recursive(order: &mut [usize], centroids: &[f32], dim: usize) {
+    if order.len() <= 1 || dim == 0 {
+        return;
+    }
+
+    let mut best_dim = 0usize;
+    let mut best_span = 0.0f32;
+    for d in 0..dim {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &c in order.iter() {
+            let v = centroids[c * dim + d];
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let span = hi - lo;
+        if span > best_span {
+            best_span = span;
+            best_dim = d;
+        }
+    }
+
+    order.sort_unstable_by(|&a, &b| {
+        centroids[a * dim + best_dim]
+            .partial_cmp(&centroids[b * dim + best_dim])
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mid = order.len() / 2;
+    let (left, right) = order.split_at_mut(mid);
+    order_centroids_recursive(left, centroids, dim);
+    order_centroids_recursive(right, centroids, dim);
 }
 
 /// Scan one cluster's rows for per-dim min/max and derive the

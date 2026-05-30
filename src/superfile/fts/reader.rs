@@ -456,8 +456,8 @@ impl FtsReader {
 
     /// Fetch the complete byte range of each requested term — metadata
     /// header (20 bytes) + skip table + encoded posting blocks — in
-    /// parallel. `metadata_offsets` are region-relative offsets as
-    /// stored in the FST (`FstValue::Pfor.metadata_offset`); the
+    /// parallel. `terms` are `(metadata_offset, postings_length)` pairs
+    /// stored in the FST (`FstValue::Pfor`); the
     /// returned `Bytes` for term `i` starts at that term's metadata
     /// header (offset 0) and runs to the end of its last block, so a
     /// `TermCursor` can index it directly.
@@ -470,44 +470,26 @@ impl FtsReader {
     /// ranges are coalesced under one async bridge and returned in
     /// input order.
     ///
-    /// Two-phase because a term's total extent isn't known until its
-    /// metadata header is read (`postings_length`, bytes 12..16, spans
-    /// metadata + skip table + blocks): phase one fetches every term's
-    /// 20-byte header in parallel, phase two fetches every term's full
-    /// body in parallel.
-    fn fetch_term_postings(&self, metadata_offsets: &[usize]) -> Result<Vec<Bytes>, FtsError> {
-        if metadata_offsets.is_empty() {
+    /// Because the FST value carries the length, this is a single
+    /// range batch. The metadata header remains in the returned bytes
+    /// for validation and cursor construction.
+    fn fetch_term_postings(&self, terms: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
         let base = self.postings_range.start;
         let region_len = self.postings_range.len();
 
-        let mut head_ranges: Vec<Range<usize>> = Vec::with_capacity(metadata_offsets.len());
-        for &m in metadata_offsets {
-            if m + 20 > region_len {
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(terms.len());
+        for &(m, postings_length) in terms {
+            if postings_length < 20 || m + postings_length > region_len {
                 return Err(FtsError::Read(ReadError::MalformedVersion(
-                    "term metadata offset out of postings region".into(),
+                    "term postings range runs past postings region".into(),
                 )));
             }
-            head_ranges.push(base + m..base + m + 20);
+            ranges.push(base + m..base + m + postings_length);
         }
-        let heads = self.source.get_ranges_parallel(&head_ranges).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "fts/postings term metadata range fetch failed: {e}"
-            )))
-        })?;
-
-        let mut body_ranges: Vec<Range<usize>> = Vec::with_capacity(metadata_offsets.len());
-        for (&m, head) in metadata_offsets.iter().zip(&heads) {
-            let postings_length = read_u32_le(&head[12..16]) as usize;
-            if m + postings_length > region_len {
-                return Err(FtsError::Read(ReadError::MalformedVersion(
-                    "term postings length runs past postings region".into(),
-                )));
-            }
-            body_ranges.push(base + m..base + m + postings_length);
-        }
-        self.source.get_ranges_parallel(&body_ranges).map_err(|e| {
+        self.source.get_ranges_parallel(&ranges).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
                 "fts/postings term body range fetch failed: {e}"
             )))
@@ -718,7 +700,7 @@ impl FtsReader {
         let Some(packed) = dict.lookup(&key) else {
             return Ok(Vec::new());
         };
-        let metadata_offset = match FstValue::unpack(packed) {
+        let (metadata_offset, postings_length) = match FstValue::unpack(packed) {
             FstValue::Inline { doc_id, tf } => {
                 // df=1 inline path: no postings-region read, no
                 // skip-table, no PFOR decode. The single doc's score
@@ -730,14 +712,17 @@ impl FtsReader {
                     crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 return Ok(vec![(doc_id, score)]);
             }
-            FstValue::Pfor { metadata_offset } => metadata_offset as usize,
+            FstValue::Pfor {
+                metadata_offset,
+                postings_length,
+            } => (metadata_offset as usize, postings_length as usize),
         };
         // Fetch only this term's byte range (metadata header + skip
         // table + blocks). The returned buffer starts at the metadata
         // header, so the region-relative `metadata_offset` rebases to
         // 0 for all indexing below.
         let term_bytes = {
-            let mut fetched = self.fetch_term_postings(&[metadata_offset])?;
+            let mut fetched = self.fetch_term_postings(&[(metadata_offset, postings_length)])?;
             fetched.pop().expect("one fetched range for one PFOR term")
         };
         let postings = term_bytes.as_ref();
@@ -905,7 +890,7 @@ impl FtsReader {
             Pfor,
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(terms.len());
-        let mut pfor_offsets: Vec<usize> = Vec::new();
+        let mut pfor_offsets: Vec<(usize, usize)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
             let Some(packed) = dict.lookup(&key) else {
@@ -915,8 +900,11 @@ impl FtsReader {
                 FstValue::Inline { doc_id, tf } => {
                     resolved.push(Resolved::Inline { doc_id, tf });
                 }
-                FstValue::Pfor { metadata_offset } => {
-                    pfor_offsets.push(metadata_offset as usize);
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length,
+                } => {
+                    pfor_offsets.push((metadata_offset as usize, postings_length as usize));
                     resolved.push(Resolved::Pfor);
                 }
             }

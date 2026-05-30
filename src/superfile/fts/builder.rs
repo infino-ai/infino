@@ -2610,7 +2610,7 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_block_write += start.elapsed();
         }
 
-        FstValue::pack_pfor(metadata_offset)
+        FstValue::pack_pfor(metadata_offset, postings_length as u32)
     };
 
     let fst_insert_start = profile.enabled.then(Instant::now);

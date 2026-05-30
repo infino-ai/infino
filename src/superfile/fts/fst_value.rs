@@ -3,10 +3,10 @@
 //!
 //! Every term's FST value is a `u64`. Bit 0 selects form:
 //!
-//! - `value & 1 == 0` → **PFOR form**. `value >> 1` is the
-//!   metadata_offset into the postings region. The reader proceeds
-//!   with the existing 20 B-metadata-header / skip-table / PFOR-block
-//!   path.
+//! - `value & 1 == 0` → **PFOR form**. The payload stores both
+//!   `metadata_offset` and `postings_length`, so the reader can fetch
+//!   the complete term range in one GET instead of probing the 20 B
+//!   metadata header first.
 //! - `value & 1 == 1` → **inline form**. The payload `(doc_id, tf)`
 //!   lives entirely in bits 1..63; there is no postings-region entry
 //!   for this term (no metadata header, no skip table, no PFOR block).
@@ -27,6 +27,12 @@
 
 const DOC_ID_SHIFT: u32 = 1;
 const TF_SHIFT: u32 = 33;
+const PFOR_OFFSET_SHIFT: u32 = 1;
+const PFOR_OFFSET_BITS: u32 = 42;
+const PFOR_LENGTH_SHIFT: u32 = PFOR_OFFSET_SHIFT + PFOR_OFFSET_BITS;
+const PFOR_LENGTH_BITS: u32 = 21;
+const PFOR_OFFSET_MAX: u64 = (1u64 << PFOR_OFFSET_BITS) - 1;
+pub(crate) const PFOR_LENGTH_MAX: u32 = (1u32 << PFOR_LENGTH_BITS) - 1;
 /// Maximum `tf` representable in the inline form's 30-bit slot.
 /// Real-world per-doc tf is bounded by document length (in tokens),
 /// which fits a u16; this limit only exists to guarantee the
@@ -35,10 +41,12 @@ pub(crate) const INLINE_TF_MAX: u32 = (1 << 30) - 1;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum FstValue {
-    /// df ≥ 2 — read the metadata header at `metadata_offset` to
-    /// recover df, postings_length, num_blocks, then walk the skip
-    /// table and PFOR blocks as before.
-    Pfor { metadata_offset: u64 },
+    /// df ≥ 2 — fetch `postings_length` bytes from `metadata_offset`
+    /// and walk the metadata header, skip table, and PFOR blocks.
+    Pfor {
+        metadata_offset: u64,
+        postings_length: u32,
+    },
     /// df = 1 — the entire posting is right here. No postings-region
     /// read required.
     Inline { doc_id: u32, tf: u32 },
@@ -49,7 +57,8 @@ impl FstValue {
     pub(crate) fn unpack(packed: u64) -> Self {
         if packed & 1 == 0 {
             Self::Pfor {
-                metadata_offset: packed >> DOC_ID_SHIFT,
+                metadata_offset: (packed >> PFOR_OFFSET_SHIFT) & PFOR_OFFSET_MAX,
+                postings_length: ((packed >> PFOR_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX,
             }
         } else {
             let doc_id = (packed >> DOC_ID_SHIFT) as u32;
@@ -58,15 +67,19 @@ impl FstValue {
         }
     }
 
-    /// Pack a metadata_offset into the PFOR-form FST value. The low
-    /// bit is always 0; the offset occupies bits 1..N.
+    /// Pack `(metadata_offset, postings_length)` into the PFOR-form
+    /// FST value. The low bit is always 0.
     #[inline]
-    pub(crate) fn pack_pfor(metadata_offset: u64) -> u64 {
+    pub(crate) fn pack_pfor(metadata_offset: u64, postings_length: u32) -> u64 {
         debug_assert!(
-            metadata_offset < (1u64 << 63),
-            "metadata_offset {metadata_offset} overflows the 63-bit PFOR slot"
+            metadata_offset <= PFOR_OFFSET_MAX,
+            "metadata_offset {metadata_offset} overflows the {PFOR_OFFSET_BITS}-bit PFOR slot"
         );
-        metadata_offset << DOC_ID_SHIFT
+        debug_assert!(
+            postings_length <= PFOR_LENGTH_MAX,
+            "postings_length {postings_length} overflows the {PFOR_LENGTH_BITS}-bit PFOR slot"
+        );
+        (metadata_offset << PFOR_OFFSET_SHIFT) | ((postings_length as u64) << PFOR_LENGTH_SHIFT)
     }
 
     /// Pack a `(doc_id, tf)` pair into the inline-form FST value. The
@@ -87,13 +100,21 @@ mod tests {
 
     #[test]
     fn pfor_round_trip() {
-        for &offset in &[0u64, 1, 20, 1 << 20, (1 << 34) - 1, 1 << 34] {
-            let packed = FstValue::pack_pfor(offset);
+        for &(offset, len) in &[
+            (0u64, 20u32),
+            (1, 128),
+            (20, 4096),
+            (1 << 20, 1 << 16),
+            ((1u64 << 34) - 1, (1 << 20) - 1),
+            (1u64 << 34, PFOR_LENGTH_MAX),
+        ] {
+            let packed = FstValue::pack_pfor(offset, len);
             assert_eq!(packed & 1, 0, "PFOR form must have low bit clear");
             assert_eq!(
                 FstValue::unpack(packed),
                 FstValue::Pfor {
-                    metadata_offset: offset
+                    metadata_offset: offset,
+                    postings_length: len
                 }
             );
         }
@@ -123,7 +144,7 @@ mod tests {
 
     #[test]
     fn flag_bit_distinguishes_forms() {
-        let pfor = FstValue::pack_pfor(42);
+        let pfor = FstValue::pack_pfor(42, 128);
         let inline = FstValue::pack_inline(42, 7);
         assert_ne!(pfor & 1, inline & 1);
     }

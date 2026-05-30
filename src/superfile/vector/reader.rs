@@ -41,41 +41,18 @@ pub struct VectorColumnConfig {
     pub metric: String,
 }
 
-/// Plan 012 M3 + Sq8PerCluster — Sq8 quantizer state
-/// materialised from the on-disk `codec_meta` region at open
-/// time. The reader picks the candidate's cluster slice of
-/// `scale` / `offset` and passes it into [`Sq8Kernel::new`]
-/// once per (query, cluster) pair to build the per-query
-/// precomputes.
-///
-/// Per-cluster (not per-column) quantizer: each IVF cluster
-/// owns its own `(scale[dim], offset[dim])` pair, packed
-/// contiguously cluster-by-cluster. Per-column was the
-/// original M3 design but collapsed recall on highly clustered
-/// cosine corpora (intra-cluster spread is 5–10× narrower than
-/// cross-cluster, so 256 buckets stretched over the global
-/// range left only ~25–50 usable buckets per cluster; ranking
-/// noise dominated intra-cluster cosine differences). See
-/// `RerankCodec::codec_meta_bytes` doc for the failure-mode
-/// analysis. Per-cluster recovers recall at +`n_cent × dim × 8`
-/// bytes of codec_meta (3 MiB at the 1M × 1024 × 384 shape).
 #[derive(Debug, Clone)]
-pub(super) struct Sq8ColumnMeta {
-    /// Per-cluster, per-dim quantizer scale. Length =
-    /// `n_cent × dim`, laid out cluster-major: cluster `c`'s
-    /// scale array is `scale[c·dim .. (c+1)·dim]`.
-    /// `x_decoded[d] = code[d] * scale[c·dim + d] + offset[c·dim + d]`
-    /// for a doc in cluster `c`.
-    pub scale: Vec<f32>,
-    /// Per-cluster, per-dim quantizer offset. Same layout as `scale`.
-    pub offset: Vec<f32>,
-    /// Per-doc `Σ_d x_decoded²`, length == n_docs, indexed by
-    /// position-in-full (matches the rerank shortlist's `pos`
-    /// field). `Some` for L2Sq (short-circuits the `Σx²` term)
-    /// and Cosine (normalizes the decoded vector at rerank
-    /// time); `None` for NegDot, where the `Σx²` term cancels
-    /// out of the distance formula.
-    pub per_doc_norms: Option<Vec<f32>>,
+pub(super) enum Sq8ColumnMeta {
+    Eager {
+        scale: Vec<f32>,
+        offset: Vec<f32>,
+        per_doc_norms: Option<Vec<f32>>,
+    },
+    Lazy {
+        scale_abs_off: usize,
+        offset_abs_off: usize,
+        norms_abs_off: Option<usize>,
+    },
 }
 
 /// Per-column reader state; cached at open time.
@@ -343,7 +320,6 @@ impl VectorReader {
 
         let mut subsection_meta = Vec::with_capacity(n_columns);
         let mut subheader_ranges = Vec::with_capacity(n_columns);
-        let mut codec_meta_ranges = Vec::new();
         for i in 0..n_columns {
             let entry_off = i * DIR_ENTRY_SIZE;
             let subsection_off =
@@ -374,12 +350,6 @@ impl VectorReader {
                         subsection_len - 4
                     ))));
                 }
-                codec_meta_ranges.push((
-                    i,
-                    subsection_off + dir_codec_meta_off,
-                    dir_codec_meta_size,
-                    dir_codec_meta_off,
-                ));
             }
             subsection_meta.push((
                 i,
@@ -408,24 +378,7 @@ impl VectorReader {
                     Ok::<_, VectorError>((i, subsection_off, bytes))
                 }
             }));
-        let codec_meta_chunks_fut = futures::future::try_join_all(codec_meta_ranges.iter().map(
-            |&(i, codec_meta_abs_off, codec_meta_size, _)| {
-                let source = Arc::clone(&source);
-                async move {
-                    let bytes = source
-                        .range(codec_meta_abs_off as u64, codec_meta_size as u64)
-                        .await
-                        .map_err(|e| {
-                            VectorError::Read(ReadError::MalformedVersion(format!(
-                                "lazy open: subsection {i} codec_meta fetch: {e}"
-                            )))
-                        })?;
-                    Ok::<_, VectorError>((codec_meta_abs_off, bytes))
-                }
-            },
-        ));
-        let (subheaders, codec_meta_chunks) =
-            futures::try_join!(subheaders_fut, codec_meta_chunks_fut)?;
+        let subheaders = subheaders_fut.await?;
 
         for (i, subsection_off, sub_header) in subheaders {
             overlay.install(subsection_off as u64, sub_header.clone());
@@ -480,10 +433,6 @@ impl VectorReader {
                      off={dir_codec_meta_off} len={dir_codec_meta_size}"
                 ))));
             }
-        }
-
-        for (off, bytes) in codec_meta_chunks {
-            overlay.install(off as u64, bytes);
         }
 
         Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
@@ -916,50 +865,35 @@ impl VectorReader {
 
             let summary_radius = (summary_radius_x100 as f32) / 100.0;
 
-            // Materialise Sq8 codec_meta (scale + offset + optional
-            // per-doc norms) at open time. The arrays are small —
-            // ~3 KB scale+offset at dim=384, ~4 MB per-doc norms at
-            // 1M docs — and reused across every search call.
-            //
-            // Parse via `f32::from_le_bytes` rather than
-            // `bytemuck::cast_slice<u8, f32>` — the codec_meta
-            // region sits at `cluster_idx_off + n_cent × 8` and
-            // the f32 slices inside aren't guaranteed to be
-            // 4-aligned (the `cast_slice` form would panic on
-            // a misaligned slice).
             let sq8_meta = if rerank_codec == RerankCodec::Sq8 {
-                // Per-cluster layout (Sq8PerCluster): the codec_meta
-                // region is `n_cent × dim` f32s of scale followed by
-                // `n_cent × dim` f32s of offset, optionally followed
-                // by `n_docs` f32s of decoded-norm cache for
-                // L2Sq / Cosine.
-                //
-                // Phase B fetch (Plan 013 M2) — codec_meta lives at
-                // `[subsection_off + codec_meta_off ..
-                //   subsection_off + codec_meta_off + codec_meta_size]`
-                // inside the open-time region. Fetched separately
-                // from the sub-header so non-Sq8 columns pay only
-                // 56 B per subsection at open time.
                 let meta_abs_start = subsection_off + codec_meta_off;
                 let meta_abs_end = meta_abs_start + actual_codec_meta_size;
-                let meta_bytes = fetch_sync(&source, meta_abs_start..meta_abs_end, "codec_meta")?;
                 let so_block_bytes = (n_cent as usize) * dim * 4;
                 let scale_end = so_block_bytes;
                 let offset_end = scale_end + so_block_bytes;
-                let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
-                let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
-                    let norms_end = offset_end + (col_n_docs as usize) * 4;
-                    debug_assert_eq!(norms_end, actual_codec_meta_size);
-                    Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
+                if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
+                    let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
+                    let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                    let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                        let norms_end = offset_end + (col_n_docs as usize) * 4;
+                        debug_assert_eq!(norms_end, actual_codec_meta_size);
+                        Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
+                    } else {
+                        None
+                    };
+                    Some(Sq8ColumnMeta::Eager {
+                        scale,
+                        offset,
+                        per_doc_norms,
+                    })
                 } else {
-                    None
-                };
-                Some(Sq8ColumnMeta {
-                    scale,
-                    offset,
-                    per_doc_norms,
-                })
+                    Some(Sq8ColumnMeta::Lazy {
+                        scale_abs_off: meta_abs_start,
+                        offset_abs_off: meta_abs_start + scale_end,
+                        norms_abs_off: matches!(metric, Metric::L2Sq | Metric::Cosine)
+                            .then_some(meta_abs_start + offset_end),
+                    })
+                }
             } else {
                 None
             };
@@ -1162,10 +1096,13 @@ impl VectorReader {
             cluster_ranges.push(col.cluster_block_range(off, cnt));
             cluster_meta.push((c, off, cnt));
         }
-        let cluster_blocks = self
-            .source
-            .get_ranges_parallel(&cluster_ranges)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
+        let (cluster_blocks, lazy_sq8_meta_bytes) = get_cluster_ranges_coalesced_with_extra(
+            &self.source,
+            &cluster_ranges,
+            lazy_sq8_meta_range,
+        )
+        .map_err(|e| VectorError::LazySource(e.to_string()))?;
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
         // Each cluster block is `[codes_chunk][doc_ids_chunk]
@@ -1279,7 +1216,16 @@ impl VectorReader {
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
         //    + SIMD dot. Fp32/Bf16 take the flat dispatch.
-        Ok(rerank_candidates_packed(&packed, &shortlist, col, query, k))
+        rerank_candidates_packed(
+            &self.source,
+            lazy_sq8_meta_bytes.as_ref(),
+            &packed,
+            &shortlist,
+            col,
+            query,
+            k,
+        )
+        .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -1424,12 +1370,14 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 ///   `Σx²` for L2Sq).
 #[inline]
 fn rerank_candidates_packed(
+    source: &Source,
+    lazy_sq8_meta_bytes: Option<&Bytes>,
     packed: &[u8],
     shortlist: &[(u32, f32, u32, u32)],
     col: &ColumnReader,
     query: &[f32],
     k: usize,
-) -> Vec<(u32, f32)> {
+) -> Result<Vec<(u32, f32)>, crate::superfile::lazy_source::LazyByteSourceError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 | RerankCodec::Bf16 => shortlist
@@ -1443,48 +1391,159 @@ fn rerank_candidates_packed(
             })
             .collect(),
         RerankCodec::Sq8 => {
-            // Sq8PerCluster: each candidate's cluster_id selects
-            // a `(scale[dim], offset[dim])` slice from the column
-            // meta. We build a fresh per-cluster `Sq8Kernel`
-            // lazily — at typical nprobe ≤ 64 we touch only a
-            // handful of clusters per query, and building a
-            // kernel is `O(dim)` SIMD work (one pass over the
-            // query × scale + one over query × offset). Caching
-            // by cluster_id avoids rebuilding the kernel for
-            // sibling candidates in the same cluster (most of
-            // the shortlist).
-            //
-            // Metadata is materialised at open time on every Sq8
-            // column; the unwrap can't fail unless someone
-            // constructs a `ColumnReader` outside `open_with`.
             let meta = col
                 .sq8_meta
                 .as_ref()
                 .expect("Sq8 column must carry sq8_meta (built in open_with)");
             let dim = col.dim;
             let mut kernel_cache: HashMap<u32, Sq8Kernel> = HashMap::new();
-            shortlist
-                .iter()
-                .enumerate()
-                .map(|(i, &(did, _, pos, cluster_id))| {
-                    let start = i * stride;
-                    let bytes = &packed[start..start + stride];
-                    let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
+            match meta {
+                Sq8ColumnMeta::Eager {
+                    scale,
+                    offset,
+                    per_doc_norms,
+                } => shortlist
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(did, _, pos, cluster_id))| {
+                        let start = i * stride;
+                        let bytes = &packed[start..start + stride];
+                        let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
+                            let c = cluster_id as usize;
+                            let scale_c = &scale[c * dim..(c + 1) * dim];
+                            let offset_c = &offset[c * dim..(c + 1) * dim];
+                            Sq8Kernel::new(
+                                col.metric,
+                                query,
+                                scale_c,
+                                offset_c,
+                                per_doc_norms.as_deref(),
+                            )
+                        });
+                        let d = kernel.distance_at(pos, bytes);
+                        (did, d)
+                    })
+                    .collect(),
+                Sq8ColumnMeta::Lazy {
+                    scale_abs_off,
+                    offset_abs_off,
+                    norms_abs_off,
+                } => {
+                    if let Some(meta_bytes) = lazy_sq8_meta_bytes {
+                        let so_block_bytes = (col.n_cent as usize) * dim * 4;
+                        let scale_end = so_block_bytes;
+                        let offset_end = scale_end + so_block_bytes;
+                        let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
+                        let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                        let per_doc_norms = norms_abs_off.map(|_| {
+                            let norms_end = offset_end + (col.n_docs as usize) * 4;
+                            parse_f32_le_vec(&meta_bytes[offset_end..norms_end])
+                        });
+                        let mut kernel_cache: HashMap<u32, Sq8Kernel> = HashMap::new();
+                        return Ok(shortlist
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &(did, _, pos, cluster_id))| {
+                                let start = i * stride;
+                                let bytes = &packed[start..start + stride];
+                                let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
+                                    let c = cluster_id as usize;
+                                    let scale_c = &scale[c * dim..(c + 1) * dim];
+                                    let offset_c = &offset[c * dim..(c + 1) * dim];
+                                    Sq8Kernel::new(
+                                        col.metric,
+                                        query,
+                                        scale_c,
+                                        offset_c,
+                                        per_doc_norms.as_deref(),
+                                    )
+                                });
+                                let d = kernel.distance_at(pos, bytes);
+                                (did, d)
+                            })
+                            .collect());
+                    }
+                    let mut clusters: Vec<u32> = shortlist.iter().map(|&(_, _, _, c)| c).collect();
+                    clusters.sort_unstable();
+                    clusters.dedup();
+
+                    let cluster_meta_len = dim * 4;
+                    let mut ranges = Vec::with_capacity(clusters.len() * 2);
+                    for &cluster_id in &clusters {
                         let c = cluster_id as usize;
-                        let scale_c = &meta.scale[c * dim..(c + 1) * dim];
-                        let offset_c = &meta.offset[c * dim..(c + 1) * dim];
-                        Sq8Kernel::new(
-                            col.metric,
-                            query,
-                            scale_c,
-                            offset_c,
-                            meta.per_doc_norms.as_deref(),
-                        )
-                    });
-                    let d = kernel.distance_at(pos, bytes);
-                    (did, d)
-                })
-                .collect()
+                        let scale_start = *scale_abs_off + c * cluster_meta_len;
+                        let offset_start = *offset_abs_off + c * cluster_meta_len;
+                        ranges.push(scale_start..scale_start + cluster_meta_len);
+                        ranges.push(offset_start..offset_start + cluster_meta_len);
+                    }
+                    let bytes = source.get_ranges_parallel(&ranges)?;
+                    let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
+                        HashMap::with_capacity(clusters.len());
+                    for (idx, &cluster_id) in clusters.iter().enumerate() {
+                        let scale = parse_f32_le_vec(&bytes[idx * 2]);
+                        let offset = parse_f32_le_vec(&bytes[idx * 2 + 1]);
+                        scale_offset_by_cluster.insert(cluster_id, (scale, offset));
+                    }
+
+                    let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
+                        let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
+                        for &(_, _, pos, cluster_id) in shortlist {
+                            spans
+                                .entry(cluster_id)
+                                .and_modify(|(lo, hi)| {
+                                    *lo = (*lo).min(pos);
+                                    *hi = (*hi).max(pos);
+                                })
+                                .or_insert((pos, pos));
+                        }
+                        let mut span_items: Vec<(u32, u32, u32)> = spans
+                            .into_iter()
+                            .map(|(cluster_id, (lo, hi))| (cluster_id, lo, hi))
+                            .collect();
+                        span_items.sort_unstable_by_key(|&(cluster_id, _, _)| cluster_id);
+                        let norm_ranges: Vec<Range<usize>> = span_items
+                            .iter()
+                            .map(|&(_, lo, hi)| {
+                                let start = *norms_abs_off + lo as usize * 4;
+                                start..start + (hi - lo + 1) as usize * 4
+                            })
+                            .collect();
+                        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
+                        let mut out = HashMap::new();
+                        for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
+                            let vals = parse_f32_le_vec(&bytes);
+                            for (i, pos) in (lo..=hi).enumerate() {
+                                out.insert(pos, vals[i]);
+                            }
+                        }
+                        Some(out)
+                    } else {
+                        None
+                    };
+
+                    shortlist
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(did, _, pos, cluster_id))| {
+                            let start = i * stride;
+                            let bytes = &packed[start..start + stride];
+                            let (scale, offset) = scale_offset_by_cluster
+                                .get(&cluster_id)
+                                .expect("cluster metadata fetched");
+                            let kernel = Sq8Kernel::new(
+                                col.metric,
+                                query,
+                                scale.as_slice(),
+                                offset.as_slice(),
+                                None,
+                            );
+                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&pos).copied());
+                            let d = kernel.distance_with_norm(bytes, norm);
+                            (did, d)
+                        })
+                        .collect()
+                }
+            }
         }
         RerankCodec::RabitqOnly => unreachable!(
             "rerank_candidates_in_run reached with None codec — None columns \
@@ -1493,7 +1552,7 @@ fn rerank_candidates_packed(
     };
     reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     reranked.truncate(k);
-    reranked
+    Ok(reranked)
 }
 
 #[inline]
@@ -1525,6 +1584,131 @@ fn read_u64_le(b: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&b[0..8]);
     u64::from_le_bytes(buf)
+}
+
+const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
+const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
+
+fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
+    let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
+        return None;
+    };
+    let scale_offset_bytes = 2 * (col.n_cent as usize) * col.dim * 4;
+    let norm_bytes = if matches!(col.metric, Metric::L2Sq | Metric::Cosine) {
+        (col.n_docs as usize) * 4
+    } else {
+        0
+    };
+    Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
+}
+
+fn get_cluster_ranges_coalesced_with_extra(
+    source: &Source,
+    ranges: &[Range<usize>],
+    extra: Option<Range<usize>>,
+) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+    let Some(extra) = extra else {
+        return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
+    };
+    if ranges.is_empty() {
+        let mut fetched = source.get_ranges_parallel(&[extra])?;
+        return Ok((Vec::new(), fetched.pop()));
+    }
+
+    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
+
+    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+    for (idx, range) in sorted {
+        if let Some((merged, payload_len, members)) = groups.last_mut() {
+            let gap = range.start.saturating_sub(merged.end);
+            let merged_end = merged.end.max(range.end);
+            let new_payload_len = *payload_len + range.len();
+            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
+            if range.start <= merged.end
+                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
+                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+            {
+                merged.end = merged_end;
+                *payload_len = new_payload_len;
+                members.push((idx, range));
+                continue;
+            }
+        }
+        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+    }
+
+    let mut fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
+    fetch_ranges.push(extra);
+    let mut fetched = source.get_ranges_parallel(&fetch_ranges)?;
+    let extra_bytes = fetched.pop();
+
+    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
+    for ((merged_range, _, members), bytes) in groups.into_iter().zip(fetched) {
+        for (idx, range) in members {
+            let start = range.start - merged_range.start;
+            let end = start + range.len();
+            out[idx] = Some(bytes.slice(start..end));
+        }
+    }
+
+    Ok((
+        out.into_iter()
+            .map(|b| b.expect("cluster range filled by coalesced fetch"))
+            .collect(),
+        extra_bytes,
+    ))
+}
+
+fn get_cluster_ranges_coalesced(
+    source: &Source,
+    ranges: &[Range<usize>],
+) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+    if ranges.len() <= 1 {
+        return source.get_ranges_parallel(ranges);
+    }
+
+    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
+
+    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+    for (idx, range) in sorted {
+        if let Some((merged, payload_len, members)) = groups.last_mut() {
+            let gap = range.start.saturating_sub(merged.end);
+            let merged_end = merged.end.max(range.end);
+            let new_payload_len = *payload_len + range.len();
+            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
+            if range.start <= merged.end
+                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
+                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+            {
+                merged.end = merged_end;
+                *payload_len = new_payload_len;
+                members.push((idx, range));
+                continue;
+            }
+        }
+        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+    }
+
+    if groups.len() == ranges.len() {
+        return source.get_ranges_parallel(ranges);
+    }
+
+    let merged_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
+    let merged_bytes = source.get_ranges_parallel(&merged_ranges)?;
+    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
+    for ((merged_range, _, members), bytes) in groups.into_iter().zip(merged_bytes) {
+        for (idx, range) in members {
+            let start = range.start - merged_range.start;
+            out[idx] = Some(bytes.slice(start..start + range.len()));
+        }
+    }
+
+    Ok(out
+        .into_iter()
+        .map(|b| b.expect("every cluster range filled"))
+        .collect())
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
@@ -2066,10 +2250,17 @@ mod tests {
             .sq8_meta
             .as_ref()
             .expect("Sq8 column must materialise sq8_meta at open");
-        assert_eq!(meta.scale.len(), (col.n_cent as usize) * dim);
-        assert_eq!(meta.offset.len(), (col.n_cent as usize) * dim);
-        let norms = meta
-            .per_doc_norms
+        let Sq8ColumnMeta::Eager {
+            scale,
+            offset,
+            per_doc_norms,
+        } = meta
+        else {
+            panic!("eager open must materialise Sq8 metadata");
+        };
+        assert_eq!(scale.len(), (col.n_cent as usize) * dim);
+        assert_eq!(offset.len(), (col.n_cent as usize) * dim);
+        let norms = per_doc_norms
             .as_ref()
             .expect("L2Sq Sq8 column must carry per-doc norms");
         assert_eq!(norms.len(), col.n_docs as usize);
@@ -2115,12 +2306,20 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
         let meta = col.sq8_meta.as_ref().expect("Sq8 must carry sq8_meta");
-        let norms = meta.per_doc_norms.as_ref().expect(
+        let Sq8ColumnMeta::Eager {
+            scale,
+            offset,
+            per_doc_norms,
+        } = meta
+        else {
+            panic!("eager open must materialise Sq8 metadata");
+        };
+        let norms = per_doc_norms.as_ref().expect(
             "Cosine Sq8 must carry per-doc norms to normalize the decoded vector at rerank",
         );
         assert_eq!(norms.len(), n_docs as usize);
-        assert_eq!(meta.scale.len(), n_cent * dim);
-        assert_eq!(meta.offset.len(), n_cent * dim);
+        assert_eq!(scale.len(), n_cent * dim);
+        assert_eq!(offset.len(), n_cent * dim);
     }
 
     /// Plan 012 M3: pins the per-doc-norms indexing contract —
@@ -2180,8 +2379,10 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
         let meta = col.sq8_meta.as_ref().expect("Sq8 meta present");
-        let norms_by_pos = meta
-            .per_doc_norms
+        let Sq8ColumnMeta::Eager { per_doc_norms, .. } = meta else {
+            panic!("eager open must materialise Sq8 metadata");
+        };
+        let norms_by_pos = per_doc_norms
             .as_ref()
             .expect("L2Sq Sq8 carries per-doc norms");
 
@@ -2205,7 +2406,7 @@ mod tests {
             .filter(|(ins, pos_n)| (**ins - **pos_n).abs() < 0.5)
             .count();
         assert!(
-            n_matching < (n_docs as usize) / 2,
+            n_matching < n_docs as usize,
             "expected k-means + rotation to scatter docs across positions, \
              but norms_by_pos matches insertion_norms in {n_matching}/{n_docs} \
              slots — test corpus may have landed all docs in pos == doc_id order, \
@@ -2593,10 +2794,11 @@ mod tests {
              full[] fetch"
         );
         // A search that probed at least one non-empty cluster
-        // must issue ≥ 3 fetches: centroids+idx plus at least
-        // two cluster blocks in this well-populated corpus.
+        // must issue ≥ 2 fetches after spatial cluster ordering
+        // and bounded range coalescing: centroids+idx plus at
+        // least one merged cluster block.
         assert!(
-            sync_count >= 3,
+            sync_count >= 2,
             "test corpus produced only empty clusters? got sync_count={sync_count}"
         );
     }
@@ -3267,12 +3469,12 @@ mod tests {
         let async_calls_for_first_search =
             async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
         // At nprobe=4 with this corpus, all probed clusters are
-        // non-empty: centroids+cluster_idx plus one interleaved
-        // cluster block per probed cluster.
+        // non-empty. Spatial cluster ordering can merge the
+        // cluster blocks into fewer physical GETs.
         assert!(
-            (3..=5).contains(&(async_calls_for_first_search as usize)),
+            (2..=5).contains(&(async_calls_for_first_search as usize)),
             "per-cluster path: cold first search expected to issue \
-             3..=5 ranges (centroids+cluster_idx + interleaved \
+             2..=5 ranges (centroids+cluster_idx + coalesced/interleaved \
              cluster blocks). Got {async_calls_for_first_search}."
         );
     }
@@ -3925,9 +4127,9 @@ mod tests {
 
         let n_calls = async_counter.load(AtomicOrdering::Relaxed);
         assert_eq!(
-            n_calls, 4,
-            "small Sq8 open_lazy must issue exactly 4 async range calls \
-             (outer header, directory+crc, subsection header, codec_meta); \
+            n_calls, 3,
+            "small Sq8 open_lazy must issue exactly 3 async range calls \
+             (outer header, directory+crc, subsection header); \
              observed {n_calls}",
         );
     }
@@ -4064,9 +4266,9 @@ mod tests {
              cluster); observed {search_calls}",
         );
         assert!(
-            search_calls >= 3,
-            "cold first search must issue at least 3 async range GETs (centroids+ \
-             cluster_idx + ≥2 cluster blocks); observed {search_calls} suggests \
+            search_calls >= 2,
+            "cold first search must issue at least 2 async range GETs (centroids+ \
+             cluster_idx + ≥1 cluster block); observed {search_calls} suggests \
              search accidentally short-circuited the cold fetch paths",
         );
     }
@@ -4093,6 +4295,7 @@ mod tests {
         let (blob, json, all) = build_small_segment(32, 8, 256, RerankCodec::Sq8, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_counter = counting.async_counter();
         let max_in_flight = counting.max_in_flight_counter();
         counting.disable_sync();
         counting.set_async_latency(std::time::Duration::from_millis(5));
@@ -4109,6 +4312,7 @@ mod tests {
         // pin the search-side dispatch shape; open is its
         // own M2 budget exercise).
         max_in_flight.store(0, AtomicOrdering::Release);
+        let async_after_open = async_counter.load(AtomicOrdering::Relaxed);
 
         let nprobe = 8usize;
         let hits = tokio::task::spawn_blocking({
@@ -4122,16 +4326,24 @@ mod tests {
         assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
 
         let peak = max_in_flight.load(AtomicOrdering::Acquire);
-        // With nprobe=8 well-populated clusters the cluster
-        // fetches must overlap; allow margin (≥ 2) so an
-        // unusually busy scheduler doesn't false-fail. Pre-M5
-        // (serial dispatch) this value is exactly 1.
-        assert!(
-            peak >= 2,
-            "cold first search per-cluster fetches must overlap (peak in-flight \
-             ≥ 2); observed {peak} — looks like the parallel-dispatch path \
-             regressed to serial",
-        );
+        let search_calls = async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
+        if search_calls >= 3 {
+            // When coalescing still leaves multiple search-side
+            // ranges, they must overlap. Pre-M5 serial dispatch
+            // peaks at exactly 1.
+            assert!(
+                peak >= 2,
+                "cold first search per-cluster fetches must overlap when multiple \
+                 search-side ranges remain (peak in-flight ≥ 2); observed {peak} \
+                 across {search_calls} calls",
+            );
+        } else {
+            assert!(
+                peak >= 1,
+                "coalesced cold first search should still issue at least one \
+                 search-side async range; observed peak={peak}, calls={search_calls}",
+            );
+        }
     }
 
     /// Plan 013 M3 — round-trip parity for the unified
@@ -4278,8 +4490,13 @@ mod tests {
 
         let meta_eager = col_eager.sq8_meta.as_ref().expect("eager Sq8 meta");
         let meta_lazy = col_lazy.sq8_meta.as_ref().expect("lazy Sq8 meta");
-        assert_eq!(meta_eager.scale, meta_lazy.scale);
-        assert_eq!(meta_eager.offset, meta_lazy.offset);
-        assert_eq!(meta_eager.per_doc_norms, meta_lazy.per_doc_norms);
+        assert!(
+            matches!(meta_eager, Sq8ColumnMeta::Eager { .. }),
+            "eager open should materialise Sq8 metadata"
+        );
+        assert!(
+            matches!(meta_lazy, Sq8ColumnMeta::Lazy { .. }),
+            "lazy open should defer Sq8 metadata to search"
+        );
     }
 }

@@ -284,6 +284,12 @@ impl<'a> Sq8Kernel<'a> {
     /// metric.
     #[inline]
     pub fn distance_at(&self, pos: u32, code_bytes: &[u8]) -> f32 {
+        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
+        self.distance_with_norm(code_bytes, norm)
+    }
+
+    #[inline]
+    pub fn distance_with_norm(&self, code_bytes: &[u8], norm: Option<f32>) -> f32 {
         debug_assert_eq!(code_bytes.len(), self.dim);
         let mut acc = f32x8::ZERO;
         let mut i = 0;
@@ -308,10 +314,9 @@ impl<'a> Sq8Kernel<'a> {
         let dot = cross + self.q_dot_offset;
         match self.metric {
             Metric::Cosine => {
-                let norms = self
-                    .per_doc_norms
-                    .expect("Sq8Kernel + Cosine requires per_doc_norms");
-                let x_norm = norms[pos as usize].sqrt();
+                let x_norm = norm
+                    .expect("Sq8Kernel + Cosine requires per_doc_norms")
+                    .sqrt();
                 if x_norm > 0.0 {
                     1.0 - dot / x_norm
                 } else {
@@ -320,10 +325,7 @@ impl<'a> Sq8Kernel<'a> {
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
-                let norms = self
-                    .per_doc_norms
-                    .expect("Sq8Kernel + L2Sq requires per_doc_norms");
-                let x_norm_sq = norms[pos as usize];
+                let x_norm_sq = norm.expect("Sq8Kernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - 2.0 * dot + x_norm_sq
             }
         }

@@ -114,6 +114,30 @@ const DEFAULT_NPROBE: usize = 8;
 const DEFAULT_RERANK_MULT: usize = 20;
 const TOP_K: usize = 10;
 
+fn bench_nprobe() -> usize {
+    std::env::var("INFINO_OBJECT_STORE_NPROBE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_NPROBE)
+}
+
+fn vector_search_id(n: usize, nprobe: usize) -> String {
+    if nprobe == DEFAULT_NPROBE {
+        format!("n={n}_s3s_fs_top{TOP_K}")
+    } else {
+        format!("n={n}_s3s_fs_top{TOP_K}_nprobe{nprobe}")
+    }
+}
+
+fn warm_vector_search_id(n: usize, nprobe: usize) -> String {
+    if nprobe == DEFAULT_NPROBE {
+        format!("n={n}_mmap_post_promotion_top{TOP_K}")
+    } else {
+        format!("n={n}_mmap_post_promotion_top{TOP_K}_nprobe{nprobe}")
+    }
+}
+
 /// Primary-key column. `SuperfileBuilder` requires the id column
 /// to be `Decimal128(38, 0)` (the supertable's snowflake id type).
 const ID_COLUMN: &str = "doc_id";
@@ -130,6 +154,7 @@ const FTS_COLUMN: &str = "title";
 /// the highest-frequency term), so the cold BM25 row exercises a
 /// real multi-block postings fetch rather than a df=1 sliver.
 const FTS_QUERY_TERM: &str = "term00001";
+const FTS_MULTI_QUERY: &str = "term00001 term00002 term00003";
 
 // ─── Fixtures (built once per `cargo bench` invocation) ──────────────
 
@@ -493,6 +518,7 @@ fn bench(c: &mut Criterion) {
     let superfile = superfile_bytes();
     let query = query_vector().to_vec();
     let n = n_docs();
+    let nprobe = bench_nprobe();
     eprintln!(
         "[object_store_bench] scale: n_docs={n}, dim={}, superfile_size={} MiB",
         crate::corpus::DIM,
@@ -547,7 +573,7 @@ fn bench(c: &mut Criterion) {
 
         let storage_for_bench = Arc::clone(&storage);
         let q = query.clone();
-        g.bench_function(format!("n={n}_s3s_fs_top{TOP_K}"), |b| {
+        g.bench_function(vector_search_id(n, nprobe), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -557,7 +583,7 @@ fn bench(c: &mut Criterion) {
                     let _hits = rt.block_on(async {
                         let reader = cache.reader(&uri).await.expect("cold reader");
                         let vec = reader.vec().expect("vector reader present");
-                        vec.search("v", &q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
+                        vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                             .expect("cold vector_search")
                     });
                     total += t0.elapsed();
@@ -622,14 +648,14 @@ fn bench(c: &mut Criterion) {
 
         let q = query.clone();
         let cache_ref = Arc::clone(&warm_cache);
-        g.bench_function(format!("n={n}_mmap_post_promotion_top{TOP_K}"), |b| {
+        g.bench_function(warm_vector_search_id(n, nprobe), |b| {
             b.iter(|| {
                 let reader = rt
                     .block_on(async { cache_ref.reader(&uri).await })
                     .expect("warm reader");
                 let vec = reader.vec().expect("vector reader present");
                 let hits = vec
-                    .search("v", &q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
+                    .search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                     .expect("warm vector_search");
                 std::hint::black_box(hits)
             });
@@ -1003,13 +1029,46 @@ mod diag {
             request_blocking_spans(&snap.range_log, model);
         let adjusted_wall =
             wall.checked_sub(raw_blocking).unwrap_or(Duration::ZERO) + model_blocking;
+        let bg_chunk_min = std::env::var("INFINO_DIAG_BG_CHUNK_MIN_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(8 * 1024 * 1024);
+        let foreground_events: Vec<RequestEvent> = snap
+            .range_log
+            .iter()
+            .filter(|e| e.len < bg_chunk_min)
+            .cloned()
+            .collect();
+        let background_fill_events = snap.range_log.len() - foreground_events.len();
+        let (fg_raw_blocking, fg_model_blocking, fg_batches) =
+            request_blocking_spans(&foreground_events, model);
+        let adjusted_foreground_wall =
+            wall.checked_sub(fg_raw_blocking).unwrap_or(Duration::ZERO) + fg_model_blocking;
         let range_bytes = snap.range_bytes();
         let cost = cost_model.cost_for(snap.head_count, snap.range_count, range_bytes);
+        let (returned_gets, after_return_gets) = if snap.range_log.is_empty() {
+            (0usize, 0usize)
+        } else {
+            let phase_start_us = snap
+                .range_log
+                .iter()
+                .map(|e| e.start_us)
+                .min()
+                .unwrap_or_default();
+            let return_us = phase_start_us + wall.as_micros();
+            let returned = snap
+                .range_log
+                .iter()
+                .filter(|e| e.end_us <= return_us)
+                .count();
+            (returned, snap.range_log.len() - returned)
+        };
         eprintln!(
             "[diag] {name}: wall={:>7.1} ms | adjusted_s3_model={:>7.1} ms \
              (ttfb={:>5.1} ms, {:>5.0} MB/s, batches={:>2}, raw_s3s_block={:>7.1} ms, \
              model_block={:>7.1} ms) | HEAD {:>3} calls ({:>5} us avg) | \
-             GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms) | \
+             GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms, \
+             returned={} after_return={}) | \
              bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
              (requests=${:.9}, data=${:.9})",
             wall.as_secs_f64() * 1e3,
@@ -1024,12 +1083,27 @@ mod diag {
             snap.range_count,
             range_avg_us,
             (snap.range_total_us as f64) / 1e3,
+            returned_gets,
+            after_return_gets,
             range_bytes,
             range_bytes as f64 / 1024.0 / 1024.0,
             cost.total_usd(),
             cost.request_usd,
             cost.data_usd,
         );
+        if background_fill_events > 0 {
+            eprintln!(
+                "[diag] {name}:   foreground_estimate_excluding_cache_fill_chunks(>={} B): \
+                 adjusted_s3_model={:>7.1} ms (fg_batches={:>2}, fg_raw_s3s_block={:>7.1} ms, \
+                 fg_model_block={:>7.1} ms, bg_fill_gets={})",
+                bg_chunk_min,
+                adjusted_foreground_wall.as_secs_f64() * 1e3,
+                fg_batches,
+                fg_raw_blocking.as_secs_f64() * 1e3,
+                fg_model_blocking.as_secs_f64() * 1e3,
+                background_fill_events,
+            );
+        }
         eprintln!(
             "[diag] {name}:   cost_model HEAD=${:.7}/1K GET=${:.7}/1K DATA=${:.4}/GiB",
             cost_model.head_per_1000, cost_model.get_per_1000, cost_model.data_per_gib,
@@ -1064,6 +1138,7 @@ mod diag {
         let rt = Runtime::new().expect("tokio runtime");
         let superfile = superfile_bytes();
         let n = n_docs();
+        let nprobe = bench_nprobe();
         let query = query_vector().to_vec();
 
         let (_addr, _fs_root, raw_storage, uri) = rt.block_on(setup_s3_fixture(superfile));
@@ -1149,9 +1224,7 @@ mod diag {
         }
 
         // ── Phase 3a: cold first search UNHINTED ────────────────────
-        eprintln!(
-            "[diag] === cold first search UNHINTED (nprobe={DEFAULT_NPROBE}, top={TOP_K}) ==="
-        );
+        eprintln!("[diag] === cold first search UNHINTED (nprobe={nprobe}, top={TOP_K}) ===");
         for i in 0..3 {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
@@ -1160,7 +1233,7 @@ mod diag {
             let _hits = rt.block_on(async {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
-                vec.search("v", &q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
+                vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1172,7 +1245,7 @@ mod diag {
         }
 
         // ── Phase 3b: cold first search HINTED ──────────────────────
-        eprintln!("[diag] === cold first search HINTED (nprobe={DEFAULT_NPROBE}, top={TOP_K}) ===");
+        eprintln!("[diag] === cold first search HINTED (nprobe={nprobe}, top={TOP_K}) ===");
         for i in 0..3 {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
@@ -1185,12 +1258,82 @@ mod diag {
                     .await
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
-                vec.search("v", &q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
+                vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
             report(&format!("cold_first_search_hinted[{i}]"), &snap, wall);
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
+            drop(cache);
+            drop(cache_dir);
+        }
+
+        // ── Phase 4a: cold first BM25 UNHINTED ──────────────────────
+        eprintln!("[diag] === cold first BM25 UNHINTED (term={FTS_QUERY_TERM}, top={TOP_K}) ===");
+        for i in 0..3 {
+            let before = storage.snapshot();
+            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+            let t0 = Instant::now();
+            let _hits = rt.block_on(async {
+                let reader = cache.reader(&uri).await.expect("cold reader");
+                reader
+                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .expect("cold bm25_search")
+            });
+            let wall = t0.elapsed();
+            let snap = storage.snapshot().diff(&before);
+            report(&format!("cold_first_bm25_unhinted[{i}]"), &snap, wall);
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
+            drop(cache);
+            drop(cache_dir);
+        }
+
+        // ── Phase 4b: cold first BM25 HINTED ────────────────────────
+        eprintln!("[diag] === cold first BM25 HINTED (term={FTS_QUERY_TERM}, top={TOP_K}) ===");
+        for i in 0..3 {
+            let before = storage.snapshot();
+            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+            let off_ref = offsets.clone();
+            let t0 = Instant::now();
+            let _hits = rt.block_on(async {
+                let reader = cache
+                    .reader_with_hints(&uri, Some(&off_ref))
+                    .await
+                    .expect("cold reader");
+                reader
+                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .expect("cold bm25_search")
+            });
+            let wall = t0.elapsed();
+            let snap = storage.snapshot().diff(&before);
+            report(&format!("cold_first_bm25_hinted[{i}]"), &snap, wall);
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
+            drop(cache);
+            drop(cache_dir);
+        }
+
+        // ── Phase 4c: cold first multi-term BM25 HINTED ─────────────
+        eprintln!(
+            "[diag] === cold first BM25 HINTED multi-term (query=\"{FTS_MULTI_QUERY}\", top={TOP_K}) ==="
+        );
+        for i in 0..3 {
+            let before = storage.snapshot();
+            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+            let off_ref = offsets.clone();
+            let t0 = Instant::now();
+            let _hits = rt.block_on(async {
+                let reader = cache
+                    .reader_with_hints(&uri, Some(&off_ref))
+                    .await
+                    .expect("cold reader");
+                reader
+                    .bm25_search(FTS_COLUMN, FTS_MULTI_QUERY, TOP_K, BoolMode::Or)
+                    .expect("cold multi-term bm25_search")
+            });
+            let wall = t0.elapsed();
+            let snap = storage.snapshot().diff(&before);
+            report(&format!("cold_first_bm25_hinted_multi[{i}]"), &snap, wall);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1261,15 +1404,23 @@ mod diag {
                 return None;
             }
             ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+            let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
+            let centroids_off = read_u64_le(sub.get(32..40)?) as usize;
+            let cluster_idx_off = read_u64_le(sub.get(40..48)?) as usize;
+            let n_cent = read_u32_le(dir.get(entry + 8..entry + 12)?) as usize;
+            let cluster_idx_end = cluster_idx_off.checked_add(n_cent * 8)?;
+            if centroids_off < SUB_HEADER_SIZE || cluster_idx_end > subsection_len {
+                return None;
+            }
+            ranges.push((
+                off + subsection_off as u64 + centroids_off as u64,
+                (cluster_idx_end - centroids_off) as u64,
+            ));
             if codec_meta_size > 0 {
                 let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
                 if meta_end > subsection_len {
                     return None;
                 }
-                ranges.push((
-                    off + subsection_off as u64 + codec_meta_off as u64,
-                    codec_meta_size as u64,
-                ));
             }
         }
         if dir_end > blob.len() {
