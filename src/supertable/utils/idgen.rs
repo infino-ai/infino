@@ -388,7 +388,10 @@ mod tests {
         assert_eq!(flat.len(), n as usize);
         let mut seen = std::collections::HashSet::with_capacity(n as usize);
         for id in &flat {
-            assert!(seen.insert(*id), "duplicate id in reserve_range output: {id}");
+            assert!(
+                seen.insert(*id),
+                "duplicate id in reserve_range output: {id}"
+            );
         }
         for w in flat.windows(2) {
             assert!(w[1] > w[0]);

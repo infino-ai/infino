@@ -39,16 +39,24 @@
 //! step-4 PUT is overwrite-safe and the step-5 manifest swap can
 //! short-circuit via the idempotency probe in step 1.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::storage::StorageError;
+use crate::superfile::SuperfileReader;
+use crate::superfile::builder::SuperfileBuilder;
 use crate::supertable::handle::Supertable;
-use crate::supertable::manifest::SuperfileEntry;
+use crate::supertable::manifest::bloom::BloomBuilder;
+use crate::supertable::manifest::{
+    FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary,
+};
+use crate::supertable::utils::vector_split::split_vectors;
 use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{AppendedPairRange, OpKind, WalState, WalStateDoc};
+use crate::supertable::wal::state_doc::{AppendedPairRange, IdSpan, OpKind, WalState, WalStateDoc};
 
 /// Outcome of one append-phase invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,39 +284,296 @@ async fn do_apply(
     wal_etag: &Etag,
     preallocated_superfile_id: Uuid,
 ) -> Result<(WalStateDoc, Etag), AppendPhaseError> {
-    // Steps 2-6 land in a follow-up commit. The orchestrator's
-    // outer shape (pre-condition checks, the idempotency short
-    // circuit, error variants) is reviewable on its own; pulling
-    // in the IPC decode + superfile build + manifest commit
-    // mechanics adds ~500 lines that are easier to review
-    // separately.
-    let _ = (
-        supertable,
-        wal_store,
-        wal_doc,
-        wal_etag,
-        preallocated_superfile_id,
-    );
-    Err(AppendPhaseError::SuperfileBuild {
-        message: "do_apply not yet implemented in this commit".into(),
+    let inner = supertable.inner();
+    let storage = inner
+        .options
+        .storage
+        .as_ref()
+        .ok_or(AppendPhaseError::NoStorageAttached)?
+        .clone();
+
+    // ---- Step 2: Fetch + verify IPC sidecar ----
+    let hash = wal_doc
+        .new_row_content_hash
+        .as_deref()
+        .ok_or(AppendPhaseError::MissingField {
+            field: "new_row_content_hash",
+        })?;
+    let ipc_bytes = wal_store
+        .get_arrow(wal_doc.wal_id, Some(hash))
+        .await
+        .map_err(|e| match e {
+            WalStoreError::SidecarContentHashMismatch { expected, got, .. } => {
+                AppendPhaseError::SidecarContentHashMismatch {
+                    wal_id: wal_doc.wal_id.to_hex(),
+                    expected,
+                    got,
+                }
+            }
+            other => AppendPhaseError::WalStore(other),
+        })?;
+
+    // ---- Step 3: Decode IPC + build the _id-prefixed batch ----
+    let user_batch = decode_ipc_batch(&ipc_bytes, wal_doc)?;
+    let new_row_count = wal_doc
+        .new_row_count
+        .ok_or(AppendPhaseError::MissingField {
+            field: "new_row_count",
+        })?;
+    let flat_ids = flatten_spans(&wal_doc.minted_id_spans);
+    if flat_ids.len() != new_row_count as usize {
+        return Err(AppendPhaseError::IdSpansLengthMismatch {
+            wal_id: wal_doc.wal_id.to_hex(),
+            flat_len: flat_ids.len(),
+            expected: new_row_count,
+        });
+    }
+    if user_batch.num_rows() != flat_ids.len() {
+        return Err(AppendPhaseError::IdSpansLengthMismatch {
+            wal_id: wal_doc.wal_id.to_hex(),
+            flat_len: flat_ids.len(),
+            expected: user_batch.num_rows() as u32,
+        });
+    }
+    let scalar_with_id = prepend_id_column(&user_batch, &flat_ids, &inner.options)?;
+
+    // Vector slices live in `user_batch`; we hold it alive
+    // across the builder.add_batch call below.
+    let (_user_scalar_no_id, vector_slices) =
+        split_vectors(&user_batch, &inner.options).map_err(|e| {
+            AppendPhaseError::SuperfileBuild {
+                message: format!("vector_split: {e}"),
+            }
+        })?;
+
+    // ---- Step 4+5: Build the superfile bytes ----
+    let bytes = {
+        let mut builder = SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
+            AppendPhaseError::SuperfileBuild {
+                message: format!("builder construction: {e}"),
+            }
+        })?;
+        builder
+            .add_batch(&scalar_with_id, &vector_slices)
+            .map_err(|e| AppendPhaseError::SuperfileBuild {
+                message: format!("add_batch: {e}"),
+            })?;
+        let raw = builder
+            .finish()
+            .map_err(|e| AppendPhaseError::SuperfileBuild {
+                message: format!("finish: {e}"),
+            })?;
+        Bytes::from(raw)
+    };
+
+    // ---- Step 6: Per-superfile summaries + SuperfileEntry ----
+    //
+    // FTS + vector summaries are derived from a fresh
+    // `SuperfileReader` on the just-built bytes — same shape the
+    // writer's `prepare_segment` uses. Scalar stats come from
+    // the in-memory `RecordBatch` directly; nothing needs to
+    // round-trip through Parquet.
+    let reader = SuperfileReader::open_with(bytes.clone(), inner.options.superfile_open_options())
+        .map_err(|e| AppendPhaseError::SuperfileOpenForSummary {
+            message: e.to_string(),
+        })?;
+    let fts_summary = build_fts_summary(&reader, &inner.options);
+    let vector_summary = build_vector_summary(&reader, &inner.options);
+    let scalar_stats =
+        ScalarStatsTable::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
+
+    let (id_min, id_max) = if flat_ids.is_empty() {
+        (0, 0)
+    } else {
+        (flat_ids[0], flat_ids[flat_ids.len() - 1])
+    };
+
+    let uri = SuperfileUri(preallocated_superfile_id);
+    let entry = Arc::new(SuperfileEntry {
+        superfile_id: preallocated_superfile_id,
+        uri,
+        n_docs: flat_ids.len() as u64,
+        id_min,
+        id_max,
+        scalar_stats,
+        fts_summary,
+        vector_summary,
+        // Unpartitioned default: the supertable's partition
+        // machinery (`assign_partition` inside the commit
+        // attempt) re-derives the on-disk `partition_key` from
+        // the strategy + this entry's stats at commit time,
+        // which is correct for the Hash{n_buckets=1} default.
+        partition_key: Vec::new(),
+        partition_hint: None,
+    });
+
+    // ---- Step 5: CAS-commit the manifest ----
+    //
+    // The writer's `persist_commit` handles the actual PUT of
+    // the superfile bytes (via `pending_storage_writes`), the
+    // OCC retry on the pointer file, and the partition-aware
+    // part rewrite. It returns the new in-memory `Manifest`
+    // that reflects the persisted state, but it does NOT swap
+    // `inner.manifest` itself — the caller owns that final
+    // visibility barrier, mirroring how the synchronous
+    // `Writer::commit` path arms it. We swap here so subsequent
+    // reads + the idempotency probe on a retry both see the
+    // new superfile.
+    let new_manifest =
+        crate::supertable::writer::persist_commit(inner, storage, vec![entry], vec![(uri, bytes)])
+            .map_err(|e| AppendPhaseError::ManifestCommit {
+                message: format!("{e}"),
+            })?;
+    inner.manifest.store(Arc::new(new_manifest));
+
+    // ---- Step 6: Advance WAL state to Appended ----
+    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag, preallocated_superfile_id).await
+}
+
+/// Flatten a `Vec<IdSpan>` into the implied sequence of `i128`
+/// ids in order. Total cost is O(n) in the flattened count;
+/// allocated once per append-phase invocation.
+fn flatten_spans(spans: &[IdSpan]) -> Vec<i128> {
+    let total: usize = spans.iter().map(|s| s.len() as usize).sum();
+    let mut out = Vec::with_capacity(total);
+    for span in spans {
+        for v in span.first.0..=span.last.0 {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Decode the WAL's IPC sidecar back to the user-shape
+/// `RecordBatch`. The sidecar contains exactly one batch (the
+/// `new_rows` argument the caller passed to `update()`); we read
+/// the first and verify there isn't a second.
+fn decode_ipc_batch(
+    ipc_bytes: &Bytes,
+    wal_doc: &WalStateDoc,
+) -> Result<RecordBatch, AppendPhaseError> {
+    use arrow::ipc::reader::StreamReader;
+    let cursor = std::io::Cursor::new(ipc_bytes.as_ref());
+    let mut reader =
+        StreamReader::try_new(cursor, None).map_err(|e| AppendPhaseError::IpcDecode {
+            wal_id: wal_doc.wal_id.to_hex(),
+            message: format!("StreamReader::try_new: {e}"),
+        })?;
+    let batch = reader
+        .next()
+        .ok_or_else(|| AppendPhaseError::IpcDecode {
+            wal_id: wal_doc.wal_id.to_hex(),
+            message: "IPC stream had no batches; expected exactly one".into(),
+        })?
+        .map_err(|e| AppendPhaseError::IpcDecode {
+            wal_id: wal_doc.wal_id.to_hex(),
+            message: format!("batch read: {e}"),
+        })?;
+    if reader.next().is_some() {
+        return Err(AppendPhaseError::IpcDecode {
+            wal_id: wal_doc.wal_id.to_hex(),
+            message: "IPC stream had more than one batch; expected exactly one".into(),
+        });
+    }
+    Ok(batch)
+}
+
+/// Construct a new `RecordBatch` matching the supertable's
+/// `scalar_schema()` shape — `_id` column prepended, followed by
+/// the user's scalar columns. The vector columns are NOT in this
+/// batch; they get passed alongside to `SuperfileBuilder::add_batch`.
+fn prepend_id_column(
+    user_batch: &RecordBatch,
+    flat_ids: &[i128],
+    options: &crate::supertable::SupertableOptions,
+) -> Result<RecordBatch, AppendPhaseError> {
+    use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
+
+    // Validate batch against user schema first — surfaces a
+    // clean error instead of a confusing builder failure
+    // downstream.
+    if user_batch.schema().as_ref() != options.schema.as_ref() {
+        return Err(AppendPhaseError::SuperfileBuild {
+            message: "IPC sidecar's RecordBatch schema doesn't match the supertable's user schema"
+                .into(),
+        });
+    }
+
+    let (scalar_no_id, _) =
+        split_vectors(user_batch, options).map_err(|e| AppendPhaseError::SuperfileBuild {
+            message: format!("split_vectors: {e}"),
+        })?;
+
+    let id_values: Vec<i128> = flat_ids.to_vec();
+    let id_array = Decimal128Array::from(id_values)
+        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+        .map_err(|e| AppendPhaseError::SuperfileBuild {
+            message: format!("Decimal128 precision/scale: {e}"),
+        })?;
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
+    columns.push(Arc::new(id_array));
+    columns.extend(scalar_no_id.columns().iter().cloned());
+
+    RecordBatch::try_new(options.scalar_schema(), columns).map_err(|e| {
+        AppendPhaseError::SuperfileBuild {
+            message: format!("RecordBatch::try_new with _id prepended: {e}"),
+        }
     })
 }
 
-/// Build the superfile bytes for a WAL's append phase.
-///
-/// Decodes the IPC sidecar back to a `RecordBatch`, prepends a
-/// `_id` column populated by flattening `minted_id_spans`, then
-/// runs the result through `SuperfileBuilder::add_batch` +
-/// `finish`. The output is bit-identical across replays given
-/// the same inputs, which is the load-bearing property the
-/// append-phase replay-safety story rests on.
-#[allow(dead_code)] // wired up by do_apply in a follow-up commit
-fn assemble_superfile_bytes(
-    _supertable: &Supertable,
-    _wal_doc: &WalStateDoc,
-    _ipc_bytes: &Bytes,
-) -> Result<(Bytes, Arc<SuperfileEntry>), AppendPhaseError> {
-    todo!("assemble_superfile_bytes lands alongside do_apply")
+/// Per-FTS-column bloom + range summary derived from the
+/// just-built superfile's `SuperfileReader`. Mirrors the shape
+/// the writer's `prepare_segment` builds so summaries match
+/// regardless of which code path produced the superfile.
+fn build_fts_summary(
+    reader: &SuperfileReader,
+    options: &crate::supertable::SupertableOptions,
+) -> HashMap<String, FtsSummary> {
+    let mut out: HashMap<String, FtsSummary> = HashMap::new();
+    let Some(fts_reader) = reader.fts() else {
+        return out;
+    };
+    for fc in &options.fts_columns {
+        let terms = fts_reader.iter_column_terms(&fc.column);
+        let n_terms_distinct = terms.len() as u32;
+        let (min_term, max_term) = match (terms.first(), terms.last()) {
+            (Some(min), Some(max)) => (min.clone(), max.clone()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        let mut bloom_builder = BloomBuilder::new();
+        for term in &terms {
+            bloom_builder.insert(term);
+        }
+        out.insert(
+            fc.column.clone(),
+            FtsSummary {
+                term_bloom: bloom_builder.finish(),
+                n_terms_distinct,
+                term_range: (min_term, max_term),
+            },
+        );
+    }
+    out
+}
+
+/// Per-vector-column centroid + radius summary. `None` from the
+/// reader → column absent from this superfile's vector blob → no
+/// entry in the summary map.
+fn build_vector_summary(
+    reader: &SuperfileReader,
+    options: &crate::supertable::SupertableOptions,
+) -> HashMap<String, VectorSummary> {
+    let mut out: HashMap<String, VectorSummary> = HashMap::new();
+    let Some(vec_reader) = reader.vec() else {
+        return out;
+    };
+    for vc in &options.vector_columns {
+        if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
+            out.insert(vc.column.clone(), VectorSummary { centroid, radius });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -409,5 +674,293 @@ mod tests {
         let opts = Arc::new(default_supertable_options());
         let empty = crate::supertable::Manifest::empty(Arc::clone(&opts));
         assert!(!manifest_contains(&empty, Uuid::nil()));
+    }
+
+    // ---- End-to-end Applied path ----------------------------------------
+
+    /// Encode a RecordBatch as Arrow IPC stream bytes — same
+    /// shape the WAL's `.arrow` sidecar carries in production.
+    fn encode_ipc(batch: &RecordBatch) -> Bytes {
+        use arrow::ipc::writer::StreamWriter;
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut out, &batch.schema()).expect("ipc writer init");
+            writer.write(batch).expect("ipc write");
+            writer.finish().expect("ipc finish");
+        }
+        Bytes::from(out)
+    }
+
+    /// Set up a fixture where the WAL's IPC payload and state
+    /// doc are consistent: matching `new_row_count`, blake3,
+    /// minted_id_spans. The supertable's storage is shared with
+    /// the WAL store so the orchestrator's IPC fetch finds the
+    /// payload we just wrote.
+    async fn fixture_with_ipc_payload(
+        titles: &[&str],
+        wal_id_value: i128,
+        minted_first: i128,
+    ) -> (TempDir, Supertable, WalStore, WalStateDoc, Etag) {
+        use crate::test_helpers::build_title_batch;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let supertable =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let wal_store = WalStore::new(Arc::clone(&storage));
+
+        let user_batch = build_title_batch(titles);
+        let ipc_bytes = encode_ipc(&user_batch);
+        let content_hash = blake3::hash(&ipc_bytes).to_hex().to_string();
+        let n = titles.len() as u32;
+        let wal_id = WalId(wal_id_value);
+
+        wal_store
+            .put_arrow(wal_id, ipc_bytes)
+            .await
+            .expect("put_arrow");
+
+        let wal_doc = WalStateDoc {
+            wal_id,
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Update,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "set up by test".into(),
+            target_ids: (0..n).map(|i| WalId(1000 + i as i128)).collect(),
+            new_row_count: Some(n),
+            new_row_content_hash: Some(content_hash),
+            preallocated_superfile_id: Some(Uuid::from_u128(0xDEAD_BEEF_CAFE)),
+            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+                first: WalId(minted_first),
+                last: WalId(minted_first + (n as i128) - 1),
+            }],
+            appended_pair_range: None,
+            tombstone_progress: (0..n)
+                .map(|i| TombstoneEntry {
+                    target_id: WalId(1000 + i as i128),
+                    outcome: TombstoneOutcome::Pending,
+                    tombstoned_in_superfile: None,
+                })
+                .collect(),
+        };
+        let etag = wal_store.create(&wal_doc).await.expect("wal create");
+        (dir, supertable, wal_store, wal_doc, etag)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn end_to_end_appends_superfile_and_advances_state() {
+        let (_dir, st, ws, wal, etag) =
+            fixture_with_ipc_payload(&["alpha bravo", "charlie delta"], 7, 5_000).await;
+        let pre_uuid = wal.preallocated_superfile_id.expect("set in fixture");
+
+        let (outcome, new_wal, new_etag) = run_append_phase(&st, &ws, &wal, &etag)
+            .await
+            .expect("append phase");
+
+        // Outcome + WAL state.
+        assert_eq!(outcome, AppendPhaseOutcome::Applied);
+        assert_eq!(new_wal.state, WalState::Appended);
+        assert_ne!(new_etag, etag, "etag must advance after the state change");
+
+        // appended_pair_range populated.
+        let range = new_wal.appended_pair_range.expect("range filled");
+        assert_eq!(range.superfile_id, pre_uuid);
+        assert_eq!(range.first_doc_id, 0);
+        assert_eq!(range.last_doc_id, 1); // 2 rows → last_doc_id = 1
+
+        // Manifest now contains the preallocated superfile.
+        let manifest = st.inner().manifest.load_full();
+        assert!(
+            manifest_contains(&manifest, pre_uuid),
+            "manifest must reference the new superfile"
+        );
+
+        // The state doc on disk reflects the in-memory new_wal.
+        let (read_back, read_etag) = ws.read(wal.wal_id).await.expect("read back");
+        assert_eq!(read_back.state, WalState::Appended);
+        assert_eq!(read_etag, new_etag);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idempotent_replay_short_circuits_to_already_applied() {
+        // Run the append phase twice on the same WAL. The first
+        // call goes through `do_apply`; the second observes the
+        // already-committed superfile in the manifest and
+        // returns `AlreadyApplied`. The WAL state ends in
+        // Appended either way.
+        let (_dir, st, ws, wal, etag) =
+            fixture_with_ipc_payload(&["alpha", "beta"], 11, 6_000).await;
+
+        let (first_outcome, after_first, etag_after_first) =
+            run_append_phase(&st, &ws, &wal, &etag)
+                .await
+                .expect("first");
+        assert_eq!(first_outcome, AppendPhaseOutcome::Applied);
+        assert_eq!(after_first.state, WalState::Appended);
+
+        let (second_outcome, after_second, etag_after_second) =
+            run_append_phase(&st, &ws, &after_first, &etag_after_first)
+                .await
+                .expect("second");
+        // The second run is a no-op on the state doc (WAL was
+        // already Appended), so etag stays put.
+        assert_eq!(second_outcome, AppendPhaseOutcome::AlreadyApplied);
+        assert_eq!(after_second.state, WalState::Appended);
+        assert_eq!(etag_after_second, etag_after_first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn intent_already_committed_advances_state_without_rebuilding() {
+        // Inject the "crashed between manifest swap and WAL
+        // state advance" failure mode: the manifest already
+        // references the WAL's preallocated_superfile_id, but
+        // the WAL is still in Intent. Recovery's first attempt
+        // should observe the existing superfile (idempotency
+        // probe), advance the WAL to Appended, and return
+        // AlreadyApplied. No new bytes get built or written.
+        let (_dir, st, ws, wal, etag) = fixture_with_ipc_payload(&["recovery"], 13, 7_000).await;
+        let pre_uuid = wal.preallocated_superfile_id.expect("set");
+
+        // First, let the orchestrator drive the manifest swap
+        // normally. (Simulating the crash directly would mean
+        // injecting a fault in persist_commit; using a
+        // successful run + a manually-reset WAL is equivalent
+        // and easier to reason about.)
+        let (_outcome, _new_wal, _new_etag) =
+            run_append_phase(&st, &ws, &wal, &etag).await.expect("seed");
+
+        // Manually reset the WAL state to Intent — simulating
+        // a crash that landed the manifest swap but lost the
+        // WAL-state CAS.
+        let mut intent_wal = wal.clone();
+        intent_wal.state = WalState::Intent;
+        intent_wal.appended_pair_range = None;
+        let intent_etag = ws
+            .update_with_etag(
+                wal.wal_id,
+                // Whatever etag is current at this point —
+                // re-read to get a fresh handle.
+                &ws.read(wal.wal_id).await.expect("read").1,
+                &intent_wal,
+            )
+            .await
+            .expect("reset");
+
+        // Now re-run the append phase. The probe sees the
+        // superfile, takes the AlreadyApplied path, advances
+        // the WAL state to Appended.
+        let (outcome, recovered, recovered_etag) =
+            run_append_phase(&st, &ws, &intent_wal, &intent_etag)
+                .await
+                .expect("recovered");
+        assert_eq!(outcome, AppendPhaseOutcome::AlreadyApplied);
+        assert_eq!(recovered.state, WalState::Appended);
+        assert_ne!(recovered_etag, intent_etag);
+        assert!(
+            manifest_contains(&st.inner().manifest.load_full(), pre_uuid),
+            "manifest still references the superfile we appended in the seed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replay_produces_bit_identical_superfile_bytes() {
+        // Determinism property: two independent runs of the
+        // assembly path (same WAL state doc + same IPC bytes)
+        // must produce bit-identical superfile bytes. This is
+        // what makes step-4's PUT overwrite-safe after a crash.
+        let (_dir1, st1, ws1, wal, etag1) =
+            fixture_with_ipc_payload(&["determinism check"], 17, 8_000).await;
+
+        // First run: drive through the orchestrator, capture
+        // the superfile's bytes from storage.
+        let (_o, _new_wal, _new_etag) = run_append_phase(&st1, &ws1, &wal, &etag1)
+            .await
+            .expect("first run");
+        let manifest1 = st1.inner().manifest.load_full();
+        let pre_uuid = wal.preallocated_superfile_id.expect("set");
+        let entry1 = manifest1
+            .superfile_list
+            .superfiles
+            .iter()
+            .find(|e| e.uri.0 == pre_uuid)
+            .expect("entry");
+        let storage1 = st1.inner().options.storage.as_ref().expect("storage");
+        let path = format!("data/seg-{}.sf", pre_uuid);
+        let bytes1 = storage1.get(&path).await.expect("get bytes");
+
+        // Second independent run on a fresh fixture with the
+        // same inputs. We rebuild the user batch + IPC payload
+        // deterministically by passing the same titles to the
+        // fixture helper. The minted_id_spans and the
+        // preallocated_superfile_id are fixed in the fixture
+        // helper, so the entire WAL state doc matches.
+        let (_dir2, st2, ws2, wal2, etag2) =
+            fixture_with_ipc_payload(&["determinism check"], 17, 8_000).await;
+        run_append_phase(&st2, &ws2, &wal2, &etag2)
+            .await
+            .expect("second run");
+        let storage2 = st2.inner().options.storage.as_ref().expect("storage");
+        let bytes2 = storage2.get(&path).await.expect("get bytes");
+
+        assert_eq!(
+            bytes1, bytes2,
+            "two independent runs with identical WAL inputs must produce \
+             bit-identical superfile bytes — this is the replay-safety \
+             invariant"
+        );
+        // Sanity: the entry's stats also agree.
+        let manifest2 = st2.inner().manifest.load_full();
+        let entry2 = manifest2
+            .superfile_list
+            .superfiles
+            .iter()
+            .find(|e| e.uri.0 == pre_uuid)
+            .expect("entry");
+        assert_eq!(entry1.n_docs, entry2.n_docs);
+        assert_eq!(entry1.id_min, entry2.id_min);
+        assert_eq!(entry1.id_max, entry2.id_max);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn corrupt_ipc_payload_surfaces_typed_hash_mismatch() {
+        let (_dir, st, ws, mut wal, etag) = fixture_with_ipc_payload(&["foo"], 19, 9_000).await;
+        // Replace the recorded hash with garbage so the IPC
+        // verify fails.
+        wal.new_row_content_hash = Some("ff".repeat(32));
+        // Re-CAS the WAL state doc with the bad hash so the
+        // orchestrator reads the corrupted doc, not the original.
+        let bad_etag = ws
+            .update_with_etag(wal.wal_id, &etag, &wal)
+            .await
+            .expect("re-cas with bad hash");
+
+        let err = run_append_phase(&st, &ws, &wal, &bad_etag)
+            .await
+            .expect_err("must error on hash mismatch");
+        assert!(
+            matches!(err, AppendPhaseError::SidecarContentHashMismatch { .. }),
+            "{err:?}"
+        );
+    }
+
+    // ---- flatten_spans property ----------------------------------------
+
+    #[test]
+    fn flatten_spans_concatenates_inclusive_ranges_in_order() {
+        let spans = vec![
+            crate::supertable::wal::state_doc::IdSpan {
+                first: WalId(10),
+                last: WalId(12),
+            },
+            crate::supertable::wal::state_doc::IdSpan {
+                first: WalId(100),
+                last: WalId(100),
+            },
+        ];
+        let flat = flatten_spans(&spans);
+        assert_eq!(flat, vec![10i128, 11, 12, 100]);
     }
 }
