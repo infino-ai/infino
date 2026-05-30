@@ -477,6 +477,16 @@ impl Supertable {
         self.inner.handle_id
     }
 
+    /// Construct a [`Supertable`] handle wrapping an existing
+    /// `SupertableInner` arc. Internal-only: used by the writer
+    /// to hand a `Supertable` to the WAL pipeline functions
+    /// without re-running the full create-or-open flow. Skips
+    /// the open-time recovery sweep on purpose — the inner has
+    /// already been initialized.
+    pub(super) fn from_inner(inner: Arc<SupertableInner>) -> Self {
+        Self { inner }
+    }
+
     /// Operator hatch: run one WAL recovery sweep against this
     /// supertable's storage prefix. Useful for long-lived
     /// handles that want bounded recovery latency without

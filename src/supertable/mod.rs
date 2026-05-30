@@ -24,6 +24,7 @@ pub mod error;
 pub mod handle;
 pub mod lazy_source;
 pub mod manifest;
+pub mod mutations;
 pub mod options;
 pub mod query;
 pub mod reader_cache;

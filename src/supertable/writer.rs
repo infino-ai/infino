@@ -313,6 +313,171 @@ impl SupertableWriter {
     /// rows each, the same as 8 separate `append` calls of 1.25M
     /// rows each. This decouples ingest parallelism from the
     /// caller's batching pattern.
+    /// Delete every row whose `_id` matches `predicate`.
+    ///
+    /// Runs the full WAL pipeline synchronously:
+    ///
+    /// 1. Resolve `predicate` to a `Vec<i128>` of target `_id`s
+    ///    against the current manifest snapshot (step 0a).
+    /// 2. Reject if the match count exceeds
+    ///    [`MAX_TARGETS_PER_MUTATION`].
+    /// 3. Flush any buffered appends first so the resolve sees
+    ///    a complete view of the supertable's rows.
+    /// 4. Create an Intent DELETE WAL state doc + drive the
+    ///    tombstone phase to Complete.
+    /// 5. Return the per-call [`OperationOutcome`].
+    ///
+    /// The buffer + commit shape from the plan is a follow-up;
+    /// this path runs each delete immediately. Concurrent
+    /// commits across handles are still safe because each
+    /// goes through the etag-CAS layer in `wal::pipeline`.
+    pub fn delete(
+        &mut self,
+        predicate: datafusion::prelude::Expr,
+    ) -> Result<
+        crate::supertable::mutations::OperationOutcome,
+        crate::supertable::mutations::MutationError,
+    > {
+        use crate::supertable::mutations::{
+            MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+        };
+        use crate::supertable::wal::WalStore;
+        use crate::supertable::wal::state_doc::{
+            OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+        };
+        use chrono::Utc;
+
+        // Pre-flight: storage must be attached for the WAL
+        // pipeline.
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        // Flush buffered appends so the predicate sees a
+        // complete picture of this writer's outstanding work.
+        if !self.buffer.is_empty() {
+            self.commit().map_err(|e| {
+                MutationError::Storage(crate::storage::StorageError::Permanent {
+                    uri: "writer.commit() for delete pre-flush".into(),
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                })
+            })?;
+        }
+
+        // Resolve the predicate against the manifest. Same
+        // entry point a contemporaneous SQL query would use.
+        let supertable = Supertable::from_inner(Arc::clone(&self.inner));
+        let target_ids = supertable
+            .scan_ids_matching(predicate)
+            .map_err(MutationError::PredicateEval)?;
+        let matched = target_ids.len();
+        if matched > MAX_TARGETS_PER_MUTATION {
+            return Err(MutationError::MatchCountExceedsCap {
+                matched,
+                cap: MAX_TARGETS_PER_MUTATION,
+            });
+        }
+
+        // Build + persist the WAL state doc.
+        let wal_id_value = {
+            let idgen = self
+                .inner
+                .id_generator
+                .lock()
+                .expect("id_generator mutex poisoned");
+            idgen.next_id()
+        };
+
+        let wal_doc = WalStateDoc {
+            wal_id: WalId(wal_id_value),
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Delete,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "writer.delete()".into(),
+            target_ids: target_ids.iter().map(|&v| WalId(v)).collect(),
+            new_row_count: None,
+            new_row_content_hash: None,
+            preallocated_superfile_id: None,
+            minted_id_spans: Vec::new(),
+            appended_pair_range: None,
+            tombstone_progress: target_ids
+                .iter()
+                .map(|&v| TombstoneEntry {
+                    target_id: WalId(v),
+                    outcome: TombstoneOutcome::Pending,
+                    tombstoned_in_superfile: None,
+                })
+                .collect(),
+        };
+
+        let wal_store = WalStore::new(Arc::clone(&storage));
+        let (n_tombstoned, n_not_found) =
+            self.drive_delete_wal(&wal_store, &wal_doc, &supertable)?;
+
+        Ok(OperationOutcome {
+            wal_id: WalId(wal_id_value),
+            matched,
+            n_tombstoned,
+            n_not_found,
+        })
+    }
+
+    /// Synchronously drive a freshly-created DELETE WAL to
+    /// Complete via the WAL pipeline. Sync-bridged through the
+    /// same `Handle::try_current() + block_in_place` pattern
+    /// the manifest-pointer commit path uses.
+    fn drive_delete_wal(
+        &self,
+        wal_store: &crate::supertable::wal::WalStore,
+        wal_doc: &crate::supertable::wal::state_doc::WalStateDoc,
+        supertable: &Supertable,
+    ) -> Result<(usize, usize), crate::supertable::mutations::MutationError> {
+        use crate::supertable::mutations::MutationError;
+        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
+        let wal_id = wal_doc.wal_id;
+        let wal_doc_clone = wal_doc.clone();
+        let wal_store_clone = wal_store.clone();
+        let supertable_clone = Supertable::from_inner(Arc::clone(supertable.inner()));
+        let drive = async move {
+            let etag = wal_store_clone
+                .create(&wal_doc_clone)
+                .await
+                .map_err(MutationError::WalStore)?;
+            let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
+                &supertable_clone,
+                &wal_store_clone,
+                &wal_doc_clone,
+                &etag,
+            )
+            .await?;
+            let (n_t, n_nf) = match outcome {
+                TombstonePhaseOutcome::Applied {
+                    n_tombstoned,
+                    n_not_found,
+                }
+                | TombstonePhaseOutcome::AlreadyComplete {
+                    n_tombstoned,
+                    n_not_found,
+                } => (n_tombstoned, n_not_found),
+            };
+            // Best-effort cleanup; failure here is logged
+            // implicitly by the M7 sweep eventually picking up
+            // the COMPLETE WAL.
+            let _ = wal_store_clone.delete_state(wal_id).await;
+            Ok::<_, MutationError>((n_t, n_nf))
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.inner.sql_runtime().block_on(drive),
+        }
+    }
+
     pub fn commit(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok(());

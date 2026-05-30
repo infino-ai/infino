@@ -26,3 +26,4 @@ mod manifest;
 mod query;
 mod storage;
 mod wal_recovery;
+mod writer_mutations;

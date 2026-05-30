@@ -130,6 +130,92 @@ impl Supertable {
             Err(_) => self.sql_runtime().block_on(drive),
         }
     }
+
+    /// Resolve a predicate to the matching `_id` values. Used by
+    /// the writer's `delete()` / `update()` entry points to
+    /// capture the target-id set at call time (step 0a in the
+    /// update / delete pipeline).
+    ///
+    /// Plan shape mirrors [`query_sql`]: build a `MemTable` over
+    /// the current manifest, register as `supertable`, apply
+    /// `expr` as a filter via DataFusion's `DataFrame::filter`,
+    /// project just `_id`, drain into a `Vec<i128>`. No
+    /// `TableProvider` is introduced.
+    ///
+    /// Note: the resolution is against the **current** manifest
+    /// snapshot, exactly like a contemporaneous `query_sql` would
+    /// see. Rows that newly match `expr` between this call and
+    /// the eventual `commit()` are NOT in the returned set —
+    /// captured-at-call semantics match SQL `UPDATE WHERE` /
+    /// `DELETE WHERE`.
+    pub fn scan_ids_matching(
+        &self,
+        expr: datafusion::prelude::Expr,
+    ) -> Result<Vec<i128>, QueryError> {
+        let reader = self.reader();
+        let manifest = Arc::clone(reader.manifest());
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let tombstone_cache = reader.tombstone_cache.clone();
+        let id_column = self.options().id_column.clone();
+
+        let table = build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)?;
+
+        let drive = async move {
+            let ctx = SessionContext::new();
+            ctx.register_table(TABLE_NAME, Arc::new(table))
+                .map_err(|e| QueryError::Plan(e.to_string()))?;
+            let df = ctx
+                .table(TABLE_NAME)
+                .await
+                .map_err(|e| QueryError::Plan(e.to_string()))?
+                .filter(expr)
+                .map_err(|e| QueryError::Plan(e.to_string()))?
+                .select_columns(&[id_column.as_str()])
+                .map_err(|e| QueryError::Plan(e.to_string()))?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            extract_id_column(&batches)
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.sql_runtime().block_on(drive),
+        }
+    }
+}
+
+/// Drain `_id`-only batches into a `Vec<i128>`. The supertable's
+/// `_id` is a Decimal128(38, 0) column; we read the raw 128-bit
+/// integer value directly.
+fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
+    use arrow_array::{Array, Decimal128Array};
+    let mut out: Vec<i128> = Vec::new();
+    for batch in batches {
+        if batch.num_columns() != 1 {
+            return Err(QueryError::Plan(format!(
+                "scan_ids_matching: expected 1-column batch, got {}",
+                batch.num_columns()
+            )));
+        }
+        let col = batch.column(0);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| {
+                QueryError::Plan("scan_ids_matching: _id column not Decimal128".into())
+            })?;
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            out.push(arr.value(i));
+        }
+    }
+    Ok(out)
 }
 
 /// Read every segment in the manifest and assemble a `MemTable`
