@@ -53,6 +53,7 @@ fn make_cache(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     DiskCacheStore::new(storage, cfg, pinned).expect("cache")
@@ -135,6 +136,7 @@ async fn bm25_exact_term_loads_only_the_matching_part() {
     let hits = consumer
         .reader()
         .bm25_search("title", "echo", 10, BoolMode::Or)
+        .await
         .expect("bm25");
     assert!(
         !hits.is_empty(),
@@ -186,6 +188,7 @@ async fn bm25_term_in_no_part_loads_nothing() {
     let hits = consumer
         .reader()
         .bm25_search("title", "zoo", 10, BoolMode::Or)
+        .await
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
     // up non-empty if any bloom collides on 'zoo' — but
@@ -240,6 +243,7 @@ async fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     let hits = consumer
         .reader()
         .bm25_search_prefix("title", "ech", 10)
+        .await
         .expect("prefix");
     assert!(
         !hits.is_empty(),
@@ -373,6 +377,7 @@ async fn eager_mode_query_paths_observationally_unchanged() {
     let hits = consumer
         .reader()
         .bm25_search("title", "alpha", 10, BoolMode::Or)
+        .await
         .expect("bm25");
     assert!(!hits.is_empty());
 

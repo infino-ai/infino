@@ -123,6 +123,11 @@ pub struct DiskCacheStore {
     /// mutex and invoke it lock-free, so the mutex is held
     /// only for the Arc bump.
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
+    /// Global cap on concurrent background segment fills. Each
+    /// background fill acquires one permit for its whole
+    /// duration; foreground per-query range reads don't. Sized
+    /// `config.prefetch_concurrency` at construction.
+    prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for DiskCacheStore {
@@ -154,6 +159,8 @@ impl DiskCacheStore {
         std::fs::create_dir_all(&config.cache_root)?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
+        let prefetch_semaphore =
+            Arc::new(tokio::sync::Semaphore::new(config.prefetch_concurrency.max(1)));
         let store = Arc::new(Self {
             storage,
             config,
@@ -165,6 +172,7 @@ impl DiskCacheStore {
             n_evictions: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
+            prefetch_semaphore,
         });
 
         // Idle-threshold sweep thread. Library-not-service
@@ -1287,20 +1295,34 @@ impl DiskCacheStore {
         dest_path: &std::path::Path,
         size: u64,
     ) -> Result<(), DiskCacheError> {
-        let n_streams = self.config.cold_fetch_streams.max(1) as u64;
-        let chunk_size = self
-            .config
-            .cold_fetch_chunk_bytes
-            .max(size.div_ceil(n_streams));
-        let file = tokio::fs::File::create(dest_path).await?;
-        file.set_len(size).await?;
-        let file = Arc::new(tokio::sync::Mutex::new(file));
+        let n_streams = self.config.cold_fetch_streams.max(1);
+        // Fixed chunk size — do NOT scale with `size`. Peak
+        // in-flight memory is `n_streams × chunk_size`
+        // regardless of segment size, because the per-fill
+        // semaphore below caps concurrent chunks at `n_streams`.
+        let chunk_size = self.config.cold_fetch_chunk_bytes.max(1);
+
+        // Preallocate the destination as a plain `std::fs::File`
+        // so chunk writers can use positioned (`pwrite`) writes
+        // off the async reactor without a shared file lock.
+        let file = {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dest_path)?;
+            f.set_len(size)?;
+            Arc::new(f)
+        };
 
         let n_chunks = if size == 0 {
             0
         } else {
             size.div_ceil(chunk_size)
         };
+        // Per-fill concurrency cap: at most `n_streams` chunks
+        // hold their fetched `Bytes` resident at once.
+        let stream_sem = Arc::new(tokio::sync::Semaphore::new(n_streams));
         let mut joins = Vec::with_capacity(n_chunks as usize);
         for i in 0..n_chunks {
             let start = i * chunk_size;
@@ -1308,11 +1330,18 @@ impl DiskCacheStore {
             let storage = Arc::clone(&self.storage);
             let file = Arc::clone(&file);
             let uri = storage_uri.to_string();
+            let stream_sem = Arc::clone(&stream_sem);
             joins.push(tokio::spawn(async move {
+                let _permit = stream_sem.acquire_owned().await.map_err(|e| {
+                    DiskCacheError::SuperfileOpen(format!("stream semaphore closed: {e}"))
+                })?;
                 let bytes = storage.get_range(&uri, start..end).await?;
-                let mut guard = file.lock().await;
-                guard.seek(SeekFrom::Start(start)).await?;
-                guard.write_all(&bytes).await?;
+                tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    file.write_all_at(&bytes, start)
+                })
+                .await
+                .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
             }));
         }
@@ -1320,9 +1349,9 @@ impl DiskCacheStore {
             h.await
                 .map_err(|e| DiskCacheError::SuperfileOpen(format!("join error: {e}")))??;
         }
-        let mut guard = file.lock().await;
-        guard.flush().await?;
-        guard.sync_all().await?;
+        tokio::task::spawn_blocking(move || file.sync_all())
+            .await
+            .map_err(|e| DiskCacheError::SuperfileOpen(format!("fsync join: {e}")))??;
         Ok(())
     }
 }
@@ -1480,6 +1509,26 @@ async fn lazy_background_fill(
 ) -> Result<(), DiskCacheError> {
     let tmp = store.tmp_path(&uri);
     let final_path = store.cache_path(&uri);
+
+    // Global background-fill concurrency cap. Held for the whole
+    // fill so process-wide background memory is bounded by
+    // `prefetch_concurrency × (cold_fetch_streams ×
+    // cold_fetch_chunk_bytes)`. Acquired before any GET; foreground
+    // per-query reads never touch this semaphore.
+    let _prefetch_permit = match Arc::clone(&store.prefetch_semaphore).acquire_owned().await {
+        Ok(p) => p,
+        Err(e) => {
+            store.coordinators.remove(&uri);
+            if let Some((_, entry)) = store.cached.remove(&uri) {
+                store
+                    .current_bytes
+                    .fetch_sub(entry.size_bytes, Ordering::Release);
+            }
+            return Err(DiskCacheError::SuperfileOpen(format!(
+                "prefetch semaphore closed: {e}"
+            )));
+        }
+    };
 
     let res: Result<(), DiskCacheError> = async {
         // 1. Parallel range-GETs into the temp file (existing

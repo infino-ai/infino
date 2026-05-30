@@ -13,6 +13,7 @@
 pub mod corpus;
 pub mod markdown;
 pub mod rss;
+pub mod tiers;
 
 pub mod fts_superfile;
 pub mod fts_supertable;

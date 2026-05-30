@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::corpus::{self, Calibrated, DIM};
+use crate::tiers::{self, Tier};
 use crate::{markdown, rss};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -33,9 +34,9 @@ use infino::supertable::{Supertable, SupertableOptions};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-/// Doc count for every vector-supertable bench. Pinned to 10M — the
-/// supertable is the scale-out shape.
-const N_DOCS: usize = 10_000_000;
+/// Doc count for every vector-supertable bench. Supertable is the
+/// scale-out shape → 10M.
+const N_DOCS: usize = corpus::SUPERTABLE_DOCS;
 
 const N_SEGMENTS: usize = 4;
 const TOP_K: usize = 10;
@@ -66,6 +67,13 @@ static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
 static GROUND_TRUTH_CALIBRATION: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
 static SUPERTABLE: OnceLock<Supertable> = OnceLock::new();
 static CALIBRATIONS: OnceLock<Calibrations> = OnceLock::new();
+
+/// Producer has committed the 10M vector supertable to object storage.
+struct S3VectorCommitted {
+    storage: Arc<dyn infino::supertable::storage::StorageProvider>,
+    storage_label: &'static str,
+}
+static S3_VECTOR: OnceLock<S3VectorCommitted> = OnceLock::new();
 
 fn vectors() -> &'static [f32] {
     VECTORS
@@ -117,17 +125,18 @@ fn supertable_schema() -> Arc<Schema> {
     )]))
 }
 
-fn build_supertable() -> Supertable {
+fn vector_supertable_options(
+    storage: Option<Arc<dyn infino::supertable::storage::StorageProvider>>,
+) -> SupertableOptions {
     let n_cent_total = corpus::n_cent(N_DOCS);
     let n_cent_per_segment = (n_cent_total / N_SEGMENTS).max(1);
-
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus::get().max(1))
             .build()
             .expect("pool"),
     );
-    let opts = SupertableOptions::new(
+    let mut opts = SupertableOptions::new(
         supertable_schema(),
         vec![],
         vec![VectorConfig {
@@ -142,17 +151,31 @@ fn build_supertable() -> Supertable {
     )
     .expect("opts")
     .with_writer_pool(pool);
+    if let Some(s) = storage {
+        opts = opts.with_storage(s);
+    }
+    opts
+}
 
+fn build_supertable() -> Supertable {
+    build_supertable_with_options(vector_supertable_options(None))
+}
+
+/// Commit the 10M vector supertable to object storage (producer path).
+fn build_supertable_on_storage(
+    storage: Arc<dyn infino::supertable::storage::StorageProvider>,
+) -> Supertable {
+    build_supertable_with_options(vector_supertable_options(Some(storage)))
+}
+
+fn build_supertable_with_options(opts: SupertableOptions) -> Supertable {
     let st = Supertable::create(opts);
     let mut w = st.writer().expect("writer");
-
     let chunk_size = N_DOCS / N_SEGMENTS;
     let v = vectors();
     for chunk_idx in 0..N_SEGMENTS {
         let start = chunk_idx * chunk_size;
         let end = start + chunk_size;
-        // Materialize one append batch from the disk-backed corpus, then feed
-        // it through the normal production ingestion API.
         let flat: Vec<f32> = v[start * DIM..end * DIM].to_vec();
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let values = Float32Array::from(flat);
@@ -171,6 +194,26 @@ fn build_supertable() -> Supertable {
     st
 }
 
+fn s3_vector_committed() -> &'static S3VectorCommitted {
+    S3_VECTOR.get_or_init(|| {
+        eprintln!(
+            "[supertable_vec] committing {N_DOCS} docs to object storage for warm/cold tiers..."
+        );
+        let fixture = tiers::block_on(tiers::supertable_storage_fixture());
+        let producer = build_supertable_on_storage(fixture.storage.clone());
+        eprintln!(
+            "[supertable_vec] object-store commit OK: manifest_id={} ({})",
+            producer.manifest_id(),
+            fixture.storage_label
+        );
+        drop(producer);
+        S3VectorCommitted {
+            storage: fixture.storage,
+            storage_label: fixture.storage_label,
+        }
+    })
+}
+
 /// Run a supertable kNN search and resolve per-superfile hits to
 /// global doc-ids via cumulative-`n_docs` offsets in manifest order.
 /// `commit()` row-shards into `min(writer_pool.threads, total_rows)`
@@ -183,8 +226,37 @@ fn supertable_topk(
     options: VectorSearchOptions,
 ) -> Vec<u32> {
     let r = st.reader();
+    let hits: Vec<SuperfileHit> = corpus::block_on_inmem(r.vector_search("emb", query, k, options))
+        .expect("vector_search");
+    let manifest = r.manifest();
+    let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
+    let mut acc: u32 = 0;
+    for entry in manifest.superfiles.iter() {
+        offsets.push(acc);
+        acc = acc.saturating_add(entry.n_docs as u32);
+    }
+    hits.into_iter()
+        .map(|h| {
+            let seg_idx = manifest
+                .superfiles
+                .iter()
+                .position(|e| e.uri == h.segment)
+                .expect("superfile in manifest");
+            offsets[seg_idx] + h.local_doc_id
+        })
+        .collect()
+}
+
+async fn supertable_topk_async(
+    st: &Supertable,
+    query: &[f32],
+    k: usize,
+    options: VectorSearchOptions,
+) -> Vec<u32> {
+    let r = st.reader();
     let hits: Vec<SuperfileHit> = r
         .vector_search("emb", query, k, options)
+        .await
         .expect("vector_search");
     let manifest = r.manifest();
     let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
@@ -372,7 +444,7 @@ fn bench_search(c: &mut Criterion) {
     let cal = calibrations();
     let qs = queries_calibration();
 
-    let mut g = c.benchmark_group("supertable_vec_search");
+    let mut g = c.benchmark_group(tiers::search_group_name("supertable_vec", Tier::Hot, None));
     g.sample_size(10);
     let rss_sample = rss::PeakSampler::start_default();
 
@@ -407,14 +479,119 @@ fn bench_search(c: &mut Criterion) {
         }
     }
 
+    bench_search_object_store_tiers(c, &cal, qs);
+
     emit_search_markdown();
+}
+
+/// Warm/cold search over the 10M supertable on object storage
+/// (`with_storage` + `with_disk_cache`). Hot rows stay in-memory above.
+fn bench_search_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32>]) {
+    let committed = s3_vector_committed();
+    let q = &qs[0];
+
+    for tier in [Tier::Warm, Tier::Cold] {
+        let mut g = c.benchmark_group(tiers::search_group_name(
+            "supertable_vec",
+            tier,
+            Some(committed.storage_label),
+        ));
+        g.sample_size(if tier == Tier::Cold { 10 } else { 10 });
+
+        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            let Some(c_st) = cal.supertable[i] else {
+                continue;
+            };
+            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            let (p, r) = (c_st.probe, c_st.refine);
+            let opts = VectorSearchOptions::new()
+                .with_nprobe(p)
+                .with_rerank_mult(r);
+            let bench_id = format!("supertable_{label}");
+
+            match tier {
+                Tier::Warm => {
+                    let storage = Arc::clone(&committed.storage);
+                    let (cache_dir, cache) = tiers::fresh_disk_cache(storage.clone());
+                    let consumer_opts = tiers::consumer_options(
+                        vector_supertable_options(None),
+                        storage,
+                        cache.clone(),
+                    );
+                    let st = tiers::block_on(tiers::open_consumer(
+                        consumer_opts,
+                    ));
+                    let query = q.clone();
+                    tiers::block_on(async {
+                        let _ = supertable_topk_async(&st, &query, TOP_K, opts).await;
+                        tiers::wait_for_cache_warm(
+                            &cache,
+                            Duration::from_secs(600),
+                        )
+                        .await;
+                    });
+                    g.bench_function(&bench_id, |b| {
+                        let query = q.clone();
+                        b.iter(|| {
+                            let hits = tiers::block_on(supertable_topk_async(
+                                &st,
+                                black_box(&query),
+                                TOP_K,
+                                opts,
+                            ));
+                            black_box(hits)
+                        });
+                    });
+                    drop(st);
+                    drop(cache);
+                    drop(cache_dir);
+                }
+                Tier::Cold => {
+                    let storage = Arc::clone(&committed.storage);
+                    let query = q.clone();
+                    g.bench_function(&bench_id, |b| {
+                        b.iter_custom(|iters| {
+                            let mut total = Duration::ZERO;
+                            for _ in 0..iters {
+                                let (cache_dir, cache) =
+                                    tiers::fresh_disk_cache(Arc::clone(&storage));
+                                let consumer_opts = tiers::consumer_options(
+                                    vector_supertable_options(None),
+                                    Arc::clone(&storage),
+                                    cache.clone(),
+                                );
+                                let t0 = Instant::now();
+                                tiers::block_on(async {
+                                    let st =
+                                        tiers::open_consumer(consumer_opts).await;
+                                    let _ = supertable_topk_async(
+                                        &st,
+                                        &query,
+                                        TOP_K,
+                                        opts,
+                                    )
+                                    .await;
+                                });
+                                total += t0.elapsed();
+                                drop(cache);
+                                drop(cache_dir);
+                            }
+                            total
+                        });
+                    });
+                }
+                Tier::Hot => {}
+            }
+        }
+        g.finish();
+    }
 }
 
 // ─── Markdown summary emitters ────────────────────────────────────────
 
 mod group_name {
     pub const SUPERTABLE_VEC_BUILD: &str = "supertable_vec_build";
-    pub const SUPERTABLE_VEC_SEARCH: &str = "supertable_vec_search";
+    pub const SUPERTABLE_VEC_SEARCH: &str = "supertable_vec_hot_search";
 }
 
 fn emit_ingest_markdown() {
@@ -464,35 +641,37 @@ fn emit_search_markdown() {
         "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | supertable (probe/seg, refine) | supertable p50 | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+        "Hot = in-memory; warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`).\n\n",
     );
     body.push_str(
-        "|---------------|--------------------------------|----------------|----------|------------|---------|------------|\n",
+        "| Recall target | (p/seg, r) | hot | warm | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|---------------|------------|-----|------|------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
-        let (cell, ns, rss_cell, median_rss, p90_rss, rss_delta) = match cal.supertable[i] {
+        let bid = format!("supertable_{label}");
+        let (cell, hot, warm, cold, rss_cell, median_rss, p90_rss, rss_delta) = match cal.supertable[i] {
             Some(c) => {
-                let bid = format!("supertable_{label}");
-                let ns = read_mean_ns(group, &bid);
                 let peak = rss::read_peak_rss_bytes(group, &bid);
-                let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-                let median_rss = rss::fmt_median_rss(group, &bid);
-                let p90_rss = rss::fmt_p90_rss(group, &bid);
-                let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
                 (
                     format!("(p={}, r={})", c.probe, c.refine),
-                    ns,
-                    rss_cell,
-                    median_rss,
-                    p90_rss,
-                    rss_delta,
+                    read_mean_ns(group, &bid),
+                    markdown::read_tier_mean_ns("supertable_vec", "warm", &bid),
+                    markdown::read_tier_mean_ns("supertable_vec", "cold", &bid),
+                    peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into()),
+                    rss::fmt_median_rss(group, &bid),
+                    rss::fmt_p90_rss(group, &bid),
+                    rss::fmt_peak_rss_delta(group, &bid),
                 )
             }
             None => (
                 "—".into(),
+                None,
+                None,
                 None,
                 "—".into(),
                 "—".into(),
@@ -500,9 +679,11 @@ fn emit_search_markdown() {
                 "—".into(),
             ),
         };
-        let t = ns.map(fmt_time).unwrap_or_else(|| "—".into());
         body.push_str(&format!(
-            "| {row_target} | {cell} | {t} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n"
+            "| {row_target} | {cell} | {} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
+            hot.map(fmt_time).unwrap_or_else(|| "—".into()),
+            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
+            cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }
 

@@ -236,6 +236,7 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(HashSet::new);
     let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");

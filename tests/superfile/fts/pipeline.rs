@@ -34,8 +34,8 @@ fn build_with_two_columns() -> (Bytes, String) {
     (Bytes::from(bytes), json.to_string())
 }
 
-#[test]
-fn end_to_end_routing_per_column() {
+#[tokio::test]
+async fn end_to_end_routing_per_column() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     assert_eq!(r.n_docs(), 4);
@@ -44,89 +44,97 @@ fn end_to_end_routing_per_column() {
     // confuse these (column isolation).
     let title_hits = r
         .search("title", &["rust"], 10, BoolMode::Or)
+        .await
         .expect("FTS search");
     let title_ids: Vec<u32> = title_hits.iter().map(|(d, _)| *d).collect();
     assert_eq!(title_ids, vec![0]);
 
     let body_hits = r
         .search("body", &["rust"], 10, BoolMode::Or)
+        .await
         .expect("FTS search");
     let body_ids: Vec<u32> = body_hits.iter().map(|(d, _)| *d).collect();
     assert_eq!(body_ids, vec![1]);
 }
 
-#[test]
-fn end_to_end_and_intersection() {
+#[tokio::test]
+async fn end_to_end_and_intersection() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // body: "tokio AND async" → only doc 0.
     let hits = r
         .search("body", &["tokio", "async"], 10, BoolMode::And)
+        .await
         .expect("search");
     let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
     assert_eq!(ids, vec![0]);
 }
 
-#[test]
-fn end_to_end_or_union() {
+#[tokio::test]
+async fn end_to_end_or_union() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // body: "tokio OR mature" → docs 0 and 1.
     let hits = r
         .search("body", &["tokio", "mature"], 10, BoolMode::Or)
+        .await
         .expect("search");
     let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
     ids.sort();
     assert_eq!(ids, vec![0, 1]);
 }
 
-#[test]
-fn end_to_end_missing_term_or_drops() {
+#[tokio::test]
+async fn end_to_end_missing_term_or_drops() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // OR with a missing term still returns hits for the present term.
     let hits = r
         .search("body", &["nonexistent", "tokio"], 10, BoolMode::Or)
+        .await
         .expect("search");
     let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
     assert_eq!(ids, vec![0]);
 }
 
-#[test]
-fn end_to_end_missing_term_and_short_circuits() {
+#[tokio::test]
+async fn end_to_end_missing_term_and_short_circuits() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     let hits = r
         .search("body", &["nonexistent", "tokio"], 10, BoolMode::And)
+        .await
         .expect("search");
     assert!(hits.is_empty());
 }
 
-#[test]
-fn end_to_end_unknown_column_errors() {
+#[tokio::test]
+async fn end_to_end_unknown_column_errors() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
-    let err = r.search("not_a_column", &["rust"], 10, BoolMode::Or);
+    let err = r.search("not_a_column", &["rust"], 10, BoolMode::Or).await;
     assert!(err.is_err());
 }
 
-#[test]
-fn end_to_end_top_k_limits_results() {
+#[tokio::test]
+async fn end_to_end_top_k_limits_results() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     let hits = r
         .search("body", &["filler"], 1, BoolMode::Or)
+        .await
         .expect("FTS search");
     // Even though "filler" might match multiple docs, only 1 returned.
     assert!(hits.len() <= 1);
 }
 
-#[test]
-fn end_to_end_score_is_positive() {
+#[tokio::test]
+async fn end_to_end_score_is_positive() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     let hits = r
         .search("body", &["tokio"], 10, BoolMode::Or)
+        .await
         .expect("FTS search");
     for (_, s) in &hits {
         assert!(*s > 0.0, "BM25 score should be positive");
@@ -134,13 +142,14 @@ fn end_to_end_score_is_positive() {
     }
 }
 
-#[test]
-fn end_to_end_search_multi_weighted_combine() {
+#[tokio::test]
+async fn end_to_end_search_multi_weighted_combine() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // search "rust" across both columns, title weighted 2x.
     let hits = r
         .search_multi(&[("title", 2.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
+        .await
         .expect("FTS multi-column search");
     let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
     // doc 0 (title: "rust runtime") and doc 1 (body: "rust ecosystem mature") should both rank.
@@ -161,8 +170,8 @@ fn end_to_end_n_terms_and_columns_reported_correctly() {
 /// single-term query (which goes through the BMW path) and confirm the
 /// top-k matches a hand-rolled brute-force scan (which goes through the
 /// existing multi-term path with one term).
-#[test]
-fn bmw_single_term_matches_brute_force() {
+#[tokio::test]
+async fn bmw_single_term_matches_brute_force() {
     use infino::superfile::fts::reader::BoolMode;
 
     let mut b = FtsBuilder::new(default_tokenizer());
@@ -190,6 +199,7 @@ fn bmw_single_term_matches_brute_force() {
     // Single term → BMW path.
     let bmw_hits = r
         .search("body", &["foo"], 10, BoolMode::Or)
+        .await
         .expect("FTS search");
     assert!(!bmw_hits.is_empty());
     assert_eq!(bmw_hits.len(), 10);
@@ -198,6 +208,7 @@ fn bmw_single_term_matches_brute_force() {
     // Should produce the same results as the BMW path.
     let mt_hits = r
         .search("body", &["foo", "nonexistent_term_xyz"], 10, BoolMode::Or)
+        .await
         .expect("search");
 
     let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| *d).collect();

@@ -71,3 +71,30 @@ supertable:
   # skipping the scan trades that storage-layer guarantee for
   # faster cold opens.
   verify_crc_on_open: true
+
+# Persistent storage wiring. Defaults to in-memory-only. Set
+# `backend: s3` plus `s3_bucket` / `s3_prefix` to make
+# SupertableOptions::apply_config attach an S3StorageProvider.
+#
+# Env overrides:
+#   INFINO_STORAGE__BACKEND=s3
+#   INFINO_STORAGE__S3_BUCKET=my-bucket
+#   INFINO_STORAGE__S3_PREFIX=tables/my-table
+#   INFINO_STORAGE__DISK_CACHE_ROOT=/mnt/nvme/infino-cache
+storage:
+  backend: none
+  local_root:
+  s3_bucket:
+  s3_prefix: ""
+
+  # When set, storage-backed reads use DiskCacheStore. For S3,
+  # lazy_foreground_with_background_fill is the object-store-native
+  # cold path: foreground opens/searches with exact range GETs while
+  # background fill promotes the full segment to mmap.
+  disk_cache_root:
+  disk_budget_bytes: 10737418240
+  cold_fetch_mode: lazy_foreground_with_background_fill
+  cold_fetch_streams: 8
+  cold_fetch_chunk_bytes: 4194304
+  mmap_cold_threshold_secs: 300
+  mmap_sweep_interval_secs: 75

@@ -160,6 +160,7 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: false,
+        ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
     (dir, store)
@@ -224,6 +225,7 @@ async fn lazy_foreground_cold_reader_is_queryable_immediately() {
     let fts = reader.fts().expect("fts");
     let hits = fts
         .search("title", &["special"], 10, BoolMode::Or)
+        .await
         .expect("bm25");
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
 }
@@ -253,6 +255,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
         let fts = r_cold.fts().expect("fts");
         let _ = fts
             .search("title", &["alpha"], 5, BoolMode::Or)
+            .await
             .expect("cold bm25");
     }
     let calls_after_cold = proxy.calls();
@@ -276,6 +279,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
         let fts = r_warm.fts().expect("fts");
         let hits = fts
             .search("title", &["special"], 5, BoolMode::Or)
+            .await
             .expect("warm bm25");
         assert_eq!(hits.len(), 2, "warm search must return correct results");
     }

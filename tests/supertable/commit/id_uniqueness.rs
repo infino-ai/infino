@@ -174,6 +174,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned_fn).expect("cache");

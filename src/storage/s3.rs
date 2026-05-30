@@ -49,6 +49,7 @@ use super::{ObjectMeta, StorageError, StorageProvider};
 #[derive(Debug)]
 pub struct S3StorageProvider {
     bucket: String,
+    prefix: String,
     store: Arc<AmazonS3>,
 }
 
@@ -69,8 +70,23 @@ impl S3StorageProvider {
             })?;
         Ok(Self {
             bucket,
+            prefix: String::new(),
             store: Arc::new(store),
         })
+    }
+
+    /// Construct an S3 provider scoped to a logical table
+    /// prefix inside `bucket`. The prefix is prepended to every
+    /// storage URI, so callers can use the normal supertable
+    /// paths (`_supertable/current`, `data/seg-...`) while
+    /// isolating each table under `s3://bucket/prefix/`.
+    pub fn new_with_prefix(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let mut provider = Self::new(bucket)?;
+        provider.prefix = normalize_prefix(prefix);
+        Ok(provider)
     }
 
     /// Construct an S3 provider pointed at a custom endpoint
@@ -113,8 +129,26 @@ impl S3StorageProvider {
             })?;
         Ok(Self {
             bucket,
+            prefix: String::new(),
             store: Arc::new(store),
         })
+    }
+
+    /// Custom-endpoint variant of [`Self::new_with_prefix`].
+    /// Used by S3-compatible deployments that also want a
+    /// logical table prefix.
+    pub fn new_with_endpoint_and_prefix(
+        endpoint: impl Into<String>,
+        bucket: impl Into<String>,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        region: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let mut provider =
+            Self::new_with_endpoint(endpoint, bucket, access_key, secret_key, region)?;
+        provider.prefix = normalize_prefix(prefix);
+        Ok(provider)
     }
 
     /// Wrap an already-constructed `AmazonS3` — for advanced
@@ -124,6 +158,7 @@ impl S3StorageProvider {
     pub fn from_object_store(bucket: impl Into<String>, store: AmazonS3) -> Self {
         Self {
             bucket: bucket.into(),
+            prefix: String::new(),
             store: Arc::new(store),
         }
     }
@@ -133,12 +168,31 @@ impl S3StorageProvider {
         &self.bucket
     }
 
-    fn path(uri: &str) -> Result<ObjPath, StorageError> {
-        ObjPath::parse(uri).map_err(|e| StorageError::Permanent {
+    /// Logical prefix prepended to every object path.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    fn key(&self, uri: &str) -> String {
+        let uri = uri.trim_start_matches('/');
+        if self.prefix.is_empty() {
+            uri.to_string()
+        } else {
+            format!("{}/{uri}", self.prefix)
+        }
+    }
+
+    fn path(&self, uri: &str) -> Result<ObjPath, StorageError> {
+        let key = self.key(uri);
+        ObjPath::parse(&key).map_err(|e| StorageError::Permanent {
             uri: uri.into(),
             source: Box::new(e),
         })
     }
+}
+
+fn normalize_prefix(prefix: impl Into<String>) -> String {
+    prefix.into().trim_matches('/').to_string()
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.
@@ -166,7 +220,7 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
 #[async_trait]
 impl StorageProvider for S3StorageProvider {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         let meta = self
             .store
             .head(&path)
@@ -179,13 +233,13 @@ impl StorageProvider for S3StorageProvider {
     }
 
     async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
         result.bytes().await.map_err(|e| translate(uri, e))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         self.store
             .get_range(&path, range)
             .await
@@ -210,7 +264,7 @@ impl StorageProvider for S3StorageProvider {
             let meta = self.head(uri).await?;
             return Ok((Bytes::new(), meta.size));
         }
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         let opts = GetOptions {
             range: Some(GetRange::Suffix(len)),
             ..Default::default()
@@ -226,7 +280,7 @@ impl StorageProvider for S3StorageProvider {
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -244,7 +298,7 @@ impl StorageProvider for S3StorageProvider {
         bytes: Bytes,
         expected_etag: Option<&str>,
     ) -> Result<(), StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         let opts = match expected_etag {
             // None == create-only-if-absent.
             None => PutOptions {
@@ -278,7 +332,7 @@ impl StorageProvider for S3StorageProvider {
         &self,
         uri: &str,
     ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         self.store
             .put_multipart(&path)
             .await
@@ -286,7 +340,7 @@ impl StorageProvider for S3StorageProvider {
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
-        let path = Self::path(uri)?;
+        let path = self.path(uri)?;
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),

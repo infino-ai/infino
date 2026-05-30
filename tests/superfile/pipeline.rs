@@ -110,12 +110,13 @@ fn end_to_end_open_reports_correct_metadata() {
     assert_eq!(r.schema().fields().len(), 4);
 }
 
-#[test]
-fn end_to_end_bm25_finds_rust_docs() {
+#[tokio::test]
+async fn end_to_end_bm25_finds_rust_docs() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
     let hits = r
         .bm25_search("title", "rust", 5, BoolMode::Or)
+        .await
         .expect("BM25 search");
     let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
     // docs 0, 2, 5 have "rust" in title
@@ -124,8 +125,8 @@ fn end_to_end_bm25_finds_rust_docs() {
     assert!(doc_ids.contains(&5));
 }
 
-#[test]
-fn end_to_end_bm25_multi_combines_columns() {
+#[tokio::test]
+async fn end_to_end_bm25_multi_combines_columns() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
     let hits = r
@@ -135,6 +136,7 @@ fn end_to_end_bm25_multi_combines_columns() {
             5,
             BoolMode::Or,
         )
+        .await
         .expect("BM25 multi-column search");
     // doc 2 has both "rust" (title) and "embedded" (body) → should rank well.
     assert!(!hits.is_empty());
@@ -142,8 +144,8 @@ fn end_to_end_bm25_multi_combines_columns() {
     assert!(doc_ids.contains(&2));
 }
 
-#[test]
-fn end_to_end_vector_search_recovers_self() {
+#[tokio::test]
+async fn end_to_end_vector_search_recovers_self() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
     // Reconstruct doc 4's vector (axis 3 + tiny axis 4).
@@ -160,6 +162,7 @@ fn end_to_end_vector_search_recovers_self() {
                 .with_nprobe(4)
                 .with_rerank_mult(5),
         )
+        .await
         .expect("vector search");
     assert_eq!(hits[0].0, 4, "self-query should recover doc 4");
 }
@@ -234,8 +237,8 @@ fn end_to_end_no_indexes_still_valid_parquet() {
     assert_eq!(read.num_rows(), 2);
 }
 
-#[test]
-fn end_to_end_fts_only_blob_offsets_within_file() {
+#[tokio::test]
+async fn end_to_end_fts_only_blob_offsets_within_file() {
     // Sanity: when FTS is present and vectors absent, the vec keys
     // are absent and FTS keys point inside the file.
     let schema = pipeline_schema();
@@ -270,13 +273,14 @@ fn end_to_end_fts_only_blob_offsets_within_file() {
     assert!(r.vec().is_none());
     let hits = r
         .bm25_search("title", "alpha", 5, BoolMode::Or)
+        .await
         .expect("BM25 search");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, 0);
 }
 
-#[test]
-fn end_to_end_three_batches_doc_ids_continuous() {
+#[tokio::test]
+async fn end_to_end_three_batches_doc_ids_continuous() {
     // Splitting input into multiple add_batch calls must keep
     // local_doc_id sequential across batches.
     let schema = pipeline_schema();
@@ -315,6 +319,7 @@ fn end_to_end_three_batches_doc_ids_continuous() {
     assert_eq!(r.n_docs(), 6);
     let hits = r
         .bm25_search("title", "alpha", 10, BoolMode::Or)
+        .await
         .expect("BM25 search");
     // alpha appears at local_doc_ids 0, 2, 4 (one per chunk).
     let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();

@@ -1,3 +1,10 @@
+//! **Quick-iteration harness** for the object-store cold-fetch path (Plan 013).
+//!
+//! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;
+//! `INFINO_BENCH_FULL=1` → 1M). Canonical tiered benchmarks (superfile 1M /
+//! supertable 10M × hot/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
+//! Use this bench to iterate on request shape and diagnostics, not headline SLA rows.
+//!
 //! Plan 013 M5 — unified vector + FTS cold-open / cold-first-search
 //! / warm-search against an in-process S3 server (`s3s-fs`).
 //!
@@ -30,15 +37,17 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench object-store                      # default scale (100k)
-//! INFINO_BENCH_FULL=1 cargo bench --bench object-store  # 1M scale (README row)
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench object-store  # also rewrite README
+//! cargo bench --bench object-store                                  # s3s-fs (1M superfile)
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --bench object-store   # real AWS S3
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench object-store     # also rewrite README
 //! ```
 //!
-//! Default scale is 100k × 384 (fast iteration, ~150 MiB
-//! superfile). `INFINO_BENCH_FULL=1` bumps to 1M × 384
-//! (~1.5 GiB), which is the headline number in
-//! `benches/vector/README.md`.
+//! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
+//! ~1.5 GiB) — this is the superfile warm/cold tier and matches the
+//! superfile hot benches. There is no `INFINO_BENCH_FULL` knob. The
+//! Criterion rows run over the in-process `s3s-fs` server by default;
+//! setting `INFINO_REAL_S3_BUCKET` (or `INFINO_TEST_REAL_S3_BUCKET`)
+//! reruns the same rows against real AWS S3.
 //!
 //! Throughput rows always print to stderr via the shared
 //! `emit_*_markdown()` pattern; `INFINO_BENCH_UPDATE_README=1`
@@ -69,17 +78,24 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group};
+use infino::config::{
+    Config, StorageBackend, StorageColdFetchMode, StorageSettings, SupertableSettings,
+};
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
 use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::SuperfileUri;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
+use infino::supertable::query::VectorSearchOptions;
+use infino::supertable::reader_cache::DiskCacheStore;
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
+use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
@@ -95,16 +111,15 @@ const TEST_REGION: &str = "us-east-1";
 const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
-/// Doc count. 100k × 384 is ~150 MiB on disk — small enough
-/// to iterate quickly on s3s-fs, large enough that the
-/// per-cluster range fetches dominate the search path.
-/// `INFINO_BENCH_FULL=1` bumps to 1M for the headline
-/// README row.
-fn n_docs() -> usize {
+const QUICK_ITER_DEFAULT_DOCS: usize = 100_000;
+const REAL_S3_MAX_ITERS: u64 = 3;
+
+/// Doc count for this quick-iter harness only (`INFINO_BENCH_FULL=1` → 1M).
+fn quick_iter_n_docs() -> usize {
     if std::env::var("INFINO_BENCH_FULL").is_ok() {
-        1_000_000
+        crate::corpus::SUPERFILE_DOCS
     } else {
-        100_000
+        QUICK_ITER_DEFAULT_DOCS
     }
 }
 
@@ -114,28 +129,30 @@ const DEFAULT_NPROBE: usize = 8;
 const DEFAULT_RERANK_MULT: usize = 20;
 const TOP_K: usize = 10;
 
-fn bench_nprobe() -> usize {
-    std::env::var("INFINO_OBJECT_STORE_NPROBE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_NPROBE)
-}
+const BENCH_NPROBE: usize = DEFAULT_NPROBE;
 
-fn vector_search_id(n: usize, nprobe: usize) -> String {
+fn vector_search_id(n: usize, nprobe: usize, storage_label: &str) -> String {
     if nprobe == DEFAULT_NPROBE {
-        format!("n={n}_s3s_fs_top{TOP_K}")
+        format!("n={n}_{storage_label}_top{TOP_K}")
     } else {
-        format!("n={n}_s3s_fs_top{TOP_K}_nprobe{nprobe}")
+        format!("n={n}_{storage_label}_top{TOP_K}_nprobe{nprobe}")
     }
 }
 
-fn warm_vector_search_id(n: usize, nprobe: usize) -> String {
+fn warm_vector_search_id(n: usize, nprobe: usize, storage_label: &str) -> String {
     if nprobe == DEFAULT_NPROBE {
-        format!("n={n}_mmap_post_promotion_top{TOP_K}")
+        format!("n={n}_{storage_label}_mmap_post_promotion_top{TOP_K}")
     } else {
-        format!("n={n}_mmap_post_promotion_top{TOP_K}_nprobe{nprobe}")
+        format!("n={n}_{storage_label}_mmap_post_promotion_top{TOP_K}_nprobe{nprobe}")
     }
+}
+
+fn bm25_search_id(n: usize, storage_label: &str) -> String {
+    format!("n={n}_{storage_label}_top{TOP_K}")
+}
+
+fn warm_bm25_search_id(n: usize, storage_label: &str) -> String {
+    format!("n={n}_{storage_label}_mmap_post_promotion_top{TOP_K}")
 }
 
 /// Primary-key column. `SuperfileBuilder` requires the id column
@@ -168,7 +185,7 @@ fn superfile_bytes() -> &'static Bytes {
 fn query_vector() -> &'static [f32] {
     QUERY_VECTOR
         .get_or_init(|| {
-            let n = n_docs();
+            let n = quick_iter_n_docs();
             let v = crate::corpus::MmapVectorCorpus::generate(n, crate::corpus::n_cent(n), 1, true);
             // Take vector at index 0 as the query — known to
             // exist in the planted-cluster corpus + a real-
@@ -187,7 +204,7 @@ fn query_vector() -> &'static [f32] {
 /// the `inf.*` KV metadata. Cached in `SUPERFILE_BYTES` for the
 /// bench's lifetime so every row shares one fixture.
 fn build_superfile_bytes() -> Bytes {
-    let n = n_docs();
+    let n = quick_iter_n_docs();
     let n_cent = crate::corpus::n_cent(n);
     let dim = crate::corpus::DIM;
 
@@ -309,17 +326,11 @@ impl S3LatencyModel {
     /// Read the model used for adjusted diagnostic reporting.
     /// This never changes the measured code path.
     fn from_env_or_default() -> Self {
-        let ttfb_ms = std::env::var("INFINO_S3_MODEL_TTFB_MS")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(100.0);
-        let mbps = std::env::var("INFINO_S3_MODEL_MBPS")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(100.0);
+        const TTFB_MS: f64 = 100.0;
+        const MBPS: f64 = 100.0;
         Self {
-            ttfb: Duration::from_secs_f64(ttfb_ms / 1000.0),
-            bytes_per_sec: mbps * 1_000_000.0,
+            ttfb: Duration::from_secs_f64(TTFB_MS / 1000.0),
+            bytes_per_sec: MBPS * 1_000_000.0,
         }
     }
 
@@ -350,18 +361,9 @@ impl S3CostBreakdown {
 impl S3CostModel {
     fn from_env_or_default() -> Self {
         Self {
-            head_per_1000: std::env::var("INFINO_S3_COST_HEAD_PER_1000")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0004),
-            get_per_1000: std::env::var("INFINO_S3_COST_GET_PER_1000")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0004),
-            data_per_gib: std::env::var("INFINO_S3_COST_DATA_PER_GIB")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0),
+            head_per_1000: 0.0004,
+            get_per_1000: 0.0004,
+            data_per_gib: 0.0,
         }
     }
 
@@ -451,54 +453,110 @@ async fn setup_s3_fixture(
     (addr, fs_root, storage, uri)
 }
 
+struct BenchFixture {
+    storage: Arc<dyn StorageProvider>,
+    uri: SuperfileUri,
+    storage_label: &'static str,
+    real_s3: bool,
+    cleanup_path: Option<String>,
+    _fs_root: Option<TempDir>,
+}
+
+impl BenchFixture {
+    async fn cleanup(&self) {
+        if let Some(path) = &self.cleanup_path {
+            let result = self.storage.delete(path).await;
+            eprintln!("[object_store_bench] cleanup {path}: {result:?}");
+        }
+    }
+}
+
+fn real_s3_bucket_env() -> Option<String> {
+    crate::tiers::real_s3_bucket_env()
+}
+
+fn real_s3_prefix_root_env() -> String {
+    crate::tiers::real_s3_prefix_root("infino-real-s3-bench")
+}
+
+fn unique_bench_prefix(root: &str) -> String {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos()
+    );
+    format!("{}/{}", root.trim_matches('/'), unique)
+}
+
+async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
+    if let Some(bucket) = real_s3_bucket_env() {
+        let prefix = unique_bench_prefix(&real_s3_prefix_root_env());
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            S3StorageProvider::new_with_prefix(&bucket, &prefix)
+                .expect("real S3 benchmark provider"),
+        );
+        let uri = SuperfileUri::new_v4();
+        let path = format!("data/seg-{}.sf", uri.0);
+        storage
+            .put_atomic(&path, superfile.clone())
+            .await
+            .expect("upload superfile to real S3");
+        eprintln!(
+            "[object_store_bench] real S3 fixture uploaded: bucket={bucket} prefix={prefix} path={path}"
+        );
+        BenchFixture {
+            storage,
+            uri,
+            storage_label: "real_s3",
+            real_s3: true,
+            cleanup_path: Some(path),
+            _fs_root: None,
+        }
+    } else {
+        let (_addr, fs_root, storage, uri) = setup_s3_fixture(superfile).await;
+        BenchFixture {
+            storage,
+            uri,
+            storage_label: "s3s_fs",
+            real_s3: false,
+            cleanup_path: None,
+            _fs_root: Some(fs_root),
+        }
+    }
+}
+
+fn bounded_real_s3_iters(requested: u64, real_s3: bool) -> (u64, u64) {
+    if !real_s3 {
+        return (requested, requested);
+    }
+    let max_iters = REAL_S3_MAX_ITERS;
+    let actual = requested.min(max_iters).max(1);
+    (actual, requested)
+}
+
+fn scale_duration(total: Duration, actual: u64, requested: u64) -> Duration {
+    if actual == requested {
+        total
+    } else {
+        Duration::from_secs_f64(total.as_secs_f64() * requested as f64 / actual as f64)
+    }
+}
+
 /// Fresh disk-cache in `LazyForegroundWithBackgroundFill` mode.
 /// Returns the cache + its temp root (drop after to GC).
 fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
-    let dir = TempDir::new().expect("cache tempdir");
-    let cfg = DiskCacheConfig {
-        cache_root: dir.path().to_path_buf(),
-        disk_budget_bytes: 4 * (1u64 << 30),
-        cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
-        cold_fetch_streams: 8,
-        cold_fetch_chunk_bytes: 4 * (1u64 << 20),
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: false,
-    };
-    let store = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
-    (dir, store)
+    crate::tiers::fresh_superfile_cache(storage)
 }
 
-/// Poll the cache until the URI is promoted to mmap (i.e.
-/// the background fill landed). Used by the warm-search row
-/// to wait between the cold cycle and the steady-state
-/// timing.
 async fn wait_for_mmap_promotion(
     cache: &Arc<DiskCacheStore>,
     uri: SuperfileUri,
     timeout: Duration,
 ) {
-    let start = Instant::now();
-    loop {
-        // The promotion is observable via `stats().current_bytes`
-        // exceeding 0 + a brief yield so the entry swap lands.
-        let stats = cache.stats();
-        if stats.current_bytes > 0 && stats.n_cold_fetches >= 1 {
-            for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            // Sanity: re-open and confirm we have a hot entry
-            // by asking for the reader — should be near-zero
-            // latency (mmap path).
-            let _ = cache.reader(&uri).await.expect("warm reader sanity");
-            return;
-        }
-        if start.elapsed() > timeout {
-            panic!("cache failed to promote {uri:?} within {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    crate::tiers::wait_for_superfile_promotion(cache, uri, timeout).await;
 }
 
 // ─── Benches ─────────────────────────────────────────────────────────
@@ -513,20 +571,35 @@ fn bench(c: &mut Criterion) {
         diag::diagnose_s3s_fs_cold_path();
         return;
     }
+    if std::env::var("INFINO_DIAG_REAL_S3").is_ok() {
+        diag::diagnose_real_s3_cold_path();
+        return;
+    }
+    if std::env::var("INFINO_DIAG_REAL_S3_SUPERTABLE").is_ok() {
+        diag::diagnose_real_s3_supertable_e2e();
+        return;
+    }
 
     let rt = Runtime::new().expect("tokio runtime");
     let superfile = superfile_bytes();
     let query = query_vector().to_vec();
-    let n = n_docs();
-    let nprobe = bench_nprobe();
+    let n = quick_iter_n_docs();
+    let nprobe = BENCH_NPROBE;
     eprintln!(
         "[object_store_bench] scale: n_docs={n}, dim={}, superfile_size={} MiB",
         crate::corpus::DIM,
         superfile.len() / (1024 * 1024),
     );
 
-    // ── Spawn s3s-fs + upload once. ──────────────────────────────────
-    let (_addr, _fs_root, storage, uri) = rt.block_on(setup_s3_fixture(superfile));
+    // ── Upload once to the selected object-store backend. ────────────
+    // Default remains s3s-fs. Set INFINO_BENCH_REAL_S3_BUCKET
+    // (or INFINO_REAL_S3_BUCKET) to run the same Criterion rows
+    // against actual AWS S3.
+    let fixture = rt.block_on(setup_bench_fixture(superfile));
+    let storage = Arc::clone(&fixture.storage);
+    let uri = fixture.uri;
+    let storage_label = fixture.storage_label;
+    let real_s3 = fixture.real_s3;
 
     // ── Row 1: cold lazy open via S3. ───────────────────────────────
     // Every iteration: fresh cache, `cache.reader(uri).await`.
@@ -539,10 +612,11 @@ fn bench(c: &mut Criterion) {
         g.measurement_time(Duration::from_secs(20));
 
         let storage_for_bench = Arc::clone(&storage);
-        g.bench_function(format!("n={n}_s3s_fs"), |b| {
+        g.bench_function(format!("n={n}_{storage_label}"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
-                for _ in 0..iters {
+                let (actual_iters, requested_iters) = bounded_real_s3_iters(iters, real_s3);
+                for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
                     let t0 = Instant::now();
                     let _reader =
@@ -556,7 +630,7 @@ fn bench(c: &mut Criterion) {
                     drop(cache);
                     drop(cache_dir);
                 }
-                total
+                scale_duration(total, actual_iters, requested_iters)
             });
         });
         g.finish();
@@ -573,10 +647,11 @@ fn bench(c: &mut Criterion) {
 
         let storage_for_bench = Arc::clone(&storage);
         let q = query.clone();
-        g.bench_function(vector_search_id(n, nprobe), |b| {
+        g.bench_function(vector_search_id(n, nprobe, storage_label), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
-                for _ in 0..iters {
+                let (actual_iters, requested_iters) = bounded_real_s3_iters(iters, real_s3);
+                for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
                     let q = q.clone();
                     let t0 = Instant::now();
@@ -584,13 +659,14 @@ fn bench(c: &mut Criterion) {
                         let reader = cache.reader(&uri).await.expect("cold reader");
                         let vec = reader.vec().expect("vector reader present");
                         vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                            .await
                             .expect("cold vector_search")
                     });
                     total += t0.elapsed();
                     drop(cache);
                     drop(cache_dir);
                 }
-                total
+                scale_duration(total, actual_iters, requested_iters)
             });
         });
         g.finish();
@@ -608,23 +684,25 @@ fn bench(c: &mut Criterion) {
         g.measurement_time(Duration::from_secs(30));
 
         let storage_for_bench = Arc::clone(&storage);
-        g.bench_function(format!("n={n}_s3s_fs_top{TOP_K}"), |b| {
+        g.bench_function(bm25_search_id(n, storage_label), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
-                for _ in 0..iters {
+                let (actual_iters, requested_iters) = bounded_real_s3_iters(iters, real_s3);
+                for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
                     let t0 = Instant::now();
                     let _hits = rt.block_on(async {
                         let reader = cache.reader(&uri).await.expect("cold reader");
                         reader
                             .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                            .await
                             .expect("cold bm25_search")
                     });
                     total += t0.elapsed();
                     drop(cache);
                     drop(cache_dir);
                 }
-                total
+                scale_duration(total, actual_iters, requested_iters)
             });
         });
         g.finish();
@@ -648,14 +726,14 @@ fn bench(c: &mut Criterion) {
 
         let q = query.clone();
         let cache_ref = Arc::clone(&warm_cache);
-        g.bench_function(warm_vector_search_id(n, nprobe), |b| {
+        g.bench_function(warm_vector_search_id(n, nprobe, storage_label), |b| {
             b.iter(|| {
                 let reader = rt
                     .block_on(async { cache_ref.reader(&uri).await })
                     .expect("warm reader");
                 let vec = reader.vec().expect("vector reader present");
-                let hits = vec
-                    .search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                let hits = rt
+                    .block_on(vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT))
                     .expect("warm vector_search");
                 std::hint::black_box(hits)
             });
@@ -670,13 +748,13 @@ fn bench(c: &mut Criterion) {
         g.measurement_time(Duration::from_secs(10));
 
         let cache_ref = Arc::clone(&warm_cache);
-        g.bench_function(format!("n={n}_mmap_post_promotion_top{TOP_K}"), |b| {
+        g.bench_function(warm_bm25_search_id(n, storage_label), |b| {
             b.iter(|| {
                 let reader = rt
                     .block_on(async { cache_ref.reader(&uri).await })
                     .expect("warm reader");
-                let hits = reader
-                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                let hits = rt
+                    .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
                     .expect("warm bm25_search");
                 std::hint::black_box(hits)
             });
@@ -687,7 +765,8 @@ fn bench(c: &mut Criterion) {
         drop(warm_dir);
     }
 
-    emit_object_store_markdown();
+    rt.block_on(fixture.cleanup());
+    emit_object_store_markdown(storage_label);
 }
 
 // ─── Markdown summary emitter ────────────────────────────────────────
@@ -700,35 +779,38 @@ fn bench(c: &mut Criterion) {
 /// `INFINO_BENCH_UPDATE_README=1` is set). The anchor
 /// `bench/vector/object_store/cold_warm` matches the
 /// `<!-- BEGIN/END -->` markers in `benches/vector/README.md`.
-fn emit_object_store_markdown() {
+fn emit_object_store_markdown(storage_label: &str) {
     use crate::markdown::{MarkdownSection, fmt_time, read_mean_ns};
 
-    let n = n_docs();
+    let n = quick_iter_n_docs();
     let dim = crate::corpus::DIM;
     let superfile_mib = superfile_bytes().len() as f64 / (1024.0 * 1024.0);
 
-    let cold_open_ns = read_mean_ns("object_store_cold_lazy_open", &format!("n={n}_s3s_fs"));
+    let cold_open_ns = read_mean_ns(
+        "object_store_cold_lazy_open",
+        &format!("n={n}_{storage_label}"),
+    );
     let cold_search_ns = read_mean_ns(
         "object_store_cold_first_search",
-        &format!("n={n}_s3s_fs_top{TOP_K}"),
+        &vector_search_id(n, BENCH_NPROBE, storage_label),
     );
     let cold_bm25_ns = read_mean_ns(
         "object_store_cold_first_bm25",
-        &format!("n={n}_s3s_fs_top{TOP_K}"),
+        &bm25_search_id(n, storage_label),
     );
     let warm_search_ns = read_mean_ns(
         "object_store_warm_search",
-        &format!("n={n}_mmap_post_promotion_top{TOP_K}"),
+        &warm_vector_search_id(n, BENCH_NPROBE, storage_label),
     );
     let warm_bm25_ns = read_mean_ns(
         "object_store_warm_bm25",
-        &format!("n={n}_mmap_post_promotion_top{TOP_K}"),
+        &warm_bm25_search_id(n, storage_label),
     );
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Superfile vector + FTS — object-store cold/warm via s3s-fs \
-         ({n} docs × dim={dim}, ~{superfile_mib:.0} MiB unified superfile, Sq8 rerank + \
+         ({storage_label}, {n} docs × dim={dim}, ~{superfile_mib:.0} MiB unified superfile, Sq8 rerank + \
          `title` FTS)\n\n",
     ));
     body.push_str(
@@ -1012,7 +1094,7 @@ mod diag {
         (raw_blocking, model_blocking, batches)
     }
 
-    fn report(name: &str, snap: &CountingSnapshot, wall: Duration) {
+    fn report(name: &str, snap: &CountingSnapshot, wall: Duration, real_s3: bool) {
         let head_avg_us = if snap.head_count == 0 {
             0
         } else {
@@ -1063,46 +1145,92 @@ mod diag {
                 .count();
             (returned, snap.range_log.len() - returned)
         };
-        eprintln!(
-            "[diag] {name}: wall={:>7.1} ms | adjusted_s3_model={:>7.1} ms \
-             (ttfb={:>5.1} ms, {:>5.0} MB/s, batches={:>2}, raw_s3s_block={:>7.1} ms, \
-             model_block={:>7.1} ms) | HEAD {:>3} calls ({:>5} us avg) | \
-             GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms, \
-             returned={} after_return={}) | \
-             bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
-             (requests=${:.9}, data=${:.9})",
-            wall.as_secs_f64() * 1e3,
-            adjusted_wall.as_secs_f64() * 1e3,
-            model.ttfb.as_secs_f64() * 1e3,
-            model.bytes_per_sec / 1_000_000.0,
-            batches,
-            raw_blocking.as_secs_f64() * 1e3,
-            model_blocking.as_secs_f64() * 1e3,
-            snap.head_count,
-            head_avg_us,
-            snap.range_count,
-            range_avg_us,
-            (snap.range_total_us as f64) / 1e3,
-            returned_gets,
-            after_return_gets,
-            range_bytes,
-            range_bytes as f64 / 1024.0 / 1024.0,
-            cost.total_usd(),
-            cost.request_usd,
-            cost.data_usd,
-        );
-        if background_fill_events > 0 {
+        if real_s3 {
+            // Real AWS S3: every latency below is a true wire
+            // measurement. We deliberately omit the synthetic
+            // `S3LatencyModel` projection (ttfb/mbps/
+            // adjusted_s3_model) — that model exists only to
+            // estimate S3 latency from the in-process s3s-fs
+            // path and is meaningless when the wall clock IS
+            // real S3. `raw_block` is the real time spent
+            // blocked on overlap-coalesced GET batches; the
+            // `$` cost projection is kept because dollar cost
+            // is not observable from a latency measurement.
             eprintln!(
-                "[diag] {name}:   foreground_estimate_excluding_cache_fill_chunks(>={} B): \
-                 adjusted_s3_model={:>7.1} ms (fg_batches={:>2}, fg_raw_s3s_block={:>7.1} ms, \
-                 fg_model_block={:>7.1} ms, bg_fill_gets={})",
-                bg_chunk_min,
-                adjusted_foreground_wall.as_secs_f64() * 1e3,
-                fg_batches,
-                fg_raw_blocking.as_secs_f64() * 1e3,
-                fg_model_blocking.as_secs_f64() * 1e3,
-                background_fill_events,
+                "[diag] {name}: wall={:>7.1} ms (real S3, no synthetic latency model) | \
+                 raw_block={:>7.1} ms over {:>2} batch(es) | HEAD {:>3} calls ({:>5} us avg) | \
+                 GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms, \
+                 returned={} after_return={}) | \
+                 bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
+                 (requests=${:.9}, data=${:.9})",
+                wall.as_secs_f64() * 1e3,
+                raw_blocking.as_secs_f64() * 1e3,
+                batches,
+                snap.head_count,
+                head_avg_us,
+                snap.range_count,
+                range_avg_us,
+                (snap.range_total_us as f64) / 1e3,
+                returned_gets,
+                after_return_gets,
+                range_bytes,
+                range_bytes as f64 / 1024.0 / 1024.0,
+                cost.total_usd(),
+                cost.request_usd,
+                cost.data_usd,
             );
+            if background_fill_events > 0 {
+                eprintln!(
+                    "[diag] {name}:   foreground_only_excluding_cache_fill_chunks(>={} B): \
+                     raw_block={:>7.1} ms over {:>2} batch(es) (bg_fill_gets={})",
+                    bg_chunk_min,
+                    fg_raw_blocking.as_secs_f64() * 1e3,
+                    fg_batches,
+                    background_fill_events,
+                );
+            }
+        } else {
+            eprintln!(
+                "[diag] {name}: wall={:>7.1} ms | adjusted_s3_model={:>7.1} ms \
+                 (ttfb={:>5.1} ms, {:>5.0} MB/s, batches={:>2}, raw_s3s_block={:>7.1} ms, \
+                 model_block={:>7.1} ms) | HEAD {:>3} calls ({:>5} us avg) | \
+                 GET_RANGE {:>3} calls ({:>5} us avg, summed {:>7.1} ms, \
+                 returned={} after_return={}) | \
+                 bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
+                 (requests=${:.9}, data=${:.9})",
+                wall.as_secs_f64() * 1e3,
+                adjusted_wall.as_secs_f64() * 1e3,
+                model.ttfb.as_secs_f64() * 1e3,
+                model.bytes_per_sec / 1_000_000.0,
+                batches,
+                raw_blocking.as_secs_f64() * 1e3,
+                model_blocking.as_secs_f64() * 1e3,
+                snap.head_count,
+                head_avg_us,
+                snap.range_count,
+                range_avg_us,
+                (snap.range_total_us as f64) / 1e3,
+                returned_gets,
+                after_return_gets,
+                range_bytes,
+                range_bytes as f64 / 1024.0 / 1024.0,
+                cost.total_usd(),
+                cost.request_usd,
+                cost.data_usd,
+            );
+            if background_fill_events > 0 {
+                eprintln!(
+                    "[diag] {name}:   foreground_estimate_excluding_cache_fill_chunks(>={} B): \
+                     adjusted_s3_model={:>7.1} ms (fg_batches={:>2}, fg_raw_s3s_block={:>7.1} ms, \
+                     fg_model_block={:>7.1} ms, bg_fill_gets={})",
+                    bg_chunk_min,
+                    adjusted_foreground_wall.as_secs_f64() * 1e3,
+                    fg_batches,
+                    fg_raw_blocking.as_secs_f64() * 1e3,
+                    fg_model_blocking.as_secs_f64() * 1e3,
+                    background_fill_events,
+                );
+            }
         }
         eprintln!(
             "[diag] {name}:   cost_model HEAD=${:.7}/1K GET=${:.7}/1K DATA=${:.4}/GiB",
@@ -1112,20 +1240,34 @@ mod diag {
         // see e.g. "2 MiB GET took 800ms while 32 B GET took 5ms".
         for (i, event) in snap.range_log.iter().enumerate() {
             let us = event.end_us.saturating_sub(event.start_us);
-            let model_us = model.delay_for(event.len).as_micros();
             let event_cost = cost_model.cost_for(0, 1, event.len);
-            eprintln!(
-                "[diag] {name}:   range[{i:>2}] len={:>10} B  ({:>5.1} KiB)  \
-                 raw_lat={:>7} us  model_lat={:>7} us  cost=${:.9}  \
-                 start={:>10} us  end={:>10} us",
-                event.len,
-                (event.len as f64) / 1024.0,
-                us,
-                model_us,
-                event_cost.total_usd(),
-                event.start_us,
-                event.end_us,
-            );
+            if real_s3 {
+                eprintln!(
+                    "[diag] {name}:   range[{i:>2}] len={:>10} B  ({:>5.1} KiB)  \
+                     raw_lat={:>7} us  cost=${:.9}  \
+                     start={:>10} us  end={:>10} us",
+                    event.len,
+                    (event.len as f64) / 1024.0,
+                    us,
+                    event_cost.total_usd(),
+                    event.start_us,
+                    event.end_us,
+                );
+            } else {
+                let model_us = model.delay_for(event.len).as_micros();
+                eprintln!(
+                    "[diag] {name}:   range[{i:>2}] len={:>10} B  ({:>5.1} KiB)  \
+                     raw_lat={:>7} us  model_lat={:>7} us  cost=${:.9}  \
+                     start={:>10} us  end={:>10} us",
+                    event.len,
+                    (event.len as f64) / 1024.0,
+                    us,
+                    model_us,
+                    event_cost.total_usd(),
+                    event.start_us,
+                    event.end_us,
+                );
+            }
         }
     }
 
@@ -1137,8 +1279,8 @@ mod diag {
     pub fn diagnose_s3s_fs_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
         let superfile = superfile_bytes();
-        let n = n_docs();
-        let nprobe = bench_nprobe();
+        let n = quick_iter_n_docs();
+        let nprobe = BENCH_NPROBE;
         let query = query_vector().to_vec();
 
         let (_addr, _fs_root, raw_storage, uri) = rt.block_on(setup_s3_fixture(superfile));
@@ -1192,7 +1334,7 @@ mod diag {
             let _reader = rt.block_on(cache.reader(&uri)).expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_open_unhinted[{i}]"), &snap, wall);
+            report(&format!("cold_open_unhinted[{i}]"), &snap, wall, false);
             // Let the previous iter's bg fill stop touching s3s-fs
             // before the next cold timing starts, so contention
             // doesn't poison the measurement. The `sleep` itself
@@ -1217,7 +1359,7 @@ mod diag {
                 .expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_open_hinted[{i}]"), &snap, wall);
+            report(&format!("cold_open_hinted[{i}]"), &snap, wall, false);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1234,11 +1376,12 @@ mod diag {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_search_unhinted[{i}]"), &snap, wall);
+            report(&format!("cold_first_search_unhinted[{i}]"), &snap, wall, false);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1259,11 +1402,12 @@ mod diag {
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_search_hinted[{i}]"), &snap, wall);
+            report(&format!("cold_first_search_hinted[{i}]"), &snap, wall, false);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1279,11 +1423,12 @@ mod diag {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 reader
                     .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .await
                     .expect("cold bm25_search")
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_bm25_unhinted[{i}]"), &snap, wall);
+            report(&format!("cold_first_bm25_unhinted[{i}]"), &snap, wall, false);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1303,11 +1448,12 @@ mod diag {
                     .expect("cold reader");
                 reader
                     .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .await
                     .expect("cold bm25_search")
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_bm25_hinted[{i}]"), &snap, wall);
+            report(&format!("cold_first_bm25_hinted[{i}]"), &snap, wall, false);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1329,11 +1475,12 @@ mod diag {
                     .expect("cold reader");
                 reader
                     .bm25_search(FTS_COLUMN, FTS_MULTI_QUERY, TOP_K, BoolMode::Or)
+                    .await
                     .expect("cold multi-term bm25_search")
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_bm25_hinted_multi[{i}]"), &snap, wall);
+            report(&format!("cold_first_bm25_hinted_multi[{i}]"), &snap, wall, false);
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1343,6 +1490,440 @@ mod diag {
             "[diag] === scale: n_docs={n}, superfile_size={} MiB ===",
             superfile.len() / (1024 * 1024)
         );
+    }
+
+    /// Same cold-path diagnostic as `diagnose_s3s_fs_cold_path`,
+    /// but against actual AWS S3 using the normal `S3StorageProvider`.
+    ///
+    /// Invocation:
+    ///
+    /// ```text
+    /// INFINO_DIAG_REAL_S3=1 \
+    /// INFINO_REAL_S3_BUCKET=cold-test-381491836522 \
+    /// AWS_REGION=us-east-1 \
+    /// cargo bench --no-default-features --bench object-store -- --warm-up-time 1
+    /// ```
+    pub fn diagnose_real_s3_cold_path() {
+        let rt = Runtime::new().expect("tokio runtime");
+        let superfile = superfile_bytes();
+        let n = quick_iter_n_docs();
+        let nprobe = BENCH_NPROBE;
+        let query = query_vector().to_vec();
+        let bucket = std::env::var("INFINO_REAL_S3_BUCKET")
+            .or_else(|_| std::env::var("INFINO_TEST_REAL_S3_BUCKET"))
+            .expect("set INFINO_REAL_S3_BUCKET or INFINO_TEST_REAL_S3_BUCKET");
+        let prefix_root = std::env::var("INFINO_REAL_S3_PREFIX")
+            .unwrap_or_else(|_| "infino-real-s3-bench".to_string());
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        );
+        let prefix = format!("{}/{}", prefix_root.trim_matches('/'), unique);
+        let uri = SuperfileUri::new_v4();
+        let path = format!("data/seg-{}.sf", uri.0);
+
+        eprintln!(
+            "[diag-real-s3] bucket={bucket} prefix={prefix} path={path} n_docs={n} size={} MiB",
+            superfile.len() / (1024 * 1024)
+        );
+
+        let raw_storage: Arc<dyn StorageProvider> = Arc::new(
+            S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 provider"),
+        );
+        rt.block_on(raw_storage.put_atomic(&path, superfile.clone()))
+            .expect("upload superfile to real S3");
+
+        let storage = Arc::new(CountingStorage::new(Arc::clone(&raw_storage)));
+        let storage_dyn: Arc<dyn StorageProvider> =
+            Arc::clone(&storage) as Arc<dyn StorageProvider>;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eprintln!("[diag-real-s3] === raw AWS S3 range RTT probes ===");
+            for (label, off, len) in [
+                ("32B_head", 0u64, 32u64),
+                ("64KiB_mid", 1024 * 1024, 64 * 1024),
+                ("2MiB_open_spec", 0, 2 * 1024 * 1024),
+                ("4MiB_chunk", 0, 4 * 1024 * 1024),
+            ] {
+                let len = len.min(superfile.len() as u64 - off);
+                let mut total = Duration::ZERO;
+                const ITERS: u32 = 5;
+                for _ in 0..ITERS {
+                    let t0 = Instant::now();
+                    let _b = rt
+                        .block_on(storage_dyn.get_range(&path, off..off + len))
+                        .expect("real S3 raw range");
+                    total += t0.elapsed();
+                }
+                eprintln!(
+                    "[diag-real-s3] raw_get_range[{label:<14}] len={:>8} B  avg={:>6.2} ms over {ITERS} iters",
+                    len,
+                    total.as_secs_f64() / ITERS as f64 * 1e3,
+                );
+            }
+            storage.reset();
+
+            let offsets = build_offsets_from_bytes(superfile);
+            eprintln!(
+                "[diag-real-s3] manifest hints: total={} B  vec={:?}  fts={:?}",
+                offsets.total_size, offsets.vec, offsets.fts
+            );
+
+            eprintln!("[diag-real-s3] === cold-open HINTED via real S3 (3 fresh-cache iters) ===");
+            for i in 0..3 {
+                let before = storage.snapshot();
+                let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+                let off_ref = offsets.clone();
+                let t0 = Instant::now();
+                let _reader = rt
+                    .block_on(cache.reader_with_hints(&uri, Some(&off_ref)))
+                    .expect("real S3 cold reader");
+                let wall = t0.elapsed();
+                let snap = storage.snapshot().diff(&before);
+                report(&format!("real_s3_cold_open_hinted[{i}]"), &snap, wall, true);
+                rt.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
+                drop(cache);
+                drop(cache_dir);
+            }
+
+            eprintln!(
+                "[diag-real-s3] === cold first vector HINTED (nprobe={nprobe}, top={TOP_K}) ==="
+            );
+            for i in 0..3 {
+                let before = storage.snapshot();
+                let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+                let q = query.clone();
+                let off_ref = offsets.clone();
+                let t0 = Instant::now();
+                let _hits = rt.block_on(async {
+                    let reader = cache
+                        .reader_with_hints(&uri, Some(&off_ref))
+                        .await
+                        .expect("real S3 cold reader");
+                    let vec = reader.vec().expect("vector reader present");
+                    vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                        .await
+                        .expect("real S3 cold vector_search")
+                });
+                let wall = t0.elapsed();
+                let snap = storage.snapshot().diff(&before);
+                report(
+                    &format!("real_s3_cold_first_search_hinted[{i}]"),
+                    &snap,
+                    wall,
+                    true,
+                );
+                rt.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
+                drop(cache);
+                drop(cache_dir);
+            }
+
+            eprintln!(
+                "[diag-real-s3] === cold first BM25 HINTED (term={FTS_QUERY_TERM}, top={TOP_K}) ==="
+            );
+            for i in 0..3 {
+                let before = storage.snapshot();
+                let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+                let off_ref = offsets.clone();
+                let t0 = Instant::now();
+                let _hits = rt.block_on(async {
+                    let reader = cache
+                        .reader_with_hints(&uri, Some(&off_ref))
+                        .await
+                        .expect("real S3 cold reader");
+                    reader
+                        .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                        .await
+                        .expect("real S3 cold bm25_search")
+                });
+                let wall = t0.elapsed();
+                let snap = storage.snapshot().diff(&before);
+                report(&format!("real_s3_cold_first_bm25_hinted[{i}]"), &snap, wall, true);
+                rt.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
+                drop(cache);
+                drop(cache_dir);
+            }
+
+            eprintln!(
+                "[diag-real-s3] === scale: n_docs={n}, superfile_size={} MiB ===",
+                superfile.len() / (1024 * 1024)
+            );
+        }));
+
+        let cleanup = rt.block_on(raw_storage.delete(&path));
+        eprintln!("[diag-real-s3] cleanup path={path} result={cleanup:?}");
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Production-shape real S3 diagnostic: build a unified
+    /// vector+FTS supertable through `SupertableOptions::apply_config`,
+    /// commit to S3, then reopen from a fresh config-backed handle and
+    /// time cold open, cold vector, cold BM25, and warm repeated reads.
+    pub fn diagnose_real_s3_supertable_e2e() {
+        let rt = Runtime::new().expect("tokio runtime");
+        let n = quick_iter_n_docs();
+        let nprobe = BENCH_NPROBE;
+        let bucket = std::env::var("INFINO_REAL_S3_BUCKET")
+            .or_else(|_| std::env::var("INFINO_TEST_REAL_S3_BUCKET"))
+            .expect("set INFINO_REAL_S3_BUCKET or INFINO_TEST_REAL_S3_BUCKET");
+        let prefix_root = std::env::var("INFINO_REAL_S3_PREFIX")
+            .unwrap_or_else(|_| "infino-real-s3-bench".to_string());
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        );
+        let prefix = format!("{}/{}", prefix_root.trim_matches('/'), unique);
+        let cache_dir = TempDir::new().expect("real S3 supertable cache dir");
+        let cfg = real_s3_supertable_config(&bucket, &prefix, cache_dir.path());
+        eprintln!(
+            "[diag-real-s3-supertable] bucket={bucket} prefix={prefix} n_docs={n} dim={}",
+            crate::corpus::DIM
+        );
+
+        let cleanup_keys = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_keys_for_run = Arc::clone(&cleanup_keys);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async move {
+            let build_t0 = Instant::now();
+            {
+                let producer = Supertable::create(
+                    real_s3_supertable_options()
+                        .apply_config(&cfg)
+                        .expect("apply real S3 config to producer"),
+                );
+                let mut writer = producer.writer().expect("real S3 producer writer");
+                append_unified_supertable_batches(&mut writer, n);
+                writer.commit().expect("commit unified supertable to real S3");
+                eprintln!(
+                    "[diag-real-s3-supertable] producer commit OK; manifest_id={} build_and_commit_ms={:.1}",
+                    producer.manifest_id(),
+                    build_t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+
+            let open_t0 = Instant::now();
+            let consumer = Supertable::open(
+                real_s3_supertable_options()
+                    .apply_config(&cfg)
+                    .expect("apply real S3 config to consumer"),
+            )
+            .await
+            .expect("open unified supertable from real S3");
+            let cold_open = open_t0.elapsed();
+            let reader = consumer.reader();
+            eprintln!(
+                "[diag-real-s3-supertable] cold_open wall={:.1} ms manifest_id={} n_superfiles={} n_docs_total={}",
+                cold_open.as_secs_f64() * 1e3,
+                consumer.manifest_id(),
+                reader.n_superfiles(),
+                reader.n_docs_total()
+            );
+
+            {
+                let manifest = reader.manifest();
+                let mut keys = cleanup_keys_for_run.lock().unwrap();
+                keys.push("_supertable/current".to_string());
+                keys.push(infino::supertable::manifest::commit::list_uri(
+                    consumer.manifest_id(),
+                ));
+                if let Some(list) = &manifest.list {
+                    keys.extend(list.parts.iter().map(|p| p.uri.clone()));
+                }
+                keys.extend(
+                    manifest
+                        .superfiles
+                        .iter()
+                        .map(|entry| format!("data/seg-{}.sf", entry.uri.0)),
+                );
+            }
+
+            let query = query_vector().to_vec();
+            let vec_t0 = Instant::now();
+            let vec_hits = reader
+                .vector_search(
+                    VEC_COLUMN,
+                    &query,
+                    TOP_K,
+                    VectorSearchOptions::new().with_nprobe(nprobe),
+                )
+                .await
+                .expect("cold vector search over real S3 supertable");
+            let cold_vec = vec_t0.elapsed();
+            eprintln!(
+                "[diag-real-s3-supertable] cold_vector wall={:.1} ms hits={} nprobe={nprobe}",
+                cold_vec.as_secs_f64() * 1e3,
+                vec_hits.len()
+            );
+
+            let bm25_t0 = Instant::now();
+            let bm25_hits = reader
+                .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .await
+                .expect("cold BM25 over real S3 supertable");
+            let cold_bm25 = bm25_t0.elapsed();
+            eprintln!(
+                "[diag-real-s3-supertable] cold_bm25 wall={:.1} ms hits={} query={FTS_QUERY_TERM}",
+                cold_bm25.as_secs_f64() * 1e3,
+                bm25_hits.len()
+            );
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let warm_vec_t0 = Instant::now();
+            let warm_vec_hits = reader
+                .vector_search(
+                    VEC_COLUMN,
+                    &query,
+                    TOP_K,
+                    VectorSearchOptions::new().with_nprobe(nprobe),
+                )
+                .await
+                .expect("warm vector search over real S3 supertable");
+            let warm_vec = warm_vec_t0.elapsed();
+            let warm_bm25_t0 = Instant::now();
+            let warm_bm25_hits = reader
+                .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .await
+                .expect("warm BM25 over real S3 supertable");
+            let warm_bm25 = warm_bm25_t0.elapsed();
+            let cache_stats = consumer
+                .options()
+                .disk_cache
+                .as_ref()
+                .expect("real S3 config should attach disk cache")
+                .stats();
+            eprintln!(
+                "[diag-real-s3-supertable] warm_vector wall={:.1} ms hits={} | warm_bm25 wall={:.1} ms hits={} | cache_stats={cache_stats:?}",
+                warm_vec.as_secs_f64() * 1e3,
+                warm_vec_hits.len(),
+                warm_bm25.as_secs_f64() * 1e3,
+                warm_bm25_hits.len()
+            );
+            })
+        }));
+
+        let cleanup_storage =
+            S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 cleanup provider");
+        let keys = cleanup_keys.lock().unwrap().clone();
+        let cleanup_result = rt.block_on(async {
+            for key in &keys {
+                let _ = cleanup_storage.delete(key).await;
+            }
+            cleanup_storage.delete("_supertable/current").await
+        });
+        eprintln!("[diag-real-s3-supertable] cleanup prefix={prefix} result={cleanup_result:?}");
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn real_s3_supertable_config(
+        bucket: &str,
+        prefix: &str,
+        cache_root: &std::path::Path,
+    ) -> Config {
+        Config {
+            supertable: SupertableSettings::default(),
+            storage: StorageSettings {
+                backend: StorageBackend::S3,
+                s3_bucket: Some(bucket.to_string()),
+                s3_prefix: prefix.to_string(),
+                disk_cache_root: Some(cache_root.to_path_buf()),
+                disk_budget_bytes: 8 << 30,
+                cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
+                cold_fetch_streams: 8,
+                cold_fetch_chunk_bytes: 8 << 20,
+                mmap_cold_threshold_secs: 0,
+                mmap_sweep_interval_secs: 0,
+                ..StorageSettings::default()
+            },
+        }
+    }
+
+    fn real_s3_supertable_options() -> SupertableOptions {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
+            Field::new(
+                VEC_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    crate::corpus::DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        SupertableOptions::new(
+            schema,
+            vec![FtsConfig {
+                column: FTS_COLUMN.into(),
+            }],
+            vec![VectorConfig {
+                column: VEC_COLUMN.into(),
+                dim: crate::corpus::DIM,
+                n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8,
+            }],
+            Some(default_tokenizer()),
+        )
+        .expect("real S3 supertable options")
+    }
+
+    fn append_unified_supertable_batches(
+        writer: &mut infino::supertable::writer::SupertableWriter,
+        n: usize,
+    ) {
+        let n_cent = crate::corpus::n_cent(n);
+        let dim = crate::corpus::DIM;
+        let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, 1, true);
+        let vectors = vectors_mmap.as_slice();
+        let text = crate::corpus::MmapTextCorpus::generate(n, 1);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
+            Field::new(
+                VEC_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                false,
+            ),
+        ]));
+        const CHUNK: usize = 65_536;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        for start in (0..n).step_by(CHUNK) {
+            let len = CHUNK.min(n - start);
+            let titles = LargeStringArray::from(
+                (start..start + len)
+                    .map(|i| text.doc(i))
+                    .collect::<Vec<_>>(),
+            );
+            let values = Float32Array::from(vectors[start * dim..(start + len) * dim].to_vec());
+            let vectors = FixedSizeListArray::try_new(
+                Arc::clone(&item_field),
+                dim as i32,
+                Arc::new(values) as Arc<dyn Array>,
+                None,
+            )
+            .expect("vector fixed-size-list array");
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(titles), Arc::new(vectors)])
+                    .expect("unified supertable batch");
+            writer
+                .append(&batch)
+                .expect("append unified supertable batch");
+        }
     }
 
     /// Synthesize the [`SubsectionOffsets`] the writer would have

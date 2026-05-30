@@ -2753,8 +2753,8 @@ mod tests {
         assert!(matches!(err, BuildError::FtsColumnTypeInvalid { .. }));
     }
 
-    #[test]
-    fn add_doc_accumulates_tf_within_doc() {
+    #[tokio::test]
+    async fn add_doc_accumulates_tf_within_doc() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
         use bytes::Bytes;
 
@@ -2767,9 +2767,11 @@ mod tests {
             FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
         let rust_hits = r
             .search("title", &["rust"], 10, BoolMode::Or)
+            .await
             .expect("rust search");
         let async_hits = r
             .search("title", &["async"], 10, BoolMode::Or)
+            .await
             .expect("async search");
         assert_eq!(rust_hits.len(), 1);
         assert_eq!(rust_hits[0].0, 0);
@@ -2777,8 +2779,8 @@ mod tests {
         assert_eq!(async_hits[0].0, 0);
     }
 
-    #[test]
-    fn cross_column_same_term_stays_isolated_through_round_trip() {
+    #[tokio::test]
+    async fn cross_column_same_term_stays_isolated_through_round_trip() {
         // A term that appears in two different columns must keep
         // its posting lists scoped per column in the emitted FST +
         // posting region. This also exercises the spill-backed
@@ -2811,6 +2813,7 @@ mod tests {
         // "rust" in title returns title's docs (0, 1) and no others.
         let hits_t = r
             .search("title", &["rust"], 10, BoolMode::Or)
+            .await
             .expect("title search");
         let ids_t: Vec<u32> = hits_t.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids_t.len(), 2, "title 'rust' hit count");
@@ -2822,6 +2825,7 @@ mod tests {
         // body's posting list, not title's.
         let hits_b = r
             .search("body", &["rust"], 10, BoolMode::Or)
+            .await
             .expect("body search");
         let ids_b: Vec<u32> = hits_b.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids_b.len(), 2, "body 'rust' hit count");
@@ -2833,6 +2837,7 @@ mod tests {
         // (`tokio` in body).
         let hits_async_in_title = r
             .search("title", &["async"], 10, BoolMode::Or)
+            .await
             .expect("title async search");
         assert!(
             hits_async_in_title.is_empty(),
@@ -2840,6 +2845,7 @@ mod tests {
         );
         let hits_tokio_in_body = r
             .search("body", &["tokio"], 10, BoolMode::Or)
+            .await
             .expect("body tokio search");
         assert!(
             hits_tokio_in_body.is_empty(),
@@ -2929,8 +2935,8 @@ mod tests {
         assert_eq!(via_finish_to, via_finish);
     }
 
-    #[test]
-    fn finish_to_temp_file_round_trips_through_reader() {
+    #[tokio::test]
+    async fn finish_to_temp_file_round_trips_through_reader() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
         use bytes::Bytes;
         use std::io::BufWriter;
@@ -2957,6 +2963,7 @@ mod tests {
         .expect("open FTS reader");
         let hits = r
             .search("title", &["common"], 10, BoolMode::Or)
+            .await
             .expect("search");
         assert_eq!(hits.len(), 10);
     }
@@ -3200,8 +3207,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn configurable_spill_partitions_round_trips_through_reader() {
+    #[tokio::test]
+    async fn configurable_spill_partitions_round_trips_through_reader() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
         use bytes::Bytes;
 
@@ -3222,6 +3229,7 @@ mod tests {
         .expect("open reader");
         let hits = r
             .search("body", &["alpha"], 100, BoolMode::Or)
+            .await
             .expect("search alpha");
         assert_eq!(hits.len(), 50, "alpha is in every doc");
     }

@@ -131,16 +131,17 @@ fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
 /// Run infino's BM25 search and return doc_ids in score-descending
 /// order. The superfile is built so user `doc_id` matches the row
 /// index 0..N-1, so the reader's `local_doc_id` IS the user id.
-fn infino_top_k(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
+async fn infino_top_k(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
     let hits = reader
         .bm25_search("title", query, k, BoolMode::Or)
+        .await
         .expect("BM25 search");
     hits.into_iter().map(|(d, _)| d as u64).collect()
 }
 
 /// Compare top-k *sets* between infino and brute-force for a query.
 /// Asserts agreement on the head; allows tail divergence for ties.
-fn assert_top_k_head_agrees(
+async fn assert_top_k_head_agrees(
     infino: &SuperfileReader,
     oracle: &BruteForceBm25,
     query: &str,
@@ -148,7 +149,7 @@ fn assert_top_k_head_agrees(
     k: usize,
 ) {
     let tok = default_tokenizer();
-    let infino_hits = infino_top_k(infino, query, k);
+    let infino_hits = infino_top_k(infino, query, k).await;
     let oracle_hits: Vec<u64> = oracle
         .top_k(query, k, tok.as_ref())
         .into_iter()
@@ -166,19 +167,19 @@ fn assert_top_k_head_agrees(
     );
 }
 
-#[test]
-fn oracle_rare_term_top1_matches() {
+#[tokio::test]
+async fn oracle_rare_term_top1_matches() {
     // Single-term, single-doc match: "rare-token-zzz" is unique to
     // doc 17. Both engines must return [17] as top-1.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    assert_top_k_head_agrees(&infino, &oracle, "rare-token-zzz", 1, 5);
+    assert_top_k_head_agrees(&infino, &oracle, "rare-token-zzz", 1, 5).await;
 }
 
-#[test]
-fn oracle_common_term_top1_in_correct_set() {
+#[tokio::test]
+async fn oracle_common_term_top1_in_correct_set() {
     // "rust" appears in many same-length docs at mathematically tied
     // BM25 scores. We can't assert exact top-K agreement because
     // tie-breaking diverges, but BOTH engines must pick top-1 from
@@ -187,7 +188,7 @@ fn oracle_common_term_top1_in_correct_set() {
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    let infino_top: u64 = infino_top_k(&infino, "rust", 1)[0];
+    let infino_top: u64 = infino_top_k(&infino, "rust", 1).await[0];
     let oracle_top: u64 = oracle
         .top_k("rust", 1, tok.as_ref())
         .first()
@@ -208,8 +209,8 @@ fn oracle_common_term_top1_in_correct_set() {
     );
 }
 
-#[test]
-fn oracle_two_term_or_top1_matches() {
+#[tokio::test]
+async fn oracle_two_term_or_top1_matches() {
     // "redis kafka" — doc 14 has "redis", doc 15 has "kafka". Both
     // single-occurrence docs; either could be top-1. Top-2 set must
     // agree.
@@ -217,18 +218,18 @@ fn oracle_two_term_or_top1_matches() {
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    assert_top_k_head_agrees(&infino, &oracle, "redis kafka", 2, 5);
+    assert_top_k_head_agrees(&infino, &oracle, "redis kafka", 2, 5).await;
 }
 
-#[test]
-fn oracle_two_term_overlap_top3_matches() {
+#[tokio::test]
+async fn oracle_two_term_overlap_top3_matches() {
     // "rust async" — docs 0 and 20 contain both terms, so they should
     // rank highest under any sensible BM25.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    let infino_hits = infino_top_k(&infino, "rust async", 5);
+    let infino_hits = infino_top_k(&infino, "rust async", 5).await;
     let oracle_hits: Vec<u64> = oracle
         .top_k("rust async", 5, tok.as_ref())
         .into_iter()
@@ -247,23 +248,23 @@ fn oracle_two_term_overlap_top3_matches() {
     assert_eq!(infino_head, oracle_head);
 }
 
-#[test]
-fn oracle_three_term_query_top5_set_matches() {
+#[tokio::test]
+async fn oracle_three_term_query_top5_set_matches() {
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    assert_top_k_head_agrees(&infino, &oracle, "rust web framework", 3, 10);
+    assert_top_k_head_agrees(&infino, &oracle, "rust web framework", 3, 10).await;
 }
 
-#[test]
-fn oracle_no_match_query_returns_empty() {
+#[tokio::test]
+async fn oracle_no_match_query_returns_empty() {
     // "xyzzy" is in none of the docs; both engines must return empty.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    let infino_hits = infino_top_k(&infino, "xyzzy", 5);
+    let infino_hits = infino_top_k(&infino, "xyzzy", 5).await;
     let oracle_hits = oracle.top_k("xyzzy", 5, tok.as_ref());
     assert!(
         infino_hits.is_empty(),
@@ -277,18 +278,19 @@ fn oracle_no_match_query_returns_empty() {
 
 // ─── AND-mode oracles ─────────────────────────────────────────────────
 
-fn infino_top_k_and(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
+async fn infino_top_k_and(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
     // The reader's `bm25_search` consumes a pre-built query string,
     // tokenizes it column-internally, and runs the AND intersection.
     // Returned `local_doc_id` == user `doc_id` thanks to the planted
     // 0..N row layout.
     let hits = reader
         .bm25_search("title", query, k, BoolMode::And)
+        .await
         .expect("AND BM25 search");
     hits.into_iter().map(|(d, _)| d as u64).collect()
 }
 
-fn assert_top_k_and_set_matches(
+async fn assert_top_k_and_set_matches(
     infino: &SuperfileReader,
     oracle: &BruteForceBm25,
     query: &str,
@@ -298,7 +300,7 @@ fn assert_top_k_and_set_matches(
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
     tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
-    let infino_hits = infino_top_k_and(infino, query, k);
+    let infino_hits = infino_top_k_and(infino, query, k).await;
     let oracle_hits: Vec<u64> = oracle
         .top_k_terms_and(&terms, k)
         .into_iter()
@@ -316,8 +318,8 @@ fn assert_top_k_and_set_matches(
     );
 }
 
-#[test]
-fn oracle_and_two_term_overlap_top3_matches() {
+#[tokio::test]
+async fn oracle_and_two_term_overlap_top3_matches() {
     // "rust" and "async" co-occur only in docs 0, 20, 22. Both engines
     // must return exactly that set as the AND result.
     let corp = corpus();
@@ -325,6 +327,7 @@ fn oracle_and_two_term_overlap_top3_matches() {
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
     let infino_set: HashSet<u64> = infino_top_k_and(&infino, "rust async", 10)
+        .await
         .into_iter()
         .collect();
     assert_eq!(
@@ -332,17 +335,17 @@ fn oracle_and_two_term_overlap_top3_matches() {
         HashSet::from([0u64, 20, 22]),
         "AND(rust, async) must be exactly {{0, 20, 22}}; got {infino_set:?}"
     );
-    assert_top_k_and_set_matches(&infino, &oracle, "rust async", 3, 10);
+    assert_top_k_and_set_matches(&infino, &oracle, "rust async", 3, 10).await;
 }
 
-#[test]
-fn oracle_and_three_term_singleton_match() {
+#[tokio::test]
+async fn oracle_and_three_term_singleton_match() {
     // "rust async tokio" all co-occur only in doc 0. Tightens the
     // intersection to one doc and verifies the leapfrog over three
     // cursors reduces correctly.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
-    let infino_hits = infino_top_k_and(&infino, "rust async tokio", 10);
+    let infino_hits = infino_top_k_and(&infino, "rust async tokio", 10).await;
     assert_eq!(
         infino_hits,
         vec![0u64],
@@ -350,34 +353,34 @@ fn oracle_and_three_term_singleton_match() {
     );
 }
 
-#[test]
-fn oracle_and_missing_term_returns_empty() {
+#[tokio::test]
+async fn oracle_and_missing_term_returns_empty() {
     // A term that's absent from the entire corpus must short-circuit
     // AND to empty — even though "rust" alone has many hits.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
-    let hits = infino_top_k_and(&infino, "rust definitely-not-a-token", 10);
+    let hits = infino_top_k_and(&infino, "rust definitely-not-a-token", 10).await;
     assert!(
         hits.is_empty(),
         "AND with missing term must return []; got {hits:?}"
     );
 }
 
-#[test]
-fn oracle_and_disjoint_terms_return_empty() {
+#[tokio::test]
+async fn oracle_and_disjoint_terms_return_empty() {
     // Two terms that both appear in the corpus but never co-occur
     // ("python" in docs 2-3; "kafka" in doc 15). AND yields no docs.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
-    let hits = infino_top_k_and(&infino, "python kafka", 10);
+    let hits = infino_top_k_and(&infino, "python kafka", 10).await;
     assert!(
         hits.is_empty(),
         "AND with disjoint posting lists must return []; got {hits:?}"
     );
 }
 
-#[test]
-fn oracle_and_scores_match_brute_force_ordering() {
+#[tokio::test]
+async fn oracle_and_scores_match_brute_force_ordering() {
     // For docs in the AND intersection of "rust" and "framework"
     // (only doc 8), the per-doc BM25 score must match brute force
     // bit-exactly — there's no rank ambiguity, so we can compare
@@ -391,6 +394,7 @@ fn oracle_and_scores_match_brute_force_ordering() {
 
     let infino_hits: Vec<(u64, f32)> = infino
         .bm25_search("title", "rust framework", 10, BoolMode::And)
+        .await
         .expect("AND search")
         .into_iter()
         .map(|(d, s)| (d as u64, s))
@@ -415,24 +419,24 @@ fn oracle_and_scores_match_brute_force_ordering() {
     }
 }
 
-#[test]
-fn oracle_and_single_term_routed_consistently() {
+#[tokio::test]
+async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
     // Asserting symmetry catches the case where AND's branch
     // accidentally skips the early single-term short-circuit.
     let corp = corpus();
     let infino = build_infino_superfile(&corp);
-    let and_hits = infino_top_k_and(&infino, "rare-token-zzz", 5);
-    let or_hits = infino_top_k(&infino, "rare-token-zzz", 5);
+    let and_hits = infino_top_k_and(&infino, "rare-token-zzz", 5).await;
+    let or_hits = infino_top_k(&infino, "rare-token-zzz", 5).await;
     assert_eq!(and_hits, or_hits);
     assert_eq!(and_hits, vec![17u64]);
 }
 
 // ─── (resume existing OR oracles) ─────────────────────────────────────
 
-#[test]
-fn oracle_long_doc_vs_short_doc_dl_norm() {
+#[tokio::test]
+async fn oracle_long_doc_vs_short_doc_dl_norm() {
     // BM25's dl-norm should make short docs that contain a term rank
     // higher than long docs containing the same term once. Doc 7
     // ("go web framework gin echo", 5 tokens) and doc 8 ("rust web
@@ -443,7 +447,7 @@ fn oracle_long_doc_vs_short_doc_dl_norm() {
     let infino = build_infino_superfile(&corp);
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
-    let infino_hits = infino_top_k(&infino, "framework", 5);
+    let infino_hits = infino_top_k(&infino, "framework", 5).await;
     let oracle_hits: Vec<u64> = oracle
         .top_k("framework", 5, tok.as_ref())
         .into_iter()
@@ -536,8 +540,8 @@ fn multi_block_and_truth(terms: &[&str]) -> HashSet<u64> {
         .collect()
 }
 
-#[test]
-fn oracle_and_multi_block_two_term_matches_brute_force() {
+#[tokio::test]
+async fn oracle_and_multi_block_two_term_matches_brute_force() {
     // alpha ∧ beta: both span >1 block (3 + 2). Intersection is
     // docs where d % lcm(3,4) == 0, i.e., d % 12 == 0 → 84 matches
     // distributed across the corpus, forcing the 2-term flat-merge
@@ -545,6 +549,7 @@ fn oracle_and_multi_block_two_term_matches_brute_force() {
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
     let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta", 200)
+        .await
         .into_iter()
         .collect();
     let truth = multi_block_and_truth(&["alpha", "beta"]);
@@ -554,8 +559,8 @@ fn oracle_and_multi_block_two_term_matches_brute_force() {
     );
 }
 
-#[test]
-fn oracle_and_multi_block_three_term_matches_brute_force() {
+#[tokio::test]
+async fn oracle_and_multi_block_three_term_matches_brute_force() {
     // alpha ∧ beta ∧ gamma: all span >1 block. Intersection is docs
     // where d % lcm(3,4,5) == 0, i.e., d % 60 == 0. Exercises the
     // n>=3 flat-merge `for o in others.iter_mut()` inner loop with
@@ -564,6 +569,7 @@ fn oracle_and_multi_block_three_term_matches_brute_force() {
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
     let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma", 200)
+        .await
         .into_iter()
         .collect();
     let truth = multi_block_and_truth(&["alpha", "beta", "gamma"]);
@@ -573,8 +579,8 @@ fn oracle_and_multi_block_three_term_matches_brute_force() {
     );
 }
 
-#[test]
-fn oracle_and_multi_block_four_term_matches_brute_force() {
+#[tokio::test]
+async fn oracle_and_multi_block_four_term_matches_brute_force() {
     // alpha ∧ beta ∧ gamma ∧ delta: all four span >1 block.
     // Intersection is d % lcm(3,4,5,7) == 0, i.e., d % 420 == 0 →
     // 3 matches at most {0, 420, 840} in a 1000-doc corpus.
@@ -583,6 +589,7 @@ fn oracle_and_multi_block_four_term_matches_brute_force() {
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
     let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma delta", 200)
+        .await
         .into_iter()
         .collect();
     let truth = multi_block_and_truth(&["alpha", "beta", "gamma", "delta"]);
@@ -592,8 +599,8 @@ fn oracle_and_multi_block_four_term_matches_brute_force() {
     );
 }
 
-#[test]
-fn oracle_and_multi_block_with_rare_term_short_circuits() {
+#[tokio::test]
+async fn oracle_and_multi_block_with_rare_term_short_circuits() {
     // alpha (common, multi-block) ∧ epsilon (rare, single block).
     // The leapfrog picks the rarer (epsilon) as leader and walks
     // its single block; the alpha cursor must cross several blocks
@@ -602,6 +609,7 @@ fn oracle_and_multi_block_with_rare_term_short_circuits() {
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
     let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha epsilon", 100)
+        .await
         .into_iter()
         .collect();
     let truth = multi_block_and_truth(&["alpha", "epsilon"]);
@@ -611,8 +619,8 @@ fn oracle_and_multi_block_with_rare_term_short_circuits() {
     );
 }
 
-#[test]
-fn oracle_and_multi_block_top_k_smaller_than_match_count() {
+#[tokio::test]
+async fn oracle_and_multi_block_top_k_smaller_than_match_count() {
     // top-k=5 against an AND that has ~84 matches. Once the heap
     // fills, the block-max-AND pruning check at the top of the
     // outer loop fires on every subsequent leader block whose UB
@@ -622,7 +630,7 @@ fn oracle_and_multi_block_top_k_smaller_than_match_count() {
     // brute-force order).
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
-    let infino_hits = infino_top_k_and(&r, "alpha beta", 5);
+    let infino_hits = infino_top_k_and(&r, "alpha beta", 5).await;
     assert_eq!(infino_hits.len(), 5, "top-k=5 should fill");
     let truth = multi_block_and_truth(&["alpha", "beta"]);
     for d in &infino_hits {
@@ -633,8 +641,8 @@ fn oracle_and_multi_block_top_k_smaller_than_match_count() {
     }
 }
 
-#[test]
-fn oracle_and_multi_block_score_matches_brute_force() {
+#[tokio::test]
+async fn oracle_and_multi_block_score_matches_brute_force() {
     // Cross-check scores against the brute-force scorer on the
     // multi-block corpus. The two-term AND has 84 matches and the
     // top-10 list must agree on doc-id sets with brute force (ties
@@ -651,7 +659,7 @@ fn oracle_and_multi_block_score_matches_brute_force() {
 
     let mut terms: Vec<String> = Vec::new();
     tok.tokenize_each("alpha beta", &mut |t| terms.push(t.to_owned()));
-    let infino_hits = infino_top_k_and(&r, "alpha beta", 10);
+    let infino_hits = infino_top_k_and(&r, "alpha beta", 10).await;
     let oracle_hits: Vec<u64> = oracle
         .top_k_terms_and(&terms, 10)
         .into_iter()

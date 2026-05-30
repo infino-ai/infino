@@ -225,8 +225,8 @@ fn no_storage_attached_takes_002_path() {
     assert_eq!(r.n_superfiles(), 1);
 }
 
-#[test]
-fn committed_supertable_remains_in_memory_queryable_for_now() {
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_supertable_remains_in_memory_queryable_for_now() {
     // Pre-M5: storage write-through is additive — the
     // in-memory store still holds segment bytes, so existing
     // 002 query paths keep working unchanged. Verifies no
@@ -252,6 +252,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
             5,
             infino::supertable::query::fts::BoolMode::Or,
         )
+        .await
         .expect("query");
     assert_eq!(hits.len(), 1, "M4 commit must not break in-memory reads");
 }

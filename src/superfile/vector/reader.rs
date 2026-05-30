@@ -1021,7 +1021,7 @@ impl VectorReader {
     /// in plan 011 M4 once the audit confirmed zero external
     /// readers. See `claude_plans/011_lazy_reader_loads.md`
     /// § Search path for the contract.
-    pub fn search(
+    pub async fn search(
         &self,
         column: &str,
         query: &[f32],
@@ -1048,7 +1048,8 @@ impl VectorReader {
         let idx_end = idx_start + (col.n_cent as usize) * 8;
         let centroid_idx_region = self
             .source
-            .get_range(centroids_start..idx_end)
+            .range_async(centroids_start..idx_end)
+            .await
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
         let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
         let cluster_idx =
@@ -1102,6 +1103,7 @@ impl VectorReader {
             &cluster_ranges,
             lazy_sq8_meta_range,
         )
+        .await
         .map_err(|e| VectorError::LazySource(e.to_string()))?;
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
@@ -1225,6 +1227,7 @@ impl VectorReader {
             query,
             k,
         )
+        .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
@@ -1369,7 +1372,7 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 ///   per-doc decoded-norm cached at encode time short-circuits
 ///   `Σx²` for L2Sq).
 #[inline]
-fn rerank_candidates_packed(
+async fn rerank_candidates_packed(
     source: &Source,
     lazy_sq8_meta_bytes: Option<&Bytes>,
     packed: &[u8],
@@ -1476,7 +1479,7 @@ fn rerank_candidates_packed(
                         ranges.push(scale_start..scale_start + cluster_meta_len);
                         ranges.push(offset_start..offset_start + cluster_meta_len);
                     }
-                    let bytes = source.get_ranges_parallel(&ranges)?;
+                    let bytes = source.get_ranges_parallel_async(&ranges).await?;
                     let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
                         HashMap::with_capacity(clusters.len());
                     for (idx, &cluster_id) in clusters.iter().enumerate() {
@@ -1508,7 +1511,7 @@ fn rerank_candidates_packed(
                                 start..start + (hi - lo + 1) as usize * 4
                             })
                             .collect();
-                        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
+                        let norm_bytes = source.get_ranges_parallel_async(&norm_ranges).await?;
                         let mut out = HashMap::new();
                         for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
                             let vals = parse_f32_le_vec(&bytes);
@@ -1602,16 +1605,16 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
 }
 
-fn get_cluster_ranges_coalesced_with_extra(
+async fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
     extra: Option<Range<usize>>,
 ) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
     let Some(extra) = extra else {
-        return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
+        return Ok((get_cluster_ranges_coalesced(source, ranges).await?, None));
     };
     if ranges.is_empty() {
-        let mut fetched = source.get_ranges_parallel(&[extra])?;
+        let mut fetched = source.get_ranges_parallel_async(&[extra]).await?;
         return Ok((Vec::new(), fetched.pop()));
     }
 
@@ -1640,7 +1643,7 @@ fn get_cluster_ranges_coalesced_with_extra(
 
     let mut fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
     fetch_ranges.push(extra);
-    let mut fetched = source.get_ranges_parallel(&fetch_ranges)?;
+    let mut fetched = source.get_ranges_parallel_async(&fetch_ranges).await?;
     let extra_bytes = fetched.pop();
 
     let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
@@ -1660,12 +1663,12 @@ fn get_cluster_ranges_coalesced_with_extra(
     ))
 }
 
-fn get_cluster_ranges_coalesced(
+async fn get_cluster_ranges_coalesced(
     source: &Source,
     ranges: &[Range<usize>],
 ) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
     if ranges.len() <= 1 {
-        return source.get_ranges_parallel(ranges);
+        return source.get_ranges_parallel_async(ranges).await;
     }
 
     let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
@@ -1692,11 +1695,11 @@ fn get_cluster_ranges_coalesced(
     }
 
     if groups.len() == ranges.len() {
-        return source.get_ranges_parallel(ranges);
+        return source.get_ranges_parallel_async(ranges).await;
     }
 
     let merged_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
-    let merged_bytes = source.get_ranges_parallel(&merged_ranges)?;
+    let merged_bytes = source.get_ranges_parallel_async(&merged_ranges).await?;
     let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
     for ((merged_range, _, members), bytes) in groups.into_iter().zip(merged_bytes) {
         for (idx, range) in members {
@@ -1838,8 +1841,8 @@ mod tests {
         assert_eq!(r1.n_docs(), r2.n_docs());
     }
 
-    #[test]
-    fn search_self_query_returns_self_as_top1() {
+    #[tokio::test]
+    async fn search_self_query_returns_self_as_top1() {
         let dim = 16;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -1867,6 +1870,7 @@ mod tests {
         let target = 17;
         let hits = r
             .search("embedding", &all_vecs[target], 5, 4, 5)
+            .await
             .expect("FTS search");
         assert!(!hits.is_empty(), "search should return hits");
         assert_eq!(hits[0].0, target as u32, "self should be nearest");
@@ -1877,42 +1881,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn search_unknown_column_errors() {
+    #[tokio::test]
+    async fn search_unknown_column_errors() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
             .search("nonexistent", &[0.0; 16], 5, 4, 5)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, VectorError::UnknownColumn(_)));
     }
 
-    #[test]
-    fn search_dim_mismatch_errors() {
+    #[tokio::test]
+    async fn search_dim_mismatch_errors() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
             .search("embedding", &[0.0; 8], 5, 4, 5)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, VectorError::DimensionMismatch { .. }));
     }
 
-    #[test]
-    fn search_zero_k_returns_empty() {
+    #[tokio::test]
+    async fn search_zero_k_returns_empty() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let hits = r
             .search("embedding", &[0.0; 16], 0, 4, 5)
+            .await
             .expect("FTS search");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn search_results_sorted_ascending_by_distance() {
+    #[tokio::test]
+    async fn search_results_sorted_ascending_by_distance() {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let q = vec![0.5; 16];
-        let hits = r.search("embedding", &q, 10, 4, 5).expect("FTS search");
+        let hits = r
+            .search("embedding", &q, 10, 4, 5)
+            .await
+            .expect("FTS search");
         for w in hits.windows(2) {
             assert!(w[0].1 <= w[1].1, "distances should be ascending");
         }
@@ -2149,8 +2159,8 @@ mod tests {
     /// widen-to-fp32 (search) paths agree on the bf16 layout —
     /// any byte-order or stride mismatch would surface as
     /// wrong-doc-id or out-of-bounds.
-    #[test]
-    fn bf16_self_query_round_trips_top1() {
+    #[tokio::test]
+    async fn bf16_self_query_round_trips_top1() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -2185,6 +2195,7 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let hits = r
             .search("v", &all[17], 5, 4, 5)
+            .await
             .expect("search must succeed on Bf16 column");
         assert_eq!(hits[0].0, 17, "Bf16 self-query must recover self at top-1");
         // The L2Sq distance back to self is bounded by the bf16
@@ -2343,8 +2354,8 @@ mod tests {
     /// vectors via the per-pos `doc_id` and confirm it matches
     /// — proving the pos-indexed lookup actually resolves to
     /// "this doc's decoded L2 norm".
-    #[test]
-    fn sq8_per_doc_norms_indexed_by_pos_not_doc_id() {
+    #[tokio::test]
+    async fn sq8_per_doc_norms_indexed_by_pos_not_doc_id() {
         let dim = 16usize;
         let n_cent = 4usize;
         let n_docs = 32u32;
@@ -2431,6 +2442,7 @@ mod tests {
             // norms-indexing bug, not a Hamming-recall artifact.
             let hits = r
                 .search("v", &planted[i as usize], 1, 4, 64)
+                .await
                 .expect("self-query");
             assert_eq!(hits[0].0, i, "self-query top-1 doc_id for doc {i}");
             // Quantization noise bound: per-dim error ≤ scale/2
@@ -2452,8 +2464,8 @@ mod tests {
     /// codec-aware rerank dispatch + Sq8Kernel — any layout drift
     /// (codec_meta order, code stride, per-doc-norm indexing)
     /// would surface as wrong-doc or out-of-bounds.
-    #[test]
-    fn sq8_self_query_round_trips_top1_l2sq() {
+    #[tokio::test]
+    async fn sq8_self_query_round_trips_top1_l2sq() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -2488,6 +2500,7 @@ mod tests {
         // the 1-bit shortlist's recall ceiling.
         let hits = r
             .search("v", &all[17], 5, 4, 20)
+            .await
             .expect("search must succeed on Sq8 column");
         assert_eq!(hits[0].0, 17, "Sq8 self-query must recover self at top-1");
         // Sq8 round-trip error: per-dim quantization step is
@@ -2517,8 +2530,8 @@ mod tests {
     /// kernel bug, but not a useful pin for codec correctness.
     /// Real cosine workloads (semantic embeddings) look like the
     /// current corpus, not the pathological one.
-    #[test]
-    fn sq8_self_query_round_trips_top1_cosine() {
+    #[tokio::test]
+    async fn sq8_self_query_round_trips_top1_cosine() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -2563,6 +2576,7 @@ mod tests {
         // 1-bit shortlist recall.
         let hits = r
             .search("v", &all[42], 5, 4, 20)
+            .await
             .expect("search must succeed on Sq8 cosine column");
         assert_eq!(hits[0].0, 42, "Sq8 cosine self-query must recover self");
     }
@@ -2640,8 +2654,8 @@ mod tests {
     /// self-vector even without rerank — exactly the contract
     /// `None` opts into. Returned distances are `-estimate`
     /// (sign-flipped so smaller = closer holds).
-    #[test]
-    fn none_self_query_in_top_k_via_shortlist_only() {
+    #[tokio::test]
+    async fn none_self_query_in_top_k_via_shortlist_only() {
         let dim = 128usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -2689,6 +2703,7 @@ mod tests {
         // here by passing a value that would otherwise oversample).
         let hits = r
             .search("v", &all[17], 5, n_cent, 5)
+            .await
             .expect("None-codec search must succeed");
         assert!(
             !hits.is_empty(),
@@ -2726,8 +2741,8 @@ mod tests {
     /// invariant (full[] is zero-length on disk) is pinned by
     /// `open_round_trips_none_codec_discriminator`; this test
     /// pins the read-path side.
-    #[test]
-    fn none_search_issues_no_full_region_fetch() {
+    #[tokio::test]
+    async fn none_search_issues_no_full_region_fetch() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 32u32;
@@ -2764,7 +2779,10 @@ mod tests {
         async_calls.store(0, AtomicOrdering::Relaxed);
         sync_calls.store(0, AtomicOrdering::Relaxed);
         let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
-        let _ = r.search("v", &query, 5, n_cent, 5).expect("search");
+        let _ = r
+            .search("v", &query, 5, n_cent, 5)
+            .await
+            .expect("search");
 
         // Upper-bound sync fetches for None / nprobe = n_cent:
         //   centroids (1) + cluster_idx (1)
@@ -2874,9 +2892,9 @@ mod tests {
     // with `cargo test --lib -- sq8_recall_diagnostic --ignored
     // --nocapture` to inspect. Per-column-quantizer fix (or fallback
     // to Bf16 default) is decided based on what this prints.
-    #[test]
+    #[tokio::test]
     #[ignore = "Plan 012 M5 recall diagnostic; ~10s; --ignored --nocapture"]
-    fn sq8_recall_diagnostic_planted_cluster_cosine() {
+    async fn sq8_recall_diagnostic_planted_cluster_cosine() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
         use rand_distr::{Distribution, StandardNormal};
@@ -3029,11 +3047,16 @@ mod tests {
             })
             .collect();
 
-        let recall_of = |reader: &VectorReader, label: &str| -> f32 {
+        eprintln!(
+            "--- recall@{k} on {n_queries} self-queries (nprobe={nprobe}, rerank_mult={rerank_mult}) ---"
+        );
+        let mut recalls = Vec::new();
+        for (reader, label) in [(&r_fp32, "fp32"), (&r_bf16, "bf16"), (&r_sq8, "sq8 ")] {
             let mut total_match = 0usize;
             for qi in 0..n_queries {
                 let hits = reader
                     .search("v", &all[qi], k, nprobe, rerank_mult)
+                    .await
                     .expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
@@ -3042,15 +3065,11 @@ mod tests {
             }
             let recall = total_match as f32 / (n_queries * k) as f32;
             eprintln!("recall@{k} ({label}): {recall:.4}");
-            recall
-        };
-
-        eprintln!(
-            "--- recall@{k} on {n_queries} self-queries (nprobe={nprobe}, rerank_mult={rerank_mult}) ---"
-        );
-        let r_fp = recall_of(&r_fp32, "fp32");
-        let r_bf = recall_of(&r_bf16, "bf16");
-        let r_sq = recall_of(&r_sq8, "sq8 ");
+            recalls.push(recall);
+        }
+        let r_fp = recalls[0];
+        let r_bf = recalls[1];
+        let r_sq = recalls[2];
         eprintln!(
             "drop (fp32 - bf16): {:.4}\ndrop (fp32 - sq8 ): {:.4}",
             r_fp - r_bf,
@@ -3065,7 +3084,10 @@ mod tests {
         for &rm in &[20usize, 50, 100, 200, 400] {
             let mut tm = 0usize;
             for qi in 0..n_queries {
-                let hits = r_sq8.search("v", &all[qi], k, nprobe, rm).expect("search");
+                let hits = r_sq8
+                    .search("v", &all[qi], k, nprobe, rm)
+                    .await
+                    .expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
                 tm += ground_truth[qi]
@@ -3143,12 +3165,13 @@ mod tests {
     /// recover the planted self-vector at top-1, confirming the
     /// inline-`pos` rerank path returns the correct results on
     /// the search-shape corpus that every M3/M4 test uses.
-    #[test]
-    fn lazy_default_search_recovers_self_query() {
+    #[tokio::test]
+    async fn lazy_default_search_recovers_self_query() {
         let (blob, json, all) = build_search_corpus();
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("embedding", &all[17], 5, 4, 5)
+            .await
             .expect("search must succeed on lazy InMemory");
         assert_eq!(hits[0].0, 17, "self-query must recover self");
     }
@@ -3335,8 +3358,8 @@ mod tests {
     /// `Source::InMemory` path. This is the steady-state shape the
     /// supertable reader sees today (the reader_cache is in-process,
     /// so every range is resident).
-    #[test]
-    fn search_on_lazy_source_with_warm_sync_cache_matches_in_memory() {
+    #[tokio::test]
+    async fn search_on_lazy_source_with_warm_sync_cache_matches_in_memory() {
         let (blob, json, all) = build_search_corpus();
         let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
@@ -3347,9 +3370,11 @@ mod tests {
         for &q_idx in &[0usize, 17, 31, 63] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("Lazy(warm) search");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -3373,8 +3398,8 @@ mod tests {
     /// Handle::block_on` branch is what fires there; this test
     /// exercises the no-ambient-runtime fallback branch to
     /// keep that path live.
-    #[test]
-    fn search_on_lazy_source_with_no_sync_fallback_bridges_to_async() {
+    #[tokio::test]
+    async fn search_on_lazy_source_with_no_sync_fallback_bridges_to_async() {
         let (blob, json, all) = build_search_corpus();
         let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
@@ -3390,9 +3415,11 @@ mod tests {
         for &q_idx in &[0usize, 17, 31, 63] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("sync search must succeed via block_on bridge");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -3436,8 +3463,8 @@ mod tests {
     /// reintroducing the whole-subsection fallback, or pulling the
     /// full `doc_ids` region over the wire at open — surfaces here
     /// rather than at the production S3 harness in 013.
-    #[test]
-    fn search_cold_first_search_range_count_per_cluster() {
+    #[tokio::test]
+    async fn search_cold_first_search_range_count_per_cluster() {
         let (blob, json, all) = build_search_corpus();
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -3463,6 +3490,7 @@ mod tests {
         counting.disable_sync();
         let hits = r
             .search("embedding", &all[7], 5, 4, 5)
+            .await
             .expect("sync search via block_on bridge");
         assert!(!hits.is_empty(), "search should return hits");
 
@@ -3484,8 +3512,8 @@ mod tests {
     /// results as `Source::InMemory`. Locks in the contract that
     /// the trait-based path doesn't accidentally diverge from the
     /// enum-based fast path.
-    #[test]
-    fn search_matches_in_memory_through_bytes_lazy_source() {
+    #[tokio::test]
+    async fn search_matches_in_memory_through_bytes_lazy_source() {
         let (blob, json, all) = build_search_corpus();
         let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
         let lazy_src: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(blob));
@@ -3496,9 +3524,11 @@ mod tests {
         for &q_idx in &[3usize, 19, 47] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("BytesLazyByteSource sync search");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -4191,9 +4221,11 @@ mod tests {
             for &q_idx in &[0usize, 7, 17, 31] {
                 let hits_eager = r_eager
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
                 let hits_lazy = r_lazy
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
                 assert_eq!(
                     hits_eager, hits_lazy,
@@ -4219,12 +4251,7 @@ mod tests {
     /// "At most" because some probed clusters can be empty
     /// (zero-count entries skip the block fetch entirely); for a
     /// well-distributed corpus the budget is hit exactly.
-    ///
-    /// Runs on the multi-thread tokio runtime so the sync
-    /// `search()` path's `block_in_place + Handle::block_on`
-    /// bridge can fire (the current-thread runtime that
-    /// `#[tokio::test]` uses by default rejects `block_in_place`).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn cold_first_search_after_open_lazy_within_nprobe_plus_one_ranges() {
         let (blob, json, all) = build_small_segment(32, 8, 128, RerankCodec::Sq8, Metric::L2Sq);
 
@@ -4246,14 +4273,16 @@ mod tests {
 
         let after_open = async_counter.load(AtomicOrdering::Relaxed);
         assert_eq!(
-            after_open, 4,
-            "Sq8 open_lazy must issue exact metadata ranges before search \
-             (header, directory, subheader, codec_meta); observed {after_open}",
+            after_open, 3,
+            "Sq8 open_lazy must issue exactly the open-time metadata ranges \
+             (header, directory, subheader); codec_meta is deferred to the \
+             first search on the object-store path; observed {after_open}",
         );
 
         let nprobe = 4usize;
         let _hits = r_lazy
             .search("v", &all[0], 5, nprobe, 5)
+            .await
             .expect("cold first search");
 
         let after_search = async_counter.load(AtomicOrdering::Relaxed);
@@ -4315,14 +4344,11 @@ mod tests {
         let async_after_open = async_counter.load(AtomicOrdering::Relaxed);
 
         let nprobe = 8usize;
-        let hits = tokio::task::spawn_blocking({
-            let r_lazy = std::sync::Arc::new(r_lazy);
-            let q = all[0].clone();
-            move || r_lazy.search("v", &q, 5, nprobe, 5)
-        })
-        .await
-        .expect("spawn_blocking join")
-        .expect("cold first search");
+        let q = all[0].clone();
+        let hits = r_lazy
+            .search("v", &q, 5, nprobe, 5)
+            .await
+            .expect("cold first search");
         assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
 
         let peak = max_in_flight.load(AtomicOrdering::Acquire);
@@ -4376,9 +4402,11 @@ mod tests {
             for &q_idx in &[0usize, 7, 17, 31] {
                 let hits_eager = r_eager
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
                 let hits_lazy = r_lazy
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
                 assert_eq!(
                     hits_eager, hits_lazy,
@@ -4470,6 +4498,10 @@ mod tests {
         let (blob, json, _) = build_small_segment(32, 4, 64, RerankCodec::Sq8, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        // Simulate the object-store path: with no zero-copy sync read
+        // available, open defers Sq8 codec_meta to the first search,
+        // so the lazy column resolves to `Sq8ColumnMeta::Lazy`.
+        counting.disable_sync();
         let r_lazy = VectorReader::open_lazy(
             StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
             &json,

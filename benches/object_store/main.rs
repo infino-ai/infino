@@ -9,8 +9,8 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench object-store
-//! INFINO_BENCH_FULL=1 cargo bench --bench object-store          # 1M-doc headline row
+//! cargo bench --bench object-store                                  # s3s-fs (1M superfile)
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --bench object-store   # real AWS S3
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench object-store
 //! ```
 

@@ -414,7 +414,7 @@ impl SuperfileReader {
     /// `query` is tokenized by the same v1 tokenizer used at build
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
     /// ordered by descending score.
-    pub fn bm25_search(
+    pub async fn bm25_search(
         &self,
         column: &str,
         query: &str,
@@ -426,6 +426,7 @@ impl SuperfileReader {
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
         self.bm25_search_pretokenized(column, &term_refs, k, mode)
+            .await
     }
 
     /// Pre-tokenized variant of [`Self::bm25_search`] — the caller
@@ -443,7 +444,7 @@ impl SuperfileReader {
     /// — the FST keys are stored in that form. Callers using the
     /// v1 tokenizer can produce them via
     /// `AsciiLowerTokenizer.tokenize(query)`.
-    pub fn bm25_search_pretokenized(
+    pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
         terms: &[&str],
@@ -453,7 +454,7 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search(column, terms, k, mode)?)
+        Ok(fts.search(column, terms, k, mode).await?)
     }
 
     /// Prefix-expanded BM25 search.
@@ -469,7 +470,7 @@ impl SuperfileReader {
     ///
     /// Returns an empty `Vec` if no indexed term begins with
     /// `prefix` or if `k == 0`.
-    pub fn bm25_search_prefix(
+    pub async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
@@ -493,7 +494,7 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| std::str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search(column, &term_strings, k, BoolMode::Or)?)
+        Ok(fts.search(column, &term_strings, k, BoolMode::Or).await?)
     }
 
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
@@ -510,7 +511,7 @@ impl SuperfileReader {
     /// here — they already finish in microseconds via
     /// [`Self::bm25_search_pretokenized`]; the supertable layer
     /// should keep them on the un-ranged path.
-    pub fn bm25_search_or_range_pretokenized(
+    pub async fn bm25_search_or_range_pretokenized(
         &self,
         column: &str,
         terms: &[&str],
@@ -521,7 +522,9 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search_or_range_pretokenized(column, terms, k, doc_id_start, doc_id_end)?)
+        Ok(fts
+            .search_or_range_pretokenized(column, terms, k, doc_id_start, doc_id_end)
+            .await?)
     }
 
     /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
@@ -534,7 +537,7 @@ impl SuperfileReader {
     /// queries; the per-sub-range expansion is identical (same FST,
     /// same column) so each sub-range expands locally rather than
     /// passing pre-expanded terms across the task boundary.
-    pub fn bm25_search_prefix_range(
+    pub async fn bm25_search_prefix_range(
         &self,
         column: &str,
         prefix: &str,
@@ -557,12 +560,14 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| std::str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)?)
+        Ok(fts
+            .search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)
+            .await?)
     }
 
     /// Multi-column BM25 search with per-column weights ("most
     /// fields" semantics: per-column scores summed by weight).
-    pub fn bm25_search_multi(
+    pub async fn bm25_search_multi(
         &self,
         columns: &[(&str, f32)],
         query: &str,
@@ -572,7 +577,7 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search_multi(columns, query, k, mode)?)
+        Ok(fts.search_multi(columns, query, k, mode).await?)
     }
 
     /// Single-column vector kNN against a named vector index.
@@ -582,19 +587,17 @@ impl SuperfileReader {
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
     ///
-    /// Sync — matches plan 002 Q9 (commit `2e351ba`)'s
-    /// resolution that every public surface in `src/` is sync.
-    /// Per-range byte access routes through
-    /// [`crate::superfile::vector::reader::Source::get_range`],
-    /// which is itself sync and bridges to the underlying
-    /// async `LazyByteSource::range` only on cold
-    /// `Source::Lazy` misses (via `block_in_place +
-    /// Handle::block_on`, same pattern as
-    /// `supertable::query::segment_reader::segment_reader`).
-    /// On `Source::InMemory` and on warm-cache
-    /// `Source::Lazy` (`BytesLazyByteSource`, mmap-backed)
-    /// every fetch resolves zero-copy on the sync fast path.
-    pub fn vector_search(
+    /// Async — every per-range byte access routes through
+    /// [`crate::superfile::vector::reader::Source::range_async`] /
+    /// `get_ranges_parallel_async`, which `await` the underlying
+    /// `LazyByteSource::range` on the caller's tokio runtime. On
+    /// `Source::InMemory` and warm-cache `Source::Lazy`
+    /// (`BytesLazyByteSource`, mmap-backed) every fetch resolves
+    /// zero-copy without suspending; only cold `Source::Lazy`
+    /// misses actually hit the object store, and those run on the
+    /// owning runtime's reactor (no sync bridge, no throwaway
+    /// runtime), so object-store retries fire correctly.
+    pub async fn vector_search(
         &self,
         column: &str,
         query: &[f32],
@@ -604,7 +607,8 @@ impl SuperfileReader {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(v.search(column, query, k, options.nprobe, options.rerank_mult)?)
+        Ok(v.search(column, query, k, options.nprobe, options.rerank_mult)
+            .await?)
     }
 }
 
@@ -771,12 +775,13 @@ mod tests {
         assert!(r.vec().is_none());
     }
 
-    #[test]
-    fn bm25_search_finds_matching_docs() {
+    #[tokio::test]
+    async fn bm25_search_finds_matching_docs() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
+            .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
         let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -784,8 +789,8 @@ mod tests {
         assert!(doc_ids.contains(&2));
     }
 
-    #[test]
-    fn bm25_search_errors_when_no_fts() {
+    #[tokio::test]
+    async fn bm25_search_errors_when_no_fts() {
         // Build a superfile with no FTS, no vec.
         let schema = schema_with_text();
         let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
@@ -799,6 +804,7 @@ mod tests {
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
             .bm25_search("nope", "x", 1, BoolMode::Or)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
     }
@@ -882,8 +888,8 @@ mod tests {
         assert_eq!(opts.rerank_mult, 50);
     }
 
-    #[test]
-    fn vector_search_with_default_options_succeeds() {
+    #[tokio::test]
+    async fn vector_search_with_default_options_succeeds() {
         // Confirms the default options path actually executes without
         // panicking; the recall is exercised in tests/recall.rs.
         let bytes = build_vector_only_superfile();
@@ -894,12 +900,13 @@ mod tests {
         normalize(&mut q);
         let hits = r
             .vector_search("emb", &q, 1, VectorSearchOptions::default())
+            .await
             .expect("vector search");
         assert!(!hits.is_empty());
     }
 
-    #[test]
-    fn vector_search_finds_self() {
+    #[tokio::test]
+    async fn vector_search_finds_self() {
         let bytes = build_vector_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         // Query equal to doc 2's vector → top hit must be doc 2.
@@ -916,6 +923,7 @@ mod tests {
                     .with_nprobe(4)
                     .with_rerank_mult(5),
             )
+            .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
     }
@@ -937,18 +945,19 @@ mod tests {
         assert_eq!(batch.num_columns(), 2);
     }
 
-    #[test]
-    fn unknown_column_in_search_propagates_fts_error() {
+    #[tokio::test]
+    async fn unknown_column_in_search_propagates_fts_error() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
             .bm25_search("nonexistent", "rust", 5, BoolMode::Or)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::Fts(_)));
     }
 
-    #[test]
-    fn bm25_search_multi_combines_columns() {
+    #[tokio::test]
+    async fn bm25_search_multi_combines_columns() {
         // Build a 2-FTS-column file.
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
@@ -981,6 +990,7 @@ mod tests {
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
             .bm25_search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 3, BoolMode::Or)
+            .await
             .expect("BM25 multi-column search");
         // Both doc 0 (title:rust) and doc 1 (body:rust) hit.
         let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();

@@ -123,7 +123,12 @@ which is the structured source of truth the markdown is derived from.
 ### Vector — superfile (single-segment, 1M × 384)
 
 <!-- BEGIN: bench/vector/superfile/ingest -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector -- superfile_vec_build` to populate_
+### Superfile vector — ingest (1000000 docs × dim=384, Gaussian planted clusters, cosine)
+
+| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|--------|------|------------|----------|------------|---------|------------|
+| infino | 20.60 s | 48.5 K/s | 5.75 GiB | 3.16 GiB | 4.73 GiB | -0.4% no change |
+
 <!-- END: bench/vector/superfile/ingest -->
 
 <!-- BEGIN: bench/vector/superfile/search -->

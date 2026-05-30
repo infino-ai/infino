@@ -16,12 +16,10 @@
 //!      that the existing segment-level skip + fan-out
 //!      code consumes.
 //!
-//! Sync bridge via the same ambient-runtime detection the
-//! writer's `persist_commit` uses (`Handle::try_current` →
-//! `block_in_place + handle.block_on` when in an async
-//! context; `sql_runtime.block_on` otherwise). The query
-//! paths stay sync end-to-end; callers don't acquire any
-//! runtime knowledge.
+//! `async` end-to-end: the query paths that call these helpers
+//! are themselves async and run on the owning tokio runtime, so
+//! part-load GETs are driven by that runtime's reactor (no sync
+//! bridge, no throwaway runtime).
 
 use std::sync::Arc;
 
@@ -40,12 +38,9 @@ use crate::supertable::manifest::{Manifest, SuperfileEntry};
 /// parallel so wall-clock is `max(per-part GET latency)`
 /// not the serial sum.
 ///
-/// Sync→async bridge via the standard pattern:
-/// `Handle::try_current` → `block_in_place + handle.block_on`
-/// inside an ambient runtime; build a `new_current_thread`
-/// runtime ad-hoc outside one. Mirrors `superfile_reader`'s
-/// disk-cache bridge.
-pub fn load_kept_parts(
+/// `await`s each part load on the caller's runtime; cold lazy
+/// parts' GETs run on that runtime's reactor.
+pub async fn load_kept_parts(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<ManifestPart>>, QueryError> {
@@ -60,27 +55,12 @@ pub fn load_kept_parts(
         })
         .collect();
 
-    let drive = async move {
-        let loaded = futures::future::join_all(load_futs).await;
-        let mut out = Vec::with_capacity(loaded.len());
-        for r in loaded {
-            out.push(r.map_err(|e| QueryError::Store(format!("part load: {e}")))?);
-        }
-        Ok::<Vec<Arc<ManifestPart>>, QueryError>(out)
-    };
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-        Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    QueryError::Store(format!("tokio runtime build for hierarchical_iter: {e}"))
-                })?;
-            rt.block_on(drive)
-        }
+    let loaded = futures::future::join_all(load_futs).await;
+    let mut out = Vec::with_capacity(loaded.len());
+    for r in loaded {
+        out.push(r.map_err(|e| QueryError::Store(format!("part load: {e}")))?);
     }
+    Ok(out)
 }
 
 /// Concatenate the loaded parts' superfiles into a flat
@@ -98,11 +78,11 @@ pub fn flatten_segments(parts: &[Arc<ManifestPart>]) -> Vec<Arc<SuperfileEntry>>
 
 /// Combined helper: lazy-load + flatten in one call. The
 /// common shape across query paths.
-pub fn load_and_flatten(
+pub async fn load_and_flatten(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
-    let parts = load_kept_parts(manifest, kept_part_ids)?;
+    let parts = load_kept_parts(manifest, kept_part_ids).await?;
     Ok(flatten_segments(&parts))
 }
 

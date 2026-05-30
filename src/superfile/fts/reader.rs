@@ -454,6 +454,21 @@ impl FtsReader {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
     }
 
+    /// Async FST-dictionary fetch for the query path. Resolves
+    /// zero-copy for in-memory / warm sources; for a cold `Lazy`
+    /// source it `await`s the object-store range on the caller's
+    /// runtime (no sync bridge).
+    async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
+        self.source
+            .range_async(self.fst_range.clone())
+            .await
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts/dict range fetch failed: {e}"
+                )))
+            })
+    }
+
     /// Fetch the complete byte range of each requested term — metadata
     /// header (20 bytes) + skip table + encoded posting blocks — in
     /// parallel. `terms` are `(metadata_offset, postings_length)` pairs
@@ -473,7 +488,7 @@ impl FtsReader {
     /// Because the FST value carries the length, this is a single
     /// range batch. The metadata header remains in the returned bytes
     /// for validation and cursor construction.
-    fn fetch_term_postings(&self, terms: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
+    async fn fetch_term_postings(&self, terms: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -489,11 +504,14 @@ impl FtsReader {
             }
             ranges.push(base + m..base + m + postings_length);
         }
-        self.source.get_ranges_parallel(&ranges).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "fts/postings term body range fetch failed: {e}"
-            )))
-        })
+        self.source
+            .get_ranges_parallel_async(&ranges)
+            .await
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts/postings term body range fetch failed: {e}"
+                )))
+            })
     }
 
     /// Walk the FST and collect every term registered under
@@ -549,7 +567,7 @@ impl FtsReader {
     /// to match the column's tokenizer. The format currently uses one
     /// tokenizer for all columns, so callers can use the same tokenizer
     /// that was used for indexing.
-    pub fn search(
+    pub async fn search(
         &self,
         column: &str,
         terms: &[&str],
@@ -572,7 +590,7 @@ impl FtsReader {
         // can't beat the heap's worst score are skipped without
         // decoding.
         if terms.len() == 1 {
-            return self.search_single_term_bmw(column_id, terms[0], k);
+            return self.search_single_term_bmw(column_id, terms[0], k).await;
         }
 
         // Multi-term routing:
@@ -585,11 +603,11 @@ impl FtsReader {
         //         with the OR path so neither pays for cursor work
         //         twice when the bench harness compares them.
         match mode {
-            BoolMode::Or => self.dispatch_multi_term_or(column_id, terms, k),
+            BoolMode::Or => self.dispatch_multi_term_or(column_id, terms, k).await,
             BoolMode::And => {
                 // Build cursors; if any term is missing, the
                 // intersection is empty.
-                let cursors = self.build_term_cursors(column_id, terms)?;
+                let cursors = self.build_term_cursors(column_id, terms).await?;
                 if cursors.len() != terms.len() {
                     return Ok(Vec::new());
                 }
@@ -620,7 +638,7 @@ impl FtsReader {
     /// [`Self::run_max_score_bmm_range`] which seeks every cursor
     /// to `doc_id_start` and breaks the outer loop when the next
     /// candidate doc_id reaches `doc_id_end`.
-    pub fn search_or_range_pretokenized(
+    pub async fn search_or_range_pretokenized(
         &self,
         column: &str,
         terms: &[&str],
@@ -636,7 +654,7 @@ impl FtsReader {
         if terms.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
-        let cursors = self.build_term_cursors(column_id, terms)?;
+        let cursors = self.build_term_cursors(column_id, terms).await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
@@ -646,7 +664,7 @@ impl FtsReader {
     /// Multi-column BM25 search (most_fields semantics): each
     /// `(column, weight)` runs an OR-mode search; per-column scores are
     /// multiplied by `weight` and summed across columns.
-    pub fn search_multi(
+    pub async fn search_multi(
         &self,
         columns: &[(&str, f32)],
         query: &str,
@@ -663,7 +681,7 @@ impl FtsReader {
 
         let mut combined: HashMap<u32, f32> = HashMap::new();
         for (col_name, weight) in columns {
-            let per_col = self.search(col_name, &term_refs, usize::MAX, mode)?;
+            let per_col = self.search(col_name, &term_refs, usize::MAX, mode).await?;
             for (doc_id, s) in per_col {
                 *combined.entry(doc_id).or_insert(0.0) += s * weight;
             }
@@ -686,13 +704,13 @@ impl FtsReader {
     /// posting lists with high score variance — e.g. very long lists
     /// where most blocks contain mid-relevance docs and the top-k is
     /// dominated by a few outliers.
-    fn search_single_term_bmw(
+    async fn search_single_term_bmw(
         &self,
         column_id: u32,
         term: &str,
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let fst_bytes = self.dict_bytes()?;
+        let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes)
             .expect("FST CRC verified at open(); bytes must be a valid FST");
         let col_meta = &self.columns[column_id as usize];
@@ -722,7 +740,9 @@ impl FtsReader {
         // header, so the region-relative `metadata_offset` rebases to
         // 0 for all indexing below.
         let term_bytes = {
-            let mut fetched = self.fetch_term_postings(&[(metadata_offset, postings_length)])?;
+            let mut fetched = self
+                .fetch_term_postings(&[(metadata_offset, postings_length)])
+                .await?;
             fetched.pop().expect("one fetched range for one PFOR term")
         };
         let postings = term_bytes.as_ref();
@@ -870,12 +890,12 @@ impl FtsReader {
     /// Missing terms (FST miss) are silently dropped — fine for OR
     /// semantics where a missing term contributes nothing. Returned
     /// `Vec` may be empty (all terms missed) or shorter than `terms`.
-    fn build_term_cursors(
+    async fn build_term_cursors(
         &self,
         column_id: u32,
         terms: &[&str],
     ) -> Result<Vec<TermCursor>, FtsError> {
-        let fst_bytes = self.dict_bytes()?;
+        let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes)
             .expect("FST CRC verified at open(); bytes must be a valid FST");
         let col_meta = &self.columns[column_id as usize];
@@ -910,7 +930,7 @@ impl FtsReader {
             }
         }
 
-        let pfor_bytes = self.fetch_term_postings(&pfor_offsets)?;
+        let pfor_bytes = self.fetch_term_postings(&pfor_offsets).await?;
         let mut pfor_iter = pfor_bytes.into_iter();
 
         let mut cursors: Vec<TermCursor> = Vec::with_capacity(resolved.len());
@@ -2109,13 +2129,13 @@ impl FtsReader {
     /// the one shape (prefix-of-very-rare-terms in parallel mode)
     /// where it narrowly wins. WAND+BMW remains in the codebase
     /// for the same reason — bench-harness comparison only.
-    fn dispatch_multi_term_or(
+    async fn dispatch_multi_term_or(
         &self,
         column_id: u32,
         terms: &[&str],
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let cursors = self.build_term_cursors(column_id, terms)?;
+        let cursors = self.build_term_cursors(column_id, terms).await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
@@ -2131,7 +2151,7 @@ impl FtsReader {
     /// **Not part of the stable API** — production code should use
     /// `search`, which routes through `dispatch_multi_term_or`.
     #[doc(hidden)]
-    pub fn search_with_algo_for_bench(
+    pub async fn search_with_algo_for_bench(
         &self,
         column: &str,
         terms: &[&str],
@@ -2146,7 +2166,7 @@ impl FtsReader {
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let cursors = self.build_term_cursors(column_id, terms)?;
+        let cursors = self.build_term_cursors(column_id, terms).await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
@@ -2788,12 +2808,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn search_returns_exact_doc_ids_for_known_term() {
+    #[tokio::test]
+    async fn search_returns_exact_doc_ids_for_known_term() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["rust"], 10, BoolMode::Or)
+            .await
             .expect("FTS search");
         // "rust" appears in doc 0 and doc 1.
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -2802,8 +2823,8 @@ mod tests {
         assert!(!ids.contains(&2), "doc 2 should not match");
     }
 
-    #[test]
-    fn exhaustive_and_bmm_agree_on_top_k() {
+    #[tokio::test]
+    async fn exhaustive_and_bmm_agree_on_top_k() {
         // Build a larger blob so multi-term OR queries are
         // interesting (some docs have multiple terms, some have one).
         // Both algorithms must return identical top-K (descending
@@ -2847,9 +2868,11 @@ mod tests {
         let terms: &[&str] = &["alpha", "beta", "gamma"];
         let bmm = r
             .search_with_algo_for_bench("body", terms, 5, OrAlgo::Bmm)
+            .await
             .expect("bmm");
         let exh = r
             .search_with_algo_for_bench("body", terms, 5, OrAlgo::Exhaustive)
+            .await
             .expect("exhaustive");
         assert_eq!(bmm.len(), exh.len(), "result length mismatch");
         for ((d_bmm, s_bmm), (d_exh, s_exh)) in bmm.iter().zip(exh.iter()) {
@@ -2861,33 +2884,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn search_missing_term_or_returns_empty() {
+    #[tokio::test]
+    async fn search_missing_term_or_returns_empty() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["nonexistent"], 10, BoolMode::Or)
+            .await
             .expect("search");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn search_and_short_circuits_on_missing_term() {
+    #[tokio::test]
+    async fn search_and_short_circuits_on_missing_term() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["rust", "nonexistent"], 10, BoolMode::And)
+            .await
             .expect("search");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn search_and_intersects_term_postings() {
+    #[tokio::test]
+    async fn search_and_intersects_term_postings() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         // "rust AND runtime" — both in doc 0 and doc 1.
         let hits = r
             .search("body", &["rust", "runtime"], 10, BoolMode::And)
+            .await
             .expect("search");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
@@ -2895,52 +2921,59 @@ mod tests {
         assert!(!ids.contains(&2));
     }
 
-    #[test]
-    fn search_unknown_column_errors() {
+    #[tokio::test]
+    async fn search_unknown_column_errors() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let err = r
             .search("title", &["rust"], 10, BoolMode::Or)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }
 
-    #[test]
-    fn search_empty_terms_returns_empty() {
-        let (blob, json) = build_blob();
-        let r = FtsReader::open(blob, &json).expect("open FtsReader");
-        let hits = r.search("body", &[], 10, BoolMode::Or).expect("FTS search");
-        assert!(hits.is_empty());
-    }
-
-    #[test]
-    fn search_zero_k_returns_empty() {
+    #[tokio::test]
+    async fn search_empty_terms_returns_empty() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
-            .search("body", &["rust"], 0, BoolMode::Or)
+            .search("body", &[], 10, BoolMode::Or)
+            .await
             .expect("FTS search");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn search_results_sorted_by_score_desc() {
+    #[tokio::test]
+    async fn search_zero_k_returns_empty() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let hits = r
+            .search("body", &["rust"], 0, BoolMode::Or)
+            .await
+            .expect("FTS search");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_results_sorted_by_score_desc() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["rust"], 10, BoolMode::Or)
+            .await
             .expect("FTS search");
         for w in hits.windows(2) {
             assert!(w[0].1 >= w[1].1, "scores should be descending");
         }
     }
 
-    #[test]
-    fn search_limits_to_k() {
+    #[tokio::test]
+    async fn search_limits_to_k() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["rust"], 1, BoolMode::Or)
+            .await
             .expect("FTS search");
         assert_eq!(hits.len(), 1);
     }
@@ -3009,24 +3042,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn df1_single_term_search_returns_one_doc() {
+    #[tokio::test]
+    async fn df1_single_term_search_returns_one_doc() {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["uniqzero"], 10, BoolMode::Or)
+            .await
             .expect("FTS search");
         assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
         assert_eq!(hits[0].0, 0, "uniqzero lives in doc 0");
         assert!(hits[0].1 > 0.0, "score must be positive");
     }
 
-    #[test]
-    fn df1_in_or_query_combines_with_df_ge_2() {
+    #[tokio::test]
+    async fn df1_in_or_query_combines_with_df_ge_2() {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["uniqtwo", "rust"], 10, BoolMode::Or)
+            .await
             .expect("FTS search");
         // uniqtwo → doc 2; rust → docs 0, 1.
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -3035,29 +3070,32 @@ mod tests {
         assert!(ids.contains(&2));
     }
 
-    #[test]
-    fn df1_in_and_query_intersects_correctly() {
+    #[tokio::test]
+    async fn df1_in_and_query_intersects_correctly() {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         // uniqzero ∩ rust = {doc 0}.
         let hits = r
             .search("body", &["uniqzero", "rust"], 10, BoolMode::And)
+            .await
             .expect("FTS search");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids, vec![0]);
         // uniqzero ∩ uniqtwo = ∅ (different docs).
         let hits = r
             .search("body", &["uniqzero", "uniqtwo"], 10, BoolMode::And)
+            .await
             .expect("FTS search");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn df1_missing_term_returns_empty() {
+    #[tokio::test]
+    async fn df1_missing_term_returns_empty() {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
         let hits = r
             .search("body", &["nonexistentunique"], 10, BoolMode::Or)
+            .await
             .expect("FTS search");
         assert!(hits.is_empty());
     }

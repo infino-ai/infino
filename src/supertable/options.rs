@@ -40,12 +40,16 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Schema};
 use rayon::ThreadPool;
 
-use crate::config::Config;
+use crate::config::{Config, StorageBackend, StorageColdFetchMode};
+use crate::storage::{LocalFsStorageProvider, S3StorageProvider, StorageProvider};
 use crate::superfile::builder::{BuilderOptions, FtsConfig, VectorConfig};
 use crate::superfile::fts::tokenize::Tokenizer;
 
 use super::error::BuildError;
-use super::reader_cache::{InMemoryReaderCache, SuperfileReaderCache};
+use super::reader_cache::{
+    ColdFetchMode, DiskCacheConfig, DiskCacheStore, InMemoryReaderCache, LruPolicy,
+    SuperfileReaderCache,
+};
 
 /// Vector column dim must be in this inclusive range. Mirrors
 /// `superfile::error::BuildError::VectorDimOutOfRange`.
@@ -683,18 +687,21 @@ impl SupertableOptions {
         }
     }
 
-    /// Apply system [`Config`] to this `SupertableOptions`,
-    /// rebuilding the reader / writer thread pools, copying
-    /// the auto-flush threshold, and copying the id-column
-    /// name from the config's `supertable` section.
+    /// Apply system [`Config`] to this `SupertableOptions`.
+    /// Rebuilds the reader / writer thread pools, copies
+    /// supertable knobs, and attaches configured persistent
+    /// storage + disk cache.
     ///
     /// `auto` thread counts resolve to `num_cpus` (reader) and
     /// `max(1, num_cpus / 2)` (writer). Explicit integers are used
     /// as-is (clamped to ≥ 1).
     ///
-    /// The schema, FTS / vector configuration, tokenizer, and segment
-    /// store are preserved — `Config` only governs thread sizing,
-    /// the commit threshold, and the id-column name.
+    /// The schema, FTS / vector configuration, tokenizer, and
+    /// in-memory segment store are preserved. If
+    /// `cfg.storage.backend` is not `none`, this method attaches
+    /// the requested storage provider; if
+    /// `cfg.storage.disk_cache_root` is set, it also attaches a
+    /// `DiskCacheStore` configured from the same storage section.
     ///
     /// Rejects an id-column name from config that conflicts with
     /// a user-schema field — same check as
@@ -743,7 +750,61 @@ impl SupertableOptions {
             }
             self.id_column = cfg.supertable.id_column.clone();
         }
+        self.apply_storage_config(cfg)?;
         Ok(self)
+    }
+
+    fn apply_storage_config(&mut self, cfg: &Config) -> Result<(), BuildError> {
+        let storage: Option<Arc<dyn StorageProvider>> = match cfg.storage.backend {
+            StorageBackend::None => None,
+            StorageBackend::LocalFs => {
+                let root = cfg.storage.local_root.as_ref().ok_or_else(|| {
+                    BuildError::Store("storage.backend=local_fs requires storage.local_root".into())
+                })?;
+                Some(Arc::new(LocalFsStorageProvider::new(root)?) as Arc<dyn StorageProvider>)
+            }
+            StorageBackend::S3 => {
+                let bucket = cfg.storage.s3_bucket.as_ref().ok_or_else(|| {
+                    BuildError::Store("storage.backend=s3 requires storage.s3_bucket".into())
+                })?;
+                Some(Arc::new(S3StorageProvider::new_with_prefix(
+                    bucket,
+                    &cfg.storage.s3_prefix,
+                )?) as Arc<dyn StorageProvider>)
+            }
+        };
+
+        let Some(storage) = storage else {
+            return Ok(());
+        };
+
+        if let Some(cache_root) = cfg.storage.disk_cache_root.as_ref() {
+            let cold_fetch_mode = match cfg.storage.cold_fetch_mode {
+                StorageColdFetchMode::HybridWithPrefetch => ColdFetchMode::HybridWithPrefetch,
+                StorageColdFetchMode::RangeOnly => ColdFetchMode::RangeOnly,
+                StorageColdFetchMode::LazyForegroundWithBackgroundFill => {
+                    ColdFetchMode::LazyForegroundWithBackgroundFill
+                }
+            };
+            let disk_cfg = DiskCacheConfig {
+                cache_root: cache_root.clone(),
+                disk_budget_bytes: cfg.storage.disk_budget_bytes,
+                cold_fetch_mode,
+                cold_fetch_streams: cfg.storage.cold_fetch_streams.max(1),
+                cold_fetch_chunk_bytes: cfg.storage.cold_fetch_chunk_bytes.max(1),
+                prefetch_concurrency: cfg.storage.prefetch_concurrency.max(1),
+                mmap_cold_threshold_secs: cfg.storage.mmap_cold_threshold_secs,
+                mmap_sweep_interval_secs: cfg.storage.mmap_sweep_interval_secs,
+                eviction: Box::new(LruPolicy::new()),
+                verify_crc_on_open: cfg.supertable.verify_crc_on_open,
+            };
+            let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
+                .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
+            self.disk_cache = Some(cache);
+        }
+
+        self.storage = Some(storage);
+        Ok(())
     }
 
     /// Construct a `superfile::BuilderOptions` for one rayon

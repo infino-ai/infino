@@ -108,8 +108,8 @@ fn build_reader(
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
-#[test]
-fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
+#[tokio::test]
+async fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
     let dim = 32;
     let n = 200;
     let n_cent = 4;
@@ -123,6 +123,7 @@ fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
         // nprobe = n_cent ⇒ scan everything; rerank_mult plenty.
         let approx = reader
             .search("v", query, 5, n_cent, 40)
+            .await
             .expect("FTS search");
         // Exact should fully match approx: same doc set, top-1 must
         // be the query itself (distance 0).
@@ -136,8 +137,8 @@ fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
     }
 }
 
-#[test]
-fn oracle_cosine_full_nprobe_recovers_exact_topk() {
+#[tokio::test]
+async fn oracle_cosine_full_nprobe_recovers_exact_topk() {
     let dim = 32;
     let n = 200;
     let n_cent = 4;
@@ -150,6 +151,7 @@ fn oracle_cosine_full_nprobe_recovers_exact_topk() {
         let exact = brute_force_top_k(&corpus, query, Metric::Cosine, 5);
         let approx = reader
             .search("v", query, 5, n_cent, 40)
+            .await
             .expect("FTS search");
         assert_eq!(approx[0].0 as usize, q_idx);
         let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
@@ -161,8 +163,8 @@ fn oracle_cosine_full_nprobe_recovers_exact_topk() {
     }
 }
 
-#[test]
-fn oracle_negdot_full_nprobe_recovers_exact_topk() {
+#[tokio::test]
+async fn oracle_negdot_full_nprobe_recovers_exact_topk() {
     let dim = 32;
     let n = 200;
     let n_cent = 4;
@@ -174,6 +176,7 @@ fn oracle_negdot_full_nprobe_recovers_exact_topk() {
         let exact = brute_force_top_k(&corpus, query, Metric::NegDot, 5);
         let approx = reader
             .search("v", query, 5, n_cent, 40)
+            .await
             .expect("FTS search");
         // For NegDot, self-NN is *most negative dot* — for non-unit
         // vectors that's not necessarily the query itself. So we
@@ -187,8 +190,8 @@ fn oracle_negdot_full_nprobe_recovers_exact_topk() {
     }
 }
 
-#[test]
-fn oracle_partial_nprobe_top1_preserved() {
+#[tokio::test]
+async fn oracle_partial_nprobe_top1_preserved() {
     // With reduced nprobe we may miss tail of the top-k, but the
     // single most-similar doc (= the query itself for self-query) is
     // still in the cluster the query lands in, so top-1 must
@@ -201,7 +204,10 @@ fn oracle_partial_nprobe_top1_preserved() {
 
     for q_idx in [10usize, 50, 100, 150] {
         let query = &corpus[q_idx];
-        let approx = reader.search("v", query, 5, 1, 10).expect("FTS search");
+        let approx = reader
+            .search("v", query, 5, 1, 10)
+            .await
+            .expect("FTS search");
         assert_eq!(
             approx[0].0 as usize, q_idx,
             "top-1 self-recall failed at nprobe=1, query={q_idx}"
@@ -209,8 +215,8 @@ fn oracle_partial_nprobe_top1_preserved() {
     }
 }
 
-#[test]
-fn oracle_distances_match_brute_force_within_tolerance() {
+#[tokio::test]
+async fn oracle_distances_match_brute_force_within_tolerance() {
     // For full-nprobe + max rerank, our reported distance should
     // equal the brute-force distance to within float noise.
     let dim = 32;
@@ -222,6 +228,7 @@ fn oracle_distances_match_brute_force_within_tolerance() {
     let exact = brute_force_top_k(&corpus, query, Metric::L2Sq, 5);
     let approx = reader
         .search("v", query, 5, n_cent, 40)
+        .await
         .expect("FTS search");
     // Build doc_id → exact_distance map.
     let exact_map: std::collections::HashMap<u32, f32> = exact.iter().copied().collect();
@@ -236,8 +243,8 @@ fn oracle_distances_match_brute_force_within_tolerance() {
     }
 }
 
-#[test]
-fn oracle_nonself_query_topk_recovered() {
+#[tokio::test]
+async fn oracle_nonself_query_topk_recovered() {
     // Query is *not* a corpus member; both engines must agree on
     // top-k under full-nprobe. This isolates "is rerank correct"
     // from "do you find yourself".
@@ -258,7 +265,10 @@ fn oracle_nonself_query_topk_recovered() {
     // corpus through rerank, isolating the test from 1-bit estimate
     // tail loss (which is expected behavior, just not what this
     // oracle checks).
-    let approx = reader.search("v", &q, 5, n_cent, 40).expect("FTS search");
+    let approx = reader
+        .search("v", &q, 5, n_cent, 40)
+        .await
+        .expect("FTS search");
     let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
     let approx_set: std::collections::HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
     assert_eq!(
@@ -267,8 +277,8 @@ fn oracle_nonself_query_topk_recovered() {
     );
 }
 
-#[test]
-fn oracle_topk_distance_ordering_matches_exact() {
+#[tokio::test]
+async fn oracle_topk_distance_ordering_matches_exact() {
     // The order of (doc, distance) pairs from our reader, after
     // full-nprobe, should agree with brute-force ordering modulo
     // tied scores. Test the strict-monotonicity invariant: distances
@@ -278,7 +288,10 @@ fn oracle_topk_distance_ordering_matches_exact() {
     let corpus = generate_corpus(n, dim, 53, false);
     let reader = build_reader(&corpus, dim, 4, Metric::L2Sq, 59);
     let query = &corpus[7];
-    let approx = reader.search("v", query, 10, 4, 10).expect("FTS search");
+    let approx = reader
+        .search("v", query, 10, 4, 10)
+        .await
+        .expect("FTS search");
     for w in approx.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances must be non-decreasing");
     }

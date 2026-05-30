@@ -137,7 +137,7 @@ pub enum BuildError {
 #[derive(Debug, Error)]
 pub enum CommitError {
     /// Storage backend returned an error during commit.
-    #[error("storage error during commit")]
+    #[error("storage error during commit: {0}")]
     Storage(#[from] crate::storage::StorageError),
 
     /// Below-storage validation (options + schema) failed.

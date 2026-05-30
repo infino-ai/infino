@@ -148,6 +148,7 @@ fn fresh_cache(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
     (dir, store)

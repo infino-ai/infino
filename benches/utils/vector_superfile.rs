@@ -16,9 +16,11 @@
 //! ```
 
 use std::hint::black_box;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use crate::tiers::{self, Tier};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // Calibrated `(probe, refine)` is intentionally not in the criterion ID:
 // criterion's improved/regressed/noise panel only fires on exact-ID matches
@@ -32,7 +34,7 @@ use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-const N_DOCS: usize = 1_000_000;
+const N_DOCS: usize = corpus::SUPERFILE_DOCS;
 const TOP_K: usize = 10;
 const N_CORRECTNESS_QUERIES: usize = 20;
 const N_CALIBRATION_QUERIES: usize = 100;
@@ -66,6 +68,15 @@ static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
 static GROUND_TRUTH_CALIBRATION: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
 static INFINO_BLOB: OnceLock<Vec<u8>> = OnceLock::new();
 static CALIBRATIONS: OnceLock<Calibrations> = OnceLock::new();
+static SUPERFILE_OBJECT: OnceLock<tiers::SuperfileCommitted> = OnceLock::new();
+
+fn superfile_object() -> &'static tiers::SuperfileCommitted {
+    SUPERFILE_OBJECT.get_or_init(|| {
+        let blob = Bytes::from(INFINO_BLOB.get_or_init(|| build_infino_blob(vectors())).clone());
+        eprintln!("[superfile_vec] committing {N_DOCS} docs to object storage for warm/cold tiers...");
+        tiers::block_on(tiers::commit_superfile(&blob))
+    })
+}
 
 fn vectors() -> &'static [f32] {
     VECTORS
@@ -136,9 +147,14 @@ fn assert_infino_self_consistent(reader: &VectorReader) -> f32 {
     let gt = ground_truth_correctness();
     let mut total_recall = 0.0_f32;
     for (q, truth) in qs.iter().zip(gt.iter()) {
-        let hits = reader
-            .search("v", q, TOP_K, CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT)
-            .expect("vector search");
+        let hits = corpus::block_on_inmem(reader.search(
+            "v",
+            q,
+            TOP_K,
+            CORRECTNESS_NPROBE,
+            CORRECTNESS_RERANK_MULT,
+        ))
+        .expect("vector search");
         assert_eq!(
             hits.len(),
             TOP_K,
@@ -221,7 +237,7 @@ fn bench(c: &mut Criterion) {
         let cal = calibrations();
         let qs = queries_calibration();
 
-        let mut g = c.benchmark_group("superfile_vec_search");
+        let mut g = c.benchmark_group(tiers::search_group_name("superfile_vec", Tier::Hot, None));
         g.sample_size(10);
         let rss_sample = rss::PeakSampler::start_default();
 
@@ -236,7 +252,10 @@ fn bench(c: &mut Criterion) {
                 g.bench_function(format!("infino_{label}"), |b| {
                     let q = &qs[0];
                     b.iter(|| {
-                        let hits = reader.search("v", black_box(q), TOP_K, p, r).expect("kNN");
+                        let hits = corpus::block_on_inmem(
+                            reader.search("v", black_box(q), TOP_K, p, r),
+                        )
+                        .expect("kNN");
                         black_box(hits)
                     });
                 });
@@ -247,15 +266,14 @@ fn bench(c: &mut Criterion) {
         let q = &qs[0];
         g.bench_function("infino_default_options_top10", |b| {
             b.iter(|| {
-                let hits = reader
-                    .search(
-                        black_box("v"),
-                        black_box(q),
-                        TOP_K,
-                        DEFAULT_NPROBE,
-                        DEFAULT_RERANK_MULT,
-                    )
-                    .expect("kNN");
+                let hits = corpus::block_on_inmem(reader.search(
+                    black_box("v"),
+                    black_box(q),
+                    TOP_K,
+                    DEFAULT_NPROBE,
+                    DEFAULT_RERANK_MULT,
+                ))
+                .expect("kNN");
                 black_box(hits)
             });
         });
@@ -271,9 +289,14 @@ fn bench(c: &mut Criterion) {
                 &nprobe,
                 |b, &np| {
                     b.iter(|| {
-                        let hits = reader
-                            .search("v", black_box(q), TOP_K, np, DEFAULT_RERANK_MULT)
-                            .expect("kNN");
+                        let hits = corpus::block_on_inmem(reader.search(
+                            "v",
+                            black_box(q),
+                            TOP_K,
+                            np,
+                            DEFAULT_RERANK_MULT,
+                        ))
+                        .expect("kNN");
                         black_box(hits)
                     });
                 },
@@ -287,9 +310,14 @@ fn bench(c: &mut Criterion) {
                 &rerank,
                 |b, &rm| {
                     b.iter(|| {
-                        let hits = reader
-                            .search("v", black_box(q), TOP_K, DEFAULT_NPROBE, rm)
-                            .expect("kNN");
+                        let hits = corpus::block_on_inmem(reader.search(
+                            "v",
+                            black_box(q),
+                            TOP_K,
+                            DEFAULT_NPROBE,
+                            rm,
+                        ))
+                        .expect("kNN");
                         black_box(hits)
                     });
                 },
@@ -314,7 +342,169 @@ fn bench(c: &mut Criterion) {
             stats,
         );
 
+        bench_superfile_vec_storage_tiers(c, &cal, qs);
+
         emit_search_markdown();
+    }
+}
+
+fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32>]) {
+    let committed = superfile_object();
+    let uri = committed.uri;
+    let q = &qs[0];
+
+    for tier in [Tier::Warm, Tier::Cold] {
+        let mut g = c.benchmark_group(tiers::search_group_name(
+            "superfile_vec",
+            tier,
+            Some(committed.storage_label),
+        ));
+        g.sample_size(10);
+
+        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            let Some(c_inf) = cal.infino[i] else {
+                continue;
+            };
+            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            let (p, r) = (c_inf.probe, c_inf.refine);
+            let bench_id = format!("infino_{label}");
+
+            match tier {
+                Tier::Warm => {
+                    let storage = Arc::clone(&committed.storage);
+                    let (cache_dir, cache) = tiers::fresh_superfile_cache(storage.clone());
+                    let query = q.clone();
+                    tiers::block_on(async {
+                        let _ = cache.reader(&uri).await.expect("warm prewarm open");
+                        tiers::wait_for_superfile_promotion(
+                            &cache,
+                            uri,
+                            Duration::from_secs(120),
+                        )
+                        .await;
+                        let reader = cache.reader(&uri).await.expect("warm reader");
+                        let vec = reader.vec().expect("vector subsection");
+                        let _ = vec
+                            .search("v", &query, TOP_K, p, r)
+                            .await
+                            .expect("warm prewarm search");
+                    });
+                    let cache_ref = Arc::clone(&cache);
+                    g.bench_function(&bench_id, |b| {
+                        let query = q.clone();
+                        b.iter(|| {
+                            let hits = tiers::block_on(async {
+                                let reader = cache_ref.reader(&uri).await.expect("warm reader");
+                                let vec = reader.vec().expect("vector");
+                                vec.search("v", &query, TOP_K, p, r)
+                                    .await
+                                    .expect("kNN")
+                            });
+                            black_box(hits)
+                        });
+                    });
+                    drop(cache);
+                    drop(cache_dir);
+                }
+                Tier::Cold => {
+                    let storage = Arc::clone(&committed.storage);
+                    let query = q.clone();
+                    g.bench_function(&bench_id, |b| {
+                        b.iter_custom(|iters| {
+                            let mut total = Duration::ZERO;
+                            for _ in 0..iters {
+                                let (cache_dir, cache) =
+                                    tiers::fresh_superfile_cache(Arc::clone(&storage));
+                                let t0 = Instant::now();
+                                tiers::block_on(async {
+                                    let reader = cache.reader(&uri).await.expect("cold reader");
+                                    let vec = reader.vec().expect("vector");
+                                    let _ = vec
+                                        .search("v", &query, TOP_K, p, r)
+                                        .await
+                                        .expect("cold kNN");
+                                });
+                                total += t0.elapsed();
+                                drop(cache);
+                                drop(cache_dir);
+                            }
+                            total
+                        });
+                    });
+                }
+                Tier::Hot => {}
+            }
+        }
+
+        let bench_id = "infino_default_options_top10";
+        match tier {
+            Tier::Warm => {
+                let storage = Arc::clone(&committed.storage);
+                let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
+                tiers::block_on(async {
+                    let _ = cache.reader(&uri).await.expect("open");
+                    tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
+                        .await;
+                });
+                let cache_ref = Arc::clone(&cache);
+                let query = q.clone();
+                g.bench_function(bench_id, |b| {
+                    b.iter(|| {
+                        let hits = tiers::block_on(async {
+                            let reader = cache_ref.reader(&uri).await.expect("reader");
+                            let vec = reader.vec().expect("vector");
+                            vec.search(
+                                "v",
+                                &query,
+                                TOP_K,
+                                DEFAULT_NPROBE,
+                                DEFAULT_RERANK_MULT,
+                            )
+                            .await
+                            .expect("kNN")
+                        });
+                        black_box(hits)
+                    });
+                });
+                drop(cache);
+                drop(cache_dir);
+            }
+            Tier::Cold => {
+                let storage = Arc::clone(&committed.storage);
+                let query = q.clone();
+                g.bench_function(bench_id, |b| {
+                    b.iter_custom(|iters| {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let (cache_dir, cache) =
+                                tiers::fresh_superfile_cache(Arc::clone(&storage));
+                            let t0 = Instant::now();
+                            tiers::block_on(async {
+                                let reader = cache.reader(&uri).await.expect("reader");
+                                let vec = reader.vec().expect("vector");
+                                let _ = vec
+                                    .search(
+                                        "v",
+                                        &query,
+                                        TOP_K,
+                                        DEFAULT_NPROBE,
+                                        DEFAULT_RERANK_MULT,
+                                    )
+                                    .await
+                                    .expect("kNN");
+                            });
+                            total += t0.elapsed();
+                            drop(cache);
+                            drop(cache_dir);
+                        }
+                        total
+                    });
+                });
+            }
+            Tier::Hot => {}
+        }
+
+        g.finish();
     }
 }
 
@@ -322,7 +512,7 @@ fn bench(c: &mut Criterion) {
 
 mod group_name {
     pub const SUPERFILE_VEC_BUILD: &str = "superfile_vec_build";
-    pub const SUPERFILE_VEC_SEARCH: &str = "superfile_vec_search";
+    pub const SUPERFILE_VEC_SEARCH: &str = "superfile_vec_hot_search";
 }
 
 fn emit_ingest_markdown() {
@@ -372,10 +562,13 @@ fn emit_search_markdown() {
         "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | infino (probe, refine) | infino p50 | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+        "Hot = in-memory; warm/cold = object storage + disk cache (1M superfile).\n\n",
     );
     body.push_str(
-        "|---------------|------------------------|------------|----------|------------|---------|------------|\n",
+        "| Recall target | (p, r)     | hot        | warm       | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|---------------|------------|------------|------------|------------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
@@ -383,19 +576,24 @@ fn emit_search_markdown() {
         let row_target = format!("{target:.2}");
         if let Some(c_inf) = cal.infino[i] {
             let id = format!("infino_{label}");
-            let ns = read_mean_ns(group, &id);
+            let hot = read_mean_ns(group, &id);
+            let warm = markdown::read_tier_mean_ns("superfile_vec", "warm", &id);
+            let cold = markdown::read_tier_mean_ns("superfile_vec", "cold", &id);
             let peak = rss::read_peak_rss_bytes(group, &id);
-            let p50 = ns.map(fmt_time).unwrap_or_else(|| "—".into());
             let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
             let median_rss = rss::fmt_median_rss(group, &id);
             let p90_rss = rss::fmt_p90_rss(group, &id);
             let rss_delta = rss::fmt_peak_rss_delta(group, &id);
             body.push_str(&format!(
-                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
-                c_inf.probe, c_inf.refine
+                "| {row_target:13} | (p={}, r={}) | {} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
+                c_inf.probe,
+                c_inf.refine,
+                hot.map(fmt_time).unwrap_or_else(|| "—".into()),
+                warm.map(fmt_time).unwrap_or_else(|| "—".into()),
+                cold.map(fmt_time).unwrap_or_else(|| "—".into()),
             ));
         } else {
-            body.push_str(&format!("| {row_target:13} | — | — | — | — | — | — |\n"));
+            body.push_str(&format!("| {row_target:13} | — | — | — | — | — | — | — | — |\n"));
         }
     }
 
@@ -406,13 +604,23 @@ fn emit_search_markdown() {
     body.push_str("| Metric | Value |\n");
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");
+    let def_warm = markdown::read_tier_mean_ns("superfile_vec", "warm", "infino_default_options_top10");
+    let def_cold = markdown::read_tier_mean_ns("superfile_vec", "cold", "infino_default_options_top10");
     let def_s = def.map(fmt_time).unwrap_or_else(|| "—".into());
     let def_rss = rss::read_peak_rss_bytes(group, "infino_default_options_top10")
         .map(rss::fmt_bytes)
         .unwrap_or_else(|| "—".into());
     let def_median = rss::fmt_median_rss(group, "infino_default_options_top10");
     let def_p90 = rss::fmt_p90_rss(group, "infino_default_options_top10");
-    body.push_str(&format!("| infino_default_options_top10 | {def_s} |\n"));
+    body.push_str(&format!("| infino_default_options_top10 (hot) | {def_s} |\n"));
+    body.push_str(&format!(
+        "| infino_default_options_top10 (warm) | {} |\n",
+        def_warm.map(fmt_time).unwrap_or_else(|| "—".into())
+    ));
+    body.push_str(&format!(
+        "| infino_default_options_top10 (cold) | {} |\n",
+        def_cold.map(fmt_time).unwrap_or_else(|| "—".into())
+    ));
     body.push_str(&format!(
         "| infino_default_options_top10_peak_rss | {def_rss} |\n"
     ));
@@ -449,8 +657,7 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
 
     let q = &queries_calibration()[0];
     let t0 = Instant::now();
-    let _ = reader
-        .search("v", q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
+    let _ = corpus::block_on_inmem(reader.search("v", q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT))
         .expect("kNN");
     let first_q_elapsed = t0.elapsed();
 

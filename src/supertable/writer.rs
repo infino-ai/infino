@@ -1631,8 +1631,8 @@ mod tests {
         assert_eq!(st.reader().n_superfiles(), 0);
     }
 
-    #[test]
-    fn segment_is_queryable_via_store() {
+    #[tokio::test]
+    async fn segment_is_queryable_via_store() {
         // The published segment's bytes are in the store; we
         // can fetch a SuperfileReader and run bm25_search on it.
         use crate::superfile::fts::reader::BoolMode;
@@ -1648,6 +1648,7 @@ mod tests {
         let sf_reader = store.reader(&segment.uri).expect("reader");
         let hits = sf_reader
             .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .await
             .expect("bm25");
         // All 4 docs contain "alpha"; should all be returned.
         assert_eq!(hits.len(), 4);

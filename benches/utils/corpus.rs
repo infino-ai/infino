@@ -8,15 +8,16 @@
 //! re-run would silently risk mixing measurements against drifted
 //! data.
 //!
-//! ## Scale knob
+//! ## Scale policy
 //!
-//! [`n_docs`] returns `10_000_000` when `INFINO_BENCH_FULL=1` is set
-//! in the environment, otherwise `1_000_000`. Vector at 10M × 384 (f32)
-//! = 14.6 GB resident — needs a 32 GB+ machine. Superfile-shape benches
-//! pin themselves to 1M (one-segment scale); supertable-shape benches
-//! pin to 10M (sharding scale). Each topic's bench files name the
-//! pinned constant directly rather than calling this helper at
-//! benchmark time.
+//! Scale is fixed by *shape*, not by an environment variable:
+//! superfile-shape benches use [`SUPERFILE_DOCS`] (1M, one-segment
+//! scale), supertable-shape benches use [`SUPERTABLE_DOCS`] (10M,
+//! sharding scale). Vector at 10M × 384 (f32) = 14.6 GB resident —
+//! needs a 32 GB+ machine. There is deliberately no `INFINO_BENCH_FULL`
+//! knob: a bench's scale is a property of the shape it measures, so it
+//! lives in a `const` next to that bench, not behind an env toggle that
+//! silently means different things in different files.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -45,6 +46,25 @@ use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::test_helpers::default_tokenizer;
 
+// ─── Async bridge for in-memory bench helpers ─────────────────────────
+
+/// Drive an in-memory (no object-store I/O) async search to
+/// completion from sync bench code.
+///
+/// The query/search API is `async` (Option A). Bench helpers that
+/// operate on in-memory `VectorReader` / `FtsReader` / in-process
+/// `Supertable` readers never touch the object store, so their
+/// futures resolve `Ready` without a tokio reactor — a plain
+/// `futures::executor::block_on` drives them with no runtime setup
+/// and, unlike `tokio::runtime::block_on`, never panics when nested
+/// inside another runtime. Real-object-store benches (see
+/// `unified_object_store`) drive their futures on an explicit
+/// multi-thread tokio runtime instead, because object_store needs
+/// the tokio reactor.
+pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
+    futures::executor::block_on(fut)
+}
+
 // ─── Scale constants ──────────────────────────────────────────────────
 
 /// Tokens per doc — chosen to land in the same magnitude as a typical
@@ -66,15 +86,16 @@ pub const DIM: usize = 384;
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
 pub type Hit = (u32, f32);
 
-/// Resolved doc count for the current bench run, gated by the
-/// `INFINO_BENCH_FULL` env var (10M when set, 1M otherwise).
-pub fn n_docs() -> usize {
-    if std::env::var("INFINO_BENCH_FULL").is_ok() {
-        10_000_000
-    } else {
-        1_000_000
-    }
-}
+/// Doc count for superfile-shape benches (one-segment scale). 1M ×
+/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the hot tier and
+/// is the single-superfile cold-open unit for the warm/cold tiers.
+pub const SUPERFILE_DOCS: usize = 1_000_000;
+
+/// Doc count for supertable-shape benches (scale-out / sharding
+/// scale). 10M × 384 (f32) ≈ 14.6 GB resident — needs a 32 GB+ box.
+/// This is the headline supertable scale that the warm/cold tiers run
+/// over the object store.
+pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
 /// IVF cluster count. Conventionally `~sqrt(n_docs)`, snapped to a
 /// fixed value per scale band so 1M and 10M runs share a stable
@@ -477,8 +498,7 @@ pub fn mean_recall_infino(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = reader
-            .search("v", q, k, nprobe, rerank_mult)
+        let hits = block_on_inmem(reader.search("v", q, k, nprobe, rerank_mult))
             .expect("vector search");
         sum += recall_at_k(&hits, t);
     }
@@ -540,7 +560,8 @@ pub fn calibrate_infino(
             let q = &queries[0];
             let p50 = p50_micros(
                 || {
-                    let _ = reader.search("v", q, k, probe, refine).expect("search");
+                    let _ = block_on_inmem(reader.search("v", q, k, probe, refine))
+                        .expect("search");
                 },
                 p50_iter,
             );

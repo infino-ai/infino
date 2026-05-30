@@ -330,6 +330,81 @@ impl Source {
             .map(|b| b.expect("every slot filled by sync or async path"))
             .collect())
     }
+
+    /// Async single-range fetch. Sync-resident ranges (in-memory,
+    /// warm mmap, in-process cache hits) resolve with zero I/O;
+    /// cold `Lazy` misses `await` the source's async `range`
+    /// directly on the caller's runtime — no `block_on`, no
+    /// throwaway runtime, so the object-store client's reqwest
+    /// connections stay on the runtime that owns them.
+    pub async fn range_async(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
+            return Ok(bytes);
+        }
+        let Self::Lazy(s) = self else {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: range.start as u64,
+                len: range.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+        s.range(range.start as u64, range.len() as u64).await
+    }
+
+    /// Async concurrent multi-range fetch. Sync-resident ranges are
+    /// served immediately; cold `Lazy` misses are dispatched as one
+    /// `try_join_all` batch and `await`ed on the caller's runtime.
+    /// Returns bytes in input order. This is the async sibling of
+    /// [`Self::get_ranges_parallel`] and carries the same ordering
+    /// and bounds-check contract without the sync→async bridge.
+    pub async fn get_ranges_parallel_async(
+        &self,
+        ranges: &[Range<usize>],
+    ) -> Result<Vec<Bytes>, LazyByteSourceError> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut pending: Vec<(usize, u64, u64)> = Vec::new();
+        for (i, r) in ranges.iter().enumerate() {
+            if let Some(b) = self.try_get_range_sync(r.clone()) {
+                out.push(Some(b));
+                continue;
+            }
+            if !matches!(self, Self::Lazy(_)) {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start: r.start as u64,
+                    len: r.len() as u64,
+                    size: self.len() as u64,
+                });
+            }
+            pending.push((i, r.start as u64, r.len() as u64));
+            out.push(None);
+        }
+
+        if !pending.is_empty() {
+            let Self::Lazy(s) = self else {
+                unreachable!("pending non-empty implies Source::Lazy");
+            };
+            let order: Vec<usize> = pending.iter().map(|(i, _, _)| *i).collect();
+            let futs = pending
+                .into_iter()
+                .map(|(_i, start, len)| {
+                    let s = Arc::clone(s);
+                    async move { s.range(start, len).await }
+                })
+                .collect::<Vec<_>>();
+            let bytes = futures::future::try_join_all(futs).await?;
+            for (slot, b) in order.into_iter().zip(bytes) {
+                out[slot] = Some(b);
+            }
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|b| b.expect("every slot filled by sync or async path"))
+            .collect())
+    }
 }
 
 /// In-memory `LazyByteSource` adapter — useful for tests and

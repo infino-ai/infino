@@ -100,10 +100,10 @@ impl Supertable {
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
 
-        let table = build_mem_table(scalar_schema, manifest, store, disk_cache)?;
         let sql = sql.to_owned();
 
         let drive = async move {
+            let table = build_mem_table(scalar_schema, manifest, store, disk_cache).await?;
             let ctx = SessionContext::new();
             ctx.register_table(TABLE_NAME, Arc::new(table))
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
@@ -154,7 +154,7 @@ impl Supertable {
 /// new code) or a pre-parse pass. M15c ships the "load all
 /// parts" SQL path; exact-term BM25 + prefix BM25 + vector
 /// queries get list-prune via their dedicated entry points.
-fn build_mem_table(
+async fn build_mem_table(
     schema: Arc<arrow_schema::Schema>,
     manifest: Arc<Manifest>,
     store: Arc<dyn SuperfileReaderCache>,
@@ -168,7 +168,8 @@ fn build_mem_table(
     let superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = match manifest.list.as_ref() {
         Some(list) => {
             let kept: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)?
+            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)
+                .await?
         }
         None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
             manifest.as_ref(),
@@ -182,6 +183,7 @@ fn build_mem_table(
             &entry.uri,
             entry.subsection_offsets.as_ref(),
         )
+        .await
         .map_err(|e| QueryError::Store(e.to_string()))?;
         let parquet = reader
             .parquet_bytes()

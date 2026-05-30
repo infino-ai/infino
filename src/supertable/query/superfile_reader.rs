@@ -11,23 +11,22 @@
 //!      path; no syscalls.
 //!   2. **Disk cache fallback.** Miss in the in-memory tier
 //!      AND a `DiskCacheStore` is attached →
-//!      `DiskCacheStore::reader(uri)` (async). Sync-bridged
-//!      via `block_in_place + Handle::block_on` when there's
-//!      an ambient tokio runtime; falls through to building
-//!      a dedicated one via [`tokio::runtime::Runtime::new`]
-//!      otherwise. The cache itself handles cold-fetch from
-//!      object storage, pwrite to the local cache directory,
-//!      and mmap.
+//!      `DiskCacheStore::reader(uri)` (`await`ed directly).
+//!      The cache itself handles cold-fetch from object
+//!      storage, pwrite to the local cache directory, and
+//!      mmap.
 //!   3. **No cache.** Miss in the in-memory tier and no
 //!      cache attached → surface the in-memory tier's
 //!      `ReaderCacheError::NotFound`. The in-process-only
 //!      path; supports callers without storage attached.
 //!
-//! The accessor is sync to keep call sites in the query
-//! paths (which are themselves sync from
-//! `SupertableReader::bm25_search` etc.) unchanged. The
-//! async-to-sync bridge mirrors the writer's
-//! `persist_commit` pattern.
+//! The accessor is `async`: the query paths
+//! (`SupertableReader::vector_search` / `bm25_search` /
+//! `query_sql`) are themselves async and run on the owning
+//! tokio runtime, so the cold object-store fetch the cache
+//! issues is driven by that runtime's reactor — no sync
+//! bridge, no throwaway `current_thread` runtime, and
+//! object-store retries fire correctly.
 
 use std::sync::Arc;
 
@@ -48,7 +47,7 @@ use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 /// (1 RTT cold open) instead of doing the parquet footer first
 /// and the subsection fetches second (2 RTTs). `None` falls back
 /// to the pre-M6 2-RTT path — same shape, slower.
-pub fn superfile_reader(
+pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
     uri: &SuperfileUri,
@@ -69,44 +68,12 @@ pub fn superfile_reader(
         None => return Err(ReaderCacheError::NotFound { uri: *uri }),
     };
 
-    let uri_copy = *uri;
-    let offsets_copy = offsets.cloned();
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // Ambient tokio runtime — block_in_place + block_on
-            // is the same pattern the writer's commit path uses
-            // for its sync→async bridge.
-            tokio::task::block_in_place(|| {
-                handle.block_on(cache.reader_with_hints(&uri_copy, offsets_copy.as_ref()))
-            })
-        }
-        Err(_) => {
-            // No ambient runtime. Build a tiny one just for
-            // this fetch. Cold path; the overhead (≈ 1 ms to
-            // create a current_thread Runtime) is negligible
-            // compared to the parallel range-fetch the cache
-            // is about to issue. Falls out of scope at end of
-            // statement.
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    return Err(ReaderCacheError::OpenFailed {
-                        source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
-                            "tokio runtime build for disk cache fetch: {e}"
-                        ))),
-                    });
-                }
-            };
-            rt.block_on(cache.reader_with_hints(&uri_copy, offsets_copy.as_ref()))
-        }
-    };
-
-    result.map_err(|e| ReaderCacheError::OpenFailed {
-        source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
-            "disk cache fetch: {e}"
-        ))),
-    })
+    cache
+        .reader_with_hints(uri, offsets)
+        .await
+        .map_err(|e| ReaderCacheError::OpenFailed {
+            source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
+                "disk cache fetch: {e}"
+            ))),
+        })
 }

@@ -95,8 +95,8 @@ fn build_test_superfile() -> Bytes {
     Bytes::from(b.finish().expect("finish superfile"))
 }
 
-#[test]
-fn superfile_build_routes_through_spill_backed_fts_builder() {
+#[tokio::test]
+async fn superfile_build_routes_through_spill_backed_fts_builder() {
     let blob = build_test_superfile();
 
     // The blob is a valid Parquet file with embedded FTS + (empty)
@@ -111,6 +111,7 @@ fn superfile_build_routes_through_spill_backed_fts_builder() {
     // `k` docs. With k=10 across 1024 docs the floor is exactly 10.
     let common_hits = r
         .bm25_search("title", "common", 10, BoolMode::Or)
+        .await
         .expect("search common");
     assert_eq!(
         common_hits.len(),
@@ -124,6 +125,7 @@ fn superfile_build_routes_through_spill_backed_fts_builder() {
     // column never has it.
     let payload_hits = r
         .bm25_search("body", "payload0500", 10, BoolMode::Or)
+        .await
         .expect("search payload0500");
     assert_eq!(
         payload_hits.len(),
@@ -136,6 +138,7 @@ fn superfile_build_routes_through_spill_backed_fts_builder() {
     // (`<col>\x1F<term>`) so this scopes correctly.
     let payload_in_title = r
         .bm25_search("title", "payload0500", 10, BoolMode::Or)
+        .await
         .expect("search payload0500 in title");
     assert!(
         payload_in_title.is_empty(),
@@ -144,6 +147,7 @@ fn superfile_build_routes_through_spill_backed_fts_builder() {
 
     let term_in_body = r
         .bm25_search("body", "term0500", 10, BoolMode::Or)
+        .await
         .expect("search term0500 in body");
     assert!(
         term_in_body.is_empty(),

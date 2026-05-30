@@ -21,7 +21,9 @@
 
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
+use crate::tiers::{self, Tier};
 use crate::{corpus, markdown, rss};
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -35,8 +37,8 @@ use rayon::ThreadPool;
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-/// Doc count for every FTS-supertable bench. Pinned to 10M.
-const N_DOCS: usize = 10_000_000;
+/// Doc count for every FTS-supertable bench. Supertable shape → 10M.
+const N_DOCS: usize = corpus::SUPERTABLE_DOCS;
 
 /// Input chunk count. Keeps each LargeStringArray materialization bounded
 /// instead of building one 20GB Arrow payload for the full 10M corpus.
@@ -49,12 +51,41 @@ const TOP_K: usize = 10;
 static TEXT_CORPUS: OnceLock<corpus::MmapTextCorpus> = OnceLock::new();
 static INFINO: OnceLock<Supertable> = OnceLock::new();
 
+struct S3FtsCommitted {
+    storage: Arc<dyn infino::supertable::storage::StorageProvider>,
+    storage_label: &'static str,
+}
+static S3_FTS: OnceLock<S3FtsCommitted> = OnceLock::new();
+
 fn text_corpus() -> &'static corpus::MmapTextCorpus {
     TEXT_CORPUS.get_or_init(|| corpus::MmapTextCorpus::generate(N_DOCS, 1))
 }
 
 fn infino_supertable() -> &'static Supertable {
-    INFINO.get_or_init(|| build_supertable_infino(text_corpus(), parallel_pool()))
+    INFINO.get_or_init(|| {
+        build_supertable_infino(text_corpus(), parallel_pool(), None)
+    })
+}
+
+fn s3_fts_committed() -> &'static S3FtsCommitted {
+    S3_FTS.get_or_init(|| {
+        eprintln!(
+            "[supertable_fts] committing {N_DOCS} docs to object storage for warm/cold tiers..."
+        );
+        let fixture = tiers::block_on(tiers::supertable_storage_fixture());
+        let producer =
+            build_supertable_infino(text_corpus(), parallel_pool(), Some(fixture.storage.clone()));
+        eprintln!(
+            "[supertable_fts] object-store commit OK: manifest_id={} ({})",
+            producer.manifest_id(),
+            fixture.storage_label
+        );
+        drop(producer);
+        S3FtsCommitted {
+            storage: fixture.storage,
+            storage_label: fixture.storage_label,
+        }
+    })
 }
 
 // ─── Shared rayon pool ────────────────────────────────────────────────
@@ -86,9 +117,12 @@ fn schema_id_title() -> Arc<Schema> {
     )]))
 }
 
-fn supertable_options(reader_pool: Arc<ThreadPool>) -> SupertableOptions {
+fn supertable_options(
+    reader_pool: Arc<ThreadPool>,
+    storage: Option<Arc<dyn infino::supertable::storage::StorageProvider>>,
+) -> SupertableOptions {
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
-    SupertableOptions::new(
+    let mut opts = SupertableOptions::new(
         schema_id_title(),
         vec![FtsConfig {
             column: "title".into(),
@@ -98,7 +132,11 @@ fn supertable_options(reader_pool: Arc<ThreadPool>) -> SupertableOptions {
     )
     .expect("opts")
     .with_reader_pool(reader_pool)
-    .with_commit_threshold_size_mb(1024)
+    .with_commit_threshold_size_mb(1024);
+    if let Some(s) = storage {
+        opts = opts.with_storage(s);
+    }
+    opts
 }
 
 /// Build an FTS-only supertable from an mmap-backed text corpus. Each
@@ -108,8 +146,9 @@ fn supertable_options(reader_pool: Arc<ThreadPool>) -> SupertableOptions {
 fn build_supertable_infino(
     corpus: &corpus::MmapTextCorpus,
     reader_pool: Arc<ThreadPool>,
+    storage: Option<Arc<dyn infino::supertable::storage::StorageProvider>>,
 ) -> Supertable {
-    let st = Supertable::create(supertable_options(reader_pool));
+    let st = Supertable::create(supertable_options(reader_pool, storage));
     let mut w = st.writer().expect("writer");
     let chunk_size = corpus.n_docs().div_ceil(APPEND_CHUNKS);
     for start in (0..corpus.n_docs()).step_by(chunk_size) {
@@ -131,8 +170,7 @@ fn assert_infino_self_consistent(st: &Supertable) {
     let r = st.reader();
     let probe_doc_id = (N_DOCS / 2) as u32;
     let probe_token = format!("doc{probe_doc_id:07}");
-    let hits = r
-        .bm25_search("title", &probe_token, 10, BoolMode::Or)
+    let hits = corpus::block_on_inmem(r.bm25_search("title", &probe_token, 10, BoolMode::Or))
         .expect("bm25");
     assert_eq!(
         hits.len(),
@@ -146,8 +184,7 @@ fn assert_infino_self_consistent(st: &Supertable) {
         hits[0].score
     );
 
-    let hits = r
-        .bm25_search("title", "term00001", 10, BoolMode::Or)
+    let hits = corpus::block_on_inmem(r.bm25_search("title", "term00001", 10, BoolMode::Or))
         .expect("bm25");
     assert_eq!(hits.len(), 10, "common term should fill top-10");
     for w in hits.windows(2) {
@@ -164,7 +201,7 @@ fn assert_infino_self_consistent(st: &Supertable) {
 
 fn bench_ingest(c: &mut Criterion) {
     eprintln!("[supertable_fts_build] correctness: building infino ({N_DOCS} docs)...");
-    let infino = build_supertable_infino(text_corpus(), parallel_pool());
+    let infino = build_supertable_infino(text_corpus(), parallel_pool(), None);
     assert_infino_self_consistent(&infino);
     eprintln!("[supertable_fts_build] correctness OK: infino self-consistent");
     drop(infino);
@@ -180,7 +217,7 @@ fn bench_ingest(c: &mut Criterion) {
 
     g.bench_function("infino_auto_writer_pool", |b| {
         b.iter_with_large_drop(|| {
-            build_supertable_infino(black_box(text_corpus()), parallel_pool())
+            build_supertable_infino(black_box(text_corpus()), parallel_pool(), None)
         });
     });
 
@@ -210,7 +247,7 @@ fn bench_search(c: &mut Criterion) {
 
     let r = st.reader();
 
-    let mut g = c.benchmark_group("supertable_fts_search");
+    let mut g = c.benchmark_group(tiers::search_group_name("supertable_fts", Tier::Hot, None));
     g.sample_size(10);
 
     // Group-level peak VmRSS for FTS-supertable search workload —
@@ -234,9 +271,13 @@ fn bench_search(c: &mut Criterion) {
         let q = *q;
         g.bench_function(format!("{name}_supertable_top10"), |b| {
             b.iter(|| {
-                let hits = r
-                    .bm25_search(black_box("title"), black_box(q), TOP_K, BoolMode::Or)
-                    .expect("bm25");
+                let hits = corpus::block_on_inmem(r.bm25_search(
+                    black_box("title"),
+                    black_box(q),
+                    TOP_K,
+                    BoolMode::Or,
+                ))
+                .expect("bm25");
                 black_box(hits)
             });
         });
@@ -244,9 +285,12 @@ fn bench_search(c: &mut Criterion) {
 
     g.bench_function("prefix_supertable_top10", |b| {
         b.iter(|| {
-            let hits = r
-                .bm25_search_prefix(black_box("title"), black_box("term0009"), TOP_K)
-                .expect("bm25_prefix");
+            let hits = corpus::block_on_inmem(r.bm25_search_prefix(
+                black_box("title"),
+                black_box("term0009"),
+                TOP_K,
+            ))
+            .expect("bm25_prefix");
             black_box(hits)
         });
     });
@@ -266,14 +310,180 @@ fn bench_search(c: &mut Criterion) {
         let _ = rss::write_rss_stats(group_name::SUPERTABLE_FTS_SEARCH, bid, stats);
     }
 
+    bench_search_object_store_tiers(c, &queries);
+
     emit_search_markdown();
+}
+
+fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) {
+    let committed = s3_fts_committed();
+    let pool = parallel_pool();
+
+    for tier in [Tier::Warm, Tier::Cold] {
+        let mut g = c.benchmark_group(tiers::search_group_name(
+            "supertable_fts",
+            tier,
+            Some(committed.storage_label),
+        ));
+        g.sample_size(10);
+
+        for (name, q) in queries {
+            let bench_id = format!("{name}_supertable_top10");
+            match tier {
+                Tier::Warm => {
+                    let storage = Arc::clone(&committed.storage);
+                    let (cache_dir, cache) = tiers::fresh_disk_cache(storage.clone());
+                    let consumer_opts = tiers::consumer_options(
+                        supertable_options(pool.clone(), None),
+                        storage,
+                        cache.clone(),
+                    );
+                    let st = tiers::block_on(tiers::open_consumer(
+                        consumer_opts,
+                    ));
+                    let query = *q;
+                    tiers::block_on(async {
+                        let _ = st
+                            .reader()
+                            .bm25_search("title", query, TOP_K, BoolMode::Or)
+                            .await
+                            .expect("warm prewarm bm25");
+                        tiers::wait_for_cache_warm(
+                            &cache,
+                            Duration::from_secs(600),
+                        )
+                        .await;
+                    });
+                    g.bench_function(&bench_id, |b| {
+                        b.iter(|| {
+                            let hits = tiers::block_on(async {
+                                st.reader()
+                                    .bm25_search("title", q, TOP_K, BoolMode::Or)
+                                    .await
+                                    .expect("bm25")
+                            });
+                            black_box(hits)
+                        });
+                    });
+                    drop(st);
+                    drop(cache);
+                    drop(cache_dir);
+                }
+                Tier::Cold => {
+                    let storage = Arc::clone(&committed.storage);
+                    let query = *q;
+                    g.bench_function(&bench_id, |b| {
+                        b.iter_custom(|iters| {
+                            let mut total = Duration::ZERO;
+                            for _ in 0..iters {
+                                let (cache_dir, cache) =
+                                    tiers::fresh_disk_cache(Arc::clone(&storage));
+                                let consumer_opts = tiers::consumer_options(
+                                    supertable_options(pool.clone(), None),
+                                    Arc::clone(&storage),
+                                    cache.clone(),
+                                );
+                                let t0 = std::time::Instant::now();
+                                tiers::block_on(async {
+                                    let st =
+                                        tiers::open_consumer(consumer_opts).await;
+                                    let _ = st
+                                        .reader()
+                                        .bm25_search("title", query, TOP_K, BoolMode::Or)
+                                        .await
+                                        .expect("cold bm25");
+                                });
+                                total += t0.elapsed();
+                                drop(cache);
+                                drop(cache_dir);
+                            }
+                            total
+                        });
+                    });
+                }
+                Tier::Hot => {}
+            }
+        }
+
+        g.bench_function("prefix_supertable_top10", |b| {
+            match tier {
+                Tier::Warm => {
+                    let storage = Arc::clone(&committed.storage);
+                    let (cache_dir, cache) = tiers::fresh_disk_cache(storage.clone());
+                    let consumer_opts = tiers::consumer_options(
+                        supertable_options(pool.clone(), None),
+                        storage,
+                        cache.clone(),
+                    );
+                    let st = tiers::block_on(tiers::open_consumer(
+                        consumer_opts,
+                    ));
+                    tiers::block_on(async {
+                        let _ = st
+                            .reader()
+                            .bm25_search_prefix("title", "term0009", TOP_K)
+                            .await
+                            .expect("warm prewarm prefix");
+                        tiers::wait_for_cache_warm(
+                            &cache,
+                            Duration::from_secs(600),
+                        )
+                        .await;
+                    });
+                    b.iter(|| {
+                        let hits = tiers::block_on(async {
+                            st.reader()
+                                .bm25_search_prefix("title", "term0009", TOP_K)
+                                .await
+                                .expect("prefix")
+                        });
+                        black_box(hits)
+                    });
+                    drop(st);
+                    drop(cache);
+                    drop(cache_dir);
+                }
+                Tier::Cold => {
+                    let storage = Arc::clone(&committed.storage);
+                    b.iter_custom(|iters| {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let (cache_dir, cache) =
+                                tiers::fresh_disk_cache(Arc::clone(&storage));
+                            let consumer_opts = tiers::consumer_options(
+                                supertable_options(pool.clone(), None),
+                                Arc::clone(&storage),
+                                cache.clone(),
+                            );
+                            let t0 = std::time::Instant::now();
+                            tiers::block_on(async {
+                                let st = tiers::open_consumer(consumer_opts).await;
+                                let _ = st
+                                    .reader()
+                                    .bm25_search_prefix("title", "term0009", TOP_K)
+                                    .await
+                                    .expect("cold prefix");
+                            });
+                            total += t0.elapsed();
+                            drop(cache);
+                            drop(cache_dir);
+                        }
+                        total
+                    });
+                }
+                Tier::Hot => {}
+            }
+        });
+
+        g.finish();
+    }
 }
 
 // ─── Markdown summary emitters ────────────────────────────────────────
 
 mod group_name {
     pub const SUPERTABLE_FTS_BUILD: &str = "supertable_fts_build";
-    pub const SUPERTABLE_FTS_SEARCH: &str = "supertable_fts_search";
+    pub const SUPERTABLE_FTS_SEARCH: &str = "supertable_fts_hot_search";
 }
 
 fn emit_ingest_markdown() {
@@ -324,10 +534,13 @@ fn emit_search_markdown() {
     let mut body = String::new();
     body.push_str(&format!("### Supertable FTS — search ({N_DOCS} docs)\n\n"));
     body.push_str(
-        "| Query          | infino     | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+        "Hot = in-memory; warm/cold = object storage + disk cache.\n\n",
     );
     body.push_str(
-        "|----------------|------------|-----------|------------|-----------|------------|\n",
+        "| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|----------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
     );
     let queries = [
         "single_rare",
@@ -340,8 +553,9 @@ fn emit_search_markdown() {
     ];
     for q in queries {
         let bid = format!("{q}_supertable_top10");
-        let inf = read_mean_ns(group, &bid);
-        let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
+        let hot = read_mean_ns(group, &bid);
+        let warm = markdown::read_tier_mean_ns("supertable_fts", "warm", &bid);
+        let cold = markdown::read_tier_mean_ns("supertable_fts", "cold", &bid);
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
             .unwrap_or_else(|| "—".into());
@@ -349,7 +563,10 @@ fn emit_search_markdown() {
         let p90_rss = rss::fmt_p90_rss(group, &bid);
         let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
         body.push_str(&format!(
-            "| {q:14} | {inf_s:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
+            "| {q:14} | {} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
+            hot.map(fmt_time).unwrap_or_else(|| "—".into()),
+            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
+            cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }
 

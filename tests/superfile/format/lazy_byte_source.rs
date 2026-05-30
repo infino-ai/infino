@@ -186,6 +186,7 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     let fts = reader.fts().expect("fts");
     let hits = fts
         .search("title", &["special"], 10, BoolMode::Or)
+        .await
         .expect("bm25");
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
 }
@@ -216,11 +217,13 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
         .fts()
         .expect("fts")
         .search("title", &["alpha"], 10, BoolMode::Or)
+        .await
         .expect("eager bm25");
     let lazy_hits = lazy
         .fts()
         .expect("fts")
         .search("title", &["alpha"], 10, BoolMode::Or)
+        .await
         .expect("lazy bm25");
     let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| *d).collect();
     let lazy_ids: Vec<_> = lazy_hits.iter().map(|(d, _)| *d).collect();
@@ -365,6 +368,7 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
         .fts()
         .expect("fts")
         .search("title", &["special"], 5, BoolMode::Or)
+        .await
         .expect("bm25");
     assert!(
         !fts_hits.is_empty(),

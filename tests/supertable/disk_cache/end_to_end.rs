@@ -50,6 +50,7 @@ fn make_cache(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     // No-op pinned_fn for tests — pinning is a perf
     // optimization, not a correctness requirement (cf. M14b

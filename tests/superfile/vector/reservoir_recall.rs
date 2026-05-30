@@ -114,8 +114,8 @@ fn build_reader_with_sample_size(
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
-#[test]
-fn recall_under_undersized_reservoir_matches_brute_force() {
+#[tokio::test]
+async fn recall_under_undersized_reservoir_matches_brute_force() {
     let dim = 32;
     let n_cent = 8;
     let n_docs = 2_000;
@@ -151,6 +151,7 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
             let query = &flat[q_idx * dim..(q_idx + 1) * dim];
             let approx: Vec<u32> = reader
                 .search("v", query, top_k, nprobe, rerank_mult)
+                .await
                 .expect("search")
                 .into_iter()
                 .map(|(d, _)| d)
@@ -188,8 +189,8 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
     }
 }
 
-#[test]
-fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
+#[tokio::test]
+async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
     // Sanity check: when the corpus fits inside the default
     // reservoir (which is the normal regime for unit tests), the
     // result should be self-NN-perfect just like the full-corpus path.
@@ -226,6 +227,7 @@ fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         let query = &flat[q_idx * dim..(q_idx + 1) * dim];
         let approx: Vec<u32> = reader
             .search("v", query, top_k, n_cent, /*rerank_mult=*/ 40)
+            .await
             .expect("search")
             .into_iter()
             .map(|(d, _)| d)

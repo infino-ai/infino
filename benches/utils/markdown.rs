@@ -118,6 +118,20 @@ pub fn fmt_throughput(elements_per_sec: f64) -> String {
 ///
 /// Returns `None` if the file doesn't exist (bench was filtered out or
 /// hasn't run yet) or the JSON can't be parsed.
+/// Read a tiered search group (`{family}_hot_search` or `{family}_{tier}_search_{s3s_fs|real_s3}`).
+pub fn read_tier_mean_ns(family: &str, tier: &str, bench: &str) -> Option<f64> {
+    if tier == "hot" {
+        return read_mean_ns(&format!("{family}_hot_search"), bench);
+    }
+    for storage in ["s3s_fs", "real_s3"] {
+        let group = format!("{family}_{tier}_search_{storage}");
+        if let Some(ns) = read_mean_ns(&group, bench) {
+            return Some(ns);
+        }
+    }
+    None
+}
+
 pub fn read_mean_ns(group: &str, bench: &str) -> Option<f64> {
     let path = criterion_target_dir()
         .join(group)

@@ -155,6 +155,7 @@ fn fresh_cache_with_storage(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
     (cache_dir, store)
@@ -295,6 +296,7 @@ async fn eviction_respects_pinned_set() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let cache = DiskCacheStore::new(Arc::clone(&local), cfg, pinned).expect("cache");
 
@@ -343,6 +345,7 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
 
@@ -391,6 +394,7 @@ async fn reservation_race_preserves_budget_invariant() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
 

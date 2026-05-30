@@ -428,7 +428,7 @@ impl VectorBuilder {
             let summary_offset_abs = subsection_start_off + sub.summary_offset_in_sub as u64;
             directory.extend_from_slice(&(i as u32).to_le_bytes()); // column_id
             directory.extend_from_slice(&(cfg.dim as u32).to_le_bytes()); // dim
-            directory.extend_from_slice(&(cfg.n_cent as u32).to_le_bytes()); // n_cent
+            directory.extend_from_slice(&(sub.n_cent as u32).to_le_bytes()); // physical n_cent
             directory.extend_from_slice(&metric_id(cfg.metric).to_le_bytes()); // metric_id
             directory.extend_from_slice(&cfg.rot_seed.to_le_bytes()); // rot_seed (8)
             directory.extend_from_slice(&subsection_start_off.to_le_bytes()); // subsection_offset (8)
@@ -512,6 +512,10 @@ impl VectorBuilder {
 /// Builder output for one column's subsection.
 struct SubsectionBytes {
     bytes: Vec<u8>,
+    /// Physical IVF centroid count written into this subsection.
+    /// May be lower than the configured `n_cent` for tiny shards
+    /// where `n_docs < n_cent`.
+    n_cent: usize,
     /// Byte offset of the summary centroid relative to the subsection
     /// start (matches the directory entry's `summary_offset` after
     /// translation to absolute).
@@ -978,6 +982,7 @@ fn build_subsection_streaming(
 
     Ok(SubsectionBytes {
         bytes,
+        n_cent,
         summary_offset_in_sub: summary_off,
         codec_meta_offset_in_sub: if codec_meta_size == 0 {
             0
@@ -1474,6 +1479,44 @@ mod tests {
     }
 
     #[test]
+    fn sq8_tiny_shard_writes_physical_n_cent_to_directory() {
+        use crate::superfile::vector::reader::VectorReader;
+        use bytes::Bytes;
+
+        let dim = 16;
+        let configured_n_cent = 4;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent: configured_n_cent,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8,
+        })
+        .expect("register sq8 column");
+        b.add(0, &[1.0; 16]).expect("add single row");
+
+        let blob = b.finish().expect("finish tiny sq8 shard");
+        let dir_off = OUTER_HEADER_SIZE;
+        let physical_n_cent = u32::from_le_bytes(
+            blob[dir_off + 8..dir_off + 12]
+                .try_into()
+                .expect("n_cent bytes"),
+        );
+        assert_eq!(
+            physical_n_cent, 1,
+            "directory must describe physical IVF layout, not configured n_cent"
+        );
+
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":{configured_n_cent},"rot_seed":7,"metric":"cosine"}}]"#
+        );
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open tiny sq8 shard");
+        assert_eq!(reader.n_docs(), 1);
+    }
+
+    #[test]
     fn finish_two_columns_at_different_dims() {
         let mut b = VectorBuilder::new();
         b.register_column(cfg("a", 16)).expect("register column");
@@ -1556,8 +1599,8 @@ mod tests {
     /// query (the recall-floor invariant — bit-for-bit equality
     /// isn't required because bucket-flush ordering is
     /// implementation-defined, but the retrieval contract holds).
-    #[test]
-    fn forced_spill_path_matches_in_ram_path_on_self_nn() {
+    #[tokio::test]
+    async fn forced_spill_path_matches_in_ram_path_on_self_nn() {
         use crate::superfile::vector::reader::VectorReader;
         use bytes::Bytes;
         let dim = 16;
@@ -1611,9 +1654,11 @@ mod tests {
             let query = &corpus[q * dim..(q + 1) * dim];
             let top_ram = r_ram
                 .search("v", query, 1, nprobe, rerank_mult)
+                .await
                 .expect("search ram");
             let top_spill = r_spill
                 .search("v", query, 1, nprobe, rerank_mult)
+                .await
                 .expect("search spill");
             // Both paths must return self as top-1 — that's the
             // strict recall invariant, independent of the
@@ -1707,8 +1752,8 @@ mod tests {
     /// a sane result. This catches any case where the running
     /// CRC32C accumulator drifts between the streaming write
     /// path and a one-shot `crc32c(&blob)` over the same bytes.
-    #[test]
-    fn finish_to_temp_file_round_trips_through_reader() {
+    #[tokio::test]
+    async fn finish_to_temp_file_round_trips_through_reader() {
         use crate::superfile::vector::reader::VectorReader;
         use bytes::Bytes;
         use std::io::BufWriter;
@@ -1747,6 +1792,7 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.13).sin()).collect();
         let hits = reader
             .search("v", &query, 5, n_cent, n_docs + 1)
+            .await
             .expect("kNN search");
         assert!(!hits.is_empty(), "search returned no hits");
     }

@@ -53,8 +53,6 @@
 
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::error::QueryError;
@@ -77,7 +75,7 @@ impl SupertableReader {
     ///
     /// Empty supertable (no superfiles) and `k == 0` short-circuit
     /// to an empty `Vec`.
-    pub fn vector_search(
+    pub async fn vector_search(
         &self,
         column: &str,
         query: &[f32],
@@ -90,7 +88,6 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let pool = Arc::clone(&manifest.options.reader_pool);
         let column_owned = column.to_owned();
         let query_owned: Vec<f32> = query.to_vec();
 
@@ -111,7 +108,8 @@ impl SupertableReader {
                 crate::supertable::query::hierarchical_iter::load_and_flatten(
                     manifest.as_ref(),
                     &kept,
-                )?
+                )
+                .await?
             }
             None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
                 manifest.as_ref(),
@@ -121,24 +119,35 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        let per_segment: Result<Vec<Vec<SuperfileHit>>, QueryError> = pool.install(|| {
-            superfiles
-                .par_iter()
-                .map(|entry| {
-                    let r = open_reader(&store, disk_cache.as_ref(), entry)?;
+        // Async fan-out: one future per superfile, all polled
+        // concurrently on the owning tokio runtime. Cold
+        // object-store opens + range fetches overlap across
+        // segments and are driven by the runtime's reactor (so
+        // object-store retries fire); the per-segment CPU scan
+        // inside `vector_search` runs when its future is polled.
+        // No rayon, no sync→async bridge, no throwaway runtime.
+        let per_segment: Vec<Vec<SuperfileHit>> =
+            futures::future::try_join_all(superfiles.iter().map(|entry| {
+                let store = &store;
+                let disk_cache = disk_cache.as_ref();
+                let column_owned = &column_owned;
+                let query_owned = &query_owned;
+                async move {
+                    let r = open_reader(store, disk_cache, entry).await?;
                     let hits = r
-                        .vector_search(&column_owned, &query_owned, k, options)
+                        .vector_search(column_owned, query_owned, k, options)
+                        .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    Ok(tag_hits(entry, hits))
-                })
-                .collect()
-        });
+                    Ok::<_, QueryError>(tag_hits(entry, hits))
+                }
+            }))
+            .await?;
 
-        Ok(top_k_ascending(per_segment?, k))
+        Ok(top_k_ascending(per_segment, k))
     }
 }
 
-fn open_reader(
+async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
     entry: &SuperfileEntry,
@@ -149,6 +158,7 @@ fn open_reader(
         &entry.uri,
         entry.subsection_offsets.as_ref(),
     )
+    .await
     .map_err(|e| QueryError::Store(e.to_string()))
 }
 
@@ -333,19 +343,20 @@ mod tests {
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
     }
 
-    #[test]
-    fn vector_search_empty_supertable_returns_empty() {
+    #[tokio::test]
+    async fn vector_search_empty_supertable_returns_empty() {
         let st = Supertable::create(options_one_segment_per_commit(16));
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
             .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn vector_search_k_zero_short_circuits() {
+    #[tokio::test]
+    async fn vector_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_segment_per_commit(16));
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
@@ -355,12 +366,13 @@ mod tests {
         let q = vec![0.1f32; 16];
         let hits = r
             .vector_search("emb", &q, 0, VectorSearchOptions::new())
+            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn vector_search_returns_ascending_distance_order() {
+    #[tokio::test]
+    async fn vector_search_returns_ascending_distance_order() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim));
         let mut w = st.writer().expect("writer");
@@ -375,6 +387,7 @@ mod tests {
         }
         let hits = r
             .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .await
             .expect("query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -387,8 +400,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vector_search_top_k_caps_at_k() {
+    #[tokio::test]
+    async fn vector_search_top_k_caps_at_k() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim));
         let mut w = st.writer().expect("writer");
@@ -403,12 +416,13 @@ mod tests {
         let q = vec![0.1f32; dim];
         let hits = r
             .vector_search("emb", &q, 7, VectorSearchOptions::new())
+            .await
             .expect("query");
         assert_eq!(hits.len(), 7);
     }
 
-    #[test]
-    fn vector_search_carries_segment_uris_for_multi_segment_results() {
+    #[tokio::test]
+    async fn vector_search_carries_segment_uris_for_multi_segment_results() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim));
         let mut w = st.writer().expect("writer");
@@ -422,6 +436,7 @@ mod tests {
         let q = vec![0.1f32; dim];
         let hits = r
             .vector_search("emb", &q, 24, VectorSearchOptions::new())
+            .await
             .expect("query");
         let segment_uris: std::collections::HashSet<_> = hits.iter().map(|h| h.segment).collect();
         // All three superfiles should contribute (high k pulls from
@@ -429,8 +444,8 @@ mod tests {
         assert_eq!(segment_uris.len(), 3);
     }
 
-    #[test]
-    fn vector_search_oracle_top_k_set_matches_single_superfile() {
+    #[tokio::test]
+    async fn vector_search_oracle_top_k_set_matches_single_superfile() {
         // Vector distances are segment-independent — cosine /
         // L2-sq are functions of the query + per-doc vector only.
         // So the per-segment-top-k → global-top-k pattern recovers
@@ -462,6 +477,7 @@ mod tests {
 
         let oracle_hits = oracle
             .vector_search("emb", &q, 2, opts)
+            .await
             .expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
@@ -470,6 +486,7 @@ mod tests {
         let st_reader = st.reader();
         let st_hits = st_reader
             .vector_search("emb", &q, 2, opts)
+            .await
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -487,8 +504,8 @@ mod tests {
         assert_eq!(st_globals, oracle_globals);
     }
 
-    #[test]
-    fn vector_search_unknown_column_errors() {
+    #[tokio::test]
+    async fn vector_search_unknown_column_errors() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim));
         let mut w = st.writer().expect("writer");
@@ -499,6 +516,7 @@ mod tests {
         let q = vec![0.1f32; dim];
         let err = r
             .vector_search("nope", &q, 5, VectorSearchOptions::new())
+            .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }

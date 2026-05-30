@@ -79,8 +79,20 @@ pub struct DiskCacheConfig {
     /// Range-GET chunk size in bytes. Smaller = more
     /// parallelism, larger = fewer HTTP round-trips. The
     /// product `cold_fetch_streams × cold_fetch_chunk_bytes`
-    /// bounds peak in-flight memory per cold miss.
+    /// bounds peak in-flight memory per cold miss — the
+    /// chunk size is fixed at this value regardless of
+    /// segment size, so a large segment fans out into more
+    /// chunks rather than inflating per-chunk memory.
     pub cold_fetch_chunk_bytes: u64,
+    /// Global cap on concurrent **background** segment fills
+    /// (the `LazyForegroundWithBackgroundFill` full-segment
+    /// download). Each in-flight fill is itself bounded to
+    /// `cold_fetch_streams × cold_fetch_chunk_bytes`, so the
+    /// process-wide background-fill memory ceiling is
+    /// `prefetch_concurrency × cold_fetch_streams ×
+    /// cold_fetch_chunk_bytes`. Foreground per-query range
+    /// reads do not count against this cap. Default 8.
+    pub prefetch_concurrency: usize,
     /// Idle threshold (seconds) past which a cached entry's
     /// mmap pages get `MADV_DONTNEED`'d by the background
     /// sweep thread. Default 300 s. Set to `0` to
@@ -112,6 +124,7 @@ impl Default for DiskCacheConfig {
             cold_fetch_mode: ColdFetchMode::default(),
             cold_fetch_streams: 16,
             cold_fetch_chunk_bytes: 16 * (1 << 20), // 16 MiB
+            prefetch_concurrency: 8,
             mmap_cold_threshold_secs: 300,
             mmap_sweep_interval_secs: 75,
             eviction: Box::new(LruPolicy::new()),
@@ -128,6 +141,7 @@ impl Debug for DiskCacheConfig {
             .field("cold_fetch_mode", &self.cold_fetch_mode)
             .field("cold_fetch_streams", &self.cold_fetch_streams)
             .field("cold_fetch_chunk_bytes", &self.cold_fetch_chunk_bytes)
+            .field("prefetch_concurrency", &self.prefetch_concurrency)
             .field("mmap_cold_threshold_secs", &self.mmap_cold_threshold_secs)
             .field("mmap_sweep_interval_secs", &self.mmap_sweep_interval_secs)
             .field("eviction", &"<dyn CacheEvictionPolicy>")
