@@ -30,8 +30,10 @@
 //! live one-per-superfile at `superfiles/<superfile_id>.tombstones`
 //! (not under `wal/`).
 
+pub mod lease;
 pub mod persistence;
 pub mod pipeline;
+pub mod recovery;
 pub mod state_doc;
 pub mod tombstones_codec;
 

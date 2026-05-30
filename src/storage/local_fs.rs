@@ -257,6 +257,17 @@ impl StorageProvider for LocalFsStorageProvider {
             Err(e) => Err(translate(uri, e)),
         }
     }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        use futures::TryStreamExt;
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out: Vec<String> = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(meta.location.to_string());
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

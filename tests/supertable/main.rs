@@ -25,3 +25,4 @@ mod disk_cache;
 mod manifest;
 mod query;
 mod storage;
+mod wal_recovery;

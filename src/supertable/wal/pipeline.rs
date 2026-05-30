@@ -1049,17 +1049,30 @@ fn resolve_target_id_in_manifest(
         if target < entry.id_min || target > entry.id_max {
             continue;
         }
-        let reader = crate::supertable::query::superfile_reader::superfile_reader(
+        // Tiered open: in-memory reader cache → disk cache →
+        // direct storage GET. The first two are the production
+        // reader path; the third covers cross-process recovery
+        // where neither cache layer has the bytes pinned. The
+        // recovery sweep on `Supertable::open` lands here when
+        // the freshly-opened handle's in-memory tier is empty
+        // and no disk cache is attached.
+        let parquet_bytes = match crate::supertable::query::superfile_reader::superfile_reader(
             &inner.options.store,
             inner.options.disk_cache.as_ref(),
             &entry.uri,
-        )
-        .map_err(|e| TombstonePhaseError::IdLookupFailed {
-            target_id: target_id.to_hex(),
-            message: format!("open superfile {}: {e}", entry.uri.0),
-        })?;
+        ) {
+            Ok(reader) => reader.parquet_bytes().clone(),
+            Err(_) => fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
+                TombstonePhaseError::IdLookupFailed {
+                    target_id: target_id.to_hex(),
+                    message: format!(
+                        "open superfile {} (storage fallback): {message}",
+                        entry.uri.0
+                    ),
+                }
+            })?,
+        };
 
-        let parquet_bytes = reader.parquet_bytes().clone();
         if let Some(doc_id) =
             scan_id_column_for_match(parquet_bytes, &id_column, target).map_err(|message| {
                 TombstonePhaseError::IdLookupFailed {
@@ -1072,6 +1085,46 @@ fn resolve_target_id_in_manifest(
         }
     }
     Ok(None)
+}
+
+/// Fetch a superfile's full bytes directly from storage and
+/// return just the Parquet section the `_id` scan needs.
+/// Storage-fallback path for the recovery sweep when the
+/// in-memory + disk-cache tiers are both cold.
+///
+/// Sync-bridged because the call site
+/// (`resolve_target_id_in_manifest`) is sync (called from inside
+/// the pipeline orchestrator); we mirror the
+/// `query::superfile_reader::superfile_reader` async-bridge
+/// pattern.
+fn fetch_superfile_bytes_for_id_scan(
+    inner: &Arc<crate::supertable::handle::SupertableInner>,
+    superfile_id: Uuid,
+) -> Result<Bytes, String> {
+    let storage = inner
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| "no storage attached".to_string())?
+        .clone();
+    let path = format!("data/seg-{}.sf", superfile_id);
+    let drive = async move { storage.get(&path).await };
+    let bytes = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))
+            .map_err(|e| format!("storage get: {e}"))?,
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio runtime build: {e}"))?;
+            rt.block_on(drive)
+                .map_err(|e| format!("storage get: {e}"))?
+        }
+    };
+
+    let reader = crate::superfile::SuperfileReader::open(bytes)
+        .map_err(|e| format!("SuperfileReader::open: {e}"))?;
+    Ok(reader.parquet_bytes().clone())
 }
 
 /// Sequential scan of one superfile's `_id` column looking for

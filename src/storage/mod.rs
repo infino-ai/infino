@@ -163,4 +163,23 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// Delete an object. **Idempotent** — deleting a missing
     /// object returns `Ok(())`, not [`StorageError::NotFound`].
     async fn delete(&self, uri: &str) -> Result<(), StorageError>;
+
+    /// List object URIs under `prefix`. Returns the full URI of
+    /// every object whose path starts with `prefix` (caller is
+    /// responsible for slash-aware boundary checks if they want
+    /// to restrict to direct children).
+    ///
+    /// Used by the WAL recovery sweep to enumerate
+    /// `wal/mutations/*.json`. Listing is a relatively heavy
+    /// operation on object-store backends (it's a LIST call;
+    /// pagination handled internally) so callers should not
+    /// invoke this on the hot path — it's an open-time / sweep-
+    /// time primitive.
+    ///
+    /// Default returns an empty list — test/mock providers that
+    /// don't need WAL recovery support can leave the default in
+    /// place; production providers (LocalFs, S3) override.
+    async fn list_with_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
 }

@@ -174,6 +174,46 @@ impl WalStore {
         format!("{SUPERFILES_DIR}/{superfile_id}.{TOMBSTONES_EXT}")
     }
 
+    /// Enumerate every WAL state-doc currently in `wal/mutations/`
+    /// and return their parsed [`WalId`]s, sorted ascending.
+    ///
+    /// Sorted-ascending is significant: `WalId` is Snowflake-shaped
+    /// (64-bit ms timestamp prefix), so ascending == oldest-first.
+    /// The recovery sweep walks the result in that order so older
+    /// leftover WALs get drained before fresher ones — bounded
+    /// per-sweep latency on backlogged supertables.
+    ///
+    /// Objects whose filename doesn't parse as `<hex>.json` are
+    /// silently skipped. `.arrow` sidecars live under the same
+    /// prefix and are excluded the same way.
+    pub async fn list_wal_ids(&self) -> Result<Vec<WalId>, WalStoreError> {
+        let uris = self
+            .storage
+            .list_with_prefix(WAL_DIR)
+            .await
+            .map_err(|source| WalStoreError::Storage {
+                path: WAL_DIR.into(),
+                source,
+            })?;
+        let suffix = format!(".{STATE_EXT}");
+        let mut out: Vec<WalId> = Vec::new();
+        for uri in uris {
+            let filename = match uri.rsplit_once('/') {
+                Some((_, fname)) => fname,
+                None => uri.as_str(),
+            };
+            let Some(stem) = filename.strip_suffix(&suffix) else {
+                continue;
+            };
+            let Ok(id) = WalId::from_hex(stem) else {
+                continue;
+            };
+            out.push(id);
+        }
+        out.sort_unstable_by_key(|w| w.0);
+        Ok(out)
+    }
+
     /// Write a brand-new WAL state doc atomically. Fails with
     /// `AlreadyExists` if the `wal_id`'s path is occupied —
     /// which is how a `wal_id` collision surfaces. Probability

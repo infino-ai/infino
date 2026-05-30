@@ -80,6 +80,14 @@ pub(super) struct SupertableInner {
     /// returning per-superfile hits; writers invalidate cached
     /// entries after each successful sidecar CAS-PUT.
     pub(super) tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+    /// Fresh `supertable_handle_id` minted at handle
+    /// construction. Used as the `lease.owner` identifier on
+    /// every WAL this process drives. Not the OS PID — we need
+    /// uniqueness across restarts on the same PID AND across
+    /// multiple handles within one process (a process that
+    /// opens five supertables holds five distinct ids). Minted
+    /// via `IdGenerator::next_id()` once at create / open.
+    pub(super) handle_id: crate::supertable::wal::state_doc::WalId,
 }
 
 impl SupertableInner {
@@ -113,16 +121,25 @@ impl Supertable {
         let options = Arc::new(options);
         let initial = Manifest::empty(options.clone());
         let tombstone_cache = build_tombstone_cache(&options);
+        let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
+        let handle_id = crate::supertable::wal::state_doc::WalId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options,
             manifest: ArcSwap::new(Arc::new(initial)),
             writer_outstanding: AtomicBool::new(false),
-            id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
+            id_generator: Mutex::new(id_generator),
             sql_runtime: OnceLock::new(),
             tombstone_cache,
+            handle_id,
         });
         install_disk_cache_pinning(&inner);
-        Self { inner }
+        let st = Self { inner };
+        // Open-time recovery sweep — no-op when no storage is
+        // attached. Best-effort: a sweep failure here doesn't
+        // fail handle construction; the next sweep gets another
+        // shot.
+        let _ = st.run_recovery_sweep_once_blocking();
+        st
     }
 
     /// Open an existing persisted supertable.
@@ -273,23 +290,33 @@ impl Supertable {
         };
 
         let tombstone_cache = build_tombstone_cache(&options_arc);
+        // Fresh generator per open. The 64-bit ms timestamp
+        // prefix advances naturally across process restarts, so
+        // re-opened supertables never re-mint values that already
+        // live in storage — no resume-from-id_max-on-open logic
+        // needed. The worker_id is also fresh, further insulating
+        // restarts from collisions.
+        let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
+        let handle_id = crate::supertable::wal::state_doc::WalId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options: options_arc,
             manifest: ArcSwap::new(Arc::new(manifest)),
             writer_outstanding: AtomicBool::new(false),
-            // Fresh generator per open. The 64-bit ms
-            // timestamp prefix advances naturally across
-            // process restarts, so re-opened supertables
-            // never re-mint values that already live in
-            // storage — no resume-from-id_max-on-open
-            // logic needed. The worker_id is also fresh,
-            // further insulating restarts from collisions.
-            id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
+            id_generator: Mutex::new(id_generator),
             sql_runtime: OnceLock::new(),
             tombstone_cache,
+            handle_id,
         });
         install_disk_cache_pinning(&inner);
-        Ok(Self { inner })
+        let st = Self { inner };
+        // Open-time recovery sweep — drives every Intent /
+        // Appended WAL discovered in `wal/mutations/` to
+        // Complete (or skips lease-conflicted ones for a peer
+        // to drive). Best-effort: a sweep failure doesn't fail
+        // `open` because the supertable is still functional —
+        // the next sweep gets another shot.
+        let _ = st.run_recovery_sweep_once().await;
+        Ok(st)
     }
 
     /// Re-read the manifest pointer from storage.
@@ -438,6 +465,59 @@ impl Supertable {
     /// tokenizer). Immutable for the supertable's lifetime.
     pub fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+
+    /// This handle's lease-owner id. Stamped on every WAL the
+    /// handle's recovery sweep / commit pipeline acquires.
+    /// Minted once at handle construction via `IdGenerator`;
+    /// distinct from every other handle in the process
+    /// (different `worker_id`) and from every prior process
+    /// (different `ms` timestamp).
+    pub fn handle_id(&self) -> crate::supertable::wal::state_doc::WalId {
+        self.inner.handle_id
+    }
+
+    /// Operator hatch: run one WAL recovery sweep against this
+    /// supertable's storage prefix. Useful for long-lived
+    /// handles that want bounded recovery latency without
+    /// restarting the process, and for integration tests that
+    /// pre-seed half-finished WALs and verify the sweep
+    /// completes them.
+    ///
+    /// Returns `Ok(report)` with the per-outcome counts on
+    /// success; `Err(NoStorageAttached)` for in-memory-only
+    /// supertables (no WALs can exist there).
+    pub async fn run_recovery_sweep_once(
+        &self,
+    ) -> Result<
+        crate::supertable::wal::recovery::RecoveryReport,
+        crate::supertable::wal::recovery::RecoveryError,
+    > {
+        crate::supertable::wal::recovery::scan_and_recover(
+            self,
+            self.inner.handle_id,
+            crate::supertable::wal::lease::DEFAULT_LEASE_DURATION,
+        )
+        .await
+    }
+
+    /// Sync-bridged version of [`run_recovery_sweep_once`]. Used
+    /// by [`Supertable::create`] to drive an open-time sweep
+    /// from a sync entry point. Same sync→async pattern the
+    /// writer's `persist_commit` uses: ride the ambient tokio
+    /// runtime when present, lazy-init the supertable's owned
+    /// runtime otherwise.
+    pub fn run_recovery_sweep_once_blocking(
+        &self,
+    ) -> Result<
+        crate::supertable::wal::recovery::RecoveryReport,
+        crate::supertable::wal::recovery::RecoveryError,
+    > {
+        let drive = self.run_recovery_sweep_once();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.inner.sql_runtime().block_on(drive),
+        }
     }
 
     /// Current manifest's id, without pinning a reader. Useful for
