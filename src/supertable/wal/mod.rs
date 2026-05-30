@@ -31,6 +31,7 @@
 //! (not under `wal/`).
 
 pub mod persistence;
+pub mod pipeline;
 pub mod state_doc;
 pub mod tombstones_codec;
 

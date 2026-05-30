@@ -736,7 +736,7 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// superfiles go into one `ManifestPart` with a fresh `PartId`.
 /// With a real `PartitionStrategy`, `try_commit_attempt` runs
 /// the per-partition part-reuse path described on that fn.
-fn persist_commit(
+pub(in crate::supertable) fn persist_commit(
     inner: &SupertableInner,
     storage: Arc<dyn crate::storage::StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
