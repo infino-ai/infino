@@ -4,7 +4,7 @@
 //! `SupertableOptions::with_storage(...)` is attached:
 //!
 //! - A commit on a storage-backed supertable writes:
-//!   - each new segment's bytes to `data/seg-<uuid>.sf`
+//!   - each new segment's bytes to `data/seg-<uuid>.parquet`
 //!   - one manifest part to `manifests/part-<hash>.avro.zst`
 //!   - the manifest list to `manifest-lists/list-NNNNNN.json`
 //!   - the pointer to `_supertable/current`

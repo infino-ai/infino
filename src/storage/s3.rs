@@ -438,13 +438,15 @@ mod tests {
 
     #[test]
     fn path_parses_simple_uri() {
-        let p = S3StorageProvider::path("foo/bar.txt").expect("parse");
+        let p = endpoint_provider().path("foo/bar.txt").expect("parse");
         assert_eq!(p.to_string(), "foo/bar.txt");
     }
 
     #[test]
     fn path_parses_nested_uri() {
-        let p = S3StorageProvider::path("manifest-lists/list-000042.json").expect("parse");
+        let p = endpoint_provider()
+            .path("manifest-lists/list-000042.json")
+            .expect("parse");
         assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
     }
 

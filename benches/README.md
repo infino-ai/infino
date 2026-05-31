@@ -53,10 +53,12 @@ which is the structured source of truth the markdown is derived from.
 <!-- BEGIN: bench/fts/superfile/ingest -->
 ### Superfile FTS — ingest (1000000 docs, Zipfian, 200 tokens/doc, 10K vocab)
 
+Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit).
+
 | Engine                       | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |------------------------------|------------|------------|-----------|------------|-----------|------------|
-| infino_1thread               | 9.30 s     | 107.5 K/s  | 0 B       | 0 B        | 0 B       | —          |
-| infino_rayon_default_threads | 815.44 ms  | 1.23 M/s   | 0 B       | 0 B        | 0 B       | —          |
+| infino_1thread               | 20.18 s    | 49.6 K/s   | 8.20 GiB  | 6.78 GiB   | 7.37 GiB  | —          |
+| infino_rayon_default_threads | 2.11 s     | 473.1 K/s  | 9.76 GiB  | 8.31 GiB   | 9.37 GiB  | —          |
 
 <!-- END: bench/fts/superfile/ingest -->
 
@@ -127,20 +129,54 @@ which is the structured source of truth the markdown is derived from.
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| infino | 20.60 s | 48.5 K/s | 5.75 GiB | 3.16 GiB | 4.73 GiB | -0.4% no change |
+| infino | 18.87 s | 53.0 K/s | 4.16 GiB | 2.79 GiB | 3.66 GiB | — |
 
 <!-- END: bench/vector/superfile/ingest -->
 
 <!-- BEGIN: bench/vector/superfile/search -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector -- superfile_vec_search` to populate_
+### Superfile vector — search (1000000 docs × dim=384, calibrated at recall targets)
+
+Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `vector_search` (production cold/warm path).
+
+| Recall target | (p, r)     | hot        | warm       | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|---------------|------------|------------|------------|------------|----------|------------|---------|------------|
+| 0.90          | (p=1, r=256) | 828.42 µs | 823.76 µs | 278.70 ms | 3.81 GiB | 3.78 GiB | 3.79 GiB | — |
+| 0.95          | (p=5, r=256) | 964.98 µs | 967.19 µs | 273.96 ms | 3.81 GiB | 3.78 GiB | 3.79 GiB | — |
+| 0.99          | — | — | — | — | — | — | — | — |
+
+**infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):
+
+| Metric | Value |
+|--------|-------|
+| infino_default_options_top10 (hot) | 771.49 µs |
+| infino_default_options_top10 (warm) | 780.77 µs |
+| infino_default_options_top10 (cold) | 274.54 ms |
+| infino_default_options_top10_peak_rss | 3.81 GiB |
+| infino_default_options_top10_median_rss | 3.78 GiB |
+| infino_default_options_top10_p90_rss | 3.79 GiB |
+
 <!-- END: bench/vector/superfile/search -->
 
 ### Vector — supertable (multi-segment, 10M × 384)
 
 <!-- BEGIN: bench/vector/supertable/ingest -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector -- supertable_vec_build` to populate_
+### Supertable vector — ingest (10000000 docs × dim=384, sharded into 4 superfiles)
+
+| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|--------|------|------------|----------|------------|---------|------------|
+| supertable | 178.49 s | 56.0 K/s | 27.47 GiB | 23.72 GiB | 25.93 GiB | — |
+
 <!-- END: bench/vector/supertable/ingest -->
 
 <!-- BEGIN: bench/vector/supertable/search -->
-_run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector -- supertable_vec_search` to populate_
+### Supertable vector — search (10000000 docs × dim=384, calibrated at recall targets)
+
+Hot = in-memory; warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`).
+
+| Recall target | (p/seg, r) | hot | warm | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|---------------|------------|-----|------|------|----------|------------|---------|------------|
+| 0.90 | (p=2, r=4) | 29.01 ms | 262.26 ms | 1.13 s | 28.21 GiB | 28.20 GiB | 28.20 GiB | — |
+| 0.95 | — | — | — | — | — | — | — | — |
+| 0.99 | — | — | — | — | — | — | — | — |
+
 <!-- END: bench/vector/supertable/search -->

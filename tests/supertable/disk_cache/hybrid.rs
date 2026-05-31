@@ -129,7 +129,7 @@ fn build_test_bytes() -> Bytes {
 }
 
 async fn seed(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     storage.put_atomic(&path, bytes).await.expect("seed");
 }
 

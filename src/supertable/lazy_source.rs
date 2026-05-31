@@ -48,7 +48,7 @@ use crate::superfile::{LazyByteSource, LazyByteSourceError};
 pub struct StorageRangeSource {
     storage: Arc<dyn StorageProvider>,
     /// Storage-side URI of the object (e.g.
-    /// `data/seg-<uuid>.sf`).
+    /// `data/seg-<uuid>.parquet`).
     uri: String,
     /// Cached total size. `0` means "not yet known". Set
     /// either at construction ([`Self::with_known_size`] /

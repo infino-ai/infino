@@ -7,7 +7,7 @@ use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -409,6 +409,36 @@ impl DiskCacheStore {
         }
     }
 
+    /// Whether `uri` is cached with a finished mmap promotion
+    /// (`CachedEntry::mmap == Some`). False while
+    /// `LazyForegroundWithBackgroundFill` still holds the lazy
+    /// in-memory reader or the background download is in flight.
+    pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
+        self.cached
+            .get(uri)
+            .map(|e| e.mmap.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Block until the background fill has swapped in the
+    /// mmap-backed reader, or fail after `timeout`.
+    pub async fn wait_until_mmap_promoted(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        timeout: Duration,
+    ) -> Result<(), DiskCacheError> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.is_mmap_promoted(uri) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(DiskCacheError::SuperfileOpen(format!(
+            "segment {uri:?} not mmap-promoted within {timeout:?}"
+        )))
+    }
+
     /// Snapshot of the cache's load. Cheap; reads atomics +
     /// a `DashMap::len` (which itself is `O(shards)`).
     pub fn stats(&self) -> CacheStats {
@@ -668,19 +698,19 @@ impl DiskCacheStore {
 
     /// Build a per-URI cache file path under `cache_root`.
     fn cache_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config.cache_root.join(format!("seg-{}.sf", uri.0))
+        self.config.cache_root.join(uri.cache_filename())
     }
 
     /// Build a per-URI tempfile path (sparse destination
     /// during cold fetch; renamed to `cache_path` on success).
     fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config.cache_root.join(format!("seg-{}.sf.tmp", uri.0))
+        self.config.cache_root.join(uri.cache_tmp_filename())
     }
 
     /// The storage-side URI for a segment, mirroring the
     /// writer's persist layout.
     fn storage_path(uri: &SuperfileUri) -> String {
-        format!("data/seg-{}.sf", uri.0)
+        uri.storage_path()
     }
 
     /// Hybrid cold-fetch. Returns the foreground reader

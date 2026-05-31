@@ -7,8 +7,8 @@
 //!
 //! The path scoping is: every URI handed to a method is
 //! relative to the `root` passed at construction. So
-//! `provider.get("data/seg-abc.sf")` reads
-//! `<root>/data/seg-abc.sf`. No upward traversal — paths with
+//! `provider.get("data/seg-abc.parquet")` reads
+//! `<root>/data/seg-abc.parquet`. No upward traversal — paths with
 //! `..` get rejected by `object_store::path::Path`.
 
 use std::ops::Range;
@@ -288,10 +288,10 @@ mod tests {
     async fn put_then_get_roundtrip() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(b"hello supertable storage");
-        p.put_atomic("data/seg-abc.sf", payload.clone())
+        p.put_atomic("data/seg-abc.parquet", payload.clone())
             .await
             .expect("put");
-        let got = p.get("data/seg-abc.sf").await.expect("get");
+        let got = p.get("data/seg-abc.parquet").await.expect("get");
         assert_eq!(got, payload);
     }
 
@@ -299,11 +299,11 @@ mod tests {
     async fn head_returns_accurate_size() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(&[0xABu8; 1024]);
-        p.put_atomic("data/seg-head.sf", payload)
+        p.put_atomic("data/seg-head.parquet", payload)
             .await
             .expect("put");
 
-        let meta = p.head("data/seg-head.sf").await.expect("head");
+        let meta = p.head("data/seg-head.parquet").await.expect("head");
         assert_eq!(meta.size, 1024);
         // LocalFS surfaces an mtime-derived etag; other
         // backends may not. Assert presence, not value.
@@ -314,18 +314,18 @@ mod tests {
     async fn get_range_reads_exact_slice() {
         let (_dir, p) = provider();
         let payload: Vec<u8> = (0u8..=255).collect();
-        p.put_atomic("data/seg-range.sf", Bytes::from(payload.clone()))
+        p.put_atomic("data/seg-range.parquet", Bytes::from(payload.clone()))
             .await
             .expect("put");
 
         let slice = p
-            .get_range("data/seg-range.sf", 32..64)
+            .get_range("data/seg-range.parquet", 32..64)
             .await
             .expect("range");
         assert_eq!(slice.as_ref(), &payload[32..64]);
 
         let tail = p
-            .get_range("data/seg-range.sf", 255..256)
+            .get_range("data/seg-range.parquet", 255..256)
             .await
             .expect("range tail");
         assert_eq!(tail.as_ref(), &payload[255..256]);
@@ -411,15 +411,15 @@ mod tests {
     #[tokio::test]
     async fn delete_is_idempotent() {
         let (_dir, p) = provider();
-        p.put_atomic("data/orphan.sf", Bytes::from_static(b"x"))
+        p.put_atomic("data/orphan.parquet", Bytes::from_static(b"x"))
             .await
             .expect("put");
 
-        p.delete("data/orphan.sf").await.expect("first delete");
-        p.delete("data/orphan.sf")
+        p.delete("data/orphan.parquet").await.expect("first delete");
+        p.delete("data/orphan.parquet")
             .await
             .expect("second delete (idempotent)");
-        p.delete("data/never-existed.sf")
+        p.delete("data/never-existed.parquet")
             .await
             .expect("delete of never-existing");
     }
@@ -427,14 +427,14 @@ mod tests {
     #[tokio::test]
     async fn missing_object_returns_not_found() {
         let (_dir, p) = provider();
-        let err = p.head("data/no-such.sf").await.expect_err("head missing");
+        let err = p.head("data/no-such.parquet").await.expect_err("head missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
-        let err = p.get("data/no-such.sf").await.expect_err("get missing");
+        let err = p.get("data/no-such.parquet").await.expect_err("get missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
         let err = p
-            .get_range("data/no-such.sf", 0..1)
+            .get_range("data/no-such.parquet", 0..1)
             .await
             .expect_err("get_range missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
@@ -489,7 +489,7 @@ mod tests {
         // happens at the supertable commit layer.
         let (_dir, p) = provider();
         let mut upload = p
-            .put_multipart("data/multipart-test.sf")
+            .put_multipart("data/multipart-test.parquet")
             .await
             .expect("multipart handle");
         upload.abort().await.expect("abort");

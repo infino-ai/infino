@@ -488,7 +488,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
             manifest
                 .superfiles
                 .iter()
-                .map(|entry| format!("data/seg-{}.sf", entry.uri.0)),
+                .map(|entry| entry.uri.storage_path()),
         );
 
         Ok::<Vec<String>, String>(cleanup_keys)

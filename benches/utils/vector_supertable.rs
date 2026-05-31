@@ -496,7 +496,13 @@ fn bench_search_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[
             tier,
             Some(committed.storage_label),
         ));
-        g.sample_size(if tier == Tier::Cold { 10 } else { 10 });
+        g.sample_size(10);
+        // Cold rebuilds a fresh cache + full S3 cold open per sample; widen
+        // only the cold groups so criterion stops warning it can't fit 10
+        // samples in the 5s default (warm/hot are sub-ms).
+        if tier == Tier::Cold {
+            g.measurement_time(Duration::from_secs(30));
+        }
 
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
             let Some(c_st) = cal.supertable[i] else {
@@ -524,11 +530,9 @@ fn bench_search_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[
                     let query = q.clone();
                     tiers::block_on(async {
                         let _ = supertable_topk_async(&st, &query, TOP_K, opts).await;
-                        tiers::wait_for_cache_warm(
-                            &cache,
-                            Duration::from_secs(600),
-                        )
-                        .await;
+                        st.wait_until_warm(Duration::from_secs(600))
+                            .await
+                            .expect("supertable warm promotion");
                     });
                     g.bench_function(&bench_id, |b| {
                         let query = q.clone();

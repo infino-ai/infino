@@ -157,7 +157,7 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     let bytes = build_test_bytes();
 
     // Seed the segment at a stable URI.
-    let uri = "data/seg-test.sf";
+    let uri = "data/seg-test.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     // Counting proxy so we can assert the trait is actually
@@ -197,7 +197,7 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
-    let uri = "data/seg-equiv.sf";
+    let uri = "data/seg-equiv.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let eager = SuperfileReader::open(bytes).expect("eager");
@@ -386,7 +386,7 @@ async fn storage_range_source_out_of_bounds_surfaces_typed_error() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
-    let uri = "data/seg-oob.sf";
+    let uri = "data/seg-oob.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let source = StorageRangeSource::new(Arc::clone(&local), uri)

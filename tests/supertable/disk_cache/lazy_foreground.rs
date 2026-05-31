@@ -144,7 +144,7 @@ fn build_fts_only_bytes() -> Bytes {
 }
 
 async fn seed(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     storage.put_atomic(&path, bytes).await.expect("seed");
 }
 
@@ -166,35 +166,11 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
     (dir, store)
 }
 
-/// Wait until `cache.stats()` reports an mmap-promoted entry
-/// for `uri`, or fail after `timeout`. The background fill
-/// promotes the entry under a `Mutex` so a tight async poll
-/// loop is the right wait primitive — busy-wait on a global
-/// clock would deadlock on a single-thread runtime.
-async fn wait_for_mmap_promotion(cache: &Arc<DiskCacheStore>, timeout: Duration) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        let stats = cache.stats();
-        // `current_bytes > 0` indicates the cache holds a
-        // promoted (or pending) entry; we wait the additional
-        // `cold_fetch_to_disk` time so the mmap-backed reader
-        // is actually swapped in.
-        if stats.current_bytes > 0 && stats.n_cold_fetches >= 1 {
-            // Background swap happens between
-            // `cold_fetch_to_disk` completion and the entry
-            // replacement — yield a few times so the spawn
-            // can run to completion.
-            for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!(
-        "cache failed to promote {uri:?} within {timeout:?}",
-        uri = ()
-    );
+async fn wait_for_mmap_promotion(cache: &Arc<DiskCacheStore>, uri: SuperfileUri, timeout: Duration) {
+    cache
+        .wait_until_mmap_promoted(uri, timeout)
+        .await
+        .expect("mmap promotion");
 }
 
 // ============================================================
@@ -268,7 +244,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
     //    fill is spawned via `tokio::spawn` from the cold
     //    foreground; once it finishes, the cache entry has
     //    been atomically swapped to the mmap-backed reader.
-    wait_for_mmap_promotion(&cache, Duration::from_secs(5)).await;
+    wait_for_mmap_promotion(&cache, uri, Duration::from_secs(5)).await;
 
     // 3. Warm reader + search — must hit the promoted
     //    mmap-backed entry and issue zero additional
@@ -355,7 +331,7 @@ async fn lazy_foreground_total_bandwidth_includes_background_fill() {
     let (_d, cache) = fresh_cache(Arc::clone(&proxy) as Arc<dyn StorageProvider>);
 
     let _r = cache.reader(&uri).await.expect("cold");
-    wait_for_mmap_promotion(&cache, Duration::from_secs(5)).await;
+    wait_for_mmap_promotion(&cache, uri, Duration::from_secs(5)).await;
 
     let total_bytes = proxy.bytes();
     assert!(

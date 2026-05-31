@@ -360,14 +360,15 @@ pub(crate) struct Sq8Kernel<'a> {
     q_norm_sq: f32,
     /// Optional per-doc `Σ_d x_decoded²` table, indexed by the
     /// rerank shortlist's `pos` field. `Some` for L2Sq columns,
-    /// `None` for Cosine / NegDot (the `x²` term cancels out).
+    /// `None` for NegDot. `Some` for L2Sq (stores `‖x‖²`) and
+    /// Cosine (stores `‖x‖²`; rerank divides by `√norm`).
     per_doc_norms: Option<&'a [f32]>,
 }
 
 impl<'a> Sq8Kernel<'a> {
     /// Build the per-query kernel. `scale` + `offset` are the
     /// per-dim quantizer arrays from the column's `codec_meta`.
-    /// `per_doc_norms` is `Some` iff the column metric is L2Sq.
+    /// `per_doc_norms` is `Some` for L2Sq and Cosine columns.
     pub fn new(
         metric: Metric,
         query: &[f32],
@@ -857,8 +858,24 @@ mod tests {
         let decoded = decode_sq8(&codes, dim, &scale, &offset);
 
         for m in [Metric::Cosine, Metric::NegDot] {
-            let want = distance(m, &query, &decoded);
-            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, None);
+            let norms = if m == Metric::Cosine {
+                Some(vec![decoded.iter().map(|x| x * x).sum::<f32>()])
+            } else {
+                None
+            };
+            let want = match m {
+                Metric::Cosine => {
+                    let x_norm = norms.as_ref().unwrap()[0].sqrt();
+                    if x_norm > 0.0 {
+                        1.0 - dot(&query, &decoded) / x_norm
+                    } else {
+                        1.0 - dot(&query, &decoded)
+                    }
+                }
+                Metric::NegDot => distance(m, &query, &decoded),
+                Metric::L2Sq => unreachable!(),
+            };
+            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms.as_deref());
             let got = kernel.distance_at(0, &codes);
             let err = (want - got).abs();
             assert!(
@@ -979,8 +996,8 @@ mod tests {
 
         for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
             let norms_arg: Option<&[f32]> = match m {
-                Metric::L2Sq => Some(&per_doc_norms),
-                _ => None,
+                Metric::L2Sq | Metric::Cosine => Some(&per_doc_norms),
+                Metric::NegDot => None,
             };
             let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms_arg);
             // Probe a handful of doc positions — exercises both
@@ -995,7 +1012,17 @@ mod tests {
                     &query,
                     &corpus[(pos as usize) * dim..(pos as usize + 1) * dim],
                 );
-                let want_decoded = distance(m, &query, decoded_doc);
+                let want_decoded = match m {
+                    Metric::Cosine => {
+                        let x_norm = per_doc_norms[pos as usize].sqrt();
+                        if x_norm > 0.0 {
+                            1.0 - dot(&query, decoded_doc) / x_norm
+                        } else {
+                            1.0 - dot(&query, decoded_doc)
+                        }
+                    }
+                    _ => distance(m, &query, decoded_doc),
+                };
                 // Kernel must match the decoded reference very
                 // tightly — it's doing the same math, just fused
                 // through the per-query precompute. Difference
@@ -1004,11 +1031,16 @@ mod tests {
                     (got - want_decoded).abs() <= 1e-3,
                     "metric {m:?} pos {pos}: kernel {got} vs decoded ref {want_decoded}"
                 );
-                let rel = (got - want_fp32).abs() / want_fp32.abs().max(1e-2);
-                assert!(
-                    rel <= 0.1 || (got - want_fp32).abs() <= 1.0,
-                    "metric {m:?} pos {pos}: Sq8 {got} vs fp32 {want_fp32} (rel {rel})"
-                );
+                // Cosine Sq8 normalizes the decoded vector at rerank;
+                // [`distance`] assumes unit-norm fp32 inputs, so the
+                // fp32 reference is only meaningful for L2Sq / NegDot.
+                if m != Metric::Cosine {
+                    let rel = (got - want_fp32).abs() / want_fp32.abs().max(1e-2);
+                    assert!(
+                        rel <= 0.1 || (got - want_fp32).abs() <= 1.0,
+                        "metric {m:?} pos {pos}: Sq8 {got} vs fp32 {want_fp32} (rel {rel})"
+                    );
+                }
             }
         }
     }

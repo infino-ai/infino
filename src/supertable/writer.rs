@@ -1393,7 +1393,7 @@ async fn refresh_inner_state_async(
 /// Storage path for a segment's bytes. Lives under `data/`
 /// alongside the `_supertable/` manifest hierarchy.
 fn segment_storage_path(uri: &SuperfileUri) -> String {
-    format!("data/seg-{}.sf", uri.0)
+    uri.storage_path()
 }
 
 /// Multipart-upload variant of the writer's per-segment put.

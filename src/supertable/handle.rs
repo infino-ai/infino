@@ -427,6 +427,37 @@ impl Supertable {
         &self.inner.options
     }
 
+    /// Block until every segment in the current manifest is promoted to
+    /// its mmap-backed reader in the disk cache — i.e. the supertable is
+    /// in warm steady state where each query resolves from mmap with no
+    /// object-store round-trips.
+    ///
+    /// Returns immediately for an in-memory supertable (no disk cache
+    /// attached). This is the canonical warm-readiness primitive: callers
+    /// that must guarantee residency before issuing latency-sensitive
+    /// reads (cache pre-warming, warm-tier benchmarks) should `await`
+    /// this instead of polling [`Supertable::stats`]. Cache counters only
+    /// report that *a* cold fetch started, not that *all* segments
+    /// finished promoting, so polling them races background promotion and
+    /// can report "warm" while some segments still fault to the store.
+    ///
+    /// Promotion is driven by reads, so issue a query that touches every
+    /// segment (e.g. a fan-out search) before awaiting this. Errors if any
+    /// segment fails to promote within `timeout`.
+    pub async fn wait_until_warm(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), crate::supertable::reader_cache::disk::DiskCacheError> {
+        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
+            return Ok(());
+        };
+        let manifest = self.inner.manifest.load_full();
+        for entry in manifest.superfiles.iter() {
+            cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+        }
+        Ok(())
+    }
+
     /// Current manifest's id, without pinning a reader. Useful for
     /// observability + tests that want to assert "a commit
     /// happened" without holding a snapshot.

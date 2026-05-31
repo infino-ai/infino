@@ -442,7 +442,7 @@ async fn setup_s3_fixture(
         .expect("S3StorageProvider"),
     );
     let uri = SuperfileUri::new_v4();
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     // Upload against the raw provider — fixture-setup latency is
     // not part of the measured cold path.
     storage
@@ -499,7 +499,7 @@ async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
                 .expect("real S3 benchmark provider"),
         );
         let uri = SuperfileUri::new_v4();
-        let path = format!("data/seg-{}.sf", uri.0);
+        let path = uri.storage_path();
         storage
             .put_atomic(&path, superfile.clone())
             .await
@@ -1287,7 +1287,7 @@ mod diag {
         let storage = Arc::new(CountingStorage::new(raw_storage));
         let storage_dyn: Arc<dyn StorageProvider> =
             Arc::clone(&storage) as Arc<dyn StorageProvider>;
-        let path = format!("data/seg-{}.sf", uri.0);
+        let path = uri.storage_path();
 
         // ── Phase 1: raw RTT probes ─────────────────────────────────
         eprintln!("[diag] === raw S3StorageProvider RTT probes ===");
@@ -1524,7 +1524,7 @@ mod diag {
         );
         let prefix = format!("{}/{}", prefix_root.trim_matches('/'), unique);
         let uri = SuperfileUri::new_v4();
-        let path = format!("data/seg-{}.sf", uri.0);
+        let path = uri.storage_path();
 
         eprintln!(
             "[diag-real-s3] bucket={bucket} prefix={prefix} path={path} n_docs={n} size={} MiB",
@@ -1743,7 +1743,7 @@ mod diag {
                     manifest
                         .superfiles
                         .iter()
-                        .map(|entry| format!("data/seg-{}.sf", entry.uri.0)),
+                        .map(|entry| entry.uri.storage_path()),
                 );
             }
 

@@ -420,6 +420,23 @@ impl SuperfileUri {
     pub fn new_v4() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Object-store / LocalFS path for committed segment bytes.
+    /// Standard `.parquet` suffix — on disk this is valid Parquet
+    /// (row groups + optional embedded FTS/vector blobs + footer).
+    pub fn storage_path(self) -> String {
+        format!("data/seg-{}.parquet", self.0)
+    }
+
+    /// Disk-cache filename for a promoted segment.
+    pub fn cache_filename(self) -> String {
+        format!("seg-{}.parquet", self.0)
+    }
+
+    /// Disk-cache tempfile while a cold fetch is in flight.
+    pub fn cache_tmp_filename(self) -> String {
+        format!("seg-{}.parquet.tmp", self.0)
+    }
 }
 
 /// Per-scalar-column min/max for a segment, used by scalar skip

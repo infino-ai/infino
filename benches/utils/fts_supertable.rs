@@ -326,6 +326,12 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
             Some(committed.storage_label),
         ));
         g.sample_size(10);
+        // Cold rebuilds a fresh cache + full S3 cold open per sample; widen
+        // only the cold groups so criterion stops warning it can't fit 10
+        // samples in the 5s default (warm/hot are sub-ms).
+        if tier == Tier::Cold {
+            g.measurement_time(Duration::from_secs(30));
+        }
 
         for (name, q) in queries {
             let bench_id = format!("{name}_supertable_top10");
@@ -348,11 +354,9 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
                             .bm25_search("title", query, TOP_K, BoolMode::Or)
                             .await
                             .expect("warm prewarm bm25");
-                        tiers::wait_for_cache_warm(
-                            &cache,
-                            Duration::from_secs(600),
-                        )
-                        .await;
+                        st.wait_until_warm(Duration::from_secs(600))
+                            .await
+                            .expect("supertable warm promotion");
                     });
                     g.bench_function(&bench_id, |b| {
                         b.iter(|| {
@@ -424,11 +428,9 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
                             .bm25_search_prefix("title", "term0009", TOP_K)
                             .await
                             .expect("warm prewarm prefix");
-                        tiers::wait_for_cache_warm(
-                            &cache,
-                            Duration::from_secs(600),
-                        )
-                        .await;
+                        st.wait_until_warm(Duration::from_secs(600))
+                            .await
+                            .expect("supertable warm promotion");
                     });
                     b.iter(|| {
                         let hits = tiers::block_on(async {

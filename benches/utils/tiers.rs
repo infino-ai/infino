@@ -9,8 +9,8 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
@@ -78,16 +78,28 @@ enum StorageKeepalive {
 pub struct SuperfileCommitted {
     pub storage: Arc<dyn StorageProvider>,
     pub uri: SuperfileUri,
+    /// Object key under the storage provider (same bytes the hot
+    /// path built — uploaded verbatim for lazy vector open).
+    pub object_path: String,
+    pub object_size: u64,
     pub storage_label: &'static str,
     pub real_s3: bool,
     pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
 }
 
+/// One runtime for the whole bench process. `spawn_s3s_fs` binds its
+/// accept loop to this runtime; creating a fresh `Runtime` per
+/// `block_on` call would drop the previous one and kill in-process
+/// s3s-fs before warm/cold tiers run.
+static TIER_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+fn tier_runtime() -> &'static Runtime {
+    TIER_RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime for tier benches"))
+}
+
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    Runtime::new()
-        .expect("tokio runtime for tier benches")
-        .block_on(fut)
+    tier_runtime().block_on(fut)
 }
 
 pub fn real_s3_bucket_env() -> Option<String> {
@@ -171,7 +183,21 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
             )
             .expect("s3s-fs S3StorageProvider"),
         );
-        eprintln!("[tiers] s3s-fs on {endpoint} (set INFINO_REAL_S3_BUCKET for AWS S3)");
+        eprintln!(
+            "\n\
+             ################################################################################\n\
+             ##                                                                            ##\n\
+             ##   WARNING: BENCHMARKING AGAINST s3s-fs EMULATOR, *NOT* REAL AWS S3.        ##\n\
+             ##                                                                            ##\n\
+             ##   s3s-fs loopback in this sandbox is ~650 ms PER REQUEST (fixed artifact). ##\n\
+             ##   Cold/warm numbers from this run are MEANINGLESS as S3 latency.           ##\n\
+             ##   (e.g. cold first-search inflates to ~7.5 s vs sub-second on real S3.)    ##\n\
+             ##                                                                            ##\n\
+             ##   To benchmark real S3, set INFINO_REAL_S3_BUCKET (+ AWS creds) and rerun. ##\n\
+             ##                                                                            ##\n\
+             ################################################################################\n\
+             [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT real S3)\n"
+        );
         StorageFixture {
             storage,
             storage_label: "s3s_fs",
@@ -190,7 +216,7 @@ pub async fn supertable_storage_fixture() -> StorageFixture {
 pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     let fixture = backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await;
     let uri = SuperfileUri::new_v4();
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     fixture
         .storage
         .put_atomic(&path, bytes.clone())
@@ -204,10 +230,12 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     SuperfileCommitted {
         storage: fixture.storage,
         uri,
+        object_path: path.clone(),
+        object_size: bytes.len() as u64,
         storage_label: fixture.storage_label,
         real_s3: fixture.real_s3,
         cleanup_path: if fixture.real_s3 {
-            Some(path.clone())
+            Some(path)
         } else {
             None
         },
@@ -264,37 +292,11 @@ pub async fn wait_for_superfile_promotion(
     uri: SuperfileUri,
     timeout: Duration,
 ) {
-    let start = Instant::now();
-    loop {
-        let stats = cache.stats();
-        if stats.current_bytes > 0 && stats.n_cold_fetches >= 1 {
-            for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let _ = cache.reader(&uri).await.expect("warm reader sanity");
-            return;
-        }
-        if start.elapsed() > timeout {
-            panic!("cache failed to promote {uri:?} within {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Wait until supertable disk cache has hydrated after cold open.
-pub async fn wait_for_cache_warm(cache: &Arc<DiskCacheStore>, timeout: Duration) {
-    let start = Instant::now();
-    loop {
-        let stats = cache.stats();
-        if stats.n_cold_fetches >= 1 && stats.current_bytes > 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            return;
-        }
-        if start.elapsed() > timeout {
-            panic!("disk cache failed to warm within {timeout:?}; stats={stats:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    cache
+        .wait_until_mmap_promoted(&uri, timeout)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = cache.reader(&uri).await.expect("warm reader sanity");
 }
 
 #[allow(dead_code)]
