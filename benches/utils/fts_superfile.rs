@@ -17,10 +17,8 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench fts                            # all FTS benches
-//! cargo bench --bench fts -- superfile_fts_build     # only superfile ingest
-//! cargo bench --bench fts -- superfile_fts_search    # only superfile search
-//! cargo bench --bench fts -- _build                  # ingest across superfile + supertable
+//! cargo bench --bench superfile_fts -- superfile_fts_build     # only superfile ingest
+//! cargo bench --bench superfile_fts -- superfile_fts_search    # only superfile search
 //! ```
 //!
 //! Correctness phase runs unconditionally on every invocation
@@ -53,12 +51,12 @@ const FTS_COLUMN: &str = "title";
 
 // ─── Fixtures ────────────────────────────────────────────────────────
 
-static DOCS: OnceLock<Vec<String>> = OnceLock::new();
+static TEXT_CORPUS: OnceLock<corpus::MmapTextCorpus> = OnceLock::new();
 static SUPERFILE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
 static SUPERFILE_OBJECT: OnceLock<tiers::SuperfileCommitted> = OnceLock::new();
 
 fn superfile_bytes() -> &'static [u8] {
-    SUPERFILE_BYTES.get_or_init(|| build_superfile_bytes(docs()))
+    SUPERFILE_BYTES.get_or_init(|| build_superfile_bytes(text_corpus()))
 }
 
 fn superfile_object() -> &'static tiers::SuperfileCommitted {
@@ -79,9 +77,8 @@ const TIER_OR_QUERIES: &[(&str, &[&str])] = &[
     ("three_wide_or", &["term00001", "term00050", "term00100"]),
 ];
 
-fn docs() -> &'static [String] {
-    DOCS.get_or_init(|| corpus::generate_text_corpus(N_DOCS, 1))
-        .as_slice()
+fn text_corpus() -> &'static corpus::MmapTextCorpus {
+    TEXT_CORPUS.get_or_init(|| corpus::MmapTextCorpus::generate(N_DOCS, 1))
 }
 
 fn superfile_reader() -> SuperfileReader {
@@ -99,7 +96,16 @@ fn supertable_schema() -> Arc<Schema> {
 
 /// Unified `.parquet` (Parquet body + embedded FTS blob + `inf.*` KV) — same
 /// path as supertable commit and `vector_superfile`.
-fn build_superfile_bytes(docs: &[String]) -> Vec<u8> {
+fn build_superfile_bytes(docs: &corpus::MmapTextCorpus) -> Vec<u8> {
+    build_superfile_bytes_range(docs, 0, docs.n_docs(), 0)
+}
+
+fn build_superfile_bytes_range(
+    docs: &corpus::MmapTextCorpus,
+    start_doc: usize,
+    len_docs: usize,
+    id_base: usize,
+) -> Vec<u8> {
     let schema = supertable_schema();
     let opts = BuilderOptions::new(
         schema.clone(),
@@ -112,25 +118,20 @@ fn build_superfile_bytes(docs: &[String]) -> Vec<u8> {
     );
     let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
     const CHUNK: usize = 65_536;
-    let mut start = 0;
-    while start < docs.len() {
-        let len = CHUNK.min(docs.len() - start);
-        let ids: Decimal128Array = (start as u64..(start + len) as u64)
+    let mut offset = 0;
+    while offset < len_docs {
+        let len = CHUNK.min(len_docs - offset);
+        let global_start = start_doc + offset;
+        let ids: Decimal128Array = ((id_base + offset) as u64..(id_base + offset + len) as u64)
             .map(|i| Some(i as i128))
             .collect::<Decimal128Array>()
             .with_precision_and_scale(38, 0)
             .expect("decimal128");
-        let titles = LargeStringArray::from(
-            docs[start..start + len]
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
-                .expect("RecordBatch");
+        let titles = LargeStringArray::from(docs.chunk_strs(global_start, len));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
+            .expect("RecordBatch");
         builder.add_batch(&batch, &[]).expect("add_batch");
-        start += len;
+        offset += len;
     }
     builder.finish().expect("SuperfileBuilder::finish")
 }
@@ -138,60 +139,35 @@ fn build_superfile_bytes(docs: &[String]) -> Vec<u8> {
 /// Rayon-sharded parallel build: each shard runs its own
 /// [`SuperfileBuilder`] and emits a self-contained `.parquet` — the same
 /// multi-segment shape supertable commit produces.
-fn build_superfiles_rayon(docs: &[String]) -> Vec<Vec<u8>> {
+fn build_superfiles_rayon(docs: &corpus::MmapTextCorpus) -> Vec<Vec<u8>> {
     let n_shards = rayon::current_num_threads();
-    let docs_per_shard = docs.len().div_ceil(n_shards);
-    docs.chunks(docs_per_shard)
-        .enumerate()
-        .collect::<Vec<_>>()
+    let docs_per_shard = docs.n_docs().div_ceil(n_shards);
+    (0..n_shards)
         .into_par_iter()
-        .map(|(shard_idx, chunk)| {
+        .filter_map(|shard_idx| {
+            let start = shard_idx * docs_per_shard;
+            if start >= docs.n_docs() {
+                return None;
+            }
+            let len = docs_per_shard.min(docs.n_docs() - start);
             let id_base = shard_idx * docs_per_shard;
-            build_superfile_bytes_with_id_base(chunk, id_base)
+            Some(build_superfile_bytes_range(docs, start, len, id_base))
         })
         .collect()
-}
-
-fn build_superfile_bytes_with_id_base(docs: &[String], id_base: usize) -> Vec<u8> {
-    let schema = supertable_schema();
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        ID_COLUMN,
-        vec![FtsConfig {
-            column: FTS_COLUMN.into(),
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    );
-    let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
-    let ids: Decimal128Array = (id_base as u64..(id_base + docs.len()) as u64)
-        .map(|i| Some(i as i128))
-        .collect::<Decimal128Array>()
-        .with_precision_and_scale(38, 0)
-        .expect("decimal128");
-    let titles = LargeStringArray::from(
-        docs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-    );
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
-        .expect("RecordBatch");
-    builder.add_batch(&batch, &[]).expect("add_batch");
-    builder.finish().expect("finish")
 }
 
 // ─── Correctness ──────────────────────────────────────────────────────
 
 fn assert_superfile_self_consistent(reader: &SuperfileReader) {
-    let hits = corpus::block_on_inmem(
-        reader.bm25_search(FTS_COLUMN, "doc0500000", 10, BoolMode::Or),
-    )
-    .expect("search df=1");
+    let hits =
+        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "doc0500000", 10, BoolMode::Or))
+            .expect("search df=1");
     assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
     assert_eq!(hits[0].0, 500_000, "doc0500000 should match doc_id 500000");
 
-    let hits = corpus::block_on_inmem(
-        reader.bm25_search(FTS_COLUMN, "term00001", 10, BoolMode::Or),
-    )
-    .expect("search common");
+    let hits =
+        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "term00001", 10, BoolMode::Or))
+            .expect("search common");
     assert_eq!(hits.len(), 10, "common term should fill top-10");
     for w in hits.windows(2) {
         assert!(
@@ -224,13 +200,19 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
     const SCORE_EPSILON: f32 = 1e-4;
 
     for (label, terms) in battery {
-        let bmw_top10: Vec<(u32, f32)> = corpus::block_on_inmem(
-            reader.bm25_search_pretokenized(FTS_COLUMN, terms, 10, BoolMode::Or),
-        )
+        let bmw_top10: Vec<(u32, f32)> = corpus::block_on_inmem(reader.bm25_search_pretokenized(
+            FTS_COLUMN,
+            terms,
+            10,
+            BoolMode::Or,
+        ))
         .expect("bmw search");
-        let mut brute_full = corpus::block_on_inmem(
-            reader.bm25_search_pretokenized(FTS_COLUMN, terms, usize::MAX, BoolMode::Or),
-        )
+        let mut brute_full = corpus::block_on_inmem(reader.bm25_search_pretokenized(
+            FTS_COLUMN,
+            terms,
+            usize::MAX,
+            BoolMode::Or,
+        ))
         .expect("brute-force search");
         brute_full.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -278,9 +260,12 @@ fn bench_infino(
 ) {
     c.bench_function(format!("{name}_infino_top10"), |b| {
         b.iter(|| {
-            let hits = corpus::block_on_inmem(
-                r.bm25_search_pretokenized(black_box(FTS_COLUMN), black_box(terms), black_box(10), mode),
-            )
+            let hits = corpus::block_on_inmem(r.bm25_search_pretokenized(
+                black_box(FTS_COLUMN),
+                black_box(terms),
+                black_box(10),
+                mode,
+            ))
             .expect("bm25 search");
             black_box(hits)
         });
@@ -323,17 +308,9 @@ fn bench_per_algo_probe(
 // ─── Bench entry ──────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
-    eprintln!("[fts/superfile] correctness: building superfile ({N_DOCS} docs)...");
-    let r = superfile_reader();
-    assert_superfile_self_consistent(&r);
-    let n_bmw = assert_bmw_matches_brute_force(&r);
-    eprintln!(
-        "[fts/superfile] correctness OK: superfile self-consistent + {n_bmw} queries BMW==brute-force"
-    );
-
     {
         let n = N_DOCS;
-        let docs_for_ingest = docs();
+        let docs_for_ingest = text_corpus();
         let mut g = c.benchmark_group("superfile_fts_build");
         g.sample_size(10);
         g.throughput(Throughput::Elements(n as u64));
@@ -358,6 +335,16 @@ fn bench(c: &mut Criterion) {
 
         emit_ingest_markdown();
     }
+
+    eprintln!(
+        "[fts/superfile] correctness: building shared superfile for correctness/search ({N_DOCS} docs)..."
+    );
+    let r = superfile_reader();
+    assert_superfile_self_consistent(&r);
+    let n_bmw = assert_bmw_matches_brute_force(&r);
+    eprintln!(
+        "[fts/superfile] correctness OK: superfile self-consistent + {n_bmw} queries BMW==brute-force"
+    );
 
     {
         let mut g = c.benchmark_group(tiers::search_group_name("superfile_fts", Tier::Hot, None));
@@ -522,12 +509,8 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
                             .bm25_search(FTS_COLUMN, &query, 10, BoolMode::Or)
                             .await
                             .expect("prewarm bm25");
-                        tiers::wait_for_superfile_promotion(
-                            &cache,
-                            uri,
-                            Duration::from_secs(120),
-                        )
-                        .await;
+                        tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
+                            .await;
                     });
                     let cache_ref = Arc::clone(&cache);
                     g.bench_function(&bench_id, |b| {
@@ -535,7 +518,12 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
                             let hits = tiers::block_on(async {
                                 let reader = cache_ref.reader(&uri).await.expect("reader");
                                 reader
-                                    .bm25_search(FTS_COLUMN, terms.join(" ").as_str(), 10, BoolMode::Or)
+                                    .bm25_search(
+                                        FTS_COLUMN,
+                                        terms.join(" ").as_str(),
+                                        10,
+                                        BoolMode::Or,
+                                    )
                                     .await
                                     .expect("bm25")
                             });

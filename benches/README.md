@@ -1,29 +1,41 @@
 # infino benches
 
-Infino-only performance + correctness benches. Two criterion binaries:
+Infino-only performance + correctness benches. Three criterion binaries:
 
-- `fts` — superfile (1M docs Zipfian) + supertable (10M docs)
-- `vector` — superfile (1M × 384 cosine) + supertable (10M × 384, 4 superfiles)
+- `superfile_fts` — FTS over one 1M-doc superfile
+- `superfile_vector` — vector search over one 1M × 384 superfile
+- `supertable_all` — one combined 10M-row supertable with both FTS and vector indexes
 
 These benches measure infino in isolation — no third-party crates
 enter this tree's dependency graph.
 
+`cargo bench` runs only the regular local perf benches above. Diagnostic
+benches are opt-in via `--features bench-diagnostics`:
+
+- `object-store` — S3-compatible cold/warm lazy-fetch path over a unified 1M superfile.
+- `scale` — release-profile recall gates such as `vector_recall`.
+
 ## Invocation
 
 ```sh
-cargo bench --bench fts                            # all FTS (1M + 10M)
-cargo bench --bench vector                         # all vector (1M + 10M)
+cargo bench --bench superfile_fts                  # 1M superfile FTS
+cargo bench --bench superfile_vector               # 1M superfile vector
+cargo bench --bench supertable_all                 # 10M supertable FTS + vector, one shared build
 
 # Filter to one sub-group (criterion regex/prefix on the group name)
-cargo bench --bench fts -- superfile_fts_build     # superfile FTS ingest
-cargo bench --bench fts -- supertable_fts_search   # supertable FTS search
-cargo bench --bench vector -- superfile_vec_build  # superfile vector ingest
-cargo bench --bench vector -- supertable_vec_search # supertable vector search
+cargo bench --bench superfile_fts -- superfile_fts_build       # superfile FTS ingest
+cargo bench --bench superfile_vector -- superfile_vec_build    # superfile vector ingest
+cargo bench --bench supertable_all -- supertable_all_build     # shared FTS + vector supertable ingest
+cargo bench --bench supertable_all -- supertable_fts_search    # supertable FTS search
+cargo bench --bench supertable_all -- supertable_vec_search    # supertable vector search
 
 # Knobs
-INFINO_SUPERTABLE__WRITER_THREADS=32 cargo bench --bench fts -- supertable_fts_build
-INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts        # rewrite FTS result tables in place
-INFINO_BENCH_UPDATE_README=1 cargo bench --bench vector     # rewrite vector result tables in place
+INFINO_SUPERTABLE__WRITER_THREADS=32 cargo bench --bench supertable_all -- supertable_all_build
+INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
+
+# Diagnostics (not run by plain `cargo bench`)
+cargo bench --features bench-diagnostics --bench object-store
+cargo bench --features bench-diagnostics --bench scale -- vector_recall
 ```
 
 Every invocation runs the correctness phase unconditionally
@@ -162,7 +174,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 ### Vector — supertable (multi-segment, 10M × 384)
 
 <!-- BEGIN: bench/vector/supertable/ingest -->
-### Supertable vector — ingest (10000000 docs × dim=384, sharded into 4 superfiles)
+### Supertable combined FTS + vector — ingest (10000000 docs × dim=384, sharded into 4 superfiles)
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|

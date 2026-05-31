@@ -16,8 +16,8 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench vector -- superfile_vec_build      # ingest only
-//! cargo bench --bench vector -- superfile_vec_search     # search only
+//! cargo bench --bench superfile_vector -- superfile_vec_build      # ingest only
+//! cargo bench --bench superfile_vector -- superfile_vec_search     # search only
 //! ```
 
 use std::hint::black_box;
@@ -26,10 +26,10 @@ use std::time::{Duration, Instant};
 
 use std::sync::Arc as ArrowArc;
 
+use crate::tiers::{self, Tier};
 use arrow_array::{Decimal128Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use crate::tiers::{self, Tier};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // Calibrated `(probe, refine)` is intentionally not in the criterion ID:
 // criterion's improved/regressed/noise panel only fires on exact-ID matches
@@ -180,8 +180,8 @@ fn build_superfile_bytes(vectors: &[f32]) -> Vec<u8> {
             .collect::<Decimal128Array>()
             .with_precision_and_scale(38, 0)
             .expect("decimal128");
-        let batch = RecordBatch::try_new(schema.clone(), vec![ArrowArc::new(ids)])
-            .expect("RecordBatch");
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![ArrowArc::new(ids)]).expect("RecordBatch");
         builder
             .add_batch(&batch, &[&vectors[start * DIM..(start + len) * DIM]])
             .expect("add_batch");
@@ -257,17 +257,6 @@ fn calibrations() -> &'static Calibrations {
 // ─── Bench entry ──────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
-    // ---- Correctness phase (runs regardless of criterion filter) ---
-    eprintln!("[superfile_vec] correctness: building superfile ({N_DOCS} docs)...");
-    let reader = superfile_reader();
-    let recall = assert_infino_self_consistent(&reader);
-    eprintln!(
-        "[superfile_vec] correctness OK: infino recall@{TOP_K} = {recall:.3} (≥ {:.2})",
-        CORRECTNESS_RECALL_FLOOR
-    );
-
-    artifact_report(N_DOCS, corpus::n_cent(N_DOCS), vectors());
-
     // ---- Ingest sub-bench (group: superfile_vec_build) -------------
     {
         let v = vectors();
@@ -289,11 +278,22 @@ fn bench(c: &mut Criterion) {
         emit_ingest_markdown();
     }
 
+    artifact_report(N_DOCS, corpus::n_cent(N_DOCS), vectors());
+
+    eprintln!(
+        "[superfile_vec] correctness: building shared superfile for correctness/search ({N_DOCS} docs)..."
+    );
+    let reader = superfile_reader();
+    let recall = assert_infino_self_consistent(&reader);
+    eprintln!(
+        "[superfile_vec] correctness OK: infino recall@{TOP_K} = {recall:.3} (≥ {:.2})",
+        CORRECTNESS_RECALL_FLOOR
+    );
+
     // ---- Search sub-bench (group: superfile_vec_search) ------------
     {
         let cal = calibrations();
         let qs = queries_calibration();
-        let reader = superfile_reader();
 
         let mut g = c.benchmark_group(tiers::search_group_name("superfile_vec", Tier::Hot, None));
         g.sample_size(10);
@@ -442,12 +442,8 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                     let opts = search_opts(p, r);
                     tiers::block_on(async {
                         let reader = cache.reader(&uri).await.expect("warm prewarm open");
-                        tiers::wait_for_superfile_promotion(
-                            &cache,
-                            uri,
-                            Duration::from_secs(120),
-                        )
-                        .await;
+                        tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
+                            .await;
                         let _ = reader
                             .vector_search(VEC_COLUMN, &query, TOP_K, opts)
                             .await
@@ -646,7 +642,9 @@ fn emit_search_markdown() {
                 cold.map(fmt_time).unwrap_or_else(|| "—".into()),
             ));
         } else {
-            body.push_str(&format!("| {row_target:13} | — | — | — | — | — | — | — | — |\n"));
+            body.push_str(&format!(
+                "| {row_target:13} | — | — | — | — | — | — | — | — |\n"
+            ));
         }
     }
 
@@ -657,15 +655,19 @@ fn emit_search_markdown() {
     body.push_str("| Metric | Value |\n");
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");
-    let def_warm = markdown::read_tier_mean_ns("superfile_vec", "warm", "infino_default_options_top10");
-    let def_cold = markdown::read_tier_mean_ns("superfile_vec", "cold", "infino_default_options_top10");
+    let def_warm =
+        markdown::read_tier_mean_ns("superfile_vec", "warm", "infino_default_options_top10");
+    let def_cold =
+        markdown::read_tier_mean_ns("superfile_vec", "cold", "infino_default_options_top10");
     let def_s = def.map(fmt_time).unwrap_or_else(|| "—".into());
     let def_rss = rss::read_peak_rss_bytes(group, "infino_default_options_top10")
         .map(rss::fmt_bytes)
         .unwrap_or_else(|| "—".into());
     let def_median = rss::fmt_median_rss(group, "infino_default_options_top10");
     let def_p90 = rss::fmt_p90_rss(group, "infino_default_options_top10");
-    body.push_str(&format!("| infino_default_options_top10 (hot) | {def_s} |\n"));
+    body.push_str(&format!(
+        "| infino_default_options_top10 (hot) | {def_s} |\n"
+    ));
     body.push_str(&format!(
         "| infino_default_options_top10 (warm) | {} |\n",
         def_warm.map(fmt_time).unwrap_or_else(|| "—".into())
@@ -711,10 +713,9 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     let q = &queries_calibration()[0];
     let opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
     let t0 = Instant::now();
-    let _ = corpus::block_on_inmem(async {
-        reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await
-    })
-    .expect("vector_search");
+    let _ =
+        corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
+            .expect("vector_search");
     let first_q_elapsed = t0.elapsed();
 
     eprintln!(
