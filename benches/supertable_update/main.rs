@@ -54,7 +54,8 @@ fn build_supertable_with_ingest(n: usize) -> (TempDir, Supertable) {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
     let titles_owned: Vec<String> = (0..n).map(|i| format!("row{i:08}")).collect();
     let titles: Vec<&str> = titles_owned.iter().map(|s| s.as_str()).collect();
     let mut w = st.writer().expect("writer");

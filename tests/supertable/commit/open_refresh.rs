@@ -31,7 +31,8 @@ async fn open_sees_writes_made_by_a_different_handle() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let producer =
-        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("create");
     let mut w = producer.writer().expect("writer");
     w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
         .expect("append");
@@ -90,7 +91,8 @@ async fn refresh_picks_up_new_commits() {
 
     // Producer commits v1.
     let producer =
-        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("create");
     let mut w = producer.writer().expect("w1");
     w.append(&build_title_batch(&["initial"])).expect("append1");
     w.commit().expect("commit1");
@@ -138,7 +140,8 @@ async fn refresh_no_op_when_pointer_unchanged() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let producer =
-        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("create");
     let mut w = producer.writer().expect("w");
     w.append(&build_title_batch(&["only"])).expect("append");
     w.commit().expect("commit");
@@ -163,7 +166,8 @@ async fn refresh_no_op_returns_false_when_no_pointer_yet() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(storage));
+    let st =
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
     let advanced = st.refresh().await.expect("refresh");
     assert!(!advanced);
     assert_eq!(st.manifest_id(), 0);
@@ -182,7 +186,8 @@ async fn open_rejects_mismatched_options_via_options_hash() {
     // Producer: standard schema.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha"])).expect("append");
         w.commit().expect("commit");
@@ -233,7 +238,8 @@ async fn open_with_matching_options_succeeds_under_options_hash_validation() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha"])).expect("append");
         w.commit().expect("commit");

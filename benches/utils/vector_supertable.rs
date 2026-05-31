@@ -143,7 +143,7 @@ fn build_supertable() -> Supertable {
     .expect("opts")
     .with_writer_pool(pool);
 
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");
 
     let chunk_size = N_DOCS / N_SEGMENTS;

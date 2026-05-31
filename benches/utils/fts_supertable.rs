@@ -109,7 +109,7 @@ fn build_supertable_infino(
     corpus: &corpus::MmapTextCorpus,
     reader_pool: Arc<ThreadPool>,
 ) -> Supertable {
-    let st = Supertable::create(supertable_options(reader_pool));
+    let st = Supertable::create(supertable_options(reader_pool)).expect("create");
     let mut w = st.writer().expect("writer");
     let chunk_size = corpus.n_docs().div_ceil(APPEND_CHUNKS);
     for start in (0..corpus.n_docs()).step_by(chunk_size) {

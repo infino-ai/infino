@@ -62,7 +62,8 @@ async fn fts_query_excludes_tombstoned_row() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     // Three rows; all contain "alpha" so the BM25 search hits
     // every one of them. The middle row carries "bravo" too —
@@ -116,7 +117,8 @@ async fn sql_query_excludes_tombstoned_row() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["aa", "bb", "cc", "dd"]))
@@ -257,7 +259,7 @@ async fn vector_query_excludes_tombstoned_row() {
     .with_reader_pool(pool)
     .with_storage(Arc::clone(&storage));
 
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
 
     // 16 unit-norm rows; rotating which lane is "hot" so the IVF
     // training has enough samples (n_cent=4 by default). The query

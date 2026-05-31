@@ -69,7 +69,8 @@ async fn seed_partial_state(
 ) -> WalId {
     {
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = st.writer().expect("writer");
         let titles_owned: Vec<String> = (0..n).map(|i| format!("row{i:08}")).collect();
         let titles: Vec<&str> = titles_owned.iter().map(|s| s.as_str()).collect();

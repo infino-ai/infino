@@ -422,14 +422,14 @@ mod tests {
 
     #[test]
     fn query_sql_count_star_returns_zero_on_empty_supertable() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let n = run_count(&st, "SELECT COUNT(*) FROM supertable");
         assert_eq!(n, 0);
     }
 
     #[test]
     fn query_sql_count_star_returns_total_doc_count() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(
             0,
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn query_sql_filter_predicate_applied_above_mem_table() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(
             0,
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn query_sql_group_by_returns_correct_per_category_counts() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(
             0,
@@ -523,7 +523,7 @@ mod tests {
     fn query_sql_scans_across_multiple_segments() {
         // Three commits → three superfiles. SQL must aggregate across
         // all of them.
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["rust", "rust"], &["a", "b"]))
             .expect("a1");
@@ -555,7 +555,7 @@ mod tests {
         // are auto-injected by the supertable (timestamp +
         // worker + counter), so we don't assert specific
         // values — only strict-increasing order.
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(100, &["a", "b"], &["t1", "t2"]))
             .expect("a1");
@@ -589,7 +589,7 @@ mod tests {
         // The supertable is a thin SQL skin over scalar columns —
         // `inf.*` KV metadata stays invisible. The injected `_id`
         // column is part of the visible schema.
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["x"], &["t"])).expect("a");
         w.commit().expect("c");
@@ -612,7 +612,7 @@ mod tests {
         // cache regressed, tests would still pass but would leak
         // a Runtime per call. The functional check below is
         // adequate for correctness; benchmarks would catch leak).
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["x"], &["t"])).expect("a");
         w.commit().expect("c");
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn query_sql_invalid_sql_returns_plan_error() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let err = st
             .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn query_sql_hides_vector_columns_from_sql_surface() {
-        let st = Supertable::create(options_with_vector(16));
+        let st = Supertable::create(options_with_vector(16)).expect("create");
         let mut w = st.writer().expect("writer");
         // n=8 ≥ n_cent=4 so kmeans has data to cluster.
         w.append(&build_vector_batch(0, 8, 16)).expect("append");
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn query_sql_referencing_vector_column_returns_plan_error() {
-        let st = Supertable::create(options_with_vector(16));
+        let st = Supertable::create(options_with_vector(16)).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_vector_batch(0, 8, 16)).expect("append");
         w.commit().expect("commit");

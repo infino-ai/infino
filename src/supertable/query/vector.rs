@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn vector_search_empty_supertable_returns_empty() {
-        let st = Supertable::create(options_one_segment_per_commit(16));
+        let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn vector_search_k_zero_short_circuits() {
-        let st = Supertable::create(options_one_segment_per_commit(16));
+        let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, 16, schema)).expect("a");
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn vector_search_returns_ascending_distance_order() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn vector_search_top_k_caps_at_k() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         // Three commits → three superfiles × 8 docs = 24 docs.
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn vector_search_carries_segment_uris_for_multi_segment_results() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         for chunk in 0..3u64 {
@@ -458,7 +458,7 @@ mod tests {
         // the same set as a single-superfile search, modulo each
         // IVF's nprobe-driven recall (we use a high-recall config).
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         // 24 docs across 3 superfiles.
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn vector_search_unknown_column_errors() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");

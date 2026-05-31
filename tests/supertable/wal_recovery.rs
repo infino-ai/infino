@@ -71,7 +71,8 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     //    it. The pointer + superfile bytes are durable now.
     {
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["alpha", "beta", "gamma"]))
             .expect("append");
@@ -142,7 +143,7 @@ async fn operator_hatch_sweep_yields_same_report() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let opts = default_supertable_options().with_storage(Arc::clone(&storage));
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
     // Fresh handle on empty storage: zero work.
     let report = st.run_recovery_sweep_once().await.expect("sweep");
     assert_eq!(report.n_scanned, 0);
@@ -151,12 +152,65 @@ async fn operator_hatch_sweep_yields_same_report() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_memory_supertable_hatch_errors_cleanly() {
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let err = st.run_recovery_sweep_once().await.expect_err("must error");
     assert!(matches!(
         err,
         infino::supertable::wal::recovery::RecoveryError::NoStorageAttached
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_with_existing_pointer_delegates_to_open() {
+    // The point of `Supertable::create`'s create-or-open
+    // shape: when storage already carries a committed pointer,
+    // `create` MUST behave like `open` rather than silently
+    // shadowing existing data with an empty manifest.
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+    // Phase 1: write some rows + drop the supertable so the
+    // pointer file is durable on storage.
+    {
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["one", "two", "three"]))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        drop(st);
+    }
+
+    // Phase 2: call `create` again against the same storage.
+    // The pointer file is present, so `create` should
+    // delegate to `open`'s load path and surface the committed
+    // manifest — three rows visible.
+    let cache_dir = TempDir::new().expect("cache");
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create with existing pointer");
+    let manifest = st.reader().manifest().clone();
+    assert!(
+        !manifest.superfile_list.superfiles.is_empty(),
+        "create against existing pointer must load the committed manifest"
+    );
+    let batches = st
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("sql");
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("count column")
+        .value(0);
+    assert_eq!(total, 3, "create-or-open must surface 3 committed rows");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -175,7 +229,8 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     // target to resolve.
     {
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["foo", "bar"]))
             .expect("append");

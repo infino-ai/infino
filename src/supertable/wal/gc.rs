@@ -275,7 +275,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let report = run_sweep(&st, Utc::now(), DEFAULT_WAL_GRACE, DEFAULT_SIDECAR_GRACE)
             .await
             .expect("sweep");
@@ -288,7 +289,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let ws = WalStore::new(Arc::clone(&storage));
 
         // Seed a Complete WAL with created_at = 10 minutes ago.
@@ -316,7 +318,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let ws = WalStore::new(Arc::clone(&storage));
 
         let now = Utc::now();
@@ -340,7 +343,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let ws = WalStore::new(Arc::clone(&storage));
 
         // Even an OLD intent WAL is preserved — the recovery
@@ -361,7 +365,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn in_memory_supertable_sweep_errors_cleanly() {
-        let st = Supertable::create(default_supertable_options());
+        let st = Supertable::create(default_supertable_options()).expect("create");
         let err = run_sweep(&st, Utc::now(), DEFAULT_WAL_GRACE, DEFAULT_SIDECAR_GRACE)
             .await
             .expect_err("must error");

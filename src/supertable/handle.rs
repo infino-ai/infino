@@ -1,6 +1,6 @@
 //! `Supertable` + `SupertableReader` — the in-memory handle.
 //!
-//! `Supertable::create(opts)` returns a clone-shared handle holding
+//! `Supertable::create(opts).expect("create")` returns a clone-shared handle holding
 //! an empty initial manifest behind `ArcSwap<Manifest>`.
 //! `Supertable::reader()` does `ArcSwap::load_full` once and pins
 //! the resulting `Arc<Manifest>` for the reader's lifetime, so a
@@ -110,14 +110,57 @@ impl SupertableInner {
 }
 
 impl Supertable {
-    /// Create a new in-memory supertable from validated options.
-    /// The initial manifest is empty (`manifest_id = 0`,
-    /// `superfiles = []`).
+    /// Create-or-open from validated options.
     ///
-    /// The `SupertableOptions` is consumed and Arc-wrapped
-    /// internally — clone the options ahead of the call if the
-    /// caller wants to keep their own reference.
-    pub fn create(options: SupertableOptions) -> Self {
+    /// Behaviour:
+    ///
+    /// - **No storage attached** → fresh in-memory handle, no
+    ///   I/O. Empty manifest; recovery is a no-op.
+    /// - **Storage attached, no pointer file** → fresh
+    ///   storage-backed handle. Empty manifest; recovery sweep
+    ///   runs in case prior peer processes left stray WALs.
+    /// - **Storage attached, pointer file present** →
+    ///   transparently delegates to [`Supertable::open`]. Loads
+    ///   the existing manifest list + parts and runs the
+    ///   recovery sweep. This closes the "create silently
+    ///   shadows existing committed state" footgun.
+    ///
+    /// Sync API. Internally bridges to async I/O for the
+    /// pointer probe + the open delegation via the same
+    /// `Handle::try_current() + block_in_place` pattern the
+    /// rest of the supertable's sync paths use. Works from
+    /// sync `#[test]` contexts and from multi-thread
+    /// `#[tokio::test]` contexts; calling from a
+    /// `current_thread` runtime panics (use the async
+    /// [`Supertable::open`] directly in that case).
+    pub fn create(options: SupertableOptions) -> Result<Self, OpenError> {
+        // Pointer-probe pass. When storage is attached AND a
+        // pointer file already exists, we want open's load path
+        // — never silently shadow committed state with an empty
+        // manifest.
+        if let Some(storage) = options.storage.as_ref() {
+            let probe = Arc::clone(storage);
+            let probe_result = bridge_sync_to_async(async move {
+                crate::supertable::manifest::commit::read_pointer(&*probe).await
+            });
+            match probe_result {
+                Ok(Some(_pointer)) => {
+                    return bridge_sync_to_async(Self::open(options));
+                }
+                Ok(None) => {
+                    // No pointer → fall through to fresh-create.
+                }
+                Err(e) => {
+                    return Err(OpenError::Storage(
+                        crate::storage::StorageError::Permanent {
+                            uri: "_supertable/current".into(),
+                            source: Box::new(std::io::Error::other(format!("{e}"))),
+                        },
+                    ));
+                }
+            }
+        }
+
         let options = Arc::new(options);
         let initial = Manifest::empty(options.clone());
         let tombstone_cache = build_tombstone_cache(&options);
@@ -134,12 +177,13 @@ impl Supertable {
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
-        // Open-time recovery sweep — no-op when no storage is
-        // attached. Best-effort: a sweep failure here doesn't
-        // fail handle construction; the next sweep gets another
-        // shot.
+        // Open-time recovery + gc sweeps — no-op when no
+        // storage is attached. Best-effort: a sweep failure
+        // here doesn't fail handle construction; the next
+        // sweep gets another shot.
         let _ = st.run_recovery_sweep_once_blocking();
-        st
+        let _ = bridge_sync_to_async(async { st.run_gc_sweep_once().await.map_err(|_| ()) });
+        Ok(st)
     }
 
     /// Open an existing persisted supertable.
@@ -635,6 +679,33 @@ impl Supertable {
 /// Returns `None` for in-memory-only supertables — no sidecars
 /// can exist there, so the query paths skip the filter hook
 /// entirely.
+/// Sync→async bridge for `Supertable::create`'s pointer probe +
+/// delegated `open` call. Mirrors the pattern the writer's
+/// `persist_commit` uses: ride the ambient tokio runtime when
+/// present (via `block_in_place + block_on`), otherwise build a
+/// tiny `current_thread` runtime for the duration of the call.
+///
+/// Panics if called from inside a `current_thread` runtime
+/// (`block_in_place` requires `multi_thread`).
+fn bridge_sync_to_async<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect(
+                    "invariant: tokio Runtime build only fails on \
+                     catastrophic OS resource exhaustion",
+                );
+            rt.block_on(fut)
+        }
+    }
+}
+
 fn build_tombstone_cache(
     options: &Arc<SupertableOptions>,
 ) -> Option<Arc<crate::supertable::tombstones::SidecarCache>> {
@@ -794,7 +865,7 @@ mod tests {
 
     #[test]
     fn create_returns_handle_with_empty_initial_manifest() {
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         assert_eq!(st.manifest_id(), 0);
         let r = st.reader();
         assert_eq!(r.manifest_id(), 0);
@@ -804,7 +875,7 @@ mod tests {
 
     #[test]
     fn supertable_clone_shares_inner_state() {
-        let st1 = Supertable::create(opts());
+        let st1 = Supertable::create(opts()).expect("create");
         let st2 = st1.clone();
         // Same Arc<SupertableInner> behind both clones — verify
         // by mutating through one and observing through the other.
@@ -814,7 +885,7 @@ mod tests {
 
     #[test]
     fn options_accessor_returns_arc_to_validated_options() {
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         let opts_arc = st.options();
         assert_eq!(opts_arc.id_column, "_id");
         assert_eq!(opts_arc.fts_columns.len(), 1);
@@ -826,7 +897,7 @@ mod tests {
         // captured before a commit must keep seeing the pre-commit
         // manifest, even after the writer has ArcSwap::store'd a
         // new one.
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
 
         // Pin reader at manifest_id = 0.
         let pinned = st.reader();
@@ -854,7 +925,7 @@ mod tests {
         // independent of its predecessors. After several commits,
         // each prior reader's pinned manifest reports its
         // construction-time state, not the latest.
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
 
         let r0 = st.reader();
         publish_appended(&st, vec![entry(1)]);
@@ -891,7 +962,7 @@ mod tests {
         // is the "snapshot pinned past the supertable's lifetime"
         // guarantee — the underlying superfiles stay reachable.
         let r = {
-            let st = Supertable::create(opts());
+            let st = Supertable::create(opts()).expect("create");
             publish_appended(&st, vec![entry(5)]);
             st.reader()
             // st dropped here; reader survives.
@@ -906,7 +977,7 @@ mod tests {
         // Two readers issued at the same point should pin the SAME
         // Arc<Manifest>. The Arc-share is what makes "thousands of
         // concurrent readers" cheap: one allocation, N+1 ref count.
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         publish_appended(&st, vec![entry(7)]);
         let r1 = st.reader();
         let r2 = st.reader();
@@ -915,7 +986,7 @@ mod tests {
 
     #[test]
     fn debug_format_doesnt_explode() {
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         let s = format!("{:?}", st);
         assert!(s.contains("Supertable"));
 

@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn bm25_search_k_zero_short_circuits() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn bm25_search_returns_descending_score_order() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(
             0,
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn bm25_search_carries_segment_uri_for_each_hit() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust rust async"])).expect("a1");
         w.commit().expect("c1");
@@ -664,7 +664,7 @@ mod tests {
             "wrapping up the corpus today",     // 11
         ];
 
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for chunk_start in (0..titles.len()).step_by(4) {
             let end = (chunk_start + 4).min(titles.len());
@@ -719,7 +719,7 @@ mod tests {
             "rusty pipe rebuild",
             "go concurrency model",
         ];
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for chunk_start in (0..titles.len()).step_by(2) {
             let end = (chunk_start + 2).min(titles.len());
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn bm25_search_prefix_unmatched_prefix_returns_empty() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
@@ -776,7 +776,7 @@ mod tests {
         // Index stores tokenized terms (lowercased); user provides
         // mixed-case prefix; we lowercase before expansion so the
         // FST walk finds the matching subtree.
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["Rust async runtime"]))
             .expect("append");
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn bm25_search_unknown_column_errors() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust"])).expect("append");
         w.commit().expect("commit");
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn bm25_search_results_global_top_k_caps_at_k() {
         // 4 superfiles × 1 doc each = 4 hits; ask for k=2; expect 2.
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for i in 0..4 {
             w.append(&build_batch(i * 10, &["rust async runtime"]))

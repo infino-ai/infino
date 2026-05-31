@@ -50,7 +50,8 @@ async fn writer_delete_tombstones_matching_rows() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
-    );
+    )
+    .expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&[
@@ -116,7 +117,8 @@ async fn writer_delete_on_predicate_with_no_matches_returns_zero_outcome() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
-    );
+    )
+    .expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["x", "y"])).expect("append");
@@ -141,7 +143,7 @@ async fn writer_delete_on_predicate_with_no_matches_returns_zero_outcome() {
 async fn writer_delete_requires_storage() {
     // In-memory-only supertable can't be mutated through the WAL
     // pipeline.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let mut w = st.writer().expect("writer");
     let err = w
         .delete(col("title").eq(lit("foo")))
@@ -163,7 +165,8 @@ async fn writer_update_replaces_matching_rows() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
-    );
+    )
+    .expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
@@ -215,7 +218,8 @@ async fn writer_update_cardinality_mismatch_is_rejected() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
-    );
+    )
+    .expect("create");
 
     let mut w = st.writer().expect("writer");
     // Insert 3 rows.

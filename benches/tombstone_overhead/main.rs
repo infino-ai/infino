@@ -97,7 +97,8 @@ fn build_supertable(state: WorkloadState) -> (TempDir, Supertable) {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     // Append + commit. The corpus is synthetic: each row carries
     // the search-term plus a unique disambiguator so FTS hits

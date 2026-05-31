@@ -1996,7 +1996,7 @@ mod tests {
 
     #[test]
     fn writer_slot_is_exclusive() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let _w = st.writer().expect("first writer");
         let err = st.writer().expect_err("second writer should fail");
         assert!(matches!(err, BuildError::SupertableInUse));
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn writer_slot_releases_on_drop() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         {
             let _w = st.writer().expect("first writer");
             // dropped at scope end
@@ -2017,7 +2017,7 @@ mod tests {
 
     #[test]
     fn append_then_commit_publishes_one_segment() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 4)).expect("append");
         w.commit().expect("commit");
@@ -2030,7 +2030,7 @@ mod tests {
 
     #[test]
     fn commit_with_empty_buffer_is_noop() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.commit().expect("commit-empty");
         assert_eq!(st.manifest_id(), 0, "no manifest swap on empty commit");
@@ -2043,7 +2043,7 @@ mod tests {
         // can fetch a SuperfileReader and run bm25_search on it.
         use crate::superfile::fts::reader::BoolMode;
 
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 4)).expect("append");
         w.commit().expect("commit");
@@ -2063,7 +2063,7 @@ mod tests {
 
     #[test]
     fn segment_entry_records_id_range_and_n_docs() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(100, 3)).expect("a");
         w.append(&build_simple_batch(50, 2)).expect("b");
@@ -2084,7 +2084,7 @@ mod tests {
 
     #[test]
     fn segment_entry_carries_fts_summary() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 4)).expect("append");
         w.commit().expect("commit");
@@ -2165,7 +2165,7 @@ mod tests {
     #[test]
     fn segment_entry_carries_vector_summary() {
         let dim = 16;
-        let st = Supertable::create(options_with_vector(dim));
+        let st = Supertable::create(options_with_vector(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         // Need at least n_cent docs so kmeans has data to cluster.
         w.append(&build_vector_batch(0, 8, dim)).expect("append");
@@ -2190,7 +2190,7 @@ mod tests {
         // shard).
         for n_threads in [1usize, 2, 4] {
             let opts = options_id_title().with_writer_pool(writer_pool_with(n_threads));
-            let st = Supertable::create(opts);
+            let st = Supertable::create(opts).expect("create");
             let mut w = st.writer().expect("writer");
             // Push enough batches to fill every shard.
             for i in 0..n_threads * 2 {
@@ -2215,7 +2215,7 @@ mod tests {
         // get one batch each, the other two get nothing.
         // Should produce 2 superfiles, not 4.
         let opts = options_id_title().with_writer_pool(writer_pool_with(4));
-        let st = Supertable::create(opts);
+        let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 1)).expect("a");
         w.append(&build_simple_batch(1, 1)).expect("b");
@@ -2244,7 +2244,7 @@ supertable:
         // and verify the writer pool actually sized to the config's
         // 4 threads (one segment per shard).
         let opts = options_id_title().apply_config(&cfg).expect("apply_config");
-        let st = Supertable::create(opts);
+        let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         for i in 0..8u64 {
             w.append(&build_simple_batch(i * 10, 3)).expect("append");
@@ -2266,7 +2266,7 @@ supertable:
     fn append_auto_flushes_when_buffer_crosses_threshold() {
         // 1 MiB threshold; one append > 1 MiB should auto-commit.
         let opts = options_id_title_serial().with_commit_threshold_size_mb(1);
-        let st = Supertable::create(opts);
+        let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
 
         // Build a large batch: 50K docs × ~50-byte titles ≈ 2.5 MiB.
@@ -2285,7 +2285,7 @@ supertable:
     #[test]
     fn append_does_not_auto_flush_when_threshold_zero() {
         let opts = options_id_title_serial().with_commit_threshold_size_mb(0);
-        let st = Supertable::create(opts);
+        let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 50_000)).expect("append");
         assert_eq!(st.manifest_id(), 0, "no auto-flush at threshold=0");
@@ -2296,7 +2296,7 @@ supertable:
 
     #[test]
     fn each_commit_appends_to_existing_segments() {
-        let st = Supertable::create(options_id_title_serial());
+        let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 2)).expect("a1");
         w.commit().expect("c1");

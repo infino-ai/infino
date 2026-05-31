@@ -148,7 +148,7 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
     .expect("opts")
     .with_writer_pool(pool);
 
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");
     let chunk_size = corpus.len().div_ceil(n_superfiles);
     for chunk in corpus.chunks(chunk_size) {

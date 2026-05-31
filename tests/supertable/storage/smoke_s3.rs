@@ -184,7 +184,8 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .expect("s3 provider for producer"),
         );
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");

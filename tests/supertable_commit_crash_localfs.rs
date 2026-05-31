@@ -191,7 +191,8 @@ fn run_crash_child(dir: PathBuf, kill_point: &str) -> ! {
     let wrapped = Arc::new(CrashStorage::new(local, prefix, nth, kill_point));
     let storage: Arc<dyn StorageProvider> = wrapped;
 
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     for c in 1..=n_commits {
         let mut w = st.writer().expect("writer");

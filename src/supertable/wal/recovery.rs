@@ -2,7 +2,7 @@
 //!
 //! There is **no background scan**. Recovery runs only when a
 //! caller invokes it: at `Supertable::open(...)` time, at
-//! `Supertable::create(...)` time when storage is attached, or
+//! `Supertable::create(...).expect("create")` time when storage is attached, or
 //! via the explicit operator hatch.
 //!
 //! ## What a sweep does
@@ -342,7 +342,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let report = scan_and_recover(&st, WalId(0xCAFE), Duration::from_secs(30))
             .await
             .expect("sweep");
@@ -358,7 +359,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let ws = WalStore::new(Arc::clone(&storage));
         let wal_doc = WalStateDoc {
             wal_id: WalId(1234),
@@ -402,7 +404,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let ws = WalStore::new(Arc::clone(&storage));
         let mut wal_doc = WalStateDoc {
             wal_id: WalId(5678),
@@ -446,7 +449,8 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let ws = WalStore::new(Arc::clone(&storage));
         let now = Utc::now();
         let wal_doc = WalStateDoc {
@@ -484,7 +488,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sweep_against_in_memory_supertable_errors_cleanly() {
-        let st = Supertable::create(default_supertable_options());
+        let st = Supertable::create(default_supertable_options()).expect("create");
         let err = scan_and_recover(&st, WalId(0xC0DE), Duration::from_secs(30))
             .await
             .expect_err("must error");
