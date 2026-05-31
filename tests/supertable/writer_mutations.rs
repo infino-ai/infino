@@ -62,10 +62,15 @@ async fn writer_delete_tombstones_matching_rows() {
     .expect("append");
     w.commit().expect("commit");
 
-    // Delete every row whose `title = 'bravo'`. Should tombstone
-    // exactly 1 row.
+    // Buffer a delete + commit it. PendingDelete carries the
+    // call-time match count; the commit's outcome reflects how
+    // many tombstones actually landed.
     let predicate: Expr = col("title").eq(lit("bravo"));
-    let outcome = w.delete(predicate).expect("delete");
+    let pending = w.delete(predicate).expect("delete");
+    assert_eq!(pending.matched, 1);
+    let result = w.commit().expect("commit delete");
+    assert_eq!(result.outcomes.len(), 1);
+    let outcome = &result.outcomes[0];
     assert_eq!(outcome.matched, 1);
     assert_eq!(outcome.n_tombstoned, 1);
     assert_eq!(outcome.n_not_found, 0);
@@ -117,9 +122,16 @@ async fn writer_delete_on_predicate_with_no_matches_returns_zero_outcome() {
     w.append(&build_title_batch(&["x", "y"])).expect("append");
     w.commit().expect("commit");
 
-    let outcome = w
+    let pending = w
         .delete(col("title").eq(lit("not-present")))
         .expect("delete");
+    assert_eq!(pending.matched, 0);
+    // Even a zero-match delete buffers + commits a WAL — the
+    // tombstone phase has nothing to do but the WAL still
+    // transitions to Complete cleanly.
+    let result = w.commit().expect("commit zero-match");
+    assert_eq!(result.outcomes.len(), 1);
+    let outcome = &result.outcomes[0];
     assert_eq!(outcome.matched, 0);
     assert_eq!(outcome.n_tombstoned, 0);
     assert_eq!(outcome.n_not_found, 0);
@@ -159,9 +171,14 @@ async fn writer_update_replaces_matching_rows() {
     w.commit().expect("commit");
 
     let new_rows = build_title_batch(&["bravo-prime"]);
-    let outcome = w
+    let pending = w
         .update(col("title").eq(lit("bravo")), new_rows)
         .expect("update");
+    assert_eq!(pending.matched, 1);
+    // Drive the buffered update through the WAL pipeline.
+    let result = w.commit().expect("commit update");
+    assert_eq!(result.outcomes.len(), 1);
+    let outcome = &result.outcomes[0];
     assert_eq!(outcome.matched, 1);
     assert_eq!(outcome.n_tombstoned, 1);
     assert_eq!(outcome.n_not_found, 0);

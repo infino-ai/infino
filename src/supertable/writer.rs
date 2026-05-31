@@ -78,6 +78,37 @@ pub struct SupertableWriter {
     /// Estimated byte cost of `buffer` so append() can auto-flush
     /// when the buffer crosses the configured threshold.
     buffer_bytes: usize,
+    /// Pending update entries, in buffer order. Each is
+    /// fully-resolved at `update()` call time (predicate
+    /// captured, `_id` range minted, IPC sidecar bytes encoded);
+    /// `commit()` drives them through the WAL pipeline in order.
+    pending_updates: Vec<PendingUpdateEntry>,
+    /// Pending delete entries, in buffer order. Each carries
+    /// the call-time resolved `target_ids` + a pre-minted
+    /// `wal_id`; `commit()` builds the WAL state doc and drives
+    /// the tombstone phase.
+    pending_deletes: Vec<PendingDeleteEntry>,
+}
+
+/// One buffered update. Resources here are all reserved at the
+/// `update()` call so the writer can drop the `RecordBatch`
+/// after IPC-encoding it (the `ipc_bytes` are what the WAL
+/// sidecar carries).
+struct PendingUpdateEntry {
+    wal_id: crate::supertable::wal::state_doc::WalId,
+    target_ids: Vec<i128>,
+    preallocated_superfile_id: uuid::Uuid,
+    minted_id_spans: Vec<crate::supertable::wal::state_doc::IdSpan>,
+    new_row_count: u32,
+    new_row_content_hash: String,
+    ipc_bytes: Bytes,
+}
+
+/// One buffered delete. Just the call-time resolved target_ids
+/// + a pre-minted `wal_id`.
+struct PendingDeleteEntry {
+    wal_id: crate::supertable::wal::state_doc::WalId,
+    target_ids: Vec<i128>,
 }
 
 impl std::fmt::Debug for SupertableWriter {
@@ -186,6 +217,8 @@ impl Supertable {
                 inner: Arc::clone(self.inner()),
                 buffer: Vec::new(),
                 buffer_bytes: 0,
+                pending_updates: Vec::new(),
+                pending_deletes: Vec::new(),
             }),
             Err(_) => Err(BuildError::SupertableInUse),
         }
@@ -296,7 +329,7 @@ impl SupertableWriter {
             .saturating_mul(1024)
             .saturating_mul(1024);
         if threshold > 0 && self.buffer_bytes >= threshold {
-            self.commit()?;
+            self.commit_appends_internal()?;
         }
 
         Ok(())
@@ -313,63 +346,50 @@ impl SupertableWriter {
     /// rows each, the same as 8 separate `append` calls of 1.25M
     /// rows each. This decouples ingest parallelism from the
     /// caller's batching pattern.
-    /// Delete every row whose `_id` matches `predicate`.
+    /// Buffer a delete operation. Every row whose `_id`
+    /// matches `predicate` at call time will be tombstoned by
+    /// the next [`commit`] call.
     ///
-    /// Runs the full WAL pipeline synchronously:
+    /// `predicate` is evaluated **immediately** against the
+    /// current manifest snapshot (the same ArcSwap-backed view
+    /// queries use). The resolved `_id` set is captured on the
+    /// writer's pending-deletes buffer; rows that newly match
+    /// `predicate` between this call and `commit()` (because of
+    /// an interleaving append on this or another writer) are
+    /// NOT tombstoned — only the captured `_id` list is.
     ///
-    /// 1. Resolve `predicate` to a `Vec<i128>` of target `_id`s
-    ///    against the current manifest snapshot (step 0a).
-    /// 2. Reject if the match count exceeds
-    ///    [`MAX_TARGETS_PER_MUTATION`].
-    /// 3. Flush any buffered appends first so the resolve sees
-    ///    a complete view of the supertable's rows.
-    /// 4. Create an Intent DELETE WAL state doc + drive the
-    ///    tombstone phase to Complete.
-    /// 5. Return the per-call [`OperationOutcome`].
+    /// **Does NOT make the change durable.** Buffered deletes
+    /// are lost on writer drop until the next successful
+    /// `commit()`. Symmetric with buffered `append()`s.
     ///
-    /// The buffer + commit shape from the plan is a follow-up;
-    /// this path runs each delete immediately. Concurrent
-    /// commits across handles are still safe because each
-    /// goes through the etag-CAS layer in `wal::pipeline`.
+    /// [`commit`]: SupertableWriter::commit
     pub fn delete(
         &mut self,
         predicate: datafusion::prelude::Expr,
     ) -> Result<
-        crate::supertable::mutations::OperationOutcome,
+        crate::supertable::mutations::PendingDelete,
         crate::supertable::mutations::MutationError,
     > {
         use crate::supertable::mutations::{
-            MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+            MAX_TARGETS_PER_MUTATION, MutationError, PendingDelete,
         };
-        use crate::supertable::wal::WalStore;
-        use crate::supertable::wal::state_doc::{
-            OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
-        };
-        use chrono::Utc;
+        use crate::supertable::wal::state_doc::WalId;
 
         // Pre-flight: storage must be attached for the WAL
-        // pipeline.
-        let storage = self
+        // pipeline to drive this op at commit time.
+        let _ = self
             .inner
             .options
             .storage
             .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
+            .ok_or(MutationError::NoStorageAttached)?;
 
-        // Flush buffered appends so the predicate sees a
-        // complete picture of this writer's outstanding work.
-        if !self.buffer.is_empty() {
-            self.commit().map_err(|e| {
-                MutationError::Storage(crate::storage::StorageError::Permanent {
-                    uri: "writer.commit() for delete pre-flush".into(),
-                    source: Box::new(std::io::Error::other(e.to_string())),
-                })
-            })?;
-        }
-
-        // Resolve the predicate against the manifest. Same
-        // entry point a contemporaneous SQL query would use.
+        // Resolve the predicate against the current manifest
+        // snapshot. NOTE: the writer's pending-appends buffer
+        // is NOT flushed here. Captured-at-call semantics mean
+        // the delete sees the manifest as it stood at this
+        // call's instant; rows the caller appended in the same
+        // writer session are not yet in the manifest.
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
             .scan_ids_matching(predicate)
@@ -382,156 +402,64 @@ impl SupertableWriter {
             });
         }
 
-        // Build + persist the WAL state doc.
-        let wal_id_value = {
-            let idgen = self
-                .inner
-                .id_generator
-                .lock()
-                .expect("id_generator mutex poisoned");
-            idgen.next_id()
-        };
+        // Pre-mint the wal_id so we can surface it at commit
+        // time even on a partial-failure path (the recovery
+        // sweep on a fresh open completes any WAL whose id
+        // already landed in storage).
+        let wal_id_value = self
+            .inner
+            .id_generator
+            .lock()
+            .expect("id_generator mutex poisoned")
+            .next_id();
 
-        let wal_doc = WalStateDoc {
+        self.pending_deletes.push(PendingDeleteEntry {
             wal_id: WalId(wal_id_value),
-            schema_version: SCHEMA_VERSION,
-            op_kind: OpKind::Delete,
-            state: WalState::Intent,
-            created_at: Utc::now(),
-            lease: None,
-            predicate_repr: "writer.delete()".into(),
-            target_ids: target_ids.iter().map(|&v| WalId(v)).collect(),
-            new_row_count: None,
-            new_row_content_hash: None,
-            preallocated_superfile_id: None,
-            minted_id_spans: Vec::new(),
-            appended_pair_range: None,
-            tombstone_progress: target_ids
-                .iter()
-                .map(|&v| TombstoneEntry {
-                    target_id: WalId(v),
-                    outcome: TombstoneOutcome::Pending,
-                    tombstoned_in_superfile: None,
-                })
-                .collect(),
-        };
-
-        let wal_store = WalStore::new(Arc::clone(&storage));
-        let (n_tombstoned, n_not_found) =
-            self.drive_delete_wal(&wal_store, &wal_doc, &supertable)?;
-
-        Ok(OperationOutcome {
-            wal_id: WalId(wal_id_value),
-            matched,
-            n_tombstoned,
-            n_not_found,
-        })
+            target_ids,
+        });
+        Ok(PendingDelete { matched })
     }
 
-    /// Synchronously drive a freshly-created DELETE WAL to
-    /// Complete via the WAL pipeline. Sync-bridged through the
-    /// same `Handle::try_current() + block_in_place` pattern
-    /// the manifest-pointer commit path uses.
-    fn drive_delete_wal(
-        &self,
-        wal_store: &crate::supertable::wal::WalStore,
-        wal_doc: &crate::supertable::wal::state_doc::WalStateDoc,
-        supertable: &Supertable,
-    ) -> Result<(usize, usize), crate::supertable::mutations::MutationError> {
-        use crate::supertable::mutations::MutationError;
-        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
-        let wal_id = wal_doc.wal_id;
-        let wal_doc_clone = wal_doc.clone();
-        let wal_store_clone = wal_store.clone();
-        let supertable_clone = Supertable::from_inner(Arc::clone(supertable.inner()));
-        let drive = async move {
-            let etag = wal_store_clone
-                .create(&wal_doc_clone)
-                .await
-                .map_err(MutationError::WalStore)?;
-            let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
-                &supertable_clone,
-                &wal_store_clone,
-                &wal_doc_clone,
-                &etag,
-            )
-            .await?;
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            // Best-effort cleanup; failure here is logged
-            // implicitly by the M7 sweep eventually picking up
-            // the COMPLETE WAL.
-            let _ = wal_store_clone.delete_state(wal_id).await;
-            Ok::<_, MutationError>((n_t, n_nf))
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.inner.sql_runtime().block_on(drive),
-        }
-    }
-
-    /// 1:1-cardinality replacement: every row whose `_id`
-    /// matches `predicate` is tombstoned, and `new_rows` is
-    /// appended to the supertable as the replacement payload.
+    /// Buffer a 1:1-cardinality update: at the next [`commit`],
+    /// `new_rows` is appended as the replacement payload AND
+    /// every row whose `_id` matched `predicate` at call entry
+    /// is tombstoned.
     ///
-    /// Runs the full WAL pipeline synchronously:
+    /// `predicate` is evaluated **immediately** against the
+    /// current manifest snapshot; the resolved `_id` set + the
+    /// IPC-encoded payload + a pre-reserved `_id` range + a
+    /// preallocated superfile UUID are captured on the writer's
+    /// pending-updates buffer. `commit()` drives each entry
+    /// through its WAL pipeline (append → tombstone).
     ///
-    /// 1. Storage pre-flight.
-    /// 2. `new_rows.schema()` must match the supertable's user
-    ///    schema (no `_id` column).
-    /// 3. Flush buffered appends so the resolve sees a complete
-    ///    view of this writer's outstanding work.
-    /// 4. Resolve `predicate` → target_ids.
-    /// 5. Enforce match cap + cardinality
-    ///    (`matched == new_rows.num_rows()`).
-    /// 6. Reserve a contiguous `_id` range + preallocate a
-    ///    superfile UUID.
-    /// 7. IPC-encode `new_rows`, compute blake3, persist as the
-    ///    WAL's `.arrow` sidecar.
-    /// 8. Create the Intent UPDATE WAL state doc.
-    /// 9. Drive append-phase (Intent → Appended) +
-    ///    tombstone-phase (Appended → Complete).
+    /// **Cardinality:** `new_rows.num_rows()` MUST equal the
+    /// predicate's resolved match count. Mismatch returns
+    /// `CardinalityMismatch` and nothing is buffered.
     ///
-    /// **Order at commit time: append-first, then tombstone.**
-    /// During the transient window between the manifest swap
-    /// landing the new rows and the tombstones taking effect,
-    /// queries see BOTH old and new rows — never zero rows for
-    /// the predicate's logical key. Eventually consistent, never
-    /// *eventually empty*.
+    /// **Does NOT make the change durable.** Symmetric with
+    /// buffered `append()` / `delete()`s.
+    ///
+    /// [`commit`]: SupertableWriter::commit
     pub fn update(
         &mut self,
         predicate: datafusion::prelude::Expr,
         new_rows: arrow_array::RecordBatch,
     ) -> Result<
-        crate::supertable::mutations::OperationOutcome,
+        crate::supertable::mutations::PendingUpdate,
         crate::supertable::mutations::MutationError,
     > {
         use crate::supertable::mutations::{
-            MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+            MAX_TARGETS_PER_MUTATION, MutationError, PendingUpdate,
         };
-        use crate::supertable::wal::WalStore;
-        use crate::supertable::wal::state_doc::{
-            IdSpan, OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
-            WalStateDoc,
-        };
-        use chrono::Utc;
+        use crate::supertable::wal::state_doc::{IdSpan, WalId};
 
         // Pre-flight: storage attached.
-        let storage = self
+        let _ = self
             .inner
             .options
             .storage
             .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
+            .ok_or(MutationError::NoStorageAttached)?;
 
         // Schema check (no _id column on the user-facing path).
         if new_rows.schema().as_ref() != self.inner.options.schema.as_ref() {
@@ -542,18 +470,9 @@ impl SupertableWriter {
             )));
         }
 
-        // Flush buffered appends so the predicate sees a
-        // complete view.
-        if !self.buffer.is_empty() {
-            self.commit().map_err(|e| {
-                MutationError::Storage(crate::storage::StorageError::Permanent {
-                    uri: "writer.commit() for update pre-flush".into(),
-                    source: Box::new(std::io::Error::other(e.to_string())),
-                })
-            })?;
-        }
-
-        // Resolve predicate + cap + cardinality.
+        // Resolve predicate against the manifest snapshot.
+        // Captured-at-call semantics: appends still in this
+        // writer's buffer don't count toward the match set.
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
             .scan_ids_matching(predicate)
@@ -572,26 +491,21 @@ impl SupertableWriter {
                 new_rows: new_row_count,
             });
         }
-        // Cardinality 0 is a no-op shortcut — no WAL, no
-        // superfile.
+
+        // Cardinality 0 is a structurally-impossible update —
+        // the WAL pipeline needs `preallocated_superfile_id`
+        // and at least one minted id span. We mint a wal_id so
+        // the caller's `PendingUpdate` is comparable to the
+        // non-zero shape, but skip buffering. The commit's
+        // `CommitResult.outcomes` will reflect `matched: 0` if
+        // the caller routes through the buffer instead.
         if matched == 0 {
-            let wal_id_value = self
-                .inner
-                .id_generator
-                .lock()
-                .expect("idgen mutex")
-                .next_id();
-            return Ok(OperationOutcome {
-                wal_id: WalId(wal_id_value),
-                matched: 0,
-                n_tombstoned: 0,
-                n_not_found: 0,
-            });
+            return Ok(PendingUpdate { matched: 0 });
         }
 
         // Reserve _id range + preallocate superfile id + mint
-        // wal_id. All under one lock so the relative ordering
-        // is deterministic.
+        // wal_id under one lock so the relative ordering is
+        // deterministic and visible to any recovery replay.
         let (wal_id_value, minted_id_spans, preallocated_superfile_id) = {
             let idgen = self.inner.id_generator.lock().expect("idgen mutex");
             let spans = idgen
@@ -607,7 +521,10 @@ impl SupertableWriter {
             (wal_id_value, spans, preallocated)
         };
 
-        // IPC-encode the new_rows batch + blake3.
+        // IPC-encode the new_rows batch + blake3. Doing this at
+        // call time (rather than commit time) means the caller
+        // can drop the `RecordBatch` immediately — the buffer
+        // owns the bytes from here on.
         let ipc_bytes = encode_record_batch_ipc(&new_rows).map_err(|e| {
             MutationError::Storage(crate::storage::StorageError::Permanent {
                 uri: "ipc encode".into(),
@@ -616,24 +533,173 @@ impl SupertableWriter {
         })?;
         let content_hash = blake3::hash(&ipc_bytes).to_hex().to_string();
 
-        let wal_doc = WalStateDoc {
+        self.pending_updates.push(PendingUpdateEntry {
             wal_id: WalId(wal_id_value),
+            target_ids,
+            preallocated_superfile_id,
+            minted_id_spans,
+            new_row_count: matched as u32,
+            new_row_content_hash: content_hash,
+            ipc_bytes,
+        });
+        Ok(PendingUpdate { matched })
+    }
+
+    /// Flush every buffered operation atomically (from the
+    /// caller's perspective):
+    ///
+    /// 1. Pending appends → built into superfiles, manifest
+    ///    swap committed.
+    /// 2. Pending updates, in buffer order → per-op WAL
+    ///    pipeline (append phase + tombstone phase).
+    /// 3. Pending deletes, in buffer order → per-op WAL
+    ///    pipeline (tombstone phase only).
+    ///
+    /// On success returns a [`CommitResult`] with one
+    /// [`OperationOutcome`] per buffered mutation (in buffer
+    /// order). On a mid-flush mutation failure surfaces
+    /// [`CommitError::PartialCommit`] listing the WALs that DID
+    /// land durably; the remaining buffered ops stay on the
+    /// writer for retry, and the recovery sweep on the next
+    /// supertable open completes the listed WALs if this
+    /// process dies before retrying.
+    ///
+    /// [`CommitResult`]: crate::supertable::mutations::CommitResult
+    /// [`OperationOutcome`]: crate::supertable::mutations::OperationOutcome
+    /// [`CommitError::PartialCommit`]: crate::supertable::mutations::CommitError::PartialCommit
+    pub fn commit(
+        &mut self,
+    ) -> Result<crate::supertable::mutations::CommitResult, crate::supertable::mutations::CommitError>
+    {
+        use crate::supertable::mutations::{CommitError, CommitResult, OperationOutcome};
+
+        // Step 1: flush appends. A failure here is atomic —
+        // the buffer is preserved and no mutation WAL has
+        // landed yet.
+        if !self.buffer.is_empty() {
+            self.commit_appends_internal()
+                .map_err(CommitError::AppendFlush)?;
+        }
+
+        let total_mutations = self.pending_updates.len() + self.pending_deletes.len();
+        let mut committed_wal_ids: Vec<crate::supertable::wal::state_doc::WalId> =
+            Vec::with_capacity(total_mutations);
+        let mut outcomes: Vec<OperationOutcome> = Vec::with_capacity(total_mutations);
+
+        // Step 2: drive pending updates in buffer order. On
+        // mid-loop failure, the failed entry is dropped (its
+        // WAL may already be on storage; recovery sweep
+        // completes it on the next open) and the unattempted
+        // entries stay on `self.pending_updates` for retry.
+        let mut updates_to_run = std::mem::take(&mut self.pending_updates);
+        let mut update_cursor = 0usize;
+        while update_cursor < updates_to_run.len() {
+            let entry = &updates_to_run[update_cursor];
+            match self.drive_one_update(entry) {
+                Ok(outcome) => {
+                    committed_wal_ids.push(outcome.wal_id);
+                    outcomes.push(outcome);
+                    update_cursor += 1;
+                }
+                Err(cause) => {
+                    // Drop the failed entry + put the rest
+                    // back on the buffer.
+                    let remaining: Vec<PendingUpdateEntry> =
+                        updates_to_run.split_off(update_cursor + 1);
+                    self.pending_updates = remaining;
+                    // Don't lose the not-yet-attempted deletes
+                    // either — they stay where they were on
+                    // self.pending_deletes (we hadn't taken
+                    // them yet).
+                    return Err(CommitError::PartialCommit {
+                        committed_wal_ids,
+                        committed: outcomes.len(),
+                        total: total_mutations,
+                        cause: Box::new(cause),
+                    });
+                }
+            }
+        }
+
+        // Step 3: drive pending deletes in buffer order.
+        let mut deletes_to_run = std::mem::take(&mut self.pending_deletes);
+        let mut delete_cursor = 0usize;
+        while delete_cursor < deletes_to_run.len() {
+            let entry = &deletes_to_run[delete_cursor];
+            match self.drive_one_delete(entry) {
+                Ok(outcome) => {
+                    committed_wal_ids.push(outcome.wal_id);
+                    outcomes.push(outcome);
+                    delete_cursor += 1;
+                }
+                Err(cause) => {
+                    let remaining: Vec<PendingDeleteEntry> =
+                        deletes_to_run.split_off(delete_cursor + 1);
+                    self.pending_deletes = remaining;
+                    return Err(CommitError::PartialCommit {
+                        committed_wal_ids,
+                        committed: outcomes.len(),
+                        total: total_mutations,
+                        cause: Box::new(cause),
+                    });
+                }
+            }
+        }
+
+        Ok(CommitResult {
+            wal_ids: committed_wal_ids,
+            outcomes,
+        })
+    }
+
+    /// Drive one pending update entry through its full WAL
+    /// pipeline. Returns the per-op outcome on success.
+    fn drive_one_update(
+        &self,
+        entry: &PendingUpdateEntry,
+    ) -> Result<
+        crate::supertable::mutations::OperationOutcome,
+        crate::supertable::mutations::MutationError,
+    > {
+        use crate::supertable::mutations::{MutationError, OperationOutcome};
+        use crate::supertable::wal::WalStore;
+        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
+        use crate::supertable::wal::state_doc::{
+            OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState, WalStateDoc,
+        };
+        use chrono::Utc;
+
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = WalStateDoc {
+            wal_id: entry.wal_id,
             schema_version: SCHEMA_VERSION,
             op_kind: OpKind::Update,
             state: WalState::Intent,
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "writer.update()".into(),
-            target_ids: target_ids.iter().map(|&v| WalId(v)).collect(),
-            new_row_count: Some(matched as u32),
-            new_row_content_hash: Some(content_hash),
-            preallocated_superfile_id: Some(preallocated_superfile_id),
-            minted_id_spans,
+            target_ids: entry
+                .target_ids
+                .iter()
+                .map(|&v| crate::supertable::wal::state_doc::WalId(v))
+                .collect(),
+            new_row_count: Some(entry.new_row_count),
+            new_row_content_hash: Some(entry.new_row_content_hash.clone()),
+            preallocated_superfile_id: Some(entry.preallocated_superfile_id),
+            minted_id_spans: entry.minted_id_spans.clone(),
             appended_pair_range: None,
-            tombstone_progress: target_ids
+            tombstone_progress: entry
+                .target_ids
                 .iter()
                 .map(|&v| TombstoneEntry {
-                    target_id: WalId(v),
+                    target_id: crate::supertable::wal::state_doc::WalId(v),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 })
@@ -641,61 +707,23 @@ impl SupertableWriter {
         };
 
         let wal_store = WalStore::new(Arc::clone(&storage));
-        let (n_tombstoned, n_not_found) =
-            self.drive_update_wal(&wal_store, &wal_doc, &supertable, ipc_bytes)?;
-
-        Ok(OperationOutcome {
-            wal_id: WalId(wal_id_value),
-            matched,
-            n_tombstoned,
-            n_not_found,
-        })
-    }
-
-    /// Synchronously drive an UPDATE WAL through its full
-    /// pipeline: persist the IPC sidecar, create the state doc,
-    /// run the append phase, run the tombstone phase, best-effort
-    /// delete the WAL artifacts on completion.
-    fn drive_update_wal(
-        &self,
-        wal_store: &crate::supertable::wal::WalStore,
-        wal_doc: &crate::supertable::wal::state_doc::WalStateDoc,
-        supertable: &Supertable,
-        ipc_bytes: Bytes,
-    ) -> Result<(usize, usize), crate::supertable::mutations::MutationError> {
-        use crate::supertable::mutations::MutationError;
-        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
-        let wal_id = wal_doc.wal_id;
-        let wal_doc_clone = wal_doc.clone();
-        let wal_store_clone = wal_store.clone();
-        let supertable_clone = Supertable::from_inner(Arc::clone(supertable.inner()));
+        let supertable = Supertable::from_inner(Arc::clone(&self.inner));
+        let wal_id = entry.wal_id;
+        let ipc_bytes = entry.ipc_bytes.clone();
         let drive = async move {
-            // Step 0b: persist the arrow sidecar BEFORE the
-            // state doc. The state-doc's content_hash pins the
-            // sidecar bytes, so any recovery sweep that reads
-            // the state doc can re-verify the sidecar.
-            wal_store_clone
+            wal_store
                 .put_arrow(wal_id, ipc_bytes)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let etag = wal_store_clone
-                .create(&wal_doc_clone)
+            let etag = wal_store
+                .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-
-            // Step 1: append phase.
-            let (_outcome, doc_after_append, etag_after_append) = pipeline::run_append_phase(
-                &supertable_clone,
-                &wal_store_clone,
-                &wal_doc_clone,
-                &etag,
-            )
-            .await?;
-
-            // Step 2: tombstone phase.
+            let (_outcome, doc_after_append, etag_after_append) =
+                pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
             let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
-                &supertable_clone,
-                &wal_store_clone,
+                &supertable,
+                &wal_store,
                 &doc_after_append,
                 &etag_after_append,
             )
@@ -710,19 +738,117 @@ impl SupertableWriter {
                     n_not_found,
                 } => (n_tombstoned, n_not_found),
             };
-
-            // Best-effort cleanup.
-            let _ = wal_store_clone.delete_arrow(wal_id).await;
-            let _ = wal_store_clone.delete_state(wal_id).await;
+            // Best-effort cleanup of the WAL artifacts.
+            let _ = wal_store.delete_arrow(wal_id).await;
+            let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.inner.sql_runtime().block_on(drive),
-        }
+        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
+            Err(_) => self.inner.sql_runtime().block_on(drive)?,
+        };
+        Ok(OperationOutcome {
+            wal_id: entry.wal_id,
+            matched: entry.target_ids.len(),
+            n_tombstoned,
+            n_not_found,
+        })
     }
 
-    pub fn commit(&mut self) -> Result<(), BuildError> {
+    /// Drive one pending delete entry through its tombstone
+    /// phase. Returns the per-op outcome on success.
+    fn drive_one_delete(
+        &self,
+        entry: &PendingDeleteEntry,
+    ) -> Result<
+        crate::supertable::mutations::OperationOutcome,
+        crate::supertable::mutations::MutationError,
+    > {
+        use crate::supertable::mutations::{MutationError, OperationOutcome};
+        use crate::supertable::wal::WalStore;
+        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
+        use crate::supertable::wal::state_doc::{
+            OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState, WalStateDoc,
+        };
+        use chrono::Utc;
+
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = WalStateDoc {
+            wal_id: entry.wal_id,
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Delete,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "writer.delete()".into(),
+            target_ids: entry
+                .target_ids
+                .iter()
+                .map(|&v| crate::supertable::wal::state_doc::WalId(v))
+                .collect(),
+            new_row_count: None,
+            new_row_content_hash: None,
+            preallocated_superfile_id: None,
+            minted_id_spans: Vec::new(),
+            appended_pair_range: None,
+            tombstone_progress: entry
+                .target_ids
+                .iter()
+                .map(|&v| TombstoneEntry {
+                    target_id: crate::supertable::wal::state_doc::WalId(v),
+                    outcome: TombstoneOutcome::Pending,
+                    tombstoned_in_superfile: None,
+                })
+                .collect(),
+        };
+
+        let wal_store = WalStore::new(Arc::clone(&storage));
+        let supertable = Supertable::from_inner(Arc::clone(&self.inner));
+        let wal_id = entry.wal_id;
+        let drive = async move {
+            let etag = wal_store
+                .create(&wal_doc)
+                .await
+                .map_err(MutationError::WalStore)?;
+            let (outcome, _post, _post_etag) =
+                pipeline::run_tombstone_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
+            let (n_t, n_nf) = match outcome {
+                TombstonePhaseOutcome::Applied {
+                    n_tombstoned,
+                    n_not_found,
+                }
+                | TombstonePhaseOutcome::AlreadyComplete {
+                    n_tombstoned,
+                    n_not_found,
+                } => (n_tombstoned, n_not_found),
+            };
+            let _ = wal_store.delete_state(wal_id).await;
+            Ok::<_, MutationError>((n_t, n_nf))
+        };
+        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
+            Err(_) => self.inner.sql_runtime().block_on(drive)?,
+        };
+        Ok(OperationOutcome {
+            wal_id: entry.wal_id,
+            matched: entry.target_ids.len(),
+            n_tombstoned,
+            n_not_found,
+        })
+    }
+
+    /// Drain the pending-appends buffer and publish all shard
+    /// outputs in one manifest swap. Internal-only; the public
+    /// [`SupertableWriter::commit`] calls this first before
+    /// driving pending mutations.
+    fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok(());
         }

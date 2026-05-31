@@ -88,17 +88,21 @@ fn bench_deletes(c: &mut Criterion) {
     g.sample_size(10);
     g.throughput(Throughput::Elements(m as u64));
     g.bench_function("single_row_predicate_deletes", |b| {
-        // Each iteration drives `m` deletes; criterion times
-        // the whole batch and divides by `m` via Throughput.
+        // Each iteration buffers `m` deletes + one `commit()`
+        // to drive them all through the WAL pipeline.
+        // Criterion times the whole batch and divides by `m`
+        // via Throughput.
         b.iter(|| {
             let mut w = st.writer().expect("writer");
             for i in 0..m {
                 let title = format!("row{i:08}");
-                let outcome = w
+                let pending = w
                     .delete(col("title").eq(lit(title.clone())))
                     .expect("delete");
-                black_box(outcome);
+                black_box(pending);
             }
+            let result = w.commit().expect("commit");
+            black_box(result);
             drop(w);
         });
     });
@@ -142,11 +146,13 @@ fn bench_updates(c: &mut Criterion) {
             for i in 0..m {
                 let title = format!("row{i:08}");
                 let replacement = build_title_batch(&[&format!("row{i:08}-prime")]);
-                let outcome = w
+                let pending = w
                     .update(col("title").eq(lit(title.clone())), replacement)
                     .expect("update");
-                black_box(outcome);
+                black_box(pending);
             }
+            let result = w.commit().expect("commit");
+            black_box(result);
             drop(w);
         });
     });
