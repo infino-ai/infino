@@ -44,8 +44,9 @@ use crate::supertable::wal::WalStore;
 
 /// Default refresh interval — 1 second. Bounds how stale the
 /// cache's view can be on a query path that didn't write its
-/// own tombstones. Configured at construction; the default
-/// matches the plan's recommendation for typical workloads.
+/// own tombstones. Tuned to amortize the post-TTL refresh's
+/// extra storage GET across enough queries that the steady-
+/// state per-query cost stays inside the hot-path budget.
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(1);
 
 /// Typed failures from cache refresh. The cache's hot path is

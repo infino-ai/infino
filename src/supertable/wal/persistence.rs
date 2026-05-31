@@ -399,16 +399,16 @@ impl WalStore {
     // ---- Arrow IPC sidecar (per-WAL `new_rows` payload) -----------------
 
     /// Write the IPC payload sidecar (UPDATE only). **Idempotent
-    /// on bit-identical content** — the plan requires that a
-    /// recovery replay re-PUT the sidecar without breaking, but
-    /// our storage trait only offers create-only (`put_atomic`)
-    /// or CAS (`put_if_match`); there is no `PutMode::Overwrite`
-    /// today. So we route through `put_atomic` and swallow the
+    /// on bit-identical content** — recovery replay must be able
+    /// to re-PUT the sidecar without breaking, but our storage
+    /// trait only offers create-only (`put_atomic`) or CAS
+    /// (`put_if_match`); there is no `PutMode::Overwrite` today.
+    /// So we route through `put_atomic` and swallow the
     /// `PreconditionFailed` that fires on a second write.
     ///
     /// The replay-safety argument: the sidecar's bytes are a
     /// pure function of `new_rows`, which is itself fixed at the
-    /// caller's `update()` call. The plan's
+    /// caller's `update()` call. The state doc's
     /// `new_row_content_hash` field pins those bytes; a recovery
     /// process that re-PUTs is writing content with the same
     /// blake3, so the existing object IS the right object. The

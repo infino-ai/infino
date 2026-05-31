@@ -23,7 +23,8 @@
 //! Grace periods bound how aggressively we reap — too short
 //! risks deleting an arrow sidecar mid-flight while the
 //! producer's state-doc PUT is in progress; too long lets the
-//! prefix accumulate. Defaults mirror plan § Constants.
+//! prefix accumulate. See [`DEFAULT_WAL_GRACE`] +
+//! [`DEFAULT_SIDECAR_GRACE`] for the defaults.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,13 +38,16 @@ use crate::supertable::wal::persistence::{WalStore, WalStoreError};
 use crate::supertable::wal::state_doc::{WalId, WalState};
 
 /// Default grace period before reaping a `Complete` WAL's
-/// state-doc. Plan § Constants `T_wal_grace`.
+/// state-doc. Sized so a writer's inline-delete failure has
+/// time to retry on its own before GC steps in — a healthy
+/// supertable should never have anything to reap here.
 pub const DEFAULT_WAL_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// Default grace period before reaping an orphaned `.arrow`
-/// sidecar. Plan § Constants `T_sidecar_grace`. Sized to bound
-/// the worst-case writer-side gap between sidecar PUT and
-/// state-doc PUT.
+/// sidecar. Sized to bound the worst-case writer-side gap
+/// between sidecar PUT and state-doc PUT — long enough that a
+/// slow-but-progressing producer's mid-flight sidecar is never
+/// mistaken for an orphan.
 pub const DEFAULT_SIDECAR_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// Per-sweep tally. Stable shape so prefix-bloat regression
@@ -193,9 +197,11 @@ pub async fn run_sweep(
 
 /// Walk the `wal/mutations/` prefix looking for `.arrow`
 /// objects whose `WalId` isn't in `known_ids`. Returns each
-/// orphan's `WalId` paired with an mtime placeholder (None
-/// today; storage providers will surface mtime through
-/// `list_with_prefix` in a follow-up).
+/// orphan's `WalId` paired with an mtime placeholder. The
+/// mtime is `None` for now — `StorageProvider::list_with_prefix`
+/// doesn't surface per-object timestamps yet, so the orphan
+/// pass effectively requires a producer-side cooperative
+/// cleanup; expanding the trait is a follow-up.
 async fn list_arrow_orphans(
     storage: &Arc<dyn StorageProvider>,
     known_ids: &std::collections::HashSet<WalId>,

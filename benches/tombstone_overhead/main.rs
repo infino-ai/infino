@@ -40,12 +40,12 @@
 //! # in each carries the p50 / p95 in ns).
 //! ```
 //!
-//! The plan's per-sub-bench budget is
-//! `delta ≤ max(2 % × base_p50, 1 µs)`. Localize a regression by
-//! group: a `clean` regression points at lookup / TTL costs; a
-//! `one_percent` regression points at the filter-hook path; a
-//! `ten_percent_churned` regression points at filter cost on
-//! tombstone-heavy superfiles.
+//! Target per-sub-bench budget: `delta ≤ max(2 % × base_p50,
+//! 1 µs)`. Localize a regression by group: a `clean` regression
+//! points at lookup / TTL costs; a `one_percent` regression
+//! points at the filter-hook path; a `ten_percent_churned`
+//! regression points at filter cost on tombstone-heavy
+//! superfiles.
 
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};

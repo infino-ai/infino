@@ -44,14 +44,17 @@ use tokio::task::JoinHandle;
 use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
 use crate::supertable::wal::state_doc::{Lease, WalId, WalState, WalStateDoc};
 
-/// Default lease lifetime per acquire / heartbeat. Mirrors the
-/// plan's `T_lease = 60s`. Wall-clock, not monotonic — leases live
-/// in JSON so they have to use a serializable timebase.
+/// Default lease lifetime per acquire / heartbeat. 60s
+/// balances "long enough that NTP-level clock skew never
+/// expires a healthy owner" against "short enough that a dead
+/// owner's lease is reapable within a minute." Wall-clock, not
+/// monotonic — leases live in JSON so they have to use a
+/// serializable timebase.
 pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(60);
 
-/// Default heartbeat interval. Mirrors the plan's `T_heartbeat = 10s`.
-/// One sixth of the lease so a single missed beat doesn't flip a
-/// healthy owner over the expiry threshold.
+/// Default heartbeat interval. One sixth of the lease so a
+/// single missed beat doesn't flip a healthy owner over the
+/// expiry threshold.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Typed failures from the lease primitives. Lease loss is

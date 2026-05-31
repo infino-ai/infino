@@ -10,7 +10,7 @@
 //! 1. List every WAL state-doc at `wal/mutations/*.json`.
 //! 2. For each WAL, sorted oldest-first by `wal_id`:
 //!     - Read its state doc.
-//!     - `Complete` → skip (the M7 sweep cleans these up).
+//!     - `Complete` → skip (the GC sweep cleans these up).
 //!     - `Intent` or `Appended` → try to acquire (or preempt
 //!       expired) the lease. On acquisition, drive the WAL
 //!       through the remainder of its pipeline:
@@ -243,8 +243,8 @@ async fn recover_one(
         Err(LeaseError::InvalidPreState { .. }) => {
             // Raced with a Complete transition between our
             // first read and the acquire. Treat as already-
-            // complete; the M7 cleanup will sweep the
-            // state doc later.
+            // complete; the GC sweep will reap the state doc
+            // later.
             return Ok(OneWalOutcome::AlreadyComplete);
         }
         Err(_) => return Err(SweepStep::CasLost),

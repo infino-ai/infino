@@ -625,9 +625,9 @@ fn build_vector_summary(
 //    audit.
 //
 // Once every entry is non-`Pending`, the WAL itself is advanced to
-// `Complete`. The state-doc and IPC sidecar deletions in plan
-// step 6/7 are best-effort and live outside this function — they
-// stay with the recovery sweep.
+// `Complete`. The state-doc and IPC sidecar deletions are
+// best-effort and live outside this function — they stay with
+// the recovery sweep + GC.
 //
 // ## Recovery & idempotency
 //
@@ -759,9 +759,12 @@ pub async fn run_tombstone_phase(
     wal_doc: &WalStateDoc,
     wal_etag: &Etag,
 ) -> Result<(TombstonePhaseOutcome, WalStateDoc, Etag), TombstonePhaseError> {
-    // Pre-condition: state ↔ op-kind compatibility. The valid
-    // entry states are pinned by the state machine in plan
-    // § State machine; reject anything else as a builder bug.
+    // Pre-condition: state ↔ op-kind compatibility. The
+    // tombstone phase only runs from `Appended` (UPDATE) or
+    // `Intent` (DELETE); a `Complete` WAL is the idempotent
+    // no-op path. Anything else is a builder bug, surfaced as
+    // a typed error rather than silently driving against a
+    // half-built state doc.
     match (wal_doc.op_kind, wal_doc.state) {
         (OpKind::Update, WalState::Appended) => {}
         (OpKind::Delete, WalState::Intent) => {}
@@ -810,20 +813,23 @@ fn count_outcomes(
 /// error.
 const MAX_CAS_RETRIES: u32 = 10;
 
-/// Bounded sealed-sidecar retry budget. The plan calls for an
-/// unbounded loop in production (writer blocks until compaction
-/// forward-progresses); we bound it here so a stuck supertable
-/// surfaces a typed error rather than hanging the test process.
-/// The budget is high enough that a healthy compactor never
-/// exhausts it under realistic loads.
+/// Bounded sealed-sidecar retry budget. Architecturally this
+/// loop should be unbounded — the writer blocks until
+/// compaction's forward progress publishes a merged target and
+/// our re-resolve routes there. We bound it so a stuck
+/// supertable surfaces a typed error rather than hanging the
+/// test process. The budget is high enough that a healthy
+/// compactor never exhausts it under realistic loads.
 const MAX_SEALED_RETRIES: u32 = 16;
 
 /// Backoff floor between sealed-sidecar retries. Doubles per
 /// attempt, capped at [`SEALED_RETRY_CAP_MS`].
 const SEALED_RETRY_BASE_MS: u64 = 100;
 
-/// Cap on the exponential sealed-retry backoff. Mirrors the
-/// `T_sealed_retry_max` constant called out in the plan.
+/// Cap on the exponential sealed-retry backoff. 30 s keeps the
+/// loop from blocking the writer indefinitely under a stuck
+/// compactor while staying coarse enough that the retries don't
+/// hammer storage.
 const SEALED_RETRY_CAP_MS: u64 = 30_000;
 
 /// The non-idempotent fast path for the tombstone loop. For each

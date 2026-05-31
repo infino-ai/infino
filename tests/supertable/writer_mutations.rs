@@ -1,9 +1,9 @@
-//! `SupertableWriter::delete` integration tests.
+//! `SupertableWriter::update` + `delete` integration tests.
 //!
-//! Drive the public mutation API end-to-end: append rows, delete
-//! by predicate, verify subsequent queries don't see the deleted
-//! rows. The buffered + commit shape from the plan is a follow-up;
-//! this commit ships immediate-drive deletes.
+//! Drive the public mutation API end-to-end: buffer mutations
+//! via `update` / `delete`, flush via `commit`, verify that
+//! subsequent SQL + FTS queries reflect the mutation (deleted
+//! rows are gone, updated rows show the replacement payload).
 
 use std::collections::HashSet;
 use std::sync::Arc;

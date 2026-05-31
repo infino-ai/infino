@@ -10,10 +10,10 @@
 //! - **End-state correctness** — a closing query asserts the
 //!   row count + presence/absence shape the bench expects.
 //!
-//! Sized down from the 10M-doc figure in the plan so the bench
-//! runs in seconds on a developer laptop. Larger sizes are
-//! gated behind env vars (e.g., `INFINO_BENCH_N_DOCS=10000000`
-//! for full scale).
+//! Defaults are sized so the bench runs in seconds on a
+//! developer laptop. Larger sizes are gated behind env vars
+//! (e.g. `INFINO_BENCH_UPDATE_N_DOCS=10000000` for the
+//! 10M-doc scale-out shape).
 
 use std::env;
 use std::hint::black_box;

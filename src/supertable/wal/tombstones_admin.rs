@@ -86,9 +86,11 @@ pub async fn seal(
         None => (None, None),
     };
 
-    // Already sealed → idempotent on same compaction, error
-    // otherwise. Mirrors the abandoned-compaction recovery
-    // contract called out in plan § Compaction interaction.
+    // Already sealed → idempotent on the same compaction id,
+    // error otherwise. The mismatched-id case means a previous
+    // compaction sealed this sidecar and didn't finish; the
+    // caller has to drive that abandoned merge to completion
+    // (or unwind it) before sealing again with a fresh id.
     if let Some(existing) = &existing
         && let Some(existing_seal) = existing.seal.as_ref()
     {
@@ -284,9 +286,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn race_writer_then_seal_landed_tombstone_visible_to_compactor() {
-        // Mirror the plan's race-window safety gate (a) — the
-        // writer's tombstone lands BEFORE seal. The compactor's
-        // post-seal `live_rows` therefore excludes the row.
+        // Race-window safety property: a writer's tombstone
+        // bit lands BEFORE the compactor seals the sidecar. The
+        // compactor's post-seal `live_rows` therefore excludes
+        // the tombstoned row — the merged target won't carry it.
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x800);
 
