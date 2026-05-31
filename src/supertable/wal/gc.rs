@@ -198,10 +198,11 @@ pub async fn run_sweep(
 /// Walk the `wal/mutations/` prefix looking for `.arrow`
 /// objects whose `WalId` isn't in `known_ids`. Returns each
 /// orphan's `WalId` paired with an mtime placeholder. The
-/// mtime is `None` for now — `StorageProvider::list_with_prefix`
-/// doesn't surface per-object timestamps yet, so the orphan
-/// pass effectively requires a producer-side cooperative
-/// cleanup; expanding the trait is a follow-up.
+/// mtime placeholder is always `None` because
+/// `StorageProvider::list_with_prefix` doesn't surface
+/// per-object timestamps; the orphan pass therefore relies on
+/// producer-side cooperative cleanup until the trait exposes
+/// mtime.
 async fn list_arrow_orphans(
     storage: &Arc<dyn StorageProvider>,
     known_ids: &std::collections::HashSet<WalId>,
@@ -222,9 +223,9 @@ async fn list_arrow_orphans(
         if known_ids.contains(&wal_id) {
             continue;
         }
-        // mtime is None for now — `list_with_prefix` doesn't
+        // mtime is None because `list_with_prefix` doesn't
         // expose it. Callers that supply a non-zero
-        // `sidecar_grace` therefore see "age == now-now == 0"
+        // `sidecar_grace` therefore see "age == now-now == 0",
         // which is never older than the grace window; in
         // practice the writer's inline delete handles the
         // common case and the orphan pass is rarely needed.

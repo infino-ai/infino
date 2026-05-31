@@ -2,6 +2,8 @@
 //!
 //! ## What lives here
 //!
+//! Durability + serialization layer:
+//!
 //! - [`state_doc`] — the on-disk JSON shape of one WAL entry's
 //!   state document, plus the `wal_id` ↔ filename encoding.
 //! - [`persistence`] — the storage-level CAS primitives
@@ -13,14 +15,25 @@
 //!   per-superfile tombstone sidecar object (magic + version +
 //!   optional `SealRecord` + `RoaringBitmap`).
 //!
-//! ## What does NOT live here
+//! Coordination layer (built on the durability layer):
 //!
-//! Pipeline orchestration — append + tombstone state machines,
-//! the recovery scan, leases, GC — is intentionally out of scope.
-//! This module ships the durability + serialization layer only.
-//! Nothing here knows what a `target_id` means or when a state
-//! transition is legal; those rules belong to the pipeline layer
-//! that sits on top.
+//! - [`lease`] — advisory cooperative ownership: `try_acquire` /
+//!   `try_heartbeat` / `try_release` + a `spawn_heartbeat`
+//!   background task with stuck-worker detection.
+//! - [`pipeline`] — the append-phase + tombstone-phase
+//!   orchestrators that drive a WAL through its state machine
+//!   (Intent → Appended → Complete for UPDATE; Intent →
+//!   Complete for DELETE).
+//! - [`recovery`] — on-demand sweep that lists WALs at
+//!   `wal/mutations/*.json`, takes the lease, and drives each
+//!   non-`Complete` WAL through the rest of its pipeline.
+//! - [`gc`] — sweep over `wal/mutations/*` reaping `Complete`
+//!   state docs past the wal-grace window + orphan `.arrow`
+//!   sidecars past the sidecar-grace window.
+//! - [`tombstones_admin`] — compaction-facing `seal` +
+//!   `live_rows` helpers built on the sidecar codec; provides
+//!   the freeze-the-sources surface a tombstone-aware compactor
+//!   needs.
 //!
 //! ## On-disk layout
 //!

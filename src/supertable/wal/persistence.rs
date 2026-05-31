@@ -400,10 +400,10 @@ impl WalStore {
 
     /// Write the IPC payload sidecar (UPDATE only). **Idempotent
     /// on bit-identical content** — recovery replay must be able
-    /// to re-PUT the sidecar without breaking, but our storage
+    /// to re-PUT the sidecar without breaking, but the storage
     /// trait only offers create-only (`put_atomic`) or CAS
-    /// (`put_if_match`); there is no `PutMode::Overwrite` today.
-    /// So we route through `put_atomic` and swallow the
+    /// (`put_if_match`); it has no `PutMode::Overwrite`. So we
+    /// route through `put_atomic` and swallow the
     /// `PreconditionFailed` that fires on a second write.
     ///
     /// The replay-safety argument: the sidecar's bytes are a

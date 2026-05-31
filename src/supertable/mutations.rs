@@ -16,7 +16,7 @@
 //!
 //! Durability is the commit barrier: a writer dropped without
 //! `commit()` returning `Ok` discards every buffered entry. Same
-//! shape as today's append behaviour.
+//! shape as `append()`'s buffer.
 //!
 //! ## What's here
 //!
