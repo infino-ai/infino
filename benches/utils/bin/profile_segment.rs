@@ -1,0 +1,124 @@
+//! Standalone profiling harness for the per-segment vector query path.
+//!
+//! Builds ONE supertable-segment-sized superfile (default 2.5M docs,
+//! `n_cent = 1024`, dim 384, Sq8 / Cosine — i.e. one of the four
+//! 10M-supertable segments) and times the hot in-memory
+//! `SuperfileReader::search` across an `(nprobe, rerank_mult)` grid,
+//! reporting per-config latency and recall@10.
+//!
+//! It deliberately skips the 10M build, the Criterion calibration
+//! sweep, and the cold/warm tier machinery — none of which a
+//! query-path profile needs — so it runs in minutes instead of hours.
+//!
+//! The grid isolates the two suspected costs by differential timing:
+//!   * sweep `nprobe` at small `rerank_mult` -> coarse 1-bit scan cost
+//!   * sweep `rerank_mult` at fixed `nprobe` -> Sq8 rerank cost
+//! and the recall column shows whether per-segment recall keeps
+//! climbing past the old 16-probe cap (the ceiling question).
+//!
+//! To A/B the within-segment rayon parallelism, flip
+//! `PARALLEL_SCAN_MIN` in `src/superfile/vector/reader.rs`
+//! (`usize::MAX` forces serial, `0` forces parallel) and rerun.
+//!
+//! Run:
+//!   cargo run --release -p infino-bench-utils --bin profile_segment
+//!   cargo run --release -p infino-bench-utils --bin profile_segment -- 625000 256
+
+use std::collections::HashSet;
+use std::time::Instant;
+
+use infino::superfile::reader::VectorSearchOptions;
+use infino_bench_utils::corpus::{self, DIM};
+
+const SEED: u64 = 42;
+const N_QUERIES: usize = 30;
+const TOP_K: usize = 10;
+const SIGMA: f32 = 0.1;
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let n_docs: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(2_500_000);
+    let n_cent: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1024);
+
+    eprintln!(
+        "[profile] building 1 segment: {n_docs} docs, n_cent={n_cent}, dim={DIM}, Sq8/Cosine"
+    );
+    let t = Instant::now();
+    let vectors = corpus::generate_vector_corpus(n_docs, n_cent, SEED, true);
+    let docs = corpus::generate_text_corpus(n_docs, SEED);
+    let blob = corpus::build_superfile(&docs, &vectors, n_cent);
+    let reader = corpus::open_superfile(blob);
+    eprintln!(
+        "[profile] build+open took {:.1}s  (docs/cluster ≈ {})",
+        t.elapsed().as_secs_f64(),
+        n_docs / n_cent.max(1)
+    );
+
+    let queries =
+        corpus::generate_realistic_queries(&vectors, n_docs, N_QUERIES, SEED ^ 0x9e37, true, SIGMA);
+
+    eprintln!("[profile] computing brute-force ground truth ({N_QUERIES} queries)...");
+    let gt: Vec<Vec<u32>> = queries
+        .iter()
+        .map(|q| corpus::brute_force_topk_cosine(&vectors, n_docs, q, TOP_K))
+        .collect();
+
+    let opts = |nprobe: usize, rerank_mult: usize| {
+        VectorSearchOptions::new()
+            .with_nprobe(nprobe)
+            .with_rerank_mult(rerank_mult)
+    };
+
+    // Warm the reader (touch pages, settle the allocator) before timing.
+    for q in &queries {
+        let _ = futures::executor::block_on(reader.vector_search("emb", q, TOP_K, opts(16, 64)));
+    }
+
+    // First block sweeps nprobe at small rerank (coarse-scan cost),
+    // second sweeps rerank at fixed nprobe (rerank cost), the last
+    // block is the wide-probe high-recall region the supertable grid
+    // now reaches.
+    let grid: &[(usize, usize)] = &[
+        (1, 4),
+        (4, 4),
+        (16, 4),
+        (64, 4),
+        (128, 4),
+        (16, 16),
+        (16, 64),
+        (16, 256),
+        (16, 1024),
+        (64, 256),
+        (128, 256),
+        (128, 1024),
+    ];
+
+    println!("\n nprobe  rerank_mult   p50_ms   mean_ms   recall@10");
+    println!("-------------------------------------------------------");
+    for &(nprobe, rerank_mult) in grid {
+        let mut lats = Vec::with_capacity(N_QUERIES);
+        let mut recall_sum = 0.0f64;
+        for (qi, q) in queries.iter().enumerate() {
+            let t = Instant::now();
+            let hits = futures::executor::block_on(reader.vector_search(
+                "emb",
+                q,
+                TOP_K,
+                opts(nprobe, rerank_mult),
+            ))
+            .expect("search");
+            lats.push(t.elapsed().as_secs_f64() * 1e3);
+            let got: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+            let hit = gt[qi].iter().filter(|d| got.contains(d)).count();
+            recall_sum += hit as f64 / TOP_K as f64;
+        }
+        lats.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p50 = lats[lats.len() / 2];
+        let mean = lats.iter().sum::<f64>() / lats.len() as f64;
+        let recall = recall_sum / N_QUERIES as f64;
+        println!(" {nprobe:>6}  {rerank_mult:>11}   {p50:>6.2}   {mean:>7.2}   {recall:>8.3}");
+    }
+}

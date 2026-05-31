@@ -49,9 +49,13 @@ const BUILD_MEASUREMENT_TIME: Duration = Duration::from_secs(60 * 60);
 
 /// Per-segment probe grid. The supertable applies a single `nprobe`
 /// to every segment, so the effective probe count is `nprobe ×
-/// n_superfiles`. This grid approximates the single-superfile probe
-/// grid scaled down by [`N_SEGMENTS`].
-const SUPERTABLE_PROBES_PER_SEG: &[usize] = &[1, 2, 4, 8, 12, 16];
+/// n_superfiles`. Each segment carries `n_cent(N_DOCS) / N_SEGMENTS`
+/// clusters with ~2.5× the docs-per-cluster of the 1M single-superfile
+/// grid, so the upper end has to climb well past the old 16-probe cap
+/// to reach the same recall — otherwise calibration reports an
+/// artificially low ceiling that's just "under-probed", not a real
+/// quality limit.
+const SUPERTABLE_PROBES_PER_SEG: &[usize] = &[1, 2, 4, 8, 12, 16, 32, 64, 128];
 const SUPERTABLE_REFINES: &[usize] = &[4, 16, 64, 256, 1024];
 
 const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
@@ -145,7 +149,7 @@ fn vector_supertable_options(
             n_cent: n_cent_per_segment,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
         }],
         None,
     )

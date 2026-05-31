@@ -279,3 +279,8 @@ name = "object-store"
 path = "benches/object_store/main.rs"
 harness = false
 
+[[bench]]
+name = "scale"
+path = "benches/scale/main.rs"
+harness = false
+

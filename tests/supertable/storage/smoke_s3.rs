@@ -171,7 +171,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
             n_cent: 4,
             rot_seed: 17,
             metric: infino::superfile::vector::distance::Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
         }],
         Some(infino::test_helpers::default_tokenizer()),
     )

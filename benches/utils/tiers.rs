@@ -186,15 +186,10 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
         eprintln!(
             "\n\
              ################################################################################\n\
-             ##                                                                            ##\n\
-             ##   WARNING: BENCHMARKING AGAINST s3s-fs EMULATOR, *NOT* REAL AWS S3.        ##\n\
-             ##                                                                            ##\n\
-             ##   s3s-fs loopback in this sandbox is ~650 ms PER REQUEST (fixed artifact). ##\n\
-             ##   Cold/warm numbers from this run are MEANINGLESS as S3 latency.           ##\n\
-             ##   (e.g. cold first-search inflates to ~7.5 s vs sub-second on real S3.)    ##\n\
-             ##                                                                            ##\n\
-             ##   To benchmark real S3, set INFINO_REAL_S3_BUCKET (+ AWS creds) and rerun. ##\n\
-             ##                                                                            ##\n\
+             ##  WARNING: benchmarking against the s3s-fs emulator, NOT real AWS S3.        ##\n\
+             ##  The emulator reproduces request count and byte volume, not network         ##\n\
+             ##  latency, so warm/cold timings here are not representative of S3.            ##\n\
+             ##  Set INFINO_REAL_S3_BUCKET (+ AWS creds) to benchmark against real S3.       ##\n\
              ################################################################################\n\
              [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT real S3)\n"
         );

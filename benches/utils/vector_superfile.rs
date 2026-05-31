@@ -166,7 +166,7 @@ fn build_superfile_bytes(vectors: &[f32]) -> Vec<u8> {
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         None,
     );

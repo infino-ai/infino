@@ -725,7 +725,10 @@ fn build_subsection_streaming(
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
     let codec = cfg.rerank_codec;
-    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if codec == RerankCodec::Sq8 {
+    // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
+    // an i8 residual sidecar in `full[]`.
+    let sq8_family = matches!(codec, RerankCodec::Sq8Residual);
+    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if sq8_family {
         (
             vec![f32::INFINITY; n_cent * dim],
             vec![f32::NEG_INFINITY; n_cent * dim],
@@ -757,7 +760,7 @@ fn build_subsection_streaming(
             ))
         };
 
-        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if codec == RerankCodec::Sq8 {
+        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if sq8_family {
             Some((&mut sq8_min_arr, &mut sq8_max_arr))
         } else {
             None
@@ -779,7 +782,7 @@ fn build_subsection_streaming(
         )?;
     }
 
-    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if codec == RerankCodec::Sq8 {
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if sq8_family {
         (0..n_cent)
             .map(|c| {
                 let off = c * dim;
@@ -935,13 +938,13 @@ fn build_subsection_streaming(
     let sq8_scale_block_off = codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
     let sq8_norms_block_off =
-        if codec == RerankCodec::Sq8 && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
+        if sq8_family && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
             Some(sq8_offset_block_off + n_cent * dim * 4)
         } else {
             None
         };
 
-    if codec == RerankCodec::Sq8 {
+    if sq8_family {
         for cid in 0..n_cent {
             let (scale_c, offset_c) = &sq8_quantizers[cid];
             let sc_off = sq8_scale_block_off + cid * dim * 4;
@@ -994,12 +997,12 @@ fn build_subsection_streaming(
                 let full_base = block_base + codes_len + ids_len;
                 bytes[full_base..full_base + cluster_count * dim * 4].copy_from_slice(&full_block);
             }
-            RerankCodec::Sq8 => {
+            RerankCodec::Sq8Residual => {
                 let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                 let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
                 let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
                 let full_chunk_base = block_base + codes_len + ids_len;
-                encode_sq8_cluster_simd(
+                encode_sq8_residual_cluster_simd(
                     cluster_rows,
                     dim,
                     cluster_count,
@@ -1037,10 +1040,16 @@ fn build_subsection_streaming(
     })
 }
 
-/// Sq8 SIMD encode into a cluster's `full_chunk` within plan-013
-/// per-cluster blocks (`full_chunk_base + i * dim` per row).
+/// `Sq8Residual` per-cluster encode. Writes a row-interleaved
+/// `[code dim u8 ‖ residual dim i8]` body (`2 × dim` bytes per row)
+/// at `full_chunk_base + i × 2·dim`. The Sq8 code is the same
+/// `sq8_encode_row` quantization; the residual code captures the
+/// quantization error at `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized
+/// signed steps. Per-doc norms are computed against the fully
+/// residual-corrected vector so the search-side kernel's
+/// Cosine/L2Sq normalization matches the bytes on disk.
 #[allow(clippy::too_many_arguments)]
-fn encode_sq8_cluster_simd(
+fn encode_sq8_residual_cluster_simd(
     cluster_rows: &[f32],
     dim: usize,
     cluster_count: usize,
@@ -1054,19 +1063,35 @@ fn encode_sq8_cluster_simd(
     bytes: &mut [u8],
 ) {
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
+    let residual_divisor = crate::superfile::vector::distance::SQ8_RESIDUAL_DIVISOR;
+    let row_bytes = dim * 2;
 
     for i in 0..cluster_count {
         let src = &cluster_rows[i * dim..(i + 1) * dim];
         let pos = cluster_doc_off + i;
-        let code_off = full_chunk_base + i * dim;
+        let row_off = full_chunk_base + i * row_bytes;
+        let code_off = row_off;
+        let res_off = row_off + dim;
+        // Sq8 code leg (identical quantization to plain Sq8).
         sq8_encode_row(src, inv_scale_c, c2_c, &mut bytes[code_off..code_off + dim]);
-        if let Some(norms_off) = sq8_norms_block_off {
-            let mut acc = 0.0f64;
-            for d in 0..dim {
-                let qc = bytes[code_off + d];
-                let x = (qc as f32) * scale_c[d] + offset_c[d];
+        // Residual leg + (optional) residual-corrected norm.
+        let mut acc = 0.0f64;
+        for d in 0..dim {
+            let qc = bytes[code_off + d];
+            let base = (qc as f32) * scale_c[d] + offset_c[d];
+            let step = scale_c[d] / residual_divisor;
+            let rq = if step > 0.0 {
+                ((src[d] - base) / step).round().clamp(-127.0, 127.0) as i8
+            } else {
+                0
+            };
+            bytes[res_off + d] = rq.to_le_bytes()[0];
+            if sq8_norms_block_off.is_some() {
+                let x = base + (rq as f32) * step;
                 acc += (x as f64) * (x as f64);
             }
+        }
+        if let Some(norms_off) = sq8_norms_block_off {
             let n_off = norms_off + pos * 4;
             bytes[n_off..n_off + 4].copy_from_slice(&(acc as f32).to_le_bytes());
         }
@@ -1370,7 +1395,7 @@ mod tests {
             n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");

@@ -168,7 +168,7 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
 
 async fn wait_for_mmap_promotion(cache: &Arc<DiskCacheStore>, uri: SuperfileUri, timeout: Duration) {
     cache
-        .wait_until_mmap_promoted(uri, timeout)
+        .wait_until_mmap_promoted(&uri, timeout)
         .await
         .expect("mmap promotion");
 }

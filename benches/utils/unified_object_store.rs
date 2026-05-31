@@ -1,11 +1,11 @@
-//! **Quick-iteration harness** for the object-store cold-fetch path (Plan 013).
+//! **Quick-iteration harness** for the object-store cold-fetch path.
 //!
 //! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;
 //! `INFINO_BENCH_FULL=1` → 1M). Canonical tiered benchmarks (superfile 1M /
 //! supertable 10M × hot/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
 //! Use this bench to iterate on request shape and diagnostics, not headline SLA rows.
 //!
-//! Plan 013 M5 — unified vector + FTS cold-open / cold-first-search
+//! Exercises unified vector + FTS cold-open / cold-first-search
 //! / warm-search against an in-process S3 server (`s3s-fs`).
 //!
 //! Spawns `s3s-fs` on a random port, points an
@@ -18,12 +18,12 @@
 //! `ColdFetchMode::LazyForegroundWithBackgroundFill` path:
 //!
 //! 1. **Cold open via S3** — `cache.reader(uri)` against an
-//!    empty cache; pays the Plan 013 cold-open budget (Parquet
+//!    empty cache; pays the cold-open budget (Parquet
 //!    footer + per-subsection open-time-region GETs). One open
 //!    serves both the vector and FTS readers.
 //! 2. **Cold first vector search after S3 open** — cold open +
 //!    `vec.search` at the default `(nprobe, rerank_mult)`;
-//!    pays the M3 cold-search budget (~nprobe + 1 cluster
+//!    pays the cold-search budget (~nprobe + 1 cluster
 //!    GETs).
 //! 3. **Cold first BM25 search after S3 open** — cold open +
 //!    `bm25_search`; pays the FTS lazy open-time fetch
@@ -231,7 +231,7 @@ fn build_superfile_bytes() -> Bytes {
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     );
@@ -277,17 +277,15 @@ fn build_superfile_bytes() -> Bytes {
     Bytes::from(bytes)
 }
 
-// ─── S3 latency model (Plan 013 #1: adjusted diagnostic) ────────────
+// ─── S3 latency model (adjusted diagnostic) ────────────
 //
 // `s3s-fs` over loopback faithfully reproduces the S3 *request
-// count* and *byte volume* (the things Plan 013's GET-minimization
-// optimizes), but not S3's *wall-clock* — its per-request RTT in
-// this sandbox is dominated by a fixed ~650 ms artifact that has
-// nothing to do with real S3. To get a meaningful cold-open /
-// cold-search wall-clock signal while iterating (before the gated
-// real-S3 suite in PR9 gives the ground truth), the diagnostic
-// reports a synthetic AWS-S3-in-region timing model on top of the
-// real request shape:
+// count* and *byte volume* (the things GET-minimization
+// optimizes), but not S3's *wall-clock* — its per-request latency
+// is environment-dependent and unrelated to real S3. To get a
+// meaningful cold-open / cold-search wall-clock signal while
+// iterating, the diagnostic reports a synthetic
+// AWS-S3-in-region timing model on top of the real request shape:
 //
 //   wall(req) = TTFB + bytes / throughput
 //
@@ -1873,7 +1871,7 @@ mod diag {
                 n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8,
+                rerank_codec: RerankCodec::Sq8Residual,
             }],
             Some(default_tokenizer()),
         )

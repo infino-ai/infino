@@ -8,6 +8,10 @@ publish = false
 [lib]
 path = "mod.rs"
 
+[[bin]]
+name = "profile_segment"
+path = "bin/profile_segment.rs"
+
 [dependencies]
 arrow-array = "58"
 arrow-schema = "58"
