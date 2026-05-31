@@ -55,8 +55,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::ipc::reader::StreamReader;
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use uuid::Uuid;
 
 use crate::storage::StorageError;
@@ -67,9 +69,13 @@ use crate::supertable::manifest::bloom::BloomBuilder;
 use crate::supertable::manifest::{
     FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary,
 };
+use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::utils::vector_split::split_vectors;
 use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{AppendedPairRange, IdSpan, OpKind, WalState, WalStateDoc};
+use crate::supertable::wal::state_doc::{
+    AppendedPairRange, IdSpan, OpKind, TombstoneOutcome, WalState, WalStateDoc,
+};
+use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
 
 /// Outcome of one append-phase invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,7 +484,6 @@ fn decode_ipc_batch(
     ipc_bytes: &Bytes,
     wal_doc: &WalStateDoc,
 ) -> Result<RecordBatch, AppendPhaseError> {
-    use arrow::ipc::reader::StreamReader;
     let cursor = std::io::Cursor::new(ipc_bytes.as_ref());
     let mut reader =
         StreamReader::try_new(cursor, None).map_err(|e| AppendPhaseError::IpcDecode {
@@ -513,8 +518,6 @@ fn prepend_id_column(
     flat_ids: &[i128],
     options: &crate::supertable::SupertableOptions,
 ) -> Result<RecordBatch, AppendPhaseError> {
-    use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
-
     // Validate batch against user schema first — surfaces a
     // clean error instead of a confusing builder failure
     // downstream.
@@ -793,7 +796,6 @@ pub async fn run_tombstone_phase(
 fn count_outcomes(
     progress: &[crate::supertable::wal::state_doc::TombstoneEntry],
 ) -> (usize, usize) {
-    use crate::supertable::wal::state_doc::TombstoneOutcome;
     let mut n_tombstoned = 0usize;
     let mut n_not_found = 0usize;
     for entry in progress {
@@ -849,8 +851,6 @@ async fn do_tombstone_apply(
     wal_doc: &WalStateDoc,
     wal_etag: &Etag,
 ) -> Result<(TombstonePhaseOutcome, WalStateDoc, Etag), TombstonePhaseError> {
-    use crate::supertable::wal::state_doc::TombstoneOutcome;
-
     let inner = supertable.inner();
     if inner.options.storage.is_none() {
         return Err(TombstonePhaseError::NoStorageAttached);
@@ -930,8 +930,6 @@ async fn resolve_and_tombstone_one(
     ),
     TombstonePhaseError,
 > {
-    use crate::supertable::wal::state_doc::TombstoneOutcome;
-
     let mut sealed_attempts = 0u32;
     loop {
         let manifest = inner.manifest.load_full();
@@ -981,8 +979,6 @@ async fn cas_tombstone_bit(
     superfile_id: Uuid,
     doc_id: u32,
 ) -> Result<SidecarCasOutcome, TombstonePhaseError> {
-    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
-
     for _attempt in 0..MAX_CAS_RETRIES {
         // Read the current sidecar (None ↔ no tombstones yet).
         let (existing, etag_opt) = match wal_store.get_tombstones(superfile_id).await? {
@@ -1146,8 +1142,6 @@ fn scan_id_column_for_match(
     id_column: &str,
     target: i128,
 ) -> Result<Option<u32>, String> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
         .map_err(|e| format!("parquet builder: {e}"))?;
     let reader = builder
@@ -1195,9 +1189,11 @@ mod tests {
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
     use crate::supertable::Supertable;
     use crate::supertable::wal::state_doc::{
-        OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+        OpKind, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome, WalId, WalState,
     };
-    use crate::test_helpers::default_supertable_options;
+    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+    use crate::test_helpers::{build_title_batch, default_supertable_options};
+    use arrow::ipc::writer::StreamWriter;
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1284,7 +1280,6 @@ mod tests {
     /// Encode a RecordBatch as Arrow IPC stream bytes — same
     /// shape the WAL's `.arrow` sidecar carries in production.
     fn encode_ipc(batch: &RecordBatch) -> Bytes {
-        use arrow::ipc::writer::StreamWriter;
         let mut out: Vec<u8> = Vec::new();
         {
             let mut writer =
@@ -1305,7 +1300,6 @@ mod tests {
         wal_id_value: i128,
         minted_first: i128,
     ) -> (TempDir, Supertable, WalStore, WalStateDoc, Etag) {
-        use crate::test_helpers::build_title_batch;
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -1980,9 +1974,6 @@ mod tests {
         // bounded-budget exhaustion path requires either a
         // configurable budget or a long test; we accept the
         // shorter assertion here.
-        use crate::supertable::wal::state_doc::SealRecord;
-        use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
-
         let (_dir, st, ws, sf_id, id_min, _id_max) =
             published_superfile_fixture(&["seal"], 60_000).await;
 

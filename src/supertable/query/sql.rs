@@ -63,6 +63,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, Decimal128Array};
 use bytes::Bytes;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
@@ -192,7 +193,6 @@ impl Supertable {
 /// `_id` is a Decimal128(38, 0) column; we read the raw 128-bit
 /// integer value directly.
 fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
-    use arrow_array::{Array, Decimal128Array};
     let mut out: Vec<i128> = Vec::new();
     for batch in batches {
         if batch.num_columns() != 1 {

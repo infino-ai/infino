@@ -52,6 +52,7 @@ use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch,
 };
 use bytes::Bytes;
+use chrono::Utc;
 use rayon::prelude::*;
 
 use crate::superfile::builder::SuperfileBuilder;
@@ -60,8 +61,17 @@ use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
 use super::manifest::{FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary};
+use super::mutations::{
+    CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+    PendingDelete, PendingUpdate,
+};
 use super::options::SupertableOptions;
 use super::utils::vector_split::split_vectors;
+use super::wal::WalStore;
+use super::wal::pipeline::{self, TombstonePhaseOutcome};
+use super::wal::state_doc::{
+    IdSpan, OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+};
 
 /// Single-writer append + commit handle.
 ///
@@ -366,15 +376,7 @@ impl SupertableWriter {
     pub fn delete(
         &mut self,
         predicate: datafusion::prelude::Expr,
-    ) -> Result<
-        crate::supertable::mutations::PendingDelete,
-        crate::supertable::mutations::MutationError,
-    > {
-        use crate::supertable::mutations::{
-            MAX_TARGETS_PER_MUTATION, MutationError, PendingDelete,
-        };
-        use crate::supertable::wal::state_doc::WalId;
-
+    ) -> Result<PendingDelete, MutationError> {
         // Pre-flight: storage must be attached for the WAL
         // pipeline to drive this op at commit time.
         let _ = self
@@ -443,16 +445,8 @@ impl SupertableWriter {
     pub fn update(
         &mut self,
         predicate: datafusion::prelude::Expr,
-        new_rows: arrow_array::RecordBatch,
-    ) -> Result<
-        crate::supertable::mutations::PendingUpdate,
-        crate::supertable::mutations::MutationError,
-    > {
-        use crate::supertable::mutations::{
-            MAX_TARGETS_PER_MUTATION, MutationError, PendingUpdate,
-        };
-        use crate::supertable::wal::state_doc::{IdSpan, WalId};
-
+        new_rows: RecordBatch,
+    ) -> Result<PendingUpdate, MutationError> {
         // Pre-flight: storage attached.
         let _ = self
             .inner
@@ -567,12 +561,7 @@ impl SupertableWriter {
     /// [`CommitResult`]: crate::supertable::mutations::CommitResult
     /// [`OperationOutcome`]: crate::supertable::mutations::OperationOutcome
     /// [`CommitError::PartialCommit`]: crate::supertable::mutations::CommitError::PartialCommit
-    pub fn commit(
-        &mut self,
-    ) -> Result<crate::supertable::mutations::CommitResult, crate::supertable::mutations::CommitError>
-    {
-        use crate::supertable::mutations::{CommitError, CommitResult, OperationOutcome};
-
+    pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
         // Step 1: flush appends. A failure here is atomic —
         // the buffer is preserved and no mutation WAL has
         // landed yet.
@@ -657,18 +646,7 @@ impl SupertableWriter {
     fn drive_one_update(
         &self,
         entry: &PendingUpdateEntry,
-    ) -> Result<
-        crate::supertable::mutations::OperationOutcome,
-        crate::supertable::mutations::MutationError,
-    > {
-        use crate::supertable::mutations::{MutationError, OperationOutcome};
-        use crate::supertable::wal::WalStore;
-        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
-        use crate::supertable::wal::state_doc::{
-            OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState, WalStateDoc,
-        };
-        use chrono::Utc;
-
+    ) -> Result<OperationOutcome, MutationError> {
         let storage = self
             .inner
             .options
@@ -760,18 +738,7 @@ impl SupertableWriter {
     fn drive_one_delete(
         &self,
         entry: &PendingDeleteEntry,
-    ) -> Result<
-        crate::supertable::mutations::OperationOutcome,
-        crate::supertable::mutations::MutationError,
-    > {
-        use crate::supertable::mutations::{MutationError, OperationOutcome};
-        use crate::supertable::wal::WalStore;
-        use crate::supertable::wal::pipeline::{self, TombstonePhaseOutcome};
-        use crate::supertable::wal::state_doc::{
-            OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState, WalStateDoc,
-        };
-        use chrono::Utc;
-
+    ) -> Result<OperationOutcome, MutationError> {
         let storage = self
             .inner
             .options
