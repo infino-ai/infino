@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{
     Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
@@ -259,7 +260,6 @@ impl StorageProvider for LocalFsStorageProvider {
     }
 
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        use futures::TryStreamExt;
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out: Vec<String> = Vec::new();
