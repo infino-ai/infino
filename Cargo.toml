@@ -33,6 +33,10 @@ path = "src/lib.rs"
 # `dev-dependencies` self-reference below auto-enables this for
 # test + bench builds.
 test-helpers = []
+# Opt-in diagnostic benches that are useful for storage/request-shape
+# work or release-profile recall gates, but should not run as part of a
+# plain `cargo bench`.
+bench-diagnostics = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
@@ -249,13 +253,12 @@ path = "tests/superfile/main.rs"
 name = "supertable"
 path = "tests/supertable/main.rs"
 
-# Bench bundles. One criterion binary per topic (FTS, vector), each
-# wrapping superfile + supertable sub-groups so the topic ships as
-# a single `[[bench]]` stanza. Additionally, fts is split into
-# fts-superfile and fts-supertable to avoid unnecessary setup overhead
-# when running only one benchmark type.
+# Bench bundles. Superfile-scale FTS/vector benches stay split by
+# topic because their 1M builds are cheap enough to sample independently.
+# Supertable-scale FTS/vector benches share one combined 10M table in the
+# `supertable` bench so the expensive table is built once and reused.
 [[bench]]
-name = "fts"
+name = "superfile_fts"
 path = "benches/fts/main.rs"
 harness = false
 
@@ -265,22 +268,24 @@ path = "benches/fts/main_superfile.rs"
 harness = false
 
 [[bench]]
-name = "fts-supertable"
-path = "benches/fts/main_supertable.rs"
+name = "superfile_vector"
+path = "benches/vector/main.rs"
 harness = false
 
 [[bench]]
-name = "vector"
-path = "benches/vector/main.rs"
+name = "supertable_all"
+path = "benches/supertable/main.rs"
 harness = false
 
 [[bench]]
 name = "object-store"
 path = "benches/object_store/main.rs"
 harness = false
+required-features = ["bench-diagnostics"]
 
 [[bench]]
 name = "scale"
 path = "benches/scale/main.rs"
 harness = false
+required-features = ["bench-diagnostics"]
 

@@ -1,12 +1,13 @@
-//! Supertable FTS bench (10M docs). Standalone binary.
+//! Legacy standalone Supertable FTS bench entrypoint.
+//!
+//! The canonical 10M supertable bench is now `supertable_all`, which
+//! builds one combined text+vector table and runs both FTS and vector
+//! groups against it.
 //!
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench fts-supertable                            # all supertable FTS
-//! cargo bench --bench fts-supertable -- supertable_fts_build    # ingest only
-//! cargo bench --bench fts-supertable -- supertable_fts_search   # search only
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts-supertable
+//! cargo bench --bench supertable_all -- supertable_fts_search   # canonical FTS search
 //! ```
 
 use infino_bench_utils::fts_supertable;

@@ -24,9 +24,9 @@ use bytes::Bytes;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
@@ -58,6 +58,13 @@ pub(super) enum Sq8ColumnMeta {
     },
 }
 
+#[derive(Debug)]
+struct Sq8ParsedMeta {
+    scale: Vec<f32>,
+    offset: Vec<f32>,
+    per_doc_norms: Option<Vec<f32>>,
+}
+
 /// Per-column reader state; cached at open time.
 #[derive(Debug)]
 pub struct ColumnReader {
@@ -80,6 +87,7 @@ pub struct ColumnReader {
     /// docs / column). Materialising here amortizes the parse
     /// across every search call.
     pub(super) sq8_meta: Option<Sq8ColumnMeta>,
+    lazy_sq8_parsed: OnceLock<Arc<Sq8ParsedMeta>>,
     /// Byte range of this column's subsection within the outer blob.
     subsection_range: Range<usize>,
     /// Offsets relative to the subsection start.
@@ -141,6 +149,35 @@ impl ColumnReader {
         let start = sub_start + self.per_cluster_blocks_off + (cluster_doc_off as usize) * stride;
         let len = (cluster_count as usize) * stride;
         start..start + len
+    }
+
+    pub(super) fn cluster_codes_doc_ids_range(
+        &self,
+        cluster_doc_off: u32,
+        cluster_count: u32,
+    ) -> Range<usize> {
+        let sub_start = self.subsection_range.start;
+        let start = sub_start
+            + self.per_cluster_blocks_off
+            + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
+        let len = (cluster_count as usize) * (self.quant.code_bytes() + 4);
+        start..start + len
+    }
+
+    pub(super) fn cluster_rerank_row_range(
+        &self,
+        cluster_doc_off: u32,
+        cluster_count: u32,
+        local_idx: usize,
+    ) -> Range<usize> {
+        let sub_start = self.subsection_range.start;
+        let block_start = sub_start
+            + self.per_cluster_blocks_off
+            + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
+        let prefix_len = (cluster_count as usize) * (self.quant.code_bytes() + 4);
+        let start =
+            block_start + prefix_len + local_idx * self.rerank_codec.per_vector_bytes(self.dim);
+        start..start + self.rerank_codec.per_vector_bytes(self.dim)
     }
 
     /// Per-doc byte stride inside a cluster block:
@@ -791,10 +828,8 @@ impl VectorReader {
                 ))));
             }
             let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
-            let codec_meta_required_zero = matches!(
-                rerank_codec,
-                RerankCodec::Fp32 | RerankCodec::RabitqOnly
-            );
+            let codec_meta_required_zero =
+                matches!(rerank_codec, RerankCodec::Fp32 | RerankCodec::RabitqOnly);
 
             let codec_meta_size = read_u32_le(&sub_header[12..16]) as usize;
             let summary_off = read_u64_le(&sub_header[16..24]) as usize;
@@ -940,6 +975,7 @@ impl VectorReader {
                 rot_seed,
                 rerank_codec,
                 sq8_meta,
+                lazy_sq8_parsed: OnceLock::new(),
                 subsection_range: subsection_off..sub_end,
                 summary_off,
                 summary_radius,
@@ -1058,10 +1094,11 @@ impl VectorReader {
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        // 2. Score centroids → top `nprobe` clusters.
-        let mut centroid_scores = score_centroids(&centroids, col, query);
         let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
-        centroid_scores.truncate(nprobe_eff);
+        // 2. Score centroids → top `nprobe` clusters. Only the
+        // retained probe set is fully sorted; the tail centroids are
+        // partitioned away with `select_nth_unstable_by`.
+        let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
         // 3. Rotate query once for the 1-bit code estimator.
         let mut q_rot = vec![0f32; col.dim];
@@ -1092,22 +1129,44 @@ impl VectorReader {
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(nprobe_eff);
         let mut cluster_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
+        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
         for &(c, _) in &centroid_scores {
             let (off, cnt) = read_cluster_entry(&cluster_idx, c);
             if cnt == 0 {
                 continue;
             }
             cluster_ranges.push(col.cluster_block_range(off, cnt));
+            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
             cluster_meta.push((c, off, cnt));
         }
         let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
-        let (cluster_blocks, lazy_sq8_meta_bytes) = get_cluster_ranges_coalesced_with_extra(
-            &self.source,
-            &cluster_ranges,
-            lazy_sq8_meta_range,
-        )
-        .await
-        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
+            .iter()
+            .map(|range| self.source.try_get_range_sync(range.clone()))
+            .collect();
+        let survivor_only_rerank_fetch = prefix_blocks_sync.is_some();
+        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
+        {
+            let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
+                let mut fetched = self
+                    .source
+                    .get_ranges_parallel_async(&[range])
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                fetched.pop()
+            } else {
+                None
+            };
+            (prefix_blocks, meta_bytes)
+        } else {
+            get_cluster_ranges_coalesced_with_extra(
+                &self.source,
+                &cluster_ranges,
+                lazy_sq8_meta_range,
+            )
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?
+        };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
         // Each cluster block is `[codes_chunk][doc_ids_chunk]
@@ -1127,31 +1186,59 @@ impl VectorReader {
         // is re-sorted by estimate immediately below, so the parallel
         // and serial shortlists rank identically.
         let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
-        let score_block = |(&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
-            let codes_len = (cnt as usize) * cb;
-            let doc_ids_len = (cnt as usize) * 4;
-            debug_assert_eq!(
-                block.len(),
-                codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
-            );
-            let codes = block.slice(0..codes_len);
-            let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-            score_cluster_codes(&codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot)
+        let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+            k
+        } else {
+            k.saturating_mul(rerank_mult)
         };
-        let mut shortlist: Vec<(u32, f32, u32, u32)> =
-            if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-                cluster_meta
-                    .par_iter()
-                    .zip(cluster_blocks.par_iter())
-                    .flat_map_iter(score_block)
-                    .collect()
-            } else {
-                cluster_meta
-                    .iter()
-                    .zip(cluster_blocks.iter())
-                    .flat_map(score_block)
-                    .collect()
+        if coarse_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let score_block =
+            |heap: &mut BoundedCoarseHeap,
+             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+                let codes_len = (cnt as usize) * cb;
+                let doc_ids_len = (cnt as usize) * 4;
+                debug_assert_eq!(
+                    block.len(),
+                    if survivor_only_rerank_fetch {
+                        codes_len + doc_ids_len
+                    } else {
+                        codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
+                    }
+                );
+                let codes = block.slice(0..codes_len);
+                let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+                score_cluster_codes_into_heap(
+                    &codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot, heap,
+                );
             };
+        let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+            cluster_meta
+                .par_iter()
+                .zip(cluster_blocks.par_iter())
+                .fold(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut heap, item| {
+                        score_block(&mut heap, item);
+                        heap
+                    },
+                )
+                .reduce(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut left, right| {
+                        left.merge(right);
+                        left
+                    },
+                )
+        } else {
+            let mut heap = BoundedCoarseHeap::new(coarse_limit);
+            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+                score_block(&mut heap, item);
+            }
+            heap
+        };
+        let mut shortlist = shortlist_heap.into_vec();
 
         if shortlist.is_empty() {
             return Ok(Vec::new());
@@ -1178,12 +1265,6 @@ impl VectorReader {
         // dependent). M5 will surface the bench numbers.
         if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
             let _ = rerank_mult;
-            if shortlist.len() > k {
-                shortlist.select_nth_unstable_by(k - 1, |a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-                });
-                shortlist.truncate(k);
-            }
             shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
             return Ok(shortlist
                 .into_iter()
@@ -1191,24 +1272,12 @@ impl VectorReader {
                 .collect());
         }
 
-        // 6. Trim to `k × rerank_mult` by descending estimate.
-        let want = (k.saturating_mul(rerank_mult)).min(shortlist.len());
-        if want < shortlist.len() {
-            shortlist.select_nth_unstable_by(want.saturating_sub(1), |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-            });
-            shortlist.truncate(want);
-        }
-
-        // 7. Gather the rerank vectors for the survivors from the
-        //    cluster blocks already in hand — no second fetch. Each
-        //    block's `full_chunk` follows its `[codes][doc_ids]`
-        //    prefix; candidate at cluster-order position `pos =
-        //    cluster_doc_off + i` lives at in-block offset
-        //    `cnt*cb + cnt*4 + i*stride`. We pack the survivors
-        //    contiguously in shortlist order (a ~`k × rerank_mult ×
-        //    stride` memcpy, tens of KiB) so the rerank kernel's
-        //    indexing stays trivial and codec-agnostic.
+        // 6. Build lightweight rerank references into the cluster
+        //    blocks already in hand — no second fetch and no survivor
+        //    byte packing. Each block's `full_chunk` follows its
+        //    `[codes][doc_ids]` prefix; candidate at cluster-order
+        //    position `pos = cluster_doc_off + i` lives at in-block
+        //    offset `cnt*cb + cnt*4 + i*stride`.
         //
         //    Because `full[]` rides inside the per-cluster block,
         //    the whole cold first search is just the `nprobe`
@@ -1220,27 +1289,55 @@ impl VectorReader {
             block_by_cid.insert(c as u32, bi);
         }
         let stride = full_vec_bytes;
-        let mut packed = vec![0u8; shortlist.len() * stride];
-        for (i, &(_, _, pos, cluster_id)) in shortlist.iter().enumerate() {
+        let mut candidates = Vec::with_capacity(shortlist.len());
+        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+            Some(Vec::with_capacity(shortlist.len()))
+        } else {
+            None
+        };
+        for &(did, _, pos, cluster_id) in &shortlist {
             let bi = block_by_cid[&cluster_id];
             let (_, off, cnt) = cluster_meta[bi];
-            let block = &cluster_blocks[bi];
             let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
             let local = (pos - off) as usize;
-            let s = full_start + local * stride;
-            packed[i * stride..(i + 1) * stride].copy_from_slice(&block[s..s + stride]);
+            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+                let idx = ranges.len();
+                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+                Some(idx)
+            } else {
+                None
+            };
+            candidates.push(RerankCandidate {
+                did,
+                pos,
+                cluster_id,
+                block_idx: bi,
+                full_off: full_start + local * stride,
+                full_idx,
+            });
         }
+        let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
+            Some(
+                self.source
+                    .get_ranges_parallel_async(&ranges)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         // 8. CPU-only rerank using the true metric. Sq8 columns
         //    pre-build a per-query kernel that folds the per-dim
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
         //    + SIMD dot. Fp32 takes the flat dispatch.
-        rerank_candidates_packed(
+        rerank_candidates_from_blocks(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
-            &packed,
-            &shortlist,
+            &cluster_blocks,
+            survivor_full_rows.as_deref(),
+            &candidates,
             col,
             query,
             k,
@@ -1279,15 +1376,20 @@ impl VectorReader {
 }
 
 /// Score `query` against every centroid in `centroids_bytes` and
-/// return the per-cluster `(cluster_id, distance)` pairs sorted by
-/// ascending distance (closest first). Caller truncates to `nprobe`.
+/// return the top `nprobe` `(cluster_id, distance)` pairs sorted by
+/// ascending distance (closest first).
 ///
 /// Takes a `&[u8]` view so the caller can hand in either an
 /// in-memory subsection slice or the just-fetched centroids
 /// region bytes from [`Source::get_range`] — both reach this
 /// helper through the same shape.
 #[inline]
-fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) -> Vec<(usize, f32)> {
+fn score_centroids(
+    centroids_bytes: &[u8],
+    col: &ColumnReader,
+    query: &[f32],
+    nprobe: usize,
+) -> Vec<(usize, f32)> {
     // Centroids are stored as fp32 regardless of the column's rerank
     // codec — only the per-doc `full[]` region compresses. `distance_bytes`
     // assumes fp32, which is correct here.
@@ -1298,6 +1400,12 @@ fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) ->
             (c, distance_bytes(col.metric, query, bytes))
         })
         .collect();
+    if nprobe < scores.len() {
+        scores.select_nth_unstable_by(nprobe, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
+        });
+        scores.truncate(nprobe);
+    }
     scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     scores
 }
@@ -1310,19 +1418,8 @@ fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) ->
 /// supertable's `nprobe × segments` fan-out goes parallel.
 const PARALLEL_SCAN_MIN: usize = 2048;
 
-/// Score one cluster's 1-bit codes against the rotated query and
-/// return `(doc_id, estimate, pos_in_full, cluster_id)` tuples.
-/// `pos = off + i` is the candidate's index in the
-/// column's `full[]` array — captured here at no extra cost so the
-/// rerank step doesn't need any lookup table. `cluster_id` is
-/// captured for the Sq8PerCluster rerank dispatch: each candidate
-/// knows which cluster's `(scale, offset)` quantizer to dequant
-/// against. For Fp32/RabitqOnly the cluster_id is recorded but
-/// ignored by the rerank step (kept for layout simplicity — the
-/// extra 4 bytes per shortlist entry are noise next to the
-/// `k × rerank_mult` heap traffic).
 #[inline]
-fn score_cluster_codes(
+fn score_cluster_codes_into_heap(
     cluster_codes: &[u8],
     cluster_doc_ids: &[u8],
     cnt: u32,
@@ -1330,30 +1427,144 @@ fn score_cluster_codes(
     cluster_id: u32,
     quant: &BitQuantizer,
     q_rot: &[f32],
-) -> Vec<(u32, f32, u32, u32)> {
+    out: &mut BoundedCoarseHeap,
+) {
     let cb = quant.code_bytes();
-    // Per-query precompute for the AVX-512 RaBitQ estimator: the
-    // estimate is `2 * Σ_{bit=1} q_rot[d] − q_total`; the second
-    // term is constant across every candidate scored against
-    // this query, so we hoist it out of the per-doc loop. Cost
-    // ≪ 1 % across the typical IVF probe (thousands of candidates).
-    // Non-AVX-512 hosts ignore the precomputed value and fall
-    // back to the original sign-table kernel, so the numeric
-    // result is identical regardless.
     let q_total: f32 = q_rot.iter().sum();
-    (0..cnt as usize)
-        .map(|i| {
-            let code = &cluster_codes[i * cb..(i + 1) * cb];
-            let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
-            let did = u32::from_le_bytes([
-                cluster_doc_ids[i * 4],
-                cluster_doc_ids[i * 4 + 1],
-                cluster_doc_ids[i * 4 + 2],
-                cluster_doc_ids[i * 4 + 3],
-            ]);
-            (did, est, off + i as u32, cluster_id)
-        })
-        .collect()
+    for i in 0..cnt as usize {
+        let code = &cluster_codes[i * cb..(i + 1) * cb];
+        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
+        let did = u32::from_le_bytes([
+            cluster_doc_ids[i * 4],
+            cluster_doc_ids[i * 4 + 1],
+            cluster_doc_ids[i * 4 + 2],
+            cluster_doc_ids[i * 4 + 3],
+        ]);
+        out.push(CoarseCandidate {
+            did,
+            estimate: est,
+            pos: off + i as u32,
+            cluster_id,
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoarseCandidate {
+    did: u32,
+    estimate: f32,
+    pos: u32,
+    cluster_id: u32,
+}
+
+impl PartialEq for CoarseCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.estimate == other.estimate
+            && self.did == other.did
+            && self.pos == other.pos
+            && self.cluster_id == other.cluster_id
+    }
+}
+
+impl Eq for CoarseCandidate {}
+
+impl PartialOrd for CoarseCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CoarseCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap. Reverse estimate ordering so `peek()`
+        // is the worst retained candidate; higher estimates are better.
+        other
+            .estimate
+            .partial_cmp(&self.estimate)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| other.did.cmp(&self.did))
+            .then_with(|| other.pos.cmp(&self.pos))
+            .then_with(|| other.cluster_id.cmp(&self.cluster_id))
+    }
+}
+
+struct BoundedCoarseHeap {
+    limit: usize,
+    heap: BinaryHeap<CoarseCandidate>,
+}
+
+impl BoundedCoarseHeap {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.max(1)),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, candidate: CoarseCandidate) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.heap.len() < self.limit {
+            self.heap.push(candidate);
+            return;
+        }
+        if self
+            .heap
+            .peek()
+            .is_some_and(|worst| candidate.estimate > worst.estimate)
+        {
+            let mut worst = self
+                .heap
+                .peek_mut()
+                .expect("heap is non-empty because len == limit");
+            *worst = candidate;
+        }
+    }
+
+    fn merge(&mut self, other: BoundedCoarseHeap) {
+        for candidate in other.heap {
+            self.push(candidate);
+        }
+    }
+
+    fn into_vec(self) -> Vec<(u32, f32, u32, u32)> {
+        self.heap
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.did,
+                    candidate.estimate,
+                    candidate.pos,
+                    candidate.cluster_id,
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RerankCandidate {
+    did: u32,
+    pos: u32,
+    cluster_id: u32,
+    block_idx: usize,
+    full_off: usize,
+    full_idx: Option<usize>,
+}
+
+#[inline]
+fn candidate_full_bytes<'a>(
+    blocks: &'a [Bytes],
+    survivor_full_rows: Option<&'a [Bytes]>,
+    cand: &RerankCandidate,
+    stride: usize,
+) -> &'a [u8] {
+    if let (Some(rows), Some(idx)) = (survivor_full_rows, cand.full_idx) {
+        return &rows[idx];
+    }
+    &blocks[cand.block_idx][cand.full_off..cand.full_off + stride]
 }
 
 /// Decode one cluster's `(off, cnt)` entry from
@@ -1380,15 +1591,10 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 /// Full-precision rerank over `shortlist`, returning the top-`k`
 /// `(doc_id, distance)` pairs sorted by ascending distance.
 ///
-/// `packed` holds the candidate vectors contiguously **in
-/// shortlist order**: candidate `i`'s `full[]` bytes are at
-/// `packed[i × stride .. (i + 1) × stride)`, where `stride =
-/// col.rerank_codec.per_vector_bytes(col.dim)`. The caller
-/// gathers `packed` from the per-cluster rerank runs so this
-/// kernel never has to map a global `pos` to a byte offset — it
-/// just walks `packed` candidate-by-candidate. The candidate's
-/// global `pos` is still carried in the shortlist tuple and used
-/// for the Sq8 per-doc-norm lookup.
+/// `candidates` points into the already-fetched per-cluster blocks:
+/// each entry carries `(block_idx, full_off)` for its `full[]` row.
+/// That avoids allocating and copying a packed survivor buffer on
+/// every query while still keeping rerank byte lookup O(1).
 ///
 /// Dispatches on `col.rerank_codec`:
 /// - **Fp32**: flat dispatch via [`distance_bytes_codec`]
@@ -1399,11 +1605,12 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 ///   per-doc decoded-norm cached at encode time short-circuits
 ///   `Σx²` for L2Sq).
 #[inline]
-async fn rerank_candidates_packed(
+async fn rerank_candidates_from_blocks(
     source: &Source,
     lazy_sq8_meta_bytes: Option<&Bytes>,
-    packed: &[u8],
-    shortlist: &[(u32, f32, u32, u32)],
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    candidates: &[RerankCandidate],
     col: &ColumnReader,
     query: &[f32],
     k: usize,
@@ -1417,18 +1624,17 @@ async fn rerank_candidates_packed(
             // rerank_mult on the supertable fan-out). The output is
             // sorted by distance below, so parallel and serial rank
             // identically.
-            let rerank_one = |(i, &(did, _, _, _)): (usize, &(u32, f32, u32, u32))| {
-                let start = i * stride;
-                let bytes = &packed[start..start + stride];
+            let rerank_one = |cand: &RerankCandidate| {
+                let bytes = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
                 (
-                    did,
+                    cand.did,
                     distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
                 )
             };
-            if shortlist.len() >= PARALLEL_SCAN_MIN {
-                shortlist.par_iter().enumerate().map(rerank_one).collect()
+            if candidates.len() >= PARALLEL_SCAN_MIN {
+                candidates.par_iter().map(rerank_one).collect()
             } else {
-                shortlist.iter().enumerate().map(rerank_one).collect()
+                candidates.iter().map(rerank_one).collect()
             }
         }
         RerankCodec::Sq8Residual => {
@@ -1454,7 +1660,7 @@ async fn rerank_candidates_packed(
                     // dequant + SIMD dot parallelizes across the
                     // shortlist — this is the high-rerank_mult supertable
                     // path that dominates the in-memory query time.
-                    let mut cids: Vec<u32> = shortlist.iter().map(|&(_, _, _, c)| c).collect();
+                    let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
                     cids.sort_unstable();
                     cids.dedup();
                     let kernels: HashMap<u32, Sq8Kernel> = cids
@@ -1475,32 +1681,47 @@ async fn rerank_candidates_packed(
                             )
                         })
                         .collect();
-                    let score_one =
-                        |(i, &(did, _, pos, cluster_id)): (usize, &(u32, f32, u32, u32))| {
-                            let start = i * stride;
-                            let code = &packed[start..start + dim];
-                            let kernel = kernels
-                                .get(&cluster_id)
-                                .expect("kernel prebuilt for every probed cluster");
-                            (did, kernel.distance_at(pos, code), i, pos, cluster_id)
-                        };
-                    let scored: Vec<(u32, f32, usize, u32, u32)> =
-                        if shortlist.len() >= PARALLEL_SCAN_MIN {
-                            shortlist.par_iter().enumerate().map(score_one).collect()
-                        } else {
-                            shortlist.iter().enumerate().map(score_one).collect()
-                        };
-                    residual_refine(scored, packed, stride, dim, k, |cluster_id| {
-                        let c = cluster_id as usize;
-                        Sq8ResidualKernel::new(
-                            col.metric,
-                            query,
-                            &scale[c * dim..(c + 1) * dim],
-                            &offset[c * dim..(c + 1) * dim],
-                            SQ8_RESIDUAL_DIVISOR,
-                            per_doc_norms.as_deref(),
+                    let score_one = |(i, cand): (usize, &RerankCandidate)| {
+                        let row =
+                            candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+                        let code = &row[..dim];
+                        let kernel = kernels
+                            .get(&cand.cluster_id)
+                            .expect("kernel prebuilt for every probed cluster");
+                        (
+                            cand.did,
+                            kernel.distance_at(cand.pos, code),
+                            i,
+                            cand.pos,
+                            cand.cluster_id,
                         )
-                    })
+                    };
+                    let scored: Vec<(u32, f32, usize, u32, u32)> =
+                        if candidates.len() >= PARALLEL_SCAN_MIN {
+                            candidates.par_iter().enumerate().map(score_one).collect()
+                        } else {
+                            candidates.iter().enumerate().map(score_one).collect()
+                        };
+                    residual_refine_from_blocks(
+                        scored,
+                        cluster_blocks,
+                        survivor_full_rows,
+                        candidates,
+                        stride,
+                        dim,
+                        k,
+                        |cluster_id| {
+                            let c = cluster_id as usize;
+                            Sq8ResidualKernel::new(
+                                col.metric,
+                                query,
+                                &scale[c * dim..(c + 1) * dim],
+                                &offset[c * dim..(c + 1) * dim],
+                                SQ8_RESIDUAL_DIVISOR,
+                                per_doc_norms.as_deref(),
+                            )
+                        },
+                    )
                 }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
@@ -1508,40 +1729,57 @@ async fn rerank_candidates_packed(
                     norms_abs_off,
                 } => {
                     if let Some(meta_bytes) = lazy_sq8_meta_bytes {
-                        let so_block_bytes = (col.n_cent as usize) * dim * 4;
-                        let scale_end = so_block_bytes;
-                        let offset_end = scale_end + so_block_bytes;
-                        let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
-                        let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                        let per_doc_norms = norms_abs_off.map(|_| {
-                            let norms_end = offset_end + (col.n_docs as usize) * 4;
-                            parse_f32_le_vec(&meta_bytes[offset_end..norms_end])
-                        });
+                        let parsed = Arc::clone(col.lazy_sq8_parsed.get_or_init(|| {
+                            Arc::new(parse_sq8_meta_bytes(
+                                meta_bytes,
+                                col.n_cent as usize,
+                                dim,
+                                col.n_docs as usize,
+                                norms_abs_off.is_some(),
+                            ))
+                        }));
+                        let scale = parsed.scale.as_slice();
+                        let offset = parsed.offset.as_slice();
+                        let per_doc_norms = parsed.per_doc_norms.as_deref();
                         let mut kernel_cache: HashMap<u32, Sq8Kernel> = HashMap::new();
-                        let scored: Vec<(u32, f32, usize, u32, u32)> = shortlist
+                        let scored: Vec<(u32, f32, usize, u32, u32)> = candidates
                             .iter()
                             .enumerate()
-                            .map(|(i, &(did, _, pos, cluster_id))| {
-                                let start = i * stride;
-                                let code = &packed[start..start + dim];
-                                let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
-                                    let c = cluster_id as usize;
-                                    let scale_c = &scale[c * dim..(c + 1) * dim];
-                                    let offset_c = &offset[c * dim..(c + 1) * dim];
-                                    Sq8Kernel::new(
-                                        col.metric,
-                                        query,
-                                        scale_c,
-                                        offset_c,
-                                        per_doc_norms.as_deref(),
-                                    )
-                                });
-                                (did, kernel.distance_at(pos, code), i, pos, cluster_id)
+                            .map(|(i, cand)| {
+                                let row = candidate_full_bytes(
+                                    cluster_blocks,
+                                    survivor_full_rows,
+                                    cand,
+                                    stride,
+                                );
+                                let code = &row[..dim];
+                                let kernel =
+                                    kernel_cache.entry(cand.cluster_id).or_insert_with(|| {
+                                        let c = cand.cluster_id as usize;
+                                        let scale_c = &scale[c * dim..(c + 1) * dim];
+                                        let offset_c = &offset[c * dim..(c + 1) * dim];
+                                        Sq8Kernel::new(
+                                            col.metric,
+                                            query,
+                                            scale_c,
+                                            offset_c,
+                                            per_doc_norms,
+                                        )
+                                    });
+                                (
+                                    cand.did,
+                                    kernel.distance_at(cand.pos, code),
+                                    i,
+                                    cand.pos,
+                                    cand.cluster_id,
+                                )
                             })
                             .collect();
-                        return Ok(residual_refine(
+                        return Ok(residual_refine_from_blocks(
                             scored,
-                            packed,
+                            cluster_blocks,
+                            survivor_full_rows,
+                            candidates,
                             stride,
                             dim,
                             k,
@@ -1553,12 +1791,12 @@ async fn rerank_candidates_packed(
                                     &scale[c * dim..(c + 1) * dim],
                                     &offset[c * dim..(c + 1) * dim],
                                     SQ8_RESIDUAL_DIVISOR,
-                                    per_doc_norms.as_deref(),
+                                    per_doc_norms,
                                 )
                             },
                         ));
                     }
-                    let mut clusters: Vec<u32> = shortlist.iter().map(|&(_, _, _, c)| c).collect();
+                    let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
                     clusters.sort_unstable();
                     clusters.dedup();
 
@@ -1582,14 +1820,14 @@ async fn rerank_candidates_packed(
 
                     let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
                         let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
-                        for &(_, _, pos, cluster_id) in shortlist {
+                        for cand in candidates {
                             spans
-                                .entry(cluster_id)
+                                .entry(cand.cluster_id)
                                 .and_modify(|(lo, hi)| {
-                                    *lo = (*lo).min(pos);
-                                    *hi = (*hi).max(pos);
+                                    *lo = (*lo).min(cand.pos);
+                                    *hi = (*hi).max(cand.pos);
                                 })
-                                .or_insert((pos, pos));
+                                .or_insert((cand.pos, cand.pos));
                         }
                         let mut span_items: Vec<(u32, u32, u32)> = spans
                             .into_iter()
@@ -1616,14 +1854,19 @@ async fn rerank_candidates_packed(
                         None
                     };
 
-                    let scored: Vec<(u32, f32, usize, u32, u32)> = shortlist
+                    let scored: Vec<(u32, f32, usize, u32, u32)> = candidates
                         .iter()
                         .enumerate()
-                        .map(|(i, &(did, _, pos, cluster_id))| {
-                            let start = i * stride;
-                            let code = &packed[start..start + dim];
+                        .map(|(i, cand)| {
+                            let row = candidate_full_bytes(
+                                cluster_blocks,
+                                survivor_full_rows,
+                                cand,
+                                stride,
+                            );
+                            let code = &row[..dim];
                             let (scale, offset) = scale_offset_by_cluster
-                                .get(&cluster_id)
+                                .get(&cand.cluster_id)
                                 .expect("cluster metadata fetched");
                             let kernel = Sq8Kernel::new(
                                 col.metric,
@@ -1632,13 +1875,13 @@ async fn rerank_candidates_packed(
                                 offset.as_slice(),
                                 None,
                             );
-                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&pos).copied());
+                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&cand.pos).copied());
                             (
-                                did,
+                                cand.did,
                                 kernel.distance_with_norm(code, norm),
                                 i,
-                                pos,
-                                cluster_id,
+                                cand.pos,
+                                cand.cluster_id,
                             )
                         })
                         .collect();
@@ -1647,18 +1890,22 @@ async fn rerank_candidates_packed(
                     // explicitly because the lazy norms live in a
                     // sparse `pos → norm` map, not a contiguous slice.
                     let mut scored = scored;
-                    scored.sort_unstable_by(|a, b| {
-                        a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
-                    });
+                    scored
+                        .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
                     let final_refine = k.saturating_mul(2).max(k).min(scored.len());
                     scored.truncate(final_refine);
                     let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
                     scored
                         .into_iter()
                         .map(|(did, _, i, pos, cluster_id)| {
-                            let start = i * stride;
-                            let code = &packed[start..start + dim];
-                            let residual = &packed[start + dim..start + dim * 2];
+                            let row = candidate_full_bytes(
+                                cluster_blocks,
+                                survivor_full_rows,
+                                &candidates[i],
+                                stride,
+                            );
+                            let code = &row[..dim];
+                            let residual = &row[dim..dim * 2];
                             let kernel = rk.entry(cluster_id).or_insert_with(|| {
                                 let (scale, offset) = scale_offset_by_cluster
                                     .get(&cluster_id)
@@ -1690,15 +1937,16 @@ async fn rerank_candidates_packed(
 }
 
 /// `Sq8Residual` final-refine pass. Takes the Sq8-scored shortlist
-/// (`(did, sq8_dist, packed_idx, pos, cluster_id)`), keeps the lowest
+/// (`(did, sq8_dist, candidate_idx, pos, cluster_id)`), keeps the lowest
 /// `2·k` by Sq8 distance, then re-scores just that set with the
 /// residual-corrected [`Sq8ResidualKernel`] (built per cluster via
-/// `make_kernel`). Each candidate's `2·dim` body in `packed` is
-/// `[code dim u8 ‖ residual dim i8]`. The caller applies the final
-/// sort + `truncate(k)`.
-fn residual_refine<'a>(
+/// `make_kernel`). The candidate index points into `candidates`,
+/// whose row bytes are read directly from `cluster_blocks`.
+fn residual_refine_from_blocks<'a>(
     mut scored: Vec<(u32, f32, usize, u32, u32)>,
-    packed: &[u8],
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    candidates: &[RerankCandidate],
     stride: usize,
     dim: usize,
     k: usize,
@@ -1711,13 +1959,39 @@ fn residual_refine<'a>(
     scored
         .into_iter()
         .map(|(did, _, i, pos, cluster_id)| {
-            let start = i * stride;
-            let code = &packed[start..start + dim];
-            let residual = &packed[start + dim..start + dim * 2];
-            let kernel = rk.entry(cluster_id).or_insert_with(|| make_kernel(cluster_id));
+            let row =
+                candidate_full_bytes(cluster_blocks, survivor_full_rows, &candidates[i], stride);
+            let code = &row[..dim];
+            let residual = &row[dim..dim * 2];
+            let kernel = rk
+                .entry(cluster_id)
+                .or_insert_with(|| make_kernel(cluster_id));
             (did, kernel.distance_at(pos, code, residual))
         })
         .collect()
+}
+
+fn parse_sq8_meta_bytes(
+    bytes: &[u8],
+    n_cent: usize,
+    dim: usize,
+    n_docs: usize,
+    has_norms: bool,
+) -> Sq8ParsedMeta {
+    let so_block_bytes = n_cent * dim * 4;
+    let scale_end = so_block_bytes;
+    let offset_end = scale_end + so_block_bytes;
+    let scale = parse_f32_le_vec(&bytes[0..scale_end]);
+    let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
+    let per_doc_norms = has_norms.then(|| {
+        let norms_end = offset_end + n_docs * 4;
+        parse_f32_le_vec(&bytes[offset_end..norms_end])
+    });
+    Sq8ParsedMeta {
+        scale,
+        offset,
+        per_doc_norms,
+    }
 }
 
 #[inline]
@@ -2362,7 +2636,10 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
         assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
-        assert_ne!(col.codec_meta_off, 0, "Sq8Residual must declare codec_meta_off > 0");
+        assert_ne!(
+            col.codec_meta_off, 0,
+            "Sq8Residual must declare codec_meta_off > 0"
+        );
 
         // full[] is n_docs × 2·dim (code + residual sidecar).
         let cb = col.quant.code_bytes();
@@ -2925,10 +3202,7 @@ mod tests {
         async_calls.store(0, AtomicOrdering::Relaxed);
         sync_calls.store(0, AtomicOrdering::Relaxed);
         let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
-        let _ = r
-            .search("v", &query, 5, n_cent, 5)
-            .await
-            .expect("search");
+        let _ = r.search("v", &query, 5, n_cent, 5).await.expect("search");
 
         // Upper-bound sync fetches for None / nprobe = n_cent:
         //   centroids (1) + cluster_idx (1)
@@ -4279,7 +4553,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_lazy_small_sq8_segment_fetches_exact_metadata_ranges() {
-        let (blob, json, _) = build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let (blob, json, _) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
 
@@ -4332,7 +4607,11 @@ mod tests {
     /// metadata field.
     #[tokio::test]
     async fn open_lazy_search_matches_eager_open_per_codec() {
-        for codec in [RerankCodec::Fp32, RerankCodec::Sq8Residual, RerankCodec::RabitqOnly] {
+        for codec in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8Residual,
+            RerankCodec::RabitqOnly,
+        ] {
             let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
             let r_eager = VectorReader::open(blob.clone(), &json)
                 .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
@@ -4380,7 +4659,8 @@ mod tests {
     /// well-distributed corpus the budget is hit exactly.
     #[tokio::test]
     async fn cold_first_search_after_open_lazy_within_nprobe_plus_one_ranges() {
-        let (blob, json, all) = build_small_segment(32, 8, 128, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let (blob, json, all) =
+            build_small_segment(32, 8, 128, RerankCodec::Sq8Residual, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -4448,7 +4728,8 @@ mod tests {
     /// `block_in_place` reason as the M3 test above.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cold_first_search_dispatches_cluster_gets_concurrently() {
-        let (blob, json, all) = build_small_segment(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let (blob, json, all) =
+            build_small_segment(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -4508,7 +4789,11 @@ mod tests {
     /// from two separate ranges to one combined block).
     #[tokio::test]
     async fn m3_combined_cluster_fetch_matches_eager_open_per_codec() {
-        for codec in [RerankCodec::Fp32, RerankCodec::Sq8Residual, RerankCodec::RabitqOnly] {
+        for codec in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8Residual,
+            RerankCodec::RabitqOnly,
+        ] {
             let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
             let r_eager = VectorReader::open(blob.clone(), &json)
                 .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
@@ -4549,7 +4834,8 @@ mod tests {
     /// inside the fetched block.
     #[test]
     fn cluster_block_range_matches_v1_layout_invariant() {
-        let (blob, json, _) = build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let (blob, json, _) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let col = &r.columns[0];
         let cb = col.quant.code_bytes();
@@ -4617,7 +4903,8 @@ mod tests {
     /// field surfaces unchanged.
     #[tokio::test]
     async fn open_lazy_column_metadata_matches_eager_open() {
-        let (blob, json, _) = build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let (blob, json, _) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         // Simulate the object-store path: with no zero-copy sync read

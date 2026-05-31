@@ -607,8 +607,10 @@ impl SuperfileReader {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(v.search(column, query, k, options.nprobe, options.rerank_mult)
-            .await?)
+        Ok(
+            v.search(column, query, k, options.nprobe, options.rerank_mult)
+                .await?,
+        )
     }
 }
 

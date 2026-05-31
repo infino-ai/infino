@@ -15,7 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
-use infino::supertable::{Supertable, SupertableOptions, SuperfileUri};
+use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
@@ -229,11 +229,7 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
         object_size: bytes.len() as u64,
         storage_label: fixture.storage_label,
         real_s3: fixture.real_s3,
-        cleanup_path: if fixture.real_s3 {
-            Some(path)
-        } else {
-            None
-        },
+        cleanup_path: if fixture.real_s3 { Some(path) } else { None },
         _keepalive: fixture._keepalive,
     }
 }
@@ -278,7 +274,9 @@ pub fn consumer_options(
 }
 
 pub async fn open_consumer(opts: SupertableOptions) -> Supertable {
-    Supertable::open(opts).await.expect("Supertable::open from object store")
+    Supertable::open(opts)
+        .await
+        .expect("Supertable::open from object store")
 }
 
 /// Wait until a superfile URI is promoted to mmap (warm tier).
@@ -295,6 +293,7 @@ pub async fn wait_for_superfile_promotion(
 }
 
 #[allow(dead_code)]
-pub fn empty_pinned() -> Arc<dyn Fn() -> HashSet<infino::supertable::manifest::SuperfileUri> + Send + Sync> {
+pub fn empty_pinned()
+-> Arc<dyn Fn() -> HashSet<infino::supertable::manifest::SuperfileUri> + Send + Sync> {
     Arc::new(HashSet::new)
 }

@@ -9,9 +9,9 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench object-store                                  # s3s-fs (1M superfile)
-//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --bench object-store   # real AWS S3
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench object-store
+//! cargo bench --features bench-diagnostics --bench object-store
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --features bench-diagnostics --bench object-store
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --features bench-diagnostics --bench object-store
 //! ```
 
 use infino_bench_utils::unified_object_store;

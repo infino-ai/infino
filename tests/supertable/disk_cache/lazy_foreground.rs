@@ -1,8 +1,9 @@
 //! Plan 013 M4 — `ColdFetchMode::LazyForegroundWithBackgroundFill`
 //! integration. The cold path returns a lazy reader
 //! immediately (paying only the M1-M3 cold-open byte budget
-//! against object storage), a background task downloads the
-//! full segment to NVMe + mmaps it, and **any subsequent
+//! against object storage), a background task waits for the
+//! foreground lazy reader to release, downloads the full
+//! segment to NVMe + mmaps it, and **any subsequent
 //! `reader(uri)` call returns the mmap-backed reader** — the
 //! corresponding search issues zero S3 GETs.
 //!
@@ -166,7 +167,11 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
     (dir, store)
 }
 
-async fn wait_for_mmap_promotion(cache: &Arc<DiskCacheStore>, uri: SuperfileUri, timeout: Duration) {
+async fn wait_for_mmap_promotion(
+    cache: &Arc<DiskCacheStore>,
+    uri: SuperfileUri,
+    timeout: Duration,
+) {
     cache
         .wait_until_mmap_promoted(&uri, timeout)
         .await
@@ -204,6 +209,39 @@ async fn lazy_foreground_cold_reader_is_queryable_immediately() {
         .await
         .expect("bm25");
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
+}
+
+/// The background full-segment fill must not compete with a
+/// foreground lazy reader. Holding the reader across a short
+/// delay should not issue cache-fill range GETs; promotion begins
+/// only after the reader is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_background_fill_waits_for_foreground_reader_drop() {
+    let store_dir = TempDir::new().expect("storage");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+    let bytes = build_fts_only_bytes();
+    let uri = SuperfileUri::new_v4();
+    seed(&*local, uri, bytes).await;
+
+    let proxy = CountingProxy::new(local);
+    let (_d, cache) = fresh_cache(Arc::clone(&proxy) as Arc<dyn StorageProvider>);
+
+    let reader = cache.reader(&uri).await.expect("cold reader");
+    let calls_after_open = proxy.calls();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        proxy.calls(),
+        calls_after_open,
+        "background fill should wait while foreground lazy reader is held"
+    );
+
+    drop(reader);
+    wait_for_mmap_promotion(&cache, uri, Duration::from_secs(5)).await;
+    assert!(
+        proxy.calls() > calls_after_open,
+        "background fill should begin after foreground reader drops"
+    );
 }
 
 /// Plan 013 M4 — **the** invariant: after the background

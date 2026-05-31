@@ -38,17 +38,21 @@ pub enum ColdFetchMode {
     /// [`StorageRangeSource`]; pays only the M1-M3 cold-open
     /// + cold-search byte budget against object storage
     /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB segment).
-    /// A background task concurrently downloads the full
-    /// segment to NVMe + mmaps it + replaces the cache entry;
+    /// A background task downloads the full segment to NVMe
+    /// after foreground lazy readers release, then mmaps it
+    /// + replaces the cache entry;
     /// any subsequent `reader(uri)` call returns the
     /// mmap-backed reader and the corresponding search issues
     /// **zero** S3 GETs.
     ///
-    /// **2× bandwidth per cold miss** — foreground per-query
-    /// ranges + background full-segment GET run concurrently.
-    /// The tradeoff: minimal cold-query latency (one-segment
-    /// hot working set fits in a few range-GETs) at the cost
-    /// of doubled cold-fetch bandwidth vs. `HybridWithPrefetch`.
+    /// **Up to 2× bandwidth per cold miss** — foreground
+    /// per-query ranges and the eventual full-segment cache
+    /// fill both read from object storage, but the fill is
+    /// deferred until the latency-critical foreground reader
+    /// is dropped. The tradeoff: minimal cold-query latency
+    /// (one-segment hot working set fits in a few range-GETs)
+    /// at the cost of extra cold-fetch bandwidth vs.
+    /// `HybridWithPrefetch`.
     /// Pick this mode for object-storage-native deployments
     /// where cold-query p50 latency is the primary objective.
     ///

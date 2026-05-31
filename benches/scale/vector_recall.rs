@@ -8,7 +8,8 @@
 //!
 //! Runs in the bench-scale lane (release profile) so the 10K-doc
 //! brute-force ground truth completes in ~2 s rather than ~3-4 min
-//! in debug. Invoked via `cargo bench --bench scale -- vector_recall`.
+//! in debug. Invoked via
+//! `cargo bench --features bench-diagnostics --bench scale -- vector_recall`.
 //!
 //! ## Sizing
 //!
@@ -206,7 +207,15 @@ fn recall_l2sq_at_10k_dim384_meets_threshold() {
         "L2Sq recall@10 at nprobe=8 rerank_mult=20 below threshold: {r10:.3} < 0.90"
     );
 
-    let r10_high = measure_recall(&reader, &corpus, Metric::L2Sq, &queries, 10, 32, RERANK_MULT);
+    let r10_high = measure_recall(
+        &reader,
+        &corpus,
+        Metric::L2Sq,
+        &queries,
+        10,
+        32,
+        RERANK_MULT,
+    );
     assert!(
         r10_high >= 0.95,
         "L2Sq recall@10 at nprobe=32 rerank_mult=20 below threshold: {r10_high:.3} < 0.95"
@@ -228,13 +237,29 @@ fn recall_cosine_at_10k_dim384_meets_threshold() {
     let reader = build_reader(&corpus, Metric::Cosine);
     let queries = build_query_set(&corpus, 200, true);
 
-    let r10 = measure_recall(&reader, &corpus, Metric::Cosine, &queries, 10, 8, RERANK_MULT);
+    let r10 = measure_recall(
+        &reader,
+        &corpus,
+        Metric::Cosine,
+        &queries,
+        10,
+        8,
+        RERANK_MULT,
+    );
     assert!(
         r10 >= 0.90,
         "Cosine recall@10 at nprobe=8 rerank_mult=20 below threshold: {r10:.3} < 0.90"
     );
 
-    let r10_high = measure_recall(&reader, &corpus, Metric::Cosine, &queries, 10, 32, RERANK_MULT);
+    let r10_high = measure_recall(
+        &reader,
+        &corpus,
+        Metric::Cosine,
+        &queries,
+        10,
+        32,
+        RERANK_MULT,
+    );
     assert!(
         r10_high >= 0.95,
         "Cosine recall@10 at nprobe=32 rerank_mult=20 below threshold: {r10_high:.3} < 0.95"
@@ -273,7 +298,15 @@ fn recall_increases_monotonically_with_rerank_mult() {
 
     let mut prev: f32 = -1.0;
     for &rerank_mult in &[1, 2, 5, 10, 20, 40] {
-        let r = measure_recall(&reader, &corpus, Metric::L2Sq, &queries, 10, 16, rerank_mult);
+        let r = measure_recall(
+            &reader,
+            &corpus,
+            Metric::L2Sq,
+            &queries,
+            10,
+            16,
+            rerank_mult,
+        );
         assert!(
             r >= prev - 0.02,
             "recall regressed with more rerank_mult: rerank_mult={rerank_mult}, recall={r:.3}, prev={prev:.3}"

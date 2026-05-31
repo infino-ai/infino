@@ -10,16 +10,13 @@ and as a search index by infino's reader.
 ## Links
 
 - **[Superfile architecture →](docs/architecture/superfile.md)** —
-  long-form reference: format spec, API surface, subsystem design
-  (FTS / vector / format-surgery / allocator / commit), every
-  major design decision with the alternatives that were rejected
-  and why.
+  the single-file segment format: a valid Parquet file with embedded
+  full-text and vector indexes. Covers the layout, Parquet
+  compatibility, and the full-text and vector index design.
 - **[Supertable architecture →](docs/architecture/supertable.md)** —
-  the in-memory cross-segment query + manifest layer over
-  superfile: ArcSwap-based reader-writer isolation, copy-on-
-  write manifest, segment store, rayon-shard commit, query
-  fan-out, manifest-only skip pruning, dual-pool concurrency,
-  DataFusion SQL surface.
+  the table layer over superfile segments: manifest snapshots, the
+  commit/publish path, pluggable storage, query fan-out with
+  manifest-only skip pruning, and reader/writer concurrency.
 
 ## Quick example
 
@@ -30,8 +27,7 @@ use infino::superfile::{
 use infino::superfile::fts::reader::BoolMode;
 use bytes::Bytes;
 
-// Read a superfile (built via SuperfileBuilder; see
-// `docs/architecture/superfile.md` § Build path).
+// Read a superfile (built via SuperfileBuilder).
 let bytes: Bytes = std::fs::read("my.superfile")?.into();
 let reader = SuperfileReader::open(bytes)?;
 
@@ -49,54 +45,21 @@ let hits = vector_search(&reader, "embedding", &query, 10,
 
 ## Performance
 
-Absolute runtime numbers come from the in-tree criterion harness
-under `benches/`. Run `cargo bench` after any change to the FTS or
-vector pipeline. The architecture docs in `docs/architecture/`
-describe where the wins come from — BM25 with the BMW / BMM walks
-and the per-doc bail, IVF + 1-bit RaBitQ + Sq8/Fp32 rerank,
-the mimalloc-backed per-term `Vec<(u32, u32)>`, cluster-contiguous
-vector storage, the ArcSwap reader-writer split.
+Benchmarks live in the in-tree
+[criterion](https://github.com/bheisler/criterion.rs) harness under
+[`benches/`](benches/). Run `cargo bench` to reproduce them on your
+hardware.
 
 ## Tests
 
-Suite breakdown:
+Run `cargo test --workspace` for the full suite. It covers the
+end-to-end full-text, vector, and superfile pipelines, ingestion and
+commit, and open-format compatibility — DataFusion reads superfiles as
+plain Parquet, with column projection, GROUP BY, and predicate
+pushdown all matching the columnar data.
 
-- **End-to-end pipelines** — FTS, vector, superfile, ingestion
-  threshold-flush + commit, crash-resistance (parent spawns
-  aborting child; verifies committed superfiles survive SIGABRT).
-- **Open-format compatibility** — DataFusion reads superfiles as
-  plain Parquet; planted-row counts, GROUP BY, predicate pushdown
-  all match.
-- **Brute-force BM25 oracle** — top-k matches the textbook BM25
-  formula on a 60-doc planted corpus + a Zipfian-shape stress.
-  Catches scoring-math bugs that planted-ground-truth tests
-  can't.
-- **Brute-force vector oracle** — full-nprobe IVF recovers exact
-  top-k for L2Sq / Cosine / NegDot.
-- **CRC corruption** — every CRC-protected region rejects byte
-  flips.
-- **Recall measurement** — recall@10 ≥ 0.90 at default options on
-  the standard test corpus.
-- **Property tests** — PFOR encode/decode roundtrip.
-- **In-module unit tests** — per-module test surfaces across the
-  src tree.
-
-Run `cargo test --workspace` for the full suite.
-
-**Memory-safety lanes — both clean:**
-
-| Lane | Result |
-|---|---|
-| `make miri` (Stacked Borrows + UB detection) | passing on the FTS surface, zero violations |
-| `make asan` (LLVM AddressSanitizer) | passing on the FTS surface, zero memory errors |
-
-The only `unsafe` block in `src/` is one
-[`std::mem::transmute`](https://doc.rust-lang.org/std/mem/fn.transmute.html)
-in
-[`FtsBuilder::add_doc`](src/superfile/fts/builder.rs)
-that extends a [`bumpalo`](https://github.com/fitzgen/bumpalo)-allocated
-`&str`'s lifetime to `&'static str` so it can key the per-doc
-HashMap — the lifetime is bounded by the per-doc Bump (which
-outlives the HashMap by Rust's reverse-declaration drop order),
-which both miri (Stacked Borrows) and asan (real allocator
-instrumentation) sign off on.
+**Memory safety.** The full-text surface runs clean under
+[miri](https://github.com/rust-lang/miri) (Stacked Borrows + UB
+detection) and
+[AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html);
+run `make miri` and `make asan`.

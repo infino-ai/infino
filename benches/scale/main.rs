@@ -6,8 +6,8 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench scale                     # every scale bench
-//! cargo bench --bench scale -- vector_recall    # IVF + RaBitQ + rerank recall battery (10K × 384)
+//! cargo bench --features bench-diagnostics --bench scale
+//! cargo bench --features bench-diagnostics --bench scale -- vector_recall
 //! ```
 
 #[path = "vector_recall.rs"]

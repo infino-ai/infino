@@ -37,9 +37,9 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench object-store                                  # s3s-fs (1M superfile)
-//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --bench object-store   # real AWS S3
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench object-store     # also rewrite README
+//! cargo bench --features bench-diagnostics --bench object-store
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --features bench-diagnostics --bench object-store
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --features bench-diagnostics --bench object-store
 //! ```
 //!
 //! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
@@ -865,7 +865,7 @@ criterion_group!(benches, bench);
 // Invocation:
 //
 //   INFINO_DIAG_COLD_PATH=1 cargo bench --no-default-features \
-//     --bench object-store --warm-up-time 1
+//     --features bench-diagnostics --bench object-store --warm-up-time 1
 //
 // to localize where cold-path time is going (raw s3s-fs RTT vs.
 // our cold-fetch path's range count). When the env var is set,
@@ -1379,7 +1379,12 @@ mod diag {
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_search_unhinted[{i}]"), &snap, wall, false);
+            report(
+                &format!("cold_first_search_unhinted[{i}]"),
+                &snap,
+                wall,
+                false,
+            );
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1405,7 +1410,12 @@ mod diag {
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_search_hinted[{i}]"), &snap, wall, false);
+            report(
+                &format!("cold_first_search_hinted[{i}]"),
+                &snap,
+                wall,
+                false,
+            );
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1426,7 +1436,12 @@ mod diag {
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_bm25_unhinted[{i}]"), &snap, wall, false);
+            report(
+                &format!("cold_first_bm25_unhinted[{i}]"),
+                &snap,
+                wall,
+                false,
+            );
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1478,7 +1493,12 @@ mod diag {
             });
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
-            report(&format!("cold_first_bm25_hinted_multi[{i}]"), &snap, wall, false);
+            report(
+                &format!("cold_first_bm25_hinted_multi[{i}]"),
+                &snap,
+                wall,
+                false,
+            );
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
             drop(cache);
             drop(cache_dir);
@@ -1499,7 +1519,7 @@ mod diag {
     /// INFINO_DIAG_REAL_S3=1 \
     /// INFINO_REAL_S3_BUCKET=cold-test-381491836522 \
     /// AWS_REGION=us-east-1 \
-    /// cargo bench --no-default-features --bench object-store -- --warm-up-time 1
+    /// cargo bench --no-default-features --features bench-diagnostics --bench object-store -- --warm-up-time 1
     /// ```
     pub fn diagnose_real_s3_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
@@ -1640,7 +1660,12 @@ mod diag {
                 });
                 let wall = t0.elapsed();
                 let snap = storage.snapshot().diff(&before);
-                report(&format!("real_s3_cold_first_bm25_hinted[{i}]"), &snap, wall, true);
+                report(
+                    &format!("real_s3_cold_first_bm25_hinted[{i}]"),
+                    &snap,
+                    wall,
+                    true,
+                );
                 rt.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
                 drop(cache);
                 drop(cache_dir);

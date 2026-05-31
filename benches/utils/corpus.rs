@@ -36,11 +36,11 @@ use rand_distr::{Distribution, StandardNormal};
 use tempfile::TempDir;
 
 use infino::superfile::SuperfileReader;
-use infino::superfile::reader::VectorSearchOptions;
 use infino::superfile::builder::{
     BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
 };
 use infino::superfile::fts::builder::FtsBuilder;
+use infino::superfile::reader::VectorSearchOptions;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, normalize};
 use infino::superfile::vector::reader::{OpenOptions, VectorReader};
@@ -499,8 +499,8 @@ pub fn mean_recall_infino(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(reader.search("v", q, k, nprobe, rerank_mult))
-            .expect("vector search");
+        let hits =
+            block_on_inmem(reader.search("v", q, k, nprobe, rerank_mult)).expect("vector search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -521,10 +521,8 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(async {
-            reader.vector_search(column, q, k, opts).await
-        })
-        .expect("vector_search");
+        let hits = block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
+            .expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -585,8 +583,8 @@ pub fn calibrate_infino(
             let q = &queries[0];
             let p50 = p50_micros(
                 || {
-                    let _ = block_on_inmem(reader.search("v", q, k, probe, refine))
-                        .expect("search");
+                    let _ =
+                        block_on_inmem(reader.search("v", q, k, probe, refine)).expect("search");
                 },
                 p50_iter,
             );
@@ -640,10 +638,9 @@ pub fn calibrate_superfile(
                 .with_rerank_mult(refine);
             let p50 = p50_micros(
                 || {
-                    let _ = block_on_inmem(async {
-                        reader.vector_search(column, q, k, opts).await
-                    })
-                    .expect("vector_search");
+                    let _ =
+                        block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
+                            .expect("vector_search");
                 },
                 p50_iter,
             );

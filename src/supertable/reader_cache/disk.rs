@@ -5,12 +5,13 @@
 use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
@@ -111,6 +112,11 @@ pub struct DiskCacheStore {
     n_cold_fetches: AtomicU64,
     n_evictions: AtomicU64,
     n_madvise_calls: AtomicU64,
+    /// Number of callers explicitly waiting for lazy background
+    /// promotion. A waiter means promotion is now latency-critical,
+    /// so the background task may start even if a lazy reader Arc is
+    /// still held by the waiter.
+    n_promotion_waiters: AtomicU64,
     /// Callback for "which URIs are currently pinned" — feeds
     /// the eviction policy.
     ///
@@ -159,8 +165,9 @@ impl DiskCacheStore {
         std::fs::create_dir_all(&config.cache_root)?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
-        let prefetch_semaphore =
-            Arc::new(tokio::sync::Semaphore::new(config.prefetch_concurrency.max(1)));
+        let prefetch_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.prefetch_concurrency.max(1),
+        ));
         let store = Arc::new(Self {
             storage,
             config,
@@ -171,6 +178,7 @@ impl DiskCacheStore {
             n_cold_fetches: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
+            n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
         });
@@ -427,6 +435,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         timeout: Duration,
     ) -> Result<(), DiskCacheError> {
+        let _guard = PromotionWaitGuard::new(&self.n_promotion_waiters);
         let start = Instant::now();
         while start.elapsed() < timeout {
             if self.is_mmap_promoted(uri) {
@@ -877,10 +886,11 @@ impl DiskCacheStore {
     /// Returns immediately with a
     /// [`SuperfileReader::open_lazy`]-built reader over a
     /// [`crate::supertable::StorageRangeSource`]; spawns a
-    /// background task to fetch the full segment, mmap it,
-    /// and replace the cached entry. Subsequent `reader(uri)`
-    /// calls return the mmap-backed reader (zero S3 GETs for
-    /// any subsequent search).
+    /// background task that waits for foreground lazy readers
+    /// to release before fetching the full segment, mmap'ing
+    /// it, and replacing the cached entry. Subsequent
+    /// `reader(uri)` calls return the mmap-backed reader (zero
+    /// S3 GETs for any subsequent search).
     /// Plan 013 M6 — lazy cold-fetch coordinator, hinted shape.
     /// When `offsets` is `Some` the underlying cold-fetch runs
     /// in 1-RTT parallel-prefetch mode via
@@ -922,8 +932,9 @@ impl DiskCacheStore {
     /// Plan 013 M4 — lazy cold-fetch path. Foreground builds a
     /// reader via `SuperfileReader::open_lazy(StorageRangeSource)`
     /// (paying only the M1-M3 cold-open + cold-search byte
-    /// budget); background task downloads the full segment to
-    /// NVMe + mmaps it + replaces the cache entry in
+    /// budget); background task waits for those foreground lazy
+    /// readers to release, then downloads the full segment to
+    /// NVMe, mmaps it, and replaces the cache entry in
     /// `cached`. Concurrent `reader(uri)` callers observing
     /// the in-flight OnceCell get the lazy reader; once the
     /// background promotion completes they hit the
@@ -1072,12 +1083,17 @@ impl DiskCacheStore {
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         self.cached.insert(*uri, Arc::clone(&entry));
 
-        let store = Arc::clone(self);
+        // Background promotion waits until foreground lazy readers
+        // release before starting full-segment fetch, so cache fill
+        // does not compete with query-critical range GETs.
+        let store = Arc::downgrade(self);
+        let reader = Arc::downgrade(&lazy_reader);
         let uri_owned = *uri;
         let storage_uri_owned = storage_uri;
         tokio::spawn(async move {
             let _ = lazy_background_fill(
                 store,
+                reader,
                 uri_owned,
                 storage_uri_owned,
                 total_size,
@@ -1153,16 +1169,24 @@ impl DiskCacheStore {
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         self.cached.insert(*uri, Arc::clone(&entry));
 
-        // 2. Spawn the background full-segment fetch + mmap
-        //    promotion. Decoupled from the foreground response
-        //    — the foreground returns the lazy reader
-        //    immediately.
-        let store = Arc::clone(self);
+        // 2. Spawn background promotion. It waits until
+        //    foreground lazy readers release before starting
+        //    full-segment fetch, so cache fill does not compete
+        //    with query-critical range GETs.
+        let store = Arc::downgrade(self);
+        let reader = Arc::downgrade(&lazy_reader);
         let uri_owned = *uri;
         let storage_uri_owned = storage_uri;
         tokio::spawn(async move {
-            let _ = lazy_background_fill(store, uri_owned, storage_uri_owned, size, reserved_bytes)
-                .await;
+            let _ = lazy_background_fill(
+                store,
+                reader,
+                uri_owned,
+                storage_uri_owned,
+                size,
+                reserved_bytes,
+            )
+            .await;
         });
 
         Ok(entry)
@@ -1412,6 +1436,21 @@ impl<'a> Drop for Reservation<'a> {
     }
 }
 
+struct PromotionWaitGuard<'a>(&'a AtomicU64);
+
+impl<'a> PromotionWaitGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for PromotionWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Background finalizer for the hybrid cold-fetch. Awaits
 /// all pwrites, fsyncs + renames the destination file, mmaps
 /// it, and atomically replaces the cache entry with a
@@ -1522,23 +1561,142 @@ async fn fetch_hint_ranges(
     .await
 }
 
+fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
+    Arc::strong_count(store) == 1
+}
+
+async fn wait_for_lazy_foreground_release(
+    store: &Weak<DiskCacheStore>,
+    reader: &Weak<SuperfileReader>,
+) -> Option<Arc<DiskCacheStore>> {
+    loop {
+        if store.strong_count() == 0 || reader.strong_count() == 0 {
+            return None;
+        }
+        if let Some(strong) = store.upgrade() {
+            if strong.n_promotion_waiters.load(Ordering::Acquire) > 0 {
+                return Some(strong);
+            }
+        }
+        if reader.strong_count() <= 1 {
+            // Give short-lived callers (notably cold benchmarks with a
+            // fresh cache per iteration) a scheduling turn to drop the
+            // cache before we start a full-segment background fill.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            return store.upgrade();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn cold_fetch_to_disk_cancelable(
+    store: &Arc<DiskCacheStore>,
+    storage_uri: &str,
+    dest_path: &std::path::Path,
+    size: u64,
+) -> Result<bool, DiskCacheError> {
+    let n_streams = store.config.cold_fetch_streams.max(1);
+    let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
+    let file = {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dest_path)?;
+        f.set_len(size)?;
+        Arc::new(f)
+    };
+
+    let n_chunks = if size == 0 {
+        0
+    } else {
+        size.div_ceil(chunk_size)
+    };
+    let mut next_chunk = 0u64;
+    let mut in_flight = FuturesUnordered::new();
+
+    loop {
+        while next_chunk < n_chunks && in_flight.len() < n_streams {
+            if background_store_abandoned(store) {
+                return Ok(false);
+            }
+            let start = next_chunk * chunk_size;
+            let end = (start + chunk_size).min(size);
+            let storage = Arc::clone(&store.storage);
+            let file = Arc::clone(&file);
+            let uri = storage_uri.to_string();
+            in_flight.push(async move {
+                let bytes = storage.get_range(&uri, start..end).await?;
+                tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    file.write_all_at(&bytes, start)
+                })
+                .await
+                .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
+                Ok::<(), DiskCacheError>(())
+            });
+            next_chunk += 1;
+        }
+
+        match in_flight.next().await {
+            Some(res) => res?,
+            None => break,
+        }
+        if background_store_abandoned(store) {
+            return Ok(false);
+        }
+    }
+
+    if background_store_abandoned(store) {
+        return Ok(false);
+    }
+    tokio::task::spawn_blocking(move || file.sync_all())
+        .await
+        .map_err(|e| DiskCacheError::SuperfileOpen(format!("fsync join: {e}")))??;
+    Ok(true)
+}
+
+fn rollback_lazy_background_fill(
+    store: &Arc<DiskCacheStore>,
+    uri: &SuperfileUri,
+    tmp: &std::path::Path,
+) {
+    if let Some((_, entry)) = store.cached.remove(uri) {
+        store
+            .current_bytes
+            .fetch_sub(entry.size_bytes, Ordering::Release);
+    }
+    store.coordinators.remove(uri);
+    let _ = std::fs::remove_file(tmp);
+}
+
 /// Plan 013 M4 — background promotion path for the
 /// `LazyForegroundWithBackgroundFill` cold-fetch mode.
-/// Downloads the full segment via `cold_fetch_to_disk`
-/// (parallel range-GETs to NVMe), mmaps the resulting file,
-/// and atomically replaces the lazy cache entry with a
-/// mmap-backed reader. Subsequent `reader(uri)` calls hit
-/// the promoted entry — every query resolves from mmap (zero
-/// S3 GETs).
+/// Waits for foreground lazy readers to release, downloads the
+/// full segment via cancelable parallel range-GETs to NVMe,
+/// mmaps the resulting file, and atomically replaces the lazy
+/// cache entry with a mmap-backed reader. Subsequent
+/// `reader(uri)` calls hit the promoted entry — every query
+/// resolves from mmap (zero S3 GETs).
 async fn lazy_background_fill(
-    store: Arc<DiskCacheStore>,
+    store: Weak<DiskCacheStore>,
+    reader: Weak<SuperfileReader>,
     uri: SuperfileUri,
     storage_uri: String,
     size: u64,
     reserved_bytes: u64,
 ) -> Result<(), DiskCacheError> {
+    let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
+        return Ok(());
+    };
     let tmp = store.tmp_path(&uri);
     let final_path = store.cache_path(&uri);
+
+    if background_store_abandoned(&store) {
+        rollback_lazy_background_fill(&store, &uri, &tmp);
+        let _ = reserved_bytes;
+        return Ok(());
+    }
 
     // Global background-fill concurrency cap. Held for the whole
     // fill so process-wide background memory is bounded by
@@ -1561,9 +1719,18 @@ async fn lazy_background_fill(
     };
 
     let res: Result<(), DiskCacheError> = async {
+        if background_store_abandoned(&store) {
+            return Ok(());
+        }
         // 1. Parallel range-GETs into the temp file (existing
-        //    cold_fetch_to_disk helper).
-        store.cold_fetch_to_disk(&storage_uri, &tmp, size).await?;
+        //    cold_fetch_to_disk shape, but cancelable for
+        //    short-lived caches).
+        if !cold_fetch_to_disk_cancelable(&store, &storage_uri, &tmp, size).await? {
+            return Ok(());
+        }
+        if background_store_abandoned(&store) {
+            return Ok(());
+        }
 
         // 2. Promote to final path + mmap.
         tokio::fs::rename(&tmp, &final_path).await?;
@@ -1601,16 +1768,11 @@ async fn lazy_background_fill(
     }
     .await;
 
-    if res.is_err() {
+    if res.is_err() || background_store_abandoned(&store) {
         // Rollback — same atomic gate as eviction so we don't
         // double-decrement when a racing eviction already
         // removed this entry + released its bytes.
-        if let Some((_, entry)) = store.cached.remove(&uri) {
-            store
-                .current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Release);
-        }
-        store.coordinators.remove(&uri);
+        rollback_lazy_background_fill(&store, &uri, &tmp);
         // Clean up the temp file if cold_fetch_to_disk failed
         // mid-way.
         let _ = std::fs::remove_file(&tmp);

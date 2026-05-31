@@ -12,25 +12,24 @@
 //! ## What "lazy" means here
 //!
 //! [`SuperfileReader::open_lazy`] accepts a source instead
-//! of bytes-in-hand. It asks the source for the full
-//! segment (`source.get_range(0..size)`) and constructs the
-//! same reader `open(bytes)` would. The caller no longer
-//! materializes the segment before calling; the source
-//! decides where the bytes come from (mmap of a local
-//! file, range-fetched object store, a coalescing
-//! broadcaster that fans one fetch out to many
-//! subscribers).
+//! of bytes-in-hand. The caller no longer materializes the
+//! segment before calling; the source decides where the
+//! bytes come from (mmap of a local file, range-fetched
+//! object store, a coalescing broadcaster that fans one
+//! fetch out to many subscribers).
 //!
-//! What it doesn't do *yet*: fetch only the bytes a
-//! specific BM25 / vector query touches. The inner FTS
-//! posting reader + vector cluster reader still take a
-//! full materialized buffer, so each `open_lazy` call
-//! still pulls the whole segment regardless of which
-//! queries will run against the resulting reader. Making
-//! per-query laziness work needs those inner readers to
-//! thread the source through their own lookups — the trait
-//! shape here is what makes that change source-compatible
-//! when it lands.
+//! Opening reads only the metadata ranges the reader needs,
+//! not the whole segment: the Parquet footer, then the FTS
+//! and vector section headers and directories. The inner
+//! readers thread the source through their own lookups, so
+//! queries fetch only the bytes they touch — `FtsReader`
+//! fetches each query term's posting list on demand (the
+//! postings region is never read in full), and `VectorReader`
+//! fetches centroids and then only the probed clusters'
+//! blocks. A source-opened [`SuperfileReader`] therefore does
+//! not retain the full segment; `parquet_bytes()` returns
+//! `None`, and pass-through Parquet callers use the eager
+//! `open` path instead.
 //!
 //! See [`SuperfileReader::open_lazy`].
 //!

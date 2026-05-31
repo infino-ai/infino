@@ -3,9 +3,9 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench fts-superfile                            # all superfile FTS
-//! cargo bench --bench fts-superfile -- superfile_fts_build     # ingest only
-//! cargo bench --bench fts-superfile -- superfile_fts_search    # search only
+//! cargo bench --bench fts-superfile                                # legacy alias
+//! cargo bench --bench fts-superfile -- superfile_fts_build         # ingest only
+//! cargo bench --bench fts-superfile -- superfile_fts_search        # search only
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench fts-superfile
 //! ```
 

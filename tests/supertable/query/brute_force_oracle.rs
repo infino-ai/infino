@@ -429,7 +429,8 @@ async fn oracle_two_term_and_matches() {
 async fn oracle_three_term_and_singleton_match() {
     // "rust" + "async" + "tokio" intersect only at doc 0 (segment 0).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE).await;
+    let inf_hits =
+        supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE).await;
     assert_eq!(inf_hits, vec![0u64], "got {inf_hits:?}");
 }
 

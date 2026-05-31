@@ -937,12 +937,11 @@ fn build_subsection_streaming(
 
     let sq8_scale_block_off = codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
-    let sq8_norms_block_off =
-        if sq8_family && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
-            Some(sq8_offset_block_off + n_cent * dim * 4)
-        } else {
-            None
-        };
+    let sq8_norms_block_off = if sq8_family && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
+        Some(sq8_offset_block_off + n_cent * dim * 4)
+    } else {
+        None
+    };
 
     if sq8_family {
         for cid in 0..n_cent {

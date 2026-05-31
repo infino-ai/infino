@@ -207,7 +207,10 @@ async fn end_to_end_results_sorted_by_distance() {
     let (blob, json) = build_two_column_blob(60);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
     let q = vec![0.5; 16];
-    let hits = r.search("text_emb", &q, 10, 4, 5).await.expect("FTS search");
+    let hits = r
+        .search("text_emb", &q, 10, 4, 5)
+        .await
+        .expect("FTS search");
     for w in hits.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances ascending");
     }
