@@ -68,7 +68,9 @@ uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 num_cpus = "1"
 
+# Tombstone bitmaps.
 roaring = "0.10"
+# WAL state-doc timestamps.
 chrono = { version = "0.4", features = ["serde"] }
 
 # Hierarchical config (YAML defaults + file overrides + env). Used by
