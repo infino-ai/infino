@@ -40,6 +40,7 @@ use dashmap::DashMap;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::supertable::wal::WalStore;
 
 /// Default refresh interval — 1 second. Bounds how stale the
@@ -163,25 +164,8 @@ impl SidecarCache {
     /// the bitmap.
     fn refresh(&self, superfile_id: Uuid) -> Result<Arc<RoaringBitmap>, SidecarCacheError> {
         let wal_store = self.wal_store.clone();
-        let drive = async move { wal_store.get_tombstones(superfile_id).await };
-
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => {
-                // No ambient runtime — query paths invoked from
-                // rayon workers land here. Build a tiny
-                // current_thread runtime; one round-trip's worth
-                // of work, falls out of scope at end of stmt.
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| SidecarCacheError::RefreshFailed {
-                        superfile_id,
-                        message: format!("tokio runtime build: {e}"),
-                    })?;
-                rt.block_on(drive)
-            }
-        };
+        let result =
+            bridge_sync_to_async(async move { wal_store.get_tombstones(superfile_id).await });
 
         let (bitmap, etag) = match result {
             Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), Some(etag)),

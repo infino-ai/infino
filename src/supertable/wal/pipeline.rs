@@ -61,6 +61,7 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use uuid::Uuid;
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::storage::StorageError;
 use crate::superfile::SuperfileReader;
 use crate::superfile::builder::SuperfileBuilder;
@@ -1110,19 +1111,8 @@ fn fetch_superfile_bytes_for_id_scan(
         .ok_or_else(|| "no storage attached".to_string())?
         .clone();
     let path = format!("data/seg-{}.sf", superfile_id);
-    let drive = async move { storage.get(&path).await };
-    let (bytes, _) = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))
-            .map_err(|e| format!("storage get: {e}"))?,
-        Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("tokio runtime build: {e}"))?;
-            rt.block_on(drive)
-                .map_err(|e| format!("storage get: {e}"))?
-        }
-    };
+    let (bytes, _) = bridge_sync_to_async(async move { storage.get(&path).await })
+        .map_err(|e| format!("storage get: {e}"))?;
 
     let reader = crate::superfile::SuperfileReader::open(bytes)
         .map_err(|e| format!("SuperfileReader::open: {e}"))?;

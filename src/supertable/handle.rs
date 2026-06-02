@@ -20,6 +20,7 @@ use tokio::runtime::Runtime;
 use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
+use crate::runtime_bridge::bridge_sync_to_async;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -679,33 +680,6 @@ impl Supertable {
 /// Returns `None` for in-memory-only supertables — no sidecars
 /// can exist there, so the query paths skip the filter hook
 /// entirely.
-/// Sync→async bridge for `Supertable::create`'s pointer probe +
-/// delegated `open` call. Mirrors the pattern the writer's
-/// `persist_commit` uses: ride the ambient tokio runtime when
-/// present (via `block_in_place + block_on`), otherwise build a
-/// tiny `current_thread` runtime for the duration of the call.
-///
-/// Panics if called from inside a `current_thread` runtime
-/// (`block_in_place` requires `multi_thread`).
-fn bridge_sync_to_async<F, T>(fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect(
-                    "invariant: tokio Runtime build only fails on \
-                     catastrophic OS resource exhaustion",
-                );
-            rt.block_on(fut)
-        }
-    }
-}
-
 fn build_tombstone_cache(
     options: &Arc<SupertableOptions>,
 ) -> Option<Arc<crate::supertable::tombstones::SidecarCache>> {
