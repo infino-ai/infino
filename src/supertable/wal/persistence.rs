@@ -26,13 +26,14 @@
 //!
 //! ## ETag capture strategy
 //!
-//! Our `StorageProvider` trait's `put_atomic` and `put_if_match`
-//! return `()`, not the new etag. To carry an etag forward after
-//! a write, `create` / `update_with_etag` issue a follow-up
-//! `head()` to capture the post-write etag. Two round trips per
-//! write is fine — the state doc is KB-scale; the latency floor
-//! is dominated by the round-trip count, not bandwidth, and a
-//! WAL transition already has multiple round trips around it.
+//! Reads and writes pick up the etag in the same round trip:
+//! `StorageProvider::get` returns `(Bytes, ObjectMeta)` from
+//! the backend's `GetResult` directly, and `put_atomic` /
+//! `put_if_match` return the new etag from the `PutResult`.
+//! `Ok(None)` on the put paths collapses to the empty `Etag`,
+//! a legal "create-only-if-absent" input on the next CAS hop.
+//! The state machine never mints two WALs at the same path,
+//! so a missing etag doesn't break the chain.
 
 use std::sync::Arc;
 
@@ -308,9 +309,7 @@ impl WalStore {
             .await
         {
             Ok(etag) => Ok(etag.unwrap_or_default()),
-            Err(StorageError::PreconditionFailed { .. }) => {
-                Err(WalStoreError::CasFailed { path })
-            }
+            Err(StorageError::PreconditionFailed { .. }) => Err(WalStoreError::CasFailed { path }),
             Err(StorageError::NotFound { .. }) => {
                 // `put_if_match` against a deleted object can
                 // surface NotFound depending on backend.
@@ -405,14 +404,14 @@ impl WalStore {
         expected_blake3_hex: Option<&str>,
     ) -> Result<Bytes, WalStoreError> {
         let path = Self::arrow_path(wal_id);
-        let (bytes, _) = self
-            .storage
-            .get(&path)
-            .await
-            .map_err(|source| WalStoreError::Storage {
-                path: path.clone(),
-                source,
-            })?;
+        let (bytes, _) =
+            self.storage
+                .get(&path)
+                .await
+                .map_err(|source| WalStoreError::Storage {
+                    path: path.clone(),
+                    source,
+                })?;
         if let Some(want) = expected_blake3_hex {
             let got = blake3::hash(&bytes).to_hex().to_string();
             if got != want {
@@ -493,9 +492,7 @@ impl WalStore {
             .await
         {
             Ok(etag) => Ok(etag.unwrap_or_default()),
-            Err(StorageError::PreconditionFailed { .. }) => {
-                Err(WalStoreError::CasFailed { path })
-            }
+            Err(StorageError::PreconditionFailed { .. }) => Err(WalStoreError::CasFailed { path }),
             Err(other) => Err(WalStoreError::Storage {
                 path,
                 source: other,
