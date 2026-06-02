@@ -29,6 +29,7 @@ use parquet::file::metadata::{
     FileMetaData, KeyValue, ParquetMetaDataBuilder, ParquetMetaDataReader, ParquetMetaDataWriter,
 };
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -79,12 +80,21 @@ pub fn write_parquet_with_blobs(
     extra_kv: &[(String, String)],
     compression: Compression,
     row_group_size: usize,
+    column_page_size_limits: &[(&str, usize)],
 ) -> Result<ParquetParts, FooterError> {
-    // 1. Write Parquet to an in-memory buffer.
-    let props = WriterProperties::builder()
+    // 1. Write Parquet to an in-memory buffer. Per-column data-page
+    //    size limits (e.g. a small limit on the id column) keep point
+    //    lookups cheap: `RowSelection` + the offset index seek to a
+    //    tiny page and decompress just that, instead of a whole
+    //    row-group-sized page.
+    let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_row_count(Some(row_group_size))
-        .build();
+        .set_max_row_group_row_count(Some(row_group_size));
+    for (col, limit) in column_page_size_limits {
+        props_builder = props_builder
+            .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
+    }
+    let props = props_builder.build();
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
@@ -342,9 +352,17 @@ mod tests {
     fn write_with_no_blobs_produces_valid_parquet() {
         let schema = small_schema();
         let batch = small_batch(&schema);
-        let parts =
-            write_parquet_with_blobs(&schema, &[batch], &[], &[], &[], Compression::SNAPPY, 1024)
-                .expect("write should succeed");
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &[batch],
+            &[],
+            &[],
+            &[],
+            Compression::SNAPPY,
+            1024,
+            &[],
+        )
+        .expect("write should succeed");
         // PAR1 at start and end.
         assert_eq!(&parts.bytes[..4], b"PAR1");
         assert_eq!(&parts.bytes[parts.bytes.len() - 4..], b"PAR1");
@@ -365,6 +383,7 @@ mod tests {
             &[],
             Compression::SNAPPY,
             1024,
+            &[],
         )
         .expect("write parquet with blobs");
         assert_eq!(parts.fts_length as usize, fts_blob.len());
@@ -388,6 +407,7 @@ mod tests {
             &[],
             Compression::SNAPPY,
             1024,
+            &[],
         )
         .expect("write parquet with blobs");
         assert_eq!(parts.fts_length, 0);
@@ -412,6 +432,7 @@ mod tests {
             &[],
             Compression::SNAPPY,
             1024,
+            &[],
         )
         .expect("write parquet with blobs");
         assert!(parts.vec_offset > parts.fts_offset);
@@ -435,6 +456,7 @@ mod tests {
             &extra,
             Compression::SNAPPY,
             1024,
+            &[],
         )
         .expect("write parquet with blobs");
         let kv = read_kv_metadata(&parts.bytes).expect("read kv metadata");
@@ -454,9 +476,17 @@ mod tests {
         let schema = small_schema();
         let batch = small_batch(&schema);
         let fts = vec![0xCCu8; 64];
-        let parts =
-            write_parquet_with_blobs(&schema, &[batch], &fts, &[], &[], Compression::SNAPPY, 1024)
-                .expect("write parquet with blobs");
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &[batch],
+            &fts,
+            &[],
+            &[],
+            Compression::SNAPPY,
+            1024,
+            &[],
+        )
+        .expect("write parquet with blobs");
         let kv = read_kv_metadata(&parts.bytes).expect("read kv metadata");
         assert!(kv.contains_key("inf.fts.offset"));
         assert!(kv.contains_key("inf.fts.length"));
@@ -530,6 +560,7 @@ mod tests {
             &extra,
             Compression::SNAPPY,
             1024,
+            &[],
         )
         .expect("write parquet with blobs");
 
@@ -569,6 +600,7 @@ mod tests {
             &extra,
             Compression::SNAPPY,
             1024,
+            &[],
         )
         .expect("write parquet with blobs");
         let eager = read_kv_metadata(&parts.bytes).expect("eager kv");

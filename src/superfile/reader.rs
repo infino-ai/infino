@@ -21,9 +21,16 @@ use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
 use crate::superfile::vector::reader::VectorReader;
-use arrow_schema::Schema;
+use arrow::compute::{concat_batches, take};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, UInt32Array};
+use arrow_schema::{Field, Schema};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
+use parquet::file::metadata::PageIndexPolicy;
 use std::sync::Arc;
 
 /// Per-open knobs for [`SuperfileReader::open_with`]. Defaults to
@@ -58,6 +65,12 @@ pub struct SuperfileReader {
     /// different path. Vector + FTS queries work on either,
     /// since each carries its own source under the inner readers.
     bytes: Option<Bytes>,
+    /// Parquet metadata parsed once at open (eager path only), reused
+    /// by every `take_by_local_doc_ids` so targeted reads never
+    /// re-parse the footer. `None` on the lazy path (no resident
+    /// bytes). Carries the page index when present so `RowSelection`
+    /// can skip whole pages.
+    arrow_meta: Option<ArrowReaderMetadata>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -177,7 +190,7 @@ impl SuperfileReader {
                 .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?,
         );
 
-        // 4 + 5. Vector + FTS subsections — Plan 013 M5
+        // 4 + 5. Vector + FTS
         //   fires both subsection fetches **concurrently** via
         //   `futures::try_join!`. The two subsections live at
         //   disjoint offsets (parquet body → fts → vec → footer
@@ -247,6 +260,7 @@ impl SuperfileReader {
 
         Ok(Self {
             bytes: None,
+            arrow_meta: None,
             schema,
             id_column,
             n_docs,
@@ -293,11 +307,18 @@ impl SuperfileReader {
             .parse()
             .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
 
-        // 3. Read Arrow schema from the Parquet metadata via parquet-rs.
-        //    Bytes implements ChunkReader directly, so this is zero-copy.
-        let parq_builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
-        let schema = parq_builder.schema().clone();
+        // 3. Parse the Parquet metadata once, with the page index, and
+        //    cache it on the reader. `Bytes` implements `ChunkReader`
+        //    directly so this is zero-copy, and every later
+        //    `take_by_local_doc_ids` reuses this `ArrowReaderMetadata`
+        //    instead of re-parsing the footer per call. The page index
+        //    lets `RowSelection` skip whole pages on targeted reads.
+        let arrow_meta = ArrowReaderMetadata::load(
+            &bytes,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+        )
+        .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        let schema = arrow_meta.schema().clone();
 
         // 4. If FTS keys present, slice + open FtsReader.
         let fts = if all_present(&kv_map, kv::FTS_KEYS) {
@@ -344,6 +365,7 @@ impl SuperfileReader {
 
         Ok(Self {
             bytes: Some(bytes),
+            arrow_meta: Some(arrow_meta),
             schema,
             id_column,
             n_docs,
@@ -407,6 +429,169 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
+    }
+
+    /// Resolve in-segment row offsets to their durable identity
+    /// (007 D2 / Phase 3).
+    ///
+    /// Given a slice of `local_doc_id`s — the per-segment row
+    /// offsets produced by [`bm25_search`](Self::bm25_search) /
+    /// [`vector_search`](Self::vector_search) and carried in a
+    /// `SuperfileHit` — return a [`RecordBatch`] of the requested
+    /// `projection` columns at exactly those rows, in the same
+    /// order as `local_doc_ids`. This is the bridge from a hit's
+    /// `(segment, local_doc_id)` to the supertable's durable `_id`
+    /// plus any projected scalar columns: pass
+    /// [`id_column`](Self::id_column) in `projection` to recover the
+    /// primary key, and zip the result rows back to the per-hit
+    /// scores positionally (row `i` is the segment row at
+    /// `local_doc_ids[i]`).
+    ///
+    /// Output columns are `projection` in the given order (not file
+    /// order), and only those columns are decoded (column-projected
+    /// read). Duplicate or repeated offsets are honored as-is.
+    ///
+    /// # Errors
+    /// - [`ReadError::LazyReaderUnsupported`] — opened via
+    ///   [`open_lazy`](Self::open_lazy); no materialized bytes.
+    /// - [`ReadError::UnknownColumn`] — a name is not in
+    ///   [`schema`](Self::schema).
+    /// - [`ReadError::DocIdOutOfRange`] — an offset is `>= n_docs()`.
+    /// - [`ReadError::Columnar`] — a Parquet/Arrow decode failure.
+    pub fn take_by_local_doc_ids(
+        &self,
+        local_doc_ids: &[u32],
+        projection: &[&str],
+    ) -> Result<RecordBatch, ReadError> {
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+        let arrow_meta = self
+            .arrow_meta
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+
+        // 1. Resolve projected names → column indices (file order
+        //    for the ProjectionMask, caller order for the output
+        //    RecordBatch).
+        let mut col_indices = Vec::with_capacity(projection.len());
+        let mut out_fields: Vec<Field> = Vec::with_capacity(projection.len());
+        for &name in projection {
+            let idx = self
+                .schema
+                .index_of(name)
+                .map_err(|_| ReadError::UnknownColumn(name.to_string()))?;
+            col_indices.push(idx);
+            out_fields.push(self.schema.field(idx).clone());
+        }
+        let out_schema = Arc::new(Schema::new(out_fields));
+
+        // 2. Bounds-check every requested offset up front so a
+        //    single bad id is a typed error, not a silent
+        //    truncation or a confused parquet error later.
+        for &doc_id in local_doc_ids {
+            if u64::from(doc_id) >= self.n_docs {
+                return Err(ReadError::DocIdOutOfRange {
+                    doc_id,
+                    n_docs: self.n_docs,
+                });
+            }
+        }
+
+        // 3. Empty input short-circuits to an empty batch with the
+        //    projected schema — no parquet decode, no allocation
+        //    beyond the schema. Preserves the pre-existing contract
+        //    for callers that do speculative resolves with k=0 hits.
+        if local_doc_ids.is_empty() {
+            return Ok(RecordBatch::new_empty(out_schema));
+        }
+
+        // 4. Sort + dedup so the RowSelection's `(skip, select)`
+        //    pairs are strictly monotonic. local_doc_ids is dense
+        //    parquet-row index (one parquet row per doc, in id
+        //    order — invariant of the superfile body), so the
+        //    selection lines up directly with parquet row offsets.
+        //    Caller's original order (including duplicates) is
+        //    restored below via the rank-back step.
+        let mut sorted_ids: Vec<u32> = local_doc_ids.to_vec();
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+
+        // 5. Build the RowSelection as alternating skip/select
+        //    runs. This decodes only the rows containing the
+        //    requested doc ids — for k=10 hits over a 100k-doc
+        //    body, ~10 page-fragments instead of the entire
+        //    column. (With page indexes present, parquet skips
+        //    whole pages; without, it still avoids the full
+        //    concat_batches over a 100k-row decoded buffer.)
+        let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted_ids.len() * 2 + 1);
+        let mut cursor: u32 = 0;
+        for &id in &sorted_ids {
+            if id > cursor {
+                selectors.push(RowSelector::skip((id - cursor) as usize));
+            }
+            selectors.push(RowSelector::select(1));
+            cursor = id + 1;
+        }
+        let selection = RowSelection::from(selectors);
+
+        // Metadata-cached read: reuse the `ArrowReaderMetadata` parsed
+        // at open (no per-call footer parse), so this targeted read
+        // only pays the projected-column page decode. The page index
+        // (when present) lets `RowSelection` seek to the relevant
+        // pages. CPU-bound over in-memory bytes — callers fan these
+        // across `options.reader_pool` for cross-segment parallelism.
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
+        let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
+        let reader = builder
+            .with_projection(mask)
+            .with_row_selection(selection)
+            .build()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        // `selected` has exactly sorted_ids.len() rows in
+        // sorted_ids order (parquet honors the selection).
+        let selected = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        debug_assert_eq!(
+            selected.num_rows(),
+            sorted_ids.len(),
+            "RowSelection rows ≠ requested distinct doc ids"
+        );
+
+        // 6. Rank back into the caller's order via take. For each
+        //    requested doc_id, binary-search its row position in
+        //    `sorted_ids` (which is also its row position in
+        //    `selected`). Cheap: typical k is 10..1000.
+        let mut indices_builder = UInt32Array::builder(local_doc_ids.len());
+        for &id in local_doc_ids {
+            let row = sorted_ids
+                .binary_search(&id)
+                .expect("requested id was inserted into sorted_ids above");
+            indices_builder.append_value(row as u32);
+        }
+        let indices = indices_builder.finish();
+
+        // 7. Gather columns in caller's projection order (the
+        //    reader returns columns in file order, which may
+        //    differ).
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
+        for &name in projection {
+            let idx = selected
+                .schema()
+                .index_of(name)
+                .map_err(|_| ReadError::UnknownColumn(name.to_string()))?;
+            let taken = take(selected.column(idx), &indices, None)
+                .map_err(|e| ReadError::Columnar(e.to_string()))?;
+            columns.push(taken);
+        }
+        RecordBatch::try_new(out_schema, columns).map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
     /// Single-column BM25 search across the unified FTS reader.
@@ -713,7 +898,7 @@ mod tests {
     use crate::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
     use crate::superfile::vector::distance::normalize;
     use crate::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
-    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
 
     fn schema_with_text() -> Arc<Schema> {
@@ -777,6 +962,108 @@ mod tests {
         assert!(r.vec().is_none());
     }
 
+    #[test]
+    fn take_by_local_doc_ids_resolves_id_and_scalar_columns() {
+        // ids 10,11,12,13 / titles per row; local offsets index rows.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        // Offsets 2 then 0 — order preserved (ids 12 then 10).
+        let batch = r
+            .take_by_local_doc_ids(&[2, 0], &["doc_id", "title"])
+            .expect("take");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "doc_id");
+        assert_eq!(batch.schema().field(1).name(), "title");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+        assert_eq!(ids.value(0), 12_i128);
+        assert_eq!(ids.value(1), 10_i128);
+        let titles = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("titles");
+        assert_eq!(titles.value(0), "rust embedded system");
+        assert_eq!(titles.value(1), "rust async runtime");
+    }
+
+    #[test]
+    fn take_by_local_doc_ids_respects_projection_order() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        // Reverse of file order: title before doc_id.
+        let batch = r
+            .take_by_local_doc_ids(&[1], &["title", "doc_id"])
+            .expect("take");
+        assert_eq!(batch.schema().field(0).name(), "title");
+        assert_eq!(batch.schema().field(1).name(), "doc_id");
+        let titles = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("titles");
+        assert_eq!(titles.value(0), "python data pipeline");
+    }
+
+    #[test]
+    fn take_by_local_doc_ids_id_only_projection() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        let batch = r
+            .take_by_local_doc_ids(&[0, 1, 2, 3], &["doc_id"])
+            .expect("take");
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 4);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+        assert_eq!(ids.value(0), 10_i128);
+        assert_eq!(ids.value(3), 13_i128);
+    }
+
+    #[test]
+    fn take_by_local_doc_ids_empty_returns_empty_batch() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        let batch = r
+            .take_by_local_doc_ids(&[], &["doc_id", "title"])
+            .expect("take");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn take_by_local_doc_ids_unknown_column_errors() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        let err = r
+            .take_by_local_doc_ids(&[0], &["nope"])
+            .expect_err("expected error");
+        assert!(matches!(err, ReadError::UnknownColumn(_)));
+    }
+
+    #[test]
+    fn take_by_local_doc_ids_out_of_range_errors() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        let err = r
+            .take_by_local_doc_ids(&[4], &["doc_id"])
+            .expect_err("expected error");
+        assert!(matches!(
+            err,
+            ReadError::DocIdOutOfRange {
+                doc_id: 4,
+                n_docs: 4
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn bm25_search_finds_matching_docs() {
         let bytes = build_simple_fts_only_superfile();
@@ -828,9 +1115,17 @@ mod tests {
         let title = LargeStringArray::from(vec!["x"]);
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(title)])
             .expect("build RecordBatch");
-        let parts =
-            write_parquet_with_blobs(&schema, &[batch], &[], &[], &[], Compression::SNAPPY, 1024)
-                .expect("write parquet with blobs");
+        let parts = write_parquet_with_blobs(
+            &schema,
+            &[batch],
+            &[],
+            &[],
+            &[],
+            Compression::SNAPPY,
+            1024,
+            &[],
+        )
+        .expect("write parquet with blobs");
         let err = SuperfileReader::open(Bytes::from(parts.bytes)).expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
     }

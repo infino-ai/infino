@@ -577,6 +577,10 @@ fn bench(c: &mut Criterion) {
         diag::diagnose_real_s3_supertable_e2e();
         return;
     }
+    if std::env::var("INFINO_DIAG_QUERY_SQL_OVERHEAD").is_ok() {
+        diag::diagnose_query_sql_overhead();
+        return;
+    }
 
     let rt = Runtime::new().expect("tokio runtime");
     let superfile = superfile_bytes();
@@ -2082,5 +2086,350 @@ mod diag {
 
     fn read_u64_le(bytes: &[u8]) -> u64 {
         u64::from_le_bytes(bytes.try_into().expect("u64 slice length"))
+    }
+
+    /// Times warm `reader.bm25_search` / `reader.vector_search`
+    /// (kernel-direct) vs `consumer.query_sql("SELECT _id FROM
+    /// bm25_search(...)")` / `query_sql("... vector_search ...")`
+    /// (DataFusion path) side-by-side on the same warm Supertable
+    /// over an in-process `s3s-fs`. Prints min / p50 / p95 / mean
+    /// for each path plus the p50 dispatch-tax delta to stderr.
+    ///
+    /// Storage backend doesn't matter for this measurement —
+    /// after warm-up both paths read from mmap (zero S3 GETs).
+    /// The delta is the per-call cost of `SessionContext::new()` +
+    /// TVF re-registration + SQL parse/plan + RecordBatch glue
+    /// that `query_sql` pays on top of the kernel.
+    ///
+    /// Knobs:
+    ///   `INFINO_DIAG_QUERY_SQL_ITERS` (default 50) — iters per path.
+    ///   `INFINO_BENCH_FULL=1` — corpus = 1M (else 100K).
+    pub fn diagnose_query_sql_overhead() {
+        use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, LruPolicy};
+        use std::collections::HashSet;
+
+        let rt = Runtime::new().expect("tokio runtime");
+        let n = quick_iter_n_docs();
+        let iters: usize = std::env::var("INFINO_DIAG_QUERY_SQL_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        eprintln!(
+            "[diag-qsql-overhead] n_docs={n} iters={iters} \
+             (override via INFINO_DIAG_QUERY_SQL_ITERS, INFINO_BENCH_FULL=1 for 1M)"
+        );
+
+        // 1. Spawn s3s-fs + storage provider.
+        let (addr, _fs_root) = rt.block_on(spawn_s3s_fs());
+        let endpoint = format!("http://{addr}");
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            S3StorageProvider::new_with_endpoint(
+                &endpoint,
+                TEST_BUCKET,
+                TEST_ACCESS_KEY,
+                TEST_SECRET_KEY,
+                TEST_REGION,
+            )
+            .expect("s3 provider"),
+        );
+
+        // 2. Disk cache (so warm == mmap, not re-fetch).
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache_cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            disk_budget_bytes: 4u64 << 30,
+            cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+            cold_fetch_streams: 4,
+            cold_fetch_chunk_bytes: 1 << 20,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            eviction: Box::new(LruPolicy::new()),
+            verify_crc_on_open: true,
+            ..Default::default()
+        };
+        let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+        let cache = DiskCacheStore::new(Arc::clone(&storage), cache_cfg, pinned).expect("cache");
+
+        // 3. Producer: write n docs through Supertable's writer.
+        eprintln!("[diag-qsql-overhead] writing {n}-doc Supertable to s3s-fs ...");
+        let build_t0 = Instant::now();
+        rt.block_on(async {
+            let producer =
+                Supertable::create(real_s3_supertable_options().with_storage(Arc::clone(&storage)));
+            let mut writer = producer.writer().expect("producer writer");
+            append_unified_supertable_batches(&mut writer, n);
+            writer.commit().expect("commit Supertable to s3s-fs");
+        });
+        eprintln!(
+            "[diag-qsql-overhead] commit OK in {:.1} s",
+            build_t0.elapsed().as_secs_f64()
+        );
+
+        // 4. Consumer with disk cache attached.
+        let consumer = rt.block_on(async {
+            Supertable::open(
+                real_s3_supertable_options()
+                    .with_storage(Arc::clone(&storage))
+                    .with_disk_cache(Arc::clone(&cache)),
+            )
+            .await
+            .expect("Supertable::open from s3s-fs")
+        });
+        let reader = consumer.reader();
+
+        // 5. Warm the cache: cold pass + mmap-promotion sleep.
+        eprintln!("[diag-qsql-overhead] warming cache (cold pass + 2s mmap promotion sleep)");
+        let q = query_vector().to_vec();
+        let _ = rt
+            .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
+            .expect("warm-up bm25");
+        let _ = rt
+            .block_on(reader.vector_search(
+                VEC_COLUMN,
+                &q,
+                TOP_K,
+                VectorSearchOptions::new().with_nprobe(BENCH_NPROBE),
+            ))
+            .expect("warm-up vector");
+        rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+
+        // 6. Pre-warm the query_sql path: lazy-allocates the
+        //    Supertable's internal sql_runtime and warms any
+        //    DataFusion lazy state so the first timed iter
+        //    isn't contaminated by one-time setup cost.
+        let q_csv: String = q
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let bm25_sql =
+            format!("SELECT _id FROM bm25_search('{FTS_COLUMN}', '{FTS_QUERY_TERM}', {TOP_K})");
+        let vec_sql = format!("SELECT _id FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
+        // Score-only projection skips `resolve_hits` -> `resolve_columns`
+        // (no scalar decode, no per-segment superfile_reader open).
+        // Difference vs `_id` projection isolates resolve_hits cost.
+        let bm25_score_sql =
+            format!("SELECT score FROM bm25_search('{FTS_COLUMN}', '{FTS_QUERY_TERM}', {TOP_K})");
+        let vec_score_sql =
+            format!("SELECT score FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
+        let _ = consumer
+            .query_sql(&bm25_sql)
+            .expect("warm-up query_sql bm25");
+        let _ = consumer
+            .query_sql(&vec_sql)
+            .expect("warm-up query_sql vector");
+
+        // 7. Time both paths.
+        let opts = VectorSearchOptions::new().with_nprobe(BENCH_NPROBE);
+
+        let mut kernel_bm25: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = rt
+                .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
+                .expect("kernel bm25");
+            kernel_bm25.push(t.elapsed());
+        }
+        let mut qsql_bm25: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = consumer.query_sql(&bm25_sql).expect("query_sql bm25");
+            qsql_bm25.push(t.elapsed());
+        }
+        let mut kernel_vec: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = rt
+                .block_on(reader.vector_search(VEC_COLUMN, &q, TOP_K, opts))
+                .expect("kernel vector");
+            kernel_vec.push(t.elapsed());
+        }
+        let mut qsql_vec: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = consumer.query_sql(&vec_sql).expect("query_sql vector");
+            qsql_vec.push(t.elapsed());
+        }
+
+        // Decompose query_sql into parse+plan (ctx.sql) vs
+        // execute (DataFrame::collect) so we can see where the
+        // remaining dispatch time goes after the SessionContext
+        // cache hit. Goes through the same cached SessionContext
+        // the public query_sql uses — no rebuild per iter.
+        let cached_ctx = consumer.__debug_cached_session();
+        let mut bm25_parse_plan: Vec<Duration> = Vec::with_capacity(iters);
+        let mut bm25_execute: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let df = rt
+                .block_on(cached_ctx.sql(&bm25_sql))
+                .expect("ctx.sql bm25");
+            bm25_parse_plan.push(t0.elapsed());
+            let t1 = Instant::now();
+            let _ = rt.block_on(df.collect()).expect("collect bm25");
+            bm25_execute.push(t1.elapsed());
+        }
+        let mut vec_parse_plan: Vec<Duration> = Vec::with_capacity(iters);
+        let mut vec_execute: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let df = rt
+                .block_on(cached_ctx.sql(&vec_sql))
+                .expect("ctx.sql vector");
+            vec_parse_plan.push(t0.elapsed());
+            let t1 = Instant::now();
+            let _ = rt.block_on(df.collect()).expect("collect vector");
+            vec_execute.push(t1.elapsed());
+        }
+        let mut bm25_score_total: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = consumer
+                .query_sql(&bm25_score_sql)
+                .expect("query_sql bm25 score");
+            bm25_score_total.push(t.elapsed());
+        }
+        let mut vec_score_total: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = consumer
+                .query_sql(&vec_score_sql)
+                .expect("query_sql vector score");
+            vec_score_total.push(t.elapsed());
+        }
+
+        // 8. Stats + report.
+        fn stats(samples: &mut [Duration]) -> (Duration, Duration, Duration, Duration) {
+            samples.sort();
+            let n = samples.len();
+            let sum_ns: u128 = samples.iter().map(|d| d.as_nanos()).sum();
+            let mean = Duration::from_nanos((sum_ns / n as u128) as u64);
+            (
+                samples[0],
+                samples[n / 2],
+                samples[(n * 95 / 100).min(n - 1)],
+                mean,
+            )
+        }
+        let fmt = |d: Duration| -> String {
+            let us = d.as_secs_f64() * 1e6;
+            if us < 1000.0 {
+                format!("{us:>9.1} µs")
+            } else {
+                format!("{:>9.2} ms", us / 1000.0)
+            }
+        };
+
+        let (kb_min, kb_p50, kb_p95, kb_mean) = stats(&mut kernel_bm25);
+        let (qb_min, qb_p50, qb_p95, qb_mean) = stats(&mut qsql_bm25);
+        let (kv_min, kv_p50, kv_p95, kv_mean) = stats(&mut kernel_vec);
+        let (qv_min, qv_p50, qv_p95, qv_mean) = stats(&mut qsql_vec);
+
+        eprintln!();
+        eprintln!(
+            "[diag-qsql-overhead] === kernel vs query_sql (warm, n={n} docs, iters={iters}) ==="
+        );
+        eprintln!(
+            "[diag-qsql-overhead]                          min        p50        p95       mean"
+        );
+        eprintln!(
+            "[diag-qsql-overhead] BM25 kernel        {} {} {} {}",
+            fmt(kb_min),
+            fmt(kb_p50),
+            fmt(kb_p95),
+            fmt(kb_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] BM25 query_sql     {} {} {} {}",
+            fmt(qb_min),
+            fmt(qb_p50),
+            fmt(qb_p95),
+            fmt(qb_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] BM25 dispatch tax  {} (p50 query_sql − kernel)",
+            fmt(qb_p50.saturating_sub(kb_p50)),
+        );
+        eprintln!();
+        eprintln!(
+            "[diag-qsql-overhead] vec  kernel        {} {} {} {}",
+            fmt(kv_min),
+            fmt(kv_p50),
+            fmt(kv_p95),
+            fmt(kv_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] vec  query_sql     {} {} {} {}",
+            fmt(qv_min),
+            fmt(qv_p50),
+            fmt(qv_p95),
+            fmt(qv_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] vec  dispatch tax  {} (p50 query_sql − kernel)",
+            fmt(qv_p50.saturating_sub(kv_p50)),
+        );
+
+        let (bp_min, bp_p50, bp_p95, bp_mean) = stats(&mut bm25_parse_plan);
+        let (be_min, be_p50, be_p95, be_mean) = stats(&mut bm25_execute);
+        let (vp_min, vp_p50, vp_p95, vp_mean) = stats(&mut vec_parse_plan);
+        let (ve_min, ve_p50, ve_p95, ve_mean) = stats(&mut vec_execute);
+        eprintln!();
+        eprintln!("[diag-qsql-overhead] === decomposition: ctx.sql() vs DataFrame::collect() ===");
+        eprintln!(
+            "[diag-qsql-overhead] BM25 parse+plan    {} {} {} {}",
+            fmt(bp_min),
+            fmt(bp_p50),
+            fmt(bp_p95),
+            fmt(bp_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] BM25 execute       {} {} {} {}",
+            fmt(be_min),
+            fmt(be_p50),
+            fmt(be_p95),
+            fmt(be_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] vec  parse+plan    {} {} {} {}",
+            fmt(vp_min),
+            fmt(vp_p50),
+            fmt(vp_p95),
+            fmt(vp_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] vec  execute       {} {} {} {}",
+            fmt(ve_min),
+            fmt(ve_p50),
+            fmt(ve_p95),
+            fmt(ve_mean),
+        );
+
+        let (bs_min, bs_p50, bs_p95, bs_mean) = stats(&mut bm25_score_total);
+        let (vs_min, vs_p50, vs_p95, vs_mean) = stats(&mut vec_score_total);
+        eprintln!();
+        eprintln!("[diag-qsql-overhead] === score-only projection (skips resolve_hits) ===");
+        eprintln!(
+            "[diag-qsql-overhead] BM25 score-only    {} {} {} {}",
+            fmt(bs_min),
+            fmt(bs_p50),
+            fmt(bs_p95),
+            fmt(bs_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] BM25 resolve_hits  {} (p50 _id − p50 score-only)",
+            fmt(qb_p50.saturating_sub(bs_p50)),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] vec  score-only    {} {} {} {}",
+            fmt(vs_min),
+            fmt(vs_p50),
+            fmt(vs_p95),
+            fmt(vs_mean),
+        );
+        eprintln!(
+            "[diag-qsql-overhead] vec  resolve_hits  {} (p50 _id − p50 score-only)",
+            fmt(qv_p50.saturating_sub(vs_p50)),
+        );
     }
 }

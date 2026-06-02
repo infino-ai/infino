@@ -179,7 +179,21 @@ pub struct BuilderOptions {
     pub row_group_size: usize,
     /// Parquet column-chunk compression.
     pub compression: Compression,
+    /// Per-column Parquet data-page size limit (uncompressed bytes)
+    /// applied to the `id_column` only. Small pages let a point
+    /// lookup (`take_by_local_doc_ids`) decompress just the tiny
+    /// page holding the requested row instead of the whole
+    /// row-group-sized page, which is the dominant `resolve_hits`
+    /// cost. Compression stays on; the only cost is a few extra
+    /// page headers + offset-index entries for the id column.
+    pub id_page_size_limit: usize,
 }
+
+/// Default per-column data-page size limit for the id column
+/// (uncompressed bytes). At 16 bytes/row (`Decimal128`) this is
+/// ~512 rows/page, vs the ~65 536-row single page a default
+/// (1 MiB) limit produces for a full row group.
+pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 
 impl BuilderOptions {
     /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
@@ -209,6 +223,7 @@ impl BuilderOptions {
                 parquet::basic::ZstdLevel::try_new(3)
                     .expect("zstd level 3 is in the valid 1..=22 range"),
             ),
+            id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
         }
     }
 }
@@ -478,6 +493,7 @@ impl SuperfileBuilder {
             &kvs,
             self.opts.compression,
             self.opts.row_group_size,
+            &[(self.opts.id_column.as_str(), self.opts.id_page_size_limit)],
         )?;
         Ok(parts.bytes)
     }

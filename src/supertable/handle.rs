@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
+use datafusion::execution::context::SessionContext;
 use tokio::runtime::Runtime;
 
 use super::error::{BuildError, OpenError};
@@ -72,6 +73,18 @@ pub(super) struct SupertableInner {
     /// first use rather than at `create()` so supertables that
     /// never run SQL don't pay the runtime cost.
     pub(super) sql_runtime: OnceLock<Arc<Runtime>>,
+    /// Cached `SessionContext` for `query_sql`, keyed on the
+    /// manifest `Arc` it was built against. Building one is
+    /// ~1.5 ms (default optimizer rules + 3 TVF re-registrations
+    /// + provider register), so reusing it across queries on the
+    /// same snapshot is a large speedup for warm BM25 / vector
+    /// SQL where the kernel itself runs in microseconds.
+    ///
+    /// Invalidation is automatic: every commit publishes a new
+    /// `Arc<Manifest>` via `manifest.store(...)`, so on the next
+    /// `query_sql` the `Arc::ptr_eq` check fails and the cache
+    /// is rebuilt against the fresh snapshot.
+    pub(super) sql_session_cache: Mutex<Option<(Arc<Manifest>, SessionContext)>>,
 }
 
 impl SupertableInner {
@@ -110,6 +123,7 @@ impl Supertable {
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
             sql_runtime: OnceLock::new(),
+            sql_session_cache: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         Self { inner }
@@ -275,6 +289,7 @@ impl Supertable {
             // further insulating restarts from collisions.
             id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
             sql_runtime: OnceLock::new(),
+            sql_session_cache: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         Ok(Self { inner })
@@ -507,6 +522,35 @@ impl Supertable {
     /// `SupertableInner`; subsequent calls clone the `Arc`.
     pub(crate) fn sql_runtime(&self) -> Arc<Runtime> {
         self.inner.sql_runtime()
+    }
+
+    /// Crate-internal accessor for the cached `SessionContext`
+    /// keyed on the manifest `Arc`. Used by `query_sql` to
+    /// reuse the registered provider + TVFs across queries on
+    /// the same snapshot.
+    pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
+        &self.inner.sql_session_cache
+    }
+
+    /// Diagnostic-only: returns the cached `SessionContext`
+    /// (building it on miss), bypassing the run-and-collect
+    /// path. Lets benchmarks decompose `query_sql` cost into
+    /// `ctx.sql()` (parse + analyze + logical/physical plan)
+    /// vs `DataFrame::collect()` (execute) to find where the
+    /// remaining dispatch time goes after the cache hit.
+    #[doc(hidden)]
+    pub fn __debug_cached_session(&self) -> SessionContext {
+        // Reuses the same fast path as `query_sql` — see the
+        // doc-comment on `sql_session_cache` for invalidation.
+        self.query_sql("SELECT 1 WHERE 1=0").ok();
+        let guard = self
+            .sql_session_cache()
+            .lock()
+            .expect("sql_session_cache mutex poisoned");
+        guard
+            .as_ref()
+            .map(|(_, ctx)| ctx.clone())
+            .expect("session cache must be populated after warm-up call")
     }
 }
 

@@ -91,7 +91,7 @@ impl SupertableReader {
         let column_owned = column.to_owned();
         let query_owned: Vec<f32> = query.to_vec();
 
-        // M15c: hierarchical pruning. Vector list-prune
+        // Hierarchical pruning. Vector list-prune
         // (`prune_parts_for_vector`) needs an upper-bound
         // distance cutoff to be useful — for top-k vector
         // search the cutoff is *dynamic* (only known after

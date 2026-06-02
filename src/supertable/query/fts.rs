@@ -225,7 +225,7 @@ impl SupertableReader {
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();
 
-        // M15c: hierarchical pruning. List-level prefix
+        // Hierarchical pruning. List-level prefix
         // skip via term_range_union → lazy-load only the
         // surviving parts → flatten → per-segment
         // term-range skip + fan-out.

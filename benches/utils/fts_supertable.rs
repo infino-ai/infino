@@ -276,27 +276,49 @@ fn bench_search(c: &mut Criterion) {
     // pinned through the read.
     let rss_sample = rss::PeakSampler::start_default();
 
-    let queries: &[(&str, &str)] = &[
-        ("single_rare", "term09999"),
-        ("single_common", "term00001"),
-        ("two_term_or", "term00001 term00050"),
-        ("three_wide_or", "term00001 term00050 term00100"),
-        ("three_similar_or", "term00050 term00051 term00052"),
+    let queries: &[(&str, &str, BoolMode)] = &[
+        ("single_rare", "term09999", BoolMode::Or),
+        ("single_common", "term00001", BoolMode::Or),
+        ("two_term_or", "term00001 term00050", BoolMode::Or),
+        (
+            "three_wide_or",
+            "term00001 term00050 term00100",
+            BoolMode::Or,
+        ),
+        (
+            "three_similar_or",
+            "term00050 term00051 term00052",
+            BoolMode::Or,
+        ),
         (
             "five_term_or",
             "term00050 term00051 term00052 term00053 term00054",
+            BoolMode::Or,
+        ),
+        (
+            "ten_term_or",
+            "term00050 term00051 term00052 term00053 term00054 \
+             term00055 term00056 term00057 term00058 term00059",
+            BoolMode::Or,
+        ),
+        (
+            "ten_term_and",
+            "term00050 term00051 term00052 term00053 term00054 \
+             term00055 term00056 term00057 term00058 term00059",
+            BoolMode::And,
         ),
     ];
-    for (name, q) in queries {
+    for (name, q, mode) in queries {
         let name = *name;
         let q = *q;
+        let mode = *mode;
         g.bench_function(format!("{name}_supertable_top10"), |b| {
             b.iter(|| {
                 let hits = corpus::block_on_inmem(r.bm25_search(
                     black_box("title"),
                     black_box(q),
                     TOP_K,
-                    BoolMode::Or,
+                    mode,
                 ))
                 .expect("bm25");
                 black_box(hits)
@@ -325,6 +347,8 @@ fn bench_search(c: &mut Criterion) {
         "three_wide_or_supertable_top10",
         "three_similar_or_supertable_top10",
         "five_term_or_supertable_top10",
+        "ten_term_or_supertable_top10",
+        "ten_term_and_supertable_top10",
         "prefix_supertable_top10",
     ];
     for bid in search_ids {
@@ -336,7 +360,7 @@ fn bench_search(c: &mut Criterion) {
     emit_search_markdown();
 }
 
-fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) {
+fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str, BoolMode)]) {
     let committed = s3_fts_committed();
     let pool = parallel_pool();
 
@@ -354,8 +378,9 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
             g.measurement_time(Duration::from_secs(30));
         }
 
-        for (name, q) in queries {
+        for (name, q, mode) in queries {
             let bench_id = format!("{name}_supertable_top10");
+            let mode = *mode;
             match tier {
                 Tier::Warm => {
                     let storage = Arc::clone(&committed.storage);
@@ -370,7 +395,7 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
                     tiers::block_on(async {
                         let _ = st
                             .reader()
-                            .bm25_search("title", query, TOP_K, BoolMode::Or)
+                            .bm25_search("title", query, TOP_K, mode)
                             .await
                             .expect("warm prewarm bm25");
                         st.wait_until_warm(Duration::from_secs(600))
@@ -381,7 +406,7 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
                         b.iter(|| {
                             let hits = tiers::block_on(async {
                                 st.reader()
-                                    .bm25_search("title", q, TOP_K, BoolMode::Or)
+                                    .bm25_search("title", q, TOP_K, mode)
                                     .await
                                     .expect("bm25")
                             });
@@ -411,7 +436,7 @@ fn bench_search_object_store_tiers(c: &mut Criterion, queries: &[(&str, &str)]) 
                                     let st = tiers::open_consumer(consumer_opts).await;
                                     let _ = st
                                         .reader()
-                                        .bm25_search("title", query, TOP_K, BoolMode::Or)
+                                        .bm25_search("title", query, TOP_K, mode)
                                         .await
                                         .expect("cold bm25");
                                 });
@@ -562,6 +587,8 @@ fn emit_search_markdown() {
         "three_wide_or",
         "three_similar_or",
         "five_term_or",
+        "ten_term_or",
+        "ten_term_and",
         "prefix",
     ];
     for q in queries {

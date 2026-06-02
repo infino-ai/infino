@@ -389,6 +389,24 @@ fn bench(c: &mut Criterion) {
         );
         bench_infino(
             &mut g,
+            "ten_term_or",
+            &r,
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
+            ],
+            BoolMode::Or,
+        );
+        bench_infino(
+            &mut g,
             "two_term_and",
             &r,
             &["term00001", "term00050"],
@@ -418,6 +436,24 @@ fn bench(c: &mut Criterion) {
                 "term00052",
                 "term00053",
                 "term00054",
+            ],
+            BoolMode::And,
+        );
+        bench_infino(
+            &mut g,
+            "ten_term_and",
+            &r,
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
             ],
             BoolMode::And,
         );
@@ -457,10 +493,12 @@ fn bench(c: &mut Criterion) {
             "three_wide_or_infino_top10",
             "three_similar_or_infino_top10",
             "five_term_or_infino_top10",
+            "ten_term_or_infino_top10",
             "two_term_and_infino_top10",
             "three_wide_and_infino_top10",
             "three_similar_and_infino_top10",
             "five_term_and_infino_top10",
+            "ten_term_and_infino_top10",
             "wide_3_or_wand_top10",
             "wide_3_or_bmm_top10",
             "similar_3_or_wand_top10",
@@ -654,12 +692,14 @@ fn emit_search_markdown() {
         "three_wide_or",
         "three_similar_or",
         "five_term_or",
+        "ten_term_or",
     ];
     let queries_and = [
         "two_term_and",
         "three_wide_and",
         "three_similar_and",
         "five_term_and",
+        "ten_term_and",
     ];
 
     body.push_str("**OR queries:**\n\n");
