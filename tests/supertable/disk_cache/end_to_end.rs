@@ -270,12 +270,13 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
 }
 
 #[test]
-fn manifest_segments_are_auto_pinned_by_supertable_create() {
-    // M14b.1: Supertable::create / Supertable::open install
-    // a Weak<SupertableInner>-based pinned_fn on the
-    // attached cache. The closure returns the current
-    // manifest's segment URI set. Pre-commit: empty.
-    // Post-commit: contains the published segment's URI.
+fn manifest_segments_are_not_pinned_by_supertable_create() {
+    // The cache must be free to evict any segment to stay under
+    // budget. Pinning the live manifest makes the whole index
+    // required to fit in cache: once all resident entries are pinned,
+    // the next admit can fail with BudgetExceeded. Supertable::create
+    // therefore installs a pin callback that does not pin manifest
+    // segments.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -289,8 +290,7 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
     )
     .expect("create");
 
-    // Before any commit: empty segment list → empty pinned
-    // set.
+    // Before any commit: nothing pinned.
     let pre = cache.current_pinned_uris();
     assert!(pre.is_empty(), "expected empty pinned set; got {pre:?}");
 
@@ -302,29 +302,21 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
         w.commit().expect("commit");
     }
 
-    // Pinned set must now contain the committed segment's
-    // URI.
+    // Post-commit: the manifest has one segment, but the cache still
+    // pins nothing. Eviction protection is not based on the live
+    // manifest set.
     let post = cache.current_pinned_uris();
-    assert_eq!(post.len(), 1, "expected 1 pinned URI; got {post:?}");
+    assert!(post.is_empty(), "expected empty pinned set; got {post:?}");
     let reader = st.reader();
-    let segment_uri = reader
-        .manifest()
-        .superfile_list
-        .superfiles
-        .first()
-        .expect("segment exists")
-        .uri;
-    assert!(
-        post.contains(&segment_uri),
-        "pinned set must contain committed segment {segment_uri:?}; got {post:?}"
-    );
+    assert_eq!(reader.manifest().superfile_list.superfiles.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manifest_segments_are_auto_pinned_by_supertable_open() {
-    // The auto-pinning path runs from Supertable::open
-    // too — important because the cross-process consumer
-    // wires the cache + supertable in open, not in create.
+async fn manifest_segments_are_not_pinned_by_supertable_open() {
+    // Supertable::open follows the same cache policy as create: the
+    // live manifest does not pin segment files. A cross-process
+    // consumer can stream an index larger than cache budget instead
+    // of making every manifest segment ineligible for eviction.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
@@ -352,26 +344,20 @@ async fn manifest_segments_are_auto_pinned_by_supertable_open() {
     .expect("open");
 
     let pinned = cache.current_pinned_uris();
-    assert_eq!(pinned.len(), 1);
-    let segment_uri = consumer
-        .reader()
-        .manifest()
-        .superfile_list
-        .superfiles
-        .first()
-        .expect("segment exists")
-        .uri;
-    assert!(pinned.contains(&segment_uri));
+    assert!(
+        pinned.is_empty(),
+        "expected empty pinned set; got {pinned:?}"
+    );
+    let n_segments = consumer.reader().manifest().superfile_list.superfiles.len();
+    assert_eq!(n_segments, 1);
 }
 
 #[test]
-fn pinned_fn_releases_via_weak_when_supertable_drops() {
-    // Cache outliving its supertable is supported: the
-    // Weak<SupertableInner>-based closure detects the drop
-    // (via Weak::upgrade returning None) and falls through
-    // to the empty pinned set. Eviction then treats every
-    // entry as evictable. This is the "no leak via cache
-    // holding inner alive" property.
+fn pinned_fn_does_not_hold_supertable_alive() {
+    // Cache outliving its supertable is supported: the installed
+    // callback must not keep the supertable alive. The current policy
+    // pins no manifest segments, so the observable set is empty both
+    // before and after drop.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -388,12 +374,11 @@ fn pinned_fn_releases_via_weak_when_supertable_drops() {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["temp"])).expect("append");
         w.commit().expect("commit");
-        assert_eq!(cache.current_pinned_uris().len(), 1);
+        assert!(cache.current_pinned_uris().is_empty());
         // st drops at end of scope.
     }
 
-    // Supertable dropped → Weak::upgrade returns None → pinned
-    // set is empty. Cache survives without the supertable.
+    // Supertable dropped; cache survives without pinning anything.
     assert!(
         cache.current_pinned_uris().is_empty(),
         "pinned set must be empty after supertable drops"

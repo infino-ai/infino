@@ -50,10 +50,9 @@ fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
     let r = st.reader();
     let probe_doc_id = (supertable::N_DOCS / 2) as u32;
     let probe_token = format!("doc{probe_doc_id:07}");
-    let hits = tiers::block_on(
-        r.bm25_search(supertable::TEXT_COLUMN, &probe_token, TOP_K, BoolMode::Or),
-    )
-    .expect("bm25");
+    let hits =
+        tiers::block_on(r.bm25_search(supertable::TEXT_COLUMN, &probe_token, TOP_K, BoolMode::Or))
+            .expect("bm25");
     assert_eq!(
         hits.len(),
         1,
@@ -66,8 +65,9 @@ fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
         hits[0].score
     );
 
-    let hits = tiers::block_on(r.bm25_search(supertable::TEXT_COLUMN, "term00001", TOP_K, BoolMode::Or))
-        .expect("bm25");
+    let hits =
+        tiers::block_on(r.bm25_search(supertable::TEXT_COLUMN, "term00001", TOP_K, BoolMode::Or))
+            .expect("bm25");
     assert_eq!(hits.len(), TOP_K, "common term should fill top-{TOP_K}");
     for w in hits.windows(2) {
         assert!(
@@ -80,6 +80,16 @@ fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
 }
 
 pub fn bench(c: &mut Criterion) {
+    if !fixture::criterion_filter_selects(
+        &["supertable_fts", "supertable_fts_search"],
+        &[
+            "supertable_fts_hot_search",
+            "supertable_fts_warm_search_real_s3",
+            "supertable_fts_cold_search_real_s3",
+        ],
+    ) {
+        return;
+    }
     fixture::ensure_ingest_for_search("FTS correctness/search");
     let st = fixture::search_table();
     eprintln!("[supertable_fts_search] correctness on object-store supertable...");
@@ -148,8 +158,11 @@ fn bench_object_store_tiers(c: &mut Criterion) {
                     let storage = fixture::storage();
                     let (cache_dir, cache) =
                         tiers::fresh_supertable_search_cache(storage.clone(), idx_bytes);
-                    let consumer_opts =
-                        tiers::consumer_options(supertable::combined_options(None), storage, cache.clone());
+                    let consumer_opts = tiers::consumer_options(
+                        supertable::combined_options(None),
+                        storage,
+                        cache.clone(),
+                    );
                     let st = tiers::block_on(tiers::open_consumer(consumer_opts));
                     let query = *q;
                     tiers::block_on(async {
@@ -184,23 +197,31 @@ fn bench_object_store_tiers(c: &mut Criterion) {
                         b.iter_custom(|iters| {
                             let mut total = Duration::ZERO;
                             for _ in 0..iters {
-                                let (cache_dir, cache) =
-                                    tiers::fresh_supertable_search_cache(Arc::clone(&storage), idx_bytes);
+                                let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+                                    Arc::clone(&storage),
+                                    idx_bytes,
+                                );
                                 let consumer_opts = tiers::consumer_options(
                                     supertable::combined_options(None),
                                     Arc::clone(&storage),
                                     cache.clone(),
                                 );
-                                let t0 = std::time::Instant::now();
-                                tiers::block_on(async {
+                                let elapsed = tiers::block_on(async {
                                     let st = tiers::open_consumer(consumer_opts).await;
+                                    let t0 = std::time::Instant::now();
                                     let _ = st
                                         .reader()
-                                        .bm25_search(supertable::TEXT_COLUMN, query, TOP_K, BoolMode::Or)
+                                        .bm25_search(
+                                            supertable::TEXT_COLUMN,
+                                            query,
+                                            TOP_K,
+                                            BoolMode::Or,
+                                        )
                                         .await
                                         .expect("cold bm25");
+                                    t0.elapsed()
                                 });
-                                total += t0.elapsed();
+                                total += elapsed;
                                 drop(cache);
                                 drop(cache_dir);
                             }
@@ -217,8 +238,11 @@ fn bench_object_store_tiers(c: &mut Criterion) {
                 let storage = fixture::storage();
                 let (cache_dir, cache) =
                     tiers::fresh_supertable_search_cache(storage.clone(), idx_bytes);
-                let consumer_opts =
-                    tiers::consumer_options(supertable::combined_options(None), storage, cache.clone());
+                let consumer_opts = tiers::consumer_options(
+                    supertable::combined_options(None),
+                    storage,
+                    cache.clone(),
+                );
                 let st = tiers::block_on(tiers::open_consumer(consumer_opts));
                 tiers::block_on(async {
                     let _ = st
@@ -255,16 +279,17 @@ fn bench_object_store_tiers(c: &mut Criterion) {
                             Arc::clone(&storage),
                             cache.clone(),
                         );
-                        let t0 = std::time::Instant::now();
-                        tiers::block_on(async {
+                        let elapsed = tiers::block_on(async {
                             let st = tiers::open_consumer(consumer_opts).await;
+                            let t0 = std::time::Instant::now();
                             let _ = st
                                 .reader()
                                 .bm25_search_prefix(supertable::TEXT_COLUMN, "term0009", TOP_K)
                                 .await
                                 .expect("cold prefix");
+                            t0.elapsed()
                         });
-                        total += t0.elapsed();
+                        total += elapsed;
                         drop(cache);
                         drop(cache_dir);
                     }

@@ -181,6 +181,16 @@ fn calibrations(st: &Supertable, g: &grading::SupertableGrading) -> &'static Cal
 }
 
 pub fn bench(c: &mut Criterion) {
+    if !fixture::criterion_filter_selects(
+        &["supertable_vec", "supertable_vec_search"],
+        &[
+            "supertable_vec_hot_search",
+            "supertable_vec_warm_search_real_s3",
+            "supertable_vec_cold_search_real_s3",
+        ],
+    ) {
+        return;
+    }
     fixture::ensure_ingest_for_search("vector correctness/search");
     let g = grading::supertable_grading();
     let st = fixture::search_table();

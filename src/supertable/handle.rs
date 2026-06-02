@@ -132,9 +132,9 @@ impl Supertable {
     /// `Handle::try_current() + block_in_place` pattern the
     /// rest of the supertable's sync paths use. Works from
     /// sync `#[test]` contexts and from multi-thread
-    /// `#[tokio::test]` contexts; calling from a
-    /// `current_thread` runtime panics (use the async
-    /// [`Supertable::open`] directly in that case).
+    /// `#[tokio::test]` contexts. In-memory creates avoid the
+    /// open-time sweep bridge entirely because no WAL/GC I/O can
+    /// exist without attached storage.
     pub fn create(options: SupertableOptions) -> Result<Self, OpenError> {
         // Pointer-probe pass. When storage is attached AND a
         // pointer file already exists, we want open's load path
@@ -180,12 +180,17 @@ impl Supertable {
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
-        // Open-time recovery + gc sweeps — no-op when no
-        // storage is attached. Best-effort: a sweep failure
-        // here doesn't fail handle construction; the next
-        // sweep gets another shot.
-        let _ = st.run_recovery_sweep_once_blocking();
-        let _ = bridge_sync_to_async(async { st.run_gc_sweep_once().await.map_err(|_| ()) });
+        // Open-time recovery + GC sweeps need storage. For in-memory
+        // supertables they are guaranteed no-ops, so skip the async
+        // bridge; this keeps `Supertable::create` usable inside
+        // current-thread `#[tokio::test]` contexts for pure in-memory
+        // unit tests.
+        if st.inner.options.storage.is_some() {
+            // Best-effort: a sweep failure here doesn't fail handle
+            // construction; the next sweep gets another shot.
+            let _ = st.run_recovery_sweep_once_blocking();
+            let _ = bridge_sync_to_async(async { st.run_gc_sweep_once().await.map_err(|_| ()) });
+        }
         Ok(st)
     }
 

@@ -34,7 +34,6 @@ cargo bench --bench supertable_all -- supertable_all_build supertable_fts_search
 
 # Knobs
 INFINO_SUPERTABLE__WRITER_THREADS=32 cargo bench --bench supertable_all -- supertable_all_build
-INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1 cargo bench --bench supertable_all -- supertable_fts_search  # legacy: search triggers ingest
 INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
 
 # Diagnostics (not run by plain `cargo bench`)
@@ -42,11 +41,9 @@ cargo bench --features bench-diagnostics --bench object-store
 cargo bench --features bench-diagnostics --bench scale -- vector_recall
 ```
 
-**Supertable search-only filters** (`supertable_fts_search`, `supertable_vec_search`)
-require ingest in the **same** `cargo bench` process. Run
-`supertable_all_build` first in that invocation, or use unfiltered
-`cargo bench --bench supertable_all`. Set `INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1`
-to let a search-only run trigger ingest (old behaviour).
+**Supertable search filters** (`supertable_fts_search`, `supertable_vec_search`)
+build the shared combined fixture internally when needed. Build-only filters
+skip search setup entirely.
 
 Superfile benches (1M) build their own fixture per binary; supertable
 search groups run correctness (FTS oracle / vector recall floor) before timing
@@ -132,9 +129,9 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 <!-- BEGIN: bench/supertable/ingest/supertable_fts_build -->
 ### Supertable FTS-only — ingest (10000000 docs × dim=384, 16 commits → 256 superfiles)
 
-| Engine                  | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
-|-------------------------|------------|------------|-----------|------------|-----------|------------|
-| supertable | 344.78 s | 29.0 K/s | 6.93 GiB | 2.78 GiB | 5.70 GiB | — |
+| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|--------|------|------------|----------|------------|---------|------------|
+| supertable | 339.00 s | 29.5 K/s | 7.32 GiB | 3.25 GiB | 6.07 GiB | -0.4% no change |
 
 <!-- END: bench/supertable/ingest/supertable_fts_build -->
 
@@ -145,14 +142,14 @@ Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`);
 
 | Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |----------------|------------|------------|------------|-----------|------------|-----------|------------|
-| single_rare    | 3.29 ms | 3.02 ms | 3.28 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| single_common  | 3.66 ms | 3.01 ms | 3.35 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| two_term_or    | 4.06 ms | 3.46 ms | 2.96 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| three_wide_or  | 7.03 ms | 6.47 ms | 2.97 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| three_similar_or | 14.44 ms | 13.99 ms | 2.80 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| five_term_or   | 29.05 ms | 28.62 ms | 2.60 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| ten_term_or    | 77.34 ms | 77.30 ms | 2.49 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
-| prefix         | 61.42 ms | 63.83 ms | 2.75 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| single_rare    | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| single_common  | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| two_term_or    | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| three_wide_or  | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| three_similar_or | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| five_term_or   | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| ten_term_or    | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| prefix         | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
 
 <!-- END: bench/fts/supertable/search -->
 
@@ -218,8 +215,8 @@ Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`);
 
 | Recall target | (p/seg, r) | hot | warm | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|-----|------|------|----------|------------|---------|------------|
-| 0.90 | (p=4, r=4) | 9.37 ms | 9.46 ms | 929.70 ms | 9.54 GiB | 9.51 GiB | 9.53 GiB | +376.3% regressed |
-| 0.95 | (p=8, r=4) | 10.12 ms | 10.14 ms | 990.25 ms | 9.54 GiB | 9.51 GiB | 9.53 GiB | +376.3% regressed |
-| 0.99 | (p=16, r=4) | 16.56 ms | 17.16 ms | 1.08 s | 9.54 GiB | 9.51 GiB | 9.53 GiB | +376.3% regressed |
+| 0.90 | (p=8, r=4) | — | — | — | 13.10 GiB | 13.10 GiB | 13.10 GiB | — |
+| 0.95 | (p=8, r=4) | — | — | — | 13.10 GiB | 13.10 GiB | 13.10 GiB | — |
+| 0.99 | (p=16, r=4) | — | — | — | 13.10 GiB | 13.10 GiB | 13.10 GiB | — |
 
 <!-- END: bench/vector/supertable/search -->

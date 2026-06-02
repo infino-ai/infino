@@ -48,35 +48,38 @@ pub fn ensure_ingest(reason: &str) -> &'static IngestResult {
     })
 }
 
-/// Search benches: reuse ingest from an earlier group in this process, or fail fast.
+/// Whether Criterion's substring filter selects this bench family.
 ///
-/// Avoids starting a surprise 10M ingest when you only filter to `supertable_fts_search`
-/// or `supertable_vec_search`. Run ingest first in the same invocation, e.g.
-/// `cargo bench --bench supertable_all -- supertable_all_build supertable_fts_search`.
-///
-/// Set `INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1` to allow search-only invocations to
-/// trigger ingest (old behaviour).
+/// Criterion calls every registered bench function even when its filter later
+/// skips all benchmarks inside that function. Use this at the top of expensive
+/// bench functions so build-only filters don't run search setup, correctness,
+/// or a 10M fixture build.
+pub fn criterion_filter_selects(aliases: &[&str], groups: &[&str]) -> bool {
+    let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
+    let Some(filter) = filter else {
+        return true;
+    };
+    aliases.iter().any(|alias| *alias == filter) || groups.iter().any(|group| group.contains(&filter))
+}
+
+/// Search benches use the shared combined fixture. If an ingest group already
+/// ran in this Criterion process, reuse it; otherwise build it here. The
+/// expensive call sites are guarded by [`criterion_filter_selects`], so
+/// build-only filters do not accidentally trigger this path.
 pub fn ensure_ingest_for_search(reason: &str) -> &'static IngestResult {
     if let Some(built) = INGEST.get() {
         return built;
     }
-    if std::env::var("INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST").is_ok() {
-        eprintln!("[supertable_all] INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1: building for {reason}");
-        return ensure_ingest(reason);
-    }
-    panic!(
-        "supertable not ingested in this process ({reason}).\n\
-         Run ingest first in the same bench invocation:\n\
-           cargo bench --bench supertable_all -- supertable_all_build supertable_fts_search\n\
-         or run without filters:\n\
-           cargo bench --bench supertable_all\n\
-         To allow search-only runs to trigger ingest, set INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1"
-    );
+    ensure_ingest(reason)
 }
 
 pub fn ingest_build_nanos() -> f64 {
     ensure_ingest("build timing");
     *BUILD_NS.get().expect("build timing recorded")
+}
+
+pub fn ingest_recorded() -> bool {
+    INGEST.get().is_some()
 }
 
 /// FTS-only supertable ingest (apples-to-apples vs Tantivy). Separate storage
@@ -105,6 +108,10 @@ pub fn fts_ingest_build_nanos() -> f64 {
     *FTS_BUILD_NS.get().expect("fts build timing recorded")
 }
 
+pub fn fts_ingest_recorded() -> bool {
+    FTS_INGEST.get().is_some()
+}
+
 /// Vector-only supertable ingest (apples-to-apples vs Lance vector-only).
 pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
     if VEC_INGEST.get().is_none() {
@@ -128,6 +135,10 @@ pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
 pub fn vector_ingest_build_nanos() -> f64 {
     ensure_vector_ingest("build timing");
     *VEC_BUILD_NS.get().expect("vector build timing recorded")
+}
+
+pub fn vector_ingest_recorded() -> bool {
+    VEC_INGEST.get().is_some()
 }
 
 pub fn ingest() -> &'static IngestResult {

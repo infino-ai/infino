@@ -30,6 +30,7 @@ pub fn bench(c: &mut Criterion) {
         || {
             fixture::ensure_fts_ingest("ingest timing");
         },
+        fixture::fts_ingest_recorded,
         || fixture::ensure_fts_ingest("markdown").n_superfiles,
     );
     run_build(
@@ -41,6 +42,7 @@ pub fn bench(c: &mut Criterion) {
         || {
             fixture::ensure_vector_ingest("ingest timing");
         },
+        fixture::vector_ingest_recorded,
         || fixture::ensure_vector_ingest("markdown").n_superfiles,
     );
     run_build(
@@ -52,6 +54,7 @@ pub fn bench(c: &mut Criterion) {
         || {
             fixture::ensure_ingest("ingest timing");
         },
+        fixture::ingest_recorded,
         || fixture::ensure_ingest("markdown").n_superfiles,
     );
 }
@@ -64,6 +67,7 @@ fn run_build(
     shape: &str,
     build_nanos: fn() -> f64,
     ensure: impl Fn(),
+    was_built: impl Fn() -> bool,
     n_superfiles: impl Fn() -> usize,
 ) {
     let mut g = c.benchmark_group(group);
@@ -80,6 +84,9 @@ fn run_build(
         });
     });
     g.finish();
+    if !was_built() {
+        return;
+    }
     let stats = rss_sample.stop_stats();
     let _ = rss::write_rss_stats(group, bench_id, stats);
 

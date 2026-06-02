@@ -2566,8 +2566,9 @@ mod tests {
     /// round-trips through the reader. The codec discriminator
     /// surfaces on `ColumnReader.rerank_codec`; the codec_meta
     /// region carries `scale[dim] + offset[dim]` (always) plus
-    /// per-doc norms (L2Sq only). The on-disk `full[]` region
-    /// shrinks to `n_docs × dim` u8 codes (4× smaller than fp32).
+    /// per-doc norms (L2Sq only). The on-disk `full[]` region is
+    /// `n_docs × 2·dim` bytes for `Sq8Residual`: one u8 code plus
+    /// one i8 residual per dimension.
     #[test]
     fn open_round_trips_sq8_codec_discriminator_l2sq() {
         let dim = 32usize;
@@ -2600,13 +2601,13 @@ mod tests {
         // sits inside the open-time region between cluster_idx
         // and the per-cluster blocks.
         assert_ne!(col.codec_meta_off, 0, "Sq8 must declare codec_meta_off > 0");
-        // full[] is n_docs × dim u8 codes, interleaved into the
-        // per-cluster blocks region. The full portion is
-        // `region_size - n_docs × (code_bytes + 4)`.
+        // full[] is n_docs × 2·dim (code + residual sidecar),
+        // interleaved into the per-cluster blocks region. The
+        // full portion is `region_size - n_docs × (code_bytes + 4)`.
         let cb = col.quant.code_bytes();
         let region_size = (col.subsection_range.len() - 4) - col.per_cluster_blocks_off;
         let actual_full_size = region_size - (col.n_docs as usize) * (cb + 4);
-        assert_eq!(actual_full_size, (col.n_docs as usize) * dim);
+        assert_eq!(actual_full_size, (col.n_docs as usize) * dim * 2);
 
         // sq8_meta materialised at open: per-cluster scale +
         // offset (Sq8PerCluster layout — n_cent × dim floats
@@ -2810,13 +2811,24 @@ mod tests {
         let dim = 16usize;
         let n_cent = 4usize;
         let n_docs = 32u32;
-        // Vectors whose L2 norm grows monotonically with doc_id.
-        // Scattered across clusters by the k-means / random
-        // rotation, so insertion order ≠ pos order — making the
-        // mis-index easy to detect.
+        // Vectors whose L2 norm grows monotonically with doc_id,
+        // while their direction cycles by doc_id. That decouples
+        // insertion order from cluster order: k-means groups mostly
+        // by direction, not by the monotonic norm ramp, so pos order
+        // is observably different from doc_id order.
         let make = |i: u32| -> Vec<f32> {
             let s = 1.0 + (i as f32) * 0.5;
-            (0..dim).map(|j| s + (j as f32) * 0.1).collect()
+            let phase = (i % n_cent as u32) as f32;
+            (0..dim)
+                .map(|j| {
+                    let sign = if (j + phase as usize) % n_cent < n_cent / 2 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    sign * (s + (j as f32) * 0.1)
+                })
+                .collect()
         };
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
