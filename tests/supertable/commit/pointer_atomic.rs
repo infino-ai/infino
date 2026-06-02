@@ -159,9 +159,9 @@ async fn initial_commit_writes_list_part_pointer() {
     let read = read_pointer(&storage).await.expect("read").expect("some");
     assert_eq!(read, pointer);
     // List + part are at their expected URIs.
-    let list_bytes = storage.get(&list_uri(0)).await.expect("list bytes");
+    let (list_bytes, _) = storage.get(&list_uri(0)).await.expect("list bytes");
     assert!(!list_bytes.is_empty());
-    let part_bytes = storage
+    let (part_bytes, _) = storage
         .get(&entry_for(&part).uri)
         .await
         .expect("part bytes");
@@ -352,11 +352,18 @@ impl StorageProvider for BarrierMockStorage {
         }
     }
 
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let objs = self.objects.lock().await;
-        objs.get(uri)
-            .cloned()
-            .ok_or_else(|| StorageError::NotFound { uri: uri.into() })
+        match objs.get(uri) {
+            Some(b) => Ok((
+                b.clone(),
+                ObjectMeta {
+                    size: b.len() as u64,
+                    etag: Some("mock-etag".into()),
+                },
+            )),
+            None => Err(StorageError::NotFound { uri: uri.into() }),
+        }
     }
 
     async fn get_range(
@@ -370,7 +377,7 @@ impl StorageProvider for BarrierMockStorage {
         })
     }
 
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         // Tokio's Barrier is reusable, but only opens when
         // exactly N parties have called wait() in the same
         // cycle. For this test we want the first 2 PUTs
@@ -388,7 +395,7 @@ impl StorageProvider for BarrierMockStorage {
             return Err(StorageError::PreconditionFailed { uri: uri.into() });
         }
         objs.insert(uri.into(), bytes);
-        Ok(())
+        Ok(Some("mock-etag".into()))
     }
 
     async fn put_if_match(
@@ -396,14 +403,14 @@ impl StorageProvider for BarrierMockStorage {
         uri: &str,
         bytes: Bytes,
         _expected: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let prior = self.put_calls.fetch_add(1, Ordering::AcqRel);
         if prior < 2 {
             self.barrier.wait().await;
         }
         let mut objs = self.objects.lock().await;
         objs.insert(uri.into(), bytes);
-        Ok(())
+        Ok(Some("mock-etag".into()))
     }
 
     async fn put_multipart(

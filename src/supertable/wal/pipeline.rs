@@ -1111,7 +1111,7 @@ fn fetch_superfile_bytes_for_id_scan(
         .clone();
     let path = format!("data/seg-{}.sf", superfile_id);
     let drive = async move { storage.get(&path).await };
-    let bytes = match tokio::runtime::Handle::try_current() {
+    let (bytes, _) = match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))
             .map_err(|e| format!("storage get: {e}"))?,
         Err(_) => {
@@ -1487,7 +1487,7 @@ mod tests {
             .expect("entry");
         let storage1 = st1.inner().options.storage.as_ref().expect("storage");
         let path = format!("data/seg-{}.sf", pre_uuid);
-        let bytes1 = storage1.get(&path).await.expect("get bytes");
+        let (bytes1, _) = storage1.get(&path).await.expect("get bytes");
 
         // Second independent run on a fresh fixture with the
         // same inputs. We rebuild the user batch + IPC payload
@@ -1501,7 +1501,7 @@ mod tests {
             .await
             .expect("second run");
         let storage2 = st2.inner().options.storage.as_ref().expect("storage");
-        let bytes2 = storage2.get(&path).await.expect("get bytes");
+        let (bytes2, _) = storage2.get(&path).await.expect("get bytes");
 
         assert_eq!(
             bytes1, bytes2,

@@ -1396,7 +1396,9 @@ async fn try_commit_attempt(
             let result = if (bytes.len() as u64) >= multipart_threshold {
                 put_segment_multipart(storage.as_ref(), &path, bytes).await
             } else {
-                storage.put_atomic(&path, bytes).await
+                // Segment writes don't chain CAS, so the
+                // returned etag isn't needed here.
+                storage.put_atomic(&path, bytes).await.map(|_| ())
             };
             match result {
                 Ok(()) => Ok(()),
@@ -1681,7 +1683,7 @@ async fn refresh_inner_state_async(
         return Ok(());
     }
 
-    let list_bytes = storage
+    let (list_bytes, _) = storage
         .get(&pointer.manifest_list_uri)
         .await
         .map_err(crate::supertable::CommitError::from)?;

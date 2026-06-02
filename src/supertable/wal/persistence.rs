@@ -220,9 +220,14 @@ impl WalStore {
     /// is vanishingly small given the 128-bit id space, but
     /// it's a real fault mode we surface cleanly.
     ///
-    /// Returns the etag of the newly-written object via a
-    /// follow-up `head()`. Callers carry this through the
-    /// state-machine's subsequent `update_with_etag` calls.
+    /// Returns the etag of the newly-written object — surfaced
+    /// directly by [`StorageProvider::put_atomic`]. Backends
+    /// that don't carry an etag (LocalFs without xattr support)
+    /// surface `None`, which collapses to the empty [`Etag`] —
+    /// a legal input to `put_if_match` (interpreted as
+    /// "create-only-if-absent"). The state machine never mints
+    /// two WALs at the same path, so a missing etag doesn't
+    /// break the CAS chain.
     pub async fn create(&self, state: &WalStateDoc) -> Result<Etag, WalStoreError> {
         let path = Self::state_path(state.wal_id);
         let body = serde_json::to_vec(state).map_err(|e| WalStoreError::Serde {
@@ -230,34 +235,15 @@ impl WalStore {
             source: e,
         })?;
         match self.storage.put_atomic(&path, Bytes::from(body)).await {
-            Ok(()) => {}
+            Ok(etag) => Ok(etag.unwrap_or_default()),
             Err(StorageError::PreconditionFailed { .. }) => {
-                return Err(WalStoreError::AlreadyExists { path });
+                Err(WalStoreError::AlreadyExists { path })
             }
-            Err(other) => {
-                return Err(WalStoreError::Storage {
-                    path,
-                    source: other,
-                });
-            }
+            Err(other) => Err(WalStoreError::Storage {
+                path,
+                source: other,
+            }),
         }
-        // `put_atomic` doesn't return the new etag, so a
-        // follow-up `head` captures it. Backends that return
-        // `None` for etag (LocalFs without xattr support) leave
-        // the caller with `Some(Etag) = None` — which is itself
-        // a legal etag for `put_if_match` (interpreted as
-        // "create-only-if-absent"). The state machine never
-        // mints two WALs at the same path, so a missing etag
-        // doesn't break the CAS chain.
-        let meta = self
-            .storage
-            .head(&path)
-            .await
-            .map_err(|source| WalStoreError::Storage {
-                path: path.clone(),
-                source,
-            })?;
-        Ok(meta.etag.unwrap_or_default())
     }
 
     /// Fetch the current state doc + its etag. `NotFound`
@@ -266,14 +252,8 @@ impl WalStore {
     /// out of its abstraction.
     pub async fn read(&self, wal_id: WalId) -> Result<(WalStateDoc, Etag), WalStoreError> {
         let path = Self::state_path(wal_id);
-        // `head` first so we can capture the etag against the
-        // exact same version `get` is about to return. Some
-        // backends would race a concurrent overwrite between
-        // head + get; that's bounded by the CAS at the next
-        // update — a stale read just means we'll lose CAS on
-        // the subsequent write.
-        let meta = match self.storage.head(&path).await {
-            Ok(m) => m,
+        let (bytes, meta) = match self.storage.get(&path).await {
+            Ok(pair) => pair,
             Err(StorageError::NotFound { .. }) => {
                 return Err(WalStoreError::NotFound { path });
             }
@@ -284,14 +264,6 @@ impl WalStore {
                 });
             }
         };
-        let bytes = self
-            .storage
-            .get(&path)
-            .await
-            .map_err(|source| WalStoreError::Storage {
-                path: path.clone(),
-                source,
-            })?;
         let state: WalStateDoc =
             serde_json::from_slice(&bytes).map_err(|e| WalStoreError::Serde {
                 path: path.clone(),
@@ -335,33 +307,22 @@ impl WalStore {
             .put_if_match(&path, Bytes::from(body), expected_opt)
             .await
         {
-            Ok(()) => {}
+            Ok(etag) => Ok(etag.unwrap_or_default()),
             Err(StorageError::PreconditionFailed { .. }) => {
-                return Err(WalStoreError::CasFailed { path });
+                Err(WalStoreError::CasFailed { path })
             }
             Err(StorageError::NotFound { .. }) => {
                 // `put_if_match` against a deleted object can
                 // surface NotFound depending on backend.
                 // Recovery + GC may have raced; same logical
                 // outcome as CAS-loss from the caller's view.
-                return Err(WalStoreError::CasFailed { path });
+                Err(WalStoreError::CasFailed { path })
             }
-            Err(other) => {
-                return Err(WalStoreError::Storage {
-                    path,
-                    source: other,
-                });
-            }
+            Err(other) => Err(WalStoreError::Storage {
+                path,
+                source: other,
+            }),
         }
-        let meta = self
-            .storage
-            .head(&path)
-            .await
-            .map_err(|source| WalStoreError::Storage {
-                path: path.clone(),
-                source,
-            })?;
-        Ok(meta.etag.unwrap_or_default())
     }
 
     /// Best-effort DELETE of a state doc. Idempotent in the
@@ -423,7 +384,7 @@ impl WalStore {
     pub async fn put_arrow(&self, wal_id: WalId, bytes: Bytes) -> Result<(), WalStoreError> {
         let path = Self::arrow_path(wal_id);
         match self.storage.put_atomic(&path, bytes).await {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             // Second-write-of-same-bytes path (recovery replay).
             // Caller guarantees the bytes are bit-identical via
             // the WAL's content-hash invariant; the existing
@@ -444,7 +405,7 @@ impl WalStore {
         expected_blake3_hex: Option<&str>,
     ) -> Result<Bytes, WalStoreError> {
         let path = Self::arrow_path(wal_id);
-        let bytes = self
+        let (bytes, _) = self
             .storage
             .get(&path)
             .await
@@ -480,8 +441,8 @@ impl WalStore {
         superfile_id: uuid::Uuid,
     ) -> Result<Option<(TombstonesSidecar, Etag)>, WalStoreError> {
         let path = Self::tombstones_path(superfile_id);
-        let meta = match self.storage.head(&path).await {
-            Ok(m) => m,
+        let (bytes, meta) = match self.storage.get(&path).await {
+            Ok(pair) => pair,
             Err(StorageError::NotFound { .. }) => return Ok(None),
             Err(other) => {
                 return Err(WalStoreError::Storage {
@@ -490,14 +451,6 @@ impl WalStore {
                 });
             }
         };
-        let bytes = self
-            .storage
-            .get(&path)
-            .await
-            .map_err(|source| WalStoreError::Storage {
-                path: path.clone(),
-                source,
-            })?;
         let sidecar = tombstones_codec::decode_sidecar(&bytes).map_err(|source| {
             WalStoreError::SidecarCodec {
                 path: path.clone(),
@@ -539,26 +492,15 @@ impl WalStore {
             .put_if_match(&path, Bytes::from(bytes), expected_opt)
             .await
         {
-            Ok(()) => {}
+            Ok(etag) => Ok(etag.unwrap_or_default()),
             Err(StorageError::PreconditionFailed { .. }) => {
-                return Err(WalStoreError::CasFailed { path });
+                Err(WalStoreError::CasFailed { path })
             }
-            Err(other) => {
-                return Err(WalStoreError::Storage {
-                    path,
-                    source: other,
-                });
-            }
+            Err(other) => Err(WalStoreError::Storage {
+                path,
+                source: other,
+            }),
         }
-        let meta = self
-            .storage
-            .head(&path)
-            .await
-            .map_err(|source| WalStoreError::Storage {
-                path: path.clone(),
-                source,
-            })?;
-        Ok(meta.etag.unwrap_or_default())
     }
 }
 

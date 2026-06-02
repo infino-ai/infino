@@ -239,7 +239,7 @@ impl Supertable {
         };
 
         // 2. Load + parse the manifest list.
-        let list_bytes = storage
+        let (list_bytes, _) = storage
             .get(&pointer.manifest_list_uri)
             .await
             .map_err(OpenError::Storage)?;
@@ -411,7 +411,7 @@ impl Supertable {
         }
 
         // 2. Load + parse the new manifest list.
-        let list_bytes = storage
+        let (list_bytes, _) = storage
             .get(&pointer.manifest_list_uri)
             .await
             .map_err(OpenError::Storage)?;

@@ -54,7 +54,7 @@ fn commit_persists_pointer_list_part_and_segment() {
     );
 
     // Manifest list file exists and is non-empty.
-    let list_bytes =
+    let (list_bytes, _) =
         futures::executor::block_on(storage.get(&pointer.manifest_list_uri)).expect("get list");
     assert!(!list_bytes.is_empty());
 

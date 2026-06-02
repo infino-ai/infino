@@ -175,10 +175,18 @@ impl StorageProvider for S3StorageProvider {
         })
     }
 
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = Self::path(uri)?;
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-        result.bytes().await.map_err(|e| translate(uri, e))
+        // `GetResult.meta` is the version whose bytes we're
+        // about to read — etag and bytes are atomically paired
+        // by S3, so no follow-up HEAD is needed.
+        let meta = ObjectMeta {
+            size: result.meta.size as u64,
+            etag: result.meta.e_tag.clone(),
+        };
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, meta))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
@@ -189,7 +197,7 @@ impl StorageProvider for S3StorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -198,7 +206,7 @@ impl StorageProvider for S3StorageProvider {
         self.store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|_| ())
+            .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e))
     }
 
@@ -207,7 +215,7 @@ impl StorageProvider for S3StorageProvider {
         uri: &str,
         bytes: Bytes,
         expected_etag: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         let opts = match expected_etag {
             // None == create-only-if-absent.
@@ -234,7 +242,7 @@ impl StorageProvider for S3StorageProvider {
         self.store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|_| ())
+            .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e))
     }
 
