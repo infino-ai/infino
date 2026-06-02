@@ -56,7 +56,7 @@ use std::sync::Arc;
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::reader_cache::SuperfileReaderCache;
 
@@ -144,6 +144,31 @@ impl SupertableReader {
             .await?;
 
         Ok(top_k_ascending(per_segment, k))
+    }
+}
+
+impl Supertable {
+    /// Sync vector kNN search over the current snapshot — the
+    /// external mirror of [`query_sql`], using the same sync→async
+    /// bridge ([`Supertable::block_on_query`]).
+    ///
+    /// Pins a reader at call entry (one `ArcSwap::load_full`, like
+    /// `query_sql`) and drives the async
+    /// [`SupertableReader::vector_search`] kernel to completion.
+    /// Returns up to `k` hits sorted by distance *ascending*. Use
+    /// the `SupertableReader` method directly when you are already
+    /// in async context and want to `.await`.
+    ///
+    /// [`query_sql`]: Supertable::query_sql
+    pub fn vector_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let reader = self.reader();
+        self.block_on_query(reader.vector_search(column, query, k, options))
     }
 }
 
@@ -519,5 +544,49 @@ mod tests {
             .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+    }
+
+    // ---- sync wrapper on Supertable (the query_sql mirror) ----
+
+    #[test]
+    fn vector_search_sync_returns_ascending_order_no_ambient_runtime() {
+        // Plain sync caller: no ambient runtime → block_on_query
+        // drives on the owned sql_runtime arm.
+        let dim = 16;
+        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
+        w.commit().expect("c");
+
+        let mut q = vec![0.0f32; dim];
+        for (d, x) in q.iter_mut().enumerate() {
+            *x = (d as f32) / 100.0 + 0.001;
+        }
+        let hits = st
+            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .expect("sync vector_search");
+        assert!(!hits.is_empty());
+        for w in hits.windows(2) {
+            assert!(w[0].score <= w[1].score, "ascending distance order");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vector_search_sync_works_inside_multi_thread_runtime() {
+        // Ambient multi-thread runtime (web-handler call site): the
+        // sync wrapper takes the block_in_place arm of block_on_query.
+        let dim = 16;
+        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
+        w.commit().expect("c");
+
+        let q = vec![0.1f32; dim];
+        let hits = st
+            .vector_search("emb", &q, 3, VectorSearchOptions::new())
+            .expect("sync vector_search under ambient runtime");
+        assert_eq!(hits.len(), 3, "k=3 over 8 docs returns 3 hits");
     }
 }

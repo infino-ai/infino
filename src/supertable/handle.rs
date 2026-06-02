@@ -11,6 +11,7 @@
 //! single-writer slot — the writer flips it true on acquisition
 //! and (via `Drop`) flips it false on release.
 
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -522,6 +523,31 @@ impl Supertable {
     /// `SupertableInner`; subsequent calls clone the `Arc`.
     pub(crate) fn sql_runtime(&self) -> Arc<Runtime> {
         self.inner.sql_runtime()
+    }
+
+    /// Drive a query future to completion from a *sync* caller.
+    ///
+    /// The single sync→async bridge shared by every sync query
+    /// entry point — `query_sql` and the sync search wrappers
+    /// (`bm25_search`, `bm25_search_prefix`, `vector_search`). Two
+    /// arms:
+    ///   - **Ambient runtime** (web handler, `#[tokio::test(flavor =
+    ///     "multi_thread")]`): `block_in_place` releases the current
+    ///     worker back to the scheduler and drives `fut` on the
+    ///     ambient handle. Building a nested `Runtime` here would
+    ///     panic with "Cannot start a runtime from within a runtime".
+    ///   - **No runtime** (plain sync caller): drive on the lazily-
+    ///     built single-worker `sql_runtime`.
+    ///
+    /// `block_in_place` requires the multi-threaded runtime, so a
+    /// caller already inside a *current-thread* runtime must not use
+    /// these sync APIs — call the async `SupertableReader` methods
+    /// (or `DataFrame`) directly there.
+    pub(crate) fn block_on_query<F: Future>(&self, fut: F) -> F::Output {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => self.sql_runtime().block_on(fut),
+        }
     }
 
     /// Crate-internal accessor for the cached `SessionContext`

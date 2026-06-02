@@ -138,18 +138,11 @@ impl Supertable {
                 .map_err(|e| QueryError::Execute(e.to_string()))
         };
 
-        // Same ambient-runtime detection pattern the
-        // writer's persist_commit uses. Lazy-init the owned
-        // sql_runtime only when there's NO ambient runtime —
-        // calling `Builder::new_multi_thread().build()` from
-        // inside another runtime panics with "Cannot start a
-        // runtime from within a runtime". Web handlers,
-        // `#[tokio::test]`s, and any async caller now get a
-        // working query_sql.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.sql_runtime().block_on(drive),
-        }
+        // Drive through the shared sync→async bridge: ambient
+        // runtime → block_in_place on the ambient handle; otherwise
+        // the lazily-built owned sql_runtime. See
+        // [`Supertable::block_on_query`].
+        self.block_on_query(drive)
     }
 }
 

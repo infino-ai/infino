@@ -61,7 +61,7 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use crate::supertable::reader_cache::SuperfileReaderCache;
 
@@ -299,6 +299,47 @@ impl SupertableReader {
             .await?;
 
         Ok(top_k_descending(per_unit, k))
+    }
+}
+
+impl Supertable {
+    /// Sync BM25 search over the current snapshot — the external
+    /// mirror of [`query_sql`], using the same sync→async bridge
+    /// ([`Supertable::block_on_query`]).
+    ///
+    /// Pins a reader at call entry (one `ArcSwap::load_full`, like
+    /// `query_sql`) and drives the async
+    /// [`SupertableReader::bm25_search`] kernel to completion.
+    /// Returns up to `k` hits sorted by BM25 score *descending*.
+    /// Use the `SupertableReader` method directly when you are
+    /// already in async context and want to `.await`.
+    ///
+    /// [`query_sql`]: Supertable::query_sql
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let reader = self.reader();
+        self.block_on_query(reader.bm25_search(column, query, k, mode))
+    }
+
+    /// Sync prefix-expanded BM25 search — the external mirror of
+    /// [`query_sql`]; see [`Supertable::bm25_search`] for the bridge
+    /// semantics. Delegates to
+    /// [`SupertableReader::bm25_search_prefix`].
+    ///
+    /// [`query_sql`]: Supertable::query_sql
+    pub fn bm25_search_prefix(
+        &self,
+        column: &str,
+        prefix: &str,
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let reader = self.reader();
+        self.block_on_query(reader.bm25_search_prefix(column, prefix, k))
     }
 }
 
@@ -802,5 +843,59 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(hits.len(), 2);
+    }
+
+    // ---- sync wrappers on Supertable (the query_sql mirror) ----
+
+    #[test]
+    fn bm25_search_sync_returns_descending_hits_no_ambient_runtime() {
+        // Plain sync caller: no ambient runtime → block_on_query
+        // drives on the owned sql_runtime arm.
+        let st = Supertable::create(options_one_segment_per_commit());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["rust rust async", "rust runtime", "python data"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        let hits = st
+            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .expect("sync bm25_search");
+        assert_eq!(hits.len(), 2, "two titles contain 'rust'");
+        for w in hits.windows(2) {
+            assert!(w[0].score >= w[1].score, "descending score order");
+        }
+    }
+
+    #[test]
+    fn bm25_search_prefix_sync_matches_prefix_no_ambient_runtime() {
+        let st = Supertable::create(options_one_segment_per_commit());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["rust async", "rust runtime", "python"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let hits = st
+            .bm25_search_prefix("title", "rus", 5)
+            .expect("sync bm25_search_prefix");
+        assert_eq!(hits.len(), 2, "'rus' prefix matches both rust docs");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bm25_search_sync_works_inside_multi_thread_runtime() {
+        // Ambient multi-thread runtime (web-handler call site): the
+        // sync wrapper takes the block_in_place arm of block_on_query.
+        let st = Supertable::create(options_one_segment_per_commit());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["rust async", "python data"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let hits = st
+            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .expect("sync bm25_search under ambient runtime");
+        assert_eq!(hits.len(), 1, "only one title contains 'rust'");
     }
 }
