@@ -758,4 +758,225 @@ mod tests {
                 .is_err()
         );
     }
+
+    // ---- sql × vector × fts composed in ONE query ----
+    //
+    // The TVFs above each test one retriever in isolation. This block
+    // exercises the composition the plan's *Pushdown contract* promises
+    // but nothing else covered: a single SQL statement that JOINs an
+    // FTS retriever (`bm25_search`) and a vector retriever
+    // (`vector_search`) on the durable `_id` and post-filters with a
+    // scalar `WHERE` — across two segments.
+
+    /// Schema `[category (scalar), title (FTS), emb (vector)]`. Unlike
+    /// `options_title_emb`, `category` is a plain scalar column (not in
+    /// any FtsConfig/VectorConfig), so it is filterable from SQL.
+    fn options_cat_title_emb(dim: usize) -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::LargeUtf8, false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("emb", fixed_list_f32(dim), false),
+        ]));
+        SupertableOptions::new(
+            schema,
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    /// Doc `i` (0-based within the batch) gets `cats[i]`, `titles[i]`,
+    /// and a one-hot embedding at *global* dim `base_dim + i`.
+    fn build_batch_cat(
+        cats: &[&str],
+        titles: &[&str],
+        base_dim: usize,
+        dim: usize,
+        schema: Arc<Schema>,
+    ) -> RecordBatch {
+        let n = titles.len();
+        let cat_arr = LargeStringArray::from(cats.to_vec());
+        let title_arr = LargeStringArray::from(titles.to_vec());
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            let active = base_dim + i;
+            for d in 0..dim {
+                flat.push(if d == active { 1.0 } else { 0.0 });
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)) as ArrayRef,
+            None,
+        )
+        .expect("FSL");
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(cat_arr), Arc::new(title_arr), Arc::new(fsl)],
+        )
+        .expect("batch")
+    }
+
+    /// Two-segment corpus (docs 0–3, then 4–7) engineered so the three
+    /// retrievers each drop a *different* doc. With dim = 8 and a graded
+    /// query vector `[8,7,…,1]`, the cosine distance to one-hot doc `i`
+    /// is strictly increasing in `i`, so `vector_search(k=5)` is exactly
+    /// {0,1,2,3,4} (deterministic, no ties). Memberships:
+    ///   - `rust` (FTS)              = {0,2,3,5,6}
+    ///   - vector top-5              = {0,1,2,3,4}
+    ///   - `category='systems'`      = {0,1,3,5,7}
+    ///   - three-way intersection    = {0,3}
+    /// Sole-reason witnesses: doc1 dropped only by FTS, doc2 only by the
+    /// scalar filter, doc5 only by the vector cutoff.
+    fn demo_cat_two_segments(dim: usize) -> Supertable {
+        let st = Supertable::create(options_cat_title_emb(dim));
+        let schema = st.options().schema.clone();
+        // Each writer holds the single-writer lock until dropped, so
+        // scope them: seg1's writer must drop before seg2's opens.
+        {
+            let mut w = st.writer().expect("writer seg1");
+            w.append(&build_batch_cat(
+                &["systems", "systems", "cooking", "systems"],
+                &["rust alpha", "python beta", "rust gamma", "rust delta"],
+                0,
+                dim,
+                schema.clone(),
+            ))
+            .expect("append seg1");
+            w.commit().expect("commit seg1");
+        }
+        {
+            let mut w = st.writer().expect("writer seg2");
+            w.append(&build_batch_cat(
+                &["cooking", "systems", "cooking", "systems"],
+                &["python epsilon", "rust zeta", "rust eta", "python theta"],
+                4,
+                dim,
+                schema,
+            ))
+            .expect("append seg2");
+            w.commit().expect("commit seg2");
+        }
+        st
+    }
+
+    #[test]
+    fn sql_join_of_bm25_and_vector_with_scalar_filter_matches_three_way_intersection() {
+        let dim = 16;
+        let st = demo_cat_two_segments(dim);
+        // Graded query vector [dim, dim-1, …, 1] → cosine distance to
+        // one-hot doc `i` is strictly increasing in `i`, so the vector
+        // distance rank equals the doc id (no ties among the 8 docs).
+        let qv: String = (0..dim)
+            .map(|d| (dim - d).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // The three single-retriever result sets — the oracle inputs.
+        let fts = id_set(
+            &st.query_sql("SELECT _id FROM bm25_search('title', 'rust', 8)")
+                .expect("bm25 query_sql"),
+        );
+        let vector = id_set(
+            &st.query_sql(&format!("SELECT _id FROM vector_search('emb', '{qv}', 5)"))
+                .expect("vector query_sql"),
+        );
+        let scalar = id_set(
+            &st.query_sql("SELECT _id FROM supertable WHERE category = 'systems'")
+                .expect("scalar query_sql"),
+        );
+        // Guard against corpus drift: the witnesses below only hold for
+        // these exact membership sizes.
+        assert_eq!(fts.len(), 5, "'rust' should match 5 titles");
+        assert_eq!(vector.len(), 5, "vector top-5");
+        assert_eq!(scalar.len(), 5, "5 'systems' docs");
+
+        // THE query under test: FTS ⋈ vector on the durable _id, then a
+        // scalar SQL predicate — sql + vector + fts in one statement,
+        // spanning two segments.
+        let combined_batches = st
+            .query_sql(&format!(
+                "SELECT b._id, b.title AS title, b.category AS category, b.score AS score \
+                 FROM bm25_search('title', 'rust', 8) AS b \
+                 JOIN vector_search('emb', '{qv}', 5) AS v ON b._id = v._id \
+                 WHERE b.category = 'systems' \
+                 ORDER BY b.score DESC"
+            ))
+            .expect("combined sql+vector+fts query");
+        let combined = id_set(&combined_batches);
+
+        // 1. Exact correctness against the three-way intersection oracle.
+        let fts_vec: HashSet<i128> = fts.intersection(&vector).copied().collect();
+        let oracle: HashSet<i128> = fts_vec.intersection(&scalar).copied().collect();
+        assert_eq!(
+            combined, oracle,
+            "combined query must equal fts ∩ vector ∩ scalar"
+        );
+        assert_eq!(combined.len(), 2, "intersection is exactly two docs");
+
+        // 2. Each retriever is individually load-bearing: there is a doc
+        //    dropped *only* because of it (kept by the other two). If any
+        //    operator were silently a no-op, one of these would fail.
+        let inter = |x: &HashSet<i128>, y: &HashSet<i128>| -> HashSet<i128> {
+            x.intersection(y).copied().collect()
+        };
+        assert!(
+            !inter(&vector, &scalar).is_subset(&fts),
+            "FTS must be the sole reason ≥1 doc (kept by vector∧scalar) is dropped"
+        );
+        assert!(
+            !inter(&fts, &scalar).is_subset(&vector),
+            "vector cutoff must be the sole reason ≥1 doc (kept by fts∧scalar) is dropped"
+        );
+        assert!(
+            !inter(&fts, &vector).is_subset(&scalar),
+            "scalar WHERE must be the sole reason ≥1 doc (kept by fts∧vector) is dropped"
+        );
+
+        // 3. Every surviving row actually satisfies all three constraints.
+        assert!(
+            combined.is_subset(&vector),
+            "every combined hit is within the vector top-k"
+        );
+        for b in &combined_batches {
+            let cats = col_str(b, "category");
+            let titles = col_str(b, "title");
+            for i in 0..b.num_rows() {
+                assert_eq!(cats.value(i), "systems", "scalar predicate holds on output");
+                assert!(
+                    titles.value(i).contains("rust"),
+                    "FTS predicate holds on output row: {}",
+                    titles.value(i)
+                );
+            }
+        }
+
+        // 4. ORDER BY b.score DESC honored (BM25 score: higher = better).
+        let mut scores = Vec::new();
+        for b in &combined_batches {
+            let s = col_f32(b, "score");
+            scores.extend((0..s.len()).map(|i| s.value(i)));
+        }
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "combined scores must be descending: {scores:?}");
+        }
+    }
 }
