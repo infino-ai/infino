@@ -355,16 +355,21 @@ async fn do_apply(
             expected: user_batch.num_rows() as u32,
         });
     }
-    let scalar_with_id = prepend_id_column(&user_batch, &flat_ids, &inner.options)?;
-
-    // Vector slices live in `user_batch`; we hold it alive
-    // across the builder.add_batch call below.
-    let (_user_scalar_no_id, vector_slices) =
+    // Split scalars from vectors once; downstream consumes both
+    // halves. `split_vectors` runs the schema-equality check +
+    // per-vector null sweep, so this is the single validation
+    // gate for the append batch.
+    //
+    // Vector slices are zero-copy views into `user_batch`'s
+    // buffers; we hold `user_batch` alive across the
+    // `builder.add_batch` call below.
+    let (scalar_no_id, vector_slices) =
         split_vectors(&user_batch, &inner.options).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
                 message: format!("vector_split: {e}"),
             }
         })?;
+    let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &inner.options)?;
 
     // ---- Step 4+5: Build the superfile bytes ----
     let bytes = {
@@ -515,28 +520,17 @@ fn decode_ipc_batch(
 
 /// Construct a new `RecordBatch` matching the supertable's
 /// `scalar_schema()` shape — `_id` column prepended, followed by
-/// the user's scalar columns. The vector columns are NOT in this
-/// batch; they get passed alongside to `SuperfileBuilder::add_batch`.
+/// `scalar_no_id`'s columns (the scalar-only output of
+/// `split_vectors`). Vector columns are NOT in this batch; they
+/// get passed alongside to `SuperfileBuilder::add_batch`.
+///
+/// Caller must have already run `split_vectors` for schema +
+/// null validation — this function trusts its input.
 fn prepend_id_column(
-    user_batch: &RecordBatch,
+    scalar_no_id: &RecordBatch,
     flat_ids: &[i128],
     options: &crate::supertable::SupertableOptions,
 ) -> Result<RecordBatch, AppendPhaseError> {
-    // Validate batch against user schema first — surfaces a
-    // clean error instead of a confusing builder failure
-    // downstream.
-    if user_batch.schema().as_ref() != options.schema.as_ref() {
-        return Err(AppendPhaseError::SuperfileBuild {
-            message: "IPC sidecar's RecordBatch schema doesn't match the supertable's user schema"
-                .into(),
-        });
-    }
-
-    let (scalar_no_id, _) =
-        split_vectors(user_batch, options).map_err(|e| AppendPhaseError::SuperfileBuild {
-            message: format!("split_vectors: {e}"),
-        })?;
-
     let id_values: Vec<i128> = flat_ids.to_vec();
     let id_array = Decimal128Array::from(id_values)
         .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
