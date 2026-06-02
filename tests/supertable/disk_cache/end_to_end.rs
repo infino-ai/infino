@@ -72,7 +72,8 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     // validating the consumer's read path.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -150,7 +151,8 @@ async fn producer_with_cache_reads_through_cache_path() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
     let mut w = producer.writer().expect("writer");
     w.append(&build_title_batch(&["alpha"])).expect("append");
     w.commit().expect("commit");
@@ -191,7 +193,8 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     // Pre-commit: cache empty.
     assert_eq!(cache.stats().n_entries, 0);
@@ -251,7 +254,8 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     for _i in 0..3 {
         let mut w = st.writer().expect("writer");
@@ -282,7 +286,8 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     // Before any commit: empty segment list → empty pinned
     // set.
@@ -327,7 +332,8 @@ async fn manifest_segments_are_auto_pinned_by_supertable_open() {
     // Producer (no cache attached): commit + drop.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["from producer"]))
             .expect("append");
@@ -377,7 +383,8 @@ fn pinned_fn_releases_via_weak_when_supertable_drops() {
             default_supertable_options()
                 .with_storage(Arc::clone(&storage))
                 .with_disk_cache(Arc::clone(&cache)),
-        );
+        )
+        .expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["temp"])).expect("append");
         w.commit().expect("commit");
@@ -413,7 +420,8 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache))
             .with_memory_budget(1),
-    );
+    )
+    .expect("create");
 
     let before = cache.stats().n_madvise_calls;
 
@@ -453,7 +461,8 @@ fn memory_budget_unset_does_not_force_sweep() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     let before = cache.stats().n_madvise_calls;
 
@@ -482,7 +491,7 @@ fn no_cache_path_still_uses_in_memory_store() {
     // broader test suite, but reasserted here so a future
     // refactor that accidentally engages the cache plumbing
     // unconditionally is caught.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["only"])).expect("append");
     w.commit().expect("commit");

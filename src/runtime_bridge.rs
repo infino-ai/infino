@@ -1,0 +1,55 @@
+//! Sync→async bridge for sync public API on top of async storage.
+//!
+//! The supertable's public surface (writer.commit, reader queries,
+//! tombstone-cache refresh, lazy byte-source range fetches) is sync,
+//! but the storage trait + downstream object_store calls are async.
+//! Every call site that crosses that boundary lands here.
+//!
+//! ## Two modes
+//!
+//! - **Ambient `multi_thread` tokio runtime present** — `block_in_place`
+//!   tells the scheduler "I'm about to block this worker; rearrange,"
+//!   then `Handle::block_on` drives the future on the current thread.
+//!   Other tasks keep making progress on sibling workers.
+//! - **No ambient runtime** — build a one-shot `current_thread` runtime
+//!   and drive the future on it. Sync callers (CLI tools, rayon
+//!   workers, Python bindings via PyO3) land here.
+//!
+//! ## Unsupported: `current_thread` ambient runtime
+//!
+//! `tokio::task::block_in_place` requires `multi_thread`. If a caller
+//! invokes this from inside a `current_thread` tokio runtime,
+//! `Handle::try_current()` returns `Ok(...)`, we take the
+//! `block_in_place` branch, and tokio panics. There is no good
+//! detection primitive in tokio's public API for "this handle is from
+//! a current_thread runtime"; surfacing a typed error would require
+//! parsing `format!("{handle:?}")` or shipping our own probe. For now
+//! this is a documented requirement: async callers must run on a
+//! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
+//! actix, etc.).
+
+/// Drive `fut` to completion from a sync context. Uses the ambient
+/// tokio runtime if present (via `block_in_place + Handle::block_on`),
+/// otherwise builds a tiny `current_thread` runtime for the call.
+///
+/// Panics if called from inside a `current_thread` tokio runtime
+/// (`block_in_place` requires `multi_thread`). See the module-level
+/// docs.
+pub(crate) fn bridge_sync_to_async<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect(
+                    "invariant: tokio Runtime build only fails on \
+                     catastrophic OS resource exhaustion",
+                );
+            rt.block_on(fut)
+        }
+    }
+}

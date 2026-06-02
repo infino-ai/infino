@@ -56,7 +56,7 @@ use std::sync::Arc;
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::reader_cache::SuperfileReaderCache;
 
@@ -88,6 +88,8 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
+        let tombstone_cache = self.tombstone_cache.clone();
+        let now = std::time::Instant::now();
 
         let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
             Some(list) => {
@@ -154,6 +156,8 @@ impl SupertableReader {
                     k,
                     options,
                     timing.clone(),
+                    tombstone_cache.clone(),
+                    now,
                 )
             })
             .collect();
@@ -172,6 +176,29 @@ impl SupertableReader {
     }
 }
 
+impl Supertable {
+    /// Sync vector kNN search over the current snapshot — the external
+    /// mirror of [`Supertable::query_sql`], using the same sync→async
+    /// bridge ([`Supertable::block_on_query`]).
+    ///
+    /// Pins a reader at call entry (one `ArcSwap::load_full`, like
+    /// `query_sql`) and drives the async
+    /// [`SupertableReader::vector_search`] kernel to completion.
+    /// Returns up to `k` hits sorted by distance *ascending*. Use the
+    /// `SupertableReader` method directly when you are already in async
+    /// context and want to `.await`.
+    pub fn vector_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let reader = self.reader();
+        self.block_on_query(reader.vector_search(column, query, k, options))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_segment_search(
     store: &Arc<dyn SuperfileReaderCache>,
@@ -182,6 +209,8 @@ fn spawn_segment_search(
     k: usize,
     options: VectorSearchOptions,
     timing: Option<Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
+    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+    now: std::time::Instant,
 ) -> tokio::task::JoinHandle<Result<Vec<SuperfileHit>, QueryError>> {
     let store = Arc::clone(store);
     let disk_cache = disk_cache.clone();
@@ -203,7 +232,9 @@ fn spawn_segment_search(
                 g.push((open_us, search_us));
             }
         }
-        Ok(tag_hits(&entry, hits))
+        let mut tagged = tag_hits(&entry, hits);
+        apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+        Ok(tagged)
     })
 }
 
@@ -286,6 +317,28 @@ fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> 
             score,
         })
         .collect()
+}
+
+/// Drop tombstoned `local_doc_id`s from one superfile's vector hits.
+/// Same shape + perf properties as the FTS path's filter — see
+/// `query::fts::apply_tombstone_filter` for the design rationale.
+fn apply_tombstone_filter(
+    cache: Option<&Arc<crate::supertable::tombstones::SidecarCache>>,
+    entry: &SuperfileEntry,
+    hits: &mut Vec<SuperfileHit>,
+    now: std::time::Instant,
+) -> Result<(), QueryError> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let bitmap = cache
+        .bitmap_for(entry.superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    hits.retain(|h| !bitmap.contains(h.local_doc_id));
+    Ok(())
 }
 
 /// Merge per-segment hits and return the top-k by *ascending*
@@ -478,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn vector_search_empty_supertable_returns_empty() {
-        let st = Supertable::create(options_one_segment_per_commit(16));
+        let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
@@ -490,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn vector_search_k_zero_short_circuits() {
-        let st = Supertable::create(options_one_segment_per_commit(16));
+        let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, 16, schema)).expect("a");
@@ -507,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_returns_ascending_distance_order() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
@@ -536,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_top_k_caps_at_k() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         // Three commits → three superfiles × 8 docs = 24 docs.
@@ -557,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_carries_segment_uris_for_multi_segment_results() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         for chunk in 0..3u64 {
@@ -585,7 +638,7 @@ mod tests {
         // the same set as a single-superfile search, modulo each
         // IVF's nprobe-driven recall (we use a high-recall config).
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         // 24 docs across 3 superfiles.
@@ -639,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_unknown_column_errors() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
@@ -651,5 +704,119 @@ mod tests {
             .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+    }
+
+    // ---- Tombstone filter helper: direct-call coverage --------------
+    //
+    // Exercises `apply_tombstone_filter` against a synthesized
+    // bitmap + hit list without going through the full IVF +
+    // lazy-source vector search path. The hook logic is identical
+    // to the FTS path (both drop hits whose `local_doc_id` is in
+    // the per-superfile bitmap); this direct test pins the
+    // contract for the vector side.
+
+    use crate::storage::{LocalFsStorageProvider, StorageProvider};
+    use crate::supertable::SuperfileUri;
+    use crate::supertable::manifest::SuperfileEntry;
+    use crate::supertable::query::SuperfileHit;
+    use crate::supertable::tombstones::SidecarCache;
+    use crate::supertable::tombstones::cache::DEFAULT_REFRESH_TTL;
+    use crate::supertable::wal::WalStore;
+    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
+        SuperfileEntry {
+            superfile_id,
+            uri: SuperfileUri(superfile_id),
+            n_docs: 100,
+            id_min: 0,
+            id_max: 99,
+            scalar_stats: crate::supertable::manifest::ScalarStatsTable::default(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_tombstone_filter_drops_set_bits() {
+        // Build a SidecarCache backed by a real (LocalFs) storage so
+        // the hook exercises the same cache machinery that the
+        // production query path uses.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let ws = WalStore::new(Arc::clone(&storage));
+        let cache = Arc::new(SidecarCache::new(ws.clone(), DEFAULT_REFRESH_TTL));
+
+        let sf_id = Uuid::from_u128(0xFEEDFACE);
+        // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
+        let mut bitmap = roaring::RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(3);
+        bitmap.insert(5);
+        ws.put_tombstones(sf_id, None, &TombstonesSidecar { seal: None, bitmap })
+            .await
+            .expect("put sidecar");
+
+        let entry = synthetic_entry(sf_id);
+        let mut hits: Vec<SuperfileHit> = (0..8u32)
+            .map(|d| SuperfileHit {
+                segment: entry.uri,
+                local_doc_id: d,
+                score: d as f32,
+            })
+            .collect();
+
+        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
+            .expect("filter");
+
+        let remaining: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
+        assert_eq!(remaining, vec![0u32, 2, 4, 6, 7]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_tombstone_filter_is_no_op_without_cache() {
+        let entry = synthetic_entry(Uuid::from_u128(0xABCD));
+        let mut hits: Vec<SuperfileHit> = (0..4u32)
+            .map(|d| SuperfileHit {
+                segment: entry.uri,
+                local_doc_id: d,
+                score: 0.0,
+            })
+            .collect();
+        let original = hits.clone();
+        super::apply_tombstone_filter(None, &entry, &mut hits, std::time::Instant::now())
+            .expect("no-cache");
+        assert_eq!(hits, original);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_tombstone_filter_short_circuits_on_empty_bitmap() {
+        // No sidecar at all → cache populates the "known 404"
+        // sentinel and `bitmap.is_empty()` short-circuits the
+        // filter loop. Hit list is unchanged.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let ws = WalStore::new(Arc::clone(&storage));
+        let cache = Arc::new(SidecarCache::new(ws, DEFAULT_REFRESH_TTL));
+
+        let entry = synthetic_entry(Uuid::from_u128(0x1111));
+        let mut hits: Vec<SuperfileHit> = (0..4u32)
+            .map(|d| SuperfileHit {
+                segment: entry.uri,
+                local_doc_id: d,
+                score: 0.0,
+            })
+            .collect();
+        let original = hits.clone();
+        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
+            .expect("filter");
+        assert_eq!(hits, original);
     }
 }

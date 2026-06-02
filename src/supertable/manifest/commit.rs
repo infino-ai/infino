@@ -178,7 +178,7 @@ pub async fn read_pointer(
     storage: &dyn StorageProvider,
 ) -> Result<Option<PointerFile>, CommitError> {
     match storage.get(POINTER_PATH).await {
-        Ok(bytes) => Ok(Some(PointerFile::from_bytes(&bytes)?)),
+        Ok((bytes, _)) => Ok(Some(PointerFile::from_bytes(&bytes)?)),
         Err(StorageError::NotFound { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -232,7 +232,7 @@ pub async fn write_manifest_part(
         .put_atomic(&uri, bytes::Bytes::from(compressed))
         .await
     {
-        Ok(()) => {}
+        Ok(_) => {}
         // Content-addressed: same hash → same bytes. Already
         // there is benign — another writer wrote the same
         // content. Treat as success.
@@ -296,7 +296,7 @@ pub async fn write_pointer(
         }
     };
     match result {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(StorageError::PreconditionFailed { .. }) => Err(CommitError::WriteContentionExhausted),
         Err(e) => Err(e.into()),
     }

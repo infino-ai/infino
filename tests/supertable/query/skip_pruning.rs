@@ -126,7 +126,7 @@ fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
 #[tokio::test]
 async fn bm25_exact_term_skip_opens_only_matching_segment() {
     let store = Arc::new(CountingStore::new());
-    let st = Supertable::create(options_with_counting_store(Arc::clone(&store)));
+    let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
     // Four superfiles. Plant the rare term `nimblefox` in segment 0
     // only; the other three superfiles share generic terms only.
@@ -197,7 +197,7 @@ async fn bm25_exact_term_skip_opens_only_matching_segment() {
 #[tokio::test]
 async fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     let store = Arc::new(CountingStore::new());
-    let st = Supertable::create(options_with_counting_store(Arc::clone(&store)));
+    let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
     // Four superfiles. Segment 1 contains terms starting with
     // `quokka`; the other three contain only terms strictly
@@ -251,7 +251,7 @@ async fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
 #[tokio::test]
 async fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
     let store = Arc::new(CountingStore::new());
-    let st = Supertable::create(options_with_counting_store(Arc::clone(&store)));
+    let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
     // Three superfiles — none contains the rare query term.
     let mut w = st.writer().expect("writer");
@@ -289,7 +289,7 @@ async fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
 #[tokio::test]
 async fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
     let store = Arc::new(CountingStore::new());
-    let st = Supertable::create(options_with_counting_store(Arc::clone(&store)));
+    let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
     // Two superfiles. Segment 0 has both `alpha` and `beta`; segment
     // 1 has `alpha` only. AND-mode for "alpha beta" must prune

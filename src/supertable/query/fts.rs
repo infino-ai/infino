@@ -61,7 +61,7 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use crate::supertable::reader_cache::SuperfileReaderCache;
 
@@ -98,6 +98,8 @@ impl SupertableReader {
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
+        let tombstone_cache = self.tombstone_cache.clone();
+        let now = std::time::Instant::now();
 
         // Tokenize ONCE at the orchestrator. The pre-tokenized
         // term slice is reused both for the list-level + per-
@@ -167,6 +169,7 @@ impl SupertableReader {
                 let disk_cache = disk_cache.clone();
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
+                let tombstone_cache = tombstone_cache.clone();
                 tokio::spawn(async move {
                     let r = open_reader(&store, disk_cache.as_ref(), &unit.entry).await?;
                     let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
@@ -186,7 +189,14 @@ impl SupertableReader {
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     };
-                    Ok::<_, QueryError>(tag_hits(&unit.entry, hits))
+                    let mut tagged = tag_hits(&unit.entry, hits);
+                    apply_tombstone_filter(
+                        tombstone_cache.as_ref(),
+                        &unit.entry,
+                        &mut tagged,
+                        now,
+                    )?;
+                    Ok::<_, QueryError>(tagged)
                 })
             })
             .collect();
@@ -225,6 +235,8 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
+        let tombstone_cache = self.tombstone_cache.clone();
+        let now = std::time::Instant::now();
 
         // Manifest-level term-range skip uses the same
         // lowercased prefix bytes the v1 tokenizer +
@@ -293,6 +305,7 @@ impl SupertableReader {
                 let disk_cache = disk_cache.clone();
                 let column_arc = Arc::clone(&column_arc);
                 let prefix_arc = Arc::clone(&prefix_arc);
+                let tombstone_cache = tombstone_cache.clone();
                 tokio::spawn(async move {
                     let r = open_reader(&store, disk_cache.as_ref(), &unit.entry).await?;
                     let hits = match unit.range {
@@ -305,7 +318,14 @@ impl SupertableReader {
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     };
-                    Ok::<_, QueryError>(tag_hits(&unit.entry, hits))
+                    let mut tagged = tag_hits(&unit.entry, hits);
+                    apply_tombstone_filter(
+                        tombstone_cache.as_ref(),
+                        &unit.entry,
+                        &mut tagged,
+                        now,
+                    )?;
+                    Ok::<_, QueryError>(tagged)
                 })
             })
             .collect();
@@ -317,6 +337,42 @@ impl SupertableReader {
             .await?;
 
         Ok(top_k_descending(per_unit, k))
+    }
+}
+
+impl Supertable {
+    /// Sync single-column BM25 search — the external mirror of
+    /// [`Supertable::query_sql`], using the same sync→async bridge
+    /// ([`Supertable::block_on_query`]).
+    ///
+    /// Pins a reader at call entry (one `ArcSwap::load_full`, like
+    /// `query_sql`) and drives the async
+    /// [`SupertableReader::bm25_search`] kernel to completion. Returns
+    /// up to `k` hits sorted by BM25 score *descending*. Use the
+    /// `SupertableReader` method directly when you are already in async
+    /// context and want to `.await`.
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let reader = self.reader();
+        self.block_on_query(reader.bm25_search(column, query, k, mode))
+    }
+
+    /// Sync prefix-expanded BM25 search — see [`Supertable::bm25_search`]
+    /// for the bridge semantics. Delegates to
+    /// [`SupertableReader::bm25_search_prefix`].
+    pub fn bm25_search_prefix(
+        &self,
+        column: &str,
+        prefix: &str,
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let reader = self.reader();
+        self.block_on_query(reader.bm25_search_prefix(column, prefix, k))
     }
 }
 
@@ -429,6 +485,36 @@ fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> 
             score,
         })
         .collect()
+}
+
+/// Drop tombstoned `local_doc_id`s from one superfile's hit list.
+/// Looked up against the per-process [`SidecarCache`]; an absent
+/// cache (in-memory-only supertable) or an empty bitmap is the
+/// O(1) short-circuit that keeps the hot path free of work when
+/// no tombstones exist.
+///
+/// `now` is a per-query `Instant` hoisted from the orchestrator so
+/// every per-superfile call shares one timestamp for the cache's
+/// TTL check.
+///
+/// [`SidecarCache`]: crate::supertable::tombstones::SidecarCache
+fn apply_tombstone_filter(
+    cache: Option<&Arc<crate::supertable::tombstones::SidecarCache>>,
+    entry: &SuperfileEntry,
+    hits: &mut Vec<SuperfileHit>,
+    now: std::time::Instant,
+) -> Result<(), QueryError> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let bitmap = cache
+        .bitmap_for(entry.superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    hits.retain(|h| !bitmap.contains(h.local_doc_id));
+    Ok(())
 }
 
 /// Merge per-segment hits and return the top-k by *descending*
@@ -569,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
@@ -580,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn bm25_search_k_zero_short_circuits() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
@@ -594,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn bm25_search_returns_descending_score_order() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(
             0,
@@ -622,7 +708,7 @@ mod tests {
 
     #[tokio::test]
     async fn bm25_search_carries_segment_uri_for_each_hit() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust rust async"])).expect("a1");
         w.commit().expect("c1");
@@ -672,7 +758,7 @@ mod tests {
             "wrapping up the corpus today",     // 11
         ];
 
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for chunk_start in (0..titles.len()).step_by(4) {
             let end = (chunk_start + 4).min(titles.len());
@@ -729,7 +815,7 @@ mod tests {
             "rusty pipe rebuild",
             "go concurrency model",
         ];
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for chunk_start in (0..titles.len()).step_by(2) {
             let end = (chunk_start + 2).min(titles.len());
@@ -773,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn bm25_search_prefix_unmatched_prefix_returns_empty() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
@@ -791,7 +877,7 @@ mod tests {
         // Index stores tokenized terms (lowercased); user provides
         // mixed-case prefix; we lowercase before expansion so the
         // FST walk finds the matching subtree.
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["Rust async runtime"]))
             .expect("append");
@@ -807,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn bm25_search_unknown_column_errors() {
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust"])).expect("append");
         w.commit().expect("commit");
@@ -823,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn bm25_search_results_global_top_k_caps_at_k() {
         // 4 superfiles × 1 doc each = 4 hits; ask for k=2; expect 2.
-        let st = Supertable::create(options_one_segment_per_commit());
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for i in 0..4 {
             w.append(&build_batch(i * 10, &["rust async runtime"]))

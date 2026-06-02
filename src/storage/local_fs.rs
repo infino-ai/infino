@@ -7,8 +7,8 @@
 //!
 //! The path scoping is: every URI handed to a method is
 //! relative to the `root` passed at construction. So
-//! `provider.get("data/seg-abc.parquet")` reads
-//! `<root>/data/seg-abc.parquet`. No upward traversal — paths with
+//! `provider.get("data/seg-abc.sf.parquet")` reads
+//! `<root>/data/seg-abc.sf.parquet`. No upward traversal — paths with
 //! `..` get rejected by `object_store::path::Path`.
 
 use std::ops::Range;
@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{
     Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
@@ -110,10 +111,17 @@ impl StorageProvider for LocalFsStorageProvider {
         })
     }
 
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = Self::path(uri)?;
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-        result.bytes().await.map_err(|e| translate(uri, e))
+        // `GetResult.meta` matches the version we're about to
+        // read — no separate HEAD needed to capture the etag.
+        let meta = ObjectMeta {
+            size: result.meta.size as u64,
+            etag: result.meta.e_tag.clone(),
+        };
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, meta))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
@@ -124,7 +132,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -133,7 +141,7 @@ impl StorageProvider for LocalFsStorageProvider {
         self.store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|_| ())
+            .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e))
     }
 
@@ -142,7 +150,7 @@ impl StorageProvider for LocalFsStorageProvider {
         uri: &str,
         bytes: Bytes,
         expected_etag: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         match expected_etag {
             // None == create-only-if-absent. Same as put_atomic.
@@ -154,7 +162,7 @@ impl StorageProvider for LocalFsStorageProvider {
                 self.store
                     .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                     .await
-                    .map(|_| ())
+                    .map(|r| r.e_tag)
                     .map_err(|e| translate(uri, e))
             }
             // Some(tag) == update-if-etag-matches.
@@ -207,7 +215,7 @@ impl StorageProvider for LocalFsStorageProvider {
                 // microseconds, so the worst-case stall is
                 // bounded.
 
-                let result: Result<(), StorageError> = async {
+                let result: Result<Option<String>, StorageError> = async {
                     let current = self
                         .store
                         .head(&path)
@@ -224,7 +232,7 @@ impl StorageProvider for LocalFsStorageProvider {
                     self.store
                         .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                         .await
-                        .map(|_| ())
+                        .map(|r| r.e_tag)
                         .map_err(|e| translate(uri, e))
                 }
                 .await;
@@ -257,6 +265,16 @@ impl StorageProvider for LocalFsStorageProvider {
             Err(e) => Err(translate(uri, e)),
         }
     }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out: Vec<String> = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(meta.location.to_string());
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -288,10 +306,10 @@ mod tests {
     async fn put_then_get_roundtrip() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(b"hello supertable storage");
-        p.put_atomic("data/seg-abc.parquet", payload.clone())
+        p.put_atomic("data/seg-abc.sf.parquet", payload.clone())
             .await
             .expect("put");
-        let got = p.get("data/seg-abc.parquet").await.expect("get");
+        let (got, _) = p.get("data/seg-abc.sf.parquet").await.expect("get");
         assert_eq!(got, payload);
     }
 
@@ -299,11 +317,11 @@ mod tests {
     async fn head_returns_accurate_size() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(&[0xABu8; 1024]);
-        p.put_atomic("data/seg-head.parquet", payload)
+        p.put_atomic("data/seg-head.sf.parquet", payload)
             .await
             .expect("put");
 
-        let meta = p.head("data/seg-head.parquet").await.expect("head");
+        let meta = p.head("data/seg-head.sf.parquet").await.expect("head");
         assert_eq!(meta.size, 1024);
         // LocalFS surfaces an mtime-derived etag; other
         // backends may not. Assert presence, not value.
@@ -314,18 +332,18 @@ mod tests {
     async fn get_range_reads_exact_slice() {
         let (_dir, p) = provider();
         let payload: Vec<u8> = (0u8..=255).collect();
-        p.put_atomic("data/seg-range.parquet", Bytes::from(payload.clone()))
+        p.put_atomic("data/seg-range.sf.parquet", Bytes::from(payload.clone()))
             .await
             .expect("put");
 
         let slice = p
-            .get_range("data/seg-range.parquet", 32..64)
+            .get_range("data/seg-range.sf.parquet", 32..64)
             .await
             .expect("range");
         assert_eq!(slice.as_ref(), &payload[32..64]);
 
         let tail = p
-            .get_range("data/seg-range.parquet", 255..256)
+            .get_range("data/seg-range.sf.parquet", 255..256)
             .await
             .expect("range tail");
         assert_eq!(tail.as_ref(), &payload[255..256]);
@@ -348,7 +366,7 @@ mod tests {
             "expected PreconditionFailed, got {err:?}"
         );
 
-        let got = p
+        let (got, _) = p
             .get("manifest-lists/list-1.json")
             .await
             .expect("get after losing put");
@@ -368,7 +386,7 @@ mod tests {
             .await
             .expect("conditional update with correct etag");
 
-        let got = p.get("ptr/current").await.expect("get v2");
+        let (got, _) = p.get("ptr/current").await.expect("get v2");
         assert_eq!(got.as_ref(), b"v2");
     }
 
@@ -404,22 +422,22 @@ mod tests {
             "expected PreconditionFailed, got {err:?}"
         );
 
-        let got = p.get("ptr/current").await.expect("get");
+        let (got, _) = p.get("ptr/current").await.expect("get");
         assert_eq!(got.as_ref(), b"v_intermediate");
     }
 
     #[tokio::test]
     async fn delete_is_idempotent() {
         let (_dir, p) = provider();
-        p.put_atomic("data/orphan.parquet", Bytes::from_static(b"x"))
+        p.put_atomic("data/orphan.sf.parquet", Bytes::from_static(b"x"))
             .await
             .expect("put");
 
-        p.delete("data/orphan.parquet").await.expect("first delete");
-        p.delete("data/orphan.parquet")
+        p.delete("data/orphan.sf.parquet").await.expect("first delete");
+        p.delete("data/orphan.sf.parquet")
             .await
             .expect("second delete (idempotent)");
-        p.delete("data/never-existed.parquet")
+        p.delete("data/never-existed.sf.parquet")
             .await
             .expect("delete of never-existing");
     }
@@ -427,14 +445,14 @@ mod tests {
     #[tokio::test]
     async fn missing_object_returns_not_found() {
         let (_dir, p) = provider();
-        let err = p.head("data/no-such.parquet").await.expect_err("head missing");
+        let err = p.head("data/no-such.sf.parquet").await.expect_err("head missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
-        let err = p.get("data/no-such.parquet").await.expect_err("get missing");
+        let err = p.get("data/no-such.sf.parquet").await.expect_err("get missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
         let err = p
-            .get_range("data/no-such.parquet", 0..1)
+            .get_range("data/no-such.sf.parquet", 0..1)
             .await
             .expect_err("get_range missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
@@ -448,7 +466,7 @@ mod tests {
         p.put_atomic("a/b/c/d/leaf.bin", Bytes::from_static(b"deep"))
             .await
             .expect("nested put");
-        let got = p.get("a/b/c/d/leaf.bin").await.expect("nested get");
+        let (got, _) = p.get("a/b/c/d/leaf.bin").await.expect("nested get");
         assert_eq!(got.as_ref(), b"deep");
     }
 
@@ -489,7 +507,7 @@ mod tests {
         // happens at the supertable commit layer.
         let (_dir, p) = provider();
         let mut upload = p
-            .put_multipart("data/multipart-test.parquet")
+            .put_multipart("data/multipart-test.sf.parquet")
             .await
             .expect("multipart handle");
         upload.abort().await.expect("abort");

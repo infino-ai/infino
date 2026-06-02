@@ -263,7 +263,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .put_atomic("probe/hello.txt", probe_bytes.clone())
             .await
             .expect("probe put_atomic");
-        let got = storage.get("probe/hello.txt").await.expect("probe get");
+        let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
         assert_eq!(got, probe_bytes, "probe round-trip mismatch");
         eprintln!("[m16] probe round-trip OK (PUT + GET via S3 wire)");
     }
@@ -281,7 +281,8 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .expect("s3 provider for producer"),
         );
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -389,7 +390,8 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 real_s3_options(dim)
                     .apply_config(&cfg)
                     .map_err(|e| format!("apply S3 config to producer options: {e}"))?,
-            );
+            )
+            .map_err(|e| format!("create unified supertable on real S3: {e}"))?;
             let mut writer = producer
                 .writer()
                 .map_err(|e| format!("real S3 producer writer: {e}"))?;

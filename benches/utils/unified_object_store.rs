@@ -973,7 +973,7 @@ mod diag {
             r
         }
 
-        async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
             self.inner.get(uri).await
         }
 
@@ -1024,7 +1024,7 @@ mod diag {
             r
         }
 
-        async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
         }
 
@@ -1033,7 +1033,7 @@ mod diag {
             uri: &str,
             bytes: Bytes,
             expected_etag: Option<&str>,
-        ) -> Result<(), StorageError> {
+        ) -> Result<Option<String>, StorageError> {
             self.inner.put_if_match(uri, bytes, expected_etag).await
         }
 
@@ -1723,7 +1723,8 @@ mod diag {
                     real_s3_supertable_options()
                         .apply_config(&cfg)
                         .expect("apply real S3 config to producer"),
-                );
+                )
+                .expect("create real S3 producer");
                 let mut writer = producer.writer().expect("real S3 producer writer");
                 append_unified_supertable_batches(&mut writer, n);
                 writer.commit().expect("commit unified supertable to real S3");

@@ -257,7 +257,7 @@ impl ManifestPartLoader {
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
-        let bytes = self
+        let (bytes, _) = self
             .storage
             .get(uri)
             .await
@@ -440,20 +440,22 @@ impl SuperfileUri {
     }
 
     /// Object-store / LocalFS path for committed segment bytes.
-    /// Standard `.parquet` suffix — on disk this is valid Parquet
-    /// (row groups + optional embedded FTS/vector blobs + footer).
+    /// `.sf.parquet` double suffix — on disk this is still valid
+    /// Parquet (row groups + optional embedded FTS/vector blobs +
+    /// footer), while the `.sf` marker flags it as a Superfile
+    /// segment without making the file look non-standard.
     pub fn storage_path(self) -> String {
-        format!("data/seg-{}.parquet", self.0)
+        format!("data/seg-{}.sf.parquet", self.0)
     }
 
     /// Disk-cache filename for a promoted segment.
     pub fn cache_filename(self) -> String {
-        format!("seg-{}.parquet", self.0)
+        format!("seg-{}.sf.parquet", self.0)
     }
 
     /// Disk-cache tempfile while a cold fetch is in flight.
     pub fn cache_tmp_filename(self) -> String {
-        format!("seg-{}.parquet.tmp", self.0)
+        format!("seg-{}.sf.parquet.tmp", self.0)
     }
 }
 
@@ -852,10 +854,16 @@ mod tests {
                 }
             }
 
-            async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+            async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
                 self.get_calls.fetch_add(1, Ordering::AcqRel);
                 match self.objects.get(uri) {
-                    Some(b) => Ok(b.clone()),
+                    Some(b) => Ok((
+                        b.clone(),
+                        ObjectMeta {
+                            size: b.len() as u64,
+                            etag: Some("mock-etag".into()),
+                        },
+                    )),
                     None => Err(StorageError::NotFound { uri: uri.into() }),
                 }
             }
@@ -868,7 +876,11 @@ mod tests {
                 Err(permanent(uri, "get_range unimplemented for mock"))
             }
 
-            async fn put_atomic(&self, uri: &str, _bytes: Bytes) -> Result<(), StorageError> {
+            async fn put_atomic(
+                &self,
+                uri: &str,
+                _bytes: Bytes,
+            ) -> Result<Option<String>, StorageError> {
                 Err(permanent(uri, "put_atomic unimplemented for mock"))
             }
 
@@ -877,7 +889,7 @@ mod tests {
                 uri: &str,
                 _bytes: Bytes,
                 _expected_etag: Option<&str>,
-            ) -> Result<(), StorageError> {
+            ) -> Result<Option<String>, StorageError> {
                 Err(permanent(uri, "put_if_match unimplemented for mock"))
             }
 

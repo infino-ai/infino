@@ -37,7 +37,8 @@ async fn one_part_eager_fetches_under_default_threshold() {
     // Producer: 1 commit → 1 part.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha"])).expect("append");
         w.commit().expect("commit");
@@ -80,7 +81,7 @@ async fn many_parts_skip_eager_fetch() {
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(1);
-    let producer = Supertable::create(producer_opts);
+    let producer = Supertable::create(producer_opts).expect("create");
     for _i in 0..5 {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
@@ -136,7 +137,7 @@ async fn manifest_part_lazy_loads_on_first_access() {
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(1);
-    let producer = Supertable::create(producer_opts);
+    let producer = Supertable::create(producer_opts).expect("create");
     for _i in 0..5 {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
@@ -213,7 +214,8 @@ async fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
 
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");

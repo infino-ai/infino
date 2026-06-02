@@ -115,6 +115,58 @@ impl IdGenerator {
         // i128` cast is lossless under that invariant.
         id.to_raw() as i128
     }
+
+    /// Reserve `n` ids in advance and return them as an ordered
+    /// list of contiguous spans. Each span is `(first, last)`
+    /// inclusive; the flatten of all spans yields exactly `n`
+    /// distinct, monotonically-increasing ids.
+    ///
+    /// **Why spans and not a single `(first, last)`:** the
+    /// underlying ferroid generator's per-ms sequence field is
+    /// 24 bits wide. Once the sequence is exhausted within a
+    /// millisecond, the generator blocks for the next ms tick
+    /// before minting again. Two ids straddling a ms boundary
+    /// are not numerically contiguous (the timestamp field
+    /// changes), so a single-range return type can't describe
+    /// the reservation honestly under contention. The spans
+    /// shape makes that boundary visible: under typical use
+    /// the result is a `Vec` of length 1; under contention it
+    /// grows by one per ms boundary crossed mid-call.
+    ///
+    /// **Caller contract:** persist the full `Vec` into a
+    /// durable artifact (the WAL state doc) BEFORE doing any
+    /// work that depends on the ids. Recovery reads the spans
+    /// verbatim and never re-runs `reserve_range` — a recovering
+    /// process has a different `worker_id` and would mint
+    /// different ids, which would break the determinism a
+    /// replay-safe append phase needs.
+    ///
+    /// `n == 0` returns an empty `Vec` without any minting.
+    pub fn reserve_range(&self, n: u32) -> Vec<(i128, i128)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut spans: Vec<(i128, i128)> = Vec::with_capacity(1);
+        let first = self.next_id();
+        let mut span_first = first;
+        let mut span_last = first;
+        // We've already minted one id; mint `n - 1` more,
+        // extending the current span when the next id is
+        // numerically adjacent and starting a new span at any
+        // discontinuity (which signals a ms boundary).
+        for _ in 1..n {
+            let id = self.next_id();
+            if id == span_last + 1 {
+                span_last = id;
+            } else {
+                spans.push((span_first, span_last));
+                span_first = id;
+                span_last = id;
+            }
+        }
+        spans.push((span_first, span_last));
+        spans
+    }
 }
 
 impl Default for IdGenerator {
@@ -275,6 +327,128 @@ mod tests {
         let s = format!("{g:?}");
         assert!(s.contains("0x00deadbeef"), "got: {s}");
     }
+
+    // ---- reserve_range ------------------------------------------------
+
+    /// Flatten a span list to the implied sequence of ids. Used
+    /// by the tests below to assert the per-span shape produces
+    /// the right total count + ordering.
+    fn flatten_spans(spans: &[(i128, i128)]) -> Vec<i128> {
+        let mut out = Vec::new();
+        for (first, last) in spans {
+            for v in *first..=*last {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn reserve_range_zero_returns_empty() {
+        let g = IdGenerator::with_worker_id(0x1234);
+        let spans = g.reserve_range(0);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn reserve_range_one_returns_singleton_span() {
+        let g = IdGenerator::with_worker_id(0x1234);
+        let spans = g.reserve_range(1);
+        assert_eq!(spans.len(), 1);
+        let (first, last) = spans[0];
+        assert_eq!(first, last);
+    }
+
+    #[test]
+    fn reserve_range_small_n_flattens_to_n_monotonic_ids() {
+        // Mints fit comfortably in a single ms (~2 ns/mint),
+        // so we expect exactly one span here. The structural
+        // assertion is on the flatten — multi-span behavior
+        // gets exercised by the cross-ms test below.
+        let g = IdGenerator::with_worker_id(0x1234);
+        let spans = g.reserve_range(100);
+        let flat = flatten_spans(&spans);
+        assert_eq!(flat.len(), 100);
+        for w in flat.windows(2) {
+            assert!(w[1] > w[0], "reserve_range ids must be strictly monotonic");
+        }
+    }
+
+    #[test]
+    fn reserve_range_large_n_still_flattens_correctly() {
+        // 10K ids is small enough to almost certainly fit in
+        // one ms on a fast machine but large enough to catch a
+        // regression where the loop accidentally drops ids at
+        // span boundaries. We assert flat.len() == n and no
+        // duplicates regardless of whether we span 1 or N ms.
+        let g = IdGenerator::with_worker_id(0xCAFE);
+        let n = 10_000u32;
+        let spans = g.reserve_range(n);
+        let flat = flatten_spans(&spans);
+        assert_eq!(flat.len(), n as usize);
+        let mut seen = std::collections::HashSet::with_capacity(n as usize);
+        for id in &flat {
+            assert!(
+                seen.insert(*id),
+                "duplicate id in reserve_range output: {id}"
+            );
+        }
+        for w in flat.windows(2) {
+            assert!(w[1] > w[0]);
+        }
+        // Per-span shape: every span is non-empty and
+        // numerically contiguous within itself.
+        for (first, last) in &spans {
+            assert!(last >= first, "span ({first}, {last}) is inverted");
+        }
+    }
+
+    #[test]
+    fn reserve_range_back_to_back_calls_produce_disjoint_ids() {
+        // Two calls on the same generator must produce
+        // non-overlapping id sets — the in-process equivalent of
+        // the multi-mutation pattern. (Cross-generator
+        // disjointness is covered by
+        // `cross_worker_ids_remain_distinct_within_same_ms`
+        // below.)
+        let g = IdGenerator::with_worker_id(0x10);
+        let a = flatten_spans(&g.reserve_range(50));
+        let b = flatten_spans(&g.reserve_range(50));
+        let a_set: std::collections::HashSet<i128> = a.iter().copied().collect();
+        for id in &b {
+            assert!(!a_set.contains(id), "id {id} in both reservations");
+        }
+    }
+
+    #[test]
+    fn reserve_range_across_ms_boundary_produces_multi_span() {
+        // Forces a ms boundary by sleeping mid-call. The
+        // straight-line `reserve_range` API doesn't let us
+        // inject the sleep, so we exercise the multi-span
+        // path differently: mint a few ids, sleep until the
+        // next ms, mint more, and verify reserve_range
+        // *would* produce multiple spans if the same id
+        // sequence had come from one call. The boundary-
+        // detection logic (numerically-non-adjacent ids start
+        // a new span) is identical either way.
+        let g = IdGenerator::with_worker_id(0x20);
+        let a = g.next_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = g.next_id();
+        // `b` is at least 2ms after `a` in the timestamp
+        // field, so it's not `a + 1` even though both are
+        // monotonic. This is the exact predicate that
+        // `reserve_range`'s inner loop uses to start a new
+        // span.
+        assert!(b > a, "monotonic");
+        assert_ne!(
+            b,
+            a + 1,
+            "two ids straddling a ms boundary should NOT be numerically adjacent — {a} → {b}"
+        );
+    }
+
+    // ---- cross-worker isolation ----------------------------------------
 
     #[test]
     fn cross_worker_ids_remain_distinct_within_same_ms() {

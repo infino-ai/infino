@@ -136,7 +136,7 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
         .with_disk_cache(cache.clone())
         .with_memory_budget(8 * (1u64 << 30))
         .with_cache_prepopulation(false);
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create supertable");
     let mut w = st.writer().expect("writer");
     let chunk_size = N_DOCS.div_ceil(N_COMMIT_CHUNKS);
     let mut synth = SequentialSyntheticCorpus::new(
