@@ -219,17 +219,6 @@ impl IdSpan {
     }
 }
 
-/// The doc-id range that the UPDATE's append phase produced
-/// in its dedicated superfile. Filled in once the manifest
-/// swap that publishes the new superfile has committed, so it
-/// stays `None` while `state == Intent`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendedPairRange {
-    pub superfile_id: Uuid,
-    pub first_doc_id: u32,
-    pub last_doc_id: u32,
-}
-
 /// Top-level on-disk shape of one WAL entry's state document.
 /// JSON, written via `put_if_match` (etag CAS) on every
 /// transition; bounded in size by a per-mutation cap on the
@@ -301,13 +290,6 @@ pub struct WalStateDoc {
     /// by what `IdGenerator` happens to produce at replay time.
     #[serde(default)]
     pub minted_id_spans: Vec<IdSpan>,
-
-    /// Range of `(superfile_id, doc_id)` the append phase
-    /// produced. Filled in once the manifest swap that
-    /// publishes the new superfile has committed; `None`
-    /// until then.
-    #[serde(default)]
-    pub appended_pair_range: Option<AppendedPairRange>,
 
     // -------- Both UPDATE and DELETE below --------
     /// Per-target tombstone progress. One entry per `target_id`,
@@ -415,7 +397,6 @@ mod tests {
                     last: WalId(200),
                 },
             ],
-            appended_pair_range: None,
             tombstone_progress: vec![
                 TombstoneEntry {
                     target_id: WalId(1),
@@ -455,7 +436,6 @@ mod tests {
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
-            appended_pair_range: None,
             ..sample_state_doc()
         };
         let json = serde_json::to_string(&original).expect("encode");

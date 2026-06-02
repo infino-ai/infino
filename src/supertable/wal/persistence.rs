@@ -532,7 +532,6 @@ mod tests {
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
-            appended_pair_range: None,
             tombstone_progress: vec![
                 TombstoneEntry {
                     target_id: WalId(1),

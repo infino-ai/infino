@@ -32,8 +32,7 @@
 //! 5. **CAS-commit the manifest** through the writer's existing
 //!    [`persist_commit`] code path. That handles OCC retry,
 //!    partition-aware part rewrite, and the pointer-file CAS.
-//! 6. **Advance WAL state to `Appended`** with the
-//!    `appended_pair_range` populated.
+//! 6. **Advance WAL state to `Appended`**.
 //!
 //! Steps 1, 5, and 6 are the durability barriers; the rest is
 //! recovery-safe replay material (deterministic bytes; idempotent
@@ -72,9 +71,7 @@ use crate::supertable::manifest::{
 use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::utils::vector_split::split_vectors;
 use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{
-    AppendedPairRange, IdSpan, OpKind, TombstoneOutcome, WalState, WalStateDoc,
-};
+use crate::supertable::wal::state_doc::{IdSpan, OpKind, TombstoneOutcome, WalState, WalStateDoc};
 use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
 
 /// Outcome of one append-phase invocation.
@@ -229,8 +226,7 @@ pub async fn run_append_phase(
     let manifest_snapshot = inner.manifest.load_full();
     if manifest_contains(&manifest_snapshot, preallocated_superfile_id) {
         let (new_wal, new_etag) =
-            advance_to_appended_if_needed(wal_store, wal_doc, wal_etag, preallocated_superfile_id)
-                .await?;
+            advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await?;
         return Ok((AppendPhaseOutcome::AlreadyApplied, new_wal, new_etag));
     }
 
@@ -262,31 +258,17 @@ fn manifest_contains(manifest: &crate::supertable::Manifest, superfile_id: Uuid)
 }
 
 /// If the WAL is already in `Appended`, return its current doc +
-/// etag unchanged. Otherwise CAS-advance to `Appended` with a
-/// best-effort `appended_pair_range` (computed from the WAL's
-/// expected row count — the manifest swap that put the superfile
-/// there used the same range).
+/// etag unchanged. Otherwise CAS-advance to `Appended`.
 async fn advance_to_appended_if_needed(
     wal_store: &WalStore,
     wal_doc: &WalStateDoc,
     wal_etag: &Etag,
-    superfile_id: Uuid,
 ) -> Result<(WalStateDoc, Etag), AppendPhaseError> {
     if wal_doc.state == WalState::Appended {
         return Ok((wal_doc.clone(), wal_etag.clone()));
     }
     let mut next = wal_doc.clone();
     next.state = WalState::Appended;
-    if next.appended_pair_range.is_none() {
-        let n_docs = next.new_row_count.unwrap_or(0);
-        if n_docs > 0 {
-            next.appended_pair_range = Some(AppendedPairRange {
-                superfile_id,
-                first_doc_id: 0,
-                last_doc_id: n_docs - 1,
-            });
-        }
-    }
     let new_etag = wal_store
         .update_with_etag(wal_doc.wal_id, wal_etag, &next)
         .await?;
@@ -464,7 +446,7 @@ async fn do_apply(
     let _ = inner.options.store.insert(uri, bytes);
 
     // ---- Step 7: Advance WAL state to Appended ----
-    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag, preallocated_superfile_id).await
+    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await
 }
 
 /// Flatten a `Vec<IdSpan>` into the implied sequence of `i128`
@@ -1178,7 +1160,6 @@ mod tests {
                 first: WalId(100),
                 last: WalId(100),
             }],
-            appended_pair_range: None,
             tombstone_progress: vec![TombstoneEntry {
                 target_id: WalId(1),
                 outcome: TombstoneOutcome::Pending,
@@ -1285,7 +1266,6 @@ mod tests {
                 first: WalId(minted_first),
                 last: WalId(minted_first + (n as i128) - 1),
             }],
-            appended_pair_range: None,
             tombstone_progress: (0..n)
                 .map(|i| TombstoneEntry {
                     target_id: WalId(1000 + i as i128),
@@ -1312,12 +1292,6 @@ mod tests {
         assert_eq!(outcome, AppendPhaseOutcome::Applied);
         assert_eq!(new_wal.state, WalState::Appended);
         assert_ne!(new_etag, etag, "etag must advance after the state change");
-
-        // appended_pair_range populated.
-        let range = new_wal.appended_pair_range.expect("range filled");
-        assert_eq!(range.superfile_id, pre_uuid);
-        assert_eq!(range.first_doc_id, 0);
-        assert_eq!(range.last_doc_id, 1); // 2 rows → last_doc_id = 1
 
         // Manifest now contains the preallocated superfile.
         let manifest = st.inner().manifest.load_full();
@@ -1385,7 +1359,6 @@ mod tests {
         // WAL-state CAS.
         let mut intent_wal = wal.clone();
         intent_wal.state = WalState::Intent;
-        intent_wal.appended_pair_range = None;
         let intent_etag = ws
             .update_with_etag(
                 wal.wal_id,
@@ -1708,7 +1681,6 @@ mod tests {
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
-            appended_pair_range: None,
             tombstone_progress: target_ids
                 .iter()
                 .map(|&v| TombstoneEntry {

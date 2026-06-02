@@ -672,7 +672,6 @@ impl SupertableWriter {
             new_row_content_hash: Some(entry.new_row_content_hash.clone()),
             preallocated_superfile_id: Some(entry.preallocated_superfile_id),
             minted_id_spans: entry.minted_id_spans.clone(),
-            appended_pair_range: None,
             tombstone_progress: entry
                 .target_ids
                 .iter()
@@ -764,7 +763,6 @@ impl SupertableWriter {
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
-            appended_pair_range: None,
             tombstone_progress: entry
                 .target_ids
                 .iter()

@@ -52,7 +52,6 @@ fn seed_intent_delete_wal(target_id: i128, wal_id_v: i128) -> WalStateDoc {
         new_row_content_hash: None,
         preallocated_superfile_id: None,
         minted_id_spans: Vec::new(),
-        appended_pair_range: None,
         tombstone_progress: vec![TombstoneEntry {
             target_id: WalId(target_id),
             outcome: TombstoneOutcome::Pending,
