@@ -129,29 +129,30 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 ### FTS — supertable (multi-segment, 10M docs)
 
-<!-- BEGIN: bench/fts/supertable/ingest -->
-### Supertable FTS — ingest (10000000 docs, Zipfian, 200 tokens/doc, 10K vocab)
+<!-- BEGIN: bench/supertable/ingest/supertable_fts_build -->
+### Supertable FTS-only — ingest (10000000 docs × dim=384, 16 commits → 256 superfiles)
 
 | Engine                  | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |-------------------------|------------|------------|-----------|------------|-----------|------------|
-| infino_auto_writer_pool | 41.97 s    | 238.3 K/s  | 0 B       | 0 B        | 0 B       | —          |
+| supertable | 344.78 s | 29.0 K/s | 6.93 GiB | 2.78 GiB | 5.70 GiB | — |
 
-*Output cardinality: infino emits `min(writer_pool.threads, chunk_rows)` superfiles per commit across 16 bounded append chunks (writer auto = cpus/2). Override with `INFINO_SUPERTABLE__WRITER_THREADS=N` for a specific shard count.*
-
-<!-- END: bench/fts/supertable/ingest -->
+<!-- END: bench/supertable/ingest/supertable_fts_build -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
-### Supertable FTS — search (10000000 docs)
+### Supertable FTS — search (10000000 docs, shared combined supertable)
 
-| Query          | infino     | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
-|----------------|------------|-----------|------------|-----------|------------|
-| single_rare    | 42.69 µs   | 0 B       | 0 B        | 0 B       | —          |
-| single_common  | 57.57 µs   | 0 B       | 0 B        | 0 B       | —          |
-| two_term_or    | 301.85 µs  | 0 B       | 0 B        | 0 B       | —          |
-| three_wide_or  | 2.67 ms    | 0 B       | 0 B        | 0 B       | —          |
-| three_similar_or | 8.32 ms    | 0 B       | 0 B        | 0 B       | —          |
-| five_term_or   | 14.18 ms   | 0 B       | 0 B        | 0 B       | —          |
-| prefix         | 33.19 ms   | 0 B       | 0 B        | 0 B       | —          |
+Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`); warm waits for mmap promotion.
+
+| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|------------|------------|-----------|------------|-----------|------------|
+| single_rare    | 3.29 ms | 3.02 ms | 3.28 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| single_common  | 3.66 ms | 3.01 ms | 3.35 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| two_term_or    | 4.06 ms | 3.46 ms | 2.96 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| three_wide_or  | 7.03 ms | 6.47 ms | 2.97 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| three_similar_or | 14.44 ms | 13.99 ms | 2.80 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| five_term_or   | 29.05 ms | 28.62 ms | 2.60 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| ten_term_or    | 77.34 ms | 77.30 ms | 2.49 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
+| prefix         | 61.42 ms | 63.83 ms | 2.75 s | 10.61 GiB | 4.80 GiB   | 8.15 GiB  | +466.2% regressed |
 
 <!-- END: bench/fts/supertable/search -->
 
@@ -192,24 +193,33 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 ### Vector — supertable (multi-segment, 10M × 384)
 
-<!-- BEGIN: bench/vector/supertable/ingest -->
-### Supertable combined FTS + vector — ingest (10000000 docs × dim=384, sharded into 4 superfiles)
+<!-- BEGIN: bench/supertable/ingest/supertable_vec_build -->
+### Supertable vector-only — ingest (10000000 docs × dim=384, 16 commits → 256 superfiles)
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 179.72 s | 55.6 K/s | 27.79 GiB | 23.66 GiB | 25.89 GiB | — |
+| supertable | 405.20 s | 24.7 K/s | 5.18 GiB | 2.94 GiB | 4.55 GiB | — |
 
-<!-- END: bench/vector/supertable/ingest -->
+<!-- END: bench/supertable/ingest/supertable_vec_build -->
+
+<!-- BEGIN: bench/supertable/ingest/supertable_all_build -->
+### Supertable combined FTS + vector — ingest (10000000 docs × dim=384, 16 commits → 256 superfiles)
+
+| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|--------|------|------------|----------|------------|---------|------------|
+| supertable | 494.81 s | 20.2 K/s | 7.47 GiB | 3.54 GiB | 6.36 GiB | +50951.9% regressed |
+
+<!-- END: bench/supertable/ingest/supertable_all_build -->
 
 <!-- BEGIN: bench/vector/supertable/search -->
 ### Supertable vector — search (10000000 docs × dim=384, calibrated at recall targets)
 
-Hot = in-memory; warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`).
+Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`); warm waits for mmap promotion.
 
 | Recall target | (p/seg, r) | hot | warm | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|-----|------|------|----------|------------|---------|------------|
-| 0.90 | (p=4, r=4) | 33.21 ms | 33.54 ms | 904.77 ms | 28.59 GiB | 28.57 GiB | 28.57 GiB | — |
-| 0.95 | — | — | — | — | — | — | — | — |
-| 0.99 | — | — | — | — | — | — | — | — |
+| 0.90 | (p=4, r=4) | 9.37 ms | 9.46 ms | 929.70 ms | 9.54 GiB | 9.51 GiB | 9.53 GiB | +376.3% regressed |
+| 0.95 | (p=8, r=4) | 10.12 ms | 10.14 ms | 990.25 ms | 9.54 GiB | 9.51 GiB | 9.53 GiB | +376.3% regressed |
+| 0.99 | (p=16, r=4) | 16.56 ms | 17.16 ms | 1.08 s | 9.54 GiB | 9.51 GiB | 9.53 GiB | +376.3% regressed |
 
 <!-- END: bench/vector/supertable/search -->
