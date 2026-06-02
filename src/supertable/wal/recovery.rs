@@ -52,7 +52,7 @@ use crate::supertable::wal::persistence::{WalStore, WalStoreError};
 use crate::supertable::wal::pipeline::{
     self, AppendPhaseError, AppendPhaseOutcome, TombstonePhaseError, TombstonePhaseOutcome,
 };
-use crate::supertable::wal::state_doc::{OpKind, WalId, WalState, WalStateDoc};
+use crate::supertable::wal::state_doc::{OpKind, SupertableHandleId, WalId, WalState, WalStateDoc};
 
 /// Aggregate counts from one recovery sweep. Stable shape so
 /// integration tests + operator scripts can pin assertions
@@ -116,7 +116,7 @@ pub enum RecoveryError {
 /// id-allocation concerns.
 pub async fn scan_and_recover(
     supertable: &Supertable,
-    owner: WalId,
+    owner: SupertableHandleId,
     lease_duration: Duration,
 ) -> Result<RecoveryReport, RecoveryError> {
     let inner = supertable.inner();
@@ -211,7 +211,7 @@ async fn recover_one(
     supertable: &Supertable,
     wal_store: &WalStore,
     wal_id: WalId,
-    owner: WalId,
+    owner: SupertableHandleId,
     lease_duration: Duration,
 ) -> Result<OneWalOutcome, SweepStep> {
     // Read the state doc up front. If it vanished between our
@@ -329,7 +329,7 @@ mod tests {
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
     use crate::supertable::Supertable;
     use crate::supertable::wal::state_doc::{
-        OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome,
+        OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome,
     };
     use crate::test_helpers::default_supertable_options;
     use chrono::Utc;
@@ -344,7 +344,7 @@ mod tests {
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
                 .expect("create");
-        let report = scan_and_recover(&st, WalId(0xCAFE), Duration::from_secs(30))
+        let report = scan_and_recover(&st, SupertableHandleId(0xCAFE), Duration::from_secs(30))
             .await
             .expect("sweep");
         assert_eq!(report, RecoveryReport::default());
@@ -370,19 +370,19 @@ mod tests {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "test".into(),
-            target_ids: vec![WalId(99)],
+            target_ids: vec![RowId(99)],
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: vec![TombstoneEntry {
-                target_id: WalId(99),
+                target_id: RowId(99),
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
         };
         ws.create(&wal_doc).await.expect("seed");
-        let owner = WalId(0xC0DE);
+        let owner = SupertableHandleId(0xC0DE);
 
         let report = scan_and_recover(&st, owner, Duration::from_secs(30))
             .await
@@ -414,13 +414,13 @@ mod tests {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "test".into(),
-            target_ids: vec![WalId(1)],
+            target_ids: vec![RowId(1)],
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: vec![TombstoneEntry {
-                target_id: WalId(1),
+                target_id: RowId(1),
                 outcome: TombstoneOutcome::Tombstoned,
                 tombstoned_in_superfile: Some(Uuid::from_u128(0xCAFE)),
             }],
@@ -429,7 +429,7 @@ mod tests {
         wal_doc.predicate_repr = "noop".into();
         let etag_before = ws.create(&wal_doc).await.expect("seed");
 
-        let report = scan_and_recover(&st, WalId(0xABCD), Duration::from_secs(30))
+        let report = scan_and_recover(&st, SupertableHandleId(0xABCD), Duration::from_secs(30))
             .await
             .expect("sweep");
         assert_eq!(report.n_scanned, 1);
@@ -458,24 +458,24 @@ mod tests {
             state: WalState::Intent,
             created_at: now,
             lease: Some(crate::supertable::wal::state_doc::Lease {
-                owner: WalId(0xDEAD_DEAD),
+                owner: SupertableHandleId(0xDEAD_DEAD),
                 acquired_at: now,
                 expires_at: now + chrono::Duration::seconds(120),
             }),
             predicate_repr: "held".into(),
-            target_ids: vec![WalId(1)],
+            target_ids: vec![RowId(1)],
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: vec![TombstoneEntry {
-                target_id: WalId(1),
+                target_id: RowId(1),
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
         };
         ws.create(&wal_doc).await.expect("seed");
-        let report = scan_and_recover(&st, WalId(0xBEEF), Duration::from_secs(30))
+        let report = scan_and_recover(&st, SupertableHandleId(0xBEEF), Duration::from_secs(30))
             .await
             .expect("sweep");
         assert_eq!(report.n_scanned, 1);
@@ -486,7 +486,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sweep_against_in_memory_supertable_errors_cleanly() {
         let st = Supertable::create(default_supertable_options()).expect("create");
-        let err = scan_and_recover(&st, WalId(0xC0DE), Duration::from_secs(30))
+        let err = scan_and_recover(&st, SupertableHandleId(0xC0DE), Duration::from_secs(30))
             .await
             .expect_err("must error");
         assert!(matches!(err, RecoveryError::NoStorageAttached));

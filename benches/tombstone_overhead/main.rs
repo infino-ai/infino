@@ -59,7 +59,7 @@ use infino::supertable::Supertable;
 use infino::supertable::wal::WalStore;
 use infino::supertable::wal::pipeline::run_tombstone_phase;
 use infino::supertable::wal::state_doc::{
-    OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+    OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
 };
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
@@ -187,13 +187,13 @@ fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
         created_at: Utc::now(),
         lease: None,
         predicate_repr: "bench".into(),
-        target_ids: vec![WalId(target_id)],
+        target_ids: vec![RowId(target_id)],
         new_row_count: None,
         new_row_content_hash: None,
         preallocated_superfile_id: None,
         minted_id_spans: Vec::new(),
         tombstone_progress: vec![TombstoneEntry {
-            target_id: WalId(target_id),
+            target_id: RowId(target_id),
             outcome: TombstoneOutcome::Pending,
             tombstoned_in_superfile: None,
         }],

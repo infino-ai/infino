@@ -240,7 +240,7 @@ mod tests {
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
     use crate::supertable::Supertable;
     use crate::supertable::wal::state_doc::{
-        OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalStateDoc,
+        OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalStateDoc,
     };
     use crate::test_helpers::default_supertable_options;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -255,13 +255,13 @@ mod tests {
             created_at,
             lease: None,
             predicate_repr: "gc-test".into(),
-            target_ids: vec![WalId(1)],
+            target_ids: vec![RowId(1)],
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: vec![TombstoneEntry {
-                target_id: WalId(1),
+                target_id: RowId(1),
                 outcome: TombstoneOutcome::NotFound,
                 tombstoned_in_superfile: None,
             }],

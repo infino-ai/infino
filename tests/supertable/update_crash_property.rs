@@ -35,7 +35,7 @@ use infino::supertable::Supertable;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::wal::WalStore;
 use infino::supertable::wal::state_doc::{
-    OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+    OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
 };
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 
@@ -99,7 +99,7 @@ async fn seed_partial_state(
     // length, then Pending for the rest.
     let progress: Vec<TombstoneEntry> = (0..target_count)
         .map(|i| {
-            let target = WalId(id_min + i as i128);
+            let target = RowId(id_min + i as i128);
             let outcome = pre_completed
                 .get(i)
                 .copied()

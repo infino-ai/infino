@@ -70,7 +70,8 @@ use super::utils::vector_split::split_vectors;
 use super::wal::WalStore;
 use super::wal::pipeline::{self, TombstonePhaseOutcome};
 use super::wal::state_doc::{
-    IdSpan, OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+    IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+    WalStateDoc,
 };
 
 /// Single-writer append + commit handle.
@@ -506,8 +507,8 @@ impl SupertableWriter {
                 .reserve_range(matched as u32)
                 .into_iter()
                 .map(|(first, last)| IdSpan {
-                    first: WalId(first),
-                    last: WalId(last),
+                    first: RowId(first),
+                    last: RowId(last),
                 })
                 .collect::<Vec<_>>();
             let wal_id_value = idgen.next_id();
@@ -663,11 +664,7 @@ impl SupertableWriter {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "writer.update()".into(),
-            target_ids: entry
-                .target_ids
-                .iter()
-                .map(|&v| crate::supertable::wal::state_doc::WalId(v))
-                .collect(),
+            target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: Some(entry.new_row_count),
             new_row_content_hash: Some(entry.new_row_content_hash.clone()),
             preallocated_superfile_id: Some(entry.preallocated_superfile_id),
@@ -676,7 +673,7 @@ impl SupertableWriter {
                 .target_ids
                 .iter()
                 .map(|&v| TombstoneEntry {
-                    target_id: crate::supertable::wal::state_doc::WalId(v),
+                    target_id: RowId(v),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 })
@@ -754,11 +751,7 @@ impl SupertableWriter {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "writer.delete()".into(),
-            target_ids: entry
-                .target_ids
-                .iter()
-                .map(|&v| crate::supertable::wal::state_doc::WalId(v))
-                .collect(),
+            target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
@@ -767,7 +760,7 @@ impl SupertableWriter {
                 .target_ids
                 .iter()
                 .map(|&v| TombstoneEntry {
-                    target_id: crate::supertable::wal::state_doc::WalId(v),
+                    target_id: RowId(v),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 })

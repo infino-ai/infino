@@ -88,7 +88,7 @@ pub(super) struct SupertableInner {
     /// multiple handles within one process (a process that
     /// opens five supertables holds five distinct ids). Minted
     /// via `IdGenerator::next_id()` once at create / open.
-    pub(super) handle_id: crate::supertable::wal::state_doc::WalId,
+    pub(super) handle_id: crate::supertable::wal::state_doc::SupertableHandleId,
 }
 
 impl SupertableInner {
@@ -166,7 +166,8 @@ impl Supertable {
         let initial = Manifest::empty(options.clone());
         let tombstone_cache = build_tombstone_cache(&options);
         let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
-        let handle_id = crate::supertable::wal::state_doc::WalId(id_generator.next_id());
+        let handle_id =
+            crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options,
             manifest: ArcSwap::new(Arc::new(initial)),
@@ -342,7 +343,8 @@ impl Supertable {
         // needed. The worker_id is also fresh, further insulating
         // restarts from collisions.
         let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
-        let handle_id = crate::supertable::wal::state_doc::WalId(id_generator.next_id());
+        let handle_id =
+            crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options: options_arc,
             manifest: ArcSwap::new(Arc::new(manifest)),
@@ -523,7 +525,7 @@ impl Supertable {
     /// distinct from every other handle in the process
     /// (different `worker_id`) and from every prior process
     /// (different `ms` timestamp).
-    pub fn handle_id(&self) -> crate::supertable::wal::state_doc::WalId {
+    pub fn handle_id(&self) -> crate::supertable::wal::state_doc::SupertableHandleId {
         self.inner.handle_id
     }
 

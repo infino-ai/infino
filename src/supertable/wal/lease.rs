@@ -42,7 +42,7 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 
 use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{Lease, WalId, WalState, WalStateDoc};
+use crate::supertable::wal::state_doc::{Lease, SupertableHandleId, WalId, WalState, WalStateDoc};
 
 /// Default lease lifetime per acquire / heartbeat. 60s
 /// balances "long enough that NTP-level clock skew never
@@ -68,7 +68,7 @@ pub enum LeaseError {
     /// this WAL on this pass.
     #[error("lease held by another owner ({held_owner:?}) until {held_expires_at}; cannot acquire")]
     Conflict {
-        held_owner: WalId,
+        held_owner: SupertableHandleId,
         held_expires_at: DateTime<Utc>,
     },
 
@@ -78,15 +78,15 @@ pub enum LeaseError {
     /// check; the heartbeat task self-terminates.
     #[error("WAL preempted: lease owner is now {actual_owner:?}, not {expected_owner:?}")]
     Preempted {
-        expected_owner: WalId,
-        actual_owner: WalId,
+        expected_owner: SupertableHandleId,
+        actual_owner: SupertableHandleId,
     },
 
     /// Heartbeat / release found no lease at all — typically the
     /// WAL transitioned to `Complete` and a peer cleared the lease.
     /// Treat the same as `Preempted`: stop work.
     #[error("WAL has no lease; expected owner {expected_owner:?}")]
-    LeaseMissing { expected_owner: WalId },
+    LeaseMissing { expected_owner: SupertableHandleId },
 
     /// The CAS lost because the WAL state doc was mutated between
     /// our read and our PUT. The caller decides whether to retry
@@ -132,7 +132,7 @@ pub enum LeaseError {
 pub async fn try_acquire(
     store: &WalStore,
     wal_id: WalId,
-    owner: WalId,
+    owner: SupertableHandleId,
     now: DateTime<Utc>,
     lease_duration: Duration,
 ) -> Result<(WalStateDoc, Etag), LeaseError> {
@@ -182,7 +182,7 @@ pub async fn try_acquire(
 pub async fn try_heartbeat(
     store: &WalStore,
     wal_id: WalId,
-    owner: WalId,
+    owner: SupertableHandleId,
     now: DateTime<Utc>,
     lease_duration: Duration,
 ) -> Result<(WalStateDoc, Etag), LeaseError> {
@@ -221,7 +221,7 @@ pub async fn try_heartbeat(
 pub async fn try_release(
     store: &WalStore,
     wal_id: WalId,
-    owner: WalId,
+    owner: SupertableHandleId,
 ) -> Result<(WalStateDoc, Etag), LeaseError> {
     let (mut doc, etag) = store.read(wal_id).await?;
     match &doc.lease {
@@ -390,7 +390,7 @@ impl Drop for HeartbeatHandle {
 pub fn spawn_heartbeat(
     store: WalStore,
     wal_id: WalId,
-    owner: WalId,
+    owner: SupertableHandleId,
     lease_duration: Duration,
     interval: Duration,
 ) -> HeartbeatHandle {
@@ -439,7 +439,8 @@ mod tests {
     use super::*;
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
     use crate::supertable::wal::state_doc::{
-        OpKind, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState,
+        OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome,
+        WalState,
     };
     use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
@@ -455,13 +456,13 @@ mod tests {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "test".into(),
-            target_ids: vec![WalId(1)],
+            target_ids: vec![RowId(1)],
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: vec![TombstoneEntry {
-                target_id: WalId(1),
+                target_id: RowId(1),
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
@@ -484,7 +485,7 @@ mod tests {
         let (_dir, store) = fixture();
         let doc = sample_intent_wal(1);
         let _ = put_wal(&store, &doc).await;
-        let owner = WalId(0x1111);
+        let owner = SupertableHandleId(0x1111);
         let now = Utc::now();
         let (post, new_etag) = try_acquire(&store, doc.wal_id, owner, now, Duration::from_secs(30))
             .await
@@ -504,7 +505,7 @@ mod tests {
         let mut doc = sample_intent_wal(2);
         let now = Utc::now();
         doc.lease = Some(Lease {
-            owner: WalId(0xAAAA),
+            owner: SupertableHandleId(0xAAAA),
             acquired_at: now,
             expires_at: now + ChronoDuration::seconds(60),
         });
@@ -512,14 +513,14 @@ mod tests {
         let err = try_acquire(
             &store,
             doc.wal_id,
-            WalId(0xBBBB),
+            SupertableHandleId(0xBBBB),
             now,
             Duration::from_secs(30),
         )
         .await
         .expect_err("must conflict");
         assert!(
-            matches!(err, LeaseError::Conflict { held_owner, .. } if held_owner == WalId(0xAAAA))
+            matches!(err, LeaseError::Conflict { held_owner, .. } if held_owner == SupertableHandleId(0xAAAA))
         );
     }
 
@@ -529,7 +530,7 @@ mod tests {
         let mut doc = sample_intent_wal(3);
         let now = Utc::now();
         doc.lease = Some(Lease {
-            owner: WalId(0xAAAA),
+            owner: SupertableHandleId(0xAAAA),
             acquired_at: now - ChronoDuration::seconds(120),
             expires_at: now - ChronoDuration::seconds(10),
         });
@@ -537,20 +538,20 @@ mod tests {
         let (post, _etag) = try_acquire(
             &store,
             doc.wal_id,
-            WalId(0xBBBB),
+            SupertableHandleId(0xBBBB),
             now,
             Duration::from_secs(30),
         )
         .await
         .expect("expired → preempt");
-        assert_eq!(post.lease.expect("set").owner, WalId(0xBBBB));
+        assert_eq!(post.lease.expect("set").owner, SupertableHandleId(0xBBBB));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acquire_re_takes_for_same_owner_renewing_expiry() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(4);
-        let owner = WalId(0xC0C0);
+        let owner = SupertableHandleId(0xC0C0);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner,
@@ -577,7 +578,7 @@ mod tests {
         let err = try_acquire(
             &store,
             doc.wal_id,
-            WalId(0xDEAD),
+            SupertableHandleId(0xDEAD),
             Utc::now(),
             Duration::from_secs(30),
         )
@@ -595,7 +596,7 @@ mod tests {
     async fn heartbeat_extends_expires_at() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(6);
-        let owner = WalId(0x10001);
+        let owner = SupertableHandleId(0x10001);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner,
@@ -620,10 +621,10 @@ mod tests {
     async fn heartbeat_on_preempted_lease_returns_preempted() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(7);
-        let original = WalId(0xAAAA);
+        let original = SupertableHandleId(0xAAAA);
         let now = Utc::now();
         doc.lease = Some(Lease {
-            owner: WalId(0xBBBB),
+            owner: SupertableHandleId(0xBBBB),
             acquired_at: now,
             expires_at: now + ChronoDuration::seconds(60),
         });
@@ -636,7 +637,7 @@ mod tests {
             LeaseError::Preempted {
                 expected_owner,
                 actual_owner,
-            } if expected_owner == original && actual_owner == WalId(0xBBBB)
+            } if expected_owner == original && actual_owner == SupertableHandleId(0xBBBB)
         ));
     }
 
@@ -648,7 +649,7 @@ mod tests {
         let err = try_heartbeat(
             &store,
             doc.wal_id,
-            WalId(0xAAAA),
+            SupertableHandleId(0xAAAA),
             Utc::now(),
             Duration::from_secs(60),
         )
@@ -661,7 +662,7 @@ mod tests {
     async fn release_clears_lease_for_matching_owner() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(9);
-        let owner = WalId(0xC0DE);
+        let owner = SupertableHandleId(0xC0DE);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner,
@@ -681,12 +682,12 @@ mod tests {
         let mut doc = sample_intent_wal(10);
         let now = Utc::now();
         doc.lease = Some(Lease {
-            owner: WalId(0xAAAA),
+            owner: SupertableHandleId(0xAAAA),
             acquired_at: now,
             expires_at: now + ChronoDuration::seconds(60),
         });
         let _ = put_wal(&store, &doc).await;
-        let err = try_release(&store, doc.wal_id, WalId(0xBBBB))
+        let err = try_release(&store, doc.wal_id, SupertableHandleId(0xBBBB))
             .await
             .expect_err("preempted");
         assert!(matches!(err, LeaseError::Preempted { .. }));
@@ -704,7 +705,7 @@ mod tests {
     async fn heartbeat_extends_lease_while_worker_marks_progress() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(20);
-        let owner = WalId(0xC0FFEE);
+        let owner = SupertableHandleId(0xC0FFEE);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner,
@@ -748,7 +749,7 @@ mod tests {
     async fn heartbeat_signals_stop_when_worker_is_stuck() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(21);
-        let owner = WalId(0xDEAD_BEEF);
+        let owner = SupertableHandleId(0xDEAD_BEEF);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner,
@@ -782,7 +783,7 @@ mod tests {
     async fn heartbeat_signals_stop_on_preemption() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(22);
-        let original = WalId(0xAAAA);
+        let original = SupertableHandleId(0xAAAA);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner: original,
@@ -802,7 +803,7 @@ mod tests {
         // Externally preempt: write a new lease owner.
         let (mut current, etag) = store.read(doc.wal_id).await.expect("read");
         current.lease = Some(Lease {
-            owner: WalId(0xBBBB),
+            owner: SupertableHandleId(0xBBBB),
             acquired_at: now,
             expires_at: now + ChronoDuration::seconds(60),
         });
@@ -831,7 +832,7 @@ mod tests {
     async fn explicit_stop_winds_down_heartbeat_task() {
         let (_dir, store) = fixture();
         let mut doc = sample_intent_wal(23);
-        let owner = WalId(0x4242);
+        let owner = SupertableHandleId(0x4242);
         let now = Utc::now();
         doc.lease = Some(Lease {
             owner,

@@ -32,75 +32,109 @@ use uuid::Uuid;
 /// reject anything > the version they were built against.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Snowflake-shaped 128-bit identifier for one WAL entry.
-///
-/// Same layout as the supertable's `_id` column
-/// (`utils::idgen::IdGenerator`): 64-bit ms timestamp + 40-bit
-/// random worker_id + 24-bit sequence, packed into an `i128`.
-/// Stored as 32-char zero-padded lowercase hex of the value's
-/// big-endian bytes so file listings sort time-ordered with a
-/// trailing tie-break on worker_id + sequence.
-///
-/// The hex form is the on-disk filename (`wal/mutations/<hex>.json`)
-/// and is also the wire form in the state doc's `wal_id` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WalId(pub i128);
-
-impl WalId {
-    /// 32-char zero-padded lowercase hex of `self.0.to_be_bytes()`.
-    /// Stable across releases — used as both filename and JSON
-    /// payload, so any change here is a wire-format change.
-    pub fn to_hex(self) -> String {
-        let bytes = self.0.to_be_bytes();
-        let mut out = String::with_capacity(32);
-        for b in bytes {
-            // `{:02x}` always emits two lowercase hex digits.
-            use std::fmt::Write as _;
-            let _ = write!(out, "{b:02x}");
-        }
-        out
-    }
-
-    /// Inverse of `to_hex`. Rejects strings whose length isn't
-    /// exactly 32 or that contain non-hex characters.
-    pub fn from_hex(s: &str) -> Result<Self, WalIdParseError> {
-        if s.len() != 32 {
-            return Err(WalIdParseError::WrongLength { len: s.len() });
-        }
-        let mut bytes = [0u8; 16];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| {
-                WalIdParseError::InvalidHex {
-                    pos: 2 * i,
-                    snippet: s[2 * i..2 * i + 2].to_string(),
-                }
-            })?;
-        }
-        Ok(Self(i128::from_be_bytes(bytes)))
-    }
-}
-
-impl Serialize for WalId {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_hex())
-    }
-}
-
-impl<'de> Deserialize<'de> for WalId {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        Self::from_hex(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Parse failure for the hex form. Carries enough context to
-/// pinpoint the offending byte position.
+/// Parse failure for the hex form of any 128-bit identifier
+/// ([`WalId`], [`RowId`], [`SupertableHandleId`]). Carries enough context
+/// to pinpoint the offending byte position.
 #[derive(Debug, thiserror::Error)]
-pub enum WalIdParseError {
-    #[error("wal_id hex must be exactly 32 chars; got {len}")]
+pub enum IdParseError {
+    #[error("id hex must be exactly 32 chars; got {len}")]
     WrongLength { len: usize },
-    #[error("wal_id hex contains non-hex at byte position {pos}: {snippet:?}")]
+    #[error("id hex contains non-hex at byte position {pos}: {snippet:?}")]
     InvalidHex { pos: usize, snippet: String },
+}
+
+/// Defines a Snowflake-shaped 128-bit newtype with the shared
+/// hex encoding, `Serialize` / `Deserialize` (as hex string),
+/// and parse helpers. All three id types in this module share
+/// the same encoding so they sort time-ordered when listed and
+/// can be mixed freely on the JSON wire.
+macro_rules! define_id_type {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(pub i128);
+
+        impl $name {
+            /// 32-char zero-padded lowercase hex of `self.0.to_be_bytes()`.
+            /// Stable across releases — JSON payload format, so any
+            /// change here is a wire-format change.
+            pub fn to_hex(self) -> String {
+                let bytes = self.0.to_be_bytes();
+                let mut out = String::with_capacity(32);
+                for b in bytes {
+                    // `{:02x}` always emits two lowercase hex digits.
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{b:02x}");
+                }
+                out
+            }
+
+            /// Inverse of `to_hex`. Rejects strings whose length isn't
+            /// exactly 32 or that contain non-hex characters.
+            pub fn from_hex(s: &str) -> Result<Self, IdParseError> {
+                if s.len() != 32 {
+                    return Err(IdParseError::WrongLength { len: s.len() });
+                }
+                let mut bytes = [0u8; 16];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| {
+                        IdParseError::InvalidHex {
+                            pos: 2 * i,
+                            snippet: s[2 * i..2 * i + 2].to_string(),
+                        }
+                    })?;
+                }
+                Ok(Self(i128::from_be_bytes(bytes)))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(&self.to_hex())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                Self::from_hex(&s).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+define_id_type! {
+    /// Snowflake-shaped 128-bit identifier for one WAL entry.
+    ///
+    /// Same layout as the supertable's `_id` column
+    /// (`utils::idgen::IdGenerator`): 64-bit ms timestamp + 40-bit
+    /// random worker_id + 24-bit sequence, packed into an `i128`.
+    /// Stored as 32-char zero-padded lowercase hex of the value's
+    /// big-endian bytes so file listings sort time-ordered with a
+    /// trailing tie-break on worker_id + sequence.
+    ///
+    /// The hex form is the on-disk filename
+    /// (`wal/mutations/<hex>.json`) and is also the wire form in
+    /// the state doc's `wal_id` field.
+    WalId
+}
+
+define_id_type! {
+    /// Snowflake-shaped 128-bit value of the supertable's `_id`
+    /// column — a row's stable global identifier, minted by
+    /// `IdGenerator::next_id` at append time. Distinct from
+    /// [`WalId`] (which identifies a WAL state doc) and from
+    /// the local `u32` doc-id (a row's position within one
+    /// superfile, used by tombstones / FTS / vector indices).
+    RowId
+}
+
+define_id_type! {
+    /// Snowflake-shaped 128-bit id of one [`crate::supertable::Supertable`]
+    /// handle, minted at handle construction. Stamped onto WAL
+    /// leases as `owner` so the recovery sweep can tell whether
+    /// a peer or a stale local handle holds a given WAL.
+    SupertableHandleId
 }
 
 /// Kind of mutation a WAL is driving.
@@ -131,9 +165,9 @@ pub enum WalState {
 /// construction — safety has to surface at the CAS layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
-    /// `supertable_handle_id` of the process currently driving
-    /// this WAL. Set on take; cleared on COMPLETE or preemption.
-    pub owner: WalId,
+    /// Handle id of the process currently driving this WAL.
+    /// Set on take; cleared on COMPLETE or preemption.
+    pub owner: SupertableHandleId,
     pub acquired_at: DateTime<Utc>,
     /// Heartbeat-extended; recovery treats expiry as the cue to
     /// preempt.
@@ -146,9 +180,8 @@ pub struct Lease {
 /// id) once step 2 sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TombstoneEntry {
-    /// `_id` of the row being tombstoned, hex-encoded for the
-    /// same reason `WalId` is.
-    pub target_id: WalId,
+    /// `_id` of the row being tombstoned.
+    pub target_id: RowId,
     pub outcome: TombstoneOutcome,
     /// Audit field: which superfile this tombstone landed in.
     /// `None` until outcome flips to `Tombstoned`; stays `None`
@@ -197,8 +230,8 @@ pub struct SealRecord {
 /// is the typical case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdSpan {
-    pub first: WalId,
-    pub last: WalId,
+    pub first: RowId,
+    pub last: RowId,
 }
 
 impl IdSpan {
@@ -257,7 +290,7 @@ pub struct WalStateDoc {
     /// stable across whatever manifest churn happens between
     /// the original call and a later recovery. Length is
     /// bounded by the per-mutation target cap.
-    pub target_ids: Vec<WalId>,
+    pub target_ids: Vec<RowId>,
 
     // -------- UPDATE-only fields below --------
     // All `None` / empty for DELETE; OpKind discriminates.
@@ -367,12 +400,12 @@ mod tests {
         let too_short = "0000";
         assert!(matches!(
             WalId::from_hex(too_short),
-            Err(WalIdParseError::WrongLength { len: 4 })
+            Err(IdParseError::WrongLength { len: 4 })
         ));
         let too_long = "0".repeat(33);
         assert!(matches!(
             WalId::from_hex(&too_long),
-            Err(WalIdParseError::WrongLength { len: 33 })
+            Err(IdParseError::WrongLength { len: 33 })
         ));
     }
 
@@ -383,7 +416,7 @@ mod tests {
         s.push('z');
         assert!(matches!(
             WalId::from_hex(&s),
-            Err(WalIdParseError::InvalidHex { pos: 30, .. })
+            Err(IdParseError::InvalidHex { pos: 30, .. })
         ));
     }
 
@@ -397,38 +430,38 @@ mod tests {
             state: WalState::Intent,
             created_at: "2026-05-30T10:00:00Z".parse().expect("ts"),
             lease: Some(Lease {
-                owner: WalId(42),
+                owner: SupertableHandleId(42),
                 acquired_at: "2026-05-30T10:00:01Z".parse().expect("ts"),
                 expires_at: "2026-05-30T10:01:01Z".parse().expect("ts"),
             }),
             predicate_repr: "status = 'pending'".into(),
-            target_ids: vec![WalId(1), WalId(2), WalId(3)],
+            target_ids: vec![RowId(1), RowId(2), RowId(3)],
             new_row_count: Some(3),
             new_row_content_hash: Some("deadbeef".into()),
             preallocated_superfile_id: Some(Uuid::nil()),
             minted_id_spans: vec![
                 IdSpan {
-                    first: WalId(100),
-                    last: WalId(101),
+                    first: RowId(100),
+                    last: RowId(101),
                 },
                 IdSpan {
-                    first: WalId(200),
-                    last: WalId(200),
+                    first: RowId(200),
+                    last: RowId(200),
                 },
             ],
             tombstone_progress: vec![
                 TombstoneEntry {
-                    target_id: WalId(1),
+                    target_id: RowId(1),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 },
                 TombstoneEntry {
-                    target_id: WalId(2),
+                    target_id: RowId(2),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 },
                 TombstoneEntry {
-                    target_id: WalId(3),
+                    target_id: RowId(3),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 },
@@ -511,13 +544,13 @@ mod tests {
     #[test]
     fn id_span_len_inclusive() {
         let s = IdSpan {
-            first: WalId(10),
-            last: WalId(14),
+            first: RowId(10),
+            last: RowId(14),
         };
         assert_eq!(s.len(), 5);
         let single = IdSpan {
-            first: WalId(7),
-            last: WalId(7),
+            first: RowId(7),
+            last: RowId(7),
         };
         assert_eq!(single.len(), 1);
     }

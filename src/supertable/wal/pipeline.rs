@@ -71,7 +71,9 @@ use crate::supertable::manifest::{
 use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::utils::vector_split::split_vectors;
 use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{IdSpan, OpKind, TombstoneOutcome, WalState, WalStateDoc};
+use crate::supertable::wal::state_doc::{
+    IdSpan, OpKind, RowId, TombstoneOutcome, WalState, WalStateDoc,
+};
 use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
 
 /// Outcome of one append-phase invocation.
@@ -901,7 +903,7 @@ async fn do_tombstone_apply(
 async fn resolve_and_tombstone_one(
     inner: &Arc<crate::supertable::handle::SupertableInner>,
     wal_store: &WalStore,
-    target_id: crate::supertable::wal::state_doc::WalId,
+    target_id: RowId,
 ) -> Result<
     (
         crate::supertable::wal::state_doc::TombstoneOutcome,
@@ -1021,7 +1023,7 @@ async fn cas_tombstone_bit(
 fn resolve_target_id_in_manifest(
     inner: &Arc<crate::supertable::handle::SupertableInner>,
     manifest: &crate::supertable::Manifest,
-    target_id: crate::supertable::wal::state_doc::WalId,
+    target_id: RowId,
 ) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
     let target = target_id.0;
 
@@ -1121,7 +1123,8 @@ mod tests {
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
     use crate::supertable::Supertable;
     use crate::supertable::wal::state_doc::{
-        OpKind, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+        OpKind, RowId, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome, WalId,
+        WalState,
     };
     use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
     use crate::test_helpers::{build_title_batch, default_supertable_options};
@@ -1152,16 +1155,16 @@ mod tests {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "_id = 1".into(),
-            target_ids: vec![WalId(1)],
+            target_ids: vec![RowId(1)],
             new_row_count: Some(1),
             new_row_content_hash: Some("0".repeat(64)),
             preallocated_superfile_id: Some(Uuid::from_u128(0x1234_5678_9ABC)),
             minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
-                first: WalId(100),
-                last: WalId(100),
+                first: RowId(100),
+                last: RowId(100),
             }],
             tombstone_progress: vec![TombstoneEntry {
-                target_id: WalId(1),
+                target_id: RowId(1),
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
@@ -1258,17 +1261,17 @@ mod tests {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "set up by test".into(),
-            target_ids: (0..n).map(|i| WalId(1000 + i as i128)).collect(),
+            target_ids: (0..n).map(|i| RowId(1000 + i as i128)).collect(),
             new_row_count: Some(n),
             new_row_content_hash: Some(content_hash),
             preallocated_superfile_id: Some(Uuid::from_u128(0xDEAD_BEEF_CAFE)),
             minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
-                first: WalId(minted_first),
-                last: WalId(minted_first + (n as i128) - 1),
+                first: RowId(minted_first),
+                last: RowId(minted_first + (n as i128) - 1),
             }],
             tombstone_progress: (0..n)
                 .map(|i| TombstoneEntry {
-                    target_id: WalId(1000 + i as i128),
+                    target_id: RowId(1000 + i as i128),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 })
@@ -1473,12 +1476,12 @@ mod tests {
     fn flatten_spans_concatenates_inclusive_ranges_in_order() {
         let spans = vec![
             crate::supertable::wal::state_doc::IdSpan {
-                first: WalId(10),
-                last: WalId(12),
+                first: RowId(10),
+                last: RowId(12),
             },
             crate::supertable::wal::state_doc::IdSpan {
-                first: WalId(100),
-                last: WalId(100),
+                first: RowId(100),
+                last: RowId(100),
             },
         ];
         let flat = flatten_spans(&spans);
@@ -1530,7 +1533,7 @@ mod tests {
         outcome: TombstoneOutcome,
     ) -> crate::supertable::wal::state_doc::TombstoneEntry {
         crate::supertable::wal::state_doc::TombstoneEntry {
-            target_id: WalId(target_id),
+            target_id: RowId(target_id),
             outcome,
             tombstoned_in_superfile: None,
         }
@@ -1676,7 +1679,7 @@ mod tests {
             created_at: Utc::now(),
             lease: None,
             predicate_repr: "test delete".into(),
-            target_ids: target_ids.iter().map(|&v| WalId(v)).collect(),
+            target_ids: target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: None,
             new_row_content_hash: None,
             preallocated_superfile_id: None,
@@ -1684,7 +1687,7 @@ mod tests {
             tombstone_progress: target_ids
                 .iter()
                 .map(|&v| TombstoneEntry {
-                    target_id: WalId(v),
+                    target_id: RowId(v),
                     outcome: TombstoneOutcome::Pending,
                     tombstoned_in_superfile: None,
                 })
