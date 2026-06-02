@@ -332,7 +332,6 @@ impl SuperfileReader {
                 cols_json,
                 crate::superfile::vector::reader::OpenOptions {
                     verify_crc: opts.verify_crc,
-                    ..Default::default()
                 },
             )?)
         } else if any_present(&kv_map, kv::VEC_KEYS) {

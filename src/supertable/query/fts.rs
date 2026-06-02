@@ -548,11 +548,11 @@ fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superf
     for hit in per_segment.into_iter().flatten() {
         if heap.len() < k {
             heap.push(MinByScore(hit));
-        } else if let Some(worst) = heap.peek() {
-            if hit.score > worst.0.score {
-                heap.pop();
-                heap.push(MinByScore(hit));
-            }
+        } else if let Some(worst) = heap.peek()
+            && hit.score > worst.0.score
+        {
+            heap.pop();
+            heap.push(MinByScore(hit));
         }
     }
     let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();

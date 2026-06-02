@@ -398,7 +398,7 @@ fn bench(c: &mut Criterion) {
             stats,
         );
 
-        bench_superfile_vec_storage_tiers(c, &cal, qs);
+        bench_superfile_vec_storage_tiers(c, cal, qs);
 
         emit_search_markdown();
     }

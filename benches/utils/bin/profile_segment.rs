@@ -13,6 +13,7 @@
 //! The grid isolates the two suspected costs by differential timing:
 //!   * sweep `nprobe` at small `rerank_mult` -> coarse 1-bit scan cost
 //!   * sweep `rerank_mult` at fixed `nprobe` -> Sq8 rerank cost
+//!
 //! and the recall column shows whether per-segment recall keeps
 //! climbing past the old 16-probe cap (the ceiling question).
 //!

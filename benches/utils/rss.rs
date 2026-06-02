@@ -55,7 +55,7 @@ pub fn current_rss_bytes() -> Option<u64> {
     for line in s.lines() {
         // Format: `VmRSS:\t   12345 kB`
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * 1024);
         }
     }

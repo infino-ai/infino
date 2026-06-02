@@ -723,15 +723,8 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
     let json = format!(
         r#"[{{"column":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
     );
-    VectorReader::open_with(
-        Bytes::from(blob),
-        &json,
-        OpenOptions {
-            verify_crc: true,
-            ..Default::default()
-        },
-    )
-    .expect("open VectorReader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open VectorReader")
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.

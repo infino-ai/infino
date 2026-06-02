@@ -2280,14 +2280,8 @@ mod tests {
         let mut bytes = blob.to_vec();
         let pos = OUTER_HEADER_SIZE + 10;
         bytes[pos] ^= 0xFF;
-        let r = VectorReader::open_with(
-            Bytes::from(bytes),
-            &json,
-            OpenOptions {
-                verify_crc: false,
-                ..OpenOptions::default()
-            },
-        );
+        let r =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false });
         // Open succeeds; the corruption may surface later as a
         // bad-magic / bounds error or be silently absorbed depending
         // on which byte got flipped. The contract is "we don't
@@ -3302,15 +3296,9 @@ mod tests {
         let crc_off = dir_off + DIR_ENTRY;
         bytes[crc_off..crc_off + 4].copy_from_slice(&new_crc.to_le_bytes());
 
-        let err = VectorReader::open_with(
-            Bytes::from(bytes),
-            &json,
-            OpenOptions {
-                verify_crc: false,
-                ..Default::default()
-            },
-        )
-        .expect_err("unknown codec id must error at open");
+        let err =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
+                .expect_err("unknown codec id must error at open");
         assert!(
             matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
             "expected MalformedVersion for unknown codec id, got {err:?}"
@@ -4114,10 +4102,7 @@ mod tests {
         let reader = VectorReader::open_with_source(
             Source::Lazy(lazy),
             json,
-            OpenOptions {
-                verify_crc: false,
-                ..Default::default()
-            },
+            OpenOptions { verify_crc: false },
         )
         .expect("lazy open");
 
@@ -4304,10 +4289,7 @@ mod tests {
             let reader = VectorReader::open_with_source(
                 Source::Lazy(StdArc::clone(lazy)),
                 json,
-                OpenOptions {
-                    verify_crc: false,
-                    ..Default::default()
-                },
+                OpenOptions { verify_crc: false },
             )
             .expect("lazy open");
             n_cols_total += reader.columns.len();

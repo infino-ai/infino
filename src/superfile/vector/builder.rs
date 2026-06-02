@@ -944,8 +944,7 @@ fn build_subsection_streaming(
     };
 
     if sq8_family {
-        for cid in 0..n_cent {
-            let (scale_c, offset_c) = &sq8_quantizers[cid];
+        for (cid, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate().take(n_cent) {
             let sc_off = sq8_scale_block_off + cid * dim * 4;
             bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
             let oc_off = sq8_offset_block_off + cid * dim * 4;

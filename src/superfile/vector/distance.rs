@@ -1116,7 +1116,7 @@ mod tests {
             };
             let want = match m {
                 Metric::Cosine => {
-                    let x_norm = norms.as_ref().unwrap()[0].sqrt();
+                    let x_norm = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
                     if x_norm > 0.0 {
                         1.0 - dot(&query, &decoded) / x_norm
                     } else {

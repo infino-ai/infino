@@ -87,7 +87,7 @@ fn brute_force_top_k(corpus: &[Vec<f32>], query: &[f32], metric: Metric, k: usiz
 }
 
 fn build_superfile_reader(corpus: &[Vec<f32>], metric: Metric) -> SuperfileReader {
-    let metric_str = match metric {
+    let _metric_str = match metric {
         Metric::L2Sq => "l2sq",
         Metric::Cosine => "cosine",
         Metric::NegDot => "negdot",

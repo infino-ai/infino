@@ -236,7 +236,7 @@ impl Eq for Hit {}
 
 impl PartialOrd for Hit {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 

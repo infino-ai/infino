@@ -65,11 +65,11 @@
 //!   tails that distort a regression bench.
 //! - `s3s-fs` gives us the full S3 wire path (path-style URL
 //!   + SigV4 + HTTP/1.1 range headers), so it is useful for
-//!   validating request shape: GET count, byte ranges, and
-//!   overlap. Its loopback latency is not treated as S3 latency;
-//!   the diagnostic prints an adjusted model line that replaces
-//!   the observed s3s-fs blocking span with a configurable S3
-//!   TTFB + throughput model.
+//!     validating request shape: GET count, byte ranges, and
+//!     overlap. Its loopback latency is not treated as S3 latency;
+//!     the diagnostic prints an adjusted model line that replaces
+//!     the observed s3s-fs blocking span with a configurable S3
+//!     TTFB + throughput model.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -712,7 +712,7 @@ fn bench(c: &mut Criterion) {
     // the mmap-backed reader; zero S3 GETs per iteration.
     {
         let (warm_dir, warm_cache) = fresh_cache(Arc::clone(&storage));
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             // Trigger cold + wait for promotion.
             let _ = warm_cache.reader(&uri).await.expect("warm prewarm");
             wait_for_mmap_promotion(&warm_cache, uri, Duration::from_secs(60)).await;
@@ -1097,16 +1097,11 @@ mod diag {
     }
 
     fn report(name: &str, snap: &CountingSnapshot, wall: Duration, real_s3: bool) {
-        let head_avg_us = if snap.head_count == 0 {
-            0
-        } else {
-            snap.head_total_us / snap.head_count
-        };
-        let range_avg_us = if snap.range_count == 0 {
-            0
-        } else {
-            snap.range_total_us / snap.range_count
-        };
+        let head_avg_us = snap.head_total_us.checked_div(snap.head_count).unwrap_or(0);
+        let range_avg_us = snap
+            .range_total_us
+            .checked_div(snap.range_count)
+            .unwrap_or(0);
         let model = S3LatencyModel::from_env_or_default();
         let cost_model = S3CostModel::from_env_or_default();
         let (raw_blocking, model_blocking, batches) =

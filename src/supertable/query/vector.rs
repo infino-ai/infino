@@ -270,7 +270,7 @@ fn summarize_fanout_timing(timing: &std::sync::Mutex<Vec<(u64, u64)>>, total_us:
         let idx = (((v.len() - 1) as f64) * p).round() as usize;
         v[idx]
     };
-    let max_combined = *combined.last().unwrap();
+    let max_combined = combined.last().copied().unwrap_or(0);
     let ratio = total_us as f64 / max_combined.max(1) as f64;
     eprintln!(
         "[fanout-timing] n_seg={n} total={:.1}ms | per-seg open+search: \
@@ -282,10 +282,10 @@ fn summarize_fanout_timing(timing: &std::sync::Mutex<Vec<(u64, u64)>>, total_us:
         pct(&combined, 0.9) as f64 / 1000.0,
         max_combined as f64 / 1000.0,
         pct(&opens, 0.5) as f64 / 1000.0,
-        *opens.last().unwrap() as f64 / 1000.0,
+        opens.last().copied().unwrap_or(0) as f64 / 1000.0,
         pct(&searches, 0.5) as f64 / 1000.0,
         pct(&searches, 0.9) as f64 / 1000.0,
-        *searches.last().unwrap() as f64 / 1000.0,
+        searches.last().copied().unwrap_or(0) as f64 / 1000.0,
         ratio,
         if ratio <= 1.5 {
             "PARALLEL: cost is throughput/slowest-segment"
@@ -371,11 +371,11 @@ fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superfi
     for hit in per_segment.into_iter().flatten() {
         if heap.len() < k {
             heap.push(MaxByScore(hit));
-        } else if let Some(worst) = heap.peek() {
-            if hit.score < worst.0.score {
-                heap.pop();
-                heap.push(MaxByScore(hit));
-            }
+        } else if let Some(worst) = heap.peek()
+            && hit.score < worst.0.score
+        {
+            heap.pop();
+            heap.push(MaxByScore(hit));
         }
     }
     let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();

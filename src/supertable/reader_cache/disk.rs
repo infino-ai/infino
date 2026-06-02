@@ -1640,10 +1640,10 @@ async fn wait_for_lazy_foreground_release(
         if store.strong_count() == 0 || reader.strong_count() == 0 {
             return None;
         }
-        if let Some(strong) = store.upgrade() {
-            if strong.n_promotion_waiters.load(Ordering::Acquire) > 0 {
-                return Some(strong);
-            }
+        if let Some(strong) = store.upgrade()
+            && strong.n_promotion_waiters.load(Ordering::Acquire) > 0
+        {
+            return Some(strong);
         }
         if reader.strong_count() <= 1 {
             // Give short-lived callers (notably cold benchmarks with a
