@@ -29,7 +29,10 @@ use infino::test_helpers::{
 };
 use tempfile::NamedTempFile;
 
-const DOC: &str = "the quick brown fox";
+const DOCSTRING_1: &str = "the quick brown fox";
+const DOCSTRING_2: &str = "a lazy sleeping fox";
+const DOC_ID_1: u64 = 42;
+const EMB_DIM: usize = 16;
 
 fn main() {
     let bytes = demo_superfile();
@@ -57,7 +60,13 @@ fn demo_superfile() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![VectorConfig::new("emb".into(), 16, 1, 7, Metric::Cosine)],
+        vec![VectorConfig::new(
+            "emb".into(),
+            EMB_DIM,
+            1,
+            7,
+            Metric::Cosine,
+        )],
         Some(default_tokenizer()),
     );
 
@@ -65,14 +74,14 @@ fn demo_superfile() -> Bytes {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(decimal128_ids(vec![42u64])),
-            Arc::new(LargeStringArray::from(vec![DOC])),
+            Arc::new(decimal128_ids(vec![DOC_ID_1])),
+            Arc::new(LargeStringArray::from(vec![DOCSTRING_1])),
         ],
     )
     .expect("build RecordBatch");
 
     // One unit-norm embedding for the single doc.
-    let mut emb = vec![0.0f32; 16];
+    let mut emb = vec![0.0f32; EMB_DIM];
     emb[0] = 1.0;
     normalize(&mut emb);
 
@@ -151,7 +160,7 @@ fn demo_supertable() {
     // Each commit seals one segment. The writer holds an exclusive
     // slot on the supertable, so we scope it so it drops before the
     // next one is taken.
-    for title in [DOC, "a lazy sleeping fox"] {
+    for title in [DOCSTRING_1, DOCSTRING_2] {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&[title])).expect("append");
         w.commit().expect("commit");
