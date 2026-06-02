@@ -146,7 +146,7 @@ fn demo_supertable() {
     // default_supertable_options(): schema is `title: LargeUtf8`,
     // FTS on title, no vectors, in-memory store. The `_id` column is
     // added by the supertable, not declared here.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create supertable");
 
     // Each commit seals one segment. The writer holds an exclusive
     // slot on the supertable, so we scope it so it drops before the
