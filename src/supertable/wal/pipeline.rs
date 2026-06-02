@@ -58,7 +58,6 @@ use std::sync::Arc;
 use arrow::ipc::reader::StreamReader;
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use uuid::Uuid;
 
 use crate::runtime_bridge::bridge_sync_to_async;
@@ -1043,7 +1042,6 @@ fn resolve_target_id_in_manifest(
     target_id: crate::supertable::wal::state_doc::WalId,
 ) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
     let target = target_id.0;
-    let id_column = inner.options.id_column.clone();
 
     for entry in manifest.superfile_list.superfiles.iter() {
         if target < entry.id_min || target > entry.id_max {
@@ -1056,30 +1054,42 @@ fn resolve_target_id_in_manifest(
         // recovery sweep on `Supertable::open` lands here when
         // the freshly-opened handle's in-memory tier is empty
         // and no disk cache is attached.
-        let parquet_bytes = match crate::supertable::query::superfile_reader::superfile_reader(
+        let reader = match crate::supertable::query::superfile_reader::superfile_reader(
             &inner.options.store,
             inner.options.disk_cache.as_ref(),
             &entry.uri,
         ) {
-            Ok(reader) => reader.parquet_bytes().clone(),
-            Err(_) => fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
-                TombstonePhaseError::IdLookupFailed {
-                    target_id: target_id.to_hex(),
-                    message: format!(
-                        "open superfile {} (storage fallback): {message}",
-                        entry.uri.0
-                    ),
-                }
-            })?,
+            Ok(r) => r,
+            Err(_) => {
+                let bytes =
+                    fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
+                        TombstonePhaseError::IdLookupFailed {
+                            target_id: target_id.to_hex(),
+                            message: format!(
+                                "open superfile {} (storage fallback): {message}",
+                                entry.uri.0
+                            ),
+                        }
+                    })?;
+                Arc::new(SuperfileReader::open(bytes).map_err(|e| {
+                    TombstonePhaseError::IdLookupFailed {
+                        target_id: target_id.to_hex(),
+                        message: format!(
+                            "SuperfileReader::open {} (storage fallback): {e}",
+                            entry.uri.0
+                        ),
+                    }
+                })?)
+            }
         };
 
         if let Some(doc_id) =
-            scan_id_column_for_match(parquet_bytes, &id_column, target).map_err(|message| {
-                TombstonePhaseError::IdLookupFailed {
+            reader
+                .id_lookup(target)
+                .map_err(|e| TombstonePhaseError::IdLookupFailed {
                     target_id: target_id.to_hex(),
-                    message: format!("scan _id in superfile {}: {message}", entry.uri.0),
-                }
-            })?
+                    message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
+                })?
         {
             return Ok(Some((entry.superfile_id, doc_id)));
         }
@@ -1087,8 +1097,7 @@ fn resolve_target_id_in_manifest(
     Ok(None)
 }
 
-/// Fetch a superfile's full bytes directly from storage and
-/// return just the Parquet section the `_id` scan needs.
+/// Fetch a superfile's full bytes directly from storage.
 /// Storage-fallback path for the recovery sweep when the
 /// in-memory + disk-cache tiers are both cold.
 ///
@@ -1110,53 +1119,7 @@ fn fetch_superfile_bytes_for_id_scan(
     let path = format!("data/seg-{}.sf", superfile_id);
     let (bytes, _) = bridge_sync_to_async(async move { storage.get(&path).await })
         .map_err(|e| format!("storage get: {e}"))?;
-
-    let reader = crate::superfile::SuperfileReader::open(bytes)
-        .map_err(|e| format!("SuperfileReader::open: {e}"))?;
-    Ok(reader.parquet_bytes().clone())
-}
-
-/// Sequential scan of one superfile's `_id` column looking for
-/// `target`. Returns the matching row's index within the
-/// superfile (the local doc_id used by tombstones / FTS / vector
-/// indices), or `None` if the column doesn't contain `target`.
-///
-/// `_id` is a Decimal128 column with the supertable's fixed
-/// precision/scale; we decode it as `i128` since the supertable
-/// stores `_id`s as raw 128-bit values.
-fn scan_id_column_for_match(
-    parquet_bytes: Bytes,
-    id_column: &str,
-    target: i128,
-) -> Result<Option<u32>, String> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
-        .map_err(|e| format!("parquet builder: {e}"))?;
-    let reader = builder
-        .build()
-        .map_err(|e| format!("parquet builder build: {e}"))?;
-
-    let mut row_offset: u32 = 0;
-    for batch_res in reader {
-        let batch = batch_res.map_err(|e| format!("batch read: {e}"))?;
-        let id_idx = batch
-            .schema()
-            .index_of(id_column)
-            .map_err(|e| format!("missing {id_column}: {e}"))?;
-        let arr = batch.column(id_idx);
-        let id_arr = arr
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .ok_or_else(|| format!("{id_column} column is not Decimal128"))?;
-        for i in 0..id_arr.len() {
-            if id_arr.value(i) == target {
-                return Ok(Some(row_offset + i as u32));
-            }
-        }
-        row_offset = row_offset
-            .checked_add(id_arr.len() as u32)
-            .ok_or_else(|| "row_offset overflow".to_string())?;
-    }
-    Ok(None)
+    Ok(bytes)
 }
 
 #[cfg(test)]
