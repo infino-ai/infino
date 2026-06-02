@@ -140,8 +140,7 @@ fn superfile_reader() -> SuperfileReader {
 }
 
 fn search_opts(nprobe: usize, _rerank_mult: usize) -> VectorSearchOptions {
-    VectorSearchOptions::new()
-        .with_nprobe(nprobe)
+    VectorSearchOptions::new().with_nprobe(nprobe)
 }
 
 // ─── Builder (production SuperfileBuilder) ───────────────────────────

@@ -1195,8 +1195,8 @@ fn prepare_segment(
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
     // Pre-populating the disk cache is opt-out: a write-only producer that
     // drops the cache right after ingest skips this wasted warm-fill.
-    let bytes_for_cache = (cache_attached && inner.options.prepopulate_cache_on_commit)
-        .then(|| shard.bytes.clone());
+    let bytes_for_cache =
+        (cache_attached && inner.options.prepopulate_cache_on_commit).then(|| shard.bytes.clone());
 
     // Open the reader directly on shard bytes (not via the
     // in-memory `SuperfileReaderCache`). This lets the cache-attached

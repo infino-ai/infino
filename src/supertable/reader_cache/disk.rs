@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;

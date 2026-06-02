@@ -21,9 +21,9 @@ use std::sync::Arc;
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use infino::superfile::VectorSearchOptions;
 use infino::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
 use infino::superfile::reader::SuperfileReader;
-use infino::superfile::VectorSearchOptions;
 use infino::superfile::vector::distance::{Metric, distance, normalize};
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use rand::SeedableRng;
@@ -93,11 +93,7 @@ fn build_superfile_reader(corpus: &[Vec<f32>], metric: Metric) -> SuperfileReade
         Metric::NegDot => "negdot",
     };
     let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "_id",
-            DataType::Decimal128(38, 0),
-            false,
-        ),
+        Field::new("_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -117,13 +113,13 @@ fn build_superfile_reader(corpus: &[Vec<f32>], metric: Metric) -> SuperfileReade
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let flat: Vec<f32> = corpus.iter().flatten().copied().collect();
-    let ids = arrow_array::Decimal128Array::from(
-        (0..corpus.len() as i128).collect::<Vec<_>>(),
-    )
-    .with_precision_and_scale(38, 0)
-    .expect("decimal128");
+    let ids = arrow_array::Decimal128Array::from((0..corpus.len() as i128).collect::<Vec<_>>())
+        .with_precision_and_scale(38, 0)
+        .expect("decimal128");
     let titles = LargeStringArray::from(
-        (0..corpus.len()).map(|i| format!("doc {i}")).collect::<Vec<_>>(),
+        (0..corpus.len())
+            .map(|i| format!("doc {i}"))
+            .collect::<Vec<_>>(),
     );
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
         .expect("build RecordBatch");

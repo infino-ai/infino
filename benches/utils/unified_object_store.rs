@@ -1024,7 +1024,11 @@ mod diag {
             r
         }
 
-        async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
         }
 

@@ -3,9 +3,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use infino::supertable::Supertable;
 use infino::supertable::reader_cache::DiskCacheStore;
 use infino::supertable::storage::StorageProvider;
-use infino::supertable::Supertable;
 use tempfile::TempDir;
 
 use crate::ingest::supertable::{self, IngestResult, Modality};
@@ -59,7 +59,8 @@ pub fn criterion_filter_selects(aliases: &[&str], groups: &[&str]) -> bool {
     let Some(filter) = filter else {
         return true;
     };
-    aliases.iter().any(|alias| *alias == filter) || groups.iter().any(|group| group.contains(&filter))
+    aliases.iter().any(|alias| *alias == filter)
+        || groups.iter().any(|group| group.contains(&filter))
 }
 
 /// Search benches use the shared combined fixture. If an ingest group already
@@ -152,7 +153,9 @@ pub fn search_table() -> &'static Supertable {
 
 fn search_consumer() -> &'static SearchConsumer {
     SEARCH_CONSUMER.get_or_init(|| {
-        let built = INGEST.get().expect("ensure_ingest_for_search must run first");
+        let built = INGEST
+            .get()
+            .expect("ensure_ingest_for_search must run first");
         let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
             Arc::clone(&built.storage),
             Some(built.total_index_bytes),

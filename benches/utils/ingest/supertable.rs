@@ -11,7 +11,7 @@ use infino::supertable::storage::StorageProvider;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
 
-use crate::corpus::{self, DIM, SequentialSyntheticCorpus, SUPERTABLE_DOCS};
+use crate::corpus::{self, DIM, SUPERTABLE_DOCS, SequentialSyntheticCorpus};
 use crate::tiers;
 
 pub const N_DOCS: usize = SUPERTABLE_DOCS;
@@ -115,9 +115,7 @@ pub fn options_for(
     opts
 }
 
-pub fn combined_options(
-    storage: Option<Arc<dyn StorageProvider>>,
-) -> SupertableOptions {
+pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> SupertableOptions {
     options_for(Modality::Combined, storage)
 }
 
@@ -139,12 +137,8 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
     let st = Supertable::create(opts).expect("create supertable");
     let mut w = st.writer().expect("writer");
     let chunk_size = N_DOCS.div_ceil(N_COMMIT_CHUNKS);
-    let mut synth = SequentialSyntheticCorpus::new(
-        n_cent_total,
-        CORPUS_VEC_SEED,
-        CORPUS_TEXT_SEED,
-        true,
-    );
+    let mut synth =
+        SequentialSyntheticCorpus::new(n_cent_total, CORPUS_VEC_SEED, CORPUS_TEXT_SEED, true);
     let schema = schema_for(modality);
     let mut titles = Vec::new();
     let mut flat = Vec::new();

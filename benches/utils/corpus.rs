@@ -520,8 +520,7 @@ pub fn mean_recall_superfile(
     k: usize,
     nprobe: usize,
 ) -> f32 {
-    let opts = VectorSearchOptions::new()
-        .with_nprobe(nprobe);
+    let opts = VectorSearchOptions::new().with_nprobe(nprobe);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
         let hits = block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
@@ -638,13 +637,11 @@ pub fn calibrate_superfile(
             continue;
         }
         let q = &queries[0];
-        let opts = VectorSearchOptions::new()
-            .with_nprobe(probe);
+        let opts = VectorSearchOptions::new().with_nprobe(probe);
         let p50 = p50_micros(
             || {
-                let _ =
-                    block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
-                        .expect("vector_search");
+                let _ = block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
+                    .expect("vector_search");
             },
             p50_iter,
         );

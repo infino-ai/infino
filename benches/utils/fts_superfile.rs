@@ -118,11 +118,7 @@ const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
         ],
         BoolMode::Or,
     ),
-    (
-        "two_term_and",
-        &["term00001", "term00050"],
-        BoolMode::And,
-    ),
+    ("two_term_and", &["term00001", "term00050"], BoolMode::And),
     (
         "three_wide_and",
         &["term00001", "term00050", "term00100"],

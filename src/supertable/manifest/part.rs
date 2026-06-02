@@ -779,10 +779,7 @@ mod tests {
                 fts: Some((11_111, 22_222)),
                 vec_open_ranges: vec![(123_456, 96), (200_000, 4096)],
                 fts_open_ranges: vec![(11_111, 1024), (30_000, 2048)],
-                open_blob: vec![
-                    (12_345_614, vec![0xAB; 64]),
-                    (123_456, vec![0xCD; 96]),
-                ],
+                open_blob: vec![(12_345_614, vec![0xAB; 64]), (123_456, vec![0xCD; 96])],
             }),
         })
     }

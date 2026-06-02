@@ -162,11 +162,12 @@ impl SupertableReader {
             })
             .collect();
 
-        let results: Vec<Vec<SuperfileHit>> =
-            futures::future::try_join_all(handles.into_iter().map(|h| async move {
-                h.await.map_err(|e| QueryError::Store(e.to_string()))?
-            }))
-            .await?;
+        let results: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
+            handles
+                .into_iter()
+                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
+        )
+        .await?;
 
         if let Some(timing) = &timing {
             summarize_fanout_timing(timing, fanout_t0.elapsed().as_micros() as u64);
@@ -346,18 +347,23 @@ fn apply_tombstone_filter(
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
 fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     #[derive(PartialEq)]
     struct MaxByScore(SuperfileHit);
     impl Eq for MaxByScore {}
     impl PartialOrd for MaxByScore {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
     }
     impl Ord for MaxByScore {
         fn cmp(&self, other: &Self) -> Ordering {
-            self.0.score.partial_cmp(&other.0.score).unwrap_or(Ordering::Equal)
+            self.0
+                .score
+                .partial_cmp(&other.0.score)
+                .unwrap_or(Ordering::Equal)
         }
     }
 
@@ -650,8 +656,7 @@ mod tests {
         let oracle = build_oracle_superfile(24, dim);
 
         // High-recall config: full nprobe + plenty of rerank.
-        let opts = VectorSearchOptions::new()
-            .with_nprobe(4);
+        let opts = VectorSearchOptions::new().with_nprobe(4);
 
         // Query targets dim 0 — closest neighbors are docs whose
         // global id is 0 mod dim (i.e. 0 and 16 in 24 docs at

@@ -15,9 +15,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::corpus::{
-    self, DIM, SequentialSyntheticCorpus, SUPERTABLE_DOCS, normalize,
-};
+use crate::corpus::{self, DIM, SUPERTABLE_DOCS, SequentialSyntheticCorpus, normalize};
 
 const MAGIC: &[u8; 8] = b"INFBENCH";
 const CACHE_VERSION: u32 = 1;
@@ -63,12 +61,7 @@ pub fn supertable_grading() -> &'static SupertableGrading {
     })
 }
 
-pub fn realistic_queries(
-    n_docs: usize,
-    n_queries: usize,
-    seed: u64,
-    sigma: f32,
-) -> Vec<Vec<f32>> {
+pub fn realistic_queries(n_docs: usize, n_queries: usize, seed: u64, sigma: f32) -> Vec<Vec<f32>> {
     let bases: HashSet<usize> = query_base_doc_ids(n_docs, n_queries).into_iter().collect();
     let base_vectors = collect_doc_vectors(n_docs, &bases);
     build_queries_from_bases(n_docs, n_queries, seed, sigma, &base_vectors)
@@ -96,11 +89,7 @@ fn load_or_compute(n_docs: usize) -> SupertableGrading {
 fn compute(n_docs: usize) -> SupertableGrading {
     let corr_bases = query_base_doc_ids(n_docs, N_CORRECTNESS_QUERIES);
     let cal_bases = query_base_doc_ids(n_docs, N_CALIBRATION_QUERIES);
-    let all_bases: HashSet<usize> = corr_bases
-        .iter()
-        .chain(cal_bases.iter())
-        .copied()
-        .collect();
+    let all_bases: HashSet<usize> = corr_bases.iter().chain(cal_bases.iter()).copied().collect();
 
     let base_vectors = collect_doc_vectors(n_docs, &all_bases);
 
@@ -133,9 +122,7 @@ fn compute(n_docs: usize) -> SupertableGrading {
 }
 
 fn query_base_doc_ids(n_docs: usize, n_queries: usize) -> Vec<usize> {
-    (0..n_queries)
-        .map(|i| (i * 7919) % n_docs)
-        .collect()
+    (0..n_queries).map(|i| (i * 7919) % n_docs).collect()
 }
 
 fn build_queries_from_bases(
@@ -234,10 +221,7 @@ fn streaming_ground_truth(n_docs: usize, queries: &[Vec<f32>], k: usize) -> Vec<
     heaps
         .into_iter()
         .map(|mut h| {
-            let mut v: Vec<(f32, u32)> = h
-                .drain()
-                .map(|Reverse(Hit(dot, id))| (dot, id))
-                .collect();
+            let mut v: Vec<(f32, u32)> = h.drain().map(|Reverse(Hit(dot, id))| (dot, id)).collect();
             v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             v.truncate(k);
             v.into_iter().map(|(_, id)| id).collect()
@@ -398,7 +382,8 @@ mod tests {
         let n_docs = 512;
         let queries = realistic_queries(n_docs, 4, 17, 0.05);
         let stream_gt = streaming_ground_truth(n_docs, &queries, 5);
-        let mmap = corpus::MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), VEC_SEED, true);
+        let mmap =
+            corpus::MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), VEC_SEED, true);
         let brute = corpus::ground_truth(mmap.as_slice(), n_docs, &queries, 5);
         assert_eq!(stream_gt, brute);
     }

@@ -4,9 +4,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::corpus::{
-    DIM, TOKENS_PER_DOC, VOCAB_SIZE, ZipfDistribution, normalize,
-};
+use crate::corpus::{DIM, TOKENS_PER_DOC, VOCAB_SIZE, ZipfDistribution, normalize};
 
 /// Stream the same deterministic synthetic docs as [`super::MmapTextCorpus`] +
 /// [`super::MmapVectorCorpus`], one append chunk at a time.

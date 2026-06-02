@@ -972,13 +972,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search(
-                "emb",
-                &q,
-                1,
-                VectorSearchOptions::new()
-                    .with_nprobe(4),
-            )
+            .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
             .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);

@@ -433,7 +433,9 @@ mod tests {
             .await
             .expect("put");
 
-        p.delete("data/orphan.sf.parquet").await.expect("first delete");
+        p.delete("data/orphan.sf.parquet")
+            .await
+            .expect("first delete");
         p.delete("data/orphan.sf.parquet")
             .await
             .expect("second delete (idempotent)");
@@ -445,10 +447,16 @@ mod tests {
     #[tokio::test]
     async fn missing_object_returns_not_found() {
         let (_dir, p) = provider();
-        let err = p.head("data/no-such.sf.parquet").await.expect_err("head missing");
+        let err = p
+            .head("data/no-such.sf.parquet")
+            .await
+            .expect_err("head missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
-        let err = p.get("data/no-such.sf.parquet").await.expect_err("get missing");
+        let err = p
+            .get("data/no-such.sf.parquet")
+            .await
+            .expect_err("get missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
         let err = p

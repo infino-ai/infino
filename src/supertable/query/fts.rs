@@ -201,11 +201,12 @@ impl SupertableReader {
             })
             .collect();
 
-        let per_unit: Vec<Vec<SuperfileHit>> =
-            futures::future::try_join_all(handles.into_iter().map(|h| async move {
-                h.await.map_err(|e| QueryError::Store(e.to_string()))?
-            }))
-            .await?;
+        let per_unit: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
+            handles
+                .into_iter()
+                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
+        )
+        .await?;
 
         Ok(top_k_descending(per_unit, k))
     }
@@ -330,11 +331,12 @@ impl SupertableReader {
             })
             .collect();
 
-        let per_unit: Vec<Vec<SuperfileHit>> =
-            futures::future::try_join_all(handles.into_iter().map(|h| async move {
-                h.await.map_err(|e| QueryError::Store(e.to_string()))?
-            }))
-            .await?;
+        let per_unit: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
+            handles
+                .into_iter()
+                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
+        )
+        .await?;
 
         Ok(top_k_descending(per_unit, k))
     }
@@ -521,18 +523,24 @@ fn apply_tombstone_filter(
 /// score (highest BM25 = most relevant). Uses a min-heap of size k
 /// so we never sort more than k elements.
 fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     #[derive(PartialEq)]
     struct MinByScore(SuperfileHit);
     impl Eq for MinByScore {}
     impl PartialOrd for MinByScore {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
     }
     impl Ord for MinByScore {
         fn cmp(&self, other: &Self) -> Ordering {
-            other.0.score.partial_cmp(&self.0.score).unwrap_or(Ordering::Equal)
+            other
+                .0
+                .score
+                .partial_cmp(&self.0.score)
+                .unwrap_or(Ordering::Equal)
         }
     }
 
