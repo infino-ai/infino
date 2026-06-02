@@ -8,11 +8,17 @@ use infino::supertable::storage::StorageProvider;
 use infino::supertable::Supertable;
 use tempfile::TempDir;
 
-use crate::ingest::supertable::{self, IngestResult};
+use crate::ingest::supertable::{self, IngestResult, Modality};
 use crate::tiers;
 
 static INGEST: OnceLock<IngestResult> = OnceLock::new();
 static BUILD_NS: OnceLock<f64> = OnceLock::new();
+
+static FTS_INGEST: OnceLock<IngestResult> = OnceLock::new();
+static FTS_BUILD_NS: OnceLock<f64> = OnceLock::new();
+
+static VEC_INGEST: OnceLock<IngestResult> = OnceLock::new();
+static VEC_BUILD_NS: OnceLock<f64> = OnceLock::new();
 
 struct SearchConsumer {
     st: Supertable,
@@ -71,6 +77,57 @@ pub fn ensure_ingest_for_search(reason: &str) -> &'static IngestResult {
 pub fn ingest_build_nanos() -> f64 {
     ensure_ingest("build timing");
     *BUILD_NS.get().expect("build timing recorded")
+}
+
+/// FTS-only supertable ingest (apples-to-apples vs Tantivy). Separate storage
+/// prefix + fixture from the combined build.
+pub fn ensure_fts_ingest(reason: &str) -> &'static IngestResult {
+    if FTS_INGEST.get().is_none() {
+        eprintln!(
+            "[supertable_fts] ingesting {} docs (FTS-only) to object storage for {reason}...",
+            supertable::N_DOCS
+        );
+    }
+    FTS_INGEST.get_or_init(|| {
+        let t0 = Instant::now();
+        let built = supertable::build_on_storage(Modality::Fts);
+        let _ = FTS_BUILD_NS.set(t0.elapsed().as_secs_f64() * 1e9);
+        eprintln!(
+            "[supertable_fts] ingest OK: {} superfiles ({})",
+            built.n_superfiles, built.storage_label
+        );
+        built
+    })
+}
+
+pub fn fts_ingest_build_nanos() -> f64 {
+    ensure_fts_ingest("build timing");
+    *FTS_BUILD_NS.get().expect("fts build timing recorded")
+}
+
+/// Vector-only supertable ingest (apples-to-apples vs Lance vector-only).
+pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
+    if VEC_INGEST.get().is_none() {
+        eprintln!(
+            "[supertable_vec] ingesting {} docs (vector-only) to object storage for {reason}...",
+            supertable::N_DOCS
+        );
+    }
+    VEC_INGEST.get_or_init(|| {
+        let t0 = Instant::now();
+        let built = supertable::build_on_storage(Modality::Vector);
+        let _ = VEC_BUILD_NS.set(t0.elapsed().as_secs_f64() * 1e9);
+        eprintln!(
+            "[supertable_vec] ingest OK: {} superfiles ({})",
+            built.n_superfiles, built.storage_label
+        );
+        built
+    })
+}
+
+pub fn vector_ingest_build_nanos() -> f64 {
+    ensure_vector_ingest("build timing");
+    *VEC_BUILD_NS.get().expect("vector build timing recorded")
 }
 
 pub fn ingest() -> &'static IngestResult {

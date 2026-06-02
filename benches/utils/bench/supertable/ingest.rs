@@ -1,4 +1,6 @@
-//! `supertable_all_build` — time one object-storage ingest.
+//! Supertable ingest timing — three apples-to-apples shapes:
+//! `supertable_fts_build` (vs Tantivy), `supertable_vec_build` (vs Lance
+//! vector-only), and `supertable_all_build` (combined, vs combined Lance).
 
 use std::time::Duration;
 
@@ -12,42 +14,88 @@ const BUILD_MEASUREMENT_TIME: Duration = Duration::from_secs(60 * 60);
 
 pub mod group_name {
     pub const SUPERTABLE_ALL_BUILD: &str = "supertable_all_build";
+    pub const SUPERTABLE_FTS_BUILD: &str = "supertable_fts_build";
+    pub const SUPERTABLE_VEC_BUILD: &str = "supertable_vec_build";
 }
 
 pub fn bench(c: &mut Criterion) {
-    let mut g = c.benchmark_group(group_name::SUPERTABLE_ALL_BUILD);
+    // FTS-only and vector-only first so each RSS window opens before the
+    // combined build (and the shared search consumer) makes anything resident.
+    run_build(
+        c,
+        group_name::SUPERTABLE_FTS_BUILD,
+        &format!("supertable_fts_{}docs", supertable::N_DOCS),
+        "FTS-only",
+        fixture::fts_ingest_build_nanos,
+        || {
+            fixture::ensure_fts_ingest("ingest timing");
+        },
+        || fixture::ensure_fts_ingest("markdown").n_superfiles,
+    );
+    run_build(
+        c,
+        group_name::SUPERTABLE_VEC_BUILD,
+        &format!("supertable_vec_{}docs", supertable::N_DOCS),
+        "vector-only",
+        fixture::vector_ingest_build_nanos,
+        || {
+            fixture::ensure_vector_ingest("ingest timing");
+        },
+        || fixture::ensure_vector_ingest("markdown").n_superfiles,
+    );
+    run_build(
+        c,
+        group_name::SUPERTABLE_ALL_BUILD,
+        &format!("supertable_{}docs", supertable::N_DOCS),
+        "combined FTS + vector",
+        fixture::ingest_build_nanos,
+        || {
+            fixture::ensure_ingest("ingest timing");
+        },
+        || fixture::ensure_ingest("markdown").n_superfiles,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_build(
+    c: &mut Criterion,
+    group: &str,
+    bench_id: &str,
+    shape: &str,
+    build_nanos: fn() -> f64,
+    ensure: impl Fn(),
+    n_superfiles: impl Fn() -> usize,
+) {
+    let mut g = c.benchmark_group(group);
     g.sample_size(10);
     g.measurement_time(BUILD_MEASUREMENT_TIME);
     g.throughput(Throughput::Elements(supertable::N_DOCS as u64));
 
     let rss_sample = rss::PeakSampler::start_default();
-    let bench_id = format!("supertable_{}docs", supertable::N_DOCS);
-    g.bench_function(bench_id.clone(), |b| {
+    g.bench_function(bench_id, |b| {
         b.iter_custom(|iters| {
-            fixture::ensure_ingest("ingest timing");
-            let ns = fixture::ingest_build_nanos();
+            ensure();
+            let ns = build_nanos();
             Duration::from_nanos(ns as u64) * (iters as u32)
         });
     });
-
     g.finish();
     let stats = rss_sample.stop_stats();
-    let _ = rss::write_rss_stats(group_name::SUPERTABLE_ALL_BUILD, &bench_id, stats);
+    let _ = rss::write_rss_stats(group, bench_id, stats);
 
-    emit_markdown(&bench_id);
+    emit_markdown(group, bench_id, shape, &n_superfiles());
 }
 
-fn emit_markdown(bench: &str) {
+fn emit_markdown(group: &str, bench: &str, shape: &str, n_superfiles: &usize) {
     use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
 
-    let group = group_name::SUPERTABLE_ALL_BUILD;
     let ns = read_mean_ns(group, bench);
     let peak_rss = rss::read_peak_rss_bytes(group, bench);
-    let n_superfiles = fixture::ensure_ingest("markdown").n_superfiles;
 
     let mut body = String::new();
     body.push_str(&format!(
-        "### Supertable combined FTS + vector — ingest ({} docs × dim={}, {} commits → {} superfiles)\n\n",
+        "### Supertable {} — ingest ({} docs × dim={}, {} commits → {} superfiles)\n\n",
+        shape,
         supertable::N_DOCS,
         crate::corpus::DIM,
         supertable::N_COMMIT_CHUNKS,
@@ -72,7 +120,7 @@ fn emit_markdown(bench: &str) {
     ));
 
     markdown::emit(&MarkdownSection {
-        anchor_id: "bench/vector/supertable/ingest".into(),
+        anchor_id: format!("bench/supertable/ingest/{group}"),
         body,
     });
 }
