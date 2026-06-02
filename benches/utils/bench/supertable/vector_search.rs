@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use criterion::Criterion;
-use infino::supertable::query::vector::VectorSearchOptions;
 use infino::supertable::Supertable;
+use infino::supertable::query::vector::VectorSearchOptions;
 
 use crate::bench::supertable::query::vector_topk_global;
 use crate::corpus::{Calibrated, grading};
@@ -55,14 +55,8 @@ fn mean_recall(
 }
 
 fn assert_correctness(st: &Supertable, g: &grading::SupertableGrading) -> f32 {
-    let opts = VectorSearchOptions::new()
-        .with_nprobe(CORRECTNESS_NPROBE);
-    let mean_recall = mean_recall(
-        st,
-        &g.correctness_queries,
-        &g.correctness_gt,
-        opts,
-    );
+    let opts = VectorSearchOptions::new().with_nprobe(CORRECTNESS_NPROBE);
+    let mean_recall = mean_recall(st, &g.correctness_queries, &g.correctness_gt, opts);
     assert!(
         mean_recall >= CORRECTNESS_RECALL_FLOOR,
         "supertable mean recall@{TOP_K} at correctness config \
@@ -72,11 +66,7 @@ fn assert_correctness(st: &Supertable, g: &grading::SupertableGrading) -> f32 {
     mean_recall
 }
 
-fn measure_p50_micros(
-    st: &Supertable,
-    query: &[f32],
-    options: VectorSearchOptions,
-) -> f32 {
+fn measure_p50_micros(st: &Supertable, query: &[f32], options: VectorSearchOptions) -> f32 {
     let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
     for _ in 0..CALIBRATION_P50_ITERS {
         let t0 = Instant::now();
@@ -87,23 +77,15 @@ fn measure_p50_micros(
     samples[samples.len() / 2]
 }
 
-fn calibration_grid(
-    st: &Supertable,
-    queries: &[Vec<f32>],
-    truths: &[Vec<u32>],
-) -> Vec<Calibrated> {
-    let min_target = RECALL_TARGETS
-        .iter()
-        .copied()
-        .fold(f32::INFINITY, f32::min);
+fn calibration_grid(st: &Supertable, queries: &[Vec<f32>], truths: &[Vec<u32>]) -> Vec<Calibrated> {
+    let min_target = RECALL_TARGETS.iter().copied().fold(f32::INFINITY, f32::min);
     let refine = VectorSearchOptions::RERANK_MULT;
     let total = SUPERTABLE_PROBES_PER_SEG.len();
     let mut seen = 0usize;
     let mut points = Vec::with_capacity(total);
     for &probe in SUPERTABLE_PROBES_PER_SEG {
         seen += 1;
-        let opts = VectorSearchOptions::new()
-            .with_nprobe(probe);
+        let opts = VectorSearchOptions::new().with_nprobe(probe);
         let t0 = Instant::now();
         let recall = mean_recall(st, queries, truths, opts);
         let recall_secs = t0.elapsed().as_secs_f32();
@@ -207,8 +189,7 @@ pub fn bench(c: &mut Criterion) {
     eprintln!("[supertable_vec] warming cache: triggering background fills for all segments...");
     let warm_t0 = Instant::now();
     tiers::block_on(async {
-        let opts = VectorSearchOptions::new()
-            .with_nprobe(CORRECTNESS_NPROBE);
+        let opts = VectorSearchOptions::new().with_nprobe(CORRECTNESS_NPROBE);
         let _ = vector_topk_global(st, &g.correctness_queries[0], TOP_K, opts).await;
         st.wait_until_warm(Duration::from_secs(600))
             .await
@@ -232,8 +213,7 @@ pub fn bench(c: &mut Criterion) {
             let p = c_st.probe;
             g_hot.bench_function(format!("supertable_{label}"), |b| {
                 let q = &qs[0];
-                let opts = VectorSearchOptions::new()
-                    .with_nprobe(p);
+                let opts = VectorSearchOptions::new().with_nprobe(p);
                 b.iter(|| {
                     let hits = tiers::block_on(vector_topk_global(st, black_box(q), TOP_K, opts));
                     black_box(hits)
@@ -278,8 +258,7 @@ fn bench_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32
             };
             let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
             let p = c_st.probe;
-            let opts = VectorSearchOptions::new()
-                .with_nprobe(p);
+            let opts = VectorSearchOptions::new().with_nprobe(p);
             let bench_id = format!("supertable_{label}");
 
             match tier {
@@ -287,8 +266,11 @@ fn bench_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32
                     let storage = fixture::storage();
                     let (cache_dir, cache) =
                         tiers::fresh_supertable_search_cache(storage.clone(), idx_bytes);
-                    let consumer_opts =
-                        tiers::consumer_options(supertable::combined_options(None), storage, cache.clone());
+                    let consumer_opts = tiers::consumer_options(
+                        supertable::combined_options(None),
+                        storage,
+                        cache.clone(),
+                    );
                     let st = tiers::block_on(tiers::open_consumer(consumer_opts));
                     let query = q.clone();
                     tiers::block_on(async {
@@ -300,8 +282,12 @@ fn bench_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32
                     g.bench_function(&bench_id, |b| {
                         let query = q.clone();
                         b.iter(|| {
-                            let hits =
-                                tiers::block_on(vector_topk_global(&st, black_box(&query), TOP_K, opts));
+                            let hits = tiers::block_on(vector_topk_global(
+                                &st,
+                                black_box(&query),
+                                TOP_K,
+                                opts,
+                            ));
                             black_box(hits)
                         });
                     });
@@ -316,8 +302,10 @@ fn bench_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32
                         b.iter_custom(|iters| {
                             let mut total = Duration::ZERO;
                             for _ in 0..iters {
-                                let (cache_dir, cache) =
-                                    tiers::fresh_supertable_search_cache(Arc::clone(&storage), idx_bytes);
+                                let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+                                    Arc::clone(&storage),
+                                    idx_bytes,
+                                );
                                 let consumer_opts = tiers::consumer_options(
                                     supertable::combined_options(None),
                                     Arc::clone(&storage),
