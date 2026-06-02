@@ -371,7 +371,7 @@ async fn do_apply(
         })?;
     let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &inner.options)?;
 
-    // ---- Step 4+5: Build the superfile bytes ----
+    // ---- Step 4: Build the superfile bytes ----
     let bytes = {
         let mut builder = SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
@@ -391,7 +391,7 @@ async fn do_apply(
         Bytes::from(raw)
     };
 
-    // ---- Step 6: Per-superfile summaries + SuperfileEntry ----
+    // ---- Step 5: Per-superfile summaries + SuperfileEntry ----
     //
     // FTS + vector summaries are derived from a fresh
     // `SuperfileReader` on the just-built bytes — same shape the
@@ -432,7 +432,7 @@ async fn do_apply(
         partition_hint: None,
     });
 
-    // ---- Step 5: CAS-commit the manifest ----
+    // ---- Step 6: PUT bytes + CAS-commit the manifest ----
     //
     // The writer's `persist_commit` handles the actual PUT of
     // the superfile bytes (via `pending_storage_writes`), the
@@ -464,7 +464,7 @@ async fn do_apply(
     // them.
     let _ = inner.options.store.insert(uri, bytes);
 
-    // ---- Step 6: Advance WAL state to Appended ----
+    // ---- Step 7: Advance WAL state to Appended ----
     advance_to_appended_if_needed(wal_store, wal_doc, wal_etag, preallocated_superfile_id).await
 }
 
