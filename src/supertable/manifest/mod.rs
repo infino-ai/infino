@@ -404,6 +404,24 @@ pub struct SubsectionOffsets {
     /// header+dictionary and doc-length tables. Query-time postings
     /// stay lazy.
     pub fts_open_ranges: Vec<(u64, u64)>,
+    /// Plan 013 M7 — the actual bytes covering the segment's
+    /// open-time batch (parquet footer tail + the
+    /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
+    /// in the manifest part.
+    ///
+    /// When non-empty, the cold-fetch path installs these directly
+    /// into the reader's prefetch overlay and issues **zero**
+    /// open-time GETs against the segment object — the bytes
+    /// already arrived in the single part GET that `cold_open`
+    /// performs. The genuine first-touch per-segment cost then
+    /// collapses from 2 RTT-batches (open metadata + cluster
+    /// postings) to 1 (postings only).
+    ///
+    /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
+    /// produced by pre-M7 writers, or when blob capture is disabled
+    /// — the path then falls back to fetching `vec_open_ranges` /
+    /// `fts_open_ranges` over the wire.
+    pub open_blob: Vec<(u64, Vec<u8>)>,
 }
 
 /// Opaque store key — wraps a UUID v4. The segment store treats

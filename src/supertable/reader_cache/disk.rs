@@ -344,6 +344,46 @@ impl DiskCacheStore {
         }
     }
 
+    /// Open a streaming, RangeOnly reader directly against object
+    /// storage, bypassing the disk cache entirely: no budget
+    /// reservation, no background fill, no entry inserted into
+    /// `cached`.
+    ///
+    /// Used as the [`DiskCacheError::BudgetExceeded`] fallback —
+    /// e.g. a single segment larger than the whole cache budget.
+    /// The query still succeeds by issuing range GETs for only the
+    /// bytes the reader touches; nothing is admitted, so there's
+    /// nothing to evict.
+    pub async fn open_range_only(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        offsets: Option<&SubsectionOffsets>,
+    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        let storage_uri = Self::storage_path(uri);
+        let range_src: Arc<dyn crate::superfile::LazyByteSource> = match offsets {
+            Some(o) if o.total_size > 0 => {
+                Arc::new(crate::supertable::StorageRangeSource::with_known_size(
+                    Arc::clone(&self.storage),
+                    storage_uri,
+                    o.total_size,
+                ))
+            }
+            _ => Arc::new(crate::supertable::StorageRangeSource::with_unknown_size(
+                Arc::clone(&self.storage),
+                storage_uri,
+            )),
+        };
+        let reader = SuperfileReader::open_lazy_with(
+            range_src,
+            OpenOptions {
+                verify_crc: self.config.verify_crc_on_open,
+            },
+        )
+        .await
+        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        Ok(Arc::new(reader))
+    }
+
     /// Strictly-cached cold-fetch path — waits for all pwrites
     /// + fsync + mmap before returning. Public for integration
     /// tests that want this deterministic behavior; the
@@ -1033,13 +1073,10 @@ impl DiskCacheStore {
         let fts_fut =
             async move { fetch_hint_ranges(storage_for_fts, storage_uri_c, fts_ranges).await };
 
-        let (parquet_bytes, vec_pre, fts_pre) = futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
-
         // Build the lazy source: a `StorageRangeSource` with the
         // size baked in (no HEAD, no suffix-range discovery)
         // wrapped in a `PrefetchedSource` overlay carrying the
-        // three pre-fetched byte ranges at their absolute
-        // offsets.
+        // open-time byte ranges at their absolute offsets.
         let inner: Arc<dyn crate::superfile::LazyByteSource> =
             Arc::new(crate::supertable::StorageRangeSource::with_known_size(
                 Arc::clone(&self.storage),
@@ -1047,14 +1084,31 @@ impl DiskCacheStore {
                 total_size,
             ));
         let mut overlay = PrefetchedSource::new(inner);
-        if !parquet_bytes.is_empty() {
-            overlay.install(parquet_tail_start, parquet_bytes);
-        }
-        for (off, bytes) in vec_pre {
-            overlay.install(off, bytes);
-        }
-        for (off, bytes) in fts_pre {
-            overlay.install(off, bytes);
+
+        if !offsets.open_blob.is_empty() {
+            // Plan 013 M7 — the open-batch bytes (parquet tail +
+            // vector + FTS open ranges) already rode in with the
+            // manifest part GET that `cold_open` performed. Install
+            // them straight into the overlay: ZERO open-time GETs
+            // against the segment object. The futures above are
+            // never awaited.
+            for (off, bytes) in &offsets.open_blob {
+                overlay.install(*off, Bytes::copy_from_slice(bytes));
+            }
+        } else {
+            // Pre-M7 fallback: fetch the open batch over the wire
+            // (parquet tail + vec + fts ranges in parallel, 1 RTT).
+            let (parquet_bytes, vec_pre, fts_pre) =
+                futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
+            if !parquet_bytes.is_empty() {
+                overlay.install(parquet_tail_start, parquet_bytes);
+            }
+            for (off, bytes) in vec_pre {
+                overlay.install(off, bytes);
+            }
+            for (off, bytes) in fts_pre {
+                overlay.install(off, bytes);
+            }
         }
         let source: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(overlay);
 
@@ -1086,21 +1140,28 @@ impl DiskCacheStore {
         // Background promotion waits until foreground lazy readers
         // release before starting full-segment fetch, so cache fill
         // does not compete with query-critical range GETs.
-        let store = Arc::downgrade(self);
-        let reader = Arc::downgrade(&lazy_reader);
-        let uri_owned = *uri;
-        let storage_uri_owned = storage_uri;
-        tokio::spawn(async move {
-            let _ = lazy_background_fill(
-                store,
-                reader,
-                uri_owned,
-                storage_uri_owned,
-                total_size,
-                reserved_bytes,
-            )
-            .await;
-        });
+        //
+        // Diagnostic gate (`INFINO_DISABLE_BG_FILL=1`): skip the
+        // full-segment background fill entirely. This isolates the
+        // foreground cold fan-out cost from the competing
+        // full-segment downloads that the fill issues per segment.
+        if !skip_background_fill() {
+            let store = Arc::downgrade(self);
+            let reader = Arc::downgrade(&lazy_reader);
+            let uri_owned = *uri;
+            let storage_uri_owned = storage_uri;
+            tokio::spawn(async move {
+                let _ = lazy_background_fill(
+                    store,
+                    reader,
+                    uri_owned,
+                    storage_uri_owned,
+                    total_size,
+                    reserved_bytes,
+                )
+                .await;
+            });
+        }
 
         Ok(entry)
     }
@@ -1173,21 +1234,27 @@ impl DiskCacheStore {
         //    foreground lazy readers release before starting
         //    full-segment fetch, so cache fill does not compete
         //    with query-critical range GETs.
-        let store = Arc::downgrade(self);
-        let reader = Arc::downgrade(&lazy_reader);
-        let uri_owned = *uri;
-        let storage_uri_owned = storage_uri;
-        tokio::spawn(async move {
-            let _ = lazy_background_fill(
-                store,
-                reader,
-                uri_owned,
-                storage_uri_owned,
-                size,
-                reserved_bytes,
-            )
-            .await;
-        });
+        //
+        //    Diagnostic gate (`INFINO_DISABLE_BG_FILL=1`): skip it
+        //    to isolate the foreground cold fan-out from competing
+        //    full-segment downloads.
+        if !skip_background_fill() {
+            let store = Arc::downgrade(self);
+            let reader = Arc::downgrade(&lazy_reader);
+            let uri_owned = *uri;
+            let storage_uri_owned = storage_uri;
+            tokio::spawn(async move {
+                let _ = lazy_background_fill(
+                    store,
+                    reader,
+                    uri_owned,
+                    storage_uri_owned,
+                    size,
+                    reserved_bytes,
+                )
+                .await;
+            });
+        }
 
         Ok(entry)
     }
@@ -1678,6 +1745,22 @@ fn rollback_lazy_background_fill(
 /// cache entry with a mmap-backed reader. Subsequent
 /// `reader(uri)` calls hit the promoted entry — every query
 /// resolves from mmap (zero S3 GETs).
+/// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
+/// full-segment promotion. When `INFINO_DISABLE_BG_FILL=1` (or
+/// `true`), the cold-fetch path installs the M7 open-blob overlay
+/// and serves the foreground query over range GETs, but never
+/// spawns the full-segment background download. Lets us measure
+/// the cold fan-out cost in isolation from the competing
+/// full-segment fills.
+pub(crate) fn skip_background_fill() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("INFINO_DISABLE_BG_FILL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 async fn lazy_background_fill(
     store: Weak<DiskCacheStore>,
     reader: Weak<SuperfileReader>,

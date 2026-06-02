@@ -263,11 +263,6 @@ path = "benches/fts/main.rs"
 harness = false
 
 [[bench]]
-name = "fts-superfile"
-path = "benches/fts/main_superfile.rs"
-harness = false
-
-[[bench]]
 name = "superfile_vector"
 path = "benches/vector/main.rs"
 harness = false

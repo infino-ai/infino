@@ -1,7 +1,7 @@
 //! Shared hot / warm / cold storage tier helpers for canonical benches.
 //!
-//! - **Hot**: in-memory bytes or `Supertable::create` (no object store).
-//! - **Warm**: `DiskCacheStore` over a `StorageProvider`, pre-promoted mmap.
+//! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
+//! - **Warm**: same, with explicit mmap promotion before timing.
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
 //! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
@@ -234,25 +234,97 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     }
 }
 
-/// Fresh disk cache for supertable consumers (8 GiB budget).
+fn env_gib(name: &str, default_gib: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default_gib)
+}
+
+fn supertable_search_cache_gib() -> Option<u64> {
+    std::env::var("INFINO_SUPERTABLE_SEARCH_CACHE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+}
+
+/// Fresh disk cache for ingest producers (8 GiB budget).
+///
+/// Ingest attaches this cache only to keep segment bytes out of the
+/// unbounded in-memory tier; commit-time cache prepopulation is disabled,
+/// so this budget is not meant to hold the searchable working set.
 pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
-    fresh_disk_cache_with_budget(storage, 8 * (1u64 << 30))
+    fresh_disk_cache_with_mode(
+        storage,
+        env_gib("INFINO_SUPERTABLE_INGEST_CACHE_GIB", 8) * (1u64 << 30),
+        ColdFetchMode::LazyForegroundWithBackgroundFill,
+    )
+}
+
+/// Fresh disk cache for supertable search consumers.
+///
+/// Budget selection (first match wins):
+/// 1. `INFINO_SUPERTABLE_SEARCH_CACHE_GIB` env var (explicit override).
+/// 2. `index_size_bytes + 10%` when the caller knows the total index
+///    size from the manifest — ensures the hot bench is truly hot.
+/// 3. `INFINO_SUPERTABLE_INGEST_CACHE_GIB` or 8 GiB fallback.
+pub fn fresh_supertable_search_cache(
+    storage: Arc<dyn StorageProvider>,
+    index_size_bytes: Option<u64>,
+) -> (TempDir, Arc<DiskCacheStore>) {
+    use std::sync::Once;
+    static LOG_ONCE: Once = Once::new();
+
+    let budget_bytes = if let Some(explicit_gib) = supertable_search_cache_gib() {
+        let b = explicit_gib * (1u64 << 30);
+        LOG_ONCE.call_once(|| {
+            eprintln!("[tiers] search cache budget = {explicit_gib} GiB (INFINO_SUPERTABLE_SEARCH_CACHE_GIB)");
+        });
+        b
+    } else if let Some(idx) = index_size_bytes.filter(|&s| s > 0) {
+        let b = idx + idx / 10;
+        LOG_ONCE.call_once(|| {
+            eprintln!(
+                "[tiers] search cache budget = {:.2} GiB (auto-sized from {:.2} GiB index + 10% headroom)",
+                b as f64 / (1u64 << 30) as f64,
+                idx as f64 / (1u64 << 30) as f64,
+            );
+        });
+        b
+    } else {
+        let gib = env_gib("INFINO_SUPERTABLE_INGEST_CACHE_GIB", 8);
+        LOG_ONCE.call_once(|| {
+            eprintln!("[tiers] search cache budget = {gib} GiB (default)");
+        });
+        gib * (1u64 << 30)
+    };
+    fresh_disk_cache_with_mode(
+        storage,
+        budget_bytes,
+        ColdFetchMode::LazyForegroundWithBackgroundFill,
+    )
 }
 
 /// Fresh disk cache for single-superfile tier benches (4 GiB budget).
 pub fn fresh_superfile_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
-    fresh_disk_cache_with_budget(storage, 4 * (1u64 << 30))
+    fresh_disk_cache_with_mode(
+        storage,
+        4 * (1u64 << 30),
+        ColdFetchMode::LazyForegroundWithBackgroundFill,
+    )
 }
 
-fn fresh_disk_cache_with_budget(
+fn fresh_disk_cache_with_mode(
     storage: Arc<dyn StorageProvider>,
     disk_budget_bytes: u64,
+    cold_fetch_mode: ColdFetchMode,
 ) -> (TempDir, Arc<DiskCacheStore>) {
     let dir = TempDir::new().expect("disk cache tempdir");
     let cfg = DiskCacheConfig {
         cache_root: dir.path().to_path_buf(),
         disk_budget_bytes,
-        cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+        cold_fetch_mode,
         cold_fetch_streams: 8,
         cold_fetch_chunk_bytes: 8 * (1u64 << 20),
         mmap_cold_threshold_secs: 0,

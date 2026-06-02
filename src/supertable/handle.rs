@@ -451,6 +451,14 @@ impl Supertable {
         let Some(cache) = self.inner.options.disk_cache.as_ref() else {
             return Ok(());
         };
+        // Diagnostic A/B: with `INFINO_DISABLE_BG_FILL=1` no segment
+        // is ever promoted to an mmap-backed entry, so there is
+        // nothing to wait for. Short-circuit instead of blocking
+        // until the timeout — lets the cold-tier A/B run without the
+        // warm/calibration warm-up steps hanging.
+        if crate::supertable::reader_cache::disk::skip_background_fill() {
+            return Ok(());
+        }
         let manifest = self.inner.manifest.load_full();
         for entry in manifest.superfiles.iter() {
             cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
@@ -510,44 +518,40 @@ impl Supertable {
     }
 }
 
-/// M14b.1 — install a manifest-aware pinned-URI callback on
-/// the attached `DiskCacheStore`. Called from
-/// [`Supertable::create`] and [`Supertable::open`] right
-/// after the `Arc<SupertableInner>` is built; before the
-/// supertable is exposed to any concurrent user.
+/// Install the eviction-pinning policy on the attached
+/// `DiskCacheStore`. Called from [`Supertable::create`] and
+/// [`Supertable::open`] right after the `Arc<SupertableInner>`
+/// is built; before the supertable is exposed to any
+/// concurrent user.
 ///
-/// The closure captures a `Weak<SupertableInner>` (not a
-/// strong `Arc`) — without that, the cache holds the
-/// supertable alive and the supertable holds the cache
-/// alive, leaking both at drop. The `Weak::upgrade` is
-/// cheap and bounded: on each eviction sweep, returns the
-/// current `Manifest`'s segment URI set; if the supertable
-/// has already dropped (cache outlived it), returns the
-/// empty set — eviction proceeds without pinning, which is
-/// the safe fallback.
+/// Policy: **pin nothing.** The cache is a bounded LRU and must
+/// be free to evict any segment to stay under its budget — an
+/// index larger than the cache budget has to be able to
+/// stream/evict through it. (Previously this pinned the entire
+/// live manifest, which made the index *required* to fit inside
+/// the budget: once the cache filled, every entry was pinned,
+/// eviction found "no eligible victims", and the next admit
+/// hard-failed with `BudgetExceeded`.)
+///
+/// Pinning the live index was never needed for in-flight
+/// correctness: a query holds an `Arc<SuperfileReader>` over an
+/// mmap, and the cache can evict + unlink the backing file while
+/// that mapping stays valid (POSIX keeps the inode alive until
+/// the last reference drops). So eviction during a read is
+/// already safe without pinning.
+///
+/// Left as a function (rather than inlined) so a future
+/// genuinely-in-flight pin set (URIs a query is actively
+/// holding) can be wired here if a workload ever needs it —
+/// but that is a *bounded* set, never the whole manifest.
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
     let cache = match inner.options.disk_cache.as_ref() {
         Some(c) => c,
         None => return,
     };
-    let weak = Arc::downgrade(inner);
     let pinned_fn: Arc<
         dyn Fn() -> std::collections::HashSet<crate::supertable::SuperfileUri> + Send + Sync,
-    > = Arc::new(move || {
-        let strong = match weak.upgrade() {
-            Some(s) => s,
-            // Supertable already dropped; nothing to pin.
-            None => return std::collections::HashSet::new(),
-        };
-        strong
-            .manifest
-            .load()
-            .superfile_list
-            .superfiles
-            .iter()
-            .map(|e| e.uri)
-            .collect()
-    });
+    > = Arc::new(std::collections::HashSet::new);
     cache.set_pinned_fn(pinned_fn);
 }
 

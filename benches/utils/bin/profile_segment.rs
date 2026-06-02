@@ -66,10 +66,9 @@ fn main() {
         .map(|q| corpus::brute_force_topk_cosine(&vectors, n_docs, q, TOP_K))
         .collect();
 
-    let opts = |nprobe: usize, rerank_mult: usize| {
+    let opts = |nprobe: usize, _rerank_mult: usize| {
         VectorSearchOptions::new()
             .with_nprobe(nprobe)
-            .with_rerank_mult(rerank_mult)
     };
 
     // Warm the reader (touch pages, settle the allocator) before timing.

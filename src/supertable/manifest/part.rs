@@ -473,7 +473,7 @@ fn encode_subsection_offsets(off: &SubsectionOffsets) -> Vec<u8> {
             + 4
             + off.fts_open_ranges.len() * 16,
     );
-    out.push(2u8); // version
+    out.push(3u8); // version (3 adds open_blob; 2 had none)
     out.extend_from_slice(&off.total_size.to_le_bytes());
     match off.vec {
         Some((o, l)) => {
@@ -493,7 +493,20 @@ fn encode_subsection_offsets(off: &SubsectionOffsets) -> Vec<u8> {
     }
     encode_range_list(&mut out, &off.vec_open_ranges);
     encode_range_list(&mut out, &off.fts_open_ranges);
+    encode_open_blob(&mut out, &off.open_blob);
     out
+}
+
+/// Encode the inline open-batch blob: a u32 count, then each
+/// entry as `(u64 absolute_offset, u32 byte_len, bytes)`. Stays
+/// in lock-step with [`decode_open_blob`].
+fn encode_open_blob(out: &mut Vec<u8>, blob: &[(u64, Vec<u8>)]) {
+    out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+    for (off, bytes) in blob {
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
 }
 
 fn encode_range_list(out: &mut Vec<u8>, ranges: &[(u64, u64)]) {
@@ -526,7 +539,7 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
         Ok(u64::from_le_bytes(arr))
     };
     let ver = take(&mut cur, 1)?[0];
-    if ver != 2 {
+    if ver != 2 && ver != 3 {
         return Err(PartParseError::SchemaMismatch(format!(
             "subsection_offsets unknown version {ver}"
         )));
@@ -550,6 +563,13 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
     };
     let vec_open_ranges = decode_range_list(&mut cur, &read_u64, &take)?;
     let fts_open_ranges = decode_range_list(&mut cur, &read_u64, &take)?;
+    // Version 3 appends the inline open-batch blob; version 2 has
+    // none (and leaves `cur` empty here).
+    let open_blob = if ver >= 3 {
+        decode_open_blob(&mut cur, &read_u64, &take)?
+    } else {
+        Vec::new()
+    };
     if !cur.is_empty() {
         return Err(PartParseError::SchemaMismatch(
             "subsection_offsets has trailing bytes".into(),
@@ -561,7 +581,36 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
         fts,
         vec_open_ranges,
         fts_open_ranges,
+        open_blob,
     })
+}
+
+fn decode_open_blob(
+    cur: &mut &[u8],
+    read_u64: &impl Fn(&mut &[u8]) -> Result<u64, PartParseError>,
+    take: &impl Fn(&mut &[u8], usize) -> Result<Vec<u8>, PartParseError>,
+) -> Result<Vec<(u64, Vec<u8>)>, PartParseError> {
+    let count_bytes = take(cur, 4)?;
+    let count = u32::from_le_bytes(
+        count_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| PartParseError::SchemaMismatch("open_blob count read".into()))?,
+    ) as usize;
+    let mut blob = Vec::with_capacity(count);
+    for _ in 0..count {
+        let off = read_u64(cur)?;
+        let len_bytes = take(cur, 4)?;
+        let len = u32::from_le_bytes(
+            len_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| PartParseError::SchemaMismatch("open_blob len read".into()))?,
+        ) as usize;
+        let bytes = take(cur, len)?;
+        blob.push((off, bytes));
+    }
+    Ok(blob)
 }
 
 fn decode_range_list(
@@ -730,6 +779,10 @@ mod tests {
                 fts: Some((11_111, 22_222)),
                 vec_open_ranges: vec![(123_456, 96), (200_000, 4096)],
                 fts_open_ranges: vec![(11_111, 1024), (30_000, 2048)],
+                open_blob: vec![
+                    (12_345_614, vec![0xAB; 64]),
+                    (123_456, vec![0xCD; 96]),
+                ],
             }),
         })
     }

@@ -213,6 +213,16 @@ pub struct SupertableOptions {
     /// idle-threshold madvise sweep on its existing schedule
     /// but does NOT proactively bound the RSS.
     pub memory_budget_bytes: Option<u64>,
+    /// When `true` (default), each commit pre-populates the
+    /// attached `disk_cache` with the segment bytes it just
+    /// wrote (so the producer's own next query skips the
+    /// cold-fetch round-trip). Set `false` for a write-only
+    /// producer that drops the cache right after ingest: the
+    /// pre-population is then pure wasted work (and, when the
+    /// segment set exceeds the cache budget, floods the log
+    /// with "budget exceeded" warnings). No effect without
+    /// `disk_cache` attached.
+    pub prepopulate_cache_on_commit: bool,
     /// Partition strategy. Stamped into the manifest list
     /// on the first commit; immutable thereafter (changes
     /// require external compaction).
@@ -449,6 +459,7 @@ impl SupertableOptions {
             storage: None,
             disk_cache: None,
             memory_budget_bytes: None,
+            prepopulate_cache_on_commit: true,
             partition_strategy: None,
             target_superfiles_per_partition: 10_000,
             part_size_threshold_bytes: 10 * (1 << 20),
@@ -604,6 +615,15 @@ impl SupertableOptions {
     /// budget only steers the cache's sweep behavior.
     pub fn with_memory_budget(mut self, budget_bytes: u64) -> Self {
         self.memory_budget_bytes = Some(budget_bytes);
+        self
+    }
+
+    /// Enable/disable post-commit disk-cache pre-population. See
+    /// [`Self::prepopulate_cache_on_commit`]. Pass `false` for a
+    /// write-only producer (ingest then drop) to skip the wasted
+    /// warm-fill and its "budget exceeded" log spam.
+    pub fn with_cache_prepopulation(mut self, enabled: bool) -> Self {
+        self.prepopulate_cache_on_commit = enabled;
         self
     }
 

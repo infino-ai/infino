@@ -26,11 +26,15 @@ cargo bench --bench supertable_all                 # 10M supertable FTS + vector
 cargo bench --bench superfile_fts -- superfile_fts_build       # superfile FTS ingest
 cargo bench --bench superfile_vector -- superfile_vec_build    # superfile vector ingest
 cargo bench --bench supertable_all -- supertable_all_build     # shared FTS + vector supertable ingest
-cargo bench --bench supertable_all -- supertable_fts_search    # supertable FTS search
-cargo bench --bench supertable_all -- supertable_vec_search    # supertable vector search
+cargo bench --bench supertable_all -- supertable_fts_search    # supertable FTS search (needs ingest in same process)
+cargo bench --bench supertable_all -- supertable_vec_search    # supertable vector search (needs ingest in same process)
+
+# Search-only filter: include ingest in the same invocation (one process, shared fixture)
+cargo bench --bench supertable_all -- supertable_all_build supertable_fts_search
 
 # Knobs
 INFINO_SUPERTABLE__WRITER_THREADS=32 cargo bench --bench supertable_all -- supertable_all_build
+INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1 cargo bench --bench supertable_all -- supertable_fts_search  # legacy: search triggers ingest
 INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
 
 # Diagnostics (not run by plain `cargo bench`)
@@ -38,10 +42,25 @@ cargo bench --features bench-diagnostics --bench object-store
 cargo bench --features bench-diagnostics --bench scale -- vector_recall
 ```
 
-Every invocation runs the correctness phase unconditionally
-(criterion filters skip timing, not setup), so a filter to a search
-group still validates the BMW oracle (FTS) and the recall-floor gate
-(vector) before timing starts.
+**Supertable search-only filters** (`supertable_fts_search`, `supertable_vec_search`)
+require ingest in the **same** `cargo bench` process. Run
+`supertable_all_build` first in that invocation, or use unfiltered
+`cargo bench --bench supertable_all`. Set `INFINO_SUPERTABLE_ALLOW_SEARCH_INGEST=1`
+to let a search-only run trigger ingest (old behaviour).
+
+Superfile benches (1M) build their own fixture per binary; supertable
+search groups run correctness (FTS oracle / vector recall floor) before timing
+when ingest is already available.
+
+## Code layout (`infino-bench-utils`)
+
+```text
+corpus/     synthetic rows + recall grading (streamed, small cache file)
+ingest/     supertable append + commit → object storage
+fixture/    one 10M ingest + search consumer per process
+bench/      criterion groups (supertable ingest / FTS / vector search)
+fts_superfile.rs, vector_superfile.rs   1M superfile bodies
+```
 
 ## Result anchors
 

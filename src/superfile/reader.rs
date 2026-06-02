@@ -608,7 +608,7 @@ impl SuperfileReader {
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         Ok(
-            v.search(column, query, k, options.nprobe, options.rerank_mult)
+            v.search(column, query, k, options.nprobe, options.rerank_mult())
                 .await?,
         )
     }
@@ -623,33 +623,29 @@ impl SuperfileReader {
 ///   slower. Default `8`, internally clamped to `[1, n_cent]`. For a
 ///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
 ///   index per query.
-/// - `rerank_mult`: number of `k * rerank_mult` candidates passed
-///   from the 1-bit RaBitQ shortlist into the full-precision rerank.
-///   Higher = better recall, slower. Default `20`. With smaller
-///   values (e.g. `5`) recall@10 drops to ~50% on a 10k×384 corpus
-///   because the 1-bit estimate noise drops true neighbors out of
-///   the shortlist before rerank can recover them — see
-///   `tests/recall.rs` for the measurements behind the default.
 ///
-/// The defaults are deliberately conservative; the bench harness
-/// has the measured 1M / 10M recall-vs-latency curves and may
-/// motivate a smaller default later.
+/// Rerank multiplier is fixed internally at `4` (i.e. `4*k`
+/// candidates from the 1-bit shortlist enter the Sq8/residual
+/// rerank). Bench data on 10M×384 cosine shows recall is
+/// identical at r=4..1024 for every nprobe — the 1-bit pass
+/// is accurate enough that 4× oversampling saturates recall.
 #[derive(Debug, Clone, Copy)]
 pub struct VectorSearchOptions {
     pub nprobe: usize,
-    pub rerank_mult: usize,
 }
 
 impl VectorSearchOptions {
-    /// Builder default: `nprobe = 8`, `rerank_mult = 20`.
     pub const DEFAULT_NPROBE: usize = 8;
-    pub const DEFAULT_RERANK_MULT: usize = 20;
 
-    /// Construct with both defaults applied.
+    /// Internal rerank multiplier. `k * RERANK_MULT` candidates
+    /// from the 1-bit RaBitQ shortlist enter Sq8/residual rerank.
+    /// Bench-validated: recall saturates at 4 on 10M×384 cosine.
+    pub const RERANK_MULT: usize = 4;
+
+    /// Construct with defaults applied.
     pub fn new() -> Self {
         Self {
             nprobe: Self::DEFAULT_NPROBE,
-            rerank_mult: Self::DEFAULT_RERANK_MULT,
         }
     }
 
@@ -659,10 +655,8 @@ impl VectorSearchOptions {
         self
     }
 
-    /// Override the rerank candidate multiplier.
-    pub fn with_rerank_mult(mut self, n: usize) -> Self {
-        self.rerank_mult = n;
-        self
+    pub fn rerank_mult(&self) -> usize {
+        Self::RERANK_MULT
     }
 }
 
@@ -875,19 +869,16 @@ mod tests {
     fn vector_search_options_default_values() {
         let opts = VectorSearchOptions::default();
         assert_eq!(opts.nprobe, 8);
-        assert_eq!(opts.rerank_mult, 20);
+        assert_eq!(opts.rerank_mult(), 4);
         let opts2 = VectorSearchOptions::new();
         assert_eq!(opts.nprobe, opts2.nprobe);
-        assert_eq!(opts.rerank_mult, opts2.rerank_mult);
     }
 
     #[test]
     fn vector_search_options_builder_chains() {
-        let opts = VectorSearchOptions::new()
-            .with_nprobe(2)
-            .with_rerank_mult(50);
+        let opts = VectorSearchOptions::new().with_nprobe(2);
         assert_eq!(opts.nprobe, 2);
-        assert_eq!(opts.rerank_mult, 50);
+        assert_eq!(opts.rerank_mult(), VectorSearchOptions::RERANK_MULT);
     }
 
     #[tokio::test]
@@ -922,8 +913,7 @@ mod tests {
                 &q,
                 1,
                 VectorSearchOptions::new()
-                    .with_nprobe(4)
-                    .with_rerank_mult(5),
+                    .with_nprobe(4),
             )
             .await
             .expect("vector search");

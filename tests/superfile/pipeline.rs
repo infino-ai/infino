@@ -159,8 +159,7 @@ async fn end_to_end_vector_search_recovers_self() {
             &q,
             1,
             VectorSearchOptions::new()
-                .with_nprobe(4)
-                .with_rerank_mult(5),
+                .with_nprobe(4),
         )
         .await
         .expect("vector search");

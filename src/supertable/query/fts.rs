@@ -157,22 +157,24 @@ impl SupertableReader {
         }
         let work_units = build_or_work_units(&kept, mode, term_refs.len(), pool_threads);
 
-        // Async fan-out: one future per work unit, all polled
-        // concurrently on the owning tokio runtime so cold opens +
-        // posting fetches overlap and run on the runtime's reactor.
-        let per_unit: Vec<Vec<SuperfileHit>> =
-            futures::future::try_join_all(work_units.iter().map(|unit| {
-                let store = &store;
-                let disk_cache = disk_cache.as_ref();
-                let column_owned = &column_owned;
-                let term_refs = &term_refs;
-                async move {
-                    let r = open_reader(store, disk_cache, &unit.entry).await?;
+        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let column_arc = Arc::new(column_owned);
+
+        let handles: Vec<_> = work_units
+            .into_iter()
+            .map(|unit| {
+                let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
+                let column_arc = Arc::clone(&column_arc);
+                let term_arc = Arc::clone(&term_arc);
+                tokio::spawn(async move {
+                    let r = open_reader(&store, disk_cache.as_ref(), &unit.entry).await?;
+                    let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                     let hits = match unit.range {
                         Some((start, end)) => r
                             .bm25_search_or_range_pretokenized(
-                                column_owned,
-                                term_refs,
+                                &column_arc,
+                                &term_refs,
                                 k,
                                 start,
                                 end,
@@ -180,12 +182,18 @@ impl SupertableReader {
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                         None => r
-                            .bm25_search_pretokenized(column_owned, term_refs, k, mode)
+                            .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     };
                     Ok::<_, QueryError>(tag_hits(&unit.entry, hits))
-                }
+                })
+            })
+            .collect();
+
+        let per_unit: Vec<Vec<SuperfileHit>> =
+            futures::future::try_join_all(handles.into_iter().map(|h| async move {
+                h.await.map_err(|e| QueryError::Store(e.to_string()))?
             }))
             .await?;
 
@@ -275,26 +283,36 @@ impl SupertableReader {
         // care about.
         let work_units = build_or_work_units(&kept, BoolMode::Or, 2, pool_threads);
 
-        let per_unit: Vec<Vec<SuperfileHit>> =
-            futures::future::try_join_all(work_units.iter().map(|unit| {
-                let store = &store;
-                let disk_cache = disk_cache.as_ref();
-                let column_owned = &column_owned;
-                let prefix_owned = &prefix_owned;
-                async move {
-                    let r = open_reader(store, disk_cache, &unit.entry).await?;
+        let column_arc = Arc::new(column_owned);
+        let prefix_arc = Arc::new(prefix_owned);
+
+        let handles: Vec<_> = work_units
+            .into_iter()
+            .map(|unit| {
+                let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
+                let column_arc = Arc::clone(&column_arc);
+                let prefix_arc = Arc::clone(&prefix_arc);
+                tokio::spawn(async move {
+                    let r = open_reader(&store, disk_cache.as_ref(), &unit.entry).await?;
                     let hits = match unit.range {
                         Some((start, end)) => r
-                            .bm25_search_prefix_range(column_owned, prefix_owned, k, start, end)
+                            .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                         None => r
-                            .bm25_search_prefix(column_owned, prefix_owned, k)
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     };
                     Ok::<_, QueryError>(tag_hits(&unit.entry, hits))
-                }
+                })
+            })
+            .collect();
+
+        let per_unit: Vec<Vec<SuperfileHit>> =
+            futures::future::try_join_all(handles.into_iter().map(|h| async move {
+                h.await.map_err(|e| QueryError::Store(e.to_string()))?
             }))
             .await?;
 
@@ -413,23 +431,39 @@ fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> 
         .collect()
 }
 
-/// Concatenate per-segment hits and return the top-k by descending
-/// score. Total-order on `f32` is broken by `score.partial_cmp`
-/// returning `None` for NaN — bm25 score arithmetic is built from
-/// real-valued idf + tf and never emits NaN, so we treat NaN as
-/// "least relevant" (sorted to the bottom) defensively.
+/// Merge per-segment hits and return the top-k by *descending*
+/// score (highest BM25 = most relevant). Uses a min-heap of size k
+/// so we never sort more than k elements.
 fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    let mut all: Vec<SuperfileHit> = per_segment.into_iter().flatten().collect();
-    // pdqsort: same rationale as `top_k_ascending` in the vector
-    // path — cross-segment top-k merge, partial_cmp tie-break
-    // composes with (segment, local_doc_id) for total order.
-    all.sort_unstable_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    all.truncate(k);
-    all
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    #[derive(PartialEq)]
+    struct MinByScore(SuperfileHit);
+    impl Eq for MinByScore {}
+    impl PartialOrd for MinByScore {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    }
+    impl Ord for MinByScore {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other.0.score.partial_cmp(&self.0.score).unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut heap = BinaryHeap::with_capacity(k + 1);
+    for hit in per_segment.into_iter().flatten() {
+        if heap.len() < k {
+            heap.push(MinByScore(hit));
+        } else if let Some(worst) = heap.peek() {
+            if hit.score > worst.0.score {
+                heap.pop();
+                heap.push(MinByScore(hit));
+            }
+        }
+    }
+    let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
+    result.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    result
 }
 
 /// Helper used by [`Manifest`] consumers in tests and downstream

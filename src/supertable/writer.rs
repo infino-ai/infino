@@ -492,17 +492,73 @@ fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
         (Some(o), Some(l)) if l > 0 => Some((o, l)),
         _ => None,
     };
+    let total_size = bytes.len() as u64;
+    let vec_open_ranges = vec
+        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+        .unwrap_or_default();
+    let fts_open_ranges = fts
+        .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
+        .unwrap_or_default();
+
+    // Plan 013 M7 — capture the open-time batch bytes (parquet
+    // footer tail + vector open ranges + FTS open ranges) so the
+    // reader can resolve a segment's open metadata straight from
+    // the manifest part, issuing zero per-segment open GETs.
+    let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &fts_open_ranges);
+
     Some(SubsectionOffsets {
-        total_size: bytes.len() as u64,
+        total_size,
         vec,
         fts,
-        vec_open_ranges: vec
-            .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
-            .unwrap_or_default(),
-        fts_open_ranges: fts
-            .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
-            .unwrap_or_default(),
+        vec_open_ranges,
+        fts_open_ranges,
+        open_blob,
     })
+}
+
+/// Slice the bytes for the segment's open-time batch out of the
+/// freshly-written superfile so the manifest can carry them
+/// inline. Mirrors the cold-fetch open batch in
+/// `DiskCacheStore::cold_fetch_lazy_with_hints`: the parquet
+/// footer tail (matching the 64 KiB speculation length) plus each
+/// vector / FTS open range. Returns `(absolute_offset, bytes)`
+/// tuples; an empty `Vec` disables the inline-open fast path for
+/// this segment.
+fn build_open_blob(
+    bytes: &Bytes,
+    total_size: u64,
+    vec_open_ranges: &[(u64, u64)],
+    fts_open_ranges: &[(u64, u64)],
+) -> Vec<(u64, Vec<u8>)> {
+    // Must match `cold_fetch_lazy_with_hints`'s parquet tail
+    // speculation length so the overlay covers `source.tail()`.
+    const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
+    let mut blob: Vec<(u64, Vec<u8>)> =
+        Vec::with_capacity(1 + vec_open_ranges.len() + fts_open_ranges.len());
+
+    let parquet_tail_len = PARQUET_TAIL_SPEC.min(total_size);
+    let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
+    let slice = |off: u64, len: u64| -> Option<Vec<u8>> {
+        let start = off as usize;
+        let end = start.checked_add(len as usize)?;
+        bytes.get(start..end).map(|s| s.to_vec())
+    };
+    if parquet_tail_len > 0 {
+        match slice(parquet_tail_start, parquet_tail_len) {
+            Some(b) => blob.push((parquet_tail_start, b)),
+            None => return Vec::new(),
+        }
+    }
+    for &(off, len) in vec_open_ranges.iter().chain(fts_open_ranges.iter()) {
+        match slice(off, len) {
+            Some(b) => blob.push((off, b)),
+            // A range we can't satisfy means the capture is
+            // inconsistent; disable the fast path rather than ship
+            // a partial overlay.
+            None => return Vec::new(),
+        }
+    }
+    blob
 }
 
 fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
@@ -640,8 +696,14 @@ fn prepare_segment(
 
     let bytes_for_storage = inner.options.storage.is_some().then(|| shard.bytes.clone());
     let cache_attached = inner.options.disk_cache.is_some() && inner.options.storage.is_some();
+    // `bytes_for_store` (in-memory tier) is gated only on cache attachment —
+    // a cache-attached producer keeps segment bytes out of the unbounded
+    // in-memory store regardless of whether we pre-populate the disk cache.
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
-    let bytes_for_cache = cache_attached.then(|| shard.bytes.clone());
+    // Pre-populating the disk cache is opt-out: a write-only producer that
+    // drops the cache right after ingest skips this wasted warm-fill.
+    let bytes_for_cache = (cache_attached && inner.options.prepopulate_cache_on_commit)
+        .then(|| shard.bytes.clone());
 
     // Open the reader directly on shard bytes (not via the
     // in-memory `SuperfileReaderCache`). This lets the cache-attached
@@ -801,13 +863,14 @@ fn publish_superfiles(
             warm_cache_after_commit(inner, &cache, pending_cache_inserts);
         }
 
-        // Best-effort memory-budget enforcement. Each commit
-        // pre-populates the cache (above); sustained writers
-        // grow the working set linearly, so a post-commit
-        // check + sweep keeps the working set under the
-        // configured budget. Pages re-fault from disk on next
-        // access if needed; the cache entries themselves are
-        // unaffected.
+        // Best-effort memory-budget enforcement. When commits
+        // pre-populate the cache (above), sustained writers grow
+        // the working set linearly, so a post-commit check +
+        // sweep keeps the working set under the configured
+        // budget. Pages re-fault from disk on next access if
+        // needed; the cache entries themselves are unaffected.
+        // Runs regardless of pre-population so an externally
+        // warmed cache is still bounded.
         if let (Some(cache), Some(budget)) = (
             inner.options.disk_cache.as_ref(),
             inner.options.memory_budget_bytes,

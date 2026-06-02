@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
 use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
+use crate::supertable::reader_cache::disk::DiskCacheError;
 use crate::supertable::reader_cache::DiskCacheStore;
 use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 
@@ -68,12 +69,22 @@ pub async fn superfile_reader(
         None => return Err(ReaderCacheError::NotFound { uri: *uri }),
     };
 
-    cache
-        .reader_with_hints(uri, offsets)
-        .await
-        .map_err(|e| ReaderCacheError::OpenFailed {
-            source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
-                "disk cache fetch: {e}"
-            ))),
-        })
+    match cache.reader_with_hints(uri, offsets).await {
+        Ok(reader) => Ok(reader),
+        // Cache can't admit this segment (e.g. it's larger than the
+        // whole budget). Stream it directly via range GETs instead
+        // of failing the query.
+        Err(DiskCacheError::BudgetExceeded) => {
+            cache.open_range_only(uri, offsets).await.map_err(cache_open_failed)
+        }
+        Err(e) => Err(cache_open_failed(e)),
+    }
+}
+
+fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
+    ReaderCacheError::OpenFailed {
+        source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
+            "disk cache fetch: {e}"
+        ))),
+    }
 }

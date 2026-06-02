@@ -427,16 +427,10 @@ mod tests {
     #[tokio::test]
     async fn missing_object_returns_not_found() {
         let (_dir, p) = provider();
-        let err = p
-            .head("data/no-such.parquet")
-            .await
-            .expect_err("head missing");
+        let err = p.head("data/no-such.parquet").await.expect_err("head missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
-        let err = p
-            .get("data/no-such.parquet")
-            .await
-            .expect_err("get missing");
+        let err = p.get("data/no-such.parquet").await.expect_err("get missing");
         assert!(matches!(err, StorageError::NotFound { .. }));
 
         let err = p

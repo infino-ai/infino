@@ -63,6 +63,7 @@ impl S3StorageProvider {
         let store = AmazonS3Builder::from_env()
             .with_bucket_name(&bucket)
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            .with_client_options(tuned_client_options())
             .build()
             .map_err(|e| StorageError::Permanent {
                 uri: format!("s3://{bucket}"),
@@ -122,6 +123,15 @@ impl S3StorageProvider {
             // doesn't terminate `<bucket>.<endpoint>` DNS).
             .with_virtual_hosted_style_request(false)
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            // NB: do NOT apply `tuned_client_options()` here. The
+            // deep idle-connection pool / long keep-alive is tuned
+            // for real-S3 fan-out latency and destabilizes local
+            // S3-compatible endpoints (s3s-fs / MinIO): reqwest
+            // reuses connections the emulator has already closed,
+            // surfacing as "error sending request". Also,
+            // `with_client_options` would clobber the
+            // `with_allow_http(true)` above. The endpoint path keeps
+            // object_store's defaults.
             .build()
             .map_err(|e| StorageError::Permanent {
                 uri: format!("s3://{bucket} @ {endpoint}"),
@@ -193,6 +203,33 @@ impl S3StorageProvider {
 
 fn normalize_prefix(prefix: impl Into<String>) -> String {
     prefix.into().trim_matches('/').to_string()
+}
+
+/// Tuned HTTP client options for the object-store-native fan-out.
+///
+/// The supertable vector/FTS query path fans out one cold-open +
+/// cold-search batch per segment concurrently. With the default
+/// idle-connection pool, a wide fan-out (hundreds of segments ×
+/// several range GETs each) churns TCP/TLS connections — each new
+/// connection pays a TLS handshake RTT on top of the request RTT,
+/// inflating the p99 tail under load. Keeping a large warm idle
+/// pool lets the fan-out reuse connections so the per-GET cost is
+/// one RTT, not handshake + RTT.
+fn tuned_client_options() -> object_store::ClientOptions {
+    object_store::ClientOptions::new()
+        // Keep many connections warm per host so concurrent
+        // fan-out GETs reuse established TLS sessions instead of
+        // handshaking. AWS S3 in-region serves many parallel
+        // range GETs per host; a deep idle pool is the difference
+        // between "RTT" and "handshake + RTT" on the cold tail.
+        .with_pool_max_idle_per_host(1024)
+        // Hold idle connections long enough to span a full fan-out
+        // wave plus the next query, so back-to-back cold queries on
+        // a fresh worker don't re-handshake.
+        .with_pool_idle_timeout(std::time::Duration::from_secs(90))
+        // Bound the connect phase so a single slow SYN/TLS doesn't
+        // dominate the fan-out's p99; the retry layer covers drops.
+        .with_connect_timeout(std::time::Duration::from_secs(5))
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.

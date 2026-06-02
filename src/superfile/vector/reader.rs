@@ -139,6 +139,13 @@ impl ColumnReader {
     /// `cluster_idx` addresses both halves with no extra
     /// lookup: byte offset = `per_cluster_blocks_off +
     /// doc_off * (code_bytes + 4)`.
+    /// Full per-cluster block range `[codes][doc_ids][full]`. The
+    /// production search now fetches only the codes+doc_ids prefix
+    /// (`cluster_codes_doc_ids_range`) plus survivor `full[]` rows
+    /// (`cluster_rerank_row_range`), so this whole-block range is
+    /// retained for the layout-invariant test that pins the on-disk
+    /// shape.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn cluster_block_range(
         &self,
         cluster_doc_off: u32,
@@ -1128,14 +1135,12 @@ impl VectorReader {
         let _ = sub_start; // retained for downstream offset math below
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(nprobe_eff);
-        let mut cluster_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
         let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
         for &(c, _) in &centroid_scores {
             let (off, cnt) = read_cluster_entry(&cluster_idx, c);
             if cnt == 0 {
                 continue;
             }
-            cluster_ranges.push(col.cluster_block_range(off, cnt));
             cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
             cluster_meta.push((c, off, cnt));
         }
@@ -1144,7 +1149,22 @@ impl VectorReader {
             .iter()
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
-        let survivor_only_rerank_fetch = prefix_blocks_sync.is_some();
+        // Survivor-only rerank fetch on BOTH the warm and cold paths.
+        // Coarse-score off the cheap `[codes][doc_ids]` prefix, then
+        // pull the full rerank vectors ONLY for the survivors:
+        //   * warm — the prefix is already resident (the sync probe
+        //     above hits), and survivor rows are sliced from the
+        //     resident segment; zero GETs either wave.
+        //   * cold — fetch the prefixes over the wire in one coalesced
+        //     RTT batch, score, then fetch the survivor rows in a
+        //     second small batch. The dominant per-candidate `full[]`
+        //     bytes (~3.4 MiB/segment — the volume that saturates S3
+        //     read throughput on a 256-way cold fan-out) are never
+        //     moved for non-survivors.
+        // The scoring math is identical to the old full-block path —
+        // same codes, same coarse shortlist, same fp32/Sq8 rerank — so
+        // recall is unchanged; only *which* bytes are fetched differs.
+        let survivor_only_rerank_fetch = true;
         let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
         {
             let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
@@ -1159,9 +1179,12 @@ impl VectorReader {
             };
             (prefix_blocks, meta_bytes)
         } else {
+            // Cold: fetch only the codes+doc_ids prefixes (coalesced)
+            // plus the Sq8 meta in one batch. Full vectors are fetched
+            // later, for survivors only.
             get_cluster_ranges_coalesced_with_extra(
                 &self.source,
-                &cluster_ranges,
+                &cluster_prefix_ranges,
                 lazy_sq8_meta_range,
             )
             .await
@@ -1317,9 +1340,14 @@ impl VectorReader {
             });
         }
         let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
+            // Coalesce the survivor rows: on the cold path these are
+            // scattered single-vector ranges inside each cluster's
+            // `full[]` region, so merging adjacent ones (bounded gap /
+            // overfetch) keeps the second-wave GET count down. On the
+            // warm path the underlying fetch resolves sync/zero-copy,
+            // so the coalescing is just a cheap sort.
             Some(
-                self.source
-                    .get_ranges_parallel_async(&ranges)
+                get_cluster_ranges_coalesced(&self.source, &ranges)
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
             )

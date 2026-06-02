@@ -1965,16 +1965,55 @@ mod diag {
             (Some(o), Some(l)) if l > 0 => Some((o, l)),
             _ => None,
         };
+        let total_size = bytes.len() as u64;
+        let vec_open_ranges = vec
+            .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+            .unwrap_or_default();
+        let fts_open_ranges = fts
+            .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
+            .unwrap_or_default();
+
+        // Mirror the writer's M7 open-blob capture: parquet tail
+        // (64 KiB) + each vec/fts open range, sliced inline so the
+        // diagnostic exercises the zero-open-GET cold path.
+        const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
+        let mut open_blob: Vec<(u64, Vec<u8>)> = Vec::new();
+        let parquet_tail_len = PARQUET_TAIL_SPEC.min(total_size);
+        let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
+        let slice = |off: u64, len: u64| -> Option<Vec<u8>> {
+            let start = off as usize;
+            let end = start.checked_add(len as usize)?;
+            bytes.get(start..end).map(|s| s.to_vec())
+        };
+        let mut ok = true;
+        if parquet_tail_len > 0 {
+            match slice(parquet_tail_start, parquet_tail_len) {
+                Some(b) => open_blob.push((parquet_tail_start, b)),
+                None => ok = false,
+            }
+        }
+        if ok {
+            for &(off, len) in vec_open_ranges.iter().chain(fts_open_ranges.iter()) {
+                match slice(off, len) {
+                    Some(b) => open_blob.push((off, b)),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
+            open_blob.clear();
+        }
+
         SubsectionOffsets {
-            total_size: bytes.len() as u64,
+            total_size,
             vec,
             fts,
-            vec_open_ranges: vec
-                .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
-                .unwrap_or_default(),
-            fts_open_ranges: fts
-                .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
-                .unwrap_or_default(),
+            vec_open_ranges,
+            fts_open_ranges,
+            open_blob,
         }
     }
 

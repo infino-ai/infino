@@ -139,10 +139,9 @@ fn superfile_reader() -> SuperfileReader {
     SuperfileReader::open(Bytes::from(superfile_bytes().to_vec())).expect("open superfile")
 }
 
-fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
+fn search_opts(nprobe: usize, _rerank_mult: usize) -> VectorSearchOptions {
     VectorSearchOptions::new()
         .with_nprobe(nprobe)
-        .with_rerank_mult(rerank_mult)
 }
 
 // ─── Builder (production SuperfileBuilder) ───────────────────────────
