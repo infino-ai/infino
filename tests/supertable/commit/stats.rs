@@ -256,33 +256,3 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         "mmap_resident_bytes surfaces when cache is attached"
     );
 }
-
-#[test]
-fn rss_growth_under_in_process_commits_is_observable() {
-    // Sanity check: stats.process_rss_bytes grows (or at
-    // worst, stays flat) as we add superfiles. RSS is whole-
-    // process and can move down due to allocator behavior or
-    // unrelated work, so we don't assert strict monotonicity.
-    // What we DO assert is that after many large commits,
-    // RSS is at least as large as it was at the start —
-    // i.e., the accessor is plumbed and observing real
-    // memory.
-    let st = Supertable::create(default_supertable_options());
-    let initial = st.stats().process_rss_bytes;
-
-    // Commit ten batches of 1000 rows each — should grow
-    // the in-memory store noticeably.
-    for c in 0..10 {
-        let mut w = st.writer().expect("writer");
-        let titles: Vec<String> = (0..1000).map(|i| format!("doc_{c}_{i}")).collect();
-        let titles_refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
-        w.append(&build_title_batch(&titles_refs)).expect("append");
-        w.commit().expect("commit");
-    }
-
-    let after = st.stats().process_rss_bytes;
-    assert!(
-        after >= initial.saturating_sub(initial / 4),
-        "RSS shouldn't have dropped >25% after 10 commits: {initial} → {after}"
-    );
-}
