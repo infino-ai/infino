@@ -277,6 +277,25 @@ pub struct WalStateDoc {
     /// dedicated superfile the UPDATE's new rows will land in.
     /// Stored before any I/O so recovery produces bit-identical
     /// superfile bytes.
+    ///
+    /// **Why one dedicated superfile per UPDATE, not merged
+    /// with the commit's regular `append()` rows?** Replay
+    /// safety. The new superfile must be reconstructable from
+    /// durable state alone (this WAL doc + the `.arrow`
+    /// sidecar), because a crash anywhere between `update()`
+    /// and the manifest CAS leaves recovery responsible for
+    /// finishing the work. The pre-minted UUID combined with
+    /// `minted_id_spans` and `new_row_content_hash` pins every
+    /// byte of the superfile so a recovery process's re-PUT
+    /// lands at the same path with identical content. Regular
+    /// `append()` rows live in an in-memory buffer that's never
+    /// persisted before commit; on crash the caller retries.
+    /// Merging the two would force one of: (a) every append
+    /// goes through the etag-CAS state machine (latency hit on
+    /// the common path), or (b) updates lose crash-replay
+    /// determinism. Both are worse than the current cost — one
+    /// extra superfile object per UPDATE — at any realistic
+    /// update:append ratio.
     #[serde(default)]
     pub preallocated_superfile_id: Option<Uuid>,
 
