@@ -53,6 +53,7 @@ pub const BUILDER_ID: &str = concat!(
 );
 
 pub mod config;
+mod runtime_bridge;
 pub mod storage;
 pub mod superfile;
 pub mod supertable;

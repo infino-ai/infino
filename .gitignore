@@ -1,5 +1,4 @@
 /target
-/Cargo.lock
 lcov.info
 *.profraw
 .DS_Store

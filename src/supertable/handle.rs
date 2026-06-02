@@ -1,6 +1,6 @@
 //! `Supertable` + `SupertableReader` — the in-memory handle.
 //!
-//! `Supertable::create(opts)` returns a clone-shared handle holding
+//! `Supertable::create(opts).expect("create")` returns a clone-shared handle holding
 //! an empty initial manifest behind `ArcSwap<Manifest>`.
 //! `Supertable::reader()` does `ArcSwap::load_full` once and pins
 //! the resulting `Arc<Manifest>` for the reader's lifetime, so a
@@ -20,6 +20,7 @@ use tokio::runtime::Runtime;
 use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
+use crate::runtime_bridge::bridge_sync_to_async;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -72,6 +73,22 @@ pub(super) struct SupertableInner {
     /// first use rather than at `create()` so supertables that
     /// never run SQL don't pay the runtime cost.
     pub(super) sql_runtime: OnceLock<Arc<Runtime>>,
+    /// Per-process reader-side cache of per-superfile tombstone
+    /// bitmaps. `Some` when storage is attached (the cache
+    /// fetches sidecars from `superfiles/<id>.tombstones`);
+    /// `None` for in-memory-only supertables where no sidecars
+    /// can exist. Query paths read through this cache before
+    /// returning per-superfile hits; writers invalidate cached
+    /// entries after each successful sidecar CAS-PUT.
+    pub(super) tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+    /// Fresh `supertable_handle_id` minted at handle
+    /// construction. Used as the `lease.owner` identifier on
+    /// every WAL this process drives. Not the OS PID — we need
+    /// uniqueness across restarts on the same PID AND across
+    /// multiple handles within one process (a process that
+    /// opens five supertables holds five distinct ids). Minted
+    /// via `IdGenerator::next_id()` once at create / open.
+    pub(super) handle_id: crate::supertable::wal::state_doc::SupertableHandleId,
 }
 
 impl SupertableInner {
@@ -94,25 +111,81 @@ impl SupertableInner {
 }
 
 impl Supertable {
-    /// Create a new in-memory supertable from validated options.
-    /// The initial manifest is empty (`manifest_id = 0`,
-    /// `superfiles = []`).
+    /// Create-or-open from validated options.
     ///
-    /// The `SupertableOptions` is consumed and Arc-wrapped
-    /// internally — clone the options ahead of the call if the
-    /// caller wants to keep their own reference.
-    pub fn create(options: SupertableOptions) -> Self {
+    /// Behaviour:
+    ///
+    /// - **No storage attached** → fresh in-memory handle, no
+    ///   I/O. Empty manifest; recovery is a no-op.
+    /// - **Storage attached, no pointer file** → fresh
+    ///   storage-backed handle. Empty manifest; recovery sweep
+    ///   runs in case prior peer processes left stray WALs.
+    /// - **Storage attached, pointer file present** →
+    ///   transparently delegates to [`Supertable::open`]. Loads
+    ///   the existing manifest list + parts and runs the
+    ///   recovery sweep. This closes the "create silently
+    ///   shadows existing committed state" footgun.
+    ///
+    /// Sync API. Internally bridges to async I/O for the
+    /// pointer probe + the open delegation via the same
+    /// `Handle::try_current() + block_in_place` pattern the
+    /// rest of the supertable's sync paths use. Works from
+    /// sync `#[test]` contexts and from multi-thread
+    /// `#[tokio::test]` contexts; calling from a
+    /// `current_thread` runtime panics (use the async
+    /// [`Supertable::open`] directly in that case).
+    pub fn create(options: SupertableOptions) -> Result<Self, OpenError> {
+        // Pointer-probe pass. When storage is attached AND a
+        // pointer file already exists, we want open's load path
+        // — never silently shadow committed state with an empty
+        // manifest.
+        if let Some(storage) = options.storage.as_ref() {
+            let probe = Arc::clone(storage);
+            let probe_result = bridge_sync_to_async(async move {
+                crate::supertable::manifest::commit::read_pointer(&*probe).await
+            });
+            match probe_result {
+                Ok(Some(_pointer)) => {
+                    return bridge_sync_to_async(Self::open(options));
+                }
+                Ok(None) => {
+                    // No pointer → fall through to fresh-create.
+                }
+                Err(e) => {
+                    return Err(OpenError::Storage(
+                        crate::storage::StorageError::Permanent {
+                            uri: "_supertable/current".into(),
+                            source: Box::new(std::io::Error::other(format!("{e}"))),
+                        },
+                    ));
+                }
+            }
+        }
+
         let options = Arc::new(options);
         let initial = Manifest::empty(options.clone());
+        let tombstone_cache = build_tombstone_cache(&options);
+        let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
+        let handle_id =
+            crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options,
             manifest: ArcSwap::new(Arc::new(initial)),
             writer_outstanding: AtomicBool::new(false),
-            id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
+            id_generator: Mutex::new(id_generator),
             sql_runtime: OnceLock::new(),
+            tombstone_cache,
+            handle_id,
         });
         install_disk_cache_pinning(&inner);
-        Self { inner }
+        let st = Self { inner };
+        // Open-time recovery + gc sweeps — no-op when no
+        // storage is attached. Best-effort: a sweep failure
+        // here doesn't fail handle construction; the next
+        // sweep gets another shot.
+        let _ = st.run_recovery_sweep_once_blocking();
+        let _ = bridge_sync_to_async(async { st.run_gc_sweep_once().await.map_err(|_| ()) });
+        Ok(st)
     }
 
     /// Open an existing persisted supertable.
@@ -168,7 +241,7 @@ impl Supertable {
         };
 
         // 2. Load + parse the manifest list.
-        let list_bytes = storage
+        let (list_bytes, _) = storage
             .get(&pointer.manifest_list_uri)
             .await
             .map_err(OpenError::Storage)?;
@@ -262,22 +335,40 @@ impl Supertable {
             loader: Some(loader),
         };
 
+        let tombstone_cache = build_tombstone_cache(&options_arc);
+        // Fresh generator per open. The 64-bit ms timestamp
+        // prefix advances naturally across process restarts, so
+        // re-opened supertables never re-mint values that already
+        // live in storage — no resume-from-id_max-on-open logic
+        // needed. The worker_id is also fresh, further insulating
+        // restarts from collisions.
+        let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
+        let handle_id =
+            crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options: options_arc,
             manifest: ArcSwap::new(Arc::new(manifest)),
             writer_outstanding: AtomicBool::new(false),
-            // Fresh generator per open. The 64-bit ms
-            // timestamp prefix advances naturally across
-            // process restarts, so re-opened supertables
-            // never re-mint values that already live in
-            // storage — no resume-from-id_max-on-open
-            // logic needed. The worker_id is also fresh,
-            // further insulating restarts from collisions.
-            id_generator: Mutex::new(crate::supertable::utils::idgen::IdGenerator::new()),
+            id_generator: Mutex::new(id_generator),
             sql_runtime: OnceLock::new(),
+            tombstone_cache,
+            handle_id,
         });
         install_disk_cache_pinning(&inner);
-        Ok(Self { inner })
+        let st = Self { inner };
+        // Open-time recovery sweep — drives every Intent /
+        // Appended WAL discovered in `wal/mutations/` to
+        // Complete (or skips lease-conflicted ones for a peer
+        // to drive). Best-effort: a sweep failure doesn't fail
+        // `open` because the supertable is still functional —
+        // the next sweep gets another shot.
+        let _ = st.run_recovery_sweep_once().await;
+        // GC sweep follows recovery on the same LIST: reaps
+        // Complete WALs past `T_wal_grace` and orphan arrow
+        // sidecars past `T_sidecar_grace`. Best-effort; same
+        // sweep budget.
+        let _ = st.run_gc_sweep_once().await;
+        Ok(st)
     }
 
     /// Re-read the manifest pointer from storage.
@@ -323,7 +414,7 @@ impl Supertable {
         }
 
         // 2. Load + parse the new manifest list.
-        let list_bytes = storage
+        let (list_bytes, _) = storage
             .get(&pointer.manifest_list_uri)
             .await
             .map_err(OpenError::Storage)?;
@@ -418,6 +509,7 @@ impl Supertable {
     pub fn reader(&self) -> SupertableReader {
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
+            tombstone_cache: self.inner.tombstone_cache.clone(),
         }
     }
 
@@ -425,6 +517,98 @@ impl Supertable {
     /// tokenizer). Immutable for the supertable's lifetime.
     pub fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+
+    /// This handle's lease-owner id. Stamped on every WAL the
+    /// handle's recovery sweep / commit pipeline acquires.
+    /// Minted once at handle construction via `IdGenerator`;
+    /// distinct from every other handle in the process
+    /// (different `worker_id`) and from every prior process
+    /// (different `ms` timestamp).
+    pub fn handle_id(&self) -> crate::supertable::wal::state_doc::SupertableHandleId {
+        self.inner.handle_id
+    }
+
+    /// Construct a [`Supertable`] handle wrapping an existing
+    /// `SupertableInner` arc. Internal-only: used by the writer
+    /// to hand a `Supertable` to the WAL pipeline functions
+    /// without re-running the full create-or-open flow. Skips
+    /// the open-time recovery sweep on purpose — the inner has
+    /// already been initialized.
+    pub(super) fn from_inner(inner: Arc<SupertableInner>) -> Self {
+        Self { inner }
+    }
+
+    /// Operator hatch: run one WAL recovery sweep against this
+    /// supertable's storage prefix. Useful for long-lived
+    /// handles that want bounded recovery latency without
+    /// restarting the process, and for integration tests that
+    /// pre-seed half-finished WALs and verify the sweep
+    /// completes them.
+    ///
+    /// Returns `Ok(report)` with the per-outcome counts on
+    /// success; `Err(NoStorageAttached)` for in-memory-only
+    /// supertables (no WALs can exist there).
+    pub async fn run_recovery_sweep_once(
+        &self,
+    ) -> Result<
+        crate::supertable::wal::recovery::RecoveryReport,
+        crate::supertable::wal::recovery::RecoveryError,
+    > {
+        crate::supertable::wal::recovery::scan_and_recover(
+            self,
+            self.inner.handle_id,
+            crate::supertable::wal::lease::DEFAULT_LEASE_DURATION,
+        )
+        .await
+    }
+
+    /// Sync-bridged version of [`run_recovery_sweep_once`]. Used
+    /// by [`Supertable::create`] to drive an open-time sweep
+    /// from a sync entry point. Same sync→async pattern the
+    /// writer's `persist_commit` uses: ride the ambient tokio
+    /// runtime when present, lazy-init the supertable's owned
+    /// runtime otherwise.
+    pub fn run_recovery_sweep_once_blocking(
+        &self,
+    ) -> Result<
+        crate::supertable::wal::recovery::RecoveryReport,
+        crate::supertable::wal::recovery::RecoveryError,
+    > {
+        let drive = self.run_recovery_sweep_once();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.inner.sql_runtime().block_on(drive),
+        }
+    }
+
+    /// Operator hatch: run one GC sweep over this supertable's
+    /// `wal/mutations/` prefix. Reaps `Complete` WALs older
+    /// than the wal-grace window + orphan `.arrow` sidecars
+    /// older than the sidecar-grace window. Tests pass custom
+    /// grace windows via [`run_gc_sweep_with_grace`].
+    pub async fn run_gc_sweep_once(
+        &self,
+    ) -> Result<crate::supertable::wal::gc::GcReport, crate::supertable::wal::gc::GcError> {
+        crate::supertable::wal::gc::run_sweep(
+            self,
+            chrono::Utc::now(),
+            crate::supertable::wal::gc::DEFAULT_WAL_GRACE,
+            crate::supertable::wal::gc::DEFAULT_SIDECAR_GRACE,
+        )
+        .await
+    }
+
+    /// Same as [`run_gc_sweep_once`] but with caller-supplied
+    /// `now` + grace windows. Useful for deterministic tests
+    /// that simulate grace-window crossings without sleeping.
+    pub async fn run_gc_sweep_with_grace(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        wal_grace: std::time::Duration,
+        sidecar_grace: std::time::Duration,
+    ) -> Result<crate::supertable::wal::gc::GcReport, crate::supertable::wal::gc::GcError> {
+        crate::supertable::wal::gc::run_sweep(self, now, wal_grace, sidecar_grace).await
     }
 
     /// Current manifest's id, without pinning a reader. Useful for
@@ -494,6 +678,21 @@ impl Supertable {
 /// has already dropped (cache outlived it), returns the
 /// empty set — eviction proceeds without pinning, which is
 /// the safe fallback.
+/// Build the tombstone-sidecar cache when storage is attached.
+/// Returns `None` for in-memory-only supertables — no sidecars
+/// can exist there, so the query paths skip the filter hook
+/// entirely.
+fn build_tombstone_cache(
+    options: &Arc<SupertableOptions>,
+) -> Option<Arc<crate::supertable::tombstones::SidecarCache>> {
+    let storage = options.storage.as_ref()?.clone();
+    let wal_store = crate::supertable::wal::WalStore::new(storage);
+    Some(Arc::new(crate::supertable::tombstones::SidecarCache::new(
+        wal_store,
+        crate::supertable::tombstones::cache::DEFAULT_REFRESH_TTL,
+    )))
+}
+
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
     let cache = match inner.options.disk_cache.as_ref() {
         Some(c) => c,
@@ -538,6 +737,11 @@ impl std::fmt::Debug for Supertable {
 /// modules on top of this handle.
 pub struct SupertableReader {
     manifest: Arc<Manifest>,
+    /// Per-process tombstone-bitmap cache shared with the parent
+    /// `Supertable`. Query paths read through this before
+    /// returning per-superfile hits so tombstoned rows never
+    /// reach callers. `None` for in-memory-only supertables.
+    pub(crate) tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 }
 
 impl SupertableReader {
@@ -637,7 +841,7 @@ mod tests {
 
     #[test]
     fn create_returns_handle_with_empty_initial_manifest() {
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         assert_eq!(st.manifest_id(), 0);
         let r = st.reader();
         assert_eq!(r.manifest_id(), 0);
@@ -647,7 +851,7 @@ mod tests {
 
     #[test]
     fn supertable_clone_shares_inner_state() {
-        let st1 = Supertable::create(opts());
+        let st1 = Supertable::create(opts()).expect("create");
         let st2 = st1.clone();
         // Same Arc<SupertableInner> behind both clones — verify
         // by mutating through one and observing through the other.
@@ -657,7 +861,7 @@ mod tests {
 
     #[test]
     fn options_accessor_returns_arc_to_validated_options() {
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         let opts_arc = st.options();
         assert_eq!(opts_arc.id_column, "_id");
         assert_eq!(opts_arc.fts_columns.len(), 1);
@@ -669,7 +873,7 @@ mod tests {
         // captured before a commit must keep seeing the pre-commit
         // manifest, even after the writer has ArcSwap::store'd a
         // new one.
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
 
         // Pin reader at manifest_id = 0.
         let pinned = st.reader();
@@ -697,7 +901,7 @@ mod tests {
         // independent of its predecessors. After several commits,
         // each prior reader's pinned manifest reports its
         // construction-time state, not the latest.
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
 
         let r0 = st.reader();
         publish_appended(&st, vec![entry(1)]);
@@ -734,7 +938,7 @@ mod tests {
         // is the "snapshot pinned past the supertable's lifetime"
         // guarantee — the underlying superfiles stay reachable.
         let r = {
-            let st = Supertable::create(opts());
+            let st = Supertable::create(opts()).expect("create");
             publish_appended(&st, vec![entry(5)]);
             st.reader()
             // st dropped here; reader survives.
@@ -749,7 +953,7 @@ mod tests {
         // Two readers issued at the same point should pin the SAME
         // Arc<Manifest>. The Arc-share is what makes "thousands of
         // concurrent readers" cheap: one allocation, N+1 ref count.
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         publish_appended(&st, vec![entry(7)]);
         let r1 = st.reader();
         let r2 = st.reader();
@@ -758,7 +962,7 @@ mod tests {
 
     #[test]
     fn debug_format_doesnt_explode() {
-        let st = Supertable::create(opts());
+        let st = Supertable::create(opts()).expect("create");
         let s = format!("{:?}", st);
         assert!(s.contains("Supertable"));
 

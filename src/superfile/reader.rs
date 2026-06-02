@@ -21,6 +21,7 @@ use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
 use crate::superfile::vector::reader::VectorReader;
+use arrow_array::Decimal128Array;
 use arrow_schema::Schema;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -273,6 +274,63 @@ impl SuperfileReader {
     /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
     pub fn parquet_bytes(&self) -> &Bytes {
         &self.bytes
+    }
+
+    /// Sequential scan of the `_id` column for an exact `target`
+    /// match. Returns the matching row's local doc_id (the row
+    /// offset within this superfile, used by tombstones / FTS /
+    /// vector indices) or `None` if the target isn't present.
+    ///
+    /// `_id` is stored as `Decimal128` with the supertable's
+    /// fixed precision/scale; we decode each value as `i128`.
+    ///
+    /// Used by the WAL recovery sweep's `resolve_target_id`
+    /// path: given a `target_id`, scan the candidate superfile to
+    /// find where the row lives so the tombstone phase can mark
+    /// its bit. Currently rebuilds a `ParquetRecordBatchReader`
+    /// each call — opportunity for a follow-up that caches
+    /// parquet metadata on the reader (see TODO in module-level
+    /// comments).
+    pub fn id_lookup(&self, target: i128) -> Result<Option<u32>, ReadError> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(self.bytes.clone())
+            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        let reader = builder
+            .build()
+            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+
+        let mut row_offset: u32 = 0;
+        for batch_res in reader {
+            // `batch_res` is `Result<RecordBatch, ArrowError>`;
+            // funnel through ParquetError so the whole id_lookup
+            // path surfaces a single error variant.
+            let batch =
+                batch_res.map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e.into())))?;
+            let id_idx = batch.schema().index_of(&self.id_column).map_err(|_| {
+                ReadError::MalformedKv(format!(
+                    "id_column {:?} declared in KV metadata but missing from parquet schema",
+                    self.id_column
+                ))
+            })?;
+            let arr = batch.column(id_idx);
+            let id_arr = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    ReadError::MalformedKv(format!(
+                        "id_column {:?} is not Decimal128",
+                        self.id_column
+                    ))
+                })?;
+            for i in 0..id_arr.len() {
+                if id_arr.value(i) == target {
+                    return Ok(Some(row_offset + i as u32));
+                }
+            }
+            row_offset = row_offset.checked_add(id_arr.len() as u32).ok_or_else(|| {
+                ReadError::MalformedKv("row_offset overflow scanning id column".to_string())
+            })?;
+        }
+        Ok(None)
     }
 
     /// Single-column BM25 search across the unified FTS reader.

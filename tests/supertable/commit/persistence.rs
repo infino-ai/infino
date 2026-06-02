@@ -34,7 +34,8 @@ fn commit_persists_pointer_list_part_and_segment() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
         .expect("append");
@@ -53,7 +54,7 @@ fn commit_persists_pointer_list_part_and_segment() {
     );
 
     // Manifest list file exists and is non-empty.
-    let list_bytes =
+    let (list_bytes, _) =
         futures::executor::block_on(storage.get(&pointer.manifest_list_uri)).expect("get list");
     assert!(!list_bytes.is_empty());
 
@@ -92,7 +93,8 @@ fn two_successive_commits_both_publish() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     let mut w = st.writer().expect("w1");
     w.append(&build_title_batch(&["foo", "bar"]))
@@ -160,7 +162,7 @@ async fn multipart_threshold_forces_segment_through_put_multipart() {
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_put_multipart_threshold_bytes(1);
-    let producer = Supertable::create(opts);
+    let producer = Supertable::create(opts).expect("create");
     {
         let mut w = producer.writer().expect("writer");
         // Two docs so the FTS posting list has more than a
@@ -201,7 +203,7 @@ fn no_storage_attached_takes_002_path() {
     // Sanity: a supertable WITHOUT storage attached behaves
     // exactly like 002 — no on-disk state, in-memory only.
     let dir = TempDir::new().expect("tempdir");
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["x", "y"])).expect("append");
@@ -234,7 +236,8 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&[
         "nimblefox special token",
@@ -264,7 +267,8 @@ fn manifest_id_increments_only_on_non_empty_commits() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     let mut w = st.writer().expect("w");
     w.commit().expect("empty commit"); // no buffer → no-op

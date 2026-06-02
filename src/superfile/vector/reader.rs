@@ -8,6 +8,7 @@
 //! Self-contained: owns its `Bytes`. Per-column metadata is parsed
 //! eagerly at `open()`; per-query work happens on demand.
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
 use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
@@ -257,23 +258,7 @@ impl Source {
         };
         let start = range.start as u64;
         let len = range.len() as u64;
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(s.range(start, len))),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
-                            uri: "lazy-source://vector-reader".to_string(),
-                            source: Box::new(std::io::Error::other(format!(
-                                "tokio runtime build for lazy source fetch: {e}"
-                            ))),
-                        })
-                    })?;
-                rt.block_on(s.range(start, len))
-            }
-        }
+        bridge_sync_to_async(s.range(start, len))
     }
 }
 

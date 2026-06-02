@@ -68,7 +68,7 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(1);
-    let producer = Supertable::create(opts);
+    let producer = Supertable::create(opts).expect("create");
 
     // Each commit's batch uses a distinct vocabulary so the
     // list-level bloom-union skip can route an exact-term
@@ -338,7 +338,8 @@ async fn eager_mode_query_paths_observationally_unchanged() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");

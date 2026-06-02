@@ -63,6 +63,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, Decimal128Array};
 use bytes::Bytes;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
@@ -99,8 +100,9 @@ impl Supertable {
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
+        let tombstone_cache = reader.tombstone_cache.clone();
 
-        let table = build_mem_table(scalar_schema, manifest, store, disk_cache)?;
+        let table = build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)?;
         let sql = sql.to_owned();
 
         let drive = async move {
@@ -129,6 +131,91 @@ impl Supertable {
             Err(_) => self.sql_runtime().block_on(drive),
         }
     }
+
+    /// Resolve a predicate to the matching `_id` values. Used by
+    /// the writer's `delete()` / `update()` entry points to
+    /// capture the target-id set at call time (step 0a in the
+    /// update / delete pipeline).
+    ///
+    /// Plan shape mirrors [`query_sql`]: build a `MemTable` over
+    /// the current manifest, register as `supertable`, apply
+    /// `expr` as a filter via DataFusion's `DataFrame::filter`,
+    /// project just `_id`, drain into a `Vec<i128>`. No
+    /// `TableProvider` is introduced.
+    ///
+    /// Note: the resolution is against the **current** manifest
+    /// snapshot, exactly like a contemporaneous `query_sql` would
+    /// see. Rows that newly match `expr` between this call and
+    /// the eventual `commit()` are NOT in the returned set —
+    /// captured-at-call semantics match SQL `UPDATE WHERE` /
+    /// `DELETE WHERE`.
+    pub fn scan_ids_matching(
+        &self,
+        expr: datafusion::prelude::Expr,
+    ) -> Result<Vec<i128>, QueryError> {
+        let reader = self.reader();
+        let manifest = Arc::clone(reader.manifest());
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let tombstone_cache = reader.tombstone_cache.clone();
+        let id_column = self.options().id_column.clone();
+
+        let table = build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)?;
+
+        let drive = async move {
+            let ctx = SessionContext::new();
+            ctx.register_table(TABLE_NAME, Arc::new(table))
+                .map_err(|e| QueryError::Plan(e.to_string()))?;
+            let df = ctx
+                .table(TABLE_NAME)
+                .await
+                .map_err(|e| QueryError::Plan(e.to_string()))?
+                .filter(expr)
+                .map_err(|e| QueryError::Plan(e.to_string()))?
+                .select_columns(&[id_column.as_str()])
+                .map_err(|e| QueryError::Plan(e.to_string()))?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            extract_id_column(&batches)
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.sql_runtime().block_on(drive),
+        }
+    }
+}
+
+/// Drain `_id`-only batches into a `Vec<i128>`. The supertable's
+/// `_id` is a Decimal128(38, 0) column; we read the raw 128-bit
+/// integer value directly.
+fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
+    let mut out: Vec<i128> = Vec::new();
+    for batch in batches {
+        if batch.num_columns() != 1 {
+            return Err(QueryError::Plan(format!(
+                "scan_ids_matching: expected 1-column batch, got {}",
+                batch.num_columns()
+            )));
+        }
+        let col = batch.column(0);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| {
+                QueryError::Plan("scan_ids_matching: _id column not Decimal128".into())
+            })?;
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            out.push(arr.value(i));
+        }
+    }
+    Ok(out)
 }
 
 /// Read every segment in the manifest and assemble a `MemTable`
@@ -159,6 +246,7 @@ fn build_mem_table(
     manifest: Arc<Manifest>,
     store: Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 ) -> Result<MemTable, QueryError> {
     // M15c: route through the hierarchical iterator when
     // the manifest has a persisted list (which includes
@@ -174,6 +262,10 @@ fn build_mem_table(
             manifest.as_ref(),
         ),
     };
+    // One `Instant::now()` for the entire SQL query so each
+    // per-superfile tombstone lookup shares the same TTL
+    // reference. Matches the FTS / vector hot-path budget.
+    let now = std::time::Instant::now();
     let mut partitions: Vec<Vec<RecordBatch>> = Vec::with_capacity(superfiles.len().max(1));
     for entry in &superfiles {
         let reader = crate::supertable::query::superfile_reader::superfile_reader(
@@ -182,13 +274,60 @@ fn build_mem_table(
             &entry.uri,
         )
         .map_err(|e| QueryError::Store(e.to_string()))?;
-        let batches = read_all_batches(reader.parquet_bytes().clone())?;
+        let mut batches = read_all_batches(reader.parquet_bytes().clone())?;
+        if let Some(cache) = tombstone_cache.as_ref() {
+            apply_tombstone_filter_to_batches(cache, entry.superfile_id, &mut batches, now)?;
+        }
         partitions.push(batches);
     }
     if partitions.is_empty() {
         partitions.push(Vec::new());
     }
     MemTable::try_new(schema, partitions).map_err(|e| QueryError::Plan(e.to_string()))
+}
+
+/// Drop tombstoned rows from one superfile's batches before they
+/// reach DataFusion's `MemTable`. The local doc-id of row `i` in
+/// batch `b` is `row_offset(b) + i`, where `row_offset(b)` sums
+/// the lengths of all batches preceding `b` within the superfile.
+///
+/// Empty-bitmap short-circuits the entire loop so a tombstone-free
+/// superfile pays nothing beyond the cache lookup.
+fn apply_tombstone_filter_to_batches(
+    cache: &Arc<crate::supertable::tombstones::SidecarCache>,
+    superfile_id: uuid::Uuid,
+    batches: &mut Vec<RecordBatch>,
+    now: std::time::Instant,
+) -> Result<(), QueryError> {
+    let bitmap = cache
+        .bitmap_for(superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    let mut row_offset: u32 = 0;
+    let mut filtered: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    for batch in batches.drain(..) {
+        let n = batch.num_rows() as u32;
+        // Build a boolean mask. `true` keeps the row; `false`
+        // drops it. We allocate once per batch — the typical
+        // batch is row-group-sized (~64K rows) so this is one
+        // small allocation per superfile-batch combination.
+        let mask: Vec<bool> = (0..n).map(|i| !bitmap.contains(row_offset + i)).collect();
+        // Fast-path: every row keeps → no filter call needed.
+        if mask.iter().all(|b| *b) {
+            row_offset += n;
+            filtered.push(batch);
+            continue;
+        }
+        let mask_array = arrow_array::BooleanArray::from(mask);
+        let kept = arrow::compute::filter_record_batch(&batch, &mask_array)
+            .map_err(|e| QueryError::Parquet(format!("filter_record_batch: {e}")))?;
+        row_offset += n;
+        filtered.push(kept);
+    }
+    *batches = filtered;
+    Ok(())
 }
 
 /// Eagerly drain a parquet file into `Vec<RecordBatch>`.
@@ -283,14 +422,14 @@ mod tests {
 
     #[test]
     fn query_sql_count_star_returns_zero_on_empty_supertable() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let n = run_count(&st, "SELECT COUNT(*) FROM supertable");
         assert_eq!(n, 0);
     }
 
     #[test]
     fn query_sql_count_star_returns_total_doc_count() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(
             0,
@@ -306,7 +445,7 @@ mod tests {
 
     #[test]
     fn query_sql_filter_predicate_applied_above_mem_table() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(
             0,
@@ -325,7 +464,7 @@ mod tests {
 
     #[test]
     fn query_sql_group_by_returns_correct_per_category_counts() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(
             0,
@@ -384,7 +523,7 @@ mod tests {
     fn query_sql_scans_across_multiple_segments() {
         // Three commits → three superfiles. SQL must aggregate across
         // all of them.
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["rust", "rust"], &["a", "b"]))
             .expect("a1");
@@ -416,7 +555,7 @@ mod tests {
         // are auto-injected by the supertable (timestamp +
         // worker + counter), so we don't assert specific
         // values — only strict-increasing order.
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(100, &["a", "b"], &["t1", "t2"]))
             .expect("a1");
@@ -450,7 +589,7 @@ mod tests {
         // The supertable is a thin SQL skin over scalar columns —
         // `inf.*` KV metadata stays invisible. The injected `_id`
         // column is part of the visible schema.
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["x"], &["t"])).expect("a");
         w.commit().expect("c");
@@ -473,7 +612,7 @@ mod tests {
         // cache regressed, tests would still pass but would leak
         // a Runtime per call. The functional check below is
         // adequate for correctness; benchmarks would catch leak).
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["x"], &["t"])).expect("a");
         w.commit().expect("c");
@@ -485,7 +624,7 @@ mod tests {
 
     #[test]
     fn query_sql_invalid_sql_returns_plan_error() {
-        let st = Supertable::create(options_id_cat_title());
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let err = st
             .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
@@ -567,7 +706,7 @@ mod tests {
 
     #[test]
     fn query_sql_hides_vector_columns_from_sql_surface() {
-        let st = Supertable::create(options_with_vector(16));
+        let st = Supertable::create(options_with_vector(16)).expect("create");
         let mut w = st.writer().expect("writer");
         // n=8 ≥ n_cent=4 so kmeans has data to cluster.
         w.append(&build_vector_batch(0, 8, 16)).expect("append");
@@ -586,7 +725,7 @@ mod tests {
 
     #[test]
     fn query_sql_referencing_vector_column_returns_plan_error() {
-        let st = Supertable::create(options_with_vector(16));
+        let st = Supertable::create(options_with_vector(16)).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_vector_batch(0, 8, 16)).expect("append");
         w.commit().expect("commit");

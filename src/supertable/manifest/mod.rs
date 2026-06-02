@@ -257,7 +257,7 @@ impl ManifestPartLoader {
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
-        let bytes = self
+        let (bytes, _) = self
             .storage
             .get(uri)
             .await
@@ -765,10 +765,16 @@ mod tests {
                 }
             }
 
-            async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+            async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
                 self.get_calls.fetch_add(1, Ordering::AcqRel);
                 match self.objects.get(uri) {
-                    Some(b) => Ok(b.clone()),
+                    Some(b) => Ok((
+                        b.clone(),
+                        ObjectMeta {
+                            size: b.len() as u64,
+                            etag: Some("mock-etag".into()),
+                        },
+                    )),
                     None => Err(StorageError::NotFound { uri: uri.into() }),
                 }
             }
@@ -781,7 +787,11 @@ mod tests {
                 Err(permanent(uri, "get_range unimplemented for mock"))
             }
 
-            async fn put_atomic(&self, uri: &str, _bytes: Bytes) -> Result<(), StorageError> {
+            async fn put_atomic(
+                &self,
+                uri: &str,
+                _bytes: Bytes,
+            ) -> Result<Option<String>, StorageError> {
                 Err(permanent(uri, "put_atomic unimplemented for mock"))
             }
 
@@ -790,7 +800,7 @@ mod tests {
                 uri: &str,
                 _bytes: Bytes,
                 _expected_etag: Option<&str>,
-            ) -> Result<(), StorageError> {
+            ) -> Result<Option<String>, StorageError> {
                 Err(permanent(uri, "put_if_match unimplemented for mock"))
             }
 

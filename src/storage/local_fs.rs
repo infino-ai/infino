@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{
     Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
@@ -110,10 +111,17 @@ impl StorageProvider for LocalFsStorageProvider {
         })
     }
 
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = Self::path(uri)?;
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-        result.bytes().await.map_err(|e| translate(uri, e))
+        // `GetResult.meta` matches the version we're about to
+        // read — no separate HEAD needed to capture the etag.
+        let meta = ObjectMeta {
+            size: result.meta.size as u64,
+            etag: result.meta.e_tag.clone(),
+        };
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, meta))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
@@ -124,7 +132,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -133,7 +141,7 @@ impl StorageProvider for LocalFsStorageProvider {
         self.store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|_| ())
+            .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e))
     }
 
@@ -142,7 +150,7 @@ impl StorageProvider for LocalFsStorageProvider {
         uri: &str,
         bytes: Bytes,
         expected_etag: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         match expected_etag {
             // None == create-only-if-absent. Same as put_atomic.
@@ -154,7 +162,7 @@ impl StorageProvider for LocalFsStorageProvider {
                 self.store
                     .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                     .await
-                    .map(|_| ())
+                    .map(|r| r.e_tag)
                     .map_err(|e| translate(uri, e))
             }
             // Some(tag) == update-if-etag-matches.
@@ -207,7 +215,7 @@ impl StorageProvider for LocalFsStorageProvider {
                 // microseconds, so the worst-case stall is
                 // bounded.
 
-                let result: Result<(), StorageError> = async {
+                let result: Result<Option<String>, StorageError> = async {
                     let current = self
                         .store
                         .head(&path)
@@ -224,7 +232,7 @@ impl StorageProvider for LocalFsStorageProvider {
                     self.store
                         .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                         .await
-                        .map(|_| ())
+                        .map(|r| r.e_tag)
                         .map_err(|e| translate(uri, e))
                 }
                 .await;
@@ -256,6 +264,16 @@ impl StorageProvider for LocalFsStorageProvider {
             Err(ObjError::NotFound { .. }) => Ok(()),
             Err(e) => Err(translate(uri, e)),
         }
+    }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out: Vec<String> = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(meta.location.to_string());
+        }
+        Ok(out)
     }
 }
 
@@ -291,7 +309,7 @@ mod tests {
         p.put_atomic("data/seg-abc.sf", payload.clone())
             .await
             .expect("put");
-        let got = p.get("data/seg-abc.sf").await.expect("get");
+        let (got, _) = p.get("data/seg-abc.sf").await.expect("get");
         assert_eq!(got, payload);
     }
 
@@ -348,7 +366,7 @@ mod tests {
             "expected PreconditionFailed, got {err:?}"
         );
 
-        let got = p
+        let (got, _) = p
             .get("manifest-lists/list-1.json")
             .await
             .expect("get after losing put");
@@ -368,7 +386,7 @@ mod tests {
             .await
             .expect("conditional update with correct etag");
 
-        let got = p.get("ptr/current").await.expect("get v2");
+        let (got, _) = p.get("ptr/current").await.expect("get v2");
         assert_eq!(got.as_ref(), b"v2");
     }
 
@@ -404,7 +422,7 @@ mod tests {
             "expected PreconditionFailed, got {err:?}"
         );
 
-        let got = p.get("ptr/current").await.expect("get");
+        let (got, _) = p.get("ptr/current").await.expect("get");
         assert_eq!(got.as_ref(), b"v_intermediate");
     }
 
@@ -448,7 +466,7 @@ mod tests {
         p.put_atomic("a/b/c/d/leaf.bin", Bytes::from_static(b"deep"))
             .await
             .expect("nested put");
-        let got = p.get("a/b/c/d/leaf.bin").await.expect("nested get");
+        let (got, _) = p.get("a/b/c/d/leaf.bin").await.expect("nested get");
         assert_eq!(got.as_ref(), b"deep");
     }
 

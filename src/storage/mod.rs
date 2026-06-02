@@ -113,8 +113,12 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// issuing range-GETs.
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError>;
 
-    /// Read the entire object.
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError>;
+    /// Read the entire object together with its metadata. The
+    /// returned [`ObjectMeta`] reflects the exact version whose
+    /// bytes are in the response — no HEAD-then-GET race window
+    /// — so callers chaining CAS writes against this read can
+    /// use `meta.etag` directly.
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError>;
 
     /// Range-fetch. `range.end` is exclusive.
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
@@ -123,7 +127,13 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// exist. Maps to `If-None-Match: *` on S3,
     /// `x-goog-if-generation-match: 0` on GCS, `O_EXCL` on
     /// LocalFS.
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError>;
+    ///
+    /// Returns the new object's etag when the backend surfaces
+    /// one (S3 always, LocalFs via mtime). `Ok(None)` is legal
+    /// and means the write succeeded but no etag was reported;
+    /// CAS-chained callers treat `None` as "create-only-if-
+    /// absent" on the subsequent [`put_if_match`].
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError>;
 
     /// Conditional write — succeeds only if the target's
     /// current ETag matches `expected_etag`.
@@ -139,12 +149,15 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// `None` expected etag means "create only if absent"
     /// (semantically identical to `put_atomic`); pass `Some`
     /// to update an existing object.
+    ///
+    /// Returns the new object's etag on success — same
+    /// `Ok(None)` semantics as [`put_atomic`].
     async fn put_if_match(
         &self,
         uri: &str,
         bytes: Bytes,
         expected_etag: Option<&str>,
-    ) -> Result<(), StorageError>;
+    ) -> Result<Option<String>, StorageError>;
 
     /// Streaming multipart upload — for segments larger than
     /// `SupertableOptions::put_multipart_threshold_bytes`
@@ -163,4 +176,23 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// Delete an object. **Idempotent** — deleting a missing
     /// object returns `Ok(())`, not [`StorageError::NotFound`].
     async fn delete(&self, uri: &str) -> Result<(), StorageError>;
+
+    /// List object URIs under `prefix`. Returns the full URI of
+    /// every object whose path starts with `prefix` (caller is
+    /// responsible for slash-aware boundary checks if they want
+    /// to restrict to direct children).
+    ///
+    /// Used by the WAL recovery sweep to enumerate
+    /// `wal/mutations/*.json`. Listing is a relatively heavy
+    /// operation on object-store backends (it's a LIST call;
+    /// pagination handled internally) so callers should not
+    /// invoke this on the hot path — it's an open-time / sweep-
+    /// time primitive.
+    ///
+    /// Default returns an empty list — test/mock providers that
+    /// don't need WAL recovery support can leave the default in
+    /// place; production providers (LocalFs, S3) override.
+    async fn list_with_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
 }
