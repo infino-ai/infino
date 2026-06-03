@@ -31,7 +31,7 @@ pub mod vec {
     /// header. Bump on outer-blob-shape changes (currently 1).
     pub const VERSION: u32 = 1;
 
-    /// Plan 013 M1 — subsection layout version stamped at
+    /// subsection layout version stamped at
     /// bytes [8..12] of each per-column sub-header.
     ///
     /// On-disk shape:

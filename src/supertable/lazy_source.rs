@@ -29,7 +29,7 @@ use crate::superfile::{LazyByteSource, LazyByteSourceError};
 ///
 /// ## Size discovery
 ///
-/// Plan 013 M5 — `size` is an `AtomicU64` rather than a plain
+/// `size` is an `AtomicU64` rather than a plain
 /// `u64` so the source can be constructed *without* an
 /// up-front HEAD round-trip. The first call to [`tail`] (used
 /// by cold-open callers like `read_parquet_metadata_lazy`)
@@ -92,7 +92,7 @@ impl StorageRangeSource {
         }
     }
 
-    /// Plan 013 M5 — construct without an up-front size.
+    /// construct without an up-front size.
     ///
     /// The size is discovered lazily on the first
     /// [`LazyByteSource::tail`] call (which uses a native
@@ -147,7 +147,7 @@ impl LazyByteSource for StorageRangeSource {
         Ok(self.storage.get_range(&self.uri, range).await?)
     }
 
-    /// Plan 013 M5 — single-RTT tail fetch.
+    /// single-RTT tail fetch.
     ///
     /// Routes through `StorageProvider::tail`, which on S3
     /// uses a native suffix-range GET so the response carries

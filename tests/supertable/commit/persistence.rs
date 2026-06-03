@@ -143,8 +143,8 @@ fn two_successive_commits_both_publish() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn multipart_threshold_forces_segment_through_put_multipart() {
+#[test]
+fn multipart_threshold_forces_segment_through_put_multipart() {
     // D1: setting `put_multipart_threshold_bytes = 1` routes
     // every segment through `put_multipart` instead of
     // `put_atomic`. Verifies the end-to-end shape:
@@ -191,7 +191,6 @@ async fn multipart_threshold_forces_segment_through_put_multipart() {
     // the writer produced.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open after multipart commit");
     let r = consumer.reader();
     assert_eq!(r.manifest_id(), 1);
@@ -227,8 +226,8 @@ fn no_storage_attached_takes_002_path() {
     assert_eq!(r.n_superfiles(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn committed_supertable_remains_in_memory_queryable_for_now() {
+#[test]
+fn committed_supertable_remains_in_memory_queryable_for_now() {
     // Pre-M5: storage write-through is additive — the
     // in-memory store still holds segment bytes, so existing
     // 002 query paths keep working unchanged. Verifies no
@@ -247,15 +246,13 @@ async fn committed_supertable_remains_in_memory_queryable_for_now() {
     w.commit().expect("commit");
     drop(w);
 
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search(
             "title",
             "nimblefox",
             5,
             infino::supertable::query::fts::BoolMode::Or,
         )
-        .await
         .expect("query");
     assert_eq!(hits.len(), 1, "M4 commit must not break in-memory reads");
 }

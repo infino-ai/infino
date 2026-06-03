@@ -89,7 +89,6 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     let target_id;
     {
         let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
         let manifest = st.reader().manifest().clone();
         target_id = manifest
@@ -113,7 +112,6 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
     )
-    .await
     .expect("re-open");
     let (post, _etag) = ws.read(wal.wal_id).await.expect("read after sweep");
     assert_eq!(post.state, WalState::Complete);
@@ -137,31 +135,16 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operator_hatch_sweep_yields_same_report() {
-    let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> =
-        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage));
-    let st = Supertable::create(opts).expect("create");
-    // Fresh handle on empty storage: zero work.
-    let report = st.run_recovery_sweep_once().await.expect("sweep");
-    assert_eq!(report.n_scanned, 0);
-    assert_eq!(report.n_already_complete, 0);
-}
+// NOTE: the operator-hatch sweep (`run_recovery_sweep_once`) is a
+// crate internal (`pub(crate)`), not part of the public API, so its
+// direct tests live in-crate as unit tests in
+// `src/supertable/wal/recovery.rs`. The integration tests here exercise
+// recovery the way a real client does: by opening the supertable (which
+// runs the sweep automatically) and observing the result through public
+// queries.
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_memory_supertable_hatch_errors_cleanly() {
-    let st = Supertable::create(default_supertable_options()).expect("create");
-    let err = st.run_recovery_sweep_once().await.expect_err("must error");
-    assert!(matches!(
-        err,
-        infino::supertable::wal::recovery::RecoveryError::NoStorageAttached
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn create_with_existing_pointer_delegates_to_open() {
+#[test]
+fn create_with_existing_pointer_delegates_to_open() {
     // The point of `Supertable::create`'s create-or-open
     // shape: when storage already carries a committed pointer,
     // `create` MUST behave like `open` rather than silently
@@ -244,7 +227,6 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     let target_id;
     {
         let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open for manifest");
         let manifest = st.reader().manifest().clone();
         target_id = manifest
@@ -276,7 +258,6 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
     )
-    .await
     .expect("open after expired lease");
 
     // The WAL is now Complete; the new lease owner is the

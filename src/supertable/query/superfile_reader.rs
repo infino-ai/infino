@@ -41,7 +41,7 @@ use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 /// configured. See the module-level docs for the precise
 /// policy.
 ///
-/// Plan 013 M6 — `offsets` is an optional pre-known layout hint
+/// `offsets` is an optional pre-known layout hint
 /// pulled from the manifest's [`SubsectionOffsets`]. When `Some`
 /// the disk-cache cold-fetch path fires the parquet-footer,
 /// vector subsection, and FTS subsection GETs **in parallel**

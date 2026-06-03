@@ -184,8 +184,8 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
         supertable: SupertableSettings::default(),
         storage: StorageSettings {
             backend: StorageBackend::S3,
-            s3_bucket: Some(bucket.to_string()),
-            s3_prefix: prefix.to_string(),
+            bucket: Some(bucket.to_string()),
+            prefix: prefix.to_string(),
             disk_cache_root: Some(cache_root.to_path_buf()),
             disk_budget_bytes: 1 << 30,
             cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
@@ -315,7 +315,6 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .with_storage(Arc::clone(&consumer_storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("Supertable::open via S3");
 
     assert_eq!(consumer.manifest_id(), 1, "recovered manifest_id mismatch");
@@ -418,7 +417,6 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 .apply_config(&cfg)
                 .map_err(|e| format!("apply S3 config to consumer options: {e}"))?,
         )
-        .await
         .map_err(|e| format!("open unified supertable from real S3: {e}"))?;
 
         if consumer.manifest_id() != 1 {
@@ -435,14 +433,12 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         }
 
         let bm25_hits = consumer
-            .reader()
             .bm25_search(
                 "title",
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
             )
-            .await
             .map_err(|e| format!("cold BM25 over real S3: {e}"))?;
         if bm25_hits.is_empty() {
             return Err("real S3 cold BM25 did not find alpha docs".to_string());
@@ -451,9 +447,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         let mut query = vec![0.0f32; dim];
         query[0] = 1.0;
         let vector_hits = consumer
-            .reader()
             .vector_search("emb", &query, 3, VectorSearchOptions::new().with_nprobe(4))
-            .await
             .map_err(|e| format!("cold vector search over real S3: {e}"))?;
         if vector_hits.is_empty() {
             return Err("real S3 cold vector search returned no hits".to_string());

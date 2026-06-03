@@ -6,17 +6,16 @@ use infino::supertable::query::vector::VectorSearchOptions;
 
 use crate::ingest::supertable::VEC_COLUMN;
 
-pub async fn vector_topk_global(
+pub fn vector_topk_global(
     st: &Supertable,
     query: &[f32],
     k: usize,
     options: VectorSearchOptions,
 ) -> Vec<u32> {
-    let r = st.reader();
-    let hits: Vec<SuperfileHit> = r
+    let hits: Vec<SuperfileHit> = st
         .vector_search(VEC_COLUMN, query, k, options)
-        .await
         .expect("vector_search");
+    let r = st.reader();
     let manifest = r.manifest();
     let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
     let mut acc: u32 = 0;

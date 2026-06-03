@@ -82,8 +82,12 @@ impl SupertableReader {
     /// Empty supertable (no superfiles) returns an empty `Vec`
     /// without consulting the store.
     ///
+    /// `pub(crate)` async kernel — the public surface is the sync
+    /// [`Supertable::bm25_search`], which drives this via the
+    /// sync→async bridge after applying the read-consistency policy.
+    ///
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
-    pub async fn bm25_search(
+    pub(crate) async fn bm25_search(
         &self,
         column: &str,
         query: &str,
@@ -221,7 +225,10 @@ impl SupertableReader {
     ///
     /// Empty supertable (no superfiles) and `k == 0` short-circuit
     /// to an empty `Vec`.
-    pub async fn bm25_search_prefix(
+    ///
+    /// `pub(crate)` async kernel — the public surface is the sync
+    /// [`Supertable::bm25_search_prefix`].
+    pub(crate) async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
@@ -246,7 +253,7 @@ impl SupertableReader {
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();
 
-        // M15c: hierarchical pruning. List-level prefix
+        // hierarchical pruning. List-level prefix
         // skip via term_range_union → lazy-load only the
         // surviving parts → flatten → per-segment
         // term-range skip + fan-out.
@@ -360,6 +367,7 @@ impl Supertable {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.ensure_fresh();
         let reader = self.reader();
         self.block_on_query(reader.bm25_search(column, query, k, mode))
     }
@@ -373,6 +381,7 @@ impl Supertable {
         prefix: &str,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.ensure_fresh();
         let reader = self.reader();
         self.block_on_query(reader.bm25_search_prefix(column, prefix, k))
     }

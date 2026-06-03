@@ -138,18 +138,18 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 <!-- BEGIN: bench/fts/supertable/search -->
 ### Supertable FTS — search (10000000 docs, shared combined supertable)
 
-Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`); warm waits for mmap promotion.
+hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`). Cold excludes the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
 
-| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
-|----------------|------------|------------|------------|-----------|------------|-----------|------------|
-| single_rare    | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| single_common  | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| two_term_or    | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| three_wide_or  | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| three_similar_or | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| five_term_or   | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| ten_term_or    | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
-| prefix         | — | — | — | 1.53 GiB  | 1.52 GiB   | 1.53 GiB  | -85.7% improved |
+| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|------------|-----------|------------|-----------|------------|
+| single_rare    | 3.46 ms | 302.51 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| single_common  | 3.79 ms | 453.36 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| two_term_or    | 7.63 ms | 401.93 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| three_wide_or  | 11.21 ms | 438.31 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| three_similar_or | 22.32 ms | 397.82 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| five_term_or   | 37.99 ms | 473.88 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| ten_term_or    | 97.57 ms | 1.55 s | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| prefix         | 77.12 ms | 3.37 s | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
 
 <!-- END: bench/fts/supertable/search -->
 
@@ -211,12 +211,12 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 <!-- BEGIN: bench/vector/supertable/search -->
 ### Supertable vector — search (10000000 docs × dim=384, calibrated at recall targets)
 
-Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`); warm waits for mmap promotion.
+hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
 
-| Recall target | (p/seg, r) | hot | warm | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
-|---------------|------------|-----|------|------|----------|------------|---------|------------|
-| 0.90 | (p=8, r=4) | — | — | — | 13.10 GiB | 13.10 GiB | 13.10 GiB | — |
-| 0.95 | (p=8, r=4) | — | — | — | 13.10 GiB | 13.10 GiB | 13.10 GiB | — |
-| 0.99 | (p=16, r=4) | — | — | — | 13.10 GiB | 13.10 GiB | 13.10 GiB | — |
+| Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|---------------|------------|-----|------|----------|------------|---------|------------|
+| 0.90 | (p=4, r=4) | 31.95 ms | 1.05 s | 18.51 GiB | 17.47 GiB | 18.15 GiB | — |
+| 0.95 | (p=8, r=4) | 17.71 ms | 1.03 s | 18.51 GiB | 17.47 GiB | 18.15 GiB | — |
+| 0.99 | (p=16, r=4) | 27.97 ms | 2.39 s | 18.51 GiB | 17.47 GiB | 18.15 GiB | — |
 
 <!-- END: bench/vector/supertable/search -->

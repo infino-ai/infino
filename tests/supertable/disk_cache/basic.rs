@@ -253,7 +253,7 @@ async fn reader_returns_working_superfile_reader() {
     // Sanity: the mmap-backed reader exposes an FTS reader
     // and the indexed terms include our planted token.
     let fts = reader.fts().expect("fts reader");
-    let title_terms = fts.iter_column_terms("title");
+    let title_terms = fts.iter_column_terms("title").expect("iter terms");
     assert!(
         title_terms.iter().any(|t| t.as_slice() == b"alpha"),
         "mmap-backed reader must expose the planted FTS term"

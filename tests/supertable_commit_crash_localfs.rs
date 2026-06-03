@@ -259,8 +259,8 @@ fn dispatch_child_if_set() -> Option<()> {
     None
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
+#[test]
+fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
     if dispatch_child_if_set().is_some() {
         return; // unreachable; child never returns
     }
@@ -275,7 +275,6 @@ async fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect_err("must reject post-crash state with no pointer");
     assert!(
         matches!(err, OpenError::PointerUnreadable(_)),
@@ -295,8 +294,8 @@ async fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
+#[test]
+fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -308,7 +307,6 @@ async fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect_err("must reject post-crash state with no pointer");
     assert!(
         matches!(err, OpenError::PointerUnreadable(_)),
@@ -326,8 +324,8 @@ async fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_segment_on_second_commit_yields_v1() {
+#[test]
+fn crash_post_segment_on_second_commit_yields_v1() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -339,7 +337,6 @@ async fn crash_post_segment_on_second_commit_yields_v1() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1, "must recover at v1");
     assert_eq!(
@@ -349,8 +346,8 @@ async fn crash_post_segment_on_second_commit_yields_v1() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_list_on_second_commit_yields_v1() {
+#[test]
+fn crash_post_list_on_second_commit_yields_v1() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -359,7 +356,6 @@ async fn crash_post_list_on_second_commit_yields_v1() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1);
     assert_eq!(consumer.reader().n_superfiles(), 1);
@@ -376,8 +372,8 @@ async fn crash_post_list_on_second_commit_yields_v1() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_pointer_on_second_commit_yields_v2() {
+#[test]
+fn crash_post_pointer_on_second_commit_yields_v2() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -389,7 +385,6 @@ async fn crash_post_pointer_on_second_commit_yields_v2() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect("open at v2");
     assert_eq!(
         consumer.manifest_id(),

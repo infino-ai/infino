@@ -1,31 +1,37 @@
-//! `Supertable::open` + `Supertable::refresh` — 003 M10.
+//! `Supertable::open` + read-path freshness (`Consistency`) — 003 M10.
 //!
-//! Covers:
+//! Covers, entirely through the public API:
 //! - open against a persisted supertable written by another
 //!   "process" (simulated via dropping the producer handle)
 //! - manifest_id + superfiles + queries all match the producer's
 //!   post-commit state
 //! - open errors with `PointerUnreadable` on a fresh tempdir
 //!   (open-or-create trigger)
-//! - refresh after a producer's commit picks up the new
-//!   manifest_id; pre-refresh reader stays pinned
-//! - refresh is a no-op when the pointer hasn't advanced
-//! - parts inherited via content-addressed Arc::clone (no
-//!   re-fetch for unchanged parts)
+//! - under `Consistency::Strong`, a query on a consumer handle picks
+//!   up another writer's new commit; readers taken before the query
+//!   keep their pinned snapshot
+//! - a strongly-consistent query is stable when the pointer hasn't
+//!   advanced, and is a clean no-op on an as-yet-uncommitted table
+//!
+//! Freshness is engine-driven on the read path (governed by
+//! `Consistency`); there is no public `refresh` verb, so these tests
+//! observe freshness the way a real client does — by querying.
 
 #![deny(clippy::unwrap_used)]
 
 use std::sync::Arc;
 
 use infino::superfile::builder::FtsConfig;
+use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::fts::tokenize::Tokenizer;
+use infino::supertable::options::Consistency;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::{OpenError, Supertable, SupertableOptions};
 use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
 use tempfile::TempDir;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn open_sees_writes_made_by_a_different_handle() {
+#[test]
+fn open_sees_writes_made_by_a_different_handle() {
     // Producer: create + commit + drop.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -43,7 +49,6 @@ async fn open_sees_writes_made_by_a_different_handle() {
     // Consumer: open against the same storage.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     assert_eq!(consumer.manifest_id(), 1);
     assert_eq!(consumer.reader().n_superfiles(), 1);
@@ -57,8 +62,8 @@ async fn open_sees_writes_made_by_a_different_handle() {
     // when the cache-backed reader path ships.
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn open_on_fresh_tempdir_returns_pointer_unreadable() {
+#[test]
+fn open_on_fresh_tempdir_returns_pointer_unreadable() {
     // The open-or-create trigger: no pointer exists, so
     // open() must surface a typed error the caller can
     // pattern-match on for fallback to Supertable::create.
@@ -66,7 +71,6 @@ async fn open_on_fresh_tempdir_returns_pointer_unreadable() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect_err("must reject fresh dir");
     assert!(
         matches!(err, OpenError::PointerUnreadable(_)),
@@ -74,17 +78,21 @@ async fn open_on_fresh_tempdir_returns_pointer_unreadable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn open_without_storage_rejects() {
+#[test]
+fn open_without_storage_rejects() {
     // open requires options.storage; without it the error is
     // a typed BuildError surfaced via OpenError::Build.
     let opts = default_supertable_options();
-    let err = Supertable::open(opts).await.expect_err("must reject");
+    let err = Supertable::open(opts).expect_err("must reject");
     assert!(matches!(err, OpenError::Build(_)), "{err:?}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_picks_up_new_commits() {
+#[test]
+fn strong_consistency_query_sees_another_writers_new_commit() {
+    // Freshness is observed the way a real client observes it: a
+    // strongly-consistent consumer issues a query and sees the latest
+    // committed state. There is no public `refresh` — the read path
+    // re-checks the pointer under `Consistency::Strong`.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -98,13 +106,15 @@ async fn refresh_picks_up_new_commits() {
     w.commit().expect("commit1");
     drop(w);
 
-    // Consumer opens at v1.
-    let consumer =
-        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
-            .expect("open");
+    // Consumer opens at v1 with strong read consistency.
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_read_consistency(Consistency::Strong),
+    )
+    .expect("open");
     assert_eq!(consumer.manifest_id(), 1);
-    let pre_refresh_reader = consumer.reader(); // pinned at v1
+    let pinned_reader = consumer.reader(); // snapshot pinned at v1
 
     // Producer commits v2.
     let mut w = producer.writer().expect("w2");
@@ -112,29 +122,30 @@ async fn refresh_picks_up_new_commits() {
     w.commit().expect("commit2");
     drop(w);
 
-    // Consumer's manifest_id hasn't moved yet — refresh()
-    // pulls the new pointer.
-    assert_eq!(consumer.manifest_id(), 1);
-    let advanced = consumer.refresh().await.expect("refresh");
-    assert!(advanced, "refresh must report it advanced");
+    // A strongly-consistent query re-checks the pointer and serves
+    // against the latest manifest — picking up the new commit.
+    let hits = consumer
+        .bm25_search("title", "added", 10, BoolMode::Or)
+        .expect("query under strong consistency");
+    assert!(!hits.is_empty(), "strong query must see the v2 row");
     assert_eq!(consumer.manifest_id(), 2);
     assert_eq!(
         consumer.reader().n_superfiles(),
         2,
-        "post-refresh reader sees both commits"
+        "post-query reader sees both commits"
     );
 
-    // Pre-refresh reader stays pinned at v1.
+    // The snapshot taken before the query stays pinned at v1.
     assert_eq!(
-        pre_refresh_reader.manifest_id(),
+        pinned_reader.manifest_id(),
         1,
-        "pre-refresh reader keeps its snapshot"
+        "a reader captured earlier keeps its snapshot"
     );
-    assert_eq!(pre_refresh_reader.n_superfiles(), 1);
+    assert_eq!(pinned_reader.n_superfiles(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_no_op_when_pointer_unchanged() {
+#[test]
+fn strong_consistency_query_is_stable_when_pointer_unchanged() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -147,34 +158,45 @@ async fn refresh_no_op_when_pointer_unchanged() {
     w.commit().expect("commit");
     drop(w);
 
-    let consumer =
-        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
-            .expect("open");
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_read_consistency(Consistency::Strong),
+    )
+    .expect("open");
 
-    // No producer commits between open and refresh.
-    let advanced = consumer.refresh().await.expect("refresh");
-    assert!(!advanced, "refresh must be a no-op when pointer unchanged");
+    // No producer commits between open and query: the pointer hasn't
+    // advanced, so the strongly-consistent query stays at v1.
+    let _ = consumer
+        .bm25_search("title", "only", 10, BoolMode::Or)
+        .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_no_op_returns_false_when_no_pointer_yet() {
-    // Edge case: in-memory consumer (created locally) calls
-    // refresh against a storage that has no pointer yet.
-    // Should be a no-op (false), not an error.
+#[test]
+fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
+    // Edge case: an in-memory table (created locally, never committed)
+    // served under strong consistency. The read-path pointer re-check
+    // finds nothing committed yet and is a clean no-op — the table
+    // stays at manifest_id 0 and the query returns no hits.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st =
-        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
-    let advanced = st.refresh().await.expect("refresh");
-    assert!(!advanced);
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(storage)
+            .with_read_consistency(Consistency::Strong),
+    )
+    .expect("create");
+    let hits = st
+        .bm25_search("title", "anything", 10, BoolMode::Or)
+        .expect("query on uncommitted table");
+    assert!(hits.is_empty());
     assert_eq!(st.manifest_id(), 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn open_rejects_mismatched_options_via_options_hash() {
+#[test]
+fn open_rejects_mismatched_options_via_options_hash() {
     // D15: a producer commits with one schema; opening with
     // a structurally-different schema (different column
     // name) must surface a typed `OptionsHashMismatch`
@@ -221,7 +243,6 @@ async fn open_rejects_mismatched_options_via_options_hash() {
     .with_storage(Arc::clone(&storage));
 
     let err = Supertable::open(mismatched_opts)
-        .await
         .expect_err("open must surface OptionsHashMismatch for a reordered schema");
     assert!(
         matches!(err, OpenError::OptionsHashMismatch { .. }),
@@ -229,8 +250,8 @@ async fn open_rejects_mismatched_options_via_options_hash() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn open_with_matching_options_succeeds_under_options_hash_validation() {
+#[test]
+fn open_with_matching_options_succeeds_under_options_hash_validation() {
     // D15 happy path: producer + consumer with identical
     // options round-trip cleanly.
     let dir = TempDir::new().expect("tempdir");
@@ -246,7 +267,6 @@ async fn open_with_matching_options_succeeds_under_options_hash_validation() {
     }
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open must succeed when options match");
     assert_eq!(consumer.manifest_id(), 1);
 }

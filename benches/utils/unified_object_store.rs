@@ -657,7 +657,6 @@ fn bench(c: &mut Criterion) {
                         let reader = cache.reader(&uri).await.expect("cold reader");
                         let vec = reader.vec().expect("vector reader present");
                         vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                            .await
                             .expect("cold vector_search")
                     });
                     total += t0.elapsed();
@@ -730,8 +729,8 @@ fn bench(c: &mut Criterion) {
                     .block_on(async { cache_ref.reader(&uri).await })
                     .expect("warm reader");
                 let vec = reader.vec().expect("vector reader present");
-                let hits = rt
-                    .block_on(vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT))
+                let hits = vec
+                    .search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                     .expect("warm vector_search");
                 std::hint::black_box(hits)
             });
@@ -825,11 +824,11 @@ fn emit_object_store_markdown(storage_label: &str) {
     body.push_str("| Phase | p50 |\n");
     body.push_str("|-------|-----|\n");
     body.push_str(&format!(
-        "| Cold open via s3s-fs (Plan 013 M2: footer + per-subsection open-time region) | {} |\n",
+        "| Cold open via s3s-fs (footer + per-subsection open-time region) | {} |\n",
         cold_open_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
-        "| Cold first vector search after S3 open (Plan 013 M3: nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE}) | {} |\n",
+        "| Cold first vector search after S3 open (nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE}) | {} |\n",
         cold_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
@@ -837,7 +836,7 @@ fn emit_object_store_markdown(storage_label: &str) {
         cold_bm25_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
-        "| Warm subsequent vector search after S3 open (Plan 013 M4: mmap, 0 S3 GETs) | {} |\n",
+        "| Warm subsequent vector search after S3 open (mmap, 0 S3 GETs) | {} |\n",
         warm_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
@@ -994,11 +993,11 @@ mod diag {
             r
         }
 
-        // Plan 013 M5 — must forward to `self.inner.tail` rather
-        // than let the trait-default impl call `self.head` +
-        // `self.get_range`. The default impl would route through
-        // this wrapper's instrumented `head` / `get_range`,
-        // splitting one S3 `bytes=-len` suffix-range GET into a
+        // Must forward to `self.inner.tail` rather than let the
+        // trait-default impl call `self.head` + `self.get_range`.
+        // The default impl would route through this wrapper's
+        // instrumented `head` / `get_range`, splitting one S3
+        // `bytes=-len` suffix-range GET into a
         // (HEAD + bounded GET) pair on the wire and totally
         // erasing the optimization the cold-open path relies on.
         async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
@@ -1312,17 +1311,16 @@ mod diag {
         }
         storage.reset();
 
-        // Build the SubsectionOffsets the manifest would carry
-        // post-Plan-013 M6, so we can A/B the cold-open path
-        // unhinted (pre-M6, 2-RTT sequential) vs hinted (M6,
-        // 1-RTT parallel prefetch).
+        // Build the SubsectionOffsets the manifest would carry,
+        // so we can A/B the cold-open path unhinted (2-RTT
+        // sequential) vs hinted (1-RTT parallel prefetch).
         let offsets = build_offsets_from_bytes(superfile);
         eprintln!(
             "[diag] manifest hints: total={} B  vec={:?}  fts={:?}",
             offsets.total_size, offsets.vec, offsets.fts
         );
 
-        // ── Phase 2a: cold-open UNHINTED (pre-M6, 2 RTTs) ───────────
+        // ── Phase 2a: cold-open UNHINTED (no manifest hints, 2 RTTs) ───────────
         eprintln!("[diag] === cold-open UNHINTED via cache.reader (3 fresh-cache iters) ===");
         for i in 0..3 {
             let before = storage.snapshot();
@@ -1373,7 +1371,6 @@ mod diag {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1404,7 +1401,6 @@ mod diag {
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1623,7 +1619,6 @@ mod diag {
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
                     vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                        .await
                         .expect("real S3 cold vector_search")
                 });
                 let wall = t0.elapsed();
@@ -1738,9 +1733,9 @@ mod diag {
             let consumer = Supertable::open(
                 real_s3_supertable_options()
                     .apply_config(&cfg)
-                    .expect("apply real S3 config to consumer"),
+                    .expect("apply real S3 config to consumer")
+                    .with_read_consistency(infino::supertable::options::Consistency::Snapshot),
             )
-            .await
             .expect("open unified supertable from real S3");
             let cold_open = open_t0.elapsed();
             let reader = consumer.reader();
@@ -1772,14 +1767,13 @@ mod diag {
 
             let query = query_vector().to_vec();
             let vec_t0 = Instant::now();
-            let vec_hits = reader
+            let vec_hits = consumer
                 .vector_search(
                     VEC_COLUMN,
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
                 )
-                .await
                 .expect("cold vector search over real S3 supertable");
             let cold_vec = vec_t0.elapsed();
             eprintln!(
@@ -1789,9 +1783,8 @@ mod diag {
             );
 
             let bm25_t0 = Instant::now();
-            let bm25_hits = reader
+            let bm25_hits = consumer
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
-                .await
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
             eprintln!(
@@ -1803,20 +1796,18 @@ mod diag {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let warm_vec_t0 = Instant::now();
-            let warm_vec_hits = reader
+            let warm_vec_hits = consumer
                 .vector_search(
                     VEC_COLUMN,
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
                 )
-                .await
                 .expect("warm vector search over real S3 supertable");
             let warm_vec = warm_vec_t0.elapsed();
             let warm_bm25_t0 = Instant::now();
-            let warm_bm25_hits = reader
+            let warm_bm25_hits = consumer
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
-                .await
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
             let cache_stats = consumer
@@ -1859,8 +1850,8 @@ mod diag {
             supertable: SupertableSettings::default(),
             storage: StorageSettings {
                 backend: StorageBackend::S3,
-                s3_bucket: Some(bucket.to_string()),
-                s3_prefix: prefix.to_string(),
+                bucket: Some(bucket.to_string()),
+                prefix: prefix.to_string(),
                 disk_cache_root: Some(cache_root.to_path_buf()),
                 disk_budget_bytes: 8 << 30,
                 cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,

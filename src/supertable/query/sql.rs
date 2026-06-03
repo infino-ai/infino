@@ -95,6 +95,7 @@ impl Supertable {
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        self.ensure_fresh();
         let reader = self.reader();
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
@@ -120,9 +121,9 @@ impl Supertable {
                 .map_err(|e| QueryError::Execute(e.to_string()))
         };
 
-        // M14b: same ambient-runtime detection pattern the
+        // same ambient-runtime detection pattern the
         // writer's persist_commit uses. Lazy-init the owned
-        // sql_runtime only when there's NO ambient runtime —
+        // query_runtime only when there's NO ambient runtime —
         // calling `Builder::new_multi_thread().build()` from
         // inside another runtime panics with "Cannot start a
         // runtime from within a runtime". Web handlers,
@@ -130,7 +131,7 @@ impl Supertable {
         // working query_sql.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.sql_runtime().block_on(drive),
+            Err(_) => self.query_runtime().block_on(drive),
         }
     }
 
@@ -187,7 +188,7 @@ impl Supertable {
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.sql_runtime().block_on(drive),
+            Err(_) => self.query_runtime().block_on(drive),
         }
     }
 }
@@ -241,7 +242,7 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 /// don't surface predicates until after `MemTable` providers
 /// have built their partition list, so a pushdown-aware
 /// variant requires either a custom `TableProvider` (significant
-/// new code) or a pre-parse pass. M15c ships the "load all
+/// new code) or a pre-parse pass. Ships the "load all
 /// parts" SQL path; exact-term BM25 + prefix BM25 + vector
 /// queries get list-prune via their dedicated entry points.
 async fn build_mem_table(
@@ -251,7 +252,7 @@ async fn build_mem_table(
     disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
     tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 ) -> Result<MemTable, QueryError> {
-    // M15c: route through the hierarchical iterator when
+    // route through the hierarchical iterator when
     // the manifest has a persisted list (which includes
     // both eager + lazy modes). For in-process supertables
     // with no list, the fallback returns the flat
@@ -620,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_runtime_is_cached_across_calls() {
+    fn query_runtime_is_cached_across_calls() {
         // Two queries on the same supertable must share one
         // Runtime — the OnceLock guarantees this; we assert by
         // checking that both calls succeed without spawning a

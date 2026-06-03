@@ -632,7 +632,7 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
 }
 
 // Silence dead-code warnings on HashMap re-export — used by
-// downstream M2c work.
+// downstream work.
 #[allow(dead_code)]
 fn _hashmap_used() -> HashMap<String, FtsSummaryAgg> {
     HashMap::new()

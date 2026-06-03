@@ -70,7 +70,6 @@ async fn end_to_end_self_query_recovers_self() {
     normalize(&mut q_text);
     let hits = r
         .search("text_emb", &q_text, 5, 4, 5)
-        .await
         .expect("FTS search");
     assert_eq!(hits[0].0, target, "self should be top-1");
     // Cosine distance to self for unit-norm vector = 1 - 1 = 0.
@@ -91,7 +90,6 @@ async fn end_to_end_l2sq_self_query_distance_is_zero() {
         .collect();
     let hits = r
         .search("image_emb", &q_img, 3, 4, 5)
-        .await
         .expect("FTS search");
     assert_eq!(hits[0].0, target);
     // L2² of v with itself is exactly 0.
@@ -105,12 +103,12 @@ async fn end_to_end_multi_column_routing_isolated() {
 
     // text_emb is dim=16; querying with a dim=24 image vector must error.
     let v_img: Vec<f32> = vec![0.5; 24];
-    let err = r.search("text_emb", &v_img, 5, 4, 5).await;
+    let err = r.search("text_emb", &v_img, 5, 4, 5);
     assert!(err.is_err(), "dim mismatch must error");
 
     // And vice versa.
     let v_text: Vec<f32> = vec![0.5; 16];
-    let err = r.search("image_emb", &v_text, 5, 4, 5).await;
+    let err = r.search("image_emb", &v_text, 5, 4, 5);
     assert!(err.is_err());
 }
 
@@ -119,7 +117,7 @@ async fn end_to_end_top_k_limits_results() {
     let (blob, json) = build_two_column_blob(80);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
     let q: Vec<f32> = vec![0.3; 16];
-    let hits = r.search("text_emb", &q, 3, 4, 5).await.expect("FTS search");
+    let hits = r.search("text_emb", &q, 3, 4, 5).expect("FTS search");
     assert!(hits.len() <= 3);
 }
 
@@ -191,7 +189,7 @@ async fn end_to_end_planted_clusters_recovered() {
     // Query at exactly the first cluster's center → top-k should all
     // come from cluster 0.
     let q = centers[0].to_vec();
-    let hits = r.search("v", &q, 10, 3, 5).await.expect("FTS search");
+    let hits = r.search("v", &q, 10, 3, 5).expect("FTS search");
     assert!(!hits.is_empty());
     for (doc, _) in &hits {
         assert_eq!(
@@ -209,7 +207,6 @@ async fn end_to_end_results_sorted_by_distance() {
     let q = vec![0.5; 16];
     let hits = r
         .search("text_emb", &q, 10, 4, 5)
-        .await
         .expect("FTS search");
     for w in hits.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances ascending");

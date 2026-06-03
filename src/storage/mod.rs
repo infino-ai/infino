@@ -123,7 +123,7 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// Range-fetch. `range.end` is exclusive.
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 
-    /// Plan 013 M5 — fetch the last `len` bytes of `uri` AND
+    /// Tail-fetch path: — fetch the last `len` bytes of `uri` AND
     /// return the total object size from the same response.
     ///
     /// Lets cold-open callers (parquet footer / format trailer

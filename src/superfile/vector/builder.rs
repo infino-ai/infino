@@ -93,7 +93,7 @@ impl VectorConfig {
 /// the on-disk path. 256 MiB is a constant — independent of
 /// reservoir size or `n_cent` — so the worst-case pre-flush
 /// resident moment (`reservoir + spill_threshold`) stays linear
-/// in reservoir only and never compounds. Plan 010 design § "spill_threshold_bytes default".
+/// in reservoir only and never compounds. design § "spill_threshold_bytes default".
 const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Per-column build-time state. After 010 M3, the column holds
@@ -407,7 +407,7 @@ impl VectorBuilder {
 
     /// Streaming variant: write the final blob progressively to
     /// `w` without materialising it as a contiguous `Vec<u8>`.
-    /// Plan 010 M5.
+    /// M5.
     ///
     /// The output bytes (outer header, directory + dir CRC, each
     /// subsection, trailing outer CRC) are identical to those
@@ -816,7 +816,7 @@ fn build_subsection_streaming(
 
     // ---- Pass 3: stream buckets into the final subsection bytes ----
     //
-    // Plan 013 layout with main's streaming assembly: allocate the
+    // layout with main's streaming assembly: allocate the
     // subsection up front, write the open-time region, then per-
     // cluster bulk-read each bucket into `[codes_chunk | doc_ids_chunk
     // | full_chunk]` without a `full_layout` staging buffer.
@@ -827,7 +827,7 @@ fn build_subsection_streaming(
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
 
     // 6. Build the subsection bytes.
-    //    Plan 013 M1 subsection layout
+    //    subsection layout
     //    (see `format::vec::SUBSECTION_VERSION` for the spec):
     //
     //      [sub_header]
@@ -1243,7 +1243,7 @@ fn run_pass2(
         // amortises to ~one syscall per 64 KiB / 1 588 B ≈ 41
         // rows at dim=384), not by the in-process loop body.
         //
-        // Plan 012 M4: for `RerankCodec::RabitqOnly` we skip the per-row
+        // for `RerankCodec::RabitqOnly` we skip the per-row
         // fp32 vector write entirely — pass 3 doesn't materialise
         // `full_layout` for that codec, and the on-disk segment
         // has no `full[]` region, so spilling the vectors to a
@@ -1555,11 +1555,9 @@ mod tests {
             let query = &corpus[q * dim..(q + 1) * dim];
             let top_ram = r_ram
                 .search("v", query, 1, nprobe, rerank_mult)
-                .await
                 .expect("search ram");
             let top_spill = r_spill
                 .search("v", query, 1, nprobe, rerank_mult)
-                .await
                 .expect("search spill");
             // Both paths must return self as top-1 — that's the
             // strict recall invariant, independent of the
@@ -1693,7 +1691,6 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.13).sin()).collect();
         let hits = reader
             .search("v", &query, 5, n_cent, n_docs + 1)
-            .await
             .expect("kNN search");
         assert!(!hits.is_empty(), "search returned no hits");
     }

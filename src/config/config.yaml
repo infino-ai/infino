@@ -73,19 +73,19 @@ supertable:
   verify_crc_on_open: true
 
 # Persistent storage wiring. Defaults to in-memory-only. Set
-# `backend: s3` plus `s3_bucket` / `s3_prefix` to make
+# `backend: s3` plus `bucket` / `prefix` to make
 # SupertableOptions::apply_config attach an S3StorageProvider.
 #
 # Env overrides:
 #   INFINO_STORAGE__BACKEND=s3
-#   INFINO_STORAGE__S3_BUCKET=my-bucket
-#   INFINO_STORAGE__S3_PREFIX=tables/my-table
+#   INFINO_STORAGE__BUCKET=my-bucket
+#   INFINO_STORAGE__PREFIX=tables/my-table
 #   INFINO_STORAGE__DISK_CACHE_ROOT=/mnt/nvme/infino-cache
 storage:
   backend: none
   local_root:
-  s3_bucket:
-  s3_prefix: ""
+  bucket:
+  prefix: ""
 
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native

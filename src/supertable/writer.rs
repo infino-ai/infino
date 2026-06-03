@@ -721,7 +721,7 @@ impl SupertableWriter {
         };
         let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
-            Err(_) => self.inner.sql_runtime().block_on(drive)?,
+            Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
         Ok(OperationOutcome {
             wal_id: entry.wal_id,
@@ -794,7 +794,7 @@ impl SupertableWriter {
         };
         let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
-            Err(_) => self.inner.sql_runtime().block_on(drive)?,
+            Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
         Ok(OperationOutcome {
             wal_id: entry.wal_id,
@@ -993,7 +993,7 @@ fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
         .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
         .unwrap_or_default();
 
-    // Plan 013 M7 — capture the open-time batch bytes (parquet
+    // capture the open-time batch bytes (parquet
     // footer tail + vector open ranges + FTS open ranges) so the
     // reader can resolve a segment's open metadata straight from
     // the manifest part, issuing zero per-segment open GETs.
@@ -1214,7 +1214,8 @@ fn prepare_segment(
     let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
         for fc in &inner.options.fts_columns {
-            let terms = fts_reader.iter_column_terms(&fc.column);
+            let terms = fts_reader.iter_column_terms(&fc.column)
+                .expect("FST bytes valid: segment just built");
             let n_terms_distinct = terms.len() as u32;
             let (min_term, max_term) = match (terms.first(), terms.last()) {
                 (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -1244,7 +1245,7 @@ fn prepare_segment(
         }
     }
 
-    // Plan 013 M6 — capture `(total_size, vec_off/len, fts_off/len)`
+    // capture `(total_size, vec_off/len, fts_off/len)`
     // from the freshly-written bytes' parquet KV metadata. Caching
     // these on the manifest lets `DiskCacheStore::reader_with_hints`
     // fire the parquet-footer, vector, and FTS subsection GETs in
@@ -1454,7 +1455,7 @@ pub(in crate::supertable) fn persist_commit(
     // layer is async. Two cases:
     //
     // - **Sync caller** (no ambient tokio runtime): drive
-    //   the future on the supertable's owned `sql_runtime`
+    //   the future on the supertable's owned `query_runtime`
     //   (lazy-init the first time we hit this branch).
     // - **Async caller** (inside a tokio runtime): use the
     //   ambient runtime via `Handle::current().block_on`
@@ -1510,7 +1511,7 @@ pub(in crate::supertable) fn persist_commit(
     let (new_list, new_segment_list) = match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // Ambient tokio runtime present — use it. Don't
-            // touch `inner.sql_runtime()` so we don't risk
+            // touch `inner.query_runtime()` so we don't risk
             // dropping our owned runtime from within
             // another's worker context.
             tokio::task::block_in_place(|| handle.block_on(drive))?
@@ -1518,7 +1519,7 @@ pub(in crate::supertable) fn persist_commit(
         Err(_) => {
             // Sync caller; lazy-init the supertable's
             // owned runtime.
-            inner.sql_runtime().block_on(drive)?
+            inner.query_runtime().block_on(drive)?
         }
     };
 
@@ -1795,7 +1796,7 @@ async fn try_commit_attempt(
     Ok(new_list)
 }
 
-/// M15a — build one `ManifestPart` from `superfiles` + the
+/// build one `ManifestPart` from `superfiles` + the
 /// matching `ManifestListEntry`. Encodes the part once,
 /// content-hashes it, and computes the list-level aggregate
 /// skip summaries that `list_prune` reads at query time.
@@ -2041,11 +2042,11 @@ async fn put_segment_multipart(
     Ok(())
 }
 
-/// M14b.2 — drive `DiskCacheStore::insert_warm` for each
+/// Drive `DiskCacheStore::insert_warm` for each
 /// just-published segment via the same sync→async bridge
 /// the rest of the writer uses (`block_in_place +
 /// Handle::block_on` when an ambient runtime is present;
-/// `inner.sql_runtime()` otherwise).
+/// `inner.query_runtime()` otherwise).
 ///
 /// Failures are swallowed with an `eprintln!` log line —
 /// the superfiles are already durable in storage and the
@@ -2062,7 +2063,7 @@ fn warm_cache_after_commit(
         for (uri, bytes) in pending {
             if let Err(e) = cache.insert_warm(&uri, bytes).await {
                 eprintln!(
-                    "supertable: M14b.2 warm cache pre-population failed for {}: {} \
+                    "supertable: warm cache pre-population failed for {}: {} \
                      (segment is durable in storage; first query will cold-fetch)",
                     uri.0, e
                 );
@@ -2074,7 +2075,7 @@ fn warm_cache_after_commit(
             tokio::task::block_in_place(|| handle.block_on(drive));
         }
         Err(_) => {
-            inner.sql_runtime().block_on(drive);
+            inner.query_runtime().block_on(drive);
         }
     }
 }

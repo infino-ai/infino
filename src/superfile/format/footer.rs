@@ -58,7 +58,7 @@ pub enum FooterError {
     Arrow(#[from] arrow::error::ArrowError),
     #[error("malformed parquet: {0}")]
     Malformed(&'static str),
-    /// Plan 013 M4 — surfaces a `LazyByteSource` failure during
+    /// surfaces a `LazyByteSource` failure during
     /// async-tail footer reading. The string carries the upstream
     /// `LazyByteSourceError`'s `Display` so the chain is visible
     /// even after the layer translation.
@@ -211,7 +211,7 @@ pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
     extract_kv_map(&metadata)
 }
 
-/// Plan 013 M4 — read the decoded Parquet metadata from a
+/// read the decoded Parquet metadata from a
 /// superfile footer via a [`LazyByteSource`], bounded to
 /// **≤ 2 range GETs**:
 ///
@@ -229,7 +229,7 @@ pub async fn read_parquet_metadata_lazy(
     source: &dyn crate::superfile::LazyByteSource,
     tail_speculative_bytes: u64,
 ) -> Result<parquet::file::metadata::ParquetMetaData, FooterError> {
-    // Plan 013 M5 — route the parquet tail fetch through
+    // route the parquet tail fetch through
     // `LazyByteSource::tail`. On a `StorageRangeSource` with
     // unknown size this is a single suffix-range GET that
     // returns both the bytes AND the total object size, so
@@ -276,7 +276,7 @@ pub async fn read_parquet_metadata_lazy(
     ParquetMetaDataReader::decode_metadata(&footer_bytes).map_err(FooterError::from)
 }
 
-/// Plan 013 M4 — convenience wrapper around
+/// convenience wrapper around
 /// [`read_parquet_metadata_lazy`] for the common case where
 /// callers only need the `inf.*` KV map (e.g. tests + the eager
 /// open path mirroring the legacy [`read_kv_metadata`]).
@@ -469,7 +469,7 @@ mod tests {
         assert!(matches!(err, FooterError::Malformed(_)));
     }
 
-    /// Plan 013 M4 — counting lazy source used by the
+    /// counting lazy source used by the
     /// `read_kv_metadata_lazy` tests below. Records every
     /// `range()` invocation so the test can assert the
     /// speculative-tail vs. follow-up GET budget.
@@ -509,7 +509,7 @@ mod tests {
         }
     }
 
-    /// Plan 013 M4 — `read_kv_metadata_lazy` recovers the same
+    /// `read_kv_metadata_lazy` recovers the same
     /// KV map as the eager [`read_kv_metadata`] when the
     /// speculative tail (default 64 KiB) fully contains the
     /// Parquet footer. Range budget: **exactly 1 GET**.
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(eager, lazy, "lazy + eager KV maps must agree");
     }
 
-    /// Plan 013 M4 — when the speculative tail is too small to
+    /// when the speculative tail is too small to
     /// cover the footer, `read_kv_metadata_lazy` issues a
     /// **second** GET for the footer body. Total range budget:
     /// **exactly 2 GETs**. KV map still matches the eager path.

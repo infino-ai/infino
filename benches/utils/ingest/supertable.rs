@@ -145,11 +145,28 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
     for start in (0..N_DOCS).step_by(chunk_size) {
         let end = (start + chunk_size).min(N_DOCS);
         let len = end - start;
-        synth.fill_chunk(len, &mut titles, &mut flat);
+        // Generate only the columns this modality ingests so the bench
+        // process never holds (and the RSS sampler never counts) a corpus
+        // column the build doesn't consume.
+        synth.fill_chunk_modality(
+            len,
+            &mut titles,
+            &mut flat,
+            modality.has_text(),
+            modality.has_vector(),
+        );
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(2);
         if modality.has_text() {
             let title_arr: Vec<&str> = titles.iter().map(String::as_str).collect();
             columns.push(Arc::new(LargeStringArray::from(title_arr)));
+            // The arrow array now owns the only copy of the text. Drop the
+            // Vec<String> heap before append/commit so the long index-build
+            // phase (where the RSS sampler dwells) measures the production
+            // working set — arrow batch + writer + index — not the in-process
+            // synthetic-corpus generator, which a real server never holds (it
+            // receives the batch over the API).
+            titles.clear();
+            titles.shrink_to_fit();
         }
         if modality.has_vector() {
             let item_field = Arc::new(Field::new("item", DataType::Float32, true));
@@ -162,8 +179,6 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
             )
             .expect("FSL");
             columns.push(Arc::new(fsl));
-        } else {
-            flat.clear();
         }
         let batch = RecordBatch::try_new(schema.clone(), columns).expect("batch");
         w.append(&batch).expect("append");

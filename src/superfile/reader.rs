@@ -20,6 +20,7 @@
 use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
+use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::vector::reader::VectorReader;
 use arrow_array::Decimal128Array;
 use arrow_schema::Schema;
@@ -178,7 +179,7 @@ impl SuperfileReader {
                 .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?,
         );
 
-        // 4 + 5. Vector + FTS subsections — Plan 013 M5
+        // 4 + 5. Vector + FTS subsections — Tail-fetch path:
         //   fires both subsection fetches **concurrently** via
         //   `futures::try_join!`. The two subsections live at
         //   disjoint offsets (parquet body → fts → vec → footer
@@ -485,7 +486,6 @@ impl SuperfileReader {
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        use crate::superfile::fts::tokenize::Tokenizer as _;
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
         self.bm25_search_pretokenized(column, &term_refs, k, mode)
@@ -546,7 +546,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -615,7 +615,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -650,17 +650,19 @@ impl SuperfileReader {
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
     ///
-    /// Async — every per-range byte access routes through
-    /// [`crate::superfile::vector::reader::Source::range_async`] /
-    /// `get_ranges_parallel_async`, which `await` the underlying
-    /// `LazyByteSource::range` on the caller's tokio runtime. On
-    /// `Source::InMemory` and warm-cache `Source::Lazy`
-    /// (`BytesLazyByteSource`, mmap-backed) every fetch resolves
-    /// zero-copy without suspending; only cold `Source::Lazy`
-    /// misses actually hit the object store, and those run on the
-    /// owning runtime's reactor (no sync bridge, no throwaway
-    /// runtime), so object-store retries fire correctly.
-    pub async fn vector_search(
+    /// Sync — every public surface in `src/` is sync (plan 002 Q9).
+    /// Per-range byte access routes through
+    /// [`crate::superfile::lazy_source::Source::get_range`] /
+    /// `get_ranges_parallel`, which resolve zero-copy on the sync
+    /// fast path for `Source::InMemory` and warm-cache `Source::Lazy`
+    /// (`BytesLazyByteSource`, mmap-backed). Only a cold `Source::Lazy`
+    /// miss bridges to the underlying async `LazyByteSource::range`
+    /// internally. The supertable fan-out
+    /// ([`crate::supertable::handle::SupertableReader::vector_search`])
+    /// drives this on the `reader_pool` rayon threads, so per-segment
+    /// CPU (centroid + 1-bit code scoring, rerank) runs in one pool
+    /// with work-stealing rather than oversubscribing tokio workers.
+    pub fn vector_search(
         &self,
         column: &str,
         query: &[f32],
@@ -670,10 +672,7 @@ impl SuperfileReader {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(
-            v.search(column, query, k, options.nprobe, options.rerank_mult())
-                .await?,
-        )
+        Ok(v.search(column, query, k, options.nprobe, options.rerank_mult())?)
     }
 }
 
@@ -956,7 +955,6 @@ mod tests {
         normalize(&mut q);
         let hits = r
             .vector_search("emb", &q, 1, VectorSearchOptions::default())
-            .await
             .expect("vector search");
         assert!(!hits.is_empty());
     }
@@ -972,7 +970,6 @@ mod tests {
         normalize(&mut q);
         let hits = r
             .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
-            .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
     }

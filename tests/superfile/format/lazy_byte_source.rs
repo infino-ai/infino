@@ -88,8 +88,8 @@ async fn open_lazy_via_bytes_source_matches_open() {
     assert_eq!(lazy.fts_columns(), eager.fts_columns());
 
     // FTS terms identical between the two readers.
-    let lazy_terms = lazy.fts().expect("fts").iter_column_terms("title");
-    let eager_terms = eager.fts().expect("fts").iter_column_terms("title");
+    let lazy_terms = lazy.fts().expect("fts").iter_column_terms("title").expect("lazy terms");
+    let eager_terms = eager.fts().expect("fts").iter_column_terms("title").expect("eager terms");
     assert_eq!(lazy_terms, eager_terms);
 }
 

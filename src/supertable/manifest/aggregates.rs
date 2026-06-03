@@ -90,7 +90,7 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Scal
         }
         // Concat each side into a single Array, then take its
         // (min, max). Encode as length-1 Arrow IPC bytes (the
-        // M2b ScalarStatsAgg shape).
+        // ScalarStatsAgg shape).
         let combined_min = match concat_arrays(&mins) {
             Some(a) => a,
             None => continue,
@@ -203,7 +203,7 @@ fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 }
 
 /// Serialize a single length-1 ArrayRef as Arrow IPC bytes —
-/// matches the `ScalarStatsAgg.{min,max}` wire shape from M2b
+/// matches the `ScalarStatsAgg.{min,max}` wire shape
 /// (the per-summary encoding the manifest part carries; we
 /// mirror it at the list level so decoders are uniform).
 fn ipc_encode_length1(col_name: &str, arr: &ArrayRef) -> Vec<u8> {

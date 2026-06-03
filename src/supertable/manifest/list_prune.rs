@@ -530,7 +530,7 @@ mod tests {
             .scalar_stats_agg
             .get("ts")
             .expect("ts scalar agg present");
-        // IPC byte introspection is M2b's job; here we just
+        // IPC byte introspection is a separate concern; here we just
         // confirm presence + non-empty encoding.
         assert!(!s.min.is_empty(), "ts min IPC bytes must be non-empty");
         assert!(!s.max.is_empty(), "ts max IPC bytes must be non-empty");

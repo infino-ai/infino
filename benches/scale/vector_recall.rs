@@ -16,22 +16,16 @@
 //! `cargo bench --features bench-diagnostics --bench scale -- vector_recall`.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use arrow_array::{LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use bytes::Bytes;
 use infino::superfile::VectorSearchOptions;
-use infino::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
 use infino::superfile::reader::SuperfileReader;
-use infino::superfile::vector::distance::{Metric, distance, normalize};
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand_distr::{Distribution, StandardNormal};
+use infino::superfile::vector::distance::Metric;
+use infino_bench_utils::corpus::{
+    brute_force_topk, build_superfile_with_metric, generate_realistic_queries,
+    generate_vector_corpus, open_superfile,
+};
 
 const N_DOCS: usize = 10_000;
-const DIM: usize = 384;
 const N_CENT: usize = 64;
 const N_QUERIES: usize = 50;
 
@@ -44,94 +38,9 @@ fn search_blocking(
     futures::executor::block_on(reader.vector_search("emb", query, k, opts)).expect("vector_search")
 }
 
-fn generate_planted_corpus(seed: u64, normalize_each: bool) -> Vec<Vec<f32>> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let dist = StandardNormal;
-    let centers: Vec<Vec<f32>> = (0..N_CENT)
-        .map(|_| {
-            (0..DIM)
-                .map(|_| {
-                    let s: f64 = dist.sample(&mut rng);
-                    (s as f32) * 3.0
-                })
-                .collect()
-        })
-        .collect();
-
-    let mut corpus = Vec::with_capacity(N_DOCS);
-    for i in 0..N_DOCS {
-        let cluster = i % N_CENT;
-        let mut v: Vec<f32> = centers[cluster]
-            .iter()
-            .map(|&c| {
-                let s: f64 = dist.sample(&mut rng);
-                c + (s as f32) * 0.3
-            })
-            .collect();
-        if normalize_each {
-            normalize(&mut v);
-        }
-        corpus.push(v);
-    }
-    corpus
-}
-
-fn brute_force_top_k(corpus: &[Vec<f32>], query: &[f32], metric: Metric, k: usize) -> Vec<u32> {
-    let mut hits: Vec<(u32, f32)> = corpus
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u32, distance(metric, query, v)))
-        .collect();
-    hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    hits.into_iter().take(k).map(|(d, _)| d).collect()
-}
-
-fn build_superfile_reader(corpus: &[Vec<f32>], metric: Metric) -> SuperfileReader {
-    let _metric_str = match metric {
-        Metric::L2Sq => "l2sq",
-        Metric::Cosine => "cosine",
-        Metric::NegDot => "negdot",
-    };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("_id", DataType::Decimal128(38, 0), false),
-        Field::new("title", DataType::LargeUtf8, false),
-    ]));
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        "_id",
-        vec![],
-        vec![VectorConfig {
-            column: "emb".into(),
-            dim: DIM,
-            n_cent: N_CENT,
-            rot_seed: 7,
-            metric,
-            rerank_codec: RerankCodec::Fp32,
-        }],
-        None,
-    );
-    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-
-    let flat: Vec<f32> = corpus.iter().flatten().copied().collect();
-    let ids = arrow_array::Decimal128Array::from((0..corpus.len() as i128).collect::<Vec<_>>())
-        .with_precision_and_scale(38, 0)
-        .expect("decimal128");
-    let titles = LargeStringArray::from(
-        (0..corpus.len())
-            .map(|i| format!("doc {i}"))
-            .collect::<Vec<_>>(),
-    );
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
-        .expect("build RecordBatch");
-    b.add_batch(&batch, &[flat.as_slice()]).expect("add_batch");
-
-    let bytes = Bytes::from(b.finish().expect("finish builder"));
-    SuperfileReader::open(bytes).expect("open SuperfileReader")
-}
-
 fn measure_recall(
     reader: &SuperfileReader,
-    corpus: &[Vec<f32>],
+    vectors: &[f32],
     metric: Metric,
     queries: &[Vec<f32>],
     k: usize,
@@ -140,7 +49,7 @@ fn measure_recall(
     let opts = VectorSearchOptions::new().with_nprobe(nprobe);
     let mut total: f32 = 0.0;
     for q in queries {
-        let truth: HashSet<u32> = brute_force_top_k(corpus, q, metric, k)
+        let truth: HashSet<u32> = brute_force_topk(vectors, N_DOCS, q, metric, k)
             .into_iter()
             .collect();
         let approx: HashSet<u32> = search_blocking(reader, q, k, opts)
@@ -153,45 +62,31 @@ fn measure_recall(
     total / (queries.len() as f32)
 }
 
-fn build_query_set(corpus: &[Vec<f32>], seed: u64, normalize_each: bool) -> Vec<Vec<f32>> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let dist = StandardNormal;
-    let mut queries = Vec::with_capacity(N_QUERIES);
-    for i in 0..N_QUERIES {
-        let base = &corpus[(i * 173) % corpus.len()];
-        let mut q: Vec<f32> = base
-            .iter()
-            .map(|&v| {
-                let s: f64 = dist.sample(&mut rng);
-                v + (s as f32) * 0.05
-            })
-            .collect();
-        if normalize_each {
-            normalize(&mut q);
-        }
-        queries.push(q);
-    }
-    queries
+fn build_fixture(seed: u64, normalize_each: bool, metric: Metric) -> (Vec<f32>, SuperfileReader) {
+    let vectors = generate_vector_corpus(N_DOCS, N_CENT, seed, normalize_each);
+    let docs: Vec<String> = (0..N_DOCS).map(|i| format!("doc {i}")).collect();
+    let bytes = build_superfile_with_metric(&docs, &vectors, N_CENT, metric);
+    let reader = open_superfile(bytes);
+    (vectors, reader)
 }
 
 fn recall_l2sq_at_10k_dim384_meets_threshold() {
-    let corpus = generate_planted_corpus(1, false);
-    let reader = build_superfile_reader(&corpus, Metric::L2Sq);
-    let queries = build_query_set(&corpus, 100, false);
+    let (vectors, reader) = build_fixture(1, false, Metric::L2Sq);
+    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 100, false, 0.05);
 
-    let r10 = measure_recall(&reader, &corpus, Metric::L2Sq, &queries, 10, 8);
+    let r10 = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, 8);
     assert!(
         r10 >= 0.90,
         "L2Sq recall@10 at nprobe=8 below threshold: {r10:.3} < 0.90"
     );
 
-    let r10_high = measure_recall(&reader, &corpus, Metric::L2Sq, &queries, 10, 32);
+    let r10_high = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, 32);
     assert!(
         r10_high >= 0.95,
         "L2Sq recall@10 at nprobe=32 below threshold: {r10_high:.3} < 0.95"
     );
 
-    let r1 = measure_recall(&reader, &corpus, Metric::L2Sq, &queries, 1, 8);
+    let r1 = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 1, 8);
     assert!(
         r1 >= 0.95,
         "L2Sq recall@1 at nprobe=8 below threshold: {r1:.3} < 0.95"
@@ -203,17 +98,16 @@ fn recall_l2sq_at_10k_dim384_meets_threshold() {
 }
 
 fn recall_cosine_at_10k_dim384_meets_threshold() {
-    let corpus = generate_planted_corpus(2, true);
-    let reader = build_superfile_reader(&corpus, Metric::Cosine);
-    let queries = build_query_set(&corpus, 200, true);
+    let (vectors, reader) = build_fixture(2, true, Metric::Cosine);
+    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 200, true, 0.05);
 
-    let r10 = measure_recall(&reader, &corpus, Metric::Cosine, &queries, 10, 8);
+    let r10 = measure_recall(&reader, &vectors, Metric::Cosine, &queries, 10, 8);
     assert!(
         r10 >= 0.90,
         "Cosine recall@10 at nprobe=8 below threshold: {r10:.3} < 0.90"
     );
 
-    let r10_high = measure_recall(&reader, &corpus, Metric::Cosine, &queries, 10, 32);
+    let r10_high = measure_recall(&reader, &vectors, Metric::Cosine, &queries, 10, 32);
     assert!(
         r10_high >= 0.95,
         "Cosine recall@10 at nprobe=32 below threshold: {r10_high:.3} < 0.95"
@@ -223,13 +117,12 @@ fn recall_cosine_at_10k_dim384_meets_threshold() {
 }
 
 fn recall_increases_monotonically_with_nprobe() {
-    let corpus = generate_planted_corpus(3, false);
-    let reader = build_superfile_reader(&corpus, Metric::L2Sq);
-    let queries = build_query_set(&corpus, 300, false);
+    let (vectors, reader) = build_fixture(3, false, Metric::L2Sq);
+    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 300, false, 0.05);
 
     let mut prev: f32 = -1.0;
     for &nprobe in &[1, 2, 4, 8, 16, 32, 64] {
-        let r = measure_recall(&reader, &corpus, Metric::L2Sq, &queries, 10, nprobe);
+        let r = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, nprobe);
         assert!(
             r >= prev - 0.02,
             "recall regressed with more nprobe: nprobe={nprobe}, recall={r:.3}, prev={prev:.3}"

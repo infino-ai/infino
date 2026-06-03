@@ -197,7 +197,7 @@ fn assert_infino_self_consistent(reader: &SuperfileReader) -> f32 {
     let mut total_recall = 0.0_f32;
     for (q, truth) in qs.iter().zip(gt.iter()) {
         let hits = corpus::block_on_inmem(async {
-            reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await
+            reader.vector_search(VEC_COLUMN, q, TOP_K, opts)
         })
         .expect("vector_search");
         assert_eq!(
@@ -310,9 +310,7 @@ fn bench(c: &mut Criterion) {
                     let q = &qs[0];
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader
-                                .vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
-                                .await
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -327,9 +325,7 @@ fn bench(c: &mut Criterion) {
         g.bench_function("infino_default_options_top10", |b| {
             b.iter(|| {
                 let hits = corpus::block_on_inmem(async {
-                    reader
-                        .vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts)
-                        .await
+                    reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts)
                 })
                 .expect("vector_search");
                 black_box(hits)
@@ -349,9 +345,7 @@ fn bench(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader
-                                .vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
-                                .await
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -369,9 +363,7 @@ fn bench(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader
-                                .vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
-                                .await
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -444,7 +436,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                             .await;
                         let _ = reader
                             .vector_search(VEC_COLUMN, &query, TOP_K, opts)
-                            .await
                             .expect("warm prewarm search");
                     });
                     let cache_ref = Arc::clone(&cache);
@@ -455,7 +446,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                                 let reader = cache_ref.reader(&uri).await.expect("warm reader");
                                 reader
                                     .vector_search(VEC_COLUMN, &query, TOP_K, opts)
-                                    .await
                                     .expect("vector_search")
                             });
                             black_box(hits)
@@ -479,7 +469,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                                     let reader = cache.reader(&uri).await.expect("cold reader");
                                     let _ = reader
                                         .vector_search(VEC_COLUMN, &query, TOP_K, opts)
-                                        .await
                                         .expect("cold vector_search");
                                 });
                                 total += t0.elapsed();
@@ -513,7 +502,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                             let reader = cache_ref.reader(&uri).await.expect("reader");
                             reader
                                 .vector_search(VEC_COLUMN, &query, TOP_K, default_opts)
-                                .await
                                 .expect("vector_search")
                         });
                         black_box(hits)
@@ -536,7 +524,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                                 let reader = cache.reader(&uri).await.expect("reader");
                                 let _ = reader
                                     .vector_search(VEC_COLUMN, &query, TOP_K, default_opts)
-                                    .await
                                     .expect("vector_search");
                             });
                             total += t0.elapsed();
@@ -712,7 +699,7 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     let opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
     let t0 = Instant::now();
     let _ =
-        corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
+        corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
             .expect("vector_search");
     let first_q_elapsed = t0.elapsed();
 

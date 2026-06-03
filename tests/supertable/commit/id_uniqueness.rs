@@ -184,7 +184,6 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
     let reader = consumer.reader();
     let segs = &reader.manifest().superfile_list.superfiles;

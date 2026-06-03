@@ -99,7 +99,7 @@ pub fn decode_partition_key(
 ///   one boundary interval. Spans → `SuperfileSpansPartition`.
 ///
 /// The `n_buckets == 1` Hash short-circuit is critical for
-/// backward compatibility: the M15a default partition
+/// backward compatibility: the default partition
 /// strategy (when nothing's configured) is
 /// `Hash { id_column, n_buckets: 1 }`, and the existing
 /// writer path doesn't yet pre-shard — so the hint is None.
@@ -175,7 +175,7 @@ pub fn assign_partition(
             column: _,
             boundaries: _,
         } => Err(CommitError::SuperfileSpansPartition {
-            detail: "ColumnRange partition assignment lands in M15a follow-up; \
+            detail: "ColumnRange partition assignment lands in a follow-up; \
                      no writer currently emits ColumnRange-partitioned commits"
                 .into(),
         }),
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn assign_partition_hash_single_bucket_short_circuits() {
         // n_buckets=1 → always bucket 0, no partition_hint needed.
-        // This is the M15a default; tests rely on it staying
+        // This is the default; tests rely on it staying
         // hint-less.
         let strategy = PartitionStrategy::Hash {
             column: "_id".into(),
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn assign_partition_column_range_is_not_yet_supported() {
         // The implementation explicitly bails on ColumnRange until
-        // M15a follow-up. Locking the message keeps it visible
+        // Follow-up. Locking the message keeps it visible
         // when the follow-up lands.
         let strategy = PartitionStrategy::ColumnRange {
             column: "_id".into(),

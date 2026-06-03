@@ -353,7 +353,7 @@ pub struct SuperfileEntry {
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
     pub partition_hint: Option<u32>,
-    /// Plan 013 M6 — precomputed superfile layout offsets so the
+    /// precomputed superfile layout offsets so the
     /// cold-open path can fire the parquet-footer, vector
     /// subsection, and FTS subsection GETs **in parallel** in a
     /// single round-trip, without first reading the parquet KV
@@ -371,7 +371,7 @@ pub struct SuperfileEntry {
     pub subsection_offsets: Option<SubsectionOffsets>,
 }
 
-/// Plan 013 M6 — superfile layout offsets cached on the manifest.
+/// superfile layout offsets cached on the manifest.
 ///
 /// Knowing these up-front lets the cold-open path issue every
 /// subsection GET in parallel against the same superfile object,
@@ -404,7 +404,7 @@ pub struct SubsectionOffsets {
     /// header+dictionary and doc-length tables. Query-time postings
     /// stay lazy.
     pub fts_open_ranges: Vec<(u64, u64)>,
-    /// Plan 013 M7 — the actual bytes covering the segment's
+    /// the actual bytes covering the segment's
     /// open-time batch (parquet footer tail + the
     /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
     /// in the manifest part.

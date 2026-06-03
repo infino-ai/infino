@@ -53,6 +53,8 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::error::QueryError;
@@ -75,7 +77,11 @@ impl SupertableReader {
     ///
     /// Empty supertable (no superfiles) and `k == 0` short-circuit
     /// to an empty `Vec`.
-    pub async fn vector_search(
+    ///
+    /// `pub(crate)` async kernel — the public surface is the sync
+    /// [`Supertable::vector_search`], which drives this via the
+    /// sync→async bridge after applying the read-consistency policy.
+    pub(crate) async fn vector_search(
         &self,
         column: &str,
         query: &[f32],
@@ -126,51 +132,77 @@ impl SupertableReader {
         // segment-level skip must compare a real lower bound
         // against the running k-th best distance; a static
         // heuristic cutoff is wrong. Correct first, fast second.
-        let query_arc = Arc::new(query.to_vec());
-        let column_arc = Arc::new(column.to_owned());
-
-        // Diagnostic (`INFINO_FANOUT_TIMING=1`): collect per-segment
-        // open + search wall so we can compare the slowest single
-        // segment against the total fan-out wall. If total ≈ max
-        // single-segment, the fan-out is parallel and the cost is
-        // throughput; if total ≫ max single-segment, parallelism is
-        // being lost. Zero overhead when the env is unset.
-        let timing: Option<Arc<std::sync::Mutex<Vec<(u64, u64)>>>> = if fanout_timing_enabled() {
-            Some(Arc::new(std::sync::Mutex::new(Vec::with_capacity(
-                superfiles.len(),
-            ))))
-        } else {
-            None
-        };
+        //
+        // Fan-out is split by concern, mirroring the SQL resolve
+        // path (`query::exec::common`):
+        //   1. **Open** every kept segment's reader **concurrently**
+        //      on the tokio runtime — opens are async I/O (in-memory
+        //      cache hits / disk-cache cold fetches), so overlapping
+        //      them wide is the right model and warm opens cost
+        //      microseconds.
+        //   2. **Search** every segment **in parallel** on
+        //      `options.reader_pool` (rayon). The per-segment kNN
+        //      search is CPU-bound over resident bytes on the hot
+        //      path (centroid + 1-bit code scoring, then rerank);
+        //      driving it on the reader pool keeps ALL per-segment
+        //      CPU in one work-stealing pool instead of
+        //      oversubscribing the tokio workers with the inner
+        //      `par_iter` on the global pool. Bridged back to the
+        //      async caller via a oneshot so no runtime worker is
+        //      blocked. Cold lazy misses inside the search bridge
+        //      through `Source::get_range` internally.
         let fanout_t0 = std::time::Instant::now();
-
-        let handles: Vec<_> = superfiles
-            .iter()
-            .map(|entry| {
-                spawn_segment_search(
-                    &store,
-                    &disk_cache,
-                    &column_arc,
-                    &query_arc,
-                    entry,
-                    k,
-                    options,
-                    timing.clone(),
-                    tombstone_cache.clone(),
-                    now,
-                )
-            })
-            .collect();
-
-        let results: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
-            handles
-                .into_iter()
-                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
+        let open_t0 = std::time::Instant::now();
+        let opened: Vec<Arc<SuperfileReader>> = futures::future::try_join_all(
+            superfiles
+                .iter()
+                .map(|entry| open_reader(&store, disk_cache.as_ref(), entry)),
         )
         .await?;
+        let open_us = open_t0.elapsed().as_micros() as u64;
 
-        if let Some(timing) = &timing {
-            summarize_fanout_timing(timing, fanout_t0.elapsed().as_micros() as u64);
+        // Pure-CPU phase on the reader pool. `into_par_iter`'s ordered
+        // collect preserves segment order, so `per_segment[i]` lines up
+        // with `superfiles[i]` for the post-phase tombstone filter.
+        let pool = Arc::clone(&manifest.options.reader_pool);
+        let column_owned = column.to_owned();
+        let query_owned = query.to_vec();
+        let timing_enabled = fanout_timing_enabled();
+        let inputs: Vec<Arc<SuperfileReader>> = opened;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pool.spawn(move || {
+            let result: Result<Vec<(Vec<(u32, f32)>, u64)>, QueryError> = inputs
+                .into_par_iter()
+                .map(|reader| {
+                    let search_t0 = std::time::Instant::now();
+                    let hits = reader
+                        .vector_search(&column_owned, &query_owned, k, options)
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    Ok((hits, search_t0.elapsed().as_micros() as u64))
+                })
+                .collect();
+            let _ = tx.send(result);
+        });
+        let per_segment = rx
+            .await
+            .map_err(|_| QueryError::Store("vector fan-out: reader pool dropped result".into()))??;
+
+        // Tombstone filtering stays on the tokio side: a cache miss
+        // refreshes the sidecar from storage (blocking I/O via the
+        // sync→async bridge), which does not belong on the CPU pool.
+        // On the hot path every `bitmap_for` is a cache hit, so this
+        // is a cheap serial pass over the already-scored segments.
+        let mut results: Vec<Vec<SuperfileHit>> = Vec::with_capacity(per_segment.len());
+        let mut searches: Vec<u64> = Vec::with_capacity(per_segment.len());
+        for (entry, (hits, search_us)) in superfiles.iter().zip(per_segment) {
+            let mut tagged = tag_hits(entry.as_ref(), hits);
+            apply_tombstone_filter(tombstone_cache.as_ref(), entry.as_ref(), &mut tagged, now)?;
+            results.push(tagged);
+            searches.push(search_us);
+        }
+
+        if timing_enabled {
+            summarize_fanout_timing(open_us, &searches, fanout_t0.elapsed().as_micros() as u64);
         }
 
         Ok(top_k_ascending(results, k))
@@ -195,48 +227,10 @@ impl Supertable {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.ensure_fresh();
         let reader = self.reader();
         self.block_on_query(reader.vector_search(column, query, k, options))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_segment_search(
-    store: &Arc<dyn SuperfileReaderCache>,
-    disk_cache: &Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
-    column: &Arc<String>,
-    query: &Arc<Vec<f32>>,
-    entry: &Arc<SuperfileEntry>,
-    k: usize,
-    options: VectorSearchOptions,
-    timing: Option<Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
-    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-    now: std::time::Instant,
-) -> tokio::task::JoinHandle<Result<Vec<SuperfileHit>, QueryError>> {
-    let store = Arc::clone(store);
-    let disk_cache = disk_cache.clone();
-    let column = Arc::clone(column);
-    let query = Arc::clone(query);
-    let entry = Arc::clone(entry);
-    tokio::spawn(async move {
-        let open_t0 = std::time::Instant::now();
-        let r = open_reader(&store, disk_cache.as_ref(), &entry).await?;
-        let open_us = open_t0.elapsed().as_micros() as u64;
-        let search_t0 = std::time::Instant::now();
-        let hits = r
-            .vector_search(&column, &query, k, options)
-            .await
-            .map_err(|e| QueryError::Parquet(e.to_string()))?;
-        if let Some(timing) = &timing {
-            let search_us = search_t0.elapsed().as_micros() as u64;
-            if let Ok(mut g) = timing.lock() {
-                g.push((open_us, search_us));
-            }
-        }
-        let mut tagged = tag_hits(&entry, hits);
-        apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
-        Ok(tagged)
-    })
 }
 
 /// `INFINO_FANOUT_TIMING=1` enables per-segment fan-out timing.
@@ -249,48 +243,41 @@ fn fanout_timing_enabled() -> bool {
     })
 }
 
-/// Print the per-segment open/search wall distribution next to the
-/// total fan-out wall. The key ratio is `total / max(open+search)`:
-/// ~1.0 means the fan-out is fully parallel (cost is throughput /
-/// the slowest segment); ≫1.0 means concurrency is being lost.
-fn summarize_fanout_timing(timing: &std::sync::Mutex<Vec<(u64, u64)>>, total_us: u64) {
-    let Ok(g) = timing.lock() else { return };
-    let n = g.len();
+/// Print the aggregate open wall + per-segment search wall
+/// distribution next to the total fan-out wall. With the
+/// two-phase fan-out (concurrent opens on tokio, then parallel
+/// search on the reader pool) the key signal is `total /
+/// (open + max_search)`: ~1.0 means the search phase is fully
+/// parallel (cost is the slowest segment); ≫1.0 means the reader
+/// pool is serializing the per-segment CPU.
+fn summarize_fanout_timing(open_us: u64, search_us: &[u64], total_us: u64) {
+    let n = search_us.len();
     if n == 0 {
         eprintln!("[fanout-timing] no segments recorded; total={total_us}us");
         return;
     }
-    let mut combined: Vec<u64> = g.iter().map(|&(o, s)| o + s).collect();
-    let mut searches: Vec<u64> = g.iter().map(|&(_, s)| s).collect();
-    let mut opens: Vec<u64> = g.iter().map(|&(o, _)| o).collect();
-    combined.sort_unstable();
+    let mut searches: Vec<u64> = search_us.to_vec();
     searches.sort_unstable();
-    opens.sort_unstable();
     let pct = |v: &[u64], p: f64| -> u64 {
         let idx = (((v.len() - 1) as f64) * p).round() as usize;
         v[idx]
     };
-    let max_combined = combined.last().copied().unwrap_or(0);
-    let ratio = total_us as f64 / max_combined.max(1) as f64;
+    let max_search = searches.last().copied().unwrap_or(0);
+    let ratio = total_us as f64 / (open_us + max_search).max(1) as f64;
     eprintln!(
-        "[fanout-timing] n_seg={n} total={:.1}ms | per-seg open+search: \
-         p50={:.1} p90={:.1} max={:.1}ms (opens: p50={:.1} max={:.1}ms; \
-         searches: p50={:.1} p90={:.1} max={:.1}ms) | total/max_seg={:.1}x  \
-         ({})",
+        "[fanout-timing] n_seg={n} total={:.1}ms | opens(concurrent)={:.1}ms | \
+         per-seg search: p50={:.1} p90={:.1} max={:.1}ms | \
+         total/(open+max_search)={:.1}x  ({})",
         total_us as f64 / 1000.0,
-        pct(&combined, 0.5) as f64 / 1000.0,
-        pct(&combined, 0.9) as f64 / 1000.0,
-        max_combined as f64 / 1000.0,
-        pct(&opens, 0.5) as f64 / 1000.0,
-        opens.last().copied().unwrap_or(0) as f64 / 1000.0,
+        open_us as f64 / 1000.0,
         pct(&searches, 0.5) as f64 / 1000.0,
         pct(&searches, 0.9) as f64 / 1000.0,
-        searches.last().copied().unwrap_or(0) as f64 / 1000.0,
+        max_search as f64 / 1000.0,
         ratio,
         if ratio <= 1.5 {
-            "PARALLEL: cost is throughput/slowest-segment"
+            "PARALLEL: cost is open + slowest-segment search"
         } else {
-            "SERIALIZED: concurrency is being lost"
+            "SERIALIZED: reader-pool search is being serialized"
         },
     );
 }
@@ -667,7 +654,6 @@ mod tests {
 
         let oracle_hits = oracle
             .vector_search("emb", &q, 2, opts)
-            .await
             .expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();

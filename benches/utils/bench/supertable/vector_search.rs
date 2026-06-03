@@ -42,7 +42,7 @@ fn mean_recall(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = tiers::block_on(vector_topk_global(st, q, TOP_K, options));
+        let hits = vector_topk_global(st, q, TOP_K, options);
         let truth_set: std::collections::HashSet<u32> = t.iter().copied().collect();
         let recall = if t.is_empty() {
             1.0
@@ -70,7 +70,7 @@ fn measure_p50_micros(st: &Supertable, query: &[f32], options: VectorSearchOptio
     let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
     for _ in 0..CALIBRATION_P50_ITERS {
         let t0 = Instant::now();
-        let _ = tiers::block_on(vector_topk_global(st, query, TOP_K, options));
+        let _ = vector_topk_global(st, query, TOP_K, options);
         samples.push(t0.elapsed().as_secs_f32() * 1e6);
     }
     samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -186,17 +186,20 @@ pub fn bench(c: &mut Criterion) {
         "[supertable_vec] correctness OK: vector recall@{TOP_K} = {recall:.3} (≥ {CORRECTNESS_RECALL_FLOOR:.2})"
     );
 
-    eprintln!("[supertable_vec] warming cache: triggering background fills for all segments...");
+    // Warm the shared in-process cache the way a real client does: by
+    // serving queries through the public API. No internal warm hook —
+    // production has none. A broad nprobe sweep over the correctness
+    // queries pulls every segment's data into the disk cache before we
+    // measure the hot tier (and calibration below adds many more reads).
+    eprintln!("[supertable_vec] warming cache by serving queries (public API)...");
     let warm_t0 = Instant::now();
-    tiers::block_on(async {
-        let opts = VectorSearchOptions::new().with_nprobe(CORRECTNESS_NPROBE);
-        let _ = vector_topk_global(st, &g.correctness_queries[0], TOP_K, opts).await;
-        st.wait_until_warm(Duration::from_secs(600))
-            .await
-            .expect("cache warm-up before calibration");
-    });
+    let warm_opts = VectorSearchOptions::new().with_nprobe(CORRECTNESS_NPROBE);
+    for query in g.correctness_queries.iter() {
+        let _ = vector_topk_global(st, query, TOP_K, warm_opts);
+    }
     eprintln!(
-        "[supertable_vec] cache warm in {:.1}s — all segments mmap-promoted",
+        "[supertable_vec] cache warmed via {} queries in {:.1}s",
+        g.correctness_queries.len(),
         warm_t0.elapsed().as_secs_f32()
     );
 
@@ -215,7 +218,7 @@ pub fn bench(c: &mut Criterion) {
                 let q = &qs[0];
                 let opts = VectorSearchOptions::new().with_nprobe(p);
                 b.iter(|| {
-                    let hits = tiers::block_on(vector_topk_global(st, black_box(q), TOP_K, opts));
+                    let hits = vector_topk_global(st, black_box(q), TOP_K, opts);
                     black_box(hits)
                 });
             });
@@ -241,116 +244,76 @@ fn bench_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32
     let storage_label = fixture::storage_label();
     let idx_bytes = Some(fixture::total_index_bytes());
 
-    for tier in [Tier::Warm, Tier::Cold] {
-        let mut g = c.benchmark_group(tiers::search_group_name(
-            "supertable_vec",
-            tier,
-            Some(storage_label),
-        ));
-        g.sample_size(10);
-        if tier == Tier::Cold {
-            g.measurement_time(Duration::from_secs(30));
-        }
+    // Cold tier only against object storage. The mmap-promoted "warm"
+    // tier was dropped: nothing is pinned in memory, so its latency is
+    // indistinguishable from the in-process hot tier measured above, and
+    // it was the sole reason the bench reached for an internal warm hook.
+    let tier = Tier::Cold;
+    let mut g = c.benchmark_group(tiers::search_group_name(
+        "supertable_vec",
+        tier,
+        Some(storage_label),
+    ));
+    g.sample_size(10);
+    g.measurement_time(Duration::from_secs(30));
 
-        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            let Some(c_st) = cal.supertable[i] else {
-                continue;
-            };
-            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
-            let p = c_st.probe;
-            let opts = VectorSearchOptions::new().with_nprobe(p);
-            let bench_id = format!("supertable_{label}");
+    for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+        let Some(c_st) = cal.supertable[i] else {
+            continue;
+        };
+        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        let p = c_st.probe;
+        let opts = VectorSearchOptions::new().with_nprobe(p);
+        let bench_id = format!("supertable_{label}");
 
-            match tier {
-                Tier::Warm => {
-                    let storage = fixture::storage();
+        let storage = fixture::storage();
+        let query = q.clone();
+        g.bench_function(&bench_id, |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
                     let (cache_dir, cache) =
-                        tiers::fresh_supertable_search_cache(storage.clone(), idx_bytes);
+                        tiers::fresh_supertable_search_cache(Arc::clone(&storage), idx_bytes);
                     let consumer_opts = tiers::consumer_options(
                         supertable::combined_options(None),
-                        storage,
+                        Arc::clone(&storage),
                         cache.clone(),
                     );
-                    let st = tiers::block_on(tiers::open_consumer(consumer_opts));
-                    let query = q.clone();
-                    tiers::block_on(async {
-                        let _ = vector_topk_global(&st, &query, TOP_K, opts).await;
-                        st.wait_until_warm(Duration::from_secs(600))
-                            .await
-                            .expect("supertable warm promotion");
-                    });
-                    g.bench_function(&bench_id, |b| {
-                        let query = q.clone();
-                        b.iter(|| {
-                            let hits = tiers::block_on(vector_topk_global(
-                                &st,
-                                black_box(&query),
-                                TOP_K,
-                                opts,
-                            ));
-                            black_box(hits)
-                        });
-                    });
+                    // COLD TIER = "first query after the reader is up, before
+                    // any segment data is cached." It must NOT include the
+                    // manifest open.
+                    //
+                    // Why: `Supertable::open()` reads the manifest from object
+                    // storage exactly once and pins it in memory behind an
+                    // `ArcSwap<Manifest>` for the life of the reader. Every
+                    // subsequent query reuses that in-memory manifest via an
+                    // Arc clone — zero object-store access. So in production the
+                    // manifest read is a one-time, process-lifetime cost, never
+                    // a per-query cost.
+                    //
+                    // Each iteration still gets a FRESH disk cache (above), which
+                    // is what legitimately makes the segment *data* cold — the
+                    // query below must range-GET codes/doc_ids/vectors from S3.
+                    // We open the consumer (one-time manifest read) OUTSIDE the
+                    // timed region and start the clock only around the query, so
+                    // the number reflects a real cold per-query latency rather
+                    // than a benchmark artifact of re-opening the table every
+                    // iteration. open + query are both public API; we only move
+                    // where the timer starts.
+                    let st = tiers::open_consumer(consumer_opts);
+                    let t0 = Instant::now();
+                    let _ = vector_topk_global(&st, &query, TOP_K, opts);
+                    let elapsed = t0.elapsed();
+                    total += elapsed;
                     drop(st);
                     drop(cache);
                     drop(cache_dir);
                 }
-                Tier::Cold => {
-                    let storage = fixture::storage();
-                    let query = q.clone();
-                    g.bench_function(&bench_id, |b| {
-                        b.iter_custom(|iters| {
-                            let mut total = Duration::ZERO;
-                            for _ in 0..iters {
-                                let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
-                                    Arc::clone(&storage),
-                                    idx_bytes,
-                                );
-                                let consumer_opts = tiers::consumer_options(
-                                    supertable::combined_options(None),
-                                    Arc::clone(&storage),
-                                    cache.clone(),
-                                );
-                                // COLD TIER = "first query after the reader is up, before
-                                // any segment data is cached." It must NOT include the
-                                // manifest open.
-                                //
-                                // Why: `Supertable::open()` reads the manifest from object
-                                // storage exactly once and pins it in memory behind an
-                                // `ArcSwap<Manifest>` for the life of the reader. Every
-                                // subsequent query (`reader()` -> `vector_search`) reuses
-                                // that in-memory manifest via an Arc clone — zero object-store
-                                // access. So in production the manifest read is a one-time,
-                                // process-lifetime cost, never a per-query cost.
-                                //
-                                // Each iteration still gets a FRESH disk cache (above), which
-                                // is what legitimately makes the segment *data* cold — the
-                                // query below must range-GET codes/doc_ids/vectors from S3.
-                                // We open the consumer (one-time manifest read) OUTSIDE the
-                                // timed region and start the clock only around the query, so
-                                // the number reflects a real cold per-query latency rather
-                                // than a benchmark artifact of re-opening the table every
-                                // iteration. No internals are touched — open + query are both
-                                // public API; we only move where the timer starts.
-                                let elapsed = tiers::block_on(async {
-                                    let st = tiers::open_consumer(consumer_opts).await;
-                                    let t0 = Instant::now();
-                                    let _ = vector_topk_global(&st, &query, TOP_K, opts).await;
-                                    t0.elapsed()
-                                });
-                                total += elapsed;
-                                drop(cache);
-                                drop(cache_dir);
-                            }
-                            total
-                        });
-                    });
-                }
-                Tier::Hot => {}
-            }
-        }
-        g.finish();
+                total
+            });
+        });
     }
+    g.finish();
 }
 
 fn emit_markdown(cal: &Calibrations) {
@@ -364,27 +327,26 @@ fn emit_markdown(cal: &Calibrations) {
         crate::corpus::DIM
     ));
     body.push_str(
-        "Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`); warm waits for mmap promotion.\n\n",
+        "hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open. The mmap-promoted \"warm\" tier was dropped: nothing is pinned in memory, so it measured identically to hot.\n\n",
     );
     body.push_str(
-        "| Recall target | (p/seg, r) | hot | warm | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+        "| Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|---------------|------------|-----|------|------|----------|------------|---------|------------|\n",
+        "|---------------|------------|-----|------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
         let bid = format!("supertable_{label}");
-        let (cell, hot, warm, cold, rss_cell, median_rss, p90_rss, rss_delta) =
+        let (cell, hot, cold, rss_cell, median_rss, p90_rss, rss_delta) =
             match cal.supertable[i] {
                 Some(c) => {
                     let peak = rss::read_peak_rss_bytes(group, &bid);
                     (
                         format!("(p={}, r={})", c.probe, c.refine),
                         read_mean_ns(group, &bid),
-                        markdown::read_tier_mean_ns("supertable_vec", "warm", &bid),
                         markdown::read_tier_mean_ns("supertable_vec", "cold", &bid),
                         peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into()),
                         rss::fmt_median_rss(group, &bid),
@@ -396,7 +358,6 @@ fn emit_markdown(cal: &Calibrations) {
                     "—".into(),
                     None,
                     None,
-                    None,
                     "—".into(),
                     "—".into(),
                     "—".into(),
@@ -404,9 +365,8 @@ fn emit_markdown(cal: &Calibrations) {
                 ),
             };
         body.push_str(&format!(
-            "| {row_target} | {cell} | {} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
+            "| {row_target} | {cell} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
             hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
             cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }

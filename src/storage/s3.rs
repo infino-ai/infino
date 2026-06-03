@@ -292,7 +292,7 @@ impl StorageProvider for S3StorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    /// Plan 013 M5 — single-RTT tail fetch via S3's native
+    /// Tail-fetch path: — single-RTT tail fetch via S3's native
     /// `Range: bytes=-len` suffix-range form. The response
     /// carries the total object size in `GetResult::meta.size`,
     /// so callers don't need a separate HEAD round-trip just

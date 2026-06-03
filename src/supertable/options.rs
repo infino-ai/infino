@@ -110,6 +110,44 @@ pub(crate) const DECIMAL128_PRECISION: u8 = 38;
 /// comparison kernels and Parquet's stats encoding.
 pub(crate) const DECIMAL128_SCALE: i8 = 0;
 
+/// Read-path freshness policy — how an open handle picks up segments
+/// committed (by this or another process) after it opened.
+///
+/// Modeled on the same knob every object-store-native engine exposes
+/// (turbopuffer's per-query consistency level, LanceDB's
+/// `read_consistency_interval`): the *engine* re-checks the manifest
+/// pointer for the caller; the application never refreshes by hand.
+/// A same-process writer's commit is always visible immediately
+/// (read-your-writes) regardless of this setting — the policy only
+/// governs picking up *other* processes' commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consistency {
+    /// Re-check the manifest pointer on every query (turbopuffer's
+    /// default). One cheap pointer read per query; strongest freshness.
+    Strong,
+    /// Re-check the pointer at most once per interval, serving the
+    /// pinned snapshot in between. Trades a bounded staleness window
+    /// for not paying the pointer read on every (sub-millisecond) hot
+    /// query — the speed-per-dollar default.
+    BoundedStaleness(std::time::Duration),
+    /// Snapshot fixed at open. Only same-process commits advance it;
+    /// other processes' new data requires a fresh `open`. For pure
+    /// read replicas / time-bounded scans that never want surprise
+    /// pointer reads.
+    Snapshot,
+}
+
+impl Default for Consistency {
+    fn default() -> Self {
+        // Bounded staleness with a 1s window: the conditional pointer
+        // read (~10ms on S3) is negligible against a cold query but
+        // dominates a hot one, so amortize it rather than pay it per
+        // hot query. Strong/Snapshot are opt-in via
+        // `with_read_consistency`.
+        Consistency::BoundedStaleness(std::time::Duration::from_secs(1))
+    }
+}
+
 /// All knobs needed to construct a supertable.
 ///
 /// Holds both the immutable per-supertable configuration (schema,
@@ -317,6 +355,11 @@ pub struct SupertableOptions {
     /// content-addressed object stores, ZFS, etc. — to skip
     /// the scan.
     pub verify_crc_on_open: bool,
+    /// Read-path freshness policy. The query path checks the manifest
+    /// pointer for the caller per this setting (see [`Consistency`]);
+    /// the application never refreshes by hand. Default:
+    /// [`Consistency::BoundedStaleness`] with a 1s window.
+    pub read_consistency: Consistency,
 }
 
 impl SupertableOptions {
@@ -468,6 +511,7 @@ impl SupertableOptions {
             commit_threshold_size_mb: 1024,
             put_multipart_threshold_bytes: 100 * (1 << 20),
             verify_crc_on_open: true,
+            read_consistency: Consistency::default(),
         })
     }
 
@@ -551,6 +595,13 @@ impl SupertableOptions {
     /// working set.
     pub fn with_max_concurrent_vector_builds(mut self, n: usize) -> Self {
         self.max_concurrent_vector_builds = n.max(1);
+        self
+    }
+
+    /// Set the read-path freshness policy. See [`Consistency`].
+    /// Default: [`Consistency::BoundedStaleness`] with a 1s window.
+    pub fn with_read_consistency(mut self, consistency: Consistency) -> Self {
+        self.read_consistency = consistency;
         self
     }
 
@@ -784,12 +835,12 @@ impl SupertableOptions {
                 Some(Arc::new(LocalFsStorageProvider::new(root)?) as Arc<dyn StorageProvider>)
             }
             StorageBackend::S3 => {
-                let bucket = cfg.storage.s3_bucket.as_ref().ok_or_else(|| {
-                    BuildError::Store("storage.backend=s3 requires storage.s3_bucket".into())
+                let bucket = cfg.storage.bucket.as_ref().ok_or_else(|| {
+                    BuildError::Store("storage.backend=s3 requires storage.bucket".into())
                 })?;
                 Some(Arc::new(S3StorageProvider::new_with_prefix(
                     bucket,
-                    &cfg.storage.s3_prefix,
+                    &cfg.storage.prefix,
                 )?) as Arc<dyn StorageProvider>)
             }
         };

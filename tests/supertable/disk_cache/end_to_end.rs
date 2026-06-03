@@ -61,8 +61,8 @@ fn make_cache(
     DiskCacheStore::new(storage, cfg, pinned_fn).expect("cache")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_process_consumer_routes_reads_through_disk_cache() {
+#[test]
+fn cross_process_consumer_routes_reads_through_disk_cache() {
     let storage_dir = TempDir::new().expect("storage tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
@@ -86,7 +86,7 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     let consumer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_disk_cache(Arc::clone(&cache));
-    let consumer = Supertable::open(consumer_opts).await.expect("open");
+    let consumer = Supertable::open(consumer_opts).expect("open");
     assert_eq!(consumer.manifest_id(), 1);
 
     // Cache starts cold: zero cold-fetches.
@@ -131,8 +131,8 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn producer_with_cache_reads_through_cache_path() {
+#[test]
+fn producer_with_cache_reads_through_cache_path() {
     // The producer commits with both storage AND cache
     // attached. The writer's M14b refactor extracts
     // summaries directly from the segment bytes (no
@@ -311,8 +311,8 @@ fn manifest_segments_are_not_pinned_by_supertable_create() {
     assert_eq!(reader.manifest().superfile_list.superfiles.len(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manifest_segments_are_not_pinned_by_supertable_open() {
+#[test]
+fn manifest_segments_are_not_pinned_by_supertable_open() {
     // Supertable::open follows the same cache policy as create: the
     // live manifest does not pin segment files. A cross-process
     // consumer can stream an index larger than cache budget instead
@@ -340,7 +340,6 @@ async fn manifest_segments_are_not_pinned_by_supertable_open() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     let pinned = cache.current_pinned_uris();

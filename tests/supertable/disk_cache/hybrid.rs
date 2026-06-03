@@ -178,7 +178,7 @@ async fn hybrid_reader_returns_working_superfile_reader() {
     let reader = cache.reader(&uri).await.expect("reader");
     // Sanity: in-memory-bytes-backed reader serves FTS terms.
     let fts = reader.fts().expect("fts");
-    let terms = fts.iter_column_terms("title");
+    let terms = fts.iter_column_terms("title").expect("iter terms");
     assert!(terms.iter().any(|t| t.as_slice() == b"alpha"));
 }
 

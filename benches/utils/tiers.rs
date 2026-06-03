@@ -342,13 +342,17 @@ pub fn consumer_options(
     storage: Arc<dyn StorageProvider>,
     cache: Arc<DiskCacheStore>,
 ) -> SupertableOptions {
-    base.with_storage(storage).with_disk_cache(cache)
+    // Search benches query a static, already-ingested supertable with no
+    // concurrent writers. Snapshot consistency keeps the read path free of
+    // pointer-GET refreshes so the measured latency is pure query cost; the
+    // one-time cold-open manifest read is timed separately.
+    base.with_storage(storage)
+        .with_disk_cache(cache)
+        .with_read_consistency(infino::supertable::options::Consistency::Snapshot)
 }
 
-pub async fn open_consumer(opts: SupertableOptions) -> Supertable {
-    Supertable::open(opts)
-        .await
-        .expect("Supertable::open from object store")
+pub fn open_consumer(opts: SupertableOptions) -> Supertable {
+    Supertable::open(opts).expect("Supertable::open from object store")
 }
 
 /// Wait until a superfile URI is promoted to mmap (warm tier).

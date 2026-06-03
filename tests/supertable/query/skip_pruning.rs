@@ -123,8 +123,8 @@ fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
     .with_store(store)
 }
 
-#[tokio::test]
-async fn bm25_exact_term_skip_opens_only_matching_segment() {
+#[test]
+fn bm25_exact_term_skip_opens_only_matching_segment() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
@@ -169,14 +169,13 @@ async fn bm25_exact_term_skip_opens_only_matching_segment() {
     // measure the delta over the query alone.
     let before = store.snapshot();
 
-    let hits = r
+    let hits = st
         .bm25_search(
             "title",
             "nimblefox",
             5,
             infino::supertable::query::fts::BoolMode::Or,
         )
-        .await
         .expect("query");
     assert_eq!(hits.len(), 1, "exactly one doc matches `nimblefox`");
     assert_eq!(hits[0].segment, target_uri);
@@ -194,8 +193,8 @@ async fn bm25_exact_term_skip_opens_only_matching_segment() {
     );
 }
 
-#[tokio::test]
-async fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
+#[test]
+fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
@@ -229,9 +228,8 @@ async fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     let quokka_uri = manifest.superfiles[1].uri;
 
     let before = store.snapshot();
-    let hits = r
+    let hits = st
         .bm25_search_prefix("title", "quokka", 5)
-        .await
         .expect("prefix query");
     assert_eq!(hits.len(), 2, "two docs in segment 1 begin with `quokka`");
     for h in &hits {
@@ -248,8 +246,8 @@ async fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     assert!(delta.contains_key(&quokka_uri));
 }
 
-#[tokio::test]
-async fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
+#[test]
+fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
@@ -265,16 +263,14 @@ async fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
     }
     drop(w);
 
-    let r = st.reader();
     let before = store.snapshot();
-    let hits = r
+    let hits = st
         .bm25_search(
             "title",
             "definitelynotpresent",
             5,
             infino::supertable::query::fts::BoolMode::Or,
         )
-        .await
         .expect("query");
     assert!(hits.is_empty());
 
@@ -286,8 +282,8 @@ async fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
     );
 }
 
-#[tokio::test]
-async fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
+#[test]
+fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
@@ -311,14 +307,13 @@ async fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
     let kept_uri = manifest.superfiles[0].uri;
 
     let before = store.snapshot();
-    let _hits = r
+    let _hits = st
         .bm25_search(
             "title",
             "alpha beta",
             5,
             infino::supertable::query::fts::BoolMode::And,
         )
-        .await
         .expect("AND query");
 
     let delta = store.delta(&before);

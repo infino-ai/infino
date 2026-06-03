@@ -337,7 +337,7 @@ fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let fts_bytes = take_bytes(&mut map, "fts_summary")?;
     let vector_bytes = take_bytes(&mut map, "vector_summary")?;
 
-    // Plan 013 M6 — `subsection_offsets` lands as a separate
+    // `subsection_offsets` lands as a separate
     // optional bytes field below. Parsed if present; defaulted to
     // None for pre-M6 manifests so old parts decode losslessly
     // (the cold-open path falls back to the 2-RTT shape).

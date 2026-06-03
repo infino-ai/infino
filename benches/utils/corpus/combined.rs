@@ -45,32 +45,61 @@ impl SequentialSyntheticCorpus {
 
     /// Fill `titles` and `flat` (`len * DIM` elements) for the next `len` docs.
     pub fn fill_chunk(&mut self, len: usize, titles: &mut Vec<String>, flat: &mut Vec<f32>) {
+        self.fill_chunk_modality(len, titles, flat, true, true);
+    }
+
+    /// Modality-aware fill: generate only the columns the build actually
+    /// ingests. A vector-only build does not need the (~2 KB/doc) title
+    /// strings, and an FTS-only build does not need the (DIM·4 B/doc) vector
+    /// payload. Generating an unused column would (a) burn CPU and (b) sit
+    /// resident in the bench process so the whole-process RSS sampler counts
+    /// it — neither of which a production server ingesting over the API pays.
+    ///
+    /// The two RNG streams are independent (`text_rng` vs `vec_rng`), so
+    /// skipping one column leaves the other column's bytes bit-identical to a
+    /// `true, true` run with the same seeds.
+    pub fn fill_chunk_modality(
+        &mut self,
+        len: usize,
+        titles: &mut Vec<String>,
+        flat: &mut Vec<f32>,
+        gen_text: bool,
+        gen_vec: bool,
+    ) {
         titles.clear();
         flat.clear();
-        titles.reserve(len);
-        flat.reserve(len.saturating_mul(DIM));
+        if gen_text {
+            titles.reserve(len);
+        }
+        if gen_vec {
+            flat.reserve(len.saturating_mul(DIM));
+        }
         let dist = StandardNormal;
         let mut row = vec![0.0f32; DIM];
         for _ in 0..len {
             let doc_id = self.doc_id;
-            let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * 8);
-            doc.push_str(&format!("doc{doc_id:07}"));
-            for _ in 0..TOKENS_PER_DOC {
-                let idx = self.zipf.sample(&mut self.text_rng);
-                doc.push(' ');
-                doc.push_str(&format!("term{idx:05}"));
+            if gen_text {
+                let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * 8);
+                doc.push_str(&format!("doc{doc_id:07}"));
+                for _ in 0..TOKENS_PER_DOC {
+                    let idx = self.zipf.sample(&mut self.text_rng);
+                    doc.push(' ');
+                    doc.push_str(&format!("term{idx:05}"));
+                }
+                titles.push(doc);
             }
-            titles.push(doc);
 
-            let center = &self.centers[doc_id % self.centers.len()];
-            for (j, slot) in row.iter_mut().enumerate() {
-                let s: f64 = dist.sample(&mut self.vec_rng);
-                *slot = center[j] + (s as f32) * 0.3;
+            if gen_vec {
+                let center = &self.centers[doc_id % self.centers.len()];
+                for (j, slot) in row.iter_mut().enumerate() {
+                    let s: f64 = dist.sample(&mut self.vec_rng);
+                    *slot = center[j] + (s as f32) * 0.3;
+                }
+                if self.normalize_vectors {
+                    normalize(&mut row);
+                }
+                flat.extend_from_slice(&row);
             }
-            if self.normalize_vectors {
-                normalize(&mut row);
-            }
-            flat.extend_from_slice(&row);
             self.doc_id += 1;
         }
     }

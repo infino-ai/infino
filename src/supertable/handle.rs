@@ -21,7 +21,7 @@ use tokio::runtime::Runtime;
 use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
-use crate::runtime_bridge::bridge_sync_to_async;
+use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -73,7 +73,7 @@ pub(super) struct SupertableInner {
     /// supertable, shared across all SQL queries; allocated on
     /// first use rather than at `create()` so supertables that
     /// never run SQL don't pay the runtime cost.
-    pub(super) sql_runtime: OnceLock<Arc<Runtime>>,
+    pub(super) query_runtime: OnceLock<Arc<Runtime>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -90,17 +90,33 @@ pub(super) struct SupertableInner {
     /// opens five supertables holds five distinct ids). Minted
     /// via `IdGenerator::next_id()` once at create / open.
     pub(super) handle_id: crate::supertable::wal::state_doc::SupertableHandleId,
+    /// Last time the read path checked the storage manifest pointer
+    /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
+    /// until the first check (so the first query always refreshes).
+    /// Unused for [`Consistency::Strong`] (always checks) and
+    /// [`Consistency::Snapshot`] (never checks).
+    pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
 }
 
 impl SupertableInner {
-    /// Get (or lazily build) the SQL Runtime.
-    pub(super) fn sql_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(self.sql_runtime.get_or_init(|| {
+    /// Get (or lazily build) the runtime that drives the public sync
+    /// API's async kernels when the caller is not already on a Tokio
+    /// runtime (queries, SQL, writer commits). Sized to the host's
+    /// parallelism: the cold read path fans a query out across every
+    /// superfile via `tokio::spawn` + `spawn_blocking` (range GETs,
+    /// CRC verification, zstd decode), so a single worker would
+    /// serialize that fan-out and inflate cold latency. One worker per
+    /// CPU lets those overlap, matching what an async caller gets.
+    pub(super) fn query_runtime(&self) -> Arc<Runtime> {
+        Arc::clone(self.query_runtime.get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
             Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
+                    .worker_threads(workers)
                     .enable_all()
-                    .thread_name("supertable-sql")
+                    .thread_name("supertable-query")
                     .build()
                     .expect(
                         "invariant: tokio Runtime build only fails on \
@@ -147,7 +163,7 @@ impl Supertable {
             });
             match probe_result {
                 Ok(Some(_pointer)) => {
-                    return bridge_sync_to_async(Self::open(options));
+                    return Self::open(options);
                 }
                 Ok(None) => {
                     // No pointer → fall through to fresh-create.
@@ -174,9 +190,10 @@ impl Supertable {
             manifest: ArcSwap::new(Arc::new(initial)),
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
-            sql_runtime: OnceLock::new(),
+            query_runtime: OnceLock::new(),
             tombstone_cache,
             handle_id,
+            last_pointer_check: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
@@ -213,7 +230,18 @@ impl Supertable {
     ///   [`OpenError::ContentHashMismatch`],
     ///   [`OpenError::ManifestPartLoad`] for fetch / parse
     ///   failures.
-    pub async fn open(options: SupertableOptions) -> Result<Self, OpenError> {
+    ///
+    /// Sync public API. Internally bridges to the async storage I/O
+    /// via the same `Handle::try_current() + block_in_place` pattern
+    /// as the rest of the supertable's sync surface.
+    pub fn open(options: SupertableOptions) -> Result<Self, OpenError> {
+        bridge_sync_to_async(Self::open_async(options))
+    }
+
+    /// Async open kernel. `pub(crate)` — the public surface is the
+    /// sync [`Supertable::open`]; this is the I/O implementation it
+    /// (and the open-time create path) drive on the ambient runtime.
+    pub(crate) async fn open_async(options: SupertableOptions) -> Result<Self, OpenError> {
         use crate::supertable::ManifestPartLoader;
         use crate::supertable::manifest::commit::read_pointer;
         use crate::supertable::manifest::list as list_mod;
@@ -316,7 +344,7 @@ impl Supertable {
             // triggers a single storage GET for that part.
             // `superfile_list.superfiles` stays empty — legacy
             // flat-iteration queries return zero results
-            // until M15c's hierarchical query path lands.
+            // until the hierarchical query path lands.
             // Callers in lazy mode today drive
             // `Manifest::part().await` directly.
             for entry in &list.parts {
@@ -328,7 +356,7 @@ impl Supertable {
         //    `manifest_id` mirrors the pointer. The flat
         //    `superfile_list.superfiles` is populated only in
         //    eager mode (see above); lazy mode leaves it
-        //    empty pending M15c.
+        //    empty until the hierarchical query path lands.
         let options_arc = Arc::new(options);
         let mut superfile_list = SuperfileList::empty(options_arc.clone());
         superfile_list.manifest_id = pointer.manifest_id;
@@ -356,9 +384,10 @@ impl Supertable {
             manifest: ArcSwap::new(Arc::new(manifest)),
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
-            sql_runtime: OnceLock::new(),
+            query_runtime: OnceLock::new(),
             tombstone_cache,
             handle_id,
+            last_pointer_check: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
@@ -390,7 +419,12 @@ impl Supertable {
     /// Returns `Ok(true)` iff a newer manifest was loaded.
     /// `Ok(false)` if the pointer hasn't advanced (the cheap
     /// no-op refresh path).
-    pub async fn refresh(&self) -> Result<bool, OpenError> {
+    ///
+    /// `pub(crate)` — not a public verb. Freshness is engine-driven
+    /// via [`Supertable::ensure_fresh`] on the read path, governed by
+    /// [`crate::supertable::options::Consistency`]. This is the
+    /// mechanism that drives the pointer re-check.
+    pub(crate) async fn refresh(&self) -> Result<bool, OpenError> {
         use crate::supertable::ManifestPartLoader;
         use crate::supertable::manifest::commit::read_pointer;
         use crate::supertable::manifest::list as list_mod;
@@ -482,7 +516,7 @@ impl Supertable {
 
         // 4. Rebuild the flat superfile_list from all parts in
         //    the new manifest — eager mode only. In lazy
-        //    mode the flat view stays empty pending M15c.
+        //    mode the flat view stays empty until the hierarchical query path lands.
         let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
         if eager {
             for entry in &new_list.parts {
@@ -519,6 +553,52 @@ impl Supertable {
         }
     }
 
+    /// Engine-driven read-path freshness. Applies
+    /// `options.read_consistency` ([`crate::supertable::options::Consistency`]):
+    /// re-checks the storage manifest pointer and advances the
+    /// in-memory snapshot when a newer `manifest_id` is published, so
+    /// the next [`Supertable::reader`] sees committed data without the
+    /// application ever calling refresh by hand.
+    ///
+    /// Called at the head of every public query method. No-op for an
+    /// in-memory supertable (no storage pointer) and for
+    /// [`Consistency::Snapshot`](crate::supertable::options::Consistency::Snapshot).
+    /// Best-effort: a failed pointer read leaves the current snapshot
+    /// in place rather than failing the query.
+    pub(crate) fn ensure_fresh(&self) {
+        use crate::supertable::options::Consistency;
+        if self.inner.options.storage.is_none() {
+            return;
+        }
+        match self.inner.options.read_consistency {
+            Consistency::Snapshot => {}
+            Consistency::Strong => {
+                let _ = bridge_sync_to_async(self.refresh());
+            }
+            Consistency::BoundedStaleness(window) => {
+                // Decide whether a check is due under the lock, stamp
+                // "now" optimistically so concurrent queries don't all
+                // stampede the pointer, then release the lock *before*
+                // the (blocking) pointer read.
+                let due = {
+                    let mut last = self
+                        .inner
+                        .last_pointer_check
+                        .lock()
+                        .expect("last_pointer_check mutex poisoned");
+                    let due = last.map(|t| t.elapsed() >= window).unwrap_or(true);
+                    if due {
+                        *last = Some(std::time::Instant::now());
+                    }
+                    due
+                };
+                if due {
+                    let _ = bridge_sync_to_async(self.refresh());
+                }
+            }
+        }
+    }
+
     /// Per-supertable configuration (schema, FTS / vector columns,
     /// tokenizer). Immutable for the supertable's lifetime.
     pub fn options(&self) -> &Arc<SupertableOptions> {
@@ -529,54 +609,12 @@ impl Supertable {
     /// runtime handling in [`Supertable::query_sql`]: when a caller is
     /// already on a `multi_thread` runtime, reuse it via
     /// `block_in_place`; otherwise drive the future on the lazily-built
-    /// `sql_runtime`. Lets `vector_search` / `bm25_search` /
+    /// `query_runtime`. Lets `vector_search` / `bm25_search` /
     /// `bm25_search_prefix` present a sync public API over the async
     /// `SupertableReader` kernels without spinning a throwaway runtime
     /// per call.
     pub(crate) fn block_on_query<F: Future>(&self, fut: F) -> F::Output {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-            Err(_) => self.sql_runtime().block_on(fut),
-        }
-    }
-
-    /// Block until every segment in the current manifest is promoted to
-    /// its mmap-backed reader in the disk cache — i.e. the supertable is
-    /// in warm steady state where each query resolves from mmap with no
-    /// object-store round-trips.
-    ///
-    /// Returns immediately for an in-memory supertable (no disk cache
-    /// attached). This is the canonical warm-readiness primitive: callers
-    /// that must guarantee residency before issuing latency-sensitive
-    /// reads (cache pre-warming, warm-tier benchmarks) should `await`
-    /// this instead of polling [`Supertable::stats`]. Cache counters only
-    /// report that *a* cold fetch started, not that *all* segments
-    /// finished promoting, so polling them races background promotion and
-    /// can report "warm" while some segments still fault to the store.
-    ///
-    /// Promotion is driven by reads, so issue a query that touches every
-    /// segment (e.g. a fan-out search) before awaiting this. Errors if any
-    /// segment fails to promote within `timeout`.
-    pub async fn wait_until_warm(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<(), crate::supertable::reader_cache::disk::DiskCacheError> {
-        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
-            return Ok(());
-        };
-        // Diagnostic A/B: with `INFINO_DISABLE_BG_FILL=1` no segment
-        // is ever promoted to an mmap-backed entry, so there is
-        // nothing to wait for. Short-circuit instead of blocking
-        // until the timeout — lets the cold-tier A/B run without the
-        // warm/calibration warm-up steps hanging.
-        if crate::supertable::reader_cache::disk::skip_background_fill() {
-            return Ok(());
-        }
-        let manifest = self.inner.manifest.load_full();
-        for entry in manifest.superfiles.iter() {
-            cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
-        }
-        Ok(())
+        bridge_on_runtime(fut, &self.query_runtime())
     }
 
     /// This handle's lease-owner id. Stamped on every WAL the
@@ -609,7 +647,11 @@ impl Supertable {
     /// Returns `Ok(report)` with the per-outcome counts on
     /// success; `Err(NoStorageAttached)` for in-memory-only
     /// supertables (no WALs can exist there).
-    pub async fn run_recovery_sweep_once(
+    /// Not public API: WAL recovery is engine-driven — it runs
+    /// automatically on [`Supertable::open`]. This manual hook is a
+    /// crate internal used only by in-crate unit tests that pre-seed
+    /// half-finished WALs and assert the sweep completes them.
+    pub(crate) async fn run_recovery_sweep_once(
         &self,
     ) -> Result<
         crate::supertable::wal::recovery::RecoveryReport,
@@ -629,25 +671,27 @@ impl Supertable {
     /// writer's `persist_commit` uses: ride the ambient tokio
     /// runtime when present, lazy-init the supertable's owned
     /// runtime otherwise.
-    pub fn run_recovery_sweep_once_blocking(
+    pub(crate) fn run_recovery_sweep_once_blocking(
         &self,
     ) -> Result<
         crate::supertable::wal::recovery::RecoveryReport,
         crate::supertable::wal::recovery::RecoveryError,
     > {
         let drive = self.run_recovery_sweep_once();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.inner.sql_runtime().block_on(drive),
-        }
+        bridge_on_runtime(drive, &self.inner.query_runtime())
     }
 
     /// Operator hatch: run one GC sweep over this supertable's
     /// `wal/mutations/` prefix. Reaps `Complete` WALs older
     /// than the wal-grace window + orphan `.arrow` sidecars
-    /// older than the sidecar-grace window. Tests pass custom
-    /// grace windows via [`run_gc_sweep_with_grace`].
-    pub async fn run_gc_sweep_once(
+    /// older than the sidecar-grace window. Tests that need custom
+    /// grace windows call `crate::supertable::wal::gc::run_sweep`
+    /// directly.
+    /// Not public API: WAL/sidecar GC is engine-driven — it runs
+    /// automatically on [`Supertable::open`] and (production) on a
+    /// background cadence. This manual hook is a crate internal used
+    /// only by in-crate unit tests.
+    pub(crate) async fn run_gc_sweep_once(
         &self,
     ) -> Result<crate::supertable::wal::gc::GcReport, crate::supertable::wal::gc::GcError> {
         crate::supertable::wal::gc::run_sweep(
@@ -657,18 +701,6 @@ impl Supertable {
             crate::supertable::wal::gc::DEFAULT_SIDECAR_GRACE,
         )
         .await
-    }
-
-    /// Same as [`run_gc_sweep_once`] but with caller-supplied
-    /// `now` + grace windows. Useful for deterministic tests
-    /// that simulate grace-window crossings without sleeping.
-    pub async fn run_gc_sweep_with_grace(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-        wal_grace: std::time::Duration,
-        sidecar_grace: std::time::Duration,
-    ) -> Result<crate::supertable::wal::gc::GcReport, crate::supertable::wal::gc::GcError> {
-        crate::supertable::wal::gc::run_sweep(self, now, wal_grace, sidecar_grace).await
     }
 
     /// Current manifest's id, without pinning a reader. Useful for
@@ -718,8 +750,8 @@ impl Supertable {
     /// `query::sql` module's `block_on`. Lazy: first call
     /// allocates a single-worker tokio Runtime cached on
     /// `SupertableInner`; subsequent calls clone the `Arc`.
-    pub(crate) fn sql_runtime(&self) -> Arc<Runtime> {
-        self.inner.sql_runtime()
+    pub(crate) fn query_runtime(&self) -> Arc<Runtime> {
+        self.inner.query_runtime()
     }
 }
 

@@ -83,7 +83,7 @@ pub trait LazyByteSource: Send + Sync {
         None
     }
 
-    /// Plan 013 M5 — fetch the last `len` bytes of the
+    /// Tail-fetch path: — fetch the last `len` bytes of the
     /// backing object AND surface the total object size.
     ///
     /// Lets the cold-open path (parquet footer, format
@@ -203,42 +203,13 @@ impl Source {
         };
         let start = range.start as u64;
         let len = range.len() as u64;
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle)
-                if matches!(
-                    handle.runtime_flavor(),
-                    tokio::runtime::RuntimeFlavor::MultiThread
-                ) =>
-            {
-                tokio::task::block_in_place(|| handle.block_on(s.range(start, len)))
-            }
-            _ => {
-                let src = Arc::clone(s);
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
-                                uri: "lazy-source://superfile-reader".to_string(),
-                                source: Box::new(std::io::Error::other(format!(
-                                    "tokio runtime build for lazy source fetch: {e}"
-                                ))),
-                            })
-                        })?;
-                    rt.block_on(src.range(start, len))
-                })
-                .join()
-                .map_err(|_| {
-                    LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
-                        uri: "lazy-source://superfile-reader".to_string(),
-                        source: Box::new(std::io::Error::other(
-                            "lazy source fetch thread panicked",
-                        )),
-                    })
-                })?
-            }
-        }
+        // All three runtime contexts (multi-thread worker, rayon
+        // reader-pool thread with no ambient runtime, or a
+        // `current_thread` test runtime) are handled by the shared
+        // bridge in `runtime_bridge`. Clone the `Arc` into the future
+        // so it is `Send + 'static`.
+        let src = Arc::clone(s);
+        crate::runtime_bridge::bridge_sync_to_async_send(async move { src.range(start, len).await })
     }
 
     /// Concurrent multi-range fetch. Sync-resident ranges are served
@@ -286,39 +257,9 @@ impl Source {
                     .collect::<Vec<_>>();
                 futures::future::try_join_all(futs).await
             };
-            let bytes: Vec<Bytes> = match tokio::runtime::Handle::try_current() {
-                Ok(handle)
-                    if matches!(
-                        handle.runtime_flavor(),
-                        tokio::runtime::RuntimeFlavor::MultiThread
-                    ) =>
-                {
-                    tokio::task::block_in_place(|| handle.block_on(fut))?
-                }
-                _ => std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
-                                uri: "lazy-source://superfile-reader-parallel".to_string(),
-                                source: Box::new(std::io::Error::other(format!(
-                                    "tokio runtime build for parallel lazy fetch: {e}"
-                                ))),
-                            })
-                        })?;
-                    rt.block_on(fut)
-                })
-                .join()
-                .map_err(|_| {
-                    LazyByteSourceError::Storage(crate::storage::StorageError::Permanent {
-                        uri: "lazy-source://superfile-reader-parallel".to_string(),
-                        source: Box::new(std::io::Error::other(
-                            "parallel lazy source fetch thread panicked",
-                        )),
-                    })
-                })??,
-            };
+            // Shared bridge handles every runtime context; the future
+            // owns its `Arc` clones so it is `Send + 'static`.
+            let bytes: Vec<Bytes> = crate::runtime_bridge::bridge_sync_to_async_send(fut)?;
             for (slot, b) in order.into_iter().zip(bytes) {
                 out[slot] = Some(b);
             }
@@ -455,7 +396,7 @@ impl LazyByteSource for BytesLazyByteSource {
     }
 }
 
-/// Plan 013 M4 — sub-range view onto another [`LazyByteSource`].
+/// Lazy sub-range path: — sub-range view onto another [`LazyByteSource`].
 ///
 /// `SuperfileReader::open_lazy` uses this to hand a sub-region
 /// of the outer superfile (the vector subsection, the FTS
@@ -522,7 +463,7 @@ impl LazyByteSource for LazySubSource {
     }
 }
 
-/// Plan 013 M2 — overlay that serves pre-fetched byte ranges
+/// Prefetched overlay: — overlay that serves pre-fetched byte ranges
 /// from memory and falls through to an underlying
 /// [`LazyByteSource`] on miss.
 ///
@@ -673,7 +614,7 @@ mod tests {
         assert!(src.try_get_range_sync(100, 0).is_none());
     }
 
-    /// Plan 013 M2 — overlay serves an installed range
+    /// Prefetched overlay: — overlay serves an installed range
     /// zero-copy via `try_get_range_sync` without calling
     /// into the underlying source.
     #[tokio::test]
@@ -693,7 +634,7 @@ mod tests {
         assert_eq!(async_got.as_ref(), &payload[3..6]);
     }
 
-    /// Plan 013 M4 — sub-source slices into a parent's range.
+    /// Lazy sub-range path: — sub-source slices into a parent's range.
     /// `range(start, len)` resolves against the parent at
     /// `offset + start`; `size()` returns the slice length.
     #[tokio::test]
@@ -713,7 +654,7 @@ mod tests {
         assert_eq!(sync_got.as_ref(), &payload[10..16]);
     }
 
-    /// Plan 013 M4 — out-of-bounds requests against a sub-source
+    /// Lazy sub-range path: — out-of-bounds requests against a sub-source
     /// surface with the slice's `size`, not the inner's larger
     /// size — keeps the caller-visible error scoped to the slice
     /// the caller actually addressed.
@@ -737,7 +678,7 @@ mod tests {
         assert!(sub.try_get_range_sync(10, 10).is_none());
     }
 
-    /// Plan 013 M2 — counting source confirms a range request
+    /// Prefetched overlay: — counting source confirms a range request
     /// that hits the overlay never reaches the underlying source.
     #[tokio::test]
     async fn prefetched_source_overlay_hit_skips_underlying_range_call() {

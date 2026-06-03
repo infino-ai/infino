@@ -47,12 +47,11 @@ pub mod group_name {
 }
 
 fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
-    let r = st.reader();
     let probe_doc_id = (supertable::N_DOCS / 2) as u32;
     let probe_token = format!("doc{probe_doc_id:07}");
-    let hits =
-        tiers::block_on(r.bm25_search(supertable::TEXT_COLUMN, &probe_token, TOP_K, BoolMode::Or))
-            .expect("bm25");
+    let hits = st
+        .bm25_search(supertable::TEXT_COLUMN, &probe_token, TOP_K, BoolMode::Or)
+        .expect("bm25");
     assert_eq!(
         hits.len(),
         1,
@@ -65,9 +64,9 @@ fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
         hits[0].score
     );
 
-    let hits =
-        tiers::block_on(r.bm25_search(supertable::TEXT_COLUMN, "term00001", TOP_K, BoolMode::Or))
-            .expect("bm25");
+    let hits = st
+        .bm25_search(supertable::TEXT_COLUMN, "term00001", TOP_K, BoolMode::Or)
+        .expect("bm25");
     assert_eq!(hits.len(), TOP_K, "common term should fill top-{TOP_K}");
     for w in hits.windows(2) {
         assert!(
@@ -96,8 +95,6 @@ pub fn bench(c: &mut Criterion) {
     assert_fts_self_consistent(st);
     eprintln!("[supertable_fts_search] correctness OK");
 
-    let r = st.reader();
-
     let mut g = c.benchmark_group(tiers::search_group_name("supertable_fts", Tier::Hot, None));
     g.sample_size(10);
     let rss_sample = rss::PeakSampler::start_default();
@@ -107,10 +104,8 @@ pub fn bench(c: &mut Criterion) {
         let q = *q;
         g.bench_function(format!("{name}_supertable_top10"), |b| {
             b.iter(|| {
-                let hits = tiers::block_on(async {
-                    r.bm25_search(supertable::TEXT_COLUMN, black_box(q), TOP_K, BoolMode::Or)
-                        .await
-                });
+                let hits =
+                    st.bm25_search(supertable::TEXT_COLUMN, black_box(q), TOP_K, BoolMode::Or);
                 black_box(hits)
             });
         });
@@ -118,10 +113,7 @@ pub fn bench(c: &mut Criterion) {
 
     g.bench_function("prefix_supertable_top10", |b| {
         b.iter(|| {
-            let hits = tiers::block_on(async {
-                r.bm25_search_prefix(supertable::TEXT_COLUMN, black_box("term0009"), TOP_K)
-                    .await
-            });
+            let hits = st.bm25_search_prefix(supertable::TEXT_COLUMN, black_box("term0009"), TOP_K);
             black_box(hits)
         });
     });
@@ -140,167 +132,80 @@ fn bench_object_store_tiers(c: &mut Criterion) {
     let storage_label = fixture::storage_label();
     let idx_bytes = Some(fixture::total_index_bytes());
 
-    for tier in [Tier::Warm, Tier::Cold] {
-        let mut g = c.benchmark_group(tiers::search_group_name(
-            "supertable_fts",
-            tier,
-            Some(storage_label),
-        ));
-        g.sample_size(10);
-        if tier == Tier::Cold {
-            g.measurement_time(Duration::from_secs(30));
-        }
+    // Only the cold tier is measured against object storage. The warm
+    // tier (mmap-promoted) was dropped: with nothing pinned in memory,
+    // its latency is indistinguishable from the in-process hot tier
+    // measured above, so it carried no signal — and it was the only
+    // reason the bench reached for an internal warm hook. A real client
+    // only ever sees "cold first touch" vs "already-served hot".
+    let tier = Tier::Cold;
+    let mut g = c.benchmark_group(tiers::search_group_name(
+        "supertable_fts",
+        tier,
+        Some(storage_label),
+    ));
+    g.sample_size(10);
+    g.measurement_time(Duration::from_secs(30));
 
-        for (name, q) in FTS_QUERIES {
-            let bench_id = format!("{name}_supertable_top10");
-            match tier {
-                Tier::Warm => {
-                    let storage = fixture::storage();
+    for (name, q) in FTS_QUERIES {
+        let bench_id = format!("{name}_supertable_top10");
+        let storage = fixture::storage();
+        let query = *q;
+        g.bench_function(&bench_id, |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
                     let (cache_dir, cache) =
-                        tiers::fresh_supertable_search_cache(storage.clone(), idx_bytes);
+                        tiers::fresh_supertable_search_cache(Arc::clone(&storage), idx_bytes);
                     let consumer_opts = tiers::consumer_options(
                         supertable::combined_options(None),
-                        storage,
+                        Arc::clone(&storage),
                         cache.clone(),
                     );
-                    let st = tiers::block_on(tiers::open_consumer(consumer_opts));
-                    let query = *q;
-                    tiers::block_on(async {
-                        let _ = st
-                            .reader()
-                            .bm25_search(supertable::TEXT_COLUMN, query, TOP_K, BoolMode::Or)
-                            .await
-                            .expect("warm prewarm bm25");
-                        st.wait_until_warm(Duration::from_secs(600))
-                            .await
-                            .expect("supertable warm promotion");
-                    });
-                    g.bench_function(&bench_id, |b| {
-                        b.iter(|| {
-                            let hits = tiers::block_on(async {
-                                st.reader()
-                                    .bm25_search(supertable::TEXT_COLUMN, q, TOP_K, BoolMode::Or)
-                                    .await
-                                    .expect("bm25")
-                            });
-                            black_box(hits)
-                        });
-                    });
+                    let st = tiers::open_consumer(consumer_opts);
+                    let t0 = std::time::Instant::now();
+                    let _ = st
+                        .bm25_search(supertable::TEXT_COLUMN, query, TOP_K, BoolMode::Or)
+                        .expect("cold bm25");
+                    let elapsed = t0.elapsed();
+                    total += elapsed;
                     drop(st);
                     drop(cache);
                     drop(cache_dir);
                 }
-                Tier::Cold => {
-                    let storage = fixture::storage();
-                    let query = *q;
-                    g.bench_function(&bench_id, |b| {
-                        b.iter_custom(|iters| {
-                            let mut total = Duration::ZERO;
-                            for _ in 0..iters {
-                                let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
-                                    Arc::clone(&storage),
-                                    idx_bytes,
-                                );
-                                let consumer_opts = tiers::consumer_options(
-                                    supertable::combined_options(None),
-                                    Arc::clone(&storage),
-                                    cache.clone(),
-                                );
-                                let elapsed = tiers::block_on(async {
-                                    let st = tiers::open_consumer(consumer_opts).await;
-                                    let t0 = std::time::Instant::now();
-                                    let _ = st
-                                        .reader()
-                                        .bm25_search(
-                                            supertable::TEXT_COLUMN,
-                                            query,
-                                            TOP_K,
-                                            BoolMode::Or,
-                                        )
-                                        .await
-                                        .expect("cold bm25");
-                                    t0.elapsed()
-                                });
-                                total += elapsed;
-                                drop(cache);
-                                drop(cache_dir);
-                            }
-                            total
-                        });
-                    });
-                }
-                Tier::Hot => {}
-            }
-        }
+                total
+            });
+        });
+    }
 
-        g.bench_function("prefix_supertable_top10", |b| match tier {
-            Tier::Warm => {
-                let storage = fixture::storage();
+    g.bench_function("prefix_supertable_top10", |b| {
+        let storage = fixture::storage();
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
                 let (cache_dir, cache) =
-                    tiers::fresh_supertable_search_cache(storage.clone(), idx_bytes);
+                    tiers::fresh_supertable_search_cache(Arc::clone(&storage), idx_bytes);
                 let consumer_opts = tiers::consumer_options(
                     supertable::combined_options(None),
-                    storage,
+                    Arc::clone(&storage),
                     cache.clone(),
                 );
-                let st = tiers::block_on(tiers::open_consumer(consumer_opts));
-                tiers::block_on(async {
-                    let _ = st
-                        .reader()
-                        .bm25_search_prefix(supertable::TEXT_COLUMN, "term0009", TOP_K)
-                        .await
-                        .expect("warm prewarm prefix");
-                    st.wait_until_warm(Duration::from_secs(600))
-                        .await
-                        .expect("supertable warm promotion");
-                });
-                b.iter(|| {
-                    let hits = tiers::block_on(async {
-                        st.reader()
-                            .bm25_search_prefix(supertable::TEXT_COLUMN, "term0009", TOP_K)
-                            .await
-                            .expect("prefix")
-                    });
-                    black_box(hits)
-                });
+                let st = tiers::open_consumer(consumer_opts);
+                let t0 = std::time::Instant::now();
+                let _ = st
+                    .bm25_search_prefix(supertable::TEXT_COLUMN, "term0009", TOP_K)
+                    .expect("cold prefix");
+                let elapsed = t0.elapsed();
+                total += elapsed;
                 drop(st);
                 drop(cache);
                 drop(cache_dir);
             }
-            Tier::Cold => {
-                let storage = fixture::storage();
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        let (cache_dir, cache) =
-                            tiers::fresh_supertable_search_cache(Arc::clone(&storage), idx_bytes);
-                        let consumer_opts = tiers::consumer_options(
-                            supertable::combined_options(None),
-                            Arc::clone(&storage),
-                            cache.clone(),
-                        );
-                        let elapsed = tiers::block_on(async {
-                            let st = tiers::open_consumer(consumer_opts).await;
-                            let t0 = std::time::Instant::now();
-                            let _ = st
-                                .reader()
-                                .bm25_search_prefix(supertable::TEXT_COLUMN, "term0009", TOP_K)
-                                .await
-                                .expect("cold prefix");
-                            t0.elapsed()
-                        });
-                        total += elapsed;
-                        drop(cache);
-                        drop(cache_dir);
-                    }
-                    total
-                });
-            }
-            Tier::Hot => {}
+            total
         });
+    });
 
-        g.finish();
-    }
+    g.finish();
 }
 
 fn emit_markdown() {
@@ -313,13 +218,13 @@ fn emit_markdown() {
         supertable::N_DOCS
     ));
     body.push_str(
-        "Hot/warm/cold = object storage + disk cache (s3s-fs or `INFINO_REAL_S3_BUCKET`); warm waits for mmap promotion.\n\n",
+        "hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`). Cold excludes the one-time manifest open. The mmap-promoted \"warm\" tier was dropped: nothing is pinned in memory, so it measured identically to hot.\n\n",
     );
     body.push_str(
-        "| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|----------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
+        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
     );
 
     for q in [
@@ -334,7 +239,6 @@ fn emit_markdown() {
     ] {
         let bid = format!("{q}_supertable_top10");
         let hot = read_mean_ns(group, &bid);
-        let warm = markdown::read_tier_mean_ns("supertable_fts", "warm", &bid);
         let cold = markdown::read_tier_mean_ns("supertable_fts", "cold", &bid);
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
@@ -343,9 +247,8 @@ fn emit_markdown() {
         let p90_rss = rss::fmt_p90_rss(group, &bid);
         let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
         body.push_str(&format!(
-            "| {q:14} | {} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
+            "| {q:14} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
             hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
             cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }

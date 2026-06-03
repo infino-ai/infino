@@ -305,7 +305,7 @@ mod tests {
         opts: Arc<SupertableOptions>,
         superfiles: Vec<Arc<SuperfileEntry>>,
     ) -> Manifest {
-        // M2c: build via `with_appended` so the new outer
+        // build via `with_appended` so the new outer
         // Manifest's metadata fields (list, parts, loader) get
         // initialized correctly. Equivalent to the old direct-
         // field-assignment helper for the test's purposes.

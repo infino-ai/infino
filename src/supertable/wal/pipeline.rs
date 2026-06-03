@@ -550,7 +550,8 @@ fn build_fts_summary(
         return out;
     };
     for fc in &options.fts_columns {
-        let terms = fts_reader.iter_column_terms(&fc.column);
+        let terms = fts_reader.iter_column_terms(&fc.column)
+            .expect("FST bytes valid: segment just built");
         let n_terms_distinct = terms.len() as u32;
         let (min_term, max_term) = match (terms.first(), terms.last()) {
             (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -1075,14 +1076,47 @@ fn resolve_target_id_in_manifest(
             }
         };
 
-        if let Some(doc_id) =
-            reader
-                .id_lookup(target)
-                .map_err(|e| TombstonePhaseError::IdLookupFailed {
+        // id_lookup requires the full segment bytes (eager open).
+        // A lazy-opened reader from the cache path will return an Io
+        // error here; fall back to a direct storage fetch in that case.
+        let lookup_result = match reader.id_lookup(target) {
+            Ok(result) => result,
+            Err(crate::superfile::ReadError::Io(_)) => {
+                // Lazy reader — re-open eagerly from storage.
+                let bytes =
+                    fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
+                        TombstonePhaseError::IdLookupFailed {
+                            target_id: target_id.to_hex(),
+                            message: format!(
+                                "open superfile {} (eager fallback for id_lookup): {message}",
+                                entry.uri.0
+                            ),
+                        }
+                    })?;
+                let eager_reader = SuperfileReader::open(bytes).map_err(|e| {
+                    TombstonePhaseError::IdLookupFailed {
+                        target_id: target_id.to_hex(),
+                        message: format!(
+                            "SuperfileReader::open {} (eager fallback for id_lookup): {e}",
+                            entry.uri.0
+                        ),
+                    }
+                })?;
+                eager_reader.id_lookup(target).map_err(|e| {
+                    TombstonePhaseError::IdLookupFailed {
+                        target_id: target_id.to_hex(),
+                        message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
+                    }
+                })?
+            }
+            Err(e) => {
+                return Err(TombstonePhaseError::IdLookupFailed {
                     target_id: target_id.to_hex(),
                     message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
-                })?
-        {
+                });
+            }
+        };
+        if let Some(doc_id) = lookup_result {
             return Ok(Some((entry.superfile_id, doc_id)));
         }
     }

@@ -133,7 +133,6 @@ async fn search_async(
 ) -> Vec<(u32, f32)> {
     reader
         .search("v", query, k, nprobe, rerank_mult)
-        .await
         .expect("search")
 }
 

@@ -165,7 +165,7 @@ fn search_consumer() -> &'static SearchConsumer {
             Arc::clone(&built.storage),
             cache.clone(),
         );
-        let st = tiers::block_on(tiers::open_consumer(opts));
+        let st = tiers::open_consumer(opts);
         SearchConsumer {
             st,
             _cache_dir: cache_dir,

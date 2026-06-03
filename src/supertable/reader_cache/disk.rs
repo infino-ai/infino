@@ -312,7 +312,7 @@ impl DiskCacheStore {
         self.reader_with_hints(uri, None).await
     }
 
-    /// Plan 013 M6 — like [`Self::reader`] but takes a precomputed
+    /// like [`Self::reader`] but takes a precomputed
     /// [`SubsectionOffsets`] hint (sourced from the manifest's
     /// [`crate::supertable::manifest::SuperfileEntry::subsection_offsets`]).
     /// On a cold miss in the
@@ -535,7 +535,7 @@ impl DiskCacheStore {
             .sum()
     }
 
-    /// M14c — drop mmap pages until the cache's working set
+    /// drop mmap pages until the cache's working set
     /// is back under `budget_bytes`. No-op if already under
     /// budget. Returns the number of entries that received
     /// `madvise(MADV_DONTNEED)`.
@@ -922,7 +922,7 @@ impl DiskCacheStore {
         Ok(entry)
     }
 
-    /// Plan 013 M4 — lazy-foreground cold-fetch coordinator.
+    /// lazy-foreground cold-fetch coordinator.
     /// Returns immediately with a
     /// [`SuperfileReader::open_lazy`]-built reader over a
     /// [`crate::supertable::StorageRangeSource`]; spawns a
@@ -931,7 +931,7 @@ impl DiskCacheStore {
     /// it, and replacing the cached entry. Subsequent
     /// `reader(uri)` calls return the mmap-backed reader (zero
     /// S3 GETs for any subsequent search).
-    /// Plan 013 M6 — lazy cold-fetch coordinator, hinted shape.
+    /// lazy cold-fetch coordinator, hinted shape.
     /// When `offsets` is `Some` the underlying cold-fetch runs
     /// in 1-RTT parallel-prefetch mode via
     /// [`Self::cold_fetch_lazy_with_hints`]; when `None` it
@@ -969,7 +969,7 @@ impl DiskCacheStore {
         }
     }
 
-    /// Plan 013 M4 — lazy cold-fetch path. Foreground builds a
+    /// lazy cold-fetch path. Foreground builds a
     /// reader via `SuperfileReader::open_lazy(StorageRangeSource)`
     /// (paying only the M1-M3 cold-open + cold-search byte
     /// budget); background task waits for those foreground lazy
@@ -979,7 +979,7 @@ impl DiskCacheStore {
     /// the in-flight OnceCell get the lazy reader; once the
     /// background promotion completes they hit the
     /// mmap-backed entry on the next call.
-    /// Plan 013 M6 cold-fetch entry point. If `offsets` is
+    /// cold-fetch entry point. If `offsets` is
     /// `Some`, the parquet-footer + vector + FTS subsection
     /// fetches run in **one parallel batch** (1 RTT cold open).
     /// If `None`, falls back to the pre-M6 [`Self::cold_fetch_lazy`]
@@ -996,7 +996,7 @@ impl DiskCacheStore {
         }
     }
 
-    /// Plan 013 M6 — hinted cold open. Issues the parquet footer
+    /// hinted cold open. Issues the parquet footer
     /// tail plus each present subsection's fixed header in parallel,
     /// then installs those bytes in a [`crate::superfile::PrefetchedSource`]
     /// overlay. The inner vector / FTS lazy readers use those headers to
@@ -1086,7 +1086,7 @@ impl DiskCacheStore {
         let mut overlay = PrefetchedSource::new(inner);
 
         if !offsets.open_blob.is_empty() {
-            // Plan 013 M7 — the open-batch bytes (parquet tail +
+            // the open-batch bytes (parquet tail +
             // vector + FTS open ranges) already rode in with the
             // manifest part GET that `cold_open` performed. Install
             // them straight into the overlay: ZERO open-time GETs
@@ -1172,7 +1172,7 @@ impl DiskCacheStore {
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
 
-        // Plan 013 M5 — drop the cold-open HEAD round-trip.
+        // drop the cold-open HEAD round-trip.
         //
         // Previously: `storage.head(uri)` to learn `size`,
         // then `with_known_size(size)`. That HEAD was a
@@ -1737,7 +1737,7 @@ fn rollback_lazy_background_fill(
     let _ = std::fs::remove_file(tmp);
 }
 
-/// Plan 013 M4 — background promotion path for the
+/// background promotion path for the
 /// `LazyForegroundWithBackgroundFill` cold-fetch mode.
 /// Waits for foreground lazy readers to release, downloads the
 /// full segment via cancelable parallel range-GETs to NVMe,

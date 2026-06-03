@@ -491,4 +491,27 @@ mod tests {
             .expect_err("must error");
         assert!(matches!(err, RecoveryError::NoStorageAttached));
     }
+
+    // Operator-hatch wrapper coverage. `Supertable::run_recovery_sweep_once`
+    // is a crate internal (`pub(crate)`), not public API, so these live
+    // in-crate rather than in the integration `tests/` crate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_recovery_sweep_once_hatch_reports_zero_work_on_empty_storage() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let report = st.run_recovery_sweep_once().await.expect("sweep");
+        assert_eq!(report.n_scanned, 0);
+        assert_eq!(report.n_already_complete, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_recovery_sweep_once_hatch_errors_on_in_memory_supertable() {
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        let err = st.run_recovery_sweep_once().await.expect_err("must error");
+        assert!(matches!(err, RecoveryError::NoStorageAttached));
+    }
 }
