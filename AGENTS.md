@@ -13,8 +13,7 @@ When guidance disagrees, resolve in this order (closest wins):
 1. **Explicit user / task instructions** in the current session trump everything below.
 2. **Subdirectory `AGENTS.md`** files (when present) take precedence over this file for the scope they cover.
 3. **This file** carries Infino-specific rules.
-4. **Workspace `CLAUDE.md`** (one directory up, outside this repo) carries workspace-wide conventions — no `Co-Authored-By` trailers, public-vs-private hygiene, the umbrella rules. Read when an agent opens at the workspace root; not visible when this repo is cloned standalone.
-5. **Configuration files** (`Cargo.toml`, `Makefile`, `rust-toolchain.toml`, `.github/workflows/`) are the source of truth where they overlap with anything written here — see "Sources of truth" near the end.
+4. **Configuration files** (`Cargo.toml`, `Makefile`, `rust-toolchain.toml`, `.github/workflows/`) are the source of truth where they overlap with anything written here — see "Sources of truth" near the end.
 
 ## Build and test commands
 
@@ -74,10 +73,9 @@ Test binaries are bundled by layer in `Cargo.toml` (`[[test]]` stanzas) to keep 
   ```
 - **No `unsafe` outside the documented surface.** The only `unsafe` sites in `src/` are one `bumpalo` lifetime extension in `FtsBuilder::add_doc` plus small pockets of byte parsing in `superfile/format/`. New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
 - **Visibility hygiene.** Items used only inside the crate are `pub(crate)`, not `pub`. Test-only methods go behind `#[cfg(test)]`, not `#[allow(dead_code)]`. The public API surface is what's re-exported from `superfile/mod.rs` and `supertable/mod.rs` — see the "Public API surface" section below.
-- **No private-repo citations in source comments.** Source comments must not reference any external private repo or document. State the rationale inline.
-- **No internal milestone jargon** (`M1`–`M16`, `003 M5`-style tags) in source, comments, or commit messages. Rewrite to plain language describing the change.
-- **`infino/` ships publicly. No references to sibling private repos or predecessor projects** anywhere in source, comments, doc-comments, READMEs, or commit messages. Write `infino/` as if it were the only thing that exists.
-- **Performance numbers live in `benches/README.md` and are Infino-only** — no third-party engine mentioned. Head-to-head comparisons against other engines do not belong in this repo.
+- **State rationale inline in comments.** Don't cite external documents or trackers a reader may not have access to; explain the reasoning directly.
+- **Use plain language in source, comments, and commit messages.** Avoid cryptic internal shorthand or tracking tags; describe the change directly.
+- **Performance numbers live in `benches/README.md`.** Keep benchmark results there rather than scattered through the codebase.
 - **Match surrounding style** for naming, comment density, and idiom. Consistency over personal preference.
 - **Comments document the *what* and the *why-when-non-obvious*.** Don't restate the code; explain hidden invariants, subtle constraints, or surprising behavior.
 
@@ -101,7 +99,7 @@ Tests are required on any non-trivial change. Test deletions require explicit ju
 
 ## Commit message guidelines
 
-- **No `Co-Authored-By: Claude ...` trailer (or any other AI-attribution trailer).** Commit metadata reflects the human author only, even when an agent drafts the message or runs `git commit`. Workspace-wide rule.
+- **No `Co-Authored-By: Claude ...` trailer (or any other AI-attribution trailer).** Commit metadata reflects the human author only, even when an agent drafts the message or runs `git commit`.
 - **Subject line under ~70 characters.** Body explains *what and why*, not *how* (the diff already shows how).
 - **Reference the layer or subsystem in the subject** when reasonable. The recent history is good reference: `fts: leapfrog AND intersection over the skip table`, `superfile/vector: gate scalar/fake test helpers behind target_arch="x86_64"`, `WAL-driven updates + deletes`.
 - **No `--no-verify`, no `--no-gpg-sign`, no `-c commit.gpgsign=false`** unless the human author has explicitly requested it. If a pre-commit hook fails, fix the cause; don't bypass.
@@ -111,10 +109,10 @@ Tests are required on any non-trivial change. Test deletions require explicit ju
 
 - **Run `make ci` locally first.** It must be green. Don't open PRs expecting CI to be the gate of first resort.
 - **Tests required for non-trivial changes.** Bug fixes need a regression test that fails before the fix and passes after. New features need coverage proportional to the surface added.
-- **For non-trivial changes, link a design doc.** The team's plan-first workflow expects a design doc to exist for any meaningful change before code review starts. See "Plan-first workflow" below.
+- **For non-trivial changes, open an issue first.** Describe the problem and proposed approach so the design can be discussed before code review starts.
 - **Don't force-push to `main` or shared branches.** Force-push your own feature branches if you need to clean up history, but never to `main`.
 - **Don't merge with red CI** or with unanswered review comments.
-- **PR title and body follow the commit-message conventions above.** No AI-attribution trailers. No private-repo references.
+- **PR title and body follow the commit-message conventions above.** No AI-attribution trailers.
 
 ## Repository layout
 
@@ -172,7 +170,7 @@ Rule of thumb for landing a change in the right place:
 - New implementations of an existing public trait — the trait is the extension contract
 - Test additions and refactors confined to one module
 
-### ⚠️ Ask first (raise as a plan or an issue before writing code)
+### ⚠️ Ask first (open an issue before writing code)
 
 - Changes to the public API surface (anything re-exported from `superfile/mod.rs` or `supertable/mod.rs`)
 - Adding a new top-level module under `src/`
@@ -191,17 +189,7 @@ Rule of thumb for landing a change in the right place:
 - **Multi-vector / ColBERT-style per-token vectors.** Niche; better as a sidecar pattern than a format primitive.
 - **`range_concurrent(&[Range])` storage API.** `LazyByteSource::range` is already `async fn`; callers parallelize with `try_join_all` or `FuturesUnordered`.
 
-If you have a strong reason to revisit any 🚫 item, write a plan with new evidence; don't open a PR cold.
-
-## Plan-first workflow
-
-For any change that isn't a small bugfix or doc edit:
-
-1. Draft a design doc in the team's plan tracker (separate from this repo). Naming convention: `NNN_short_slug.md` with the next free `NNN`.
-2. Get review on the plan before implementation begins.
-3. Reference the plan number in the commit message subject or body. Do not include private-repo paths inside source comments.
-
-Trivial bug fixes, doc fixes, and one-file refactors are exempt and can go straight to PR.
+If you have a strong reason to revisit any 🚫 item, open an issue with new evidence first; don't open a PR cold.
 
 ## Public API surface
 
@@ -226,6 +214,6 @@ If a section here drifts out of sync with one of those, the config wins and this
 
 ## When something doesn't fit any of these notes
 
-Ask. The team has a strong design-doc culture and would rather have a one-page plan to react to than a surprise PR. Filing an issue describing the problem before writing code is always welcome.
+Ask. Filing an issue describing the problem before writing code is always welcome — a short written proposal to react to beats a surprise PR.
 
 For human-contributor-facing guidance (the linear "clone → build → test → PR" narrative), see [`CONTRIBUTING.md`](CONTRIBUTING.md). For project overview and quick-start, see [`README.md`](README.md).
