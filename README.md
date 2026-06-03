@@ -47,6 +47,20 @@ let hits = vector_search(&reader, "embedding", &query, 10,
 // with DataFusion / DuckDB / pyarrow and treat as a regular table.
 ```
 
+## Development
+
+```bash
+git clone git@github.com:infino-ai/infino.git
+cd infino
+cargo build
+cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read back as Parquet
+```
+
+The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
+the right stable Rust on first build. Run `cargo test --workspace` for
+the suite and `make ci` before opening a pull request. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
+
 ## Performance
 
 Absolute runtime numbers come from the in-tree criterion harness
