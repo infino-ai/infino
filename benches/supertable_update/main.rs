@@ -129,12 +129,18 @@ fn bench_deletes(c: &mut Criterion) {
     });
     g.finish();
 
-    // Delete shrinks the table: the reused supertable must have
-    // fewer rows than the baseline — guards against a regression
-    // where deletes silently match nothing.
-    assert!(
-        count_rows(&st) < n as i64,
-        "deletes left the row count at the baseline {n} — nothing was removed"
+    // Exact end-state: each of the `i` delete attempts removed a
+    // distinct row while one was still present, so exactly
+    // `min(i, n)` rows are gone and `n - min(i, n)` remain. Asserting
+    // the exact count (not just `< n`) catches both under- and
+    // over-deletion — e.g. a predicate that silently matched nothing
+    // or matched more than one row.
+    let expected = (n as u64).saturating_sub(i) as i64;
+    assert_eq!(
+        count_rows(&st),
+        expected,
+        "after {i} single-row deletes over an {n}-row table, \
+         expected {expected} rows to remain"
     );
 }
 
