@@ -26,5 +26,4 @@ mod manifest;
 mod query;
 mod storage;
 mod update_crash_property;
-mod wal_recovery;
 mod writer_mutations;

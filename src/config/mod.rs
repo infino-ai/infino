@@ -179,14 +179,12 @@ pub struct StorageSettings {
     /// Object-store bucket name (used by the `s3` backend).
     /// Credentials and region resolve via the standard AWS provider
     /// chain (`AWS_*`, profile, instance role, etc.).
-    #[serde(alias = "s3_bucket")]
     pub bucket: Option<String>,
     /// Logical key prefix inside the bucket. All manifest and
     /// segment objects are written under
     /// `<bucket>/<prefix>/<manifest|segments>/…`. Empty means the
     /// bucket root. Not used by the `local_fs` backend (use
     /// `local_root` instead).
-    #[serde(alias = "s3_prefix")]
     pub prefix: String,
     /// Disk-cache root. When set with any persistent backend,
     /// `apply_config` attaches a `DiskCacheStore` so reads go
@@ -437,8 +435,8 @@ supertable:
         let yaml = r#"
 storage:
   backend: s3
-  s3_bucket: cold-test-381491836522
-  s3_prefix: infino-real-s3-integration/example
+  bucket: cold-test-381491836522
+  prefix: infino-real-s3-integration/example
   disk_cache_root: /tmp/infino-cache
   cold_fetch_mode: lazy_foreground_with_background_fill
   cold_fetch_streams: 8
@@ -449,8 +447,6 @@ storage:
             .merge(Yaml::string(yaml));
         let cfg = Config::from_figment(fig).expect("parse config");
         assert_eq!(cfg.storage.backend, StorageBackend::S3);
-        // YAML uses the legacy `s3_bucket`/`s3_prefix` keys —
-        // confirms the serde alias mapping to the new field names.
         assert_eq!(
             cfg.storage.bucket.as_deref(),
             Some("cold-test-381491836522")

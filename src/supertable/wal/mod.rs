@@ -52,6 +52,9 @@ pub mod state_doc;
 pub mod tombstones_admin;
 pub mod tombstones_codec;
 
+#[cfg(test)]
+mod recovery_sweep_tests;
+
 pub use persistence::{Etag, WalStore, WalStoreError};
 pub use state_doc::{
     Lease, OpKind, SealRecord, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,

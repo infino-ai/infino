@@ -1,13 +1,11 @@
-//! Vector kNN fan-out method on
-//! [`super::super::SupertableReader`].
+//! Vector kNN fan-out on [`Supertable`](super::super::Supertable).
 //!
 //! ## Public API
 //!
 //! ```ignore
-//! let reader = supertable.reader();
 //! let opts = VectorSearchOptions::new();
 //! let hits: Vec<SuperfileHit> =
-//!     reader.vector_search("emb", &query_vec, 10, opts)?;
+//!     supertable.vector_search("emb", &query_vec, 10, opts)?;
 //! ```
 //!
 //! Returns [`SuperfileHit`]s sorted by distance *ascending* —
@@ -17,7 +15,8 @@
 //!
 //! ## Strategy
 //!
-//! Vector search is a method on the reader. The reader
+//! Internally pins a snapshot reader and drives the async
+//! kernel to completion via the sync→async bridge. The reader
 //! holds a pinned `Arc<Manifest>`; for each visible segment we:
 //!
 //!   1. Fetch the segment's `SuperfileReader` from the store.
@@ -210,16 +209,12 @@ impl SupertableReader {
 }
 
 impl Supertable {
-    /// Sync vector kNN search over the current snapshot — the external
-    /// mirror of [`Supertable::query_sql`], using the same sync→async
-    /// bridge ([`Supertable::block_on_query`]).
+    /// Single-column vector kNN search over the current snapshot.
     ///
-    /// Pins a reader at call entry (one `ArcSwap::load_full`, like
-    /// `query_sql`) and drives the async
-    /// [`SupertableReader::vector_search`] kernel to completion.
-    /// Returns up to `k` hits sorted by distance *ascending*. Use the
-    /// `SupertableReader` method directly when you are already in async
-    /// context and want to `.await`.
+    /// Pins a reader at call entry, applies the read-consistency
+    /// policy, and drives the internal async kernel to completion
+    /// via the sync→async bridge ([`Supertable::block_on_query`]).
+    /// Returns up to `k` hits sorted by distance *ascending*.
     pub fn vector_search(
         &self,
         column: &str,

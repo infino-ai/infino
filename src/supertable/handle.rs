@@ -98,6 +98,31 @@ pub(super) struct SupertableInner {
     pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
 }
 
+impl Drop for SupertableInner {
+    /// Tear down the lazily-built query runtime without tripping
+    /// tokio's "cannot drop a runtime from within an async context"
+    /// guard.
+    ///
+    /// The public API is sync, but it explicitly supports being
+    /// called from inside a caller's own multi-thread runtime (the
+    /// sync→async bridge uses `block_in_place` there). In that mode a
+    /// sync query lazily builds the owned `query_runtime`. If the
+    /// caller then drops their last `Supertable` handle while still
+    /// inside their runtime, the default `Arc<Runtime>` drop would
+    /// panic. `shutdown_background` consumes the runtime without
+    /// blocking, so it is safe from any context. The `try_unwrap`
+    /// guard ensures we only shut it down when this is the last
+    /// owner; otherwise an outstanding transient clone (never the
+    /// last reference) just decrements normally.
+    fn drop(&mut self) {
+        if let Some(rt) = self.query_runtime.take() {
+            if let Ok(rt) = Arc::try_unwrap(rt) {
+                rt.shutdown_background();
+            }
+        }
+    }
+}
+
 impl SupertableInner {
     /// Get (or lazily build) the runtime that drives the public sync
     /// API's async kernels when the caller is not already on a Tokio
@@ -543,6 +568,13 @@ impl Supertable {
         Ok(true)
     }
 
+    /// Current manifest's id, without pinning a reader. Useful for
+    /// observability + tests that want to assert "a commit
+    /// happened" without holding a snapshot.
+    pub fn manifest_id(&self) -> u64 {
+        self.inner.manifest.load().manifest_id
+    }
+
     /// Pinned reader. Captures the current manifest at construction
     /// and holds it for its lifetime. New commits don't affect a
     /// live reader; closing + reopening picks up later commits.
@@ -622,8 +654,10 @@ impl Supertable {
     /// Minted once at handle construction via `IdGenerator`;
     /// distinct from every other handle in the process
     /// (different `worker_id`) and from every prior process
-    /// (different `ms` timestamp).
-    pub fn handle_id(&self) -> crate::supertable::wal::state_doc::SupertableHandleId {
+    /// (different `ms` timestamp). Test-only accessor — production
+    /// code reads `inner.handle_id` directly.
+    #[cfg(test)]
+    pub(crate) fn handle_id(&self) -> crate::supertable::wal::state_doc::SupertableHandleId {
         self.inner.handle_id
     }
 
@@ -703,12 +737,6 @@ impl Supertable {
         .await
     }
 
-    /// Current manifest's id, without pinning a reader. Useful for
-    /// observability + tests that want to assert "a commit
-    /// happened" without holding a snapshot.
-    pub fn manifest_id(&self) -> u64 {
-        self.inner.manifest.load().manifest_id
-    }
 
     /// Observability snapshot of the supertable's load.
     /// Cheap to call: one RSS syscall + an `ArcSwap::load` + a couple of

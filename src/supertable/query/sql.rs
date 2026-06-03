@@ -152,7 +152,7 @@ impl Supertable {
     /// the eventual `commit()` are NOT in the returned set —
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
-    pub fn scan_ids_matching(
+    pub(crate) fn scan_ids_matching(
         &self,
         expr: datafusion::prelude::Expr,
     ) -> Result<Vec<i128>, QueryError> {

@@ -47,13 +47,13 @@ pub struct SuperfileHit {
     /// Score. Direction is method-dependent — see the originating
     /// method's docs:
     ///
-    /// - [`super::SupertableReader::bm25_search`] /
-    ///   [`super::SupertableReader::bm25_search_prefix`] — BM25
-    ///   relevance, higher is better. Result vector is sorted
+    /// - [`Supertable::bm25_search`](super::super::Supertable::bm25_search) /
+    ///   [`Supertable::bm25_search_prefix`](super::super::Supertable::bm25_search_prefix)
+    ///   — BM25 relevance, higher is better. Result vector is sorted
     ///   descending.
-    /// - [`super::SupertableReader::vector_search`] — distance
-    ///   under the column's metric (cosine: `1 - dot(a, b)`, L2-sq:
-    ///   squared L2). Smaller is better. Result vector is sorted
+    /// - [`Supertable::vector_search`](super::super::Supertable::vector_search)
+    ///   — distance under the column's metric (cosine: `1 - dot(a, b)`,
+    ///   L2-sq: squared L2). Smaller is better. Result vector is sorted
     ///   ascending.
     pub score: f32,
 }

@@ -1,14 +1,13 @@
-//! BM25 fan-out methods on [`super::super::SupertableReader`].
+//! BM25 fan-out on [`Supertable`](super::super::Supertable).
 //!
 //! ## Public API
 //!
 //! ```ignore
-//! let reader = supertable.reader();
 //! let hits: Vec<SuperfileHit> =
-//!     reader.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+//!     supertable.bm25_search("title", "rust async", 10, BoolMode::Or)?;
 //!
 //! let prefix_hits: Vec<SuperfileHit> =
-//!     reader.bm25_search_prefix("title", "rus", 10)?;
+//!     supertable.bm25_search_prefix("title", "rus", 10)?;
 //! ```
 //!
 //! Both methods return [`SuperfileHit`]s sorted by score *descending*
@@ -18,9 +17,9 @@
 //!
 //! ## Strategy
 //!
-//! The public API style is methods on the reader. The
-//! reader holds a pinned `Arc<Manifest>`; for each visible segment
-//! we:
+//! Internally pins a snapshot reader and drives the async
+//! kernel to completion via the sync→async bridge. The reader
+//! holds a pinned `Arc<Manifest>`; for each visible segment we:
 //!
 //!   1. Fetch the segment's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::bm25_search` /
@@ -350,16 +349,12 @@ impl SupertableReader {
 }
 
 impl Supertable {
-    /// Sync single-column BM25 search — the external mirror of
-    /// [`Supertable::query_sql`], using the same sync→async bridge
-    /// ([`Supertable::block_on_query`]).
+    /// Single-column BM25 search over the current snapshot.
     ///
-    /// Pins a reader at call entry (one `ArcSwap::load_full`, like
-    /// `query_sql`) and drives the async
-    /// [`SupertableReader::bm25_search`] kernel to completion. Returns
-    /// up to `k` hits sorted by BM25 score *descending*. Use the
-    /// `SupertableReader` method directly when you are already in async
-    /// context and want to `.await`.
+    /// Pins a reader at call entry, applies the read-consistency
+    /// policy, and drives the internal async kernel to completion
+    /// via the sync→async bridge ([`Supertable::block_on_query`]).
+    /// Returns up to `k` hits sorted by BM25 score *descending*.
     pub fn bm25_search(
         &self,
         column: &str,
@@ -372,9 +367,8 @@ impl Supertable {
         self.block_on_query(reader.bm25_search(column, query, k, mode))
     }
 
-    /// Sync prefix-expanded BM25 search — see [`Supertable::bm25_search`]
-    /// for the bridge semantics. Delegates to
-    /// [`SupertableReader::bm25_search_prefix`].
+    /// Prefix-expanded BM25 search — see [`Supertable::bm25_search`]
+    /// for the bridge semantics.
     pub fn bm25_search_prefix(
         &self,
         column: &str,

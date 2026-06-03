@@ -23,6 +23,73 @@ format is described in [superfile](./superfile.md).
   and the table layer behaves the same way over in-memory, local-disk,
   and object storage.
 
+## Public API
+
+A supertable is the handle an application holds. Its operations are
+grouped behind typed accessors so call sites read clearly: a **reader**
+for queries against a pinned snapshot, a **writer** for staged changes
+published by commit, and a **stats** view for introspection. The
+manifest and segment internals behind these accessors are never part of
+the surface.
+
+Operations fall into two groups: **Read** and **Write**.
+
+### Read
+
+Reads run through a **reader** — a snapshot pinned at the moment it is
+taken, so a sequence of queries observes one consistent view of the
+table regardless of concurrent writes.
+
+Every read returns the same shape: a list of hits. A hit references a
+single row by its segment and the row's offset within that segment,
+plus a score when the query ranks results. BM25 fills the score with
+relevance (higher is better); vector search fills it with distance
+under the column's metric (smaller is closer); a SQL filter leaves it
+unset.
+
+- **Vector search.** k-nearest-neighbor over a vector column for a
+  query vector, returning the `k` closest rows ordered by ascending
+  distance. Per-query recall/latency knobs (number of clusters probed,
+  rerank breadth) are passed as search options.
+- **Full-text search.** BM25 over a text column for a query string,
+  returning the `k` highest-scoring rows ordered by descending score.
+  Search options carry the boolean combination mode (match any term or
+  all terms) and default to matching any term.
+- **Full-text prefix search.** BM25 over a text column where the query
+  is expanded as a term prefix, returning the `k` highest-scoring rows.
+- **SQL.** A SQL query over the table's scalar and full-text columns,
+  returning the matching rows as hits. Vector columns are not exposed
+  to SQL; they are reached through vector search.
+
+The reader also answers cheap snapshot questions — segment count,
+document count, manifest identity — without touching segment bytes. A
+separate **stats** view adds process-level observability (cache
+residency, resident memory) for the whole table.
+
+### Write
+
+Writes run through a **writer**: changes are staged on it and made
+durable by a single commit; nothing is persisted until commit
+succeeds. A commit applies all staged work atomically from the
+caller's perspective.
+
+- **Append.** Stage a batch of rows for insertion.
+- **Delete.** Stage the removal of every row matching a predicate. The
+  predicate is resolved against the current snapshot at call time.
+- **Update.** Stage a 1:1 replacement of every row matching a
+  predicate with a supplied batch of equal cardinality.
+- **Commit.** Flush all staged appends, updates, and deletes,
+  publishing a new snapshot of the table.
+
+### Lifecycle
+
+A table is created or opened from a set of options (schema, indexed
+columns, tokenizer, storage backend, consistency policy). The options
+used to construct the table are readable back from the handle. Read
+freshness under concurrent writers is governed by the configured
+consistency policy and applied by the engine on every read; callers
+never refresh by hand.
+
 ## Manifest
 
 The manifest is the source of truth for which segments make up the
