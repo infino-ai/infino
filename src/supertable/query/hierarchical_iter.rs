@@ -16,15 +16,13 @@
 //!      that the existing segment-level skip + fan-out
 //!      code consumes.
 //!
-//! Sync bridge via the same ambient-runtime detection the
-//! writer's `persist_commit` uses (`Handle::try_current` →
-//! `block_in_place + handle.block_on` when in an async
-//! context; `sql_runtime.block_on` otherwise). The query
-//! paths stay sync end-to-end; callers don't acquire any
+//! Sync bridge via the shared `runtime_bridge::bridge_sync_to_async`.
+//! The query paths stay sync end-to-end; callers don't acquire any
 //! runtime knowledge.
 
 use std::sync::Arc;
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::supertable::error::QueryError;
 use crate::supertable::manifest::part::{ManifestPart, PartId};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
@@ -40,11 +38,8 @@ use crate::supertable::manifest::{Manifest, SuperfileEntry};
 /// parallel so wall-clock is `max(per-part GET latency)`
 /// not the serial sum.
 ///
-/// Sync→async bridge via the standard pattern:
-/// `Handle::try_current` → `block_in_place + handle.block_on`
-/// inside an ambient runtime; build a `new_current_thread`
-/// runtime ad-hoc outside one. Mirrors `superfile_reader`'s
-/// disk-cache bridge.
+/// Sync→async bridge via the shared
+/// [`bridge_sync_to_async`].
 pub fn load_kept_parts(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
@@ -69,18 +64,7 @@ pub fn load_kept_parts(
         Ok::<Vec<Arc<ManifestPart>>, QueryError>(out)
     };
 
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-        Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    QueryError::Store(format!("tokio runtime build for hierarchical_iter: {e}"))
-                })?;
-            rt.block_on(drive)
-        }
-    }
+    bridge_sync_to_async(drive)
 }
 
 /// Concatenate the loaded parts' superfiles into a flat

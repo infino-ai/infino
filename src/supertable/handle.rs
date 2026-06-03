@@ -12,10 +12,9 @@
 //! and (via `Drop`) flips it false on release.
 
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use tokio::runtime::Runtime;
 
 use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
@@ -65,14 +64,6 @@ pub(super) struct SupertableInner {
     /// supertable, constructed fresh on `create()` /
     /// `open()` with a 40-bit random worker_id.
     pub(super) id_generator: Mutex<crate::supertable::utils::idgen::IdGenerator>,
-    /// Lazily-initialized tokio Runtime that drives DataFusion
-    /// plans for `query_sql`. Tokio is single-worker here — it
-    /// runs the async I/O state machine, not CPU-bound work
-    /// (that lives on `options.reader_pool`). One Runtime per
-    /// supertable, shared across all SQL queries; allocated on
-    /// first use rather than at `create()` so supertables that
-    /// never run SQL don't pay the runtime cost.
-    pub(super) sql_runtime: OnceLock<Arc<Runtime>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -89,25 +80,6 @@ pub(super) struct SupertableInner {
     /// opens five supertables holds five distinct ids). Minted
     /// via `IdGenerator::next_id()` once at create / open.
     pub(super) handle_id: crate::supertable::wal::state_doc::SupertableHandleId,
-}
-
-impl SupertableInner {
-    /// Get (or lazily build) the SQL Runtime.
-    pub(super) fn sql_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(self.sql_runtime.get_or_init(|| {
-            Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .thread_name("supertable-sql")
-                    .build()
-                    .expect(
-                        "invariant: tokio Runtime build only fails on \
-                         catastrophic OS resource exhaustion",
-                    ),
-            )
-        }))
-    }
 }
 
 impl Supertable {
@@ -127,9 +99,8 @@ impl Supertable {
     ///   shadows existing committed state" footgun.
     ///
     /// Sync API. Internally bridges to async I/O for the
-    /// pointer probe + the open delegation via the same
-    /// `Handle::try_current() + block_in_place` pattern the
-    /// rest of the supertable's sync paths use. Works from
+    /// pointer probe + the open delegation via the shared
+    /// `runtime_bridge::bridge_sync_to_async`. Works from
     /// sync `#[test]` contexts and from multi-thread
     /// `#[tokio::test]` contexts; calling from a
     /// `current_thread` runtime panics (use the async
@@ -173,7 +144,6 @@ impl Supertable {
             manifest: ArcSwap::new(Arc::new(initial)),
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
-            sql_runtime: OnceLock::new(),
             tombstone_cache,
             handle_id,
         });
@@ -350,7 +320,6 @@ impl Supertable {
             manifest: ArcSwap::new(Arc::new(manifest)),
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
-            sql_runtime: OnceLock::new(),
             tombstone_cache,
             handle_id,
         });
@@ -575,11 +544,7 @@ impl Supertable {
         crate::supertable::wal::recovery::RecoveryReport,
         crate::supertable::wal::recovery::RecoveryError,
     > {
-        let drive = self.run_recovery_sweep_once();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.inner.sql_runtime().block_on(drive),
-        }
+        bridge_sync_to_async(self.run_recovery_sweep_once())
     }
 
     /// Operator hatch: run one GC sweep over this supertable's
@@ -652,14 +617,6 @@ impl Supertable {
     /// the public API.
     pub(super) fn inner(&self) -> &Arc<SupertableInner> {
         &self.inner
-    }
-
-    /// SQL Runtime accessor, exposed within the crate for the
-    /// `query::sql` module's `block_on`. Lazy: first call
-    /// allocates a single-worker tokio Runtime cached on
-    /// `SupertableInner`; subsequent calls clone the `Arc`.
-    pub(crate) fn sql_runtime(&self) -> Arc<Runtime> {
-        self.inner.sql_runtime()
     }
 }
 

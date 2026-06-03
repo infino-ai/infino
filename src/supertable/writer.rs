@@ -55,6 +55,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use rayon::prelude::*;
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::superfile::builder::SuperfileBuilder;
 
 use super::error::BuildError;
@@ -717,10 +718,7 @@ impl SupertableWriter {
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
-            Err(_) => self.inner.sql_runtime().block_on(drive)?,
-        };
+        let (n_tombstoned, n_not_found) = bridge_sync_to_async(drive)?;
         Ok(OperationOutcome {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -790,10 +788,7 @@ impl SupertableWriter {
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
-            Err(_) => self.inner.sql_runtime().block_on(drive)?,
-        };
+        let (n_tombstoned, n_not_found) = bridge_sync_to_async(drive)?;
         Ok(OperationOutcome {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1145,7 +1140,7 @@ fn publish_superfiles(
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
         {
-            warm_cache_after_commit(inner, &cache, pending_cache_inserts);
+            warm_cache_after_commit(&cache, pending_cache_inserts);
         }
 
         // Best-effort memory-budget enforcement. Each commit
@@ -1241,19 +1236,10 @@ pub(in crate::supertable) fn persist_commit(
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
 
-    // The writer's commit path is sync but the persistence
-    // layer is async. Two cases:
-    //
-    // - **Sync caller** (no ambient tokio runtime): drive
-    //   the future on the supertable's owned `sql_runtime`
-    //   (lazy-init the first time we hit this branch).
-    // - **Async caller** (inside a tokio runtime): use the
-    //   ambient runtime via `Handle::current().block_on`
-    //   wrapped in `block_in_place`. This avoids creating
-    //   (and later dropping) a second owned runtime — which
-    //   would otherwise panic at Drop with "cannot drop a
-    //   runtime in a context where blocking is not allowed".
-    //   Requires the ambient runtime to be `multi_thread`.
+    // The writer's commit path is sync but the persistence layer is
+    // async. Cross the boundary through the shared
+    // `bridge_sync_to_async` (ambient `multi_thread` runtime when
+    // present, the process-wide owned runtime otherwise).
     let max_retries = opts.max_commit_retries.max(1);
     let drive = async move {
         let mut last_err: Option<crate::supertable::CommitError> = None;
@@ -1298,20 +1284,7 @@ pub(in crate::supertable) fn persist_commit(
         Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
     };
 
-    let (new_list, new_segment_list) = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // Ambient tokio runtime present — use it. Don't
-            // touch `inner.sql_runtime()` so we don't risk
-            // dropping our owned runtime from within
-            // another's worker context.
-            tokio::task::block_in_place(|| handle.block_on(drive))?
-        }
-        Err(_) => {
-            // Sync caller; lazy-init the supertable's
-            // owned runtime.
-            inner.sql_runtime().block_on(drive)?
-        }
-    };
+    let (new_list, new_segment_list) = bridge_sync_to_async(drive)?;
 
     // Build the new in-memory Manifest with the persisted
     // list + a fresh ManifestPartLoader installed.
@@ -1833,10 +1806,8 @@ async fn put_segment_multipart(
 }
 
 /// M14b.2 — drive `DiskCacheStore::insert_warm` for each
-/// just-published segment via the same sync→async bridge
-/// the rest of the writer uses (`block_in_place +
-/// Handle::block_on` when an ambient runtime is present;
-/// `inner.sql_runtime()` otherwise).
+/// just-published segment via the shared sync→async
+/// [`bridge_sync_to_async`].
 ///
 /// Failures are swallowed with an `eprintln!` log line —
 /// the superfiles are already durable in storage and the
@@ -1844,7 +1815,6 @@ async fn put_segment_multipart(
 /// becomes a "warm load fails → next query cold-fetches"
 /// degradation, not a correctness break.
 fn warm_cache_after_commit(
-    inner: &SupertableInner,
     cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
     pending: Vec<(SuperfileUri, Bytes)>,
 ) {
@@ -1860,14 +1830,7 @@ fn warm_cache_after_commit(
             }
         }
     };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(drive));
-        }
-        Err(_) => {
-            inner.sql_runtime().block_on(drive);
-        }
-    }
+    bridge_sync_to_async(drive);
 }
 
 #[cfg(test)]

@@ -69,6 +69,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::Supertable;
 use crate::supertable::manifest::Manifest;
@@ -118,18 +119,10 @@ impl Supertable {
                 .map_err(|e| QueryError::Execute(e.to_string()))
         };
 
-        // M14b: same ambient-runtime detection pattern the
-        // writer's persist_commit uses. Lazy-init the owned
-        // sql_runtime only when there's NO ambient runtime —
-        // calling `Builder::new_multi_thread().build()` from
-        // inside another runtime panics with "Cannot start a
-        // runtime from within a runtime". Web handlers,
-        // `#[tokio::test]`s, and any async caller now get a
-        // working query_sql.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.sql_runtime().block_on(drive),
-        }
+        // Cross the sync→async boundary through the one shared
+        // bridge: ride the ambient runtime when present, the
+        // process-wide owned runtime otherwise.
+        bridge_sync_to_async(drive)
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -182,10 +175,7 @@ impl Supertable {
             extract_id_column(&batches)
         };
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.sql_runtime().block_on(drive),
-        }
+        bridge_sync_to_async(drive)
     }
 }
 
@@ -603,15 +593,10 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_runtime_is_cached_across_calls() {
-        // Two queries on the same supertable must share one
-        // Runtime — the OnceLock guarantees this; we assert by
-        // checking that both calls succeed without spawning a
-        // fresh Runtime per call (observed indirectly via the
-        // `.await` over `block_on` not double-allocating; if the
-        // cache regressed, tests would still pass but would leak
-        // a Runtime per call. The functional check below is
-        // adequate for correctness; benchmarks would catch leak).
+    fn query_sql_succeeds_across_repeated_calls() {
+        // Repeated queries on the same supertable all succeed —
+        // they share the one process-wide bridge runtime, so there's
+        // no per-call runtime build to regress on.
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["x"], &["t"])).expect("a");

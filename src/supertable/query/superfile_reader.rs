@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 
+use crate::runtime_bridge::bridge_sync_to_async;
 use crate::superfile::SuperfileReader;
 use crate::supertable::manifest::SuperfileUri;
 use crate::supertable::reader_cache::DiskCacheStore;
@@ -61,36 +62,8 @@ pub fn superfile_reader(
     };
 
     let uri_copy = *uri;
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // Ambient tokio runtime — block_in_place + block_on
-            // is the same pattern the writer's commit path uses
-            // for its sync→async bridge.
-            tokio::task::block_in_place(|| handle.block_on(cache.reader(&uri_copy)))
-        }
-        Err(_) => {
-            // No ambient runtime. Build a tiny one just for
-            // this fetch. Cold path; the overhead (≈ 1 ms to
-            // create a current_thread Runtime) is negligible
-            // compared to the parallel range-fetch the cache
-            // is about to issue. Falls out of scope at end of
-            // statement.
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    return Err(ReaderCacheError::OpenFailed {
-                        source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
-                            "tokio runtime build for disk cache fetch: {e}"
-                        ))),
-                    });
-                }
-            };
-            rt.block_on(cache.reader(&uri_copy))
-        }
-    };
+    // Cross the sync→async boundary through the one shared bridge.
+    let result = bridge_sync_to_async(cache.reader(&uri_copy));
 
     result.map_err(|e| ReaderCacheError::OpenFailed {
         source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
