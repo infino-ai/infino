@@ -58,8 +58,21 @@ unset.
 - **Full-text prefix search.** BM25 over a text column where the query
   is expanded as a term prefix, returning the `k` highest-scoring rows.
 - **SQL.** A SQL query over the table's scalar and full-text columns,
-  returning the matching rows as hits. Vector columns are not exposed
-  to SQL; they are reached through vector search.
+  returning the matching rows. Search is also reachable from SQL
+  through table-valued functions, so a query can filter, project, join,
+  and order search results alongside scalar columns:
+  - `vector_search(column, query, k)` — vector kNN as a relation.
+  - `bm25_search(column, query, k)` and
+    `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
+  - `hybrid_search(text_col, q_text, vec_col, q_vec, k)` — BM25 and
+    vector kNN fused by reciprocal-rank fusion into one ranking
+    (`score` higher-is-better).
+
+  Each function runs against the reader's pinned snapshot and yields
+  the table's `_id`, the projected scalar columns, and a `score`. Vector
+  columns themselves are never scanned as SQL columns — they live in the
+  segment's embedded blob — so they are reached only through
+  `vector_search` / `hybrid_search`.
 
 The reader also answers cheap snapshot questions — segment count,
 document count, manifest identity — without touching segment bytes. A
@@ -203,6 +216,17 @@ into fixed-size chunks driven in parallel, which lowers peak memory
 during the write and limits the cost of a transient backend failure
 mid-upload.
 
+Range reads are exact-or-error. A read for a byte range returns
+exactly that many bytes or a typed error — never a short buffer. If the
+backend returns a truncated or clamped range (a body cut short by a
+transport hiccup, or a range past the object's real end), the missing
+tail is re-fetched to complete the range, and a genuinely unsatisfiable
+range surfaces as an error rather than silently feeding a partial slice
+to a reader. Transient transport failures on an idempotent range GET
+(for example a send failure on a pooled connection the backend closed)
+are retried with backoff, so the burst of concurrent range GETs a cold
+query fans out does not surface a flaky connection as a read failure.
+
 Readers may verify the segment's embedded checksums when opening it.
 This is on by default and can be turned off when the underlying
 storage already guarantees integrity (a content-addressed object
@@ -256,7 +280,14 @@ is never wrongly dropped.
 Full-text and vector search delegate to each segment's index (the same
 search the single-segment reader runs) and merge globally. SQL is
 executed over the columnar (Parquet) data and does not require the
-search indexes.
+search indexes — but it can still reach them through the search
+table-valued functions (`vector_search`, `bm25_search`,
+`bm25_search_prefix`, `hybrid_search`), which run the same per-segment
+index fan-out and hand their results back into the SQL plan as a
+relation. `hybrid_search` runs the BM25 and vector kernels
+concurrently and fuses the two rankings with reciprocal-rank fusion, so
+a row surfaced by both retrievers ranks above one surfaced by a single
+retriever.
 
 ## Concurrency
 

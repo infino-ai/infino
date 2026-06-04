@@ -167,7 +167,6 @@ pub fn bench(c: &mut Criterion) {
         &["supertable_vec", "supertable_vec_search"],
         &[
             "supertable_vec_hot_search",
-            "supertable_vec_warm_search_real_s3",
             "supertable_vec_cold_search_real_s3",
         ],
     ) {

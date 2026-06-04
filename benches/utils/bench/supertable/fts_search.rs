@@ -83,7 +83,6 @@ pub fn bench(c: &mut Criterion) {
         &["supertable_fts", "supertable_fts_search"],
         &[
             "supertable_fts_hot_search",
-            "supertable_fts_warm_search_real_s3",
             "supertable_fts_cold_search_real_s3",
         ],
     ) {

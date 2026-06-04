@@ -400,9 +400,7 @@ impl StorageProvider for S3StorageProvider {
                 Ok(chunk) => chunk,
                 Err(e) => {
                     let err = translate(uri, e);
-                    if is_retryable_transient(&err)
-                        && transient_retries < MAX_TRANSIENT_RETRIES
-                    {
+                    if is_retryable_transient(&err) && transient_retries < MAX_TRANSIENT_RETRIES {
                         tokio::time::sleep(transient_backoff(transient_retries)).await;
                         transient_retries += 1;
                         continue;

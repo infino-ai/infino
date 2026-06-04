@@ -374,10 +374,7 @@ mod tests {
         );
         let (start, len) = (1024u64, 2048u64);
         let got = src.range(start, len).await.expect("range");
-        assert_eq!(
-            got.as_ref(),
-            &blob[start as usize..(start + len) as usize]
-        );
+        assert_eq!(got.as_ref(), &blob[start as usize..(start + len) as usize]);
     }
 
     /// When the backing object is genuinely shorter than the cached

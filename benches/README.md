@@ -131,7 +131,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 339.00 s | 29.5 K/s | 7.32 GiB | 3.25 GiB | 6.07 GiB | -0.4% no change |
+| supertable | 319.28 s | 31.3 K/s | 6.25 GiB | 2.10 GiB | 3.40 GiB | +1.6% no change |
 
 <!-- END: bench/supertable/ingest/supertable_fts_build -->
 
@@ -195,7 +195,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 405.20 s | 24.7 K/s | 5.18 GiB | 2.94 GiB | 4.55 GiB | — |
+| supertable | 165.51 s | 60.4 K/s | 3.14 GiB | 2.38 GiB | 2.81 GiB | -0.4% no change |
 
 <!-- END: bench/supertable/ingest/supertable_vec_build -->
 
@@ -204,7 +204,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 494.81 s | 20.2 K/s | 7.47 GiB | 3.54 GiB | 6.36 GiB | +50951.9% regressed |
+| supertable | 486.67 s | 20.5 K/s | 7.16 GiB | 3.55 GiB | 4.65 GiB | +0.4% no change |
 
 <!-- END: bench/supertable/ingest/supertable_all_build -->
 

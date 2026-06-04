@@ -141,20 +141,8 @@ fn vector_search_id(n: usize, nprobe: usize, storage_label: &str) -> String {
     }
 }
 
-fn warm_vector_search_id(n: usize, nprobe: usize, storage_label: &str) -> String {
-    if nprobe == DEFAULT_NPROBE {
-        format!("n={n}_{storage_label}_mmap_post_promotion_top{TOP_K}")
-    } else {
-        format!("n={n}_{storage_label}_mmap_post_promotion_top{TOP_K}_nprobe{nprobe}")
-    }
-}
-
 fn bm25_search_id(n: usize, storage_label: &str) -> String {
     format!("n={n}_{storage_label}_top{TOP_K}")
-}
-
-fn warm_bm25_search_id(n: usize, storage_label: &str) -> String {
-    format!("n={n}_{storage_label}_mmap_post_promotion_top{TOP_K}")
 }
 
 /// Primary-key column. `SuperfileBuilder` requires the id column
@@ -551,14 +539,6 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
     crate::tiers::fresh_superfile_cache(storage)
 }
 
-async fn wait_for_mmap_promotion(
-    cache: &Arc<DiskCacheStore>,
-    uri: SuperfileUri,
-    timeout: Duration,
-) {
-    crate::tiers::wait_for_superfile_promotion(cache, uri, timeout).await;
-}
-
 // ─── Benches ─────────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
@@ -714,63 +694,6 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    // ── Row 4: warm subsequent search (post-promotion). ─────────────
-    // Pre-warm the cache once via a cold cycle + wait for
-    // the background promotion. Subsequent iterations hit
-    // the mmap-backed reader; zero S3 GETs per iteration.
-    {
-        let (warm_dir, warm_cache) = fresh_cache(Arc::clone(&storage));
-        rt.block_on(async {
-            // Trigger cold + wait for promotion.
-            let _ = warm_cache.reader(&uri).await.expect("warm prewarm");
-            wait_for_mmap_promotion(&warm_cache, uri, Duration::from_secs(60)).await;
-        });
-
-        let mut g = c.benchmark_group("object_store_warm_search");
-        g.sample_size(50);
-        g.measurement_time(Duration::from_secs(10));
-
-        let q = query.clone();
-        let cache_ref = Arc::clone(&warm_cache);
-        g.bench_function(warm_vector_search_id(n, nprobe, storage_label), |b| {
-            b.iter(|| {
-                let reader = rt
-                    .block_on(async { cache_ref.reader(&uri).await })
-                    .expect("warm reader");
-                let vec = reader.vec().expect("vector reader present");
-                let hits = vec
-                    .search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                    .expect("warm vector_search");
-                std::hint::black_box(hits)
-            });
-        });
-        g.finish();
-
-        // Warm BM25 on the *same* promoted cache — the unified
-        // segment is fully mmap'd, so the FTS subsection resolves
-        // from mmap too (zero S3 GETs), no second promotion wait.
-        let mut g = c.benchmark_group("object_store_warm_bm25");
-        g.sample_size(50);
-        g.measurement_time(Duration::from_secs(10));
-
-        let cache_ref = Arc::clone(&warm_cache);
-        g.bench_function(warm_bm25_search_id(n, storage_label), |b| {
-            b.iter(|| {
-                let reader = rt
-                    .block_on(async { cache_ref.reader(&uri).await })
-                    .expect("warm reader");
-                let hits = rt
-                    .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
-                    .expect("warm bm25_search");
-                std::hint::black_box(hits)
-            });
-        });
-        g.finish();
-
-        drop(warm_cache);
-        drop(warm_dir);
-    }
-
     rt.block_on(fixture.cleanup());
     emit_object_store_markdown(storage_label);
 }
@@ -778,12 +701,12 @@ fn bench(c: &mut Criterion) {
 // ─── Markdown summary emitter ────────────────────────────────────────
 
 /// Pull criterion's measured `mean.point_estimate` (ns) for
-/// each of the cold/warm rows out of
+/// each of the cold rows out of
 /// `target/criterion/<group>/<bench>/new/estimates.json`,
 /// format a single markdown table, and `markdown::emit()`
 /// it (stderr unconditionally + README rewrite when
 /// `INFINO_BENCH_UPDATE_README=1` is set). The anchor
-/// `bench/vector/object_store/cold_warm` matches the
+/// `bench/vector/object_store/cold` matches the
 /// `<!-- BEGIN/END -->` markers in `benches/vector/README.md`.
 fn emit_object_store_markdown(storage_label: &str) {
     use crate::markdown::{MarkdownSection, fmt_time, read_mean_ns};
@@ -804,18 +727,10 @@ fn emit_object_store_markdown(storage_label: &str) {
         "object_store_cold_first_bm25",
         &bm25_search_id(n, storage_label),
     );
-    let warm_search_ns = read_mean_ns(
-        "object_store_warm_search",
-        &warm_vector_search_id(n, BENCH_NPROBE, storage_label),
-    );
-    let warm_bm25_ns = read_mean_ns(
-        "object_store_warm_bm25",
-        &warm_bm25_search_id(n, storage_label),
-    );
 
     let mut body = String::new();
     body.push_str(&format!(
-        "### Superfile vector + FTS — object-store cold/warm via s3s-fs \
+        "### Superfile vector + FTS — object-store cold via s3s-fs \
          ({storage_label}, {n} docs × dim={dim}, ~{superfile_mib:.0} MiB unified superfile, Sq8 rerank + \
          `title` FTS)\n\n",
     ));
@@ -827,8 +742,8 @@ fn emit_object_store_markdown(storage_label: &str) {
          wall-clock because loopback latency is environment-dependent. \
          `ColdFetchMode::LazyForegroundWithBackgroundFill`: cold foreground \
          returns immediately via `SuperfileReader::open_lazy` (both readers), \
-         background downloads the full segment to NVMe + mmaps it, warm calls \
-         resolve from mmap (0 S3 GETs).\n\n",
+         background downloads the full segment to NVMe + mmaps it for \
+         subsequent reads.\n\n",
     );
     body.push_str("| Phase | p50 |\n");
     body.push_str("|-------|-----|\n");
@@ -844,17 +759,9 @@ fn emit_object_store_markdown(storage_label: &str) {
         "| Cold first BM25 search after S3 open (`FtsReader::open_lazy`: header + doc-lengths + dict/postings GETs) | {} |\n",
         cold_bm25_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
-    body.push_str(&format!(
-        "| Warm subsequent vector search after S3 open (mmap, 0 S3 GETs) | {} |\n",
-        warm_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
-    ));
-    body.push_str(&format!(
-        "| Warm subsequent BM25 search after S3 open (mmap, 0 S3 GETs) | {} |\n",
-        warm_bm25_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
-    ));
 
     crate::markdown::emit(&MarkdownSection {
-        anchor_id: "bench/vector/object_store/cold_warm".into(),
+        anchor_id: "bench/vector/object_store/cold".into(),
         body,
     });
 }
