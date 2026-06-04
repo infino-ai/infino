@@ -115,10 +115,10 @@ impl Drop for SupertableInner {
     /// owner; otherwise an outstanding transient clone (never the
     /// last reference) just decrements normally.
     fn drop(&mut self) {
-        if let Some(rt) = self.query_runtime.take() {
-            if let Ok(rt) = Arc::try_unwrap(rt) {
-                rt.shutdown_background();
-            }
+        if let Some(rt) = self.query_runtime.take()
+            && let Ok(rt) = Arc::try_unwrap(rt)
+        {
+            rt.shutdown_background();
         }
     }
 }

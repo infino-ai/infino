@@ -1875,7 +1875,7 @@ fn rerank_candidates_from_blocks(
 ///
 /// Both code paths keep their own data-access strategy (eager mmap vs
 /// lazy range GETs); only the scoring math is shared here.
-fn sq8_score_and_refine<'a>(
+fn sq8_score_and_refine(
     candidates: &[RerankCandidate],
     cluster_blocks: &[Bytes],
     survivor_full_rows: Option<&[Bytes]>,
@@ -1883,7 +1883,7 @@ fn sq8_score_and_refine<'a>(
     query: &[f32],
     scale: &[f32],
     offset: &[f32],
-    per_doc_norms: Option<&'a [f32]>,
+    per_doc_norms: Option<&[f32]>,
     k: usize,
     stride: usize,
 ) -> Vec<(u32, f32)> {
