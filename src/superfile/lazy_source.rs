@@ -134,6 +134,18 @@ pub enum LazyByteSourceError {
     /// Caller requested a range outside `size()`.
     #[error("range out of bounds: start={start} len={len} size={size}")]
     OutOfBounds { start: u64, len: u64, size: u64 },
+
+    /// The backing storage returned fewer bytes than the
+    /// requested range without erroring (a clamped/partial
+    /// range, e.g. an object_store GET that hit a truncated
+    /// body or an object shorter than the cached size). The
+    /// [`LazyByteSource::range`] contract requires the returned
+    /// bytes to equal `full_object[start..start + len]`, so a
+    /// read that cannot be completed surfaces here rather than
+    /// being handed up truncated — a short buffer otherwise
+    /// panics deep in a sub-reader's slice math.
+    #[error("short read: start={start} requested={requested} got={got}")]
+    ShortRead { start: u64, requested: u64, got: u64 },
 }
 
 /// Backing for source-aware superfile sub-readers.
