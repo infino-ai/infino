@@ -74,6 +74,15 @@ impl Supertable {
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        // Apply the read-consistency policy before pinning, so SQL
+        // honors the same freshness contract as the search APIs
+        // (`bm25_search` / `vector_search`): under `Strong` /
+        // `BoundedStaleness` this advances the in-memory snapshot to
+        // the latest published manifest; under `Snapshot` (and for
+        // in-memory tables) it is a no-op. See
+        // [`Supertable::ensure_fresh`].
+        self.ensure_fresh();
+
         // Pin the current manifest snapshot. ArcSwap::load_full
         // is a single atomic load + Arc clone, so this is cheap
         // even on the hot path. The same Arc is used as the
@@ -175,6 +184,12 @@ impl Supertable {
         &self,
         expr: datafusion::prelude::Expr,
     ) -> Result<Vec<i128>, QueryError> {
+        // Resolve against the freshest snapshot the consistency
+        // policy allows — the spec requires delete/update predicates
+        // to bind "against the current snapshot at call time", which
+        // means honoring `Strong` / `BoundedStaleness` just like the
+        // read APIs do. No-op under `Snapshot` / in-memory tables.
+        self.ensure_fresh();
         let reader = self.reader();
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);

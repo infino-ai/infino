@@ -15,10 +15,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::storage::{StorageError, StorageProvider};
 use crate::superfile::{LazyByteSource, LazyByteSourceError};
+
+/// Bounded re-issue budget for a `get_range` that comes back
+/// short of the requested length. Each re-issue fetches only the
+/// still-missing tail, so a healthy backend completes on the
+/// first retry; the cap stops a persistently-truncated object
+/// from spinning forever before it surfaces a typed
+/// [`LazyByteSourceError::ShortRead`].
+const MAX_SHORT_READ_RETRIES: u32 = 4;
 
 /// `LazyByteSource` over a `StorageProvider::get_range`.
 ///
@@ -140,11 +148,70 @@ impl LazyByteSource for StorageRangeSource {
                 size: known,
             });
         }
-        let range = start..(start + len);
-        // `StorageError` -> `LazyByteSourceError::Storage`
-        // via the `#[from]` impl — typed propagation, no
-        // stringification.
-        Ok(self.storage.get_range(&self.uri, range).await?)
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        // Completion loop. `StorageProvider::get_range` is
+        // contractually exact-length-or-error, but object-store
+        // backends have been observed to return a *short* buffer
+        // without erroring — a clamped/partial range on a transient
+        // transport hiccup, or an object shorter than the cached
+        // size. The `LazyByteSource::range` contract requires the
+        // returned bytes to equal `full_object[start..start + len]`,
+        // so re-issue the GET for the still-missing tail rather than
+        // handing a truncated buffer up to the sub-readers (where a
+        // short slice panics deep in the vector/FTS codec). A read
+        // that makes no forward progress, or stalls past the retry
+        // budget, surfaces as a typed `ShortRead`.
+        let want = len as usize;
+        let end = start + len;
+        let mut cursor = start;
+        let mut filled = 0usize;
+        let mut parts: Vec<Bytes> = Vec::new();
+        let mut stalls = 0u32;
+        while filled < want {
+            // `StorageError` -> `LazyByteSourceError::Storage`
+            // via the `#[from]` impl — typed propagation, no
+            // stringification.
+            let chunk = self.storage.get_range(&self.uri, cursor..end).await?;
+            if chunk.is_empty() {
+                // No bytes and no error means the object is shorter
+                // than the requested range; looping again would spin.
+                return Err(LazyByteSourceError::ShortRead {
+                    start,
+                    requested: len,
+                    got: filled as u64,
+                });
+            }
+            // Defensive clamp: a backend must never overshoot the
+            // requested tail, but never trust more than `want`.
+            let take = chunk.len().min(want - filled);
+            filled += take;
+            cursor += take as u64;
+            parts.push(chunk.slice(0..take));
+            if filled < want {
+                stalls += 1;
+                if stalls > MAX_SHORT_READ_RETRIES {
+                    return Err(LazyByteSourceError::ShortRead {
+                        start,
+                        requested: len,
+                        got: filled as u64,
+                    });
+                }
+            }
+        }
+
+        // Fast path: a single full-length chunk (the overwhelming
+        // common case) returns zero-copy.
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("len checked == 1"));
+        }
+        let mut out = BytesMut::with_capacity(want);
+        for p in &parts {
+            out.extend_from_slice(p);
+        }
+        Ok(out.freeze())
     }
 
     /// single-RTT tail fetch.
@@ -166,5 +233,196 @@ impl LazyByteSource for StorageRangeSource {
         // a last-writer-wins store is correct.
         self.size.store(total, Ordering::Release);
         Ok((bytes, total))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::ObjectMeta;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Storage fake that serves `get_range` in capped chunks and
+    /// against a (possibly smaller-than-advertised) backing object.
+    /// Models object-store backends that return a short buffer for an
+    /// in-bounds request without erroring.
+    #[derive(Debug)]
+    struct ChunkedStorage {
+        blob: Bytes,
+        /// Largest number of bytes a single `get_range` returns. A
+        /// value `< requested len` forces the completion loop to
+        /// re-issue for the missing tail.
+        chunk_cap: usize,
+        /// Bytes actually present in the backing object. Requests past
+        /// this clamp to it (mimicking S3 clamping to object size).
+        obj_size: usize,
+        calls: AtomicUsize,
+    }
+
+    impl ChunkedStorage {
+        fn new(blob: Bytes, chunk_cap: usize, obj_size: usize) -> Self {
+            Self {
+                blob,
+                chunk_cap,
+                obj_size,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    fn permanent(uri: &str, msg: &'static str) -> StorageError {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = msg.into();
+        StorageError::Permanent {
+            uri: uri.into(),
+            source: boxed,
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for ChunkedStorage {
+        async fn head(&self, _uri: &str) -> Result<ObjectMeta, StorageError> {
+            Ok(ObjectMeta {
+                size: self.obj_size as u64,
+                etag: None,
+            })
+        }
+
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            Err(permanent(uri, "get unimplemented"))
+        }
+
+        async fn get_range(
+            &self,
+            _uri: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, StorageError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let start = range.start as usize;
+            let req = (range.end - range.start) as usize;
+            let available = self.obj_size.saturating_sub(start);
+            let take = req.min(self.chunk_cap).min(available);
+            Ok(self.blob.slice(start..start + take))
+        }
+
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            _bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            Err(permanent(uri, "put_atomic unimplemented"))
+        }
+
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            _bytes: Bytes,
+            _expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            Err(permanent(uri, "put_if_match unimplemented"))
+        }
+
+        async fn put_multipart(
+            &self,
+            uri: &str,
+        ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+            Err(permanent(uri, "put_multipart unimplemented"))
+        }
+
+        async fn delete(&self, _uri: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    /// A `get_range` that comes back short (capped chunks) must be
+    /// completed by re-issuing for the missing tail — the caller sees
+    /// the full, contiguous range, never a truncated buffer.
+    #[tokio::test]
+    async fn range_completes_a_short_read_by_refetching_the_tail() {
+        let blob = Bytes::from((0u8..=255).cycle().take(4096).collect::<Vec<u8>>());
+        // Each GET returns at most 1000 bytes; the full object is
+        // present. A 4096-byte request must stitch ≥5 chunks.
+        let storage = Arc::new(ChunkedStorage::new(blob.clone(), 1000, blob.len()));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+            blob.len() as u64,
+        );
+
+        let got = src.range(0, blob.len() as u64).await.expect("range");
+        assert_eq!(got.len(), blob.len());
+        assert_eq!(got.as_ref(), blob.as_ref());
+        assert!(
+            storage.call_count() >= 5,
+            "expected multiple GETs to complete the short read, got {}",
+            storage.call_count()
+        );
+    }
+
+    /// Stitching works for an interior, non-zero-based range too.
+    #[tokio::test]
+    async fn range_completes_short_read_for_interior_range() {
+        let blob = Bytes::from((0u8..=255).cycle().take(4096).collect::<Vec<u8>>());
+        let storage = Arc::new(ChunkedStorage::new(blob.clone(), 700, blob.len()));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+            blob.len() as u64,
+        );
+        let (start, len) = (1024u64, 2048u64);
+        let got = src.range(start, len).await.expect("range");
+        assert_eq!(
+            got.as_ref(),
+            &blob[start as usize..(start + len) as usize]
+        );
+    }
+
+    /// When the backing object is genuinely shorter than the cached
+    /// size (a stale/oversized size hint), the read can never be
+    /// completed — it must surface a typed `ShortRead`, not a
+    /// truncated buffer that panics downstream.
+    #[tokio::test]
+    async fn range_surfaces_short_read_when_object_is_truncated() {
+        let blob = Bytes::from(vec![7u8; 2048]);
+        // Cached size says 4096, but the object only holds 2048.
+        let storage = Arc::new(ChunkedStorage::new(blob, 4096, 2048));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+            4096,
+        );
+        let err = src
+            .range(0, 4096)
+            .await
+            .expect_err("must reject a permanently short read");
+        match err {
+            LazyByteSourceError::ShortRead {
+                start,
+                requested,
+                got,
+            } => {
+                assert_eq!(start, 0);
+                assert_eq!(requested, 4096);
+                assert_eq!(got, 2048);
+            }
+            other => panic!("expected ShortRead, got {other:?}"),
+        }
+    }
+
+    /// A zero-length range is a no-op that never touches storage.
+    #[tokio::test]
+    async fn range_zero_length_is_empty_without_io() {
+        let storage = Arc::new(ChunkedStorage::new(Bytes::from(vec![0u8; 16]), 16, 16));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+            16,
+        );
+        let got = src.range(8, 0).await.expect("zero-length range");
+        assert!(got.is_empty());
+        assert_eq!(storage.call_count(), 0);
     }
 }

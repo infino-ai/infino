@@ -34,7 +34,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjPath;
@@ -65,6 +65,7 @@ impl S3StorageProvider {
             .with_bucket_name(&bucket)
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
             .with_client_options(tuned_client_options())
+            .with_retry(tuned_retry_config())
             .build()
             .map_err(|e| StorageError::Permanent {
                 uri: format!("s3://{bucket}"),
@@ -225,12 +226,88 @@ fn tuned_client_options() -> object_store::ClientOptions {
         // between "RTT" and "handshake + RTT" on the cold tail.
         .with_pool_max_idle_per_host(1024)
         // Hold idle connections long enough to span a full fan-out
-        // wave plus the next query, so back-to-back cold queries on
-        // a fresh worker don't re-handshake.
-        .with_pool_idle_timeout(std::time::Duration::from_secs(90))
+        // wave plus the next query so back-to-back cold queries on a
+        // fresh worker don't re-handshake — but keep this *below* S3's
+        // server-side idle-close window. AWS closes idle keep-alive
+        // connections after ~20s; a longer client idle timeout means
+        // reqwest pools sockets S3 has already dropped, then reuses
+        // one on the next bursty fan-out and fails the send with
+        // "error sending request" (object_store retries, then
+        // surfaces `TransientExhausted`). 10s keeps the pool warm
+        // across consecutive queries while expiring sockets before
+        // S3 can close them under us.
+        .with_pool_idle_timeout(std::time::Duration::from_secs(10))
         // Bound the connect phase so a single slow SYN/TLS doesn't
         // dominate the fan-out's p99; the retry layer covers drops.
         .with_connect_timeout(std::time::Duration::from_secs(5))
+}
+
+/// Tuned retry budget for real-S3 fan-out.
+///
+/// The cold vector/FTS query path fires a burst of hundreds of
+/// concurrent range GETs per query. A single wave can momentarily
+/// trip a transient transport error (a connection reset, or an
+/// `error sending request` on a socket S3 closed under us) that
+/// `object_store`'s retry layer would otherwise exhaust — surfacing
+/// as `TransientExhausted` straight into the query. A deeper budget
+/// (and a longer overall window) lets the client ride out a burst
+/// instead of failing the query. Paired with the sub-S3-idle-close
+/// `pool_idle_timeout` above, which removes the dominant cause of
+/// those errors in the first place.
+fn tuned_retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: 20,
+        retry_timeout: std::time::Duration::from_secs(300),
+        ..Default::default()
+    }
+}
+
+/// Bounded re-issue budget for an S3 GET that comes back short
+/// of the requested range. Each retry fetches only the
+/// still-missing tail, so a healthy object completes on the first
+/// retry; the cap stops a genuinely-truncated object from
+/// spinning before it surfaces a definitive error.
+const MAX_SHORT_READ_RETRIES: u32 = 4;
+
+/// Application-level re-issue budget for a transient transport
+/// failure on a range GET (e.g. reqwest "error sending request"
+/// that `object_store` does not retry itself). Each attempt dials
+/// a fresh connection, so a healthy host recovers within a couple
+/// of tries; the cap bounds a genuinely-unreachable endpoint.
+const MAX_TRANSIENT_RETRIES: u32 = 8;
+
+/// `true` for storage errors worth re-issuing an idempotent GET
+/// against — transport-level flakiness that cleared object_store's
+/// own (ineffective for this class) retry without succeeding.
+/// `NotFound` / `PreconditionFailed` / `Permanent` are stable and
+/// never retried here.
+fn is_retryable_transient(err: &StorageError) -> bool {
+    matches!(err, StorageError::TransientExhausted { .. })
+}
+
+/// Exponential backoff for transient GET retries: 50ms, 100, 200,
+/// 400, ... capped at 2s. Brief by design — the goal is to let the
+/// dead pooled connection drain and a fresh dial succeed, not to
+/// wait out a long outage.
+fn transient_backoff(attempt: u32) -> std::time::Duration {
+    let ms = 50u64.saturating_mul(1 << attempt.min(5));
+    std::time::Duration::from_millis(ms.min(2000))
+}
+
+/// Definitive error for a range the backing object can't satisfy
+/// (it returned fewer bytes than requested and made no further
+/// progress). Surfaced as `Permanent` — callers do not retry; a
+/// shorter-than-requested object is a stable condition, not a
+/// transient one.
+fn short_read(uri: &str, start: u64, requested: u64, got: u64) -> StorageError {
+    let boxed: Box<dyn std::error::Error + Send + Sync> = format!(
+        "get_range short read: object returned {got} of {requested} bytes from offset {start}"
+    )
+    .into();
+    StorageError::Permanent {
+        uri: uri.into(),
+        source: boxed,
+    }
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.
@@ -286,10 +363,82 @@ impl StorageProvider for S3StorageProvider {
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        self.store
-            .get_range(&path, range)
-            .await
-            .map_err(|e| translate(uri, e))
+        let want = range.end.saturating_sub(range.start);
+        if want == 0 {
+            return Ok(Bytes::new());
+        }
+
+        // Completion loop. `object_store::get_range` is expected to
+        // return exactly the requested span, but an S3 GET can come
+        // back *short* without erroring — a body truncated by a
+        // transient transport hiccup, or a range clamped to an object
+        // smaller than the caller's cached size. A short buffer that
+        // slips through here corrupts callers in two ways: the
+        // foreground lazy reader slices past the end (panic), and the
+        // background cache fill `pwrite`s it at the chunk offset,
+        // leaving a zero gap in the mmap'd file. Re-issue the GET for
+        // the still-missing tail; surface a definitive error only when
+        // the object genuinely can't satisfy the range.
+        let mut cursor = range.start;
+        let mut filled: u64 = 0;
+        let mut parts: Vec<Bytes> = Vec::new();
+        let mut stalls = 0u32;
+        let mut transient_retries = 0u32;
+        loop {
+            // Application-level retry for transient connection/transport
+            // failures. `object_store`'s own retry layer does NOT cover
+            // reqwest "error sending request" (a send-side failure on a
+            // socket the server closed under us): it gives up in
+            // milliseconds, well inside its configured window, and
+            // surfaces the error straight into the query. Under the cold
+            // vector/FTS fan-out (a burst of hundreds of concurrent GETs)
+            // those send failures are common. A range GET is idempotent,
+            // so re-issuing the still-missing tail with backoff is safe;
+            // a fresh attempt also forces reqwest to discard the dead
+            // pooled connection and dial a new one.
+            let chunk = match self.store.get_range(&path, cursor..range.end).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    let err = translate(uri, e);
+                    if is_retryable_transient(&err)
+                        && transient_retries < MAX_TRANSIENT_RETRIES
+                    {
+                        tokio::time::sleep(transient_backoff(transient_retries)).await;
+                        transient_retries += 1;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            if chunk.is_empty() {
+                return Err(short_read(uri, range.start, want, filled));
+            }
+            let take = (chunk.len() as u64).min(want - filled);
+            filled += take;
+            cursor += take;
+            if take as usize == chunk.len() {
+                parts.push(chunk);
+            } else {
+                parts.push(chunk.slice(0..take as usize));
+            }
+            if filled >= want {
+                break;
+            }
+            stalls += 1;
+            if stalls > MAX_SHORT_READ_RETRIES {
+                return Err(short_read(uri, range.start, want, filled));
+            }
+        }
+
+        // Fast path: a single full-length response is zero-copy.
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("len checked == 1"));
+        }
+        let mut out = BytesMut::with_capacity(want as usize);
+        for p in &parts {
+            out.extend_from_slice(p);
+        }
+        Ok(out.freeze())
     }
 
     /// Tail-fetch path: — single-RTT tail fetch via S3's native
