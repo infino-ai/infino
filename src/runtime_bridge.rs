@@ -58,6 +58,7 @@ fn owned_runtime() -> &'static Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
+            .thread_name("supertable-bridge")
             .build()
             .expect(
                 "invariant: tokio Runtime build only fails on \
