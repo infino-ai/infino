@@ -159,10 +159,12 @@ pub enum StorageColdFetchMode {
     /// Single-range sequential fetches (no background fill). Useful
     /// for constrained environments where parallelism is undesirable.
     RangeOnly,
-    /// Foreground returns immediately with a lazy reader (zero S3
-    /// GETs at open time); a background task fills the disk cache
-    /// asynchronously. First query pays per-cluster range GETs;
-    /// subsequent queries resolve from mmap once the fill completes.
+    /// Foreground returns a lazy reader and a background task fills
+    /// the disk cache asynchronously. With manifest open-batch bytes
+    /// present, open issues zero segment-object GETs; otherwise it
+    /// fetches the parquet tail plus vector/FTS open ranges. First
+    /// query pays per-cluster range GETs; subsequent queries resolve
+    /// from mmap once the fill completes.
     #[default]
     LazyForegroundWithBackgroundFill,
 }
@@ -178,8 +180,6 @@ pub struct StorageSettings {
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
-    /// Credentials and region resolve via the standard AWS provider
-    /// chain (`AWS_*`, profile, instance role, etc.).
     pub bucket: Option<String>,
     /// Logical key prefix inside the bucket. All manifest and
     /// segment objects are written under

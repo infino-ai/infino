@@ -89,8 +89,9 @@ storage:
 
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native
-  # cold path: foreground opens/searches with exact range GETs while
-  # background fill promotes the full segment to mmap.
+  # cold path: foreground opens/searches with exact range GETs (or zero
+  # segment GETs at open when manifest open-batch bytes are present)
+  # while background fill promotes the full segment to mmap.
   disk_cache_root:
   disk_budget_bytes: 10737418240
   cold_fetch_mode: lazy_foreground_with_background_fill
