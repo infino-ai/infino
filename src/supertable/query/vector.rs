@@ -182,9 +182,9 @@ impl SupertableReader {
                 .collect();
             let _ = tx.send(result);
         });
-        let per_segment = rx
-            .await
-            .map_err(|_| QueryError::Store("vector fan-out: reader pool dropped result".into()))??;
+        let per_segment = rx.await.map_err(|_| {
+            QueryError::Store("vector fan-out: reader pool dropped result".into())
+        })??;
 
         // Tombstone filtering stays on the tokio side: a cache miss
         // refreshes the sidecar from storage (blocking I/O via the

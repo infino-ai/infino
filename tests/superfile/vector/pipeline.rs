@@ -68,9 +68,7 @@ async fn end_to_end_self_query_recovers_self() {
         .map(|j| ((target.wrapping_mul(31) + j as u32 * 3) % 100) as f32 * 0.01 + 0.1)
         .collect();
     normalize(&mut q_text);
-    let hits = r
-        .search("text_emb", &q_text, 5, 4, 5)
-        .expect("FTS search");
+    let hits = r.search("text_emb", &q_text, 5, 4, 5).expect("FTS search");
     assert_eq!(hits[0].0, target, "self should be top-1");
     // Cosine distance to self for unit-norm vector = 1 - 1 = 0.
     assert!(
@@ -88,9 +86,7 @@ async fn end_to_end_l2sq_self_query_distance_is_zero() {
     let q_img: Vec<f32> = (0..24)
         .map(|j| ((target.wrapping_mul(17) + j as u32 * 7) % 100) as f32 * 0.01)
         .collect();
-    let hits = r
-        .search("image_emb", &q_img, 3, 4, 5)
-        .expect("FTS search");
+    let hits = r.search("image_emb", &q_img, 3, 4, 5).expect("FTS search");
     assert_eq!(hits[0].0, target);
     // L2² of v with itself is exactly 0.
     assert!(hits[0].1 < 1e-3, "self L2² should be ~0, got {}", hits[0].1);
@@ -205,9 +201,7 @@ async fn end_to_end_results_sorted_by_distance() {
     let (blob, json) = build_two_column_blob(60);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
     let q = vec![0.5; 16];
-    let hits = r
-        .search("text_emb", &q, 10, 4, 5)
-        .expect("FTS search");
+    let hits = r.search("text_emb", &q, 10, 4, 5).expect("FTS search");
     for w in hits.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances ascending");
     }

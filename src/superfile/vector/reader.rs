@@ -1012,6 +1012,18 @@ impl VectorReader {
         self.columns.iter().map(|c| c.name.as_str())
     }
 
+    pub(crate) fn public_rerank_mult(&self, column: &str, base: usize) -> usize {
+        let Some(&cid) = self.column_id_by_name.get(column) else {
+            return base;
+        };
+        let col = &self.columns[cid as usize];
+        if col.rerank_codec.writes_full() {
+            base.max(20)
+        } else {
+            base
+        }
+    }
+
     /// Per-column summary centroid + radius, used by the storage plan
     /// for cross-segment skip pruning.
     pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
@@ -1362,11 +1374,11 @@ impl VectorReader {
             &cluster_blocks,
             survivor_full_rows.as_deref(),
             &candidates,
-        col,
-        query,
-        k,
-    )
-    .map_err(|e| VectorError::LazySource(e.to_string()))
+            col,
+            query,
+            k,
+        )
+        .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -1674,20 +1686,18 @@ fn rerank_candidates_from_blocks(
                     scale,
                     offset,
                     per_doc_norms,
-                } => {
-                    sq8_score_and_refine(
-                        candidates,
-                        cluster_blocks,
-                        survivor_full_rows,
-                        col,
-                        query,
-                        scale,
-                        offset,
-                        per_doc_norms.as_deref(),
-                        k,
-                        stride,
-                    )
-                }
+                } => sq8_score_and_refine(
+                    candidates,
+                    cluster_blocks,
+                    survivor_full_rows,
+                    col,
+                    query,
+                    scale,
+                    offset,
+                    per_doc_norms.as_deref(),
+                    k,
+                    stride,
+                ),
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
                     offset_abs_off,
@@ -2343,9 +2353,7 @@ mod tests {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let q = vec![0.5; 16];
-        let hits = r
-            .search("embedding", &q, 10, 4, 5)
-            .expect("FTS search");
+        let hits = r.search("embedding", &q, 10, 4, 5).expect("FTS search");
         for w in hits.windows(2) {
             assert!(w[0].1 <= w[1].1, "distances should be ascending");
         }
@@ -3481,9 +3489,7 @@ mod tests {
         for &rm in &[20usize, 50, 100, 200, 400] {
             let mut tm = 0usize;
             for qi in 0..n_queries {
-                let hits = r_sq8
-                    .search("v", &all[qi], k, nprobe, rm)
-                    .expect("search");
+                let hits = r_sq8.search("v", &all[qi], k, nprobe, rm).expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
                 tm += ground_truth[qi]

@@ -336,8 +336,8 @@ fn crash_post_segment_on_second_commit_yields_v1() {
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect("open at v1");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1, "must recover at v1");
     assert_eq!(
         consumer.reader().n_superfiles(),
@@ -355,8 +355,8 @@ fn crash_post_list_on_second_commit_yields_v1() {
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect("open at v1");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1);
     assert_eq!(consumer.reader().n_superfiles(), 1);
 
@@ -384,8 +384,8 @@ fn crash_post_pointer_on_second_commit_yields_v2() {
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect("open at v2");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v2");
     assert_eq!(
         consumer.manifest_id(),
         2,

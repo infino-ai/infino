@@ -35,7 +35,9 @@ fn search_blocking(
     k: usize,
     opts: VectorSearchOptions,
 ) -> Vec<(u32, f32)> {
-    futures::executor::block_on(reader.vector_search("emb", query, k, opts)).expect("vector_search")
+    reader
+        .vector_search("emb", query, k, opts)
+        .expect("vector_search")
 }
 
 fn measure_recall(

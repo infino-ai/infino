@@ -526,8 +526,9 @@ pub fn mean_recall_infino(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits =
-            reader.search("v", q, k, nprobe, rerank_mult).expect("vector search");
+        let hits = reader
+            .search("v", q, k, nprobe, rerank_mult)
+            .expect("vector search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -545,7 +546,9 @@ pub fn mean_recall_superfile(
     let opts = VectorSearchOptions::new().with_nprobe(nprobe);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = reader.vector_search(column, q, k, opts).expect("vector_search");
+        let hits = reader
+            .vector_search(column, q, k, opts)
+            .expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -606,8 +609,7 @@ pub fn calibrate_infino(
             let q = &queries[0];
             let p50 = p50_micros(
                 || {
-                    let _ =
-                        reader.search("v", q, k, probe, refine).expect("search");
+                    let _ = reader.search("v", q, k, probe, refine).expect("search");
                 },
                 p50_iter,
             );
@@ -661,7 +663,9 @@ pub fn calibrate_superfile(
         let opts = VectorSearchOptions::new().with_nprobe(probe);
         let p50 = p50_micros(
             || {
-                let _ = reader.vector_search(column, q, k, opts).expect("vector_search");
+                let _ = reader
+                    .vector_search(column, q, k, opts)
+                    .expect("vector_search");
             },
             p50_iter,
         );

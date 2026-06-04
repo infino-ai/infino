@@ -340,30 +340,29 @@ fn emit_markdown(cal: &Calibrations) {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
         let bid = format!("supertable_{label}");
-        let (cell, hot, cold, rss_cell, median_rss, p90_rss, rss_delta) =
-            match cal.supertable[i] {
-                Some(c) => {
-                    let peak = rss::read_peak_rss_bytes(group, &bid);
-                    (
-                        format!("(p={}, r={})", c.probe, c.refine),
-                        read_mean_ns(group, &bid),
-                        markdown::read_tier_mean_ns("supertable_vec", "cold", &bid),
-                        peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into()),
-                        rss::fmt_median_rss(group, &bid),
-                        rss::fmt_p90_rss(group, &bid),
-                        rss::fmt_peak_rss_delta(group, &bid),
-                    )
-                }
-                None => (
-                    "—".into(),
-                    None,
-                    None,
-                    "—".into(),
-                    "—".into(),
-                    "—".into(),
-                    "—".into(),
-                ),
-            };
+        let (cell, hot, cold, rss_cell, median_rss, p90_rss, rss_delta) = match cal.supertable[i] {
+            Some(c) => {
+                let peak = rss::read_peak_rss_bytes(group, &bid);
+                (
+                    format!("(p={}, r={})", c.probe, c.refine),
+                    read_mean_ns(group, &bid),
+                    markdown::read_tier_mean_ns("supertable_vec", "cold", &bid),
+                    peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into()),
+                    rss::fmt_median_rss(group, &bid),
+                    rss::fmt_p90_rss(group, &bid),
+                    rss::fmt_peak_rss_delta(group, &bid),
+                )
+            }
+            None => (
+                "—".into(),
+                None,
+                None,
+                "—".into(),
+                "—".into(),
+                "—".into(),
+                "—".into(),
+            ),
+        };
         body.push_str(&format!(
             "| {row_target} | {cell} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
             hot.map(fmt_time).unwrap_or_else(|| "—".into()),

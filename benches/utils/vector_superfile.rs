@@ -196,10 +196,9 @@ fn assert_infino_self_consistent(reader: &SuperfileReader) -> f32 {
     let opts = search_opts(CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT);
     let mut total_recall = 0.0_f32;
     for (q, truth) in qs.iter().zip(gt.iter()) {
-        let hits = corpus::block_on_inmem(async {
-            reader.vector_search(VEC_COLUMN, q, TOP_K, opts)
-        })
-        .expect("vector_search");
+        let hits =
+            corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
+                .expect("vector_search");
         assert_eq!(
             hits.len(),
             TOP_K,
@@ -698,9 +697,8 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     let q = &queries_calibration()[0];
     let opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
     let t0 = Instant::now();
-    let _ =
-        corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
-            .expect("vector_search");
+    let _ = corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
+        .expect("vector_search");
     let first_q_elapsed = t0.elapsed();
 
     eprintln!(

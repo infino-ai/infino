@@ -737,7 +737,6 @@ impl Supertable {
         .await
     }
 
-
     /// Observability snapshot of the supertable's load.
     /// Cheap to call: one RSS syscall + an `ArcSwap::load` + a couple of
     /// length reads on the in-memory manifest. See

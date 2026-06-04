@@ -201,9 +201,7 @@ async fn oracle_partial_nprobe_top1_preserved() {
 
     for q_idx in [10usize, 50, 100, 150] {
         let query = &corpus[q_idx];
-        let approx = reader
-            .search("v", query, 5, 1, 10)
-            .expect("FTS search");
+        let approx = reader.search("v", query, 5, 1, 10).expect("FTS search");
         assert_eq!(
             approx[0].0 as usize, q_idx,
             "top-1 self-recall failed at nprobe=1, query={q_idx}"
@@ -260,9 +258,7 @@ async fn oracle_nonself_query_topk_recovered() {
     // corpus through rerank, isolating the test from 1-bit estimate
     // tail loss (which is expected behavior, just not what this
     // oracle checks).
-    let approx = reader
-        .search("v", &q, 5, n_cent, 40)
-        .expect("FTS search");
+    let approx = reader.search("v", &q, 5, n_cent, 40).expect("FTS search");
     let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
     let approx_set: std::collections::HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
     assert_eq!(
@@ -282,9 +278,7 @@ async fn oracle_topk_distance_ordering_matches_exact() {
     let corpus = generate_corpus(n, dim, 53, false);
     let reader = build_reader(&corpus, dim, 4, Metric::L2Sq, 59);
     let query = &corpus[7];
-    let approx = reader
-        .search("v", query, 10, 4, 10)
-        .expect("FTS search");
+    let approx = reader.search("v", query, 10, 4, 10).expect("FTS search");
     for w in approx.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances must be non-decreasing");
     }

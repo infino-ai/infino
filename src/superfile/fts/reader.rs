@@ -541,7 +541,11 @@ impl FtsReader {
     /// (e.g. ASCII-lowercasing for the v1 tokenizer). Returns an
     /// empty `Vec` if `column` is not registered or no terms match
     /// the prefix.
-    pub fn iter_terms_with_prefix(&self, column: &str, term_prefix: &[u8]) -> Result<Vec<Vec<u8>>, FtsError> {
+    pub fn iter_terms_with_prefix(
+        &self,
+        column: &str,
+        term_prefix: &[u8],
+    ) -> Result<Vec<Vec<u8>>, FtsError> {
         if !self.column_id_by_name.contains_key(column) {
             return Ok(Vec::new());
         }
@@ -553,7 +557,9 @@ impl FtsReader {
             .dict_bytes()
             .expect("FST bytes must be available for term iteration");
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!("FST parse failed: {e}")))
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
         })?;
         let pairs = dict.iter_prefix(&full_prefix);
         Ok(pairs
@@ -713,7 +719,9 @@ impl FtsReader {
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!("FST parse failed: {e}")))
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
         })?;
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
@@ -899,7 +907,9 @@ impl FtsReader {
     ) -> Result<Vec<TermCursor>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!("FST parse failed: {e}")))
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
         })?;
         let col_meta = &self.columns[column_id as usize];
 

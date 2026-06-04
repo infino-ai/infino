@@ -676,7 +676,8 @@ impl SuperfileReader {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(v.search(column, query, k, options.nprobe, options.rerank_mult())?)
+        let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
+        Ok(v.search(column, query, k, options.nprobe, rerank_mult)?)
     }
 }
 
@@ -690,11 +691,11 @@ impl SuperfileReader {
 ///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
 ///   index per query.
 ///
-/// Rerank multiplier is fixed internally at `4` (i.e. `4*k`
-/// candidates from the 1-bit shortlist enter the Sq8/residual
-/// rerank). Bench data on 10M×384 cosine shows recall is
-/// identical at r=4..1024 for every nprobe — the 1-bit pass
-/// is accurate enough that 4× oversampling saturates recall.
+/// Rerank multiplier is fixed internally at `4` for the public
+/// option surface. Columns with a rerank codec apply a wider
+/// internal floor in the vector reader because the dot-only RaBitQ
+/// shortlist needs enough candidates before exact/Sq8 rerank can
+/// recover the true nearest neighbors.
 #[derive(Debug, Clone, Copy)]
 pub struct VectorSearchOptions {
     pub nprobe: usize,

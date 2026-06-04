@@ -550,7 +550,8 @@ fn build_fts_summary(
         return out;
     };
     for fc in &options.fts_columns {
-        let terms = fts_reader.iter_column_terms(&fc.column)
+        let terms = fts_reader
+            .iter_column_terms(&fc.column)
             .expect("FST bytes valid: segment just built");
         let n_terms_distinct = terms.len() as u32;
         let (min_term, max_term) = match (terms.first(), terms.last()) {
@@ -1102,12 +1103,12 @@ fn resolve_target_id_in_manifest(
                         ),
                     }
                 })?;
-                eager_reader.id_lookup(target).map_err(|e| {
-                    TombstonePhaseError::IdLookupFailed {
+                eager_reader
+                    .id_lookup(target)
+                    .map_err(|e| TombstonePhaseError::IdLookupFailed {
                         target_id: target_id.to_hex(),
                         message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
-                    }
-                })?
+                    })?
             }
             Err(e) => {
                 return Err(TombstonePhaseError::IdLookupFailed {

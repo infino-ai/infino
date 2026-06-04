@@ -183,12 +183,7 @@ fn supertable_to_global_ids(
         .collect()
 }
 
-fn supertable_search_global(
-    st: &Supertable,
-    query: &str,
-    k: usize,
-    chunk_size: usize,
-) -> Vec<u64> {
+fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
     let hits = st
         .bm25_search("title", query, k, BoolMode::Or)
         .expect("supertable bm25");
@@ -378,8 +373,7 @@ fn oracle_three_wide_or_top3_matches() {
 fn oracle_three_similar_or_top3_matches() {
     // Three single-doc terms (docs 14, 15, 16).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_global(&f.infino, "redis kafka elasticsearch", 5, CHUNK_SIZE);
+    let inf_hits = supertable_search_global(&f.infino, "redis kafka elasticsearch", 5, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "redis kafka elasticsearch", 5);
     let want: HashSet<u64> = [14u64, 15, 16].into_iter().collect();
     let inf_top: HashSet<u64> = inf_hits.iter().take(3).copied().collect();
@@ -392,8 +386,7 @@ fn oracle_three_similar_or_top3_matches() {
 fn oracle_five_term_or_top5_matches() {
     // Five single-doc terms (docs 30..34).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_global(&f.infino, "tcp udp http2 http3 tls", 10, CHUNK_SIZE);
+    let inf_hits = supertable_search_global(&f.infino, "tcp udp http2 http3 tls", 10, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "tcp udp http2 http3 tls", 10);
     let want: HashSet<u64> = [30u64, 31, 32, 33, 34].into_iter().collect();
     let inf_top: HashSet<u64> = inf_hits.iter().take(5).copied().collect();
@@ -423,8 +416,7 @@ fn oracle_two_term_and_matches() {
 fn oracle_three_term_and_singleton_match() {
     // "rust" + "async" + "tokio" intersect only at doc 0 (segment 0).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE);
+    let inf_hits = supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE);
     assert_eq!(inf_hits, vec![0u64], "got {inf_hits:?}");
 }
 
