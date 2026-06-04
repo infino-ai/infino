@@ -25,6 +25,7 @@ use crate::superfile::vector::reader::VectorReader;
 use arrow_array::Decimal128Array;
 use arrow_schema::Schema;
 use bytes::Bytes;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 
@@ -434,7 +435,10 @@ impl SuperfileReader {
         })?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
             .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        // _id is always at index 0
+        let descriptor = builder.parquet_schema().clone();
         let reader = builder
+            .with_projection(ProjectionMask::leaves(&descriptor, vec![0]))
             .build()
             .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
 
@@ -820,6 +824,19 @@ mod tests {
         assert_eq!(s.fields().len(), 2);
         assert_eq!(s.field(0).name(), "doc_id");
         assert_eq!(s.field(1).name(), "title");
+    }
+
+    #[test]
+    fn id_lookup_returns_only_matching_ids() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        let s = r.id_lookup(10).expect("should return result");
+        assert_eq!(s.expect("should find id"), 0);
+        let s = r.id_lookup(12).expect("should return result");
+        assert_eq!(s.expect("should find id"), 2);
+
+        let s = r.id_lookup(20).expect("should return result");
+        assert!(s.is_none());
     }
 
     #[test]
