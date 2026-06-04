@@ -769,13 +769,21 @@ mod tests {
             Duration::from_millis(50),
         );
         let tracker = handle.tracker();
-        // Do NOT call mark_progress. Wait long enough for the
-        // stuck-worker check to fire.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert!(
-            tracker.stop_requested(),
-            "expected heartbeat to flip stop_requested on stuck worker"
-        );
+        // Do NOT call mark_progress. Wait until the heartbeat
+        // observes the stale progress marker. Under a loaded full
+        // `cargo test --lib` run the heartbeat task can be scheduled
+        // later than the nominal 50ms tick, so poll with a bounded
+        // timeout instead of asserting after one fixed sleep.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tracker.stop_requested() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("expected heartbeat to flip stop_requested on stuck worker");
         handle.stop().await;
     }
 
