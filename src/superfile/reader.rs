@@ -691,14 +691,12 @@ impl SuperfileReader {
 ///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
 ///   index per query.
 ///
-/// Rerank multiplier is fixed internally at `4` for the public
-/// option surface. Columns with a rerank codec apply a wider
-/// internal floor in the vector reader because the dot-only RaBitQ
-/// shortlist needs enough candidates before exact/Sq8 rerank can
-/// recover the true nearest neighbors.
+/// - `rerank_mult`: number of coarse candidates per requested hit to
+///   feed into exact/Sq8 rerank. Higher = better recall, slower.
 #[derive(Debug, Clone, Copy)]
 pub struct VectorSearchOptions {
     pub nprobe: usize,
+    rerank_mult: usize,
 }
 
 impl VectorSearchOptions {
@@ -713,6 +711,7 @@ impl VectorSearchOptions {
     pub fn new() -> Self {
         Self {
             nprobe: Self::DEFAULT_NPROBE,
+            rerank_mult: Self::RERANK_MULT,
         }
     }
 
@@ -722,8 +721,15 @@ impl VectorSearchOptions {
         self
     }
 
+    /// Override the rerank multiplier. Values below 1 are clamped
+    /// to 1 so `k > 0` always admits at least `k` coarse candidates.
+    pub fn with_rerank_mult(mut self, n: usize) -> Self {
+        self.rerank_mult = n.max(1);
+        self
+    }
+
     pub fn rerank_mult(&self) -> usize {
-        Self::RERANK_MULT
+        self.rerank_mult
     }
 }
 
@@ -956,9 +962,11 @@ mod tests {
 
     #[test]
     fn vector_search_options_builder_chains() {
-        let opts = VectorSearchOptions::new().with_nprobe(2);
+        let opts = VectorSearchOptions::new()
+            .with_nprobe(2)
+            .with_rerank_mult(32);
         assert_eq!(opts.nprobe, 2);
-        assert_eq!(opts.rerank_mult(), VectorSearchOptions::RERANK_MULT);
+        assert_eq!(opts.rerank_mult(), 32);
     }
 
     #[tokio::test]

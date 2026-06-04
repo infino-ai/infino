@@ -542,8 +542,11 @@ pub fn mean_recall_superfile(
     truths: &[Vec<u32>],
     k: usize,
     nprobe: usize,
+    rerank_mult: usize,
 ) -> f32 {
-    let opts = VectorSearchOptions::new().with_nprobe(nprobe);
+    let opts = VectorSearchOptions::new()
+        .with_nprobe(nprobe)
+        .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
         let hits = reader
@@ -634,8 +637,7 @@ pub fn calibrate_infino(
     best
 }
 
-/// Sweep nprobe values via [`SuperfileReader::vector_search`].
-/// `rerank_mult` is fixed internally at [`VectorSearchOptions::RERANK_MULT`].
+/// Sweep `(nprobe, rerank_mult)` values via [`SuperfileReader::vector_search`].
 pub fn calibrate_superfile(
     reader: &SuperfileReader,
     column: &str,
@@ -647,39 +649,41 @@ pub fn calibrate_superfile(
     p50_iter: usize,
     k: usize,
 ) -> Option<Calibrated> {
-    let _ = refines;
-    let refine = VectorSearchOptions::RERANK_MULT;
     let mut best: Option<Calibrated> = None;
     let mut peak_recall = 0f32;
     for &probe in probes {
-        let recall = mean_recall_superfile(reader, column, queries, truths, k, probe);
-        if recall > peak_recall {
-            peak_recall = recall;
+        for &refine in refines {
+            let recall = mean_recall_superfile(reader, column, queries, truths, k, probe, refine);
+            if recall > peak_recall {
+                peak_recall = recall;
+            }
+            if recall < target_recall {
+                continue;
+            }
+            let q = &queries[0];
+            let opts = VectorSearchOptions::new()
+                .with_nprobe(probe)
+                .with_rerank_mult(refine);
+            let p50 = p50_micros(
+                || {
+                    let _ = reader
+                        .vector_search(column, q, k, opts)
+                        .expect("vector_search");
+                },
+                p50_iter,
+            );
+            let cand = Calibrated {
+                probe,
+                refine,
+                recall,
+                p50_micros: p50,
+            };
+            best = match best {
+                None => Some(cand),
+                Some(b) if cand.p50_micros < b.p50_micros => Some(cand),
+                Some(b) => Some(b),
+            };
         }
-        if recall < target_recall {
-            continue;
-        }
-        let q = &queries[0];
-        let opts = VectorSearchOptions::new().with_nprobe(probe);
-        let p50 = p50_micros(
-            || {
-                let _ = reader
-                    .vector_search(column, q, k, opts)
-                    .expect("vector_search");
-            },
-            p50_iter,
-        );
-        let cand = Calibrated {
-            probe,
-            refine,
-            recall,
-            p50_micros: p50,
-        };
-        best = match best {
-            None => Some(cand),
-            Some(b) if cand.p50_micros < b.p50_micros => Some(cand),
-            Some(b) => Some(b),
-        };
     }
     if best.is_none() {
         eprintln!(

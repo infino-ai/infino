@@ -59,8 +59,12 @@ pub fn criterion_filter_selects(aliases: &[&str], groups: &[&str]) -> bool {
     let Some(filter) = filter else {
         return true;
     };
-    aliases.iter().any(|alias| *alias == filter)
-        || groups.iter().any(|group| group.contains(&filter))
+    aliases
+        .iter()
+        .any(|alias| *alias == filter || filter.contains(alias))
+        || groups
+            .iter()
+            .any(|group| group.contains(&filter) || filter.contains(group))
 }
 
 /// Search benches use the shared combined fixture. If an ingest group already

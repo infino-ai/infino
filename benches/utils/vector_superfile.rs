@@ -37,6 +37,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // calibration re-picks the lowest-p50 point. The chosen point is reported
 // in the markdown table instead.
 use crate::corpus::{self, Calibrated, DIM};
+use crate::fixture;
 use crate::{markdown, rss};
 use infino::superfile::SuperfileReader;
 use infino::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
@@ -139,8 +140,10 @@ fn superfile_reader() -> SuperfileReader {
     SuperfileReader::open(Bytes::from(superfile_bytes().to_vec())).expect("open superfile")
 }
 
-fn search_opts(nprobe: usize, _rerank_mult: usize) -> VectorSearchOptions {
-    VectorSearchOptions::new().with_nprobe(nprobe)
+fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
+    VectorSearchOptions::new()
+        .with_nprobe(nprobe)
+        .with_rerank_mult(rerank_mult)
 }
 
 // ─── Builder (production SuperfileBuilder) ───────────────────────────
@@ -254,8 +257,24 @@ fn calibrations() -> &'static Calibrations {
 // ─── Bench entry ──────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
+    let run_build = fixture::supertable::criterion_filter_selects(
+        &["superfile_vec", "superfile_vector", "superfile_vec_build"],
+        &["superfile_vec_build"],
+    );
+    let run_search = fixture::supertable::criterion_filter_selects(
+        &["superfile_vec", "superfile_vector", "superfile_vec_search"],
+        &[
+            "superfile_vec_hot_search",
+            "superfile_vec_warm_search",
+            "superfile_vec_cold_search",
+        ],
+    );
+    if !run_build && !run_search {
+        return;
+    }
+
     // ---- Ingest sub-bench (group: superfile_vec_build) -------------
-    {
+    if run_build {
         let v = vectors();
         let mut g = c.benchmark_group("superfile_vec_build");
         g.sample_size(10);
@@ -273,6 +292,9 @@ fn bench(c: &mut Criterion) {
         let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_BUILD, &bench_id, stats);
 
         emit_ingest_markdown();
+    }
+    if !run_search {
+        return;
     }
 
     artifact_report(N_DOCS, corpus::n_cent(N_DOCS), vectors());

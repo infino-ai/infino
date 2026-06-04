@@ -26,6 +26,7 @@
 //! `superfile_fts_search` still validates the BMW oracle before
 //! timing kicks in.
 
+use crate::fixture;
 use crate::tiers::{self, Tier};
 use crate::{corpus, markdown, rss};
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
@@ -404,7 +405,23 @@ fn bench_per_algo_probe(
 // ─── Bench entry ──────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
-    {
+    let run_build = fixture::supertable::criterion_filter_selects(
+        &["superfile_fts", "superfile_fts_build"],
+        &["superfile_fts_build"],
+    );
+    let run_search = fixture::supertable::criterion_filter_selects(
+        &["superfile_fts", "superfile_fts_search"],
+        &[
+            "superfile_fts_hot_search",
+            "superfile_fts_warm_search",
+            "superfile_fts_cold_search",
+        ],
+    );
+    if !run_build && !run_search {
+        return;
+    }
+
+    if run_build {
         let n = N_DOCS;
         let docs_for_ingest = text_corpus();
         let mut g = c.benchmark_group("superfile_fts_build");
@@ -430,6 +447,9 @@ fn bench(c: &mut Criterion) {
         g.finish();
 
         emit_ingest_markdown();
+    }
+    if !run_search {
+        return;
     }
 
     eprintln!(
