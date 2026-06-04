@@ -13,6 +13,7 @@
 //! The grid isolates the two suspected costs by differential timing:
 //!   * sweep `nprobe` at small `rerank_mult` -> coarse 1-bit scan cost
 //!   * sweep `rerank_mult` at fixed `nprobe` -> Sq8 rerank cost
+//!
 //! and the recall column shows whether per-segment recall keeps
 //! climbing past the old 16-probe cap (the ceiling question).
 //!
@@ -66,11 +67,7 @@ fn main() {
         .map(|q| corpus::brute_force_topk_cosine(&vectors, n_docs, q, TOP_K))
         .collect();
 
-    let opts = |nprobe: usize, rerank_mult: usize| {
-        VectorSearchOptions::new()
-            .with_nprobe(nprobe)
-            .with_rerank_mult(rerank_mult)
-    };
+    let opts = |nprobe: usize, _rerank_mult: usize| VectorSearchOptions::new().with_nprobe(nprobe);
 
     // Warm the reader (touch pages, settle the allocator) before timing.
     for q in &queries {

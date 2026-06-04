@@ -79,7 +79,7 @@ impl StorageProvider for CountingProxy {
         self.head_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.head(uri).await
     }
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         self.get_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.get(uri).await
     }
@@ -87,7 +87,7 @@ impl StorageProvider for CountingProxy {
         self.get_range_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.get_range(uri, range).await
     }
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(uri, bytes).await
     }
     async fn put_if_match(
@@ -95,7 +95,7 @@ impl StorageProvider for CountingProxy {
         uri: &str,
         bytes: Bytes,
         e: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         self.inner.put_if_match(uri, bytes, e).await
     }
     async fn put_multipart(
@@ -253,7 +253,7 @@ async fn reader_returns_working_superfile_reader() {
     // Sanity: the mmap-backed reader exposes an FTS reader
     // and the indexed terms include our planted token.
     let fts = reader.fts().expect("fts reader");
-    let title_terms = fts.iter_column_terms("title");
+    let title_terms = fts.iter_column_terms("title").expect("iter terms");
     assert!(
         title_terms.iter().any(|t| t.as_slice() == b"alpha"),
         "mmap-backed reader must expose the planted FTS term"

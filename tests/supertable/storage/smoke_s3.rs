@@ -184,8 +184,8 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
         supertable: SupertableSettings::default(),
         storage: StorageSettings {
             backend: StorageBackend::S3,
-            s3_bucket: Some(bucket.to_string()),
-            s3_prefix: prefix.to_string(),
+            bucket: Some(bucket.to_string()),
+            prefix: prefix.to_string(),
             disk_cache_root: Some(cache_root.to_path_buf()),
             disk_budget_bytes: 1 << 30,
             cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
@@ -263,7 +263,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .put_atomic("probe/hello.txt", probe_bytes.clone())
             .await
             .expect("probe put_atomic");
-        let got = storage.get("probe/hello.txt").await.expect("probe get");
+        let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
         assert_eq!(got, probe_bytes, "probe round-trip mismatch");
         eprintln!("[m16] probe round-trip OK (PUT + GET via S3 wire)");
     }
@@ -281,7 +281,8 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .expect("s3 provider for producer"),
         );
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -314,7 +315,6 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             .with_storage(Arc::clone(&consumer_storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("Supertable::open via S3");
 
     assert_eq!(consumer.manifest_id(), 1, "recovered manifest_id mismatch");
@@ -389,7 +389,8 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 real_s3_options(dim)
                     .apply_config(&cfg)
                     .map_err(|e| format!("apply S3 config to producer options: {e}"))?,
-            );
+            )
+            .map_err(|e| format!("create unified supertable on real S3: {e}"))?;
             let mut writer = producer
                 .writer()
                 .map_err(|e| format!("real S3 producer writer: {e}"))?;
@@ -416,7 +417,6 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 .apply_config(&cfg)
                 .map_err(|e| format!("apply S3 config to consumer options: {e}"))?,
         )
-        .await
         .map_err(|e| format!("open unified supertable from real S3: {e}"))?;
 
         if consumer.manifest_id() != 1 {
@@ -433,14 +433,12 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         }
 
         let bm25_hits = consumer
-            .reader()
             .bm25_search(
                 "title",
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
             )
-            .await
             .map_err(|e| format!("cold BM25 over real S3: {e}"))?;
         if bm25_hits.is_empty() {
             return Err("real S3 cold BM25 did not find alpha docs".to_string());
@@ -449,9 +447,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         let mut query = vec![0.0f32; dim];
         query[0] = 1.0;
         let vector_hits = consumer
-            .reader()
             .vector_search("emb", &query, 3, VectorSearchOptions::new().with_nprobe(4))
-            .await
             .map_err(|e| format!("cold vector search over real S3: {e}"))?;
         if vector_hits.is_empty() {
             return Err("real S3 cold vector search returned no hits".to_string());
@@ -548,7 +544,8 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
             )
             .expect("s3 provider for tvf producer"),
         );
-        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)));
+        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)))
+            .expect("create tvf producer");
         let mut w = producer.writer().expect("tvf producer writer");
         w.append(&real_s3_batch(dim))
             .expect("append unified vector+FTS batch");
@@ -576,7 +573,6 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
             .with_storage(Arc::clone(&consumer_storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("Supertable::open via S3 (tvf consumer)");
     assert_eq!(consumer.manifest_id(), 1);
     assert_eq!(consumer.reader().n_docs_total(), 8);

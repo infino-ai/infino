@@ -222,6 +222,7 @@ impl TableProvider for SupertableProvider {
             let reader = crate::supertable::query::superfile_reader::superfile_reader(
                 &self.store,
                 self.disk_cache.as_ref(),
+                self.manifest.options.storage.as_ref(),
                 &entry.uri,
                 entry.subsection_offsets.as_ref(),
             )

@@ -21,14 +21,16 @@
 //!    empty cache; pays the cold-open budget (Parquet
 //!    footer + per-subsection open-time-region GETs). One open
 //!    serves both the vector and FTS readers.
-//! 2. **Cold first vector search after S3 open** — cold open +
-//!    `vec.search` at the default `(nprobe, rerank_mult)`;
-//!    pays the cold-search budget (~nprobe + 1 cluster
-//!    GETs).
-//! 3. **Cold first BM25 search after S3 open** — cold open +
-//!    `bm25_search`; pays the FTS lazy open-time fetch
-//!    (header + doc-lengths) plus per-term dict/postings range
-//!    GETs (`FtsReader::open_lazy` mirroring the vector path).
+//! 2. **Cold first vector search after S3 open** — `vec.search`
+//!    at the default `(nprobe, rerank_mult)` against a freshly
+//!    opened reader and empty segment-data cache; pays the
+//!    cold-search budget (~nprobe + 1 cluster GETs), excluding
+//!    file open.
+//! 3. **Cold first BM25 search after S3 open** — `bm25_search`
+//!    against a freshly opened reader and empty segment-data cache;
+//!    pays the FTS lazy open-time fetch (header + doc-lengths) plus
+//!    per-term dict/postings range GETs (`FtsReader::open_lazy`
+//!    mirroring the vector path), excluding file open.
 //! 4. **Warm subsequent search after S3 open** — after the
 //!    background promotion completes, the cache returns the
 //!    mmap-backed reader and both vector + BM25 searches
@@ -65,11 +67,11 @@
 //!   tails that distort a regression bench.
 //! - `s3s-fs` gives us the full S3 wire path (path-style URL
 //!   + SigV4 + HTTP/1.1 range headers), so it is useful for
-//!   validating request shape: GET count, byte ranges, and
-//!   overlap. Its loopback latency is not treated as S3 latency;
-//!   the diagnostic prints an adjusted model line that replaces
-//!   the observed s3s-fs blocking span with a configurable S3
-//!   TTFB + throughput model.
+//!     validating request shape: GET count, byte ranges, and
+//!     overlap. Its loopback latency is not treated as S3 latency;
+//!     the diagnostic prints an adjusted model line that replaces
+//!     the observed s3s-fs blocking span with a configurable S3
+//!     TTFB + throughput model.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -638,10 +640,10 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    // ── Row 2: cold lazy open + first vector search. ────────────────
-    // The full cold cycle: fresh cache, open, one search.
-    // Measures the M2 cold-open + M3 cold-search range
-    // budget end-to-end against the S3 wire path.
+    // ── Row 2: cold first vector search after lazy open. ────────────
+    // Fresh cache each iteration, but `cache.reader(uri)` is outside
+    // the timed region. This measures first-query range GETs against
+    // the S3 wire path, not the one-time file/open work.
     {
         let mut g = c.benchmark_group("object_store_cold_first_search");
         g.sample_size(10);
@@ -656,14 +658,14 @@ fn bench(c: &mut Criterion) {
                 for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
                     let q = q.clone();
+                    let reader =
+                        rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
                     let t0 = Instant::now();
-                    let _hits = rt.block_on(async {
-                        let reader = cache.reader(&uri).await.expect("cold reader");
+                    let _hits = {
                         let vec = reader.vec().expect("vector reader present");
                         vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                            .await
                             .expect("cold vector_search")
-                    });
+                    };
                     total += t0.elapsed();
                     drop(cache);
                     drop(cache_dir);
@@ -674,12 +676,11 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    // ── Row 3: cold lazy open + first BM25 search. ──────────────────
-    // Same fresh-cache cold cycle as Row 2, but drives the FTS
-    // subsection through `FtsReader::open_lazy`: open-time fetch
-    // (header + doc-lengths) followed by per-term dict + postings
-    // range GETs. Measures the FTS half of the unified cold path
-    // against the same S3 wire.
+    // ── Row 3: cold first BM25 search after lazy open. ──────────────
+    // Same fresh-cache cold query shape as Row 2, but drives the FTS
+    // subsection through `FtsReader::open_lazy`: header/doc-lengths
+    // plus per-term dict + postings range GETs. Reader open is kept
+    // outside the timer.
     {
         let mut g = c.benchmark_group("object_store_cold_first_bm25");
         g.sample_size(10);
@@ -692,14 +693,17 @@ fn bench(c: &mut Criterion) {
                 let (actual_iters, requested_iters) = bounded_real_s3_iters(iters, real_s3);
                 for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
+                    let reader =
+                        rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
                     let t0 = Instant::now();
-                    let _hits = rt.block_on(async {
-                        let reader = cache.reader(&uri).await.expect("cold reader");
-                        reader
-                            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
-                            .await
-                            .expect("cold bm25_search")
-                    });
+                    let _hits = rt
+                        .block_on(reader.bm25_search(
+                            FTS_COLUMN,
+                            FTS_QUERY_TERM,
+                            TOP_K,
+                            BoolMode::Or,
+                        ))
+                        .expect("cold bm25_search");
                     total += t0.elapsed();
                     drop(cache);
                     drop(cache_dir);
@@ -716,7 +720,7 @@ fn bench(c: &mut Criterion) {
     // the mmap-backed reader; zero S3 GETs per iteration.
     {
         let (warm_dir, warm_cache) = fresh_cache(Arc::clone(&storage));
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             // Trigger cold + wait for promotion.
             let _ = warm_cache.reader(&uri).await.expect("warm prewarm");
             wait_for_mmap_promotion(&warm_cache, uri, Duration::from_secs(60)).await;
@@ -734,8 +738,8 @@ fn bench(c: &mut Criterion) {
                     .block_on(async { cache_ref.reader(&uri).await })
                     .expect("warm reader");
                 let vec = reader.vec().expect("vector reader present");
-                let hits = rt
-                    .block_on(vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT))
+                let hits = vec
+                    .search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                     .expect("warm vector_search");
                 std::hint::black_box(hits)
             });
@@ -829,11 +833,11 @@ fn emit_object_store_markdown(storage_label: &str) {
     body.push_str("| Phase | p50 |\n");
     body.push_str("|-------|-----|\n");
     body.push_str(&format!(
-        "| Cold open via s3s-fs (Plan 013 M2: footer + per-subsection open-time region) | {} |\n",
+        "| Cold open via s3s-fs (footer + per-subsection open-time region) | {} |\n",
         cold_open_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
-        "| Cold first vector search after S3 open (Plan 013 M3: nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE}) | {} |\n",
+        "| Cold first vector search after S3 open (nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE}) | {} |\n",
         cold_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
@@ -841,7 +845,7 @@ fn emit_object_store_markdown(storage_label: &str) {
         cold_bm25_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
-        "| Warm subsequent vector search after S3 open (Plan 013 M4: mmap, 0 S3 GETs) | {} |\n",
+        "| Warm subsequent vector search after S3 open (mmap, 0 S3 GETs) | {} |\n",
         warm_search_ns.map(fmt_time).unwrap_or_else(|| "—".into()),
     ));
     body.push_str(&format!(
@@ -977,7 +981,7 @@ mod diag {
             r
         }
 
-        async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
             self.inner.get(uri).await
         }
 
@@ -998,11 +1002,11 @@ mod diag {
             r
         }
 
-        // Plan 013 M5 — must forward to `self.inner.tail` rather
-        // than let the trait-default impl call `self.head` +
-        // `self.get_range`. The default impl would route through
-        // this wrapper's instrumented `head` / `get_range`,
-        // splitting one S3 `bytes=-len` suffix-range GET into a
+        // Must forward to `self.inner.tail` rather than let the
+        // trait-default impl call `self.head` + `self.get_range`.
+        // The default impl would route through this wrapper's
+        // instrumented `head` / `get_range`, splitting one S3
+        // `bytes=-len` suffix-range GET into a
         // (HEAD + bounded GET) pair on the wire and totally
         // erasing the optimization the cold-open path relies on.
         async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
@@ -1028,7 +1032,11 @@ mod diag {
             r
         }
 
-        async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
         }
 
@@ -1037,7 +1045,7 @@ mod diag {
             uri: &str,
             bytes: Bytes,
             expected_etag: Option<&str>,
-        ) -> Result<(), StorageError> {
+        ) -> Result<Option<String>, StorageError> {
             self.inner.put_if_match(uri, bytes, expected_etag).await
         }
 
@@ -1097,16 +1105,11 @@ mod diag {
     }
 
     fn report(name: &str, snap: &CountingSnapshot, wall: Duration, real_s3: bool) {
-        let head_avg_us = if snap.head_count == 0 {
-            0
-        } else {
-            snap.head_total_us / snap.head_count
-        };
-        let range_avg_us = if snap.range_count == 0 {
-            0
-        } else {
-            snap.range_total_us / snap.range_count
-        };
+        let head_avg_us = snap.head_total_us.checked_div(snap.head_count).unwrap_or(0);
+        let range_avg_us = snap
+            .range_total_us
+            .checked_div(snap.range_count)
+            .unwrap_or(0);
         let model = S3LatencyModel::from_env_or_default();
         let cost_model = S3CostModel::from_env_or_default();
         let (raw_blocking, model_blocking, batches) =
@@ -1317,17 +1320,16 @@ mod diag {
         }
         storage.reset();
 
-        // Build the SubsectionOffsets the manifest would carry
-        // post-Plan-013 M6, so we can A/B the cold-open path
-        // unhinted (pre-M6, 2-RTT sequential) vs hinted (M6,
-        // 1-RTT parallel prefetch).
+        // Build the SubsectionOffsets the manifest would carry,
+        // so we can A/B the cold-open path unhinted (2-RTT
+        // sequential) vs hinted (1-RTT parallel prefetch).
         let offsets = build_offsets_from_bytes(superfile);
         eprintln!(
             "[diag] manifest hints: total={} B  vec={:?}  fts={:?}",
             offsets.total_size, offsets.vec, offsets.fts
         );
 
-        // ── Phase 2a: cold-open UNHINTED (pre-M6, 2 RTTs) ───────────
+        // ── Phase 2a: cold-open UNHINTED (no manifest hints, 2 RTTs) ───────────
         eprintln!("[diag] === cold-open UNHINTED via cache.reader (3 fresh-cache iters) ===");
         for i in 0..3 {
             let before = storage.snapshot();
@@ -1378,7 +1380,6 @@ mod diag {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1409,7 +1410,6 @@ mod diag {
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1628,7 +1628,6 @@ mod diag {
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
                     vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                        .await
                         .expect("real S3 cold vector_search")
                 });
                 let wall = t0.elapsed();
@@ -1727,7 +1726,8 @@ mod diag {
                     real_s3_supertable_options()
                         .apply_config(&cfg)
                         .expect("apply real S3 config to producer"),
-                );
+                )
+                .expect("create real S3 producer");
                 let mut writer = producer.writer().expect("real S3 producer writer");
                 append_unified_supertable_batches(&mut writer, n);
                 writer.commit().expect("commit unified supertable to real S3");
@@ -1742,9 +1742,9 @@ mod diag {
             let consumer = Supertable::open(
                 real_s3_supertable_options()
                     .apply_config(&cfg)
-                    .expect("apply real S3 config to consumer"),
+                    .expect("apply real S3 config to consumer")
+                    .with_read_consistency(infino::supertable::options::Consistency::Snapshot),
             )
-            .await
             .expect("open unified supertable from real S3");
             let cold_open = open_t0.elapsed();
             let reader = consumer.reader();
@@ -1776,14 +1776,13 @@ mod diag {
 
             let query = query_vector().to_vec();
             let vec_t0 = Instant::now();
-            let vec_hits = reader
+            let vec_hits = consumer
                 .vector_search(
                     VEC_COLUMN,
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
                 )
-                .await
                 .expect("cold vector search over real S3 supertable");
             let cold_vec = vec_t0.elapsed();
             eprintln!(
@@ -1793,9 +1792,8 @@ mod diag {
             );
 
             let bm25_t0 = Instant::now();
-            let bm25_hits = reader
+            let bm25_hits = consumer
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
-                .await
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
             eprintln!(
@@ -1807,20 +1805,18 @@ mod diag {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let warm_vec_t0 = Instant::now();
-            let warm_vec_hits = reader
+            let warm_vec_hits = consumer
                 .vector_search(
                     VEC_COLUMN,
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
                 )
-                .await
                 .expect("warm vector search over real S3 supertable");
             let warm_vec = warm_vec_t0.elapsed();
             let warm_bm25_t0 = Instant::now();
-            let warm_bm25_hits = reader
+            let warm_bm25_hits = consumer
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
-                .await
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
             let cache_stats = consumer
@@ -1863,8 +1859,8 @@ mod diag {
             supertable: SupertableSettings::default(),
             storage: StorageSettings {
                 backend: StorageBackend::S3,
-                s3_bucket: Some(bucket.to_string()),
-                s3_prefix: prefix.to_string(),
+                bucket: Some(bucket.to_string()),
+                prefix: prefix.to_string(),
                 disk_cache_root: Some(cache_root.to_path_buf()),
                 disk_budget_bytes: 8 << 30,
                 cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
@@ -1969,16 +1965,55 @@ mod diag {
             (Some(o), Some(l)) if l > 0 => Some((o, l)),
             _ => None,
         };
+        let total_size = bytes.len() as u64;
+        let vec_open_ranges = vec
+            .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+            .unwrap_or_default();
+        let fts_open_ranges = fts
+            .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
+            .unwrap_or_default();
+
+        // Mirror the writer's M7 open-blob capture: parquet tail
+        // (64 KiB) + each vec/fts open range, sliced inline so the
+        // diagnostic exercises the zero-open-GET cold path.
+        const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
+        let mut open_blob: Vec<(u64, Vec<u8>)> = Vec::new();
+        let parquet_tail_len = PARQUET_TAIL_SPEC.min(total_size);
+        let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
+        let slice = |off: u64, len: u64| -> Option<Vec<u8>> {
+            let start = off as usize;
+            let end = start.checked_add(len as usize)?;
+            bytes.get(start..end).map(|s| s.to_vec())
+        };
+        let mut ok = true;
+        if parquet_tail_len > 0 {
+            match slice(parquet_tail_start, parquet_tail_len) {
+                Some(b) => open_blob.push((parquet_tail_start, b)),
+                None => ok = false,
+            }
+        }
+        if ok {
+            for &(off, len) in vec_open_ranges.iter().chain(fts_open_ranges.iter()) {
+                match slice(off, len) {
+                    Some(b) => open_blob.push((off, b)),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
+            open_blob.clear();
+        }
+
         SubsectionOffsets {
-            total_size: bytes.len() as u64,
+            total_size,
             vec,
             fts,
-            vec_open_ranges: vec
-                .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
-                .unwrap_or_default(),
-            fts_open_ranges: fts
-                .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
-                .unwrap_or_default(),
+            vec_open_ranges,
+            fts_open_ranges,
+            open_blob,
         }
     }
 
@@ -2155,7 +2190,8 @@ mod diag {
         let build_t0 = Instant::now();
         rt.block_on(async {
             let producer =
-                Supertable::create(real_s3_supertable_options().with_storage(Arc::clone(&storage)));
+                Supertable::create(real_s3_supertable_options().with_storage(Arc::clone(&storage)))
+                    .expect("create producer Supertable");
             let mut writer = producer.writer().expect("producer writer");
             append_unified_supertable_batches(&mut writer, n);
             writer.commit().expect("commit Supertable to s3s-fs");
@@ -2172,24 +2208,21 @@ mod diag {
                     .with_storage(Arc::clone(&storage))
                     .with_disk_cache(Arc::clone(&cache)),
             )
-            .await
             .expect("Supertable::open from s3s-fs")
         });
-        let reader = consumer.reader();
-
         // 5. Warm the cache: cold pass + mmap-promotion sleep.
         eprintln!("[diag-qsql-overhead] warming cache (cold pass + 2s mmap promotion sleep)");
         let q = query_vector().to_vec();
-        let _ = rt
-            .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
+        let _ = consumer
+            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
             .expect("warm-up bm25");
-        let _ = rt
-            .block_on(reader.vector_search(
+        let _ = consumer
+            .vector_search(
                 VEC_COLUMN,
                 &q,
                 TOP_K,
                 VectorSearchOptions::new().with_nprobe(BENCH_NPROBE),
-            ))
+            )
             .expect("warm-up vector");
         rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
 
@@ -2225,8 +2258,8 @@ mod diag {
         let mut kernel_bm25: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = rt
-                .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
+            let _ = consumer
+                .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("kernel bm25");
             kernel_bm25.push(t.elapsed());
         }
@@ -2239,8 +2272,8 @@ mod diag {
         let mut kernel_vec: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = rt
-                .block_on(reader.vector_search(VEC_COLUMN, &q, TOP_K, opts))
+            let _ = consumer
+                .vector_search(VEC_COLUMN, &q, TOP_K, opts)
                 .expect("kernel vector");
             kernel_vec.push(t.elapsed());
         }

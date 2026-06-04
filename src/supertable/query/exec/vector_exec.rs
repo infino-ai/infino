@@ -504,7 +504,7 @@ mod tests {
 
     /// Single-segment supertable with `n` one-hot docs.
     fn supertable_one_segment(dim: usize, n: usize) -> Supertable {
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, n, dim, schema))
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn vector_search_tvf_empty_supertable_returns_no_rows() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim));
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let sql = format!(
             "SELECT _id, score FROM vector_search('emb', '{}', 5)",
             csv_one_hot(dim, 0)

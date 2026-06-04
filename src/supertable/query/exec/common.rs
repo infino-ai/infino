@@ -184,9 +184,12 @@ async fn resolve_columns(
     let manifest = reader.manifest();
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
+    let storage = manifest.options.storage.as_ref();
 
     let opened = futures::future::try_join_all(seg_order.iter().map(|uri| {
-        crate::supertable::query::superfile_reader::superfile_reader(store, disk_cache, uri, None)
+        crate::supertable::query::superfile_reader::superfile_reader(
+            store, disk_cache, storage, uri, None,
+        )
     }))
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;

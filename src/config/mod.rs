@@ -141,7 +141,7 @@ pub enum StorageBackend {
     /// [`StorageSettings::local_root`].
     LocalFs,
     /// AWS S3 provider rooted at
-    /// `s3://storage.s3_bucket/storage.s3_prefix`.
+    /// `s3://storage.bucket/storage.prefix`.
     S3,
 }
 
@@ -151,8 +151,20 @@ pub enum StorageBackend {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageColdFetchMode {
+    /// Parallel range GETs serve both the foreground reader and the
+    /// disk-cache fill. Foreground returns after the range fetches;
+    /// pwrite, mmap, and cache registration finish in the background.
+    /// Uses one copy of segment bandwidth per cold miss.
     HybridWithPrefetch,
+    /// Single-range sequential fetches (no background fill). Useful
+    /// for constrained environments where parallelism is undesirable.
     RangeOnly,
+    /// Foreground returns a lazy reader and a background task fills
+    /// the disk cache asynchronously. With manifest open-batch bytes
+    /// present, open issues zero segment-object GETs; otherwise it
+    /// fetches the parquet tail plus vector/FTS open ranges. First
+    /// query pays per-cluster range GETs; subsequent queries resolve
+    /// from mmap once the fill completes.
     #[default]
     LazyForegroundWithBackgroundFill,
 }
@@ -167,12 +179,14 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
-    /// S3 bucket when `backend: s3`. Credentials and region use
-    /// the standard AWS provider chain (`AWS_*`, profile,
-    /// instance role, etc.).
-    pub s3_bucket: Option<String>,
-    /// Logical table prefix inside the S3 bucket.
-    pub s3_prefix: String,
+    /// Object-store bucket name (used by the `s3` backend).
+    pub bucket: Option<String>,
+    /// Logical key prefix inside the bucket. All manifest and
+    /// segment objects are written under
+    /// `<bucket>/<prefix>/<manifest|segments>/…`. Empty means the
+    /// bucket root. Not used by the `local_fs` backend (use
+    /// `local_root` instead).
+    pub prefix: String,
     /// Disk-cache root. When set with any persistent backend,
     /// `apply_config` attaches a `DiskCacheStore` so reads go
     /// through the object-store lazy/cached path.
@@ -184,7 +198,15 @@ pub struct StorageSettings {
     /// Global cap on concurrent background segment fills. See
     /// [`crate::supertable::reader_cache::DiskCacheConfig::prefetch_concurrency`].
     pub prefetch_concurrency: usize,
+    /// Minimum age (seconds) before an mmap'd segment is
+    /// considered cold and eligible for eviction by the sweep.
+    /// Default: 300 s (5 min). Prevents thrashing on segments
+    /// that just finished their background fill.
     pub mmap_cold_threshold_secs: u64,
+    /// Interval (seconds) between mmap eviction sweeps. The sweep
+    /// drops pages for segments older than
+    /// `mmap_cold_threshold_secs` and not accessed since the
+    /// previous sweep. Default: 75 s.
     pub mmap_sweep_interval_secs: u64,
 }
 
@@ -193,8 +215,8 @@ impl Default for StorageSettings {
         Self {
             backend: StorageBackend::None,
             local_root: None,
-            s3_bucket: None,
-            s3_prefix: String::new(),
+            bucket: None,
+            prefix: String::new(),
             disk_cache_root: None,
             disk_budget_bytes: 10 * (1 << 30),
             cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
@@ -405,7 +427,7 @@ supertable:
     fn embedded_default_storage_is_in_memory_only() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.storage.backend, StorageBackend::None);
-        assert_eq!(cfg.storage.s3_bucket, None);
+        assert_eq!(cfg.storage.bucket, None);
         assert_eq!(cfg.storage.disk_cache_root, None);
     }
 
@@ -414,8 +436,8 @@ supertable:
         let yaml = r#"
 storage:
   backend: s3
-  s3_bucket: cold-test-381491836522
-  s3_prefix: infino-real-s3-integration/example
+  bucket: cold-test-381491836522
+  prefix: infino-real-s3-integration/example
   disk_cache_root: /tmp/infino-cache
   cold_fetch_mode: lazy_foreground_with_background_fill
   cold_fetch_streams: 8
@@ -427,10 +449,10 @@ storage:
         let cfg = Config::from_figment(fig).expect("parse config");
         assert_eq!(cfg.storage.backend, StorageBackend::S3);
         assert_eq!(
-            cfg.storage.s3_bucket.as_deref(),
+            cfg.storage.bucket.as_deref(),
             Some("cold-test-381491836522")
         );
-        assert_eq!(cfg.storage.s3_prefix, "infino-real-s3-integration/example");
+        assert_eq!(cfg.storage.prefix, "infino-real-s3-integration/example");
         assert_eq!(
             cfg.storage.disk_cache_root.as_deref(),
             Some(Path::new("/tmp/infino-cache"))

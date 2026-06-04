@@ -26,6 +26,7 @@
 //! `superfile_fts_search` still validates the BMW oracle before
 //! timing kicks in.
 
+use crate::fixture;
 use crate::tiers::{self, Tier};
 use crate::{corpus, markdown, rss};
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
@@ -71,10 +72,91 @@ fn superfile_object() -> &'static tiers::SuperfileCommitted {
     })
 }
 
-const TIER_OR_QUERIES: &[(&str, &[&str])] = &[
-    ("single_common", &["term00001"]),
-    ("two_term_or", &["term00001", "term00050"]),
-    ("three_wide_or", &["term00001", "term00050", "term00100"]),
+/// Full warm/cold tier battery — every hot-search query shape is also
+/// exercised against real object storage so the search summary has
+/// hot/warm/cold for all OR *and* AND shapes (cold latency is
+/// fetch-bound, but we measure each shape explicitly rather than
+/// extrapolating from a 3-query sample).
+const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
+    ("single_rare", &["term09999"], BoolMode::Or),
+    ("single_df1", &["doc0500000"], BoolMode::Or),
+    ("single_common", &["term00001"], BoolMode::Or),
+    ("two_term_or", &["term00001", "term00050"], BoolMode::Or),
+    (
+        "three_wide_or",
+        &["term00001", "term00050", "term00100"],
+        BoolMode::Or,
+    ),
+    (
+        "three_similar_or",
+        &["term00050", "term00051", "term00052"],
+        BoolMode::Or,
+    ),
+    (
+        "five_term_or",
+        &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
+        BoolMode::Or,
+    ),
+    (
+        "ten_term_or",
+        &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
+        ],
+        BoolMode::Or,
+    ),
+    ("two_term_and", &["term00001", "term00050"], BoolMode::And),
+    (
+        "three_wide_and",
+        &["term00001", "term00050", "term00100"],
+        BoolMode::And,
+    ),
+    (
+        "three_similar_and",
+        &["term00050", "term00051", "term00052"],
+        BoolMode::And,
+    ),
+    (
+        "five_term_and",
+        &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
+        BoolMode::And,
+    ),
+    (
+        "ten_term_and",
+        &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
+        ],
+        BoolMode::And,
+    ),
 ];
 
 fn text_corpus() -> &'static corpus::MmapTextCorpus {
@@ -196,6 +278,21 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
                 "term00054",
             ],
         ),
+        (
+            "ten_term_or",
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
+            ],
+        ),
     ];
     const SCORE_EPSILON: f32 = 1e-4;
 
@@ -308,7 +405,23 @@ fn bench_per_algo_probe(
 // ─── Bench entry ──────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
-    {
+    let run_build = fixture::supertable::criterion_filter_selects(
+        &["superfile_fts", "superfile_fts_build"],
+        &["superfile_fts_build"],
+    );
+    let run_search = fixture::supertable::criterion_filter_selects(
+        &["superfile_fts", "superfile_fts_search"],
+        &[
+            "superfile_fts_hot_search",
+            "superfile_fts_warm_search",
+            "superfile_fts_cold_search",
+        ],
+    );
+    if !run_build && !run_search {
+        return;
+    }
+
+    if run_build {
         let n = N_DOCS;
         let docs_for_ingest = text_corpus();
         let mut g = c.benchmark_group("superfile_fts_build");
@@ -334,6 +447,9 @@ fn bench(c: &mut Criterion) {
         g.finish();
 
         emit_ingest_markdown();
+    }
+    if !run_search {
+        return;
     }
 
     eprintln!(
@@ -482,6 +598,23 @@ fn bench(c: &mut Criterion) {
                 "term00054",
             ],
         );
+        bench_per_algo_probe(
+            &mut g,
+            "similar_10_or",
+            &r,
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
+            ],
+        );
 
         g.finish();
         let stats = rss_sample.stop_stats();
@@ -505,6 +638,8 @@ fn bench(c: &mut Criterion) {
             "similar_3_or_bmm_top10",
             "similar_5_or_wand_top10",
             "similar_5_or_bmm_top10",
+            "similar_10_or_wand_top10",
+            "similar_10_or_bmm_top10",
         ];
         for bid in search_ids {
             let _ = rss::write_rss_stats(group_name::SUPERFILE_FTS_SEARCH, bid, stats);
@@ -534,7 +669,8 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
             g.measurement_time(Duration::from_secs(30));
         }
 
-        for (name, terms) in TIER_OR_QUERIES {
+        for (name, terms, mode) in TIER_QUERIES {
+            let mode = *mode;
             let bench_id = format!("{name}_infino_top10");
             let query = terms.join(" ");
             match tier {
@@ -544,7 +680,7 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
                     tiers::block_on(async {
                         let reader = cache.reader(&uri).await.expect("warm open");
                         let _ = reader
-                            .bm25_search(FTS_COLUMN, &query, 10, BoolMode::Or)
+                            .bm25_search(FTS_COLUMN, &query, 10, mode)
                             .await
                             .expect("prewarm bm25");
                         tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
@@ -556,12 +692,7 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
                             let hits = tiers::block_on(async {
                                 let reader = cache_ref.reader(&uri).await.expect("reader");
                                 reader
-                                    .bm25_search(
-                                        FTS_COLUMN,
-                                        terms.join(" ").as_str(),
-                                        10,
-                                        BoolMode::Or,
-                                    )
+                                    .bm25_search(FTS_COLUMN, query.as_str(), 10, mode)
                                     .await
                                     .expect("bm25")
                             });
@@ -583,7 +714,7 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
                                 tiers::block_on(async {
                                     let reader = cache.reader(&uri).await.expect("reader");
                                     let _ = reader
-                                        .bm25_search(FTS_COLUMN, &query, 10, BoolMode::Or)
+                                        .bm25_search(FTS_COLUMN, &query, 10, mode)
                                         .await
                                         .expect("bm25");
                                 });
@@ -723,10 +854,17 @@ fn emit_search_markdown() {
     }
 
     body.push_str("\n**AND queries:**\n\n");
+    body.push_str(
+        "| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|----------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
+    );
     for q in queries_and {
         let bid = format!("{q}_infino_top10");
-        let inf = read_mean_ns(group, &bid);
-        let inf_s = inf.map(fmt_time).unwrap_or_else(|| "—".into());
+        let hot = read_mean_ns(group, &bid);
+        let warm = markdown::read_tier_mean_ns("superfile_fts", "warm", &bid);
+        let cold = markdown::read_tier_mean_ns("superfile_fts", "cold", &bid);
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
             .unwrap_or_else(|| "—".into());
@@ -734,7 +872,10 @@ fn emit_search_markdown() {
         let p90_rss = rss::fmt_p90_rss(group, &bid);
         let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
         body.push_str(&format!(
-            "| {q:14} | {inf_s:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
+            "| {q:14} | {} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
+            hot.map(fmt_time).unwrap_or_else(|| "—".into()),
+            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
+            cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }
 
@@ -742,7 +883,7 @@ fn emit_search_markdown() {
     body.push_str("**Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):\n\n");
     body.push_str("| Shape         | WAND+BMW   | MaxScore+BMM |\n");
     body.push_str("|---------------|------------|--------------|\n");
-    for shape in ["wide_3_or", "similar_3_or", "similar_5_or"] {
+    for shape in ["wide_3_or", "similar_3_or", "similar_5_or", "similar_10_or"] {
         let wand = read_mean_ns(group, &format!("{shape}_wand_top10"));
         let bmm = read_mean_ns(group, &format!("{shape}_bmm_top10"));
         let wand_s = wand.map(fmt_time).unwrap_or_else(|| "—".into());

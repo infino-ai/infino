@@ -127,13 +127,13 @@ impl StorageProvider for CrashStorage {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
         self.inner.head(uri).await
     }
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         self.inner.get(uri).await
     }
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         self.inner.get_range(uri, range).await
     }
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let is_match = uri.starts_with(&self.trigger_path_prefix);
         let result = self.inner.put_atomic(uri, bytes).await;
         self.maybe_abort(uri, is_match, result.is_ok());
@@ -144,7 +144,7 @@ impl StorageProvider for CrashStorage {
         uri: &str,
         bytes: Bytes,
         expected_etag: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let is_match = uri.starts_with(&self.trigger_path_prefix);
         let result = self.inner.put_if_match(uri, bytes, expected_etag).await;
         self.maybe_abort(uri, is_match, result.is_ok());
@@ -191,7 +191,8 @@ fn run_crash_child(dir: PathBuf, kill_point: &str) -> ! {
     let wrapped = Arc::new(CrashStorage::new(local, prefix, nth, kill_point));
     let storage: Arc<dyn StorageProvider> = wrapped;
 
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     for c in 1..=n_commits {
         let mut w = st.writer().expect("writer");
@@ -258,8 +259,8 @@ fn dispatch_child_if_set() -> Option<()> {
     None
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
+#[test]
+fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
     if dispatch_child_if_set().is_some() {
         return; // unreachable; child never returns
     }
@@ -274,7 +275,6 @@ async fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect_err("must reject post-crash state with no pointer");
     assert!(
         matches!(err, OpenError::PointerUnreadable(_)),
@@ -294,8 +294,8 @@ async fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
+#[test]
+fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -307,7 +307,6 @@ async fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
         .expect_err("must reject post-crash state with no pointer");
     assert!(
         matches!(err, OpenError::PointerUnreadable(_)),
@@ -325,8 +324,8 @@ async fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_segment_on_second_commit_yields_v1() {
+#[test]
+fn crash_post_segment_on_second_commit_yields_v1() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -337,9 +336,8 @@ async fn crash_post_segment_on_second_commit_yields_v1() {
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
-        .expect("open at v1");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1, "must recover at v1");
     assert_eq!(
         consumer.reader().n_superfiles(),
@@ -348,8 +346,8 @@ async fn crash_post_segment_on_second_commit_yields_v1() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_list_on_second_commit_yields_v1() {
+#[test]
+fn crash_post_list_on_second_commit_yields_v1() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -357,9 +355,8 @@ async fn crash_post_list_on_second_commit_yields_v1() {
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
-        .expect("open at v1");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1);
     assert_eq!(consumer.reader().n_superfiles(), 1);
 
@@ -375,8 +372,8 @@ async fn crash_post_list_on_second_commit_yields_v1() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_post_pointer_on_second_commit_yields_v2() {
+#[test]
+fn crash_post_pointer_on_second_commit_yields_v2() {
     if dispatch_child_if_set().is_some() {
         return;
     }
@@ -387,9 +384,8 @@ async fn crash_post_pointer_on_second_commit_yields_v2() {
 
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let consumer = Supertable::open(default_supertable_options().with_storage(storage))
-        .await
-        .expect("open at v2");
+    let consumer =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v2");
     assert_eq!(
         consumer.manifest_id(),
         2,

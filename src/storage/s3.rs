@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjPath;
 use object_store::{
@@ -63,6 +64,7 @@ impl S3StorageProvider {
         let store = AmazonS3Builder::from_env()
             .with_bucket_name(&bucket)
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            .with_client_options(tuned_client_options())
             .build()
             .map_err(|e| StorageError::Permanent {
                 uri: format!("s3://{bucket}"),
@@ -122,6 +124,15 @@ impl S3StorageProvider {
             // doesn't terminate `<bucket>.<endpoint>` DNS).
             .with_virtual_hosted_style_request(false)
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            // NB: do NOT apply `tuned_client_options()` here. The
+            // deep idle-connection pool / long keep-alive is tuned
+            // for real-S3 fan-out latency and destabilizes local
+            // S3-compatible endpoints (s3s-fs / MinIO): reqwest
+            // reuses connections the emulator has already closed,
+            // surfacing as "error sending request". Also,
+            // `with_client_options` would clobber the
+            // `with_allow_http(true)` above. The endpoint path keeps
+            // object_store's defaults.
             .build()
             .map_err(|e| StorageError::Permanent {
                 uri: format!("s3://{bucket} @ {endpoint}"),
@@ -195,6 +206,33 @@ fn normalize_prefix(prefix: impl Into<String>) -> String {
     prefix.into().trim_matches('/').to_string()
 }
 
+/// Tuned HTTP client options for the object-store-native fan-out.
+///
+/// The supertable vector/FTS query path fans out one cold-open +
+/// cold-search batch per segment concurrently. With the default
+/// idle-connection pool, a wide fan-out (hundreds of segments ×
+/// several range GETs each) churns TCP/TLS connections — each new
+/// connection pays a TLS handshake RTT on top of the request RTT,
+/// inflating the p99 tail under load. Keeping a large warm idle
+/// pool lets the fan-out reuse connections so the per-GET cost is
+/// one RTT, not handshake + RTT.
+fn tuned_client_options() -> object_store::ClientOptions {
+    object_store::ClientOptions::new()
+        // Keep many connections warm per host so concurrent
+        // fan-out GETs reuse established TLS sessions instead of
+        // handshaking. AWS S3 in-region serves many parallel
+        // range GETs per host; a deep idle pool is the difference
+        // between "RTT" and "handshake + RTT" on the cold tail.
+        .with_pool_max_idle_per_host(1024)
+        // Hold idle connections long enough to span a full fan-out
+        // wave plus the next query, so back-to-back cold queries on
+        // a fresh worker don't re-handshake.
+        .with_pool_idle_timeout(std::time::Duration::from_secs(90))
+        // Bound the connect phase so a single slow SYN/TLS doesn't
+        // dominate the fan-out's p99; the retry layer covers drops.
+        .with_connect_timeout(std::time::Duration::from_secs(5))
+}
+
 /// Translate an `object_store::Error` to our `StorageError`.
 /// Same shape as the LocalFS provider's translate; kept here
 /// rather than shared to keep each backend file self-
@@ -232,10 +270,18 @@ impl StorageProvider for S3StorageProvider {
         })
     }
 
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-        result.bytes().await.map_err(|e| translate(uri, e))
+        // `GetResult.meta` is the version whose bytes we're
+        // about to read — etag and bytes are atomically paired
+        // by S3, so no follow-up HEAD is needed.
+        let meta = ObjectMeta {
+            size: result.meta.size as u64,
+            etag: result.meta.e_tag.clone(),
+        };
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, meta))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
@@ -246,7 +292,7 @@ impl StorageProvider for S3StorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    /// Plan 013 M5 — single-RTT tail fetch via S3's native
+    /// Tail-fetch path: — single-RTT tail fetch via S3's native
     /// `Range: bytes=-len` suffix-range form. The response
     /// carries the total object size in `GetResult::meta.size`,
     /// so callers don't need a separate HEAD round-trip just
@@ -279,7 +325,7 @@ impl StorageProvider for S3StorageProvider {
         Ok((bytes, size))
     }
 
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -288,7 +334,7 @@ impl StorageProvider for S3StorageProvider {
         self.store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|_| ())
+            .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e))
     }
 
@@ -297,7 +343,7 @@ impl StorageProvider for S3StorageProvider {
         uri: &str,
         bytes: Bytes,
         expected_etag: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
         let opts = match expected_etag {
             // None == create-only-if-absent.
@@ -324,7 +370,7 @@ impl StorageProvider for S3StorageProvider {
         self.store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|_| ())
+            .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e))
     }
 
@@ -346,6 +392,16 @@ impl StorageProvider for S3StorageProvider {
             Err(ObjError::NotFound { .. }) => Ok(()),
             Err(e) => Err(translate(uri, e)),
         }
+    }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out: Vec<String> = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(meta.location.to_string());
+        }
+        Ok(out)
     }
 }
 

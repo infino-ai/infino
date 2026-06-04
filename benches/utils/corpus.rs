@@ -42,7 +42,7 @@ use infino::superfile::builder::{
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::reader::VectorSearchOptions;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{Metric, normalize};
+use infino::superfile::vector::distance::{Metric, distance, normalize};
 use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::test_helpers::default_tokenizer;
@@ -242,6 +242,11 @@ impl MmapTextCorpus {
     }
 }
 
+pub mod combined;
+pub mod grading;
+
+pub use combined::SequentialSyntheticCorpus;
+
 // ─── Vector corpus ────────────────────────────────────────────────────
 
 /// Generate `n_docs` planted-cluster vectors of [`DIM`] dimensions,
@@ -435,6 +440,28 @@ pub fn generate_realistic_queries(
 
 // ─── Brute-force ground truth + recall ────────────────────────────────
 
+/// Brute-force kNN ground truth for any [`Metric`]. Returns top-k local
+/// doc_ids (no distances — recall only needs the id set).
+pub fn brute_force_topk(
+    vectors: &[f32],
+    n_docs: usize,
+    query: &[f32],
+    metric: Metric,
+    k: usize,
+) -> Vec<u32> {
+    assert_eq!(vectors.len(), n_docs * DIM);
+    assert_eq!(query.len(), DIM);
+    let mut scored: Vec<(u32, f32)> = (0..n_docs as u32)
+        .map(|i| {
+            let off = (i as usize) * DIM;
+            (i, distance(metric, query, &vectors[off..off + DIM]))
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
 /// Brute-force kNN ground truth for cosine distance on L2-normalized
 /// vectors. Returns top-k local doc_ids (no distances — recall only
 /// needs the id set).
@@ -499,8 +526,9 @@ pub fn mean_recall_infino(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits =
-            block_on_inmem(reader.search("v", q, k, nprobe, rerank_mult)).expect("vector search");
+        let hits = reader
+            .search("v", q, k, nprobe, rerank_mult)
+            .expect("vector search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -521,7 +549,8 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
+        let hits = reader
+            .vector_search(column, q, k, opts)
             .expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
@@ -583,8 +612,7 @@ pub fn calibrate_infino(
             let q = &queries[0];
             let p50 = p50_micros(
                 || {
-                    let _ =
-                        block_on_inmem(reader.search("v", q, k, probe, refine)).expect("search");
+                    let _ = reader.search("v", q, k, probe, refine).expect("search");
                 },
                 p50_iter,
             );
@@ -609,7 +637,7 @@ pub fn calibrate_infino(
     best
 }
 
-/// Sweep a `(probe, refine)` grid via [`SuperfileReader::vector_search`].
+/// Sweep `(nprobe, rerank_mult)` values via [`SuperfileReader::vector_search`].
 pub fn calibrate_superfile(
     reader: &SuperfileReader,
     column: &str,
@@ -638,9 +666,9 @@ pub fn calibrate_superfile(
                 .with_rerank_mult(refine);
             let p50 = p50_micros(
                 || {
-                    let _ =
-                        block_on_inmem(async { reader.vector_search(column, q, k, opts).await })
-                            .expect("vector_search");
+                    let _ = reader
+                        .vector_search(column, q, k, opts)
+                        .expect("vector_search");
                 },
                 p50_iter,
             );
@@ -723,15 +751,8 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
     let json = format!(
         r#"[{{"column":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
     );
-    VectorReader::open_with(
-        Bytes::from(blob),
-        &json,
-        OpenOptions {
-            verify_crc: true,
-            ..Default::default()
-        },
-    )
-    .expect("open VectorReader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open VectorReader")
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.
@@ -756,6 +777,48 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+        }],
+        Some(default_tokenizer()),
+    );
+
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let ids: Decimal128Array = (0..n as u64)
+        .map(|i| Some(i as i128))
+        .collect::<Decimal128Array>()
+        .with_precision_and_scale(38, 0)
+        .expect("decimal128 with_precision_and_scale");
+    let titles = LargeStringArray::from(docs.iter().map(String::as_str).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
+        .expect("build RecordBatch");
+    b.add_batch(&batch, &[vectors]).expect("add_batch");
+    b.finish().expect("finish builder")
+}
+
+/// Build a full superfile (FTS + vector) with an explicit metric.
+pub fn build_superfile_with_metric(
+    docs: &[String],
+    vectors: &[f32],
+    n_cent: usize,
+    metric: Metric,
+) -> Vec<u8> {
+    let n = docs.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            n_cent,
+            rot_seed: 7,
+            metric,
             rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),

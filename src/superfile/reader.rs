@@ -20,9 +20,10 @@
 use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
+use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::vector::reader::VectorReader;
 use arrow::compute::{concat_batches, take};
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, UInt32Array};
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::{Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
@@ -132,6 +133,13 @@ impl SuperfileReader {
 
     /// Like [`open_lazy`] but with explicit [`OpenOptions`].
     ///
+    /// Lazy opens do not run whole-segment CRC scans. Forcing CRC
+    /// verification here would require reading the full segment through
+    /// range GETs, which is exactly what the lazy path is meant to avoid;
+    /// the embedded vector/FTS lazy readers therefore use their
+    /// object-store options (`verify_crc = false`) while eager cache
+    /// promotion can verify after the full segment is materialized.
+    ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
         source: Arc<dyn crate::superfile::LazyByteSource>,
@@ -190,7 +198,7 @@ impl SuperfileReader {
                 .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?,
         );
 
-        // 4 + 5. Vector + FTS
+        // 4 + 5. Vector + FTS subsections — Tail-fetch path:
         //   fires both subsection fetches **concurrently** via
         //   `futures::try_join!`. The two subsections live at
         //   disjoint offsets (parquet body → fts → vec → footer
@@ -352,7 +360,6 @@ impl SuperfileReader {
                 cols_json,
                 crate::superfile::vector::reader::OpenOptions {
                     verify_crc: opts.verify_crc,
-                    ..Default::default()
                 },
             )?)
         } else if any_present(&kv_map, kv::VEC_KEYS) {
@@ -594,6 +601,72 @@ impl SuperfileReader {
         RecordBatch::try_new(out_schema, columns).map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
+    /// Sequential scan of the `_id` column for an exact `target`
+    /// match. Returns the matching row's local doc_id (the row
+    /// offset within this superfile, used by tombstones / FTS /
+    /// vector indices) or `None` if the target isn't present.
+    ///
+    /// `_id` is stored as `Decimal128` with the supertable's
+    /// fixed precision/scale; we decode each value as `i128`.
+    ///
+    /// Used by the WAL recovery sweep's `resolve_target_id`
+    /// path: given a `target_id`, scan the candidate superfile to
+    /// find where the row lives so the tombstone phase can mark
+    /// its bit. Currently rebuilds a `ParquetRecordBatchReader`
+    /// each call — opportunity for a follow-up that caches
+    /// parquet metadata on the reader (see TODO in module-level
+    /// comments).
+    pub fn id_lookup(&self, target: i128) -> Result<Option<u32>, ReadError> {
+        let bytes = self.bytes.clone().ok_or_else(|| {
+            ReadError::Io(std::io::Error::other(
+                "id_lookup requires an eager-opened superfile; this reader was opened via \
+                 the lazy path and does not hold the full segment bytes",
+            ))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        // _id is always at index 0
+        let descriptor = builder.parquet_schema().clone();
+        let reader = builder
+            .with_projection(ProjectionMask::leaves(&descriptor, vec![0]))
+            .build()
+            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+
+        let mut row_offset: u32 = 0;
+        for batch_res in reader {
+            // `batch_res` is `Result<RecordBatch, ArrowError>`;
+            // funnel through ParquetError so the whole id_lookup
+            // path surfaces a single error variant.
+            let batch =
+                batch_res.map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e.into())))?;
+            let id_idx = batch.schema().index_of(&self.id_column).map_err(|_| {
+                ReadError::MalformedKv(format!(
+                    "id_column {:?} declared in KV metadata but missing from parquet schema",
+                    self.id_column
+                ))
+            })?;
+            let arr = batch.column(id_idx);
+            let id_arr = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    ReadError::MalformedKv(format!(
+                        "id_column {:?} is not Decimal128",
+                        self.id_column
+                    ))
+                })?;
+            for i in 0..id_arr.len() {
+                if id_arr.value(i) == target {
+                    return Ok(Some(row_offset + i as u32));
+                }
+            }
+            row_offset = row_offset.checked_add(id_arr.len() as u32).ok_or_else(|| {
+                ReadError::MalformedKv("row_offset overflow scanning id column".to_string())
+            })?;
+        }
+        Ok(None)
+    }
+
     /// Single-column BM25 search across the unified FTS reader.
     ///
     /// `query` is tokenized by the same v1 tokenizer used at build
@@ -607,7 +680,6 @@ impl SuperfileReader {
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        use crate::superfile::fts::tokenize::Tokenizer as _;
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
         self.bm25_search_pretokenized(column, &term_refs, k, mode)
@@ -668,7 +740,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -737,7 +809,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -772,17 +844,19 @@ impl SuperfileReader {
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
     ///
-    /// Async — every per-range byte access routes through
-    /// [`crate::superfile::vector::reader::Source::range_async`] /
-    /// `get_ranges_parallel_async`, which `await` the underlying
-    /// `LazyByteSource::range` on the caller's tokio runtime. On
-    /// `Source::InMemory` and warm-cache `Source::Lazy`
-    /// (`BytesLazyByteSource`, mmap-backed) every fetch resolves
-    /// zero-copy without suspending; only cold `Source::Lazy`
-    /// misses actually hit the object store, and those run on the
-    /// owning runtime's reactor (no sync bridge, no throwaway
-    /// runtime), so object-store retries fire correctly.
-    pub async fn vector_search(
+    /// Sync — every public surface in `src/` is sync (plan 002 Q9).
+    /// Per-range byte access routes through
+    /// [`crate::superfile::lazy_source::Source::get_range`] /
+    /// `get_ranges_parallel`, which resolve zero-copy on the sync
+    /// fast path for `Source::InMemory` and warm-cache `Source::Lazy`
+    /// (`BytesLazyByteSource`, mmap-backed). Only a cold `Source::Lazy`
+    /// miss bridges to the underlying async `LazyByteSource::range`
+    /// internally. The supertable fan-out
+    /// ([`crate::supertable::handle::SupertableReader::vector_search`])
+    /// drives this on the `reader_pool` rayon threads, so per-segment
+    /// CPU (centroid + 1-bit code scoring, rerank) runs in one pool
+    /// with work-stealing rather than oversubscribing tokio workers.
+    pub fn vector_search(
         &self,
         column: &str,
         query: &[f32],
@@ -792,10 +866,8 @@ impl SuperfileReader {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(
-            v.search(column, query, k, options.nprobe, options.rerank_mult)
-                .await?,
-        )
+        let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
+        Ok(v.search(column, query, k, options.nprobe, rerank_mult)?)
     }
 }
 
@@ -808,33 +880,28 @@ impl SuperfileReader {
 ///   slower. Default `8`, internally clamped to `[1, n_cent]`. For a
 ///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
 ///   index per query.
-/// - `rerank_mult`: number of `k * rerank_mult` candidates passed
-///   from the 1-bit RaBitQ shortlist into the full-precision rerank.
-///   Higher = better recall, slower. Default `20`. With smaller
-///   values (e.g. `5`) recall@10 drops to ~50% on a 10k×384 corpus
-///   because the 1-bit estimate noise drops true neighbors out of
-///   the shortlist before rerank can recover them — see
-///   `tests/recall.rs` for the measurements behind the default.
 ///
-/// The defaults are deliberately conservative; the bench harness
-/// has the measured 1M / 10M recall-vs-latency curves and may
-/// motivate a smaller default later.
+/// - `rerank_mult`: number of coarse candidates per requested hit to
+///   feed into exact/Sq8 rerank. Higher = better recall, slower.
 #[derive(Debug, Clone, Copy)]
 pub struct VectorSearchOptions {
     pub nprobe: usize,
-    pub rerank_mult: usize,
+    rerank_mult: usize,
 }
 
 impl VectorSearchOptions {
-    /// Builder default: `nprobe = 8`, `rerank_mult = 20`.
     pub const DEFAULT_NPROBE: usize = 8;
-    pub const DEFAULT_RERANK_MULT: usize = 20;
 
-    /// Construct with both defaults applied.
+    /// Internal rerank multiplier. `k * RERANK_MULT` candidates
+    /// from the 1-bit RaBitQ shortlist enter Sq8/residual rerank.
+    /// Bench-validated: recall saturates at 4 on 10M×384 cosine.
+    pub const RERANK_MULT: usize = 4;
+
+    /// Construct with defaults applied.
     pub fn new() -> Self {
         Self {
             nprobe: Self::DEFAULT_NPROBE,
-            rerank_mult: Self::DEFAULT_RERANK_MULT,
+            rerank_mult: Self::RERANK_MULT,
         }
     }
 
@@ -844,10 +911,15 @@ impl VectorSearchOptions {
         self
     }
 
-    /// Override the rerank candidate multiplier.
+    /// Override the rerank multiplier. Values below 1 are clamped
+    /// to 1 so `k > 0` always admits at least `k` coarse candidates.
     pub fn with_rerank_mult(mut self, n: usize) -> Self {
-        self.rerank_mult = n;
+        self.rerank_mult = n.max(1);
         self
+    }
+
+    pub fn rerank_mult(&self) -> usize {
+        self.rerank_mult
     }
 }
 
@@ -949,6 +1021,19 @@ mod tests {
         assert_eq!(s.fields().len(), 2);
         assert_eq!(s.field(0).name(), "doc_id");
         assert_eq!(s.field(1).name(), "title");
+    }
+
+    #[test]
+    fn id_lookup_returns_only_matching_ids() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        let s = r.id_lookup(10).expect("should return result");
+        assert_eq!(s.expect("should find id"), 0);
+        let s = r.id_lookup(12).expect("should return result");
+        assert_eq!(s.expect("should find id"), 2);
+
+        let s = r.id_lookup(20).expect("should return result");
+        assert!(s.is_none());
     }
 
     #[test]
@@ -1170,19 +1255,18 @@ mod tests {
     fn vector_search_options_default_values() {
         let opts = VectorSearchOptions::default();
         assert_eq!(opts.nprobe, 8);
-        assert_eq!(opts.rerank_mult, 20);
+        assert_eq!(opts.rerank_mult(), 4);
         let opts2 = VectorSearchOptions::new();
         assert_eq!(opts.nprobe, opts2.nprobe);
-        assert_eq!(opts.rerank_mult, opts2.rerank_mult);
     }
 
     #[test]
     fn vector_search_options_builder_chains() {
         let opts = VectorSearchOptions::new()
             .with_nprobe(2)
-            .with_rerank_mult(50);
+            .with_rerank_mult(32);
         assert_eq!(opts.nprobe, 2);
-        assert_eq!(opts.rerank_mult, 50);
+        assert_eq!(opts.rerank_mult(), 32);
     }
 
     #[tokio::test]
@@ -1197,7 +1281,6 @@ mod tests {
         normalize(&mut q);
         let hits = r
             .vector_search("emb", &q, 1, VectorSearchOptions::default())
-            .await
             .expect("vector search");
         assert!(!hits.is_empty());
     }
@@ -1212,15 +1295,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search(
-                "emb",
-                &q,
-                1,
-                VectorSearchOptions::new()
-                    .with_nprobe(4)
-                    .with_rerank_mult(5),
-            )
-            .await
+            .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
     }

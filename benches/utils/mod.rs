@@ -1,22 +1,20 @@
-// Shared bench library. Holds:
+// Shared bench library:
 //
-// - Helpers (corpus, markdown, rss) consumed by every bench body.
-// - The bench bodies themselves (fts_*, vector_*), so each
-//   `[[bench]]` binary under benches/{fts,vector}/main*.rs is a
-//   2-line shell that imports the body via `use` and hands the
-//   criterion group to `criterion::criterion_main!`.
-//
-// File layout for the bench bodies follows `<topic>_<layer>.rs`
-// so the module name matches the criterion-binary name (`fts`,
-// `fts-superfile`, `fts-supertable`, `vector`) verbatim.
+// - `corpus/` — synthetic data (stream + optional grading cache)
+// - `ingest/` — stream corpus → append → commit → object storage
+// - `fixture/` — one shared 10M ingest per process (`supertable_all`)
+// - `bench/` — criterion groups only (ingest timing, FTS search, vector search)
+// - `fts_superfile`, `vector_superfile` — 1M superfile bench bodies
+// - `tiers`, `markdown`, `rss` — storage backends + reporting
 
+pub mod bench;
 pub mod corpus;
+pub mod fixture;
+pub mod ingest;
 pub mod markdown;
 pub mod rss;
 pub mod tiers;
 
 pub mod fts_superfile;
-pub mod fts_supertable;
 pub mod unified_object_store;
 pub mod vector_superfile;
-pub mod vector_supertable;

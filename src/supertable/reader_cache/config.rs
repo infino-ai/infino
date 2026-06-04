@@ -33,7 +33,7 @@ pub enum ColdFetchMode {
     ///
     /// [`StorageRangeSource`]: crate::supertable::StorageRangeSource
     RangeOnly,
-    /// Plan 013 M4 — foreground returns immediately with a
+    /// foreground returns immediately with a
     /// [`SuperfileReader::open_lazy`]-built reader over a
     /// [`StorageRangeSource`]; pays only the M1-M3 cold-open
     /// + cold-search byte budget against object storage

@@ -425,7 +425,7 @@ mod tests {
     }
 
     fn supertable_with_titles(titles: &[&str]) -> Supertable {
-        let st = Supertable::create(options_title_fts());
+        let st = Supertable::create(options_title_fts()).expect("create");
         let mut w = st.writer().expect("writer");
         let arr = LargeStringArray::from(titles.to_vec());
         let batch = RecordBatch::try_new(title_schema(), vec![Arc::new(arr)]).expect("batch");
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn bm25_search_tvf_empty_supertable_returns_no_rows() {
-        let st = Supertable::create(options_title_fts());
+        let st = Supertable::create(options_title_fts()).expect("create");
         let batches = st
             .query_sql("SELECT title, score FROM bm25_search('title', 'rust', 5)")
             .expect("query_sql");

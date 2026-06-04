@@ -148,7 +148,7 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
     .expect("opts")
     .with_writer_pool(pool);
 
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");
     let chunk_size = corpus.len().div_ceil(n_superfiles);
     for chunk in corpus.chunks(chunk_size) {
@@ -183,44 +183,33 @@ fn supertable_to_global_ids(
         .collect()
 }
 
-async fn supertable_search_global(
-    st: &Supertable,
-    query: &str,
-    k: usize,
-    chunk_size: usize,
-) -> Vec<u64> {
-    let r = st.reader();
-    let hits = r
+fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
+    let hits = st
         .bm25_search("title", query, k, BoolMode::Or)
-        .await
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
 
-async fn supertable_search_and_global(
+fn supertable_search_and_global(
     st: &Supertable,
     query: &str,
     k: usize,
     chunk_size: usize,
 ) -> Vec<u64> {
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search("title", query, k, BoolMode::And)
-        .await
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
 }
 
-async fn supertable_prefix_global(
+fn supertable_prefix_global(
     st: &Supertable,
     prefix: &str,
     k: usize,
     chunk_size: usize,
 ) -> Vec<u64> {
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search_prefix("title", prefix, k)
-        .await
         .expect("supertable bm25_prefix");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -323,22 +312,22 @@ static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
 
 // ---- Tests: query-shape coverage -------------------------------------
 
-#[tokio::test]
-async fn oracle_single_rare_top1_matches() {
+#[test]
+fn oracle_single_rare_top1_matches() {
     // "rare-token-zzz" appears in exactly 1 doc (id=17, segment 1).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_global(&f.infino, "rare-token-zzz", 5, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "rare-token-zzz", 5, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "rare-token-zzz", 5);
     assert_eq!(inf_hits.first().copied(), Some(17));
     assert_eq!(ora_hits.first().copied(), Some(17));
     assert_top_k_sets_match("single_rare", inf_hits, ora_hits, 1);
 }
 
-#[tokio::test]
-async fn oracle_single_common_top3_overlap() {
+#[test]
+fn oracle_single_common_top3_overlap() {
     // "rust" appears in many docs. Top-10 sets must overlap by ≥3.
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_global(&f.infino, "rust", 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "rust", 10, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "rust", 10);
     let inf_set: HashSet<u64> = inf_hits.iter().take(10).copied().collect();
     let ora_set: HashSet<u64> = ora_hits.iter().take(10).copied().collect();
@@ -349,11 +338,11 @@ async fn oracle_single_common_top3_overlap() {
     );
 }
 
-#[tokio::test]
-async fn oracle_two_term_or_top2_matches() {
+#[test]
+fn oracle_two_term_or_top2_matches() {
     // Docs containing both "rust" AND "async": doc 0, doc 20, doc 22.
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_global(&f.infino, "rust async", 5, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "rust async", 5, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "rust async", 5);
     let inf_top2: HashSet<u64> = inf_hits.iter().take(2).copied().collect();
     let ora_top2: HashSet<u64> = ora_hits.iter().take(2).copied().collect();
@@ -368,10 +357,10 @@ async fn oracle_two_term_or_top2_matches() {
     assert_eq!(inf_top2, ora_top2);
 }
 
-#[tokio::test]
-async fn oracle_three_wide_or_top3_matches() {
+#[test]
+fn oracle_three_wide_or_top3_matches() {
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_global(&f.infino, "rust web framework", 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "rust web framework", 10, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "rust web framework", 10);
     let inf_top: HashSet<u64> = inf_hits.iter().take(3).copied().collect();
     let ora_top: HashSet<u64> = ora_hits.iter().take(3).copied().collect();
@@ -380,12 +369,11 @@ async fn oracle_three_wide_or_top3_matches() {
     assert_top_k_sets_match("three_wide_or", inf_hits, ora_hits, 3);
 }
 
-#[tokio::test]
-async fn oracle_three_similar_or_top3_matches() {
+#[test]
+fn oracle_three_similar_or_top3_matches() {
     // Three single-doc terms (docs 14, 15, 16).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_global(&f.infino, "redis kafka elasticsearch", 5, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "redis kafka elasticsearch", 5, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "redis kafka elasticsearch", 5);
     let want: HashSet<u64> = [14u64, 15, 16].into_iter().collect();
     let inf_top: HashSet<u64> = inf_hits.iter().take(3).copied().collect();
@@ -394,12 +382,11 @@ async fn oracle_three_similar_or_top3_matches() {
     assert_eq!(ora_top, want);
 }
 
-#[tokio::test]
-async fn oracle_five_term_or_top5_matches() {
+#[test]
+fn oracle_five_term_or_top5_matches() {
     // Five single-doc terms (docs 30..34).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_global(&f.infino, "tcp udp http2 http3 tls", 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "tcp udp http2 http3 tls", 10, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "tcp udp http2 http3 tls", 10);
     let want: HashSet<u64> = [30u64, 31, 32, 33, 34].into_iter().collect();
     let inf_top: HashSet<u64> = inf_hits.iter().take(5).copied().collect();
@@ -410,13 +397,13 @@ async fn oracle_five_term_or_top5_matches() {
 
 // ---- Tests: AND-mode oracle (multi-segment intersection) ------------
 
-#[tokio::test]
-async fn oracle_two_term_and_matches() {
+#[test]
+fn oracle_two_term_and_matches() {
     // "rust" + "async" co-occur in docs 0, 20, 22 — split across
     // segments 0 (doc 0) and 1 (docs 20, 22), so this exercises
     // multi-segment AND fan-out.
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_and_global(&f.infino, "rust async", 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust async", 10, CHUNK_SIZE);
     let ora_hits = brute_force_and_top_k(&f.oracles, "rust async", 10);
     let want: HashSet<u64> = [0u64, 20, 22].into_iter().collect();
     let inf_set: HashSet<u64> = inf_hits.iter().copied().collect();
@@ -425,27 +412,26 @@ async fn oracle_two_term_and_matches() {
     assert_eq!(ora_set, want, "oracle AND={ora_hits:?}");
 }
 
-#[tokio::test]
-async fn oracle_three_term_and_singleton_match() {
+#[test]
+fn oracle_three_term_and_singleton_match() {
     // "rust" + "async" + "tokio" intersect only at doc 0 (segment 0).
     let f = &*STANDARD_FIXTURE;
-    let inf_hits =
-        supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust async tokio", 10, CHUNK_SIZE);
     assert_eq!(inf_hits, vec![0u64], "got {inf_hits:?}");
 }
 
-#[tokio::test]
-async fn oracle_and_missing_term_returns_empty() {
+#[test]
+fn oracle_and_missing_term_returns_empty() {
     // A globally absent term must short-circuit AND to empty even
     // when the other term has many hits.
     let f = &*STANDARD_FIXTURE;
     let inf_hits =
-        supertable_search_and_global(&f.infino, "rust definitelynotpresent", 10, CHUNK_SIZE).await;
+        supertable_search_and_global(&f.infino, "rust definitelynotpresent", 10, CHUNK_SIZE);
     assert!(inf_hits.is_empty(), "got {inf_hits:?}");
 }
 
-#[tokio::test]
-async fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
+#[test]
+fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
     // "rust" + "kafka" — "rust" appears in every segment, but
     // "kafka" only appears in doc 15 (segment 1) where "rust" does
     // not co-occur. The intersection is empty across the whole
@@ -453,7 +439,7 @@ async fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
     // term contribute nothing and segments without the missing term
     // also contribute nothing.
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_and_global(&f.infino, "rust kafka", 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_and_global(&f.infino, "rust kafka", 10, CHUNK_SIZE);
     let ora_hits = brute_force_and_top_k(&f.oracles, "rust kafka", 10);
     assert!(
         inf_hits.is_empty(),
@@ -467,8 +453,8 @@ async fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
 
 // ---- Tests: prefix-row exercise ---------------------------------------
 
-#[tokio::test]
-async fn oracle_prefix_query_matches_explicit_term_or() {
+#[test]
+fn oracle_prefix_query_matches_explicit_term_or() {
     // The supertable expands `alphafox` via per-segment FST walk,
     // then runs a per-segment OR over the expansion. Mirror this
     // by running a brute-force OR over the same explicit term list.
@@ -478,7 +464,7 @@ async fn oracle_prefix_query_matches_explicit_term_or() {
         .map(|i| format!("alphafox{i:02}"))
         .collect();
 
-    let inf_hits = supertable_prefix_global(&f.infino, prefix, 10, CHUNK_SIZE).await;
+    let inf_hits = supertable_prefix_global(&f.infino, prefix, 10, CHUNK_SIZE);
     let ora_hits = brute_force_terms_top_k(&f.oracles, &expanded, 10);
 
     let want: HashSet<u64> = [14u64, 29, 44, 59].into_iter().collect();
@@ -488,8 +474,8 @@ async fn oracle_prefix_query_matches_explicit_term_or() {
     assert_eq!(ora_set, want, "oracle explicit-OR hits = {ora_hits:?}");
 }
 
-#[tokio::test]
-async fn prefix_skip_prunes_segments_without_matching_lex_range() {
+#[test]
+fn prefix_skip_prunes_segments_without_matching_lex_range() {
     // Plant a prefix term in only one segment; verify the prefix
     // search returns exactly that doc and skip pruning prevents
     // other superfiles from contributing.
@@ -500,9 +486,8 @@ async fn prefix_skip_prunes_segments_without_matching_lex_range() {
     corp[0].1.push_str(" quokka_unique");
     let infino = build_supertable(&corp, SEGMENTS);
     let r = infino.reader();
-    let hits = r
+    let hits = infino
         .bm25_search_prefix("title", "quokka", 5)
-        .await
         .expect("prefix");
     assert_eq!(hits.len(), 1);
     let manifest = r.manifest();
@@ -513,10 +498,10 @@ async fn prefix_skip_prunes_segments_without_matching_lex_range() {
 
 // ---- Tests: empty + no-match ----------------------------------------
 
-#[tokio::test]
-async fn oracle_no_match_returns_empty() {
+#[test]
+fn oracle_no_match_returns_empty() {
     let f = &*STANDARD_FIXTURE;
-    let inf_hits = supertable_search_global(&f.infino, "definitelynotpresent", 5, CHUNK_SIZE).await;
+    let inf_hits = supertable_search_global(&f.infino, "definitelynotpresent", 5, CHUNK_SIZE);
     let ora_hits = brute_force_top_k(&f.oracles, "definitelynotpresent", 5);
     assert!(inf_hits.is_empty());
     assert!(ora_hits.is_empty());
@@ -559,8 +544,8 @@ fn zipfian_corpus(n_docs: usize, seed: u64) -> Vec<(u64, String)> {
     out
 }
 
-#[tokio::test]
-async fn oracle_zipfian_corpus_query_shapes_match() {
+#[test]
+fn oracle_zipfian_corpus_query_shapes_match() {
     // 5K docs × 4 superfiles = 1250 docs/segment. Brute-force across
     // segments is the exact same scoring path the supertable runs
     // (per-segment IDF + global top-k merge with identical
@@ -585,7 +570,7 @@ async fn oracle_zipfian_corpus_query_shapes_match() {
     ];
 
     for (label, q) in queries {
-        let inf = supertable_search_global(&infino, q, k, n_docs / SEGMENTS).await;
+        let inf = supertable_search_global(&infino, q, k, n_docs / SEGMENTS);
         let ora = brute_force_top_k(&oracles, q, k);
         let inf_set: HashSet<u64> = inf.iter().copied().collect();
         let ora_set: HashSet<u64> = ora.iter().copied().collect();

@@ -93,7 +93,7 @@ impl VectorConfig {
 /// the on-disk path. 256 MiB is a constant — independent of
 /// reservoir size or `n_cent` — so the worst-case pre-flush
 /// resident moment (`reservoir + spill_threshold`) stays linear
-/// in reservoir only and never compounds. Plan 010 design § "spill_threshold_bytes default".
+/// in reservoir only and never compounds. design § "spill_threshold_bytes default".
 const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Per-column build-time state. After 010 M3, the column holds
@@ -407,7 +407,7 @@ impl VectorBuilder {
 
     /// Streaming variant: write the final blob progressively to
     /// `w` without materialising it as a contiguous `Vec<u8>`.
-    /// Plan 010 M5.
+    /// M5.
     ///
     /// The output bytes (outer header, directory + dir CRC, each
     /// subsection, trailing outer CRC) are identical to those
@@ -816,7 +816,7 @@ fn build_subsection_streaming(
 
     // ---- Pass 3: stream buckets into the final subsection bytes ----
     //
-    // Plan 013 layout with main's streaming assembly: allocate the
+    // layout with main's streaming assembly: allocate the
     // subsection up front, write the open-time region, then per-
     // cluster bulk-read each bucket into `[codes_chunk | doc_ids_chunk
     // | full_chunk]` without a `full_layout` staging buffer.
@@ -827,13 +827,12 @@ fn build_subsection_streaming(
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
 
     // 6. Build the subsection bytes.
-    //    Plan 013 M1 subsection layout
+    //    subsection layout
     //    (see `format::vec::SUBSECTION_VERSION` for the spec):
     //
     //      [sub_header]
     //      [summary_centroid][centroids][cluster_idx][codec_meta]   ← open-time region
-    //      [per-cluster blocks: each = codes_chunk + doc_ids_chunk]
-    //      [full]                                                   ← rerank column
+    //      [per-cluster blocks: each = codes_chunk + doc_ids_chunk + full_chunk]
     //      [crc]
     //
     //    Two wins fold into this single layout:
@@ -841,22 +840,25 @@ fn build_subsection_streaming(
     //          so one range fetch covers everything search needs
     //          before picking a cluster (~1.5 MB at 1M × 384 sq8,
     //          16 MB at 10M × 1024 sq8).
-    //      (b) per-cluster `codes + doc_ids` interleave so each
-    //          probed cluster GET pulls both in one range.
+    //      (b) per-cluster `codes + doc_ids + full` interleave so
+    //          each probed cluster GET pulls all search-time bytes
+    //          in one range. `codes_chunk` is the 1-bit RaBitQ
+    //          estimate-code bytes; `full_chunk` is the optional
+    //          Fp32/Sq8 rerank payload for the same docs.
     //
     //    New-service-only — there are no pre-013 segments to
     //    keep readable.
     //
     //    Codec-specific shape:
-    //      Fp32: empty codec_meta; full[] is the fp32 buffer
-    //            byte-for-byte.
+    //      Fp32: empty codec_meta; full_chunk stores the fp32
+    //            vectors byte-for-byte inside each cluster block.
     //      Sq8:  codec_meta = `scale[n_cent × dim] +
     //            offset[n_cent × dim] + (per-doc norms[n_docs]
-    //            for L2Sq)`. full[] is n_docs × dim u8 codes
-    //            encoded against each doc's cluster quantizer.
+    //            for L2Sq)`. full_chunk stores dim u8 codes per
+    //            doc, encoded against that doc's cluster quantizer.
     //            ~4× smaller than Fp32; recall stays > 0.99 at
     //            default rerank_mult.
-    //      None: empty codec_meta; empty full[]. Subsection
+    //      None: empty codec_meta; empty full_chunk. Subsection
     //            collapses to summary + centroids + cluster_idx
     //            + per-cluster blocks — the 1-bit shortlist's
     //            top-K is the final answer.
@@ -944,8 +946,7 @@ fn build_subsection_streaming(
     };
 
     if sq8_family {
-        for cid in 0..n_cent {
-            let (scale_c, offset_c) = &sq8_quantizers[cid];
+        for (cid, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate().take(n_cent) {
             let sc_off = sq8_scale_block_off + cid * dim * 4;
             bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
             let oc_off = sq8_offset_block_off + cid * dim * 4;
@@ -1244,7 +1245,7 @@ fn run_pass2(
         // amortises to ~one syscall per 64 KiB / 1 588 B ≈ 41
         // rows at dim=384), not by the in-process loop body.
         //
-        // Plan 012 M4: for `RerankCodec::RabitqOnly` we skip the per-row
+        // for `RerankCodec::RabitqOnly` we skip the per-row
         // fp32 vector write entirely — pass 3 doesn't materialise
         // `full_layout` for that codec, and the on-disk segment
         // has no `full[]` region, so spilling the vectors to a
@@ -1556,11 +1557,9 @@ mod tests {
             let query = &corpus[q * dim..(q + 1) * dim];
             let top_ram = r_ram
                 .search("v", query, 1, nprobe, rerank_mult)
-                .await
                 .expect("search ram");
             let top_spill = r_spill
                 .search("v", query, 1, nprobe, rerank_mult)
-                .await
                 .expect("search spill");
             // Both paths must return self as top-1 — that's the
             // strict recall invariant, independent of the
@@ -1694,7 +1693,6 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.13).sin()).collect();
         let hits = reader
             .search("v", &query, 5, n_cent, n_docs + 1)
-            .await
             .expect("kNN search");
         assert!(!hits.is_empty(), "search returned no hits");
     }

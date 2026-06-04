@@ -69,7 +69,7 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(1);
-    let producer = Supertable::create(opts);
+    let producer = Supertable::create(opts).expect("create");
 
     // Each commit's batch uses a distinct vocabulary so the
     // list-level bloom-union skip can route an exact-term
@@ -88,8 +88,8 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bm25_exact_term_loads_only_the_matching_part() {
+#[test]
+fn bm25_exact_term_loads_only_the_matching_part() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
@@ -107,7 +107,6 @@ async fn bm25_exact_term_loads_only_the_matching_part() {
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     // Pre-condition: nothing loaded.
@@ -134,9 +133,7 @@ async fn bm25_exact_term_loads_only_the_matching_part() {
     // four parts; we expect exactly one part loaded post-
     // query.
     let hits = consumer
-        .reader()
         .bm25_search("title", "echo", 10, BoolMode::Or)
-        .await
         .expect("bm25");
     assert!(
         !hits.is_empty(),
@@ -163,8 +160,8 @@ async fn bm25_exact_term_loads_only_the_matching_part() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bm25_term_in_no_part_loads_nothing() {
+#[test]
+fn bm25_term_in_no_part_loads_nothing() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
@@ -178,7 +175,6 @@ async fn bm25_term_in_no_part_loads_nothing() {
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     // 'zoo' is not in any commit's vocabulary. The bloom-
@@ -186,9 +182,7 @@ async fn bm25_term_in_no_part_loads_nothing() {
     // zero parts loaded (other than what the bloom test
     // already rejected without needing the part bytes).
     let hits = consumer
-        .reader()
         .bm25_search("title", "zoo", 10, BoolMode::Or)
-        .await
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
     // up non-empty if any bloom collides on 'zoo' — but
@@ -220,8 +214,8 @@ async fn bm25_term_in_no_part_loads_nothing() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bm25_prefix_with_narrow_prefix_loads_one_part() {
+#[test]
+fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
@@ -235,15 +229,12 @@ async fn bm25_prefix_with_narrow_prefix_loads_one_part() {
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     // Prefix "echo" — appears only in part #2. Term-range
     // union should route the prefix to one part.
     let hits = consumer
-        .reader()
         .bm25_search_prefix("title", "ech", 10)
-        .await
         .expect("prefix");
     assert!(
         !hits.is_empty(),
@@ -274,8 +265,8 @@ async fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sql_loads_all_parts_returns_correct_count() {
+#[test]
+fn sql_loads_all_parts_returns_correct_count() {
     // SQL list-prune is deferred (DataFusion pushdown
     // through MemTable requires a custom TableProvider).
     // M15c's SQL path loads all parts and returns correct
@@ -295,7 +286,6 @@ async fn sql_loads_all_parts_returns_correct_count() {
             .with_eager_load_threshold(0)
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     // 5 commits × 2 rows/commit = 10 rows total.
@@ -331,8 +321,8 @@ async fn sql_loads_all_parts_returns_correct_count() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn eager_mode_query_paths_observationally_unchanged() {
+#[test]
+fn eager_mode_query_paths_observationally_unchanged() {
     // 1 part + default threshold (4) → eager mode. All
     // query paths return the same results they did pre-
     // M15c, and the OnceCell is populated from open (not
@@ -342,7 +332,8 @@ async fn eager_mode_query_paths_observationally_unchanged() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -356,7 +347,6 @@ async fn eager_mode_query_paths_observationally_unchanged() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     // Eager: 1 part loaded at open.
@@ -375,9 +365,7 @@ async fn eager_mode_query_paths_observationally_unchanged() {
 
     // BM25 hits.
     let hits = consumer
-        .reader()
         .bm25_search("title", "alpha", 10, BoolMode::Or)
-        .await
         .expect("bm25");
     assert!(!hits.is_empty());
 

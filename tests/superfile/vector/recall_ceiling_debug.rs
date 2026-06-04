@@ -116,15 +116,8 @@ fn open_reader_from_blob(blob: Vec<u8>) -> VectorReader {
         corpus::DIM,
         n_cent
     );
-    VectorReader::open_with(
-        Bytes::from(blob),
-        &json,
-        OpenOptions {
-            verify_crc: true,
-            ..OpenOptions::default()
-        },
-    )
-    .expect("open reader")
+    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
+        .expect("open reader")
 }
 
 fn build_reader(vectors: &[f32], codec: RerankCodec) -> VectorReader {
@@ -140,7 +133,6 @@ async fn search_async(
 ) -> Vec<(u32, f32)> {
     reader
         .search("v", query, k, nprobe, rerank_mult)
-        .await
         .expect("search")
 }
 
@@ -235,10 +227,10 @@ fn build_local_householder_sq8(vectors: &[f32], layout: &IvfLayout) -> LocalHous
             let doc_id = layout.doc_ids_by_pos[pos] as usize;
             let row = &vectors[doc_id * dim..(doc_id + 1) * dim];
             apply_householder(hv, beta, row, &mut y);
-            for d in 0..dim {
+            for (d, &yd) in y.iter().enumerate().take(dim) {
                 let idx = c * dim + d;
-                mins[idx] = mins[idx].min(y[d]);
-                maxs[idx] = maxs[idx].max(y[d]);
+                mins[idx] = mins[idx].min(yd);
+                maxs[idx] = maxs[idx].max(yd);
             }
         }
     }
@@ -381,10 +373,10 @@ fn build_least_squares_sq8(vectors: &[f32], layout: &IvfLayout) -> LeastSquaresS
         for pos in off as usize..(off + cnt) as usize {
             let doc_id = layout.doc_ids_by_pos[pos] as usize;
             let row = &vectors[doc_id * dim..(doc_id + 1) * dim];
-            for d in 0..dim {
+            for (d, &rd) in row.iter().enumerate().take(dim) {
                 let idx = c * dim + d;
-                min_v[idx] = min_v[idx].min(row[d]);
-                max_v[idx] = max_v[idx].max(row[d]);
+                min_v[idx] = min_v[idx].min(rd);
+                max_v[idx] = max_v[idx].max(rd);
             }
         }
     }
@@ -594,10 +586,10 @@ fn build_block_hadamard_sq8<const B: usize>(
             let doc_id = layout.doc_ids_by_pos[pos] as usize;
             let row = &vectors[doc_id * dim..(doc_id + 1) * dim];
             apply_block_hadamard::<B>(row, &mut y, seed);
-            for d in 0..dim {
+            for (d, &yd) in y.iter().enumerate().take(dim) {
                 let idx = c * dim + d;
-                min_v[idx] = min_v[idx].min(y[d]);
-                max_v[idx] = max_v[idx].max(y[d]);
+                min_v[idx] = min_v[idx].min(yd);
+                max_v[idx] = max_v[idx].max(yd);
             }
         }
     }
@@ -721,9 +713,9 @@ fn build_clipped_sigma_sq8(vectors: &[f32], layout: &IvfLayout, sigma: f32) -> C
         for pos in off as usize..(off + cnt) as usize {
             let doc_id = layout.doc_ids_by_pos[pos] as usize;
             let row = &vectors[doc_id * dim..(doc_id + 1) * dim];
-            for d in 0..dim {
+            for (d, &rd) in row.iter().enumerate().take(dim) {
                 let idx = c * dim + d;
-                let x = row[d] as f64;
+                let x = rd as f64;
                 count[idx] += 1;
                 sum[idx] += x;
                 sum_sq[idx] += x * x;
@@ -840,10 +832,10 @@ fn print_quant_error_proxy(vectors: &[f32]) {
     for i in 0..N_DOCS {
         let c = i % n_cent;
         let row = &vectors[i * dim..(i + 1) * dim];
-        for d in 0..dim {
+        for (d, &rd) in row.iter().enumerate().take(dim) {
             let idx = c * dim + d;
-            min_v[idx] = min_v[idx].min(row[d]);
-            max_v[idx] = max_v[idx].max(row[d]);
+            min_v[idx] = min_v[idx].min(rd);
+            max_v[idx] = max_v[idx].max(rd);
         }
     }
 
@@ -859,8 +851,8 @@ fn print_quant_error_proxy(vectors: &[f32]) {
     for i in 0..N_DOCS {
         let c = i % n_cent;
         let row = &vectors[i * dim..(i + 1) * dim];
-        for d in 0..dim {
-            let x = row[d];
+        for (d, &rd) in row.iter().enumerate().take(dim) {
+            let x = rd;
             let xb = bf16_to_f32_debug(fp32_to_bf16_debug(x));
             let be = (xb - x).abs();
             bf16_sum_abs += be as f64;
@@ -1513,10 +1505,10 @@ fn build_sq8_sidecar_by_doc(vectors: &[f32], layout: &IvfLayout) -> Sq8Sidecar {
         for pos in off as usize..(off + cnt) as usize {
             let doc_id = layout.doc_ids_by_pos[pos] as usize;
             let row = &vectors[doc_id * dim..(doc_id + 1) * dim];
-            for d in 0..dim {
+            for (d, &rd) in row.iter().enumerate().take(dim) {
                 let idx = c * dim + d;
-                mins[idx] = mins[idx].min(row[d]);
-                maxs[idx] = maxs[idx].max(row[d]);
+                mins[idx] = mins[idx].min(rd);
+                maxs[idx] = maxs[idx].max(rd);
             }
         }
     }

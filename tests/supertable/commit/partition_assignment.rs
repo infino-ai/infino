@@ -60,7 +60,8 @@ fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     for _i in 0..3 {
         let mut w = st.writer().expect("writer");
@@ -97,7 +98,8 @@ fn rewrite_path_produces_fresh_part_id_per_commit() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     let mut part_ids = Vec::new();
     for _i in 0..3 {
@@ -132,7 +134,7 @@ fn target_superfiles_per_partition_triggers_part_split() {
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(2);
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
 
     for _i in 0..3 {
         let mut w = st.writer().expect("writer");
@@ -174,7 +176,7 @@ fn hash_strategy_with_multiple_buckets_errors_without_partition_hint() {
             column: "doc_id".into(),
             n_buckets: 4,
         });
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha"])).expect("append");
@@ -206,7 +208,7 @@ fn time_range_strategy_on_unsupported_column_type_errors_cleanly() {
             column: "_id".into(),
             granularity_secs: 86_400,
         });
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
 
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha"])).expect("append");
@@ -260,7 +262,7 @@ fn time_range_assigns_int64_segments_to_bucket_zero() {
         granularity_secs: 86_400,
     });
 
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
     // All ts values land within day-0 (epoch seconds 0..86400).
     let batch = arrow_array::RecordBatch::try_new(
         schema,
@@ -334,7 +336,7 @@ fn time_range_segment_spanning_two_buckets_errors() {
         granularity_secs: 86_400,
     });
 
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
     // ts values in [10, 86_500] → spans day 0 and day 1.
     let batch = arrow_array::RecordBatch::try_new(
         schema,

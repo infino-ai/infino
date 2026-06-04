@@ -76,7 +76,7 @@ fn build_batch(start: u64, n: usize) -> RecordBatch {
 
 #[test]
 fn reader_pinned_before_writer_starts_never_sees_commits() {
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     // Pin BEFORE any commit; capture the snapshot.
     let pinned = st.reader();
     assert_eq!(pinned.manifest_id(), 0);
@@ -127,7 +127,7 @@ fn reader_pinned_before_writer_starts_never_sees_commits() {
 
 #[test]
 fn reader_obtained_after_writer_finishes_sees_full_state() {
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     let mut w = st.writer().expect("writer");
     for i in 0..3u64 {
         w.append(&build_batch(i * 10, 4)).expect("append");
@@ -143,7 +143,7 @@ fn reader_obtained_after_writer_finishes_sees_full_state() {
 
 #[test]
 fn pinned_reader_holds_arc_across_subsequent_commits() {
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     let mut w = st.writer().expect("writer");
     w.append(&build_batch(0, 2)).expect("a1");
     w.commit().expect("c1");
@@ -173,7 +173,7 @@ fn pinned_reader_holds_arc_across_subsequent_commits() {
 
 #[test]
 fn concurrent_readers_at_same_commit_share_arc_pointer() {
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     let mut w = st.writer().expect("writer");
     w.append(&build_batch(0, 5)).expect("a1");
     w.commit().expect("c1");
@@ -212,7 +212,7 @@ fn manifest_id_monotonic_across_serially_pinned_readers() {
     // Sanity: between commits, fresh readers see successively
     // higher manifest_ids. Single-threaded; this is the baseline
     // invariant the concurrent tests build on.
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     let mut w = st.writer().expect("writer");
     let mut observed: Vec<u64> = Vec::new();
     observed.push(st.reader().manifest_id());
@@ -237,7 +237,7 @@ fn many_concurrent_readers_during_writer_commits_no_inconsistencies() {
     // pins, samples (manifest_id, n_superfiles) twice with a gap,
     // and asserts the pair is unchanged across the hold (the
     // load-bearing snapshot-stability guarantee).
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     let n_commits = 50u64;
     let n_readers = 16usize;
     let pins_per_reader = 200usize;
@@ -312,7 +312,7 @@ fn fresh_reader_sequence_taken_during_concurrent_commits_is_monotonic() {
     // non-decreasing. (ArcSwap::load_full is monotone with
     // respect to ArcSwap::store under happens-before; this test
     // smoke-checks that under realistic interleaving.)
-    let st = Supertable::create(options());
+    let st = Supertable::create(options()).expect("create");
     let n_commits = 30u64;
 
     let st_for_writer = st.clone();

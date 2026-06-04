@@ -257,7 +257,7 @@ impl ManifestPartLoader {
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
-        let bytes = self
+        let (bytes, _) = self
             .storage
             .get(uri)
             .await
@@ -353,7 +353,7 @@ pub struct SuperfileEntry {
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
     pub partition_hint: Option<u32>,
-    /// Plan 013 M6 — precomputed superfile layout offsets so the
+    /// precomputed superfile layout offsets so the
     /// cold-open path can fire the parquet-footer, vector
     /// subsection, and FTS subsection GETs **in parallel** in a
     /// single round-trip, without first reading the parquet KV
@@ -371,7 +371,7 @@ pub struct SuperfileEntry {
     pub subsection_offsets: Option<SubsectionOffsets>,
 }
 
-/// Plan 013 M6 — superfile layout offsets cached on the manifest.
+/// superfile layout offsets cached on the manifest.
 ///
 /// Knowing these up-front lets the cold-open path issue every
 /// subsection GET in parallel against the same superfile object,
@@ -404,6 +404,24 @@ pub struct SubsectionOffsets {
     /// header+dictionary and doc-length tables. Query-time postings
     /// stay lazy.
     pub fts_open_ranges: Vec<(u64, u64)>,
+    /// the actual bytes covering the segment's
+    /// open-time batch (parquet footer tail + the
+    /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
+    /// in the manifest part.
+    ///
+    /// When non-empty, the cold-fetch path installs these directly
+    /// into the reader's prefetch overlay and issues **zero**
+    /// open-time GETs against the segment object — the bytes
+    /// already arrived in the single part GET that `cold_open`
+    /// performs. The genuine first-touch per-segment cost then
+    /// collapses from 2 RTT-batches (open metadata + cluster
+    /// postings) to 1 (postings only).
+    ///
+    /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
+    /// produced by pre-M7 writers, or when blob capture is disabled
+    /// — the path then falls back to fetching `vec_open_ranges` /
+    /// `fts_open_ranges` over the wire.
+    pub open_blob: Vec<(u64, Vec<u8>)>,
 }
 
 /// Opaque store key — wraps a UUID v4. The segment store treats
@@ -422,20 +440,22 @@ impl SuperfileUri {
     }
 
     /// Object-store / LocalFS path for committed segment bytes.
-    /// Standard `.parquet` suffix — on disk this is valid Parquet
-    /// (row groups + optional embedded FTS/vector blobs + footer).
+    /// `.sf.parquet` double suffix — on disk this is still valid
+    /// Parquet (row groups + optional embedded FTS/vector blobs +
+    /// footer), while the `.sf` marker flags it as a Superfile
+    /// segment without making the file look non-standard.
     pub fn storage_path(self) -> String {
-        format!("data/seg-{}.parquet", self.0)
+        format!("data/seg-{}.sf.parquet", self.0)
     }
 
     /// Disk-cache filename for a promoted segment.
     pub fn cache_filename(self) -> String {
-        format!("seg-{}.parquet", self.0)
+        format!("seg-{}.sf.parquet", self.0)
     }
 
     /// Disk-cache tempfile while a cold fetch is in flight.
     pub fn cache_tmp_filename(self) -> String {
-        format!("seg-{}.parquet.tmp", self.0)
+        format!("seg-{}.sf.parquet.tmp", self.0)
     }
 }
 
@@ -834,10 +854,16 @@ mod tests {
                 }
             }
 
-            async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+            async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
                 self.get_calls.fetch_add(1, Ordering::AcqRel);
                 match self.objects.get(uri) {
-                    Some(b) => Ok(b.clone()),
+                    Some(b) => Ok((
+                        b.clone(),
+                        ObjectMeta {
+                            size: b.len() as u64,
+                            etag: Some("mock-etag".into()),
+                        },
+                    )),
                     None => Err(StorageError::NotFound { uri: uri.into() }),
                 }
             }
@@ -850,7 +876,11 @@ mod tests {
                 Err(permanent(uri, "get_range unimplemented for mock"))
             }
 
-            async fn put_atomic(&self, uri: &str, _bytes: Bytes) -> Result<(), StorageError> {
+            async fn put_atomic(
+                &self,
+                uri: &str,
+                _bytes: Bytes,
+            ) -> Result<Option<String>, StorageError> {
                 Err(permanent(uri, "put_atomic unimplemented for mock"))
             }
 
@@ -859,7 +889,7 @@ mod tests {
                 uri: &str,
                 _bytes: Bytes,
                 _expected_etag: Option<&str>,
-            ) -> Result<(), StorageError> {
+            ) -> Result<Option<String>, StorageError> {
                 Err(permanent(uri, "put_if_match unimplemented for mock"))
             }
 

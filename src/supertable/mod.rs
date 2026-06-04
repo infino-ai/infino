@@ -24,11 +24,14 @@ pub mod error;
 pub mod handle;
 pub mod lazy_source;
 pub mod manifest;
+pub mod mutations;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
 pub mod stats;
+pub mod tombstones;
 pub mod utils;
+pub mod wal;
 pub mod writer;
 
 /// Re-export of [`crate::storage`] under the

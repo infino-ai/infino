@@ -498,7 +498,7 @@ mod tests {
     /// Demo corpus (single segment). `async` is unique to doc 0;
     /// `rust` is in docs 0 + 4. Doc `i`'s vector is one-hot at dim `i`.
     fn demo(dim: usize) -> Supertable {
-        let st = Supertable::create(options_title_emb(dim));
+        let st = Supertable::create(options_title_emb(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         let titles = [
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn hybrid_search_empty_supertable_returns_no_rows() {
         let dim = 16;
-        let st = Supertable::create(options_title_emb(dim));
+        let st = Supertable::create(options_title_emb(dim)).expect("create");
         let batches = st
             .query_sql(&format!(
                 "SELECT _id, score FROM hybrid_search('title', 'rust', 'emb', '{}', 5)",
@@ -847,7 +847,7 @@ mod tests {
     /// Sole-reason witnesses: doc1 dropped only by FTS, doc2 only by the
     /// scalar filter, doc5 only by the vector cutoff.
     fn demo_cat_two_segments(dim: usize) -> Supertable {
-        let st = Supertable::create(options_cat_title_emb(dim));
+        let st = Supertable::create(options_cat_title_emb(dim)).expect("create");
         let schema = st.options().schema.clone();
         // Each writer holds the single-writer lock until dropped, so
         // scope them: seg1's writer must drop before seg2's opens.
@@ -976,7 +976,10 @@ mod tests {
             scores.extend((0..s.len()).map(|i| s.value(i)));
         }
         for w in scores.windows(2) {
-            assert!(w[0] >= w[1], "combined scores must be descending: {scores:?}");
+            assert!(
+                w[0] >= w[1],
+                "combined scores must be descending: {scores:?}"
+            );
         }
     }
 }

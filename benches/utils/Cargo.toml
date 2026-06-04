@@ -12,6 +12,7 @@ path = "mod.rs"
 name = "profile_segment"
 path = "bin/profile_segment.rs"
 
+
 [dependencies]
 arrow-array = "58"
 arrow-schema = "58"

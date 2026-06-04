@@ -71,11 +71,11 @@ impl FstValue {
     /// FST value. The low bit is always 0.
     #[inline]
     pub(crate) fn pack_pfor(metadata_offset: u64, postings_length: u32) -> u64 {
-        debug_assert!(
+        assert!(
             metadata_offset <= PFOR_OFFSET_MAX,
             "metadata_offset {metadata_offset} overflows the {PFOR_OFFSET_BITS}-bit PFOR slot"
         );
-        debug_assert!(
+        assert!(
             postings_length <= PFOR_LENGTH_MAX,
             "postings_length {postings_length} overflows the {PFOR_LENGTH_BITS}-bit PFOR slot"
         );
@@ -86,7 +86,7 @@ impl FstValue {
     /// low bit is always 1.
     #[inline]
     pub(crate) fn pack_inline(doc_id: u32, tf: u32) -> u64 {
-        debug_assert!(
+        assert!(
             tf <= INLINE_TF_MAX,
             "tf {tf} overflows the inline 30-bit slot (max {INLINE_TF_MAX})"
         );
@@ -136,9 +136,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "overflows the inline 30-bit slot")]
-    fn inline_tf_overflow_panics_in_debug() {
+    fn inline_tf_overflow_panics() {
         let _ = FstValue::pack_inline(0, INLINE_TF_MAX + 1);
     }
 

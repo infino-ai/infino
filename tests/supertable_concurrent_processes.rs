@@ -39,8 +39,10 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
-    let st_b = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let st_b = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     // Commit via spawn_blocking — SupertableWriter::commit is
     // sync, and its persist_commit internally detects the
@@ -88,7 +90,6 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
     drop(st_b);
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     assert_eq!(consumer.manifest_id(), 2);
     assert_eq!(
@@ -107,9 +108,12 @@ async fn three_handles_concurrent_commits_all_succeed() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
-    let st_b = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
-    let st_c = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let st_b = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let st_c = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     let t_a = tokio::task::spawn_blocking({
         let st = st_a.clone();
@@ -145,7 +149,6 @@ async fn three_handles_concurrent_commits_all_succeed() {
     drop(st_c);
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     assert_eq!(
         consumer.manifest_id(),
@@ -187,8 +190,10 @@ async fn retry_winner_sees_loser_segments_in_final_manifest() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
-    let st_b = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let st_b = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
 
     let t_a = tokio::task::spawn_blocking({
         let st = st_a.clone();
@@ -240,14 +245,15 @@ async fn retry_winner_sees_loser_segments_in_final_manifest() {
 /// hitting contention. Sanity check that the M11 path
 /// degenerates cleanly to the M10 non-contended case when no
 /// race occurs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequential_commits_across_handles_no_retry_needed() {
+#[test]
+fn sequential_commits_across_handles_no_retry_needed() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     // Handle A commits first.
-    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+    let st_a = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
     {
         let mut w = st_a.writer().expect("writer A");
         w.append(&build_title_batch(&["first"])).expect("append A");
@@ -258,7 +264,6 @@ async fn sequential_commits_across_handles_no_retry_needed() {
 
     // Handle B opens (sees A's state), then commits.
     let st_b = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
         .expect("open B");
     assert_eq!(st_b.manifest_id(), 1, "B opens at A's last manifest_id");
     {
@@ -311,12 +316,14 @@ async fn max_commit_retries_is_plumbed_through_options() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_max_commit_retries(20),
-    );
+    )
+    .expect("create");
     let st_b = Supertable::create(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_max_commit_retries(20),
-    );
+    )
+    .expect("create");
 
     let t_a = tokio::task::spawn_blocking({
         let st = st_a.clone();
@@ -342,7 +349,6 @@ async fn max_commit_retries_is_plumbed_through_options() {
     drop(st_b);
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     assert_eq!(consumer.manifest_id(), 2);
 }

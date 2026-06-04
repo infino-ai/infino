@@ -84,6 +84,11 @@ uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 num_cpus = "1"
 
+# Tombstone bitmaps.
+roaring = "0.10"
+# WAL state-doc timestamps.
+chrono = { version = "0.4", features = ["serde"] }
+
 # Hierarchical config (YAML defaults + file overrides + env). Used by
 # the `config` module; see infino/src/config/mod.rs.
 figment = { version = "0.10", features = ["yaml", "env"] }
@@ -263,11 +268,6 @@ path = "benches/fts/main.rs"
 harness = false
 
 [[bench]]
-name = "fts-superfile"
-path = "benches/fts/main_superfile.rs"
-harness = false
-
-[[bench]]
 name = "superfile_vector"
 path = "benches/vector/main.rs"
 harness = false
@@ -288,4 +288,14 @@ name = "scale"
 path = "benches/scale/main.rs"
 harness = false
 required-features = ["bench-diagnostics"]
+
+[[bench]]
+name = "tombstone-overhead"
+path = "benches/tombstone_overhead/main.rs"
+harness = false
+
+[[bench]]
+name = "supertable-update"
+path = "benches/supertable_update/main.rs"
+harness = false
 

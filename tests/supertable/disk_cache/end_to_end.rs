@@ -61,8 +61,8 @@ fn make_cache(
     DiskCacheStore::new(storage, cfg, pinned_fn).expect("cache")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_process_consumer_routes_reads_through_disk_cache() {
+#[test]
+fn cross_process_consumer_routes_reads_through_disk_cache() {
     let storage_dir = TempDir::new().expect("storage tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
@@ -72,7 +72,8 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     // validating the consumer's read path.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("producer writer");
         w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
             .expect("append");
@@ -85,7 +86,7 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     let consumer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_disk_cache(Arc::clone(&cache));
-    let consumer = Supertable::open(consumer_opts).await.expect("open");
+    let consumer = Supertable::open(consumer_opts).expect("open");
     assert_eq!(consumer.manifest_id(), 1);
 
     // Cache starts cold: zero cold-fetches.
@@ -130,8 +131,8 @@ async fn cross_process_consumer_routes_reads_through_disk_cache() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn producer_with_cache_reads_through_cache_path() {
+#[test]
+fn producer_with_cache_reads_through_cache_path() {
     // The producer commits with both storage AND cache
     // attached. The writer's M14b refactor extracts
     // summaries directly from the segment bytes (no
@@ -150,7 +151,8 @@ async fn producer_with_cache_reads_through_cache_path() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
     let mut w = producer.writer().expect("writer");
     w.append(&build_title_batch(&["alpha"])).expect("append");
     w.commit().expect("commit");
@@ -191,7 +193,8 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     // Pre-commit: cache empty.
     assert_eq!(cache.stats().n_entries, 0);
@@ -251,7 +254,8 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     for _i in 0..3 {
         let mut w = st.writer().expect("writer");
@@ -266,12 +270,13 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
 }
 
 #[test]
-fn manifest_segments_are_auto_pinned_by_supertable_create() {
-    // M14b.1: Supertable::create / Supertable::open install
-    // a Weak<SupertableInner>-based pinned_fn on the
-    // attached cache. The closure returns the current
-    // manifest's segment URI set. Pre-commit: empty.
-    // Post-commit: contains the published segment's URI.
+fn manifest_segments_are_not_pinned_by_supertable_create() {
+    // The cache must be free to evict any segment to stay under
+    // budget. Pinning the live manifest makes the whole index
+    // required to fit in cache: once all resident entries are pinned,
+    // the next admit can fail with BudgetExceeded. Supertable::create
+    // therefore installs a pin callback that does not pin manifest
+    // segments.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -282,10 +287,10 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
-    // Before any commit: empty segment list → empty pinned
-    // set.
+    // Before any commit: nothing pinned.
     let pre = cache.current_pinned_uris();
     assert!(pre.is_empty(), "expected empty pinned set; got {pre:?}");
 
@@ -297,29 +302,21 @@ fn manifest_segments_are_auto_pinned_by_supertable_create() {
         w.commit().expect("commit");
     }
 
-    // Pinned set must now contain the committed segment's
-    // URI.
+    // Post-commit: the manifest has one segment, but the cache still
+    // pins nothing. Eviction protection is not based on the live
+    // manifest set.
     let post = cache.current_pinned_uris();
-    assert_eq!(post.len(), 1, "expected 1 pinned URI; got {post:?}");
+    assert!(post.is_empty(), "expected empty pinned set; got {post:?}");
     let reader = st.reader();
-    let segment_uri = reader
-        .manifest()
-        .superfile_list
-        .superfiles
-        .first()
-        .expect("segment exists")
-        .uri;
-    assert!(
-        post.contains(&segment_uri),
-        "pinned set must contain committed segment {segment_uri:?}; got {post:?}"
-    );
+    assert_eq!(reader.manifest().superfile_list.superfiles.len(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manifest_segments_are_auto_pinned_by_supertable_open() {
-    // The auto-pinning path runs from Supertable::open
-    // too — important because the cross-process consumer
-    // wires the cache + supertable in open, not in create.
+#[test]
+fn manifest_segments_are_not_pinned_by_supertable_open() {
+    // Supertable::open follows the same cache policy as create: the
+    // live manifest does not pin segment files. A cross-process
+    // consumer can stream an index larger than cache budget instead
+    // of making every manifest segment ineligible for eviction.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
@@ -327,7 +324,8 @@ async fn manifest_segments_are_auto_pinned_by_supertable_open() {
     // Producer (no cache attached): commit + drop.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["from producer"]))
             .expect("append");
@@ -342,30 +340,23 @@ async fn manifest_segments_are_auto_pinned_by_supertable_open() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
 
     let pinned = cache.current_pinned_uris();
-    assert_eq!(pinned.len(), 1);
-    let segment_uri = consumer
-        .reader()
-        .manifest()
-        .superfile_list
-        .superfiles
-        .first()
-        .expect("segment exists")
-        .uri;
-    assert!(pinned.contains(&segment_uri));
+    assert!(
+        pinned.is_empty(),
+        "expected empty pinned set; got {pinned:?}"
+    );
+    let n_segments = consumer.reader().manifest().superfile_list.superfiles.len();
+    assert_eq!(n_segments, 1);
 }
 
 #[test]
-fn pinned_fn_releases_via_weak_when_supertable_drops() {
-    // Cache outliving its supertable is supported: the
-    // Weak<SupertableInner>-based closure detects the drop
-    // (via Weak::upgrade returning None) and falls through
-    // to the empty pinned set. Eviction then treats every
-    // entry as evictable. This is the "no leak via cache
-    // holding inner alive" property.
+fn pinned_fn_does_not_hold_supertable_alive() {
+    // Cache outliving its supertable is supported: the installed
+    // callback must not keep the supertable alive. The current policy
+    // pins no manifest segments, so the observable set is empty both
+    // before and after drop.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -377,16 +368,16 @@ fn pinned_fn_releases_via_weak_when_supertable_drops() {
             default_supertable_options()
                 .with_storage(Arc::clone(&storage))
                 .with_disk_cache(Arc::clone(&cache)),
-        );
+        )
+        .expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["temp"])).expect("append");
         w.commit().expect("commit");
-        assert_eq!(cache.current_pinned_uris().len(), 1);
+        assert!(cache.current_pinned_uris().is_empty());
         // st drops at end of scope.
     }
 
-    // Supertable dropped → Weak::upgrade returns None → pinned
-    // set is empty. Cache survives without the supertable.
+    // Supertable dropped; cache survives without pinning anything.
     assert!(
         cache.current_pinned_uris().is_empty(),
         "pinned set must be empty after supertable drops"
@@ -413,7 +404,8 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache))
             .with_memory_budget(1),
-    );
+    )
+    .expect("create");
 
     let before = cache.stats().n_madvise_calls;
 
@@ -453,7 +445,8 @@ fn memory_budget_unset_does_not_force_sweep() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
-    );
+    )
+    .expect("create");
 
     let before = cache.stats().n_madvise_calls;
 
@@ -482,7 +475,7 @@ fn no_cache_path_still_uses_in_memory_store() {
     // broader test suite, but reasserted here so a future
     // refactor that accidentally engages the cache plumbing
     // unconditionally is caught.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["only"])).expect("append");
     w.commit().expect("commit");

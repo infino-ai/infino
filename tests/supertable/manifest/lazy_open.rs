@@ -28,8 +28,8 @@ use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_part_eager_fetches_under_default_threshold() {
+#[test]
+fn one_part_eager_fetches_under_default_threshold() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -37,7 +37,8 @@ async fn one_part_eager_fetches_under_default_threshold() {
     // Producer: 1 commit → 1 part.
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["alpha"])).expect("append");
         w.commit().expect("commit");
@@ -47,7 +48,6 @@ async fn one_part_eager_fetches_under_default_threshold() {
     // manifest → eager-fetch.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
 
     let r = consumer.reader();
@@ -67,8 +67,8 @@ async fn one_part_eager_fetches_under_default_threshold() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn many_parts_skip_eager_fetch() {
+#[test]
+fn many_parts_skip_eager_fetch() {
     // target_superfiles_per_partition=1 + 5 single-segment
     // commits → 5 list entries, all sharing the same
     // partition_key (the M15a split path). With default
@@ -80,7 +80,7 @@ async fn many_parts_skip_eager_fetch() {
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(1);
-    let producer = Supertable::create(producer_opts);
+    let producer = Supertable::create(producer_opts).expect("create");
     for _i in 0..5 {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
@@ -92,7 +92,6 @@ async fn many_parts_skip_eager_fetch() {
     // lazy mode.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
@@ -136,7 +135,7 @@ async fn manifest_part_lazy_loads_on_first_access() {
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_target_superfiles_per_partition(1);
-    let producer = Supertable::create(producer_opts);
+    let producer = Supertable::create(producer_opts).expect("create");
     for _i in 0..5 {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
@@ -146,7 +145,6 @@ async fn manifest_part_lazy_loads_on_first_access() {
 
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
@@ -202,8 +200,8 @@ async fn manifest_part_lazy_loads_on_first_access() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
+#[test]
+fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
     // Even a 1-part manifest goes lazy when threshold=0.
     // Useful for tests that want to exercise the lazy path
     // without producing many parts.
@@ -213,7 +211,8 @@ async fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
 
     {
         let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
@@ -224,7 +223,6 @@ async fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
             .with_storage(Arc::clone(&storage))
             .with_eager_load_threshold(0),
     )
-    .await
     .expect("open");
     let r = consumer.reader();
     let m = r.manifest();

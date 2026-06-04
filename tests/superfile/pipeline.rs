@@ -154,15 +154,7 @@ async fn end_to_end_vector_search_recovers_self() {
     q[4] = 0.1;
     normalize(&mut q);
     let hits = r
-        .vector_search(
-            "emb",
-            &q,
-            1,
-            VectorSearchOptions::new()
-                .with_nprobe(4)
-                .with_rerank_mult(5),
-        )
-        .await
+        .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
         .expect("vector search");
     assert_eq!(hits[0].0, 4, "self-query should recover doc 4");
 }

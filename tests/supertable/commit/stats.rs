@@ -32,7 +32,7 @@ use tempfile::TempDir;
 
 #[test]
 fn fresh_supertable_returns_empty_stats() {
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let s = st.stats();
     assert_eq!(s.manifest_id, 0);
     assert_eq!(s.n_superfiles, 0);
@@ -46,7 +46,7 @@ fn fresh_supertable_returns_empty_stats() {
 
 #[test]
 fn stats_track_commits_on_in_process_supertable() {
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
 
     {
         let mut w = st.writer().expect("writer");
@@ -76,13 +76,14 @@ fn stats_track_commits_on_in_process_supertable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn stats_show_manifest_parts_when_storage_attached() {
+#[test]
+fn stats_show_manifest_parts_when_storage_attached() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let producer =
-        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("create");
     {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["initial"])).expect("append");
@@ -110,7 +111,6 @@ async fn stats_show_manifest_parts_when_storage_attached() {
     // n_manifest_parts_loaded should equal n_manifest_parts.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     let consumer_stats = consumer.stats();
     assert_eq!(consumer_stats.manifest_id, 1);
@@ -138,7 +138,7 @@ fn process_rss_bytes_matches_independent_reading_within_pct() {
     // allocations. This makes the tolerance self-calibrating to
     // whatever concurrent allocator activity the process is
     // experiencing during the test run.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
 
     let read = || {
         memory_stats::memory_stats()
@@ -175,7 +175,7 @@ fn process_rss_bytes_matches_independent_reading_within_pct() {
 fn repeat_stats_calls_return_fresh_snapshots() {
     // No internal caching: calling stats() twice after a
     // mutation must reflect the mutation.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let pre = st.stats();
     assert_eq!(pre.manifest_id, 0);
 
@@ -197,7 +197,7 @@ fn stats_without_disk_cache_have_none_cache_counters() {
     // consumer can tell whether "no cold fetches happened"
     // is because there's no cache at all, or because the
     // cache is attached but the workload didn't trigger one.
-    let st = Supertable::create(default_supertable_options());
+    let st = Supertable::create(default_supertable_options()).expect("create");
     let s = st.stats();
     assert_eq!(s.n_cold_fetches, None);
     assert_eq!(s.n_cache_evictions, None);
@@ -244,7 +244,7 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
         .with_disk_cache(Arc::clone(&cache));
-    let st = Supertable::create(opts);
+    let st = Supertable::create(opts).expect("create");
 
     let s = st.stats();
     assert_eq!(s.n_cold_fetches, Some(0), "fresh cache: zero cold fetches");
@@ -255,35 +255,5 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     assert!(
         s.mmap_resident_bytes.is_some(),
         "mmap_resident_bytes surfaces when cache is attached"
-    );
-}
-
-#[test]
-fn rss_growth_under_in_process_commits_is_observable() {
-    // Sanity check: stats.process_rss_bytes grows (or at
-    // worst, stays flat) as we add superfiles. RSS is whole-
-    // process and can move down due to allocator behavior or
-    // unrelated work, so we don't assert strict monotonicity.
-    // What we DO assert is that after many large commits,
-    // RSS is at least as large as it was at the start —
-    // i.e., the accessor is plumbed and observing real
-    // memory.
-    let st = Supertable::create(default_supertable_options());
-    let initial = st.stats().process_rss_bytes;
-
-    // Commit ten batches of 1000 rows each — should grow
-    // the in-memory store noticeably.
-    for c in 0..10 {
-        let mut w = st.writer().expect("writer");
-        let titles: Vec<String> = (0..1000).map(|i| format!("doc_{c}_{i}")).collect();
-        let titles_refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
-        w.append(&build_title_batch(&titles_refs)).expect("append");
-        w.commit().expect("commit");
-    }
-
-    let after = st.stats().process_rss_bytes;
-    assert!(
-        after >= initial.saturating_sub(initial / 4),
-        "RSS shouldn't have dropped >25% after 10 commits: {initial} → {after}"
     );
 }

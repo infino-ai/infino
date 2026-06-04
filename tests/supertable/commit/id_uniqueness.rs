@@ -3,7 +3,7 @@
 //!
 //! The supertable injects a 128-bit Snowflake-shaped id on
 //! every `append()` via
-//! `utils::idgen::IdGenerator`. Each `Supertable::create()` /
+//! `utils::idgen::IdGenerator`. Each `Supertable::create().expect("create")` /
 //! `::open()` constructs a fresh generator with a 40-bit
 //! random worker_id; no coordination across supertables. This
 //! file validates that property under two stress shapes:
@@ -124,7 +124,8 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     for handle_idx in 0..N_HANDLES {
         let storage = Arc::clone(&storage);
         tasks.push(tokio::task::spawn_blocking(move || {
-            let st = Supertable::create(default_supertable_options().with_storage(storage));
+            let st = Supertable::create(default_supertable_options().with_storage(storage))
+                .expect("create");
             let mut w = st.writer().expect("writer");
             let titles: Vec<String> = (0..ROWS_PER_HANDLE)
                 .map(|i| format!("h{handle_idx}_doc{i}"))
@@ -183,7 +184,6 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache)),
     )
-    .await
     .expect("open");
     let reader = consumer.reader();
     let segs = &reader.manifest().superfile_list.superfiles;

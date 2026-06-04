@@ -88,8 +88,16 @@ async fn open_lazy_via_bytes_source_matches_open() {
     assert_eq!(lazy.fts_columns(), eager.fts_columns());
 
     // FTS terms identical between the two readers.
-    let lazy_terms = lazy.fts().expect("fts").iter_column_terms("title");
-    let eager_terms = eager.fts().expect("fts").iter_column_terms("title");
+    let lazy_terms = lazy
+        .fts()
+        .expect("fts")
+        .iter_column_terms("title")
+        .expect("lazy terms");
+    let eager_terms = eager
+        .fts()
+        .expect("fts")
+        .iter_column_terms("title")
+        .expect("eager terms");
     assert_eq!(lazy_terms, eager_terms);
 }
 
@@ -120,14 +128,14 @@ impl StorageProvider for CountingProxy {
         self.head_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.head(uri).await
     }
-    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         self.inner.get(uri).await
     }
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         self.get_range_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.get_range(uri, range).await
     }
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(uri, bytes).await
     }
     async fn put_if_match(
@@ -135,7 +143,7 @@ impl StorageProvider for CountingProxy {
         uri: &str,
         bytes: Bytes,
         e: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         self.inner.put_if_match(uri, bytes, e).await
     }
     async fn put_multipart(
@@ -157,7 +165,7 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     let bytes = build_test_bytes();
 
     // Seed the segment at a stable URI.
-    let uri = "data/seg-test.parquet";
+    let uri = "data/seg-test.sf.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     // Counting proxy so we can assert the trait is actually
@@ -197,7 +205,7 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
-    let uri = "data/seg-equiv.parquet";
+    let uri = "data/seg-equiv.sf.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let eager = SuperfileReader::open(bytes).expect("eager");
@@ -386,7 +394,7 @@ async fn storage_range_source_out_of_bounds_surfaces_typed_error() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
-    let uri = "data/seg-oob.parquet";
+    let uri = "data/seg-oob.sf.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
     let source = StorageRangeSource::new(Arc::clone(&local), uri)
