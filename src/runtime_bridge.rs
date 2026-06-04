@@ -18,21 +18,12 @@
 //!   bridge; a current-thread runtime serializes that and can't be
 //!   `block_in_place`d. Building one per call also pays a setup cost.
 //! - **Not `multi_thread` with N workers** — the work is await/IO-bound
-//!   (CPU work lives on rayon), so extra OS threads buy nothing.
+//!   (CPU work lives on rayon), so extra OS threads buy nothing. Parallel
+//!   GETs aren't worker-bound anyway: they run on the reactor (remote) or
+//!   the blocking pool (local), with the worker only polling them.
 //! - **`multi_thread` + 1 worker** — a real runtime (so `spawn` and
 //!   `block_in_place` are legal and tasks make progress) at one thread
 //!   of overhead. Revisit only if a CPU-bound async path appears.
-//!
-//! One worker does **not** serialize parallel I/O. A `join_all` over N
-//! storage GETs is single-task *concurrency*, not multi-thread
-//! parallelism — it polls all N futures on one task and never fans them
-//! across workers (no `spawn`), so worker count is irrelevant to it. The
-//! actual GET parallelism lives below the worker pool and is unbounded
-//! by it: `object_store`'s remote backends are reactor-async (one worker
-//! drives many in-flight requests), and the local backend offloads reads
-//! to `spawn_blocking` (the separate blocking-thread pool). The single
-//! worker only bottlenecks CPU-bound *spawned* async tasks — which is
-//! why CPU work stays on rayon.
 //!
 //! ## Two modes
 //!
