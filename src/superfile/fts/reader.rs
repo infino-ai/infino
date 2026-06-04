@@ -181,9 +181,12 @@ impl FtsReader {
         // Prefetch the FST directory ([48..postings_offset], contiguous
         // after the header) so every later `dict_bytes()` resolves from
         // the overlay instead of a fresh GET per search, and the
-        // doc-length tables ([doc_lengths_table_offset..end], the
-        // trailing region) so `open_with_source` builds its BM25 norm
-        // tables without touching the source again.
+        // doc-length tail ([doc_lengths_table_offset..source_len]) so
+        // `open_with_source` builds its BM25 norm tables without
+        // touching the source again. `source_len` is the length of this
+        // FTS subsection, not the whole superfile; the tail starts at
+        // the doc-lengths directory and includes every per-column
+        // doc-length array plus its CRC in one range GET.
         //
         // Both ranges are known exactly once the header is parsed and
         // neither depends on the other, so they fire **concurrently**:
@@ -191,20 +194,21 @@ impl FtsReader {
         // pair) instead of 3. On a warm/in-memory source both resolve
         // through the sync zero-copy path at no cost. The doc-length
         // tail is fetched whole (one range) rather than dir-then-arrays,
-        // keeping the open-time GET count minimal.
-        let (fst_region, doc_lengths_region) = futures::try_join!(
+        // keeping the open-time GET count minimal and avoiding
+        // per-column range calls during metadata decode.
+        let (fst_region, doc_lengths_tail) = futures::try_join!(
             fetch_lazy_range(source.as_ref(), 48..postings_offset, "fts/dict"),
             fetch_lazy_range(
                 source.as_ref(),
                 doc_lengths_table_offset..source_len,
-                "fts/doc_lengths",
+                "fts/doc_lengths_tail",
             ),
         )?;
 
         let mut overlay = PrefetchedSource::new(source);
         overlay.install(0, header);
         overlay.install(48, fst_region);
-        overlay.install(doc_lengths_table_offset as u64, doc_lengths_region);
+        overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
         Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
     }

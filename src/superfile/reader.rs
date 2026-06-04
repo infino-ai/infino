@@ -122,6 +122,13 @@ impl SuperfileReader {
 
     /// Like [`open_lazy`] but with explicit [`OpenOptions`].
     ///
+    /// Lazy opens do not run whole-segment CRC scans. Forcing CRC
+    /// verification here would require reading the full segment through
+    /// range GETs, which is exactly what the lazy path is meant to avoid;
+    /// the embedded vector/FTS lazy readers therefore use their
+    /// object-store options (`verify_crc = false`) while eager cache
+    /// promotion can verify after the full segment is materialized.
+    ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
         source: Arc<dyn crate::superfile::LazyByteSource>,

@@ -832,8 +832,7 @@ fn build_subsection_streaming(
     //
     //      [sub_header]
     //      [summary_centroid][centroids][cluster_idx][codec_meta]   ← open-time region
-    //      [per-cluster blocks: each = codes_chunk + doc_ids_chunk]
-    //      [full]                                                   ← rerank column
+    //      [per-cluster blocks: each = codes_chunk + doc_ids_chunk + full_chunk]
     //      [crc]
     //
     //    Two wins fold into this single layout:
@@ -841,22 +840,25 @@ fn build_subsection_streaming(
     //          so one range fetch covers everything search needs
     //          before picking a cluster (~1.5 MB at 1M × 384 sq8,
     //          16 MB at 10M × 1024 sq8).
-    //      (b) per-cluster `codes + doc_ids` interleave so each
-    //          probed cluster GET pulls both in one range.
+    //      (b) per-cluster `codes + doc_ids + full` interleave so
+    //          each probed cluster GET pulls all search-time bytes
+    //          in one range. `codes_chunk` is the 1-bit RaBitQ
+    //          estimate-code bytes; `full_chunk` is the optional
+    //          Fp32/Sq8 rerank payload for the same docs.
     //
     //    New-service-only — there are no pre-013 segments to
     //    keep readable.
     //
     //    Codec-specific shape:
-    //      Fp32: empty codec_meta; full[] is the fp32 buffer
-    //            byte-for-byte.
+    //      Fp32: empty codec_meta; full_chunk stores the fp32
+    //            vectors byte-for-byte inside each cluster block.
     //      Sq8:  codec_meta = `scale[n_cent × dim] +
     //            offset[n_cent × dim] + (per-doc norms[n_docs]
-    //            for L2Sq)`. full[] is n_docs × dim u8 codes
-    //            encoded against each doc's cluster quantizer.
+    //            for L2Sq)`. full_chunk stores dim u8 codes per
+    //            doc, encoded against that doc's cluster quantizer.
     //            ~4× smaller than Fp32; recall stays > 0.99 at
     //            default rerank_mult.
-    //      None: empty codec_meta; empty full[]. Subsection
+    //      None: empty codec_meta; empty full_chunk. Subsection
     //            collapses to summary + centroids + cluster_idx
     //            + per-cluster blocks — the 1-bit shortlist's
     //            top-K is the final answer.

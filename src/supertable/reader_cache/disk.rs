@@ -1054,29 +1054,6 @@ impl DiskCacheStore {
             }
         };
 
-        // Fire the footer tail and fixed subsection headers concurrently.
-        // Larger vector / FTS metadata ranges are discovered and fetched
-        // by the inner readers after this seeded open.
-        let storage = Arc::clone(&self.storage);
-        let storage_uri_a = storage_uri.clone();
-        let storage_uri_b = storage_uri.clone();
-        let storage_uri_c = storage_uri.clone();
-        let storage_for_vec = Arc::clone(&storage);
-        let storage_for_fts = Arc::clone(&storage);
-
-        let parquet_fut = async move {
-            let end = total_size;
-            let start = parquet_tail_start;
-            if end == start {
-                return Ok::<_, StorageError>(Bytes::new());
-            }
-            storage.get_range(&storage_uri_a, start..end).await
-        };
-        let vec_fut =
-            async move { fetch_hint_ranges(storage_for_vec, storage_uri_b, vec_ranges).await };
-        let fts_fut =
-            async move { fetch_hint_ranges(storage_for_fts, storage_uri_c, fts_ranges).await };
-
         // Build the lazy source: a `StorageRangeSource` with the
         // size baked in (no HEAD, no suffix-range discovery)
         // wrapped in a `PrefetchedSource` overlay carrying the
@@ -1094,14 +1071,35 @@ impl DiskCacheStore {
             // vector + FTS open ranges) already rode in with the
             // manifest part GET that `cold_open` performed. Install
             // them straight into the overlay: ZERO open-time GETs
-            // against the segment object. The futures above are
-            // never awaited.
+            // against the segment object.
             for (off, bytes) in &offsets.open_blob {
                 overlay.install(*off, Bytes::copy_from_slice(bytes));
             }
         } else {
             // Pre-M7 fallback: fetch the open batch over the wire
             // (parquet tail + vec + fts ranges in parallel, 1 RTT).
+            let storage_for_parquet = Arc::clone(&self.storage);
+            let storage_for_vec = Arc::clone(&self.storage);
+            let storage_for_fts = Arc::clone(&self.storage);
+            let parquet_uri = storage_uri.clone();
+            let vec_uri = storage_uri.clone();
+            let fts_uri = storage_uri.clone();
+
+            let parquet_fut = async move {
+                let end = total_size;
+                let start = parquet_tail_start;
+                if end == start {
+                    return Ok::<_, StorageError>(Bytes::new());
+                }
+                storage_for_parquet
+                    .get_range(&parquet_uri, start..end)
+                    .await
+            };
+            let vec_fut =
+                async move { fetch_hint_ranges(storage_for_vec, vec_uri, vec_ranges).await };
+            let fts_fut =
+                async move { fetch_hint_ranges(storage_for_fts, fts_uri, fts_ranges).await };
+
             let (parquet_bytes, vec_pre, fts_pre) =
                 futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
             if !parquet_bytes.is_empty() {
@@ -1119,14 +1117,14 @@ impl DiskCacheStore {
         // Every internal read inside `open_lazy_with` (parquet
         // tail, vec subsection head, fts subsection) hits the
         // overlay sync — zero additional GETs against storage.
-        let lazy_reader = SuperfileReader::open_lazy_with(
-            Arc::clone(&source),
-            OpenOptions {
-                verify_crc: self.config.verify_crc_on_open,
-            },
-        )
-        .await
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        // Lazy opens intentionally skip full CRC scans: verifying
+        // every subsection would force whole-segment range reads,
+        // defeating the lazy/open-batch path. Eager cache promotion
+        // can still verify when it materializes the full segment.
+        let lazy_reader =
+            SuperfileReader::open_lazy_with(Arc::clone(&source), OpenOptions { verify_crc: false })
+                .await
+                .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
 
         self.reserve_manual(total_size).await?;
         let reserved_bytes = total_size;

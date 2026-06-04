@@ -151,9 +151,10 @@ pub enum StorageBackend {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageColdFetchMode {
-    /// Multi-stream parallel prefetch into the disk cache before
-    /// handing the reader to the caller. Lowest cold-search latency
-    /// at the cost of higher cold-open latency.
+    /// Parallel range GETs serve both the foreground reader and the
+    /// disk-cache fill. Foreground returns after the range fetches;
+    /// pwrite, mmap, and cache registration finish in the background.
+    /// Uses one copy of segment bandwidth per cold miss.
     HybridWithPrefetch,
     /// Single-range sequential fetches (no background fill). Useful
     /// for constrained environments where parallelism is undesirable.
