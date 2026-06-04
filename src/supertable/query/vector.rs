@@ -93,6 +93,7 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
         let tombstone_cache = self.tombstone_cache.clone();
         let now = std::time::Instant::now();
 
@@ -155,7 +156,7 @@ impl SupertableReader {
         let opened: Vec<Arc<SuperfileReader>> = futures::future::try_join_all(
             superfiles
                 .iter()
-                .map(|entry| open_reader(&store, disk_cache.as_ref(), entry)),
+                .map(|entry| open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry)),
         )
         .await?;
         let open_us = open_t0.elapsed().as_micros() as u64;
@@ -280,11 +281,13 @@ fn summarize_fanout_timing(open_us: u64, search_us: &[u64], total_us: u64) {
 async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    storage: Option<&Arc<dyn crate::storage::StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     crate::supertable::query::superfile_reader::superfile_reader(
         store,
         disk_cache,
+        storage,
         &entry.uri,
         entry.subsection_offsets.as_ref(),
     )

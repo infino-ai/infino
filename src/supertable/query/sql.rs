@@ -100,15 +100,22 @@ impl Supertable {
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let storage = self.options().storage.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
         let tombstone_cache = reader.tombstone_cache.clone();
 
         let sql = sql.to_owned();
 
         let drive = async move {
-            let table =
-                build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)
-                    .await?;
+            let table = build_mem_table(
+                scalar_schema,
+                manifest,
+                store,
+                disk_cache,
+                storage,
+                tombstone_cache,
+            )
+            .await?;
             let ctx = SessionContext::new();
             ctx.register_table(TABLE_NAME, Arc::new(table))
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
@@ -160,14 +167,21 @@ impl Supertable {
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let storage = self.options().storage.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
         let tombstone_cache = reader.tombstone_cache.clone();
         let id_column = self.options().id_column.clone();
 
         let drive = async move {
-            let table =
-                build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)
-                    .await?;
+            let table = build_mem_table(
+                scalar_schema,
+                manifest,
+                store,
+                disk_cache,
+                storage,
+                tombstone_cache,
+            )
+            .await?;
             let ctx = SessionContext::new();
             ctx.register_table(TABLE_NAME, Arc::new(table))
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
@@ -250,6 +264,7 @@ async fn build_mem_table(
     manifest: Arc<Manifest>,
     store: Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    storage: Option<Arc<dyn crate::storage::StorageProvider>>,
     tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 ) -> Result<MemTable, QueryError> {
     // route through the hierarchical iterator when
@@ -276,6 +291,7 @@ async fn build_mem_table(
         let reader = crate::supertable::query::superfile_reader::superfile_reader(
             &store,
             disk_cache.as_ref(),
+            storage.as_ref(),
             &entry.uri,
             entry.subsection_offsets.as_ref(),
         )

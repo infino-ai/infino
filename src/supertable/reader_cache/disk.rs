@@ -448,11 +448,15 @@ impl DiskCacheStore {
             .await;
         match result {
             Ok(entry) => Ok(Arc::clone(&entry.reader)),
-            Err(_e) => {
+            Err(DiskCacheError::BudgetExceeded) => {
                 self.coordinators.remove(uri);
-                Err(self.cold_fetch_hybrid(uri).await.err().unwrap_or(
-                    DiskCacheError::SuperfileOpen("hybrid cold fetch error".into()),
-                ))
+                Err(DiskCacheError::BudgetExceeded)
+            }
+            Err(_) => {
+                self.coordinators.remove(uri);
+                self.cold_fetch_hybrid(uri)
+                    .await
+                    .map(|entry| Arc::clone(&entry.reader))
             }
         }
     }

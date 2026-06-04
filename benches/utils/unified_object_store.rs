@@ -21,14 +21,16 @@
 //!    empty cache; pays the cold-open budget (Parquet
 //!    footer + per-subsection open-time-region GETs). One open
 //!    serves both the vector and FTS readers.
-//! 2. **Cold first vector search after S3 open** — cold open +
-//!    `vec.search` at the default `(nprobe, rerank_mult)`;
-//!    pays the cold-search budget (~nprobe + 1 cluster
-//!    GETs).
-//! 3. **Cold first BM25 search after S3 open** — cold open +
-//!    `bm25_search`; pays the FTS lazy open-time fetch
-//!    (header + doc-lengths) plus per-term dict/postings range
-//!    GETs (`FtsReader::open_lazy` mirroring the vector path).
+//! 2. **Cold first vector search after S3 open** — `vec.search`
+//!    at the default `(nprobe, rerank_mult)` against a freshly
+//!    opened reader and empty segment-data cache; pays the
+//!    cold-search budget (~nprobe + 1 cluster GETs), excluding
+//!    file open.
+//! 3. **Cold first BM25 search after S3 open** — `bm25_search`
+//!    against a freshly opened reader and empty segment-data cache;
+//!    pays the FTS lazy open-time fetch (header + doc-lengths) plus
+//!    per-term dict/postings range GETs (`FtsReader::open_lazy`
+//!    mirroring the vector path), excluding file open.
 //! 4. **Warm subsequent search after S3 open** — after the
 //!    background promotion completes, the cache returns the
 //!    mmap-backed reader and both vector + BM25 searches
@@ -634,10 +636,10 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    // ── Row 2: cold lazy open + first vector search. ────────────────
-    // The full cold cycle: fresh cache, open, one search.
-    // Measures the M2 cold-open + M3 cold-search range
-    // budget end-to-end against the S3 wire path.
+    // ── Row 2: cold first vector search after lazy open. ────────────
+    // Fresh cache each iteration, but `cache.reader(uri)` is outside
+    // the timed region. This measures first-query range GETs against
+    // the S3 wire path, not the one-time file/open work.
     {
         let mut g = c.benchmark_group("object_store_cold_first_search");
         g.sample_size(10);
@@ -652,13 +654,14 @@ fn bench(c: &mut Criterion) {
                 for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
                     let q = q.clone();
+                    let reader =
+                        rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
                     let t0 = Instant::now();
-                    let _hits = rt.block_on(async {
-                        let reader = cache.reader(&uri).await.expect("cold reader");
+                    let _hits = {
                         let vec = reader.vec().expect("vector reader present");
                         vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
                             .expect("cold vector_search")
-                    });
+                    };
                     total += t0.elapsed();
                     drop(cache);
                     drop(cache_dir);
@@ -669,12 +672,11 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    // ── Row 3: cold lazy open + first BM25 search. ──────────────────
-    // Same fresh-cache cold cycle as Row 2, but drives the FTS
-    // subsection through `FtsReader::open_lazy`: open-time fetch
-    // (header + doc-lengths) followed by per-term dict + postings
-    // range GETs. Measures the FTS half of the unified cold path
-    // against the same S3 wire.
+    // ── Row 3: cold first BM25 search after lazy open. ──────────────
+    // Same fresh-cache cold query shape as Row 2, but drives the FTS
+    // subsection through `FtsReader::open_lazy`: header/doc-lengths
+    // plus per-term dict + postings range GETs. Reader open is kept
+    // outside the timer.
     {
         let mut g = c.benchmark_group("object_store_cold_first_bm25");
         g.sample_size(10);
@@ -687,14 +689,17 @@ fn bench(c: &mut Criterion) {
                 let (actual_iters, requested_iters) = bounded_real_s3_iters(iters, real_s3);
                 for _ in 0..actual_iters {
                     let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_for_bench));
+                    let reader =
+                        rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
                     let t0 = Instant::now();
-                    let _hits = rt.block_on(async {
-                        let reader = cache.reader(&uri).await.expect("cold reader");
-                        reader
-                            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
-                            .await
-                            .expect("cold bm25_search")
-                    });
+                    let _hits = rt
+                        .block_on(reader.bm25_search(
+                            FTS_COLUMN,
+                            FTS_QUERY_TERM,
+                            TOP_K,
+                            BoolMode::Or,
+                        ))
+                        .expect("cold bm25_search");
                     total += t0.elapsed();
                     drop(cache);
                     drop(cache_dir);

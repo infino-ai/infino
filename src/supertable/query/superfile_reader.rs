@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use crate::storage::StorageProvider;
 use crate::superfile::SuperfileReader;
 use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
 use crate::supertable::reader_cache::DiskCacheStore;
@@ -51,6 +52,7 @@ use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
     uri: &SuperfileUri,
     offsets: Option<&SubsectionOffsets>,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
@@ -64,22 +66,42 @@ pub async fn superfile_reader(
     }
 
     // 2. Disk cache fallback (when attached).
-    let cache = match disk_cache {
-        Some(c) => Arc::clone(c),
-        None => return Err(ReaderCacheError::NotFound { uri: *uri }),
-    };
-
-    match cache.reader_with_hints(uri, offsets).await {
-        Ok(reader) => Ok(reader),
-        // Cache can't admit this segment (e.g. it's larger than the
-        // whole budget). Stream it directly via range GETs instead
-        // of failing the query.
-        Err(DiskCacheError::BudgetExceeded) => cache
-            .open_range_only(uri, offsets)
-            .await
-            .map_err(cache_open_failed),
-        Err(e) => Err(cache_open_failed(e)),
+    if let Some(cache) = disk_cache {
+        match cache.reader_with_hints(uri, offsets).await {
+            Ok(reader) => return Ok(reader),
+            // Cache can't admit this segment (e.g. it's larger than the
+            // whole budget). Stream it directly via range GETs instead
+            // of failing the query.
+            Err(DiskCacheError::BudgetExceeded) => {
+                return cache
+                    .open_range_only(uri, offsets)
+                    .await
+                    .map_err(cache_open_failed);
+            }
+            Err(e) => return Err(cache_open_failed(e)),
+        }
     }
+
+    // 3. Storage-only fallback. This covers reopened LocalFs/S3
+    // handles configured with durable storage but no disk cache.
+    // It is intentionally whole-object: callers who need bounded
+    // memory attach `DiskCacheStore`, which uses lazy/range opens.
+    if let Some(storage) = storage {
+        let path = uri.storage_path();
+        let (bytes, _) = storage
+            .get(&path)
+            .await
+            .map_err(|e| ReaderCacheError::OpenFailed {
+                source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
+                    "storage fetch {path}: {e}"
+                ))),
+            })?;
+        let reader = SuperfileReader::open(bytes)
+            .map_err(|source| ReaderCacheError::OpenFailed { source })?;
+        return Ok(Arc::new(reader));
+    }
+
+    Err(ReaderCacheError::NotFound { uri: *uri })
 }
 
 fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {

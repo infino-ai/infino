@@ -99,6 +99,7 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let tombstone_cache = self.tombstone_cache.clone();
@@ -170,11 +171,13 @@ impl SupertableReader {
             .map(|unit| {
                 let store = Arc::clone(&store);
                 let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let tombstone_cache = tombstone_cache.clone();
                 tokio::spawn(async move {
-                    let r = open_reader(&store, disk_cache.as_ref(), &unit.entry).await?;
+                    let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &unit.entry)
+                        .await?;
                     let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                     let hits = match unit.range {
                         Some((start, end)) => r
@@ -239,6 +242,7 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
@@ -310,11 +314,13 @@ impl SupertableReader {
             .map(|unit| {
                 let store = Arc::clone(&store);
                 let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
                 let column_arc = Arc::clone(&column_arc);
                 let prefix_arc = Arc::clone(&prefix_arc);
                 let tombstone_cache = tombstone_cache.clone();
                 tokio::spawn(async move {
-                    let r = open_reader(&store, disk_cache.as_ref(), &unit.entry).await?;
+                    let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &unit.entry)
+                        .await?;
                     let hits = match unit.range {
                         Some((start, end)) => r
                             .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
@@ -470,11 +476,13 @@ fn build_or_work_units(
 async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    storage: Option<&Arc<dyn crate::storage::StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     crate::supertable::query::superfile_reader::superfile_reader(
         store,
         disk_cache,
+        storage,
         &entry.uri,
         entry.subsection_offsets.as_ref(),
     )

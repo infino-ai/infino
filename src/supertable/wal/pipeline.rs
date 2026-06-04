@@ -1049,6 +1049,7 @@ fn resolve_target_id_in_manifest(
             crate::supertable::query::superfile_reader::superfile_reader(
                 &inner.options.store,
                 inner.options.disk_cache.as_ref(),
+                inner.options.storage.as_ref(),
                 &entry.uri,
                 entry.subsection_offsets.as_ref(),
             ),
