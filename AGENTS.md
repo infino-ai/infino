@@ -1,4 +1,6 @@
-# Infino
+# Infino — notes for AI agents
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — it covers prerequisites, build, the demo, test commands, the `make ci` gates, code conventions, and the fork → branch → PR workflow. This file only covers what isn't in there: the repository map, hard boundaries, and traps that aren't obvious from the code.
 
 ## Project overview
 
@@ -12,28 +14,12 @@ When guidance disagrees, resolve in this order (closest wins):
 
 1. **Explicit user / task instructions** in the current session trump everything below.
 2. **Subdirectory `AGENTS.md`** files (when present) take precedence over this file for the scope they cover.
-3. **This file** carries Infino-specific rules.
+3. **This file** carries the traps and boundaries; [`CONTRIBUTING.md`](CONTRIBUTING.md) carries the general contributor workflow.
 4. **Configuration files** (`Cargo.toml`, `Makefile`, `rust-toolchain.toml`, `.github/workflows/`) are the source of truth where they overlap with anything written here — see "Sources of truth" near the end.
 
-## Build and test commands
+## Running a focused test subset
 
-| What | Command |
-|---|---|
-| Build | `cargo build` |
-| Run the end-to-end demo | `cargo run --example demo` |
-| Format + lint check (CI gate) | `make check` |
-| Run all tests | `make test` (= `cargo test`) |
-| Coverage summary | `make coverage` |
-| Pre-PR check (format + lint + coverage ≥ 90%) | `make ci` |
-| Bench (criterion) | `make bench` |
-| Quick bench (sanity only) | `make bench-quick` |
-| Memory-safety, Rust UB model (FTS surface) | `make miri` (nightly) |
-| Memory-safety, real allocator (FTS surface) | `make asan` (nightly) |
-| Clean | `make clean` |
-
-Toolchain is pinned by `rust-toolchain.toml` — `rustup` installs the right stable Rust automatically on first build. For miri/asan: `rustup toolchain install nightly` and `rustup +nightly component add miri`. For coverage locally: `cargo install cargo-llvm-cov --locked`.
-
-### Running a focused subset
+Test binaries are bundled by layer in `Cargo.toml` (`[[test]]` stanzas) to keep link time down — `--test <binary>` picks the layer, the filter narrows within it. Same applies to benches (`[[bench]]` stanzas).
 
 ```sh
 # Run one integration test crate (each binary covers a top-level layer)
@@ -44,40 +30,18 @@ cargo test --test superfile format::crc_corruption
 # Run unit tests in one module
 cargo test --lib superfile::vector::
 
-# Single test, with stdout
-cargo test bm25_oracle -- --nocapture
-
 # Single bench
 cargo bench --bench fts
 cargo bench --bench vector
 ```
 
-Test binaries are bundled by layer in `Cargo.toml` (`[[test]]` stanzas) to keep link time down. Same applies to benches.
+## Code style beyond CONTRIBUTING.md
 
-## Code style guidelines
-
-- **No `.unwrap()` anywhere — including tests and benches.** The crate sets `#![deny(clippy::unwrap_used)]`. Use `?` to propagate; `.expect("invariant: ...")` for paths that are infallible by construction; `.expect("description")` in tests and benches so a failing message tells you which step broke without counting line numbers.
-
-  ```rust
-  // ✗ Never:
-  let v = fallible_call().unwrap();
-
-  // ✓ Production — propagate:
-  let v = fallible_call()?;
-
-  // ✓ Production — infallible by construction:
-  let v = fallible_call().expect("invariant: builder has at least one batch before finish()");
-
-  // ✓ Tests and benches:
-  let v = fallible_call().expect("setup: build superfile for vector_search_oracle test");
-  ```
 - **No `unsafe` outside the documented surface.** The only `unsafe` sites in `src/` are one `bumpalo` lifetime extension in `FtsBuilder::add_doc` plus small pockets of byte parsing in `superfile/format/`. New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
 - **Visibility hygiene.** Items used only inside the crate are `pub(crate)`, not `pub`. Test-only methods go behind `#[cfg(test)]`, not `#[allow(dead_code)]`. The public API surface is what's re-exported from `superfile/mod.rs` and `supertable/mod.rs` — see the "Public API surface" section below.
 - **State rationale inline in comments.** Don't cite external documents or trackers a reader may not have access to; explain the reasoning directly.
 - **Use plain language in source, comments, and commit messages.** Avoid cryptic internal shorthand or tracking tags; describe the change directly.
 - **Performance numbers live in `benches/README.md`.** Keep benchmark results there rather than scattered through the codebase.
-- **Match surrounding style** for naming, comment density, and idiom. Consistency over personal preference.
-- **Comments document the *what* and the *why-when-non-obvious*.** Don't restate the code; explain hidden invariants, subtle constraints, or surprising behavior.
 
 ## Testing instructions
 
@@ -85,10 +49,10 @@ Three lanes beyond `cargo test`:
 
 - **Brute-force oracles** under `tests/` — BM25 top-K is compared against the textbook BM25 formula on planted corpora; full-nprobe IVF is compared against brute-force exact-nearest for L2Sq / Cosine / NegDot. These are the correctness gates; if you touch scoring math or vector distance kernels, the oracles run first.
 - **Recall measurement** — recall@10 must stay ≥ 0.90 at default options on the standard test corpus.
-- **`make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`). Cost: miri ~100-1000× slower than native; asan 2-3×.
+- **`make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`), not just when you touch `unsafe` directly. Cost: miri ~100-1000× slower than native; asan 2-3×.
 - **Property tests** — `proptest` is in dev-deps; used for round-trip invariants like PFOR encode/decode.
 
-Tests are required on any non-trivial change. Test deletions require explicit justification. CI runs the same gates as `make ci`; PRs do not merge with red CI.
+Test deletions require explicit justification.
 
 ## Security considerations
 
@@ -107,9 +71,8 @@ Tests are required on any non-trivial change. Test deletions require explicit ju
 
 ## Pull request guidelines
 
-- **Run `make ci` locally first.** It must be green. Don't open PRs expecting CI to be the gate of first resort.
-- **Tests required for non-trivial changes.** Bug fixes need a regression test that fails before the fix and passes after. New features need coverage proportional to the surface added.
 - **For non-trivial changes, open an issue first.** Describe the problem and proposed approach so the design can be discussed before code review starts.
+- **Bug fixes need a regression test** that fails before the fix and passes after. New features need coverage proportional to the surface added.
 - **Don't force-push to `main` or shared branches.** Force-push your own feature branches if you need to clean up history, but never to `main`.
 - **Don't merge with red CI** or with unanswered review comments.
 - **PR title and body follow the commit-message conventions above.** No AI-attribution trailers.
@@ -216,4 +179,4 @@ If a section here drifts out of sync with one of those, the config wins and this
 
 Ask. Filing an issue describing the problem before writing code is always welcome — a short written proposal to react to beats a surprise PR.
 
-For human-contributor-facing guidance (the linear "clone → build → test → PR" narrative), see [`CONTRIBUTING.md`](CONTRIBUTING.md). For project overview and quick-start, see [`README.md`](README.md).
+For project overview and quick-start, see [`README.md`](README.md).
