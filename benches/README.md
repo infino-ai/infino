@@ -196,7 +196,7 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 117.03 s | 85.5 K/s | 3.34 GiB | 2.41 GiB | 3.01 GiB | +6.8% regressed |
+| supertable | 140.55 s | 71.1 K/s | 2.85 GiB | 2.21 GiB | 2.58 GiB | -12.2% improved |
 
 <!-- END: bench/supertable/ingest/supertable_vec_build -->
 
@@ -212,12 +212,12 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 <!-- BEGIN: bench/vector/supertable/search -->
 ### Supertable vector — search (10000000 docs × dim=384, calibrated at recall targets)
 
-hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
+hot = warm steady state: every segment mmap-promoted via the public `Supertable::wait_until_warm` before timing, so reads hit resident pages (no object-store GETs). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open.
 
 | Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|-----|------|----------|------------|---------|------------|
-| 0.90 | (p=4, r=4) | 31.95 ms | 1.05 s | 18.51 GiB | 17.47 GiB | 18.15 GiB | — |
-| 0.95 | (p=8, r=4) | 17.71 ms | 1.03 s | 18.51 GiB | 17.47 GiB | 18.15 GiB | — |
-| 0.99 | (p=16, r=4) | 27.97 ms | 2.39 s | 18.51 GiB | 17.47 GiB | 18.15 GiB | — |
+| 0.90 | (p=4, r=4) | 9.18 ms | 1.15 s | 10.08 GiB | 10.04 GiB | 10.06 GiB | +1.0% no change |
+| 0.95 | (p=8, r=4) | 10.22 ms | 1.19 s | 10.08 GiB | 10.04 GiB | 10.06 GiB | +1.0% no change |
+| 0.99 | (p=16, r=4) | 16.49 ms | 1.22 s | 10.08 GiB | 10.04 GiB | 10.06 GiB | +1.0% no change |
 
 <!-- END: bench/vector/supertable/search -->
