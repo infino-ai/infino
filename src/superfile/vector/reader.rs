@@ -1012,16 +1012,8 @@ impl VectorReader {
         self.columns.iter().map(|c| c.name.as_str())
     }
 
-    pub(crate) fn public_rerank_mult(&self, column: &str, base: usize) -> usize {
-        let Some(&cid) = self.column_id_by_name.get(column) else {
-            return base;
-        };
-        let col = &self.columns[cid as usize];
-        if col.rerank_codec.writes_full() {
-            base.max(20)
-        } else {
-            base
-        }
+    pub(crate) fn public_rerank_mult(&self, _column: &str, base: usize) -> usize {
+        base
     }
 
     /// Per-column summary centroid + radius, used by the storage plan
@@ -1368,6 +1360,226 @@ impl VectorReader {
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
         //    + SIMD dot. Fp32 takes the flat dispatch.
+        rerank_candidates_from_blocks(
+            &self.source,
+            lazy_sq8_meta_bytes.as_ref(),
+            &cluster_blocks,
+            survivor_full_rows.as_deref(),
+            &candidates,
+            col,
+            query,
+            k,
+        )
+        .map_err(|e| VectorError::LazySource(e.to_string()))
+    }
+
+    /// Async sibling of [`Self::search`]. Byte-for-byte the same IVF
+    /// kernel — identical centroid scoring, coarse 1-bit shortlist,
+    /// survivor-only rerank, and the same coalesced range plans, so
+    /// recall is identical — but the three fetch waves (centroid+idx
+    /// region, per-cluster code prefixes + Sq8 meta, survivor rerank
+    /// rows) are `await`ed on the caller's runtime instead of bridged
+    /// through a per-call throwaway runtime. This is what lets the
+    /// supertable vector fan-out drive every segment concurrently on
+    /// the shared query runtime — mirroring the FTS
+    /// `bm25_search_pretokenized` path — rather than serializing cold
+    /// object-store GETs. The CPU steps (centroid/code scoring,
+    /// rerank) call the same helpers as the sync path and parallelize
+    /// on the global rayon pool; warm/in-memory ranges still resolve
+    /// sync/zero-copy via `try_get_range_sync` with no `await`.
+    pub async fn search_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_mult: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated {
+            return Ok(Vec::new());
+        }
+        let centroid_stride = col.dim * 4;
+        let sub_start = col.subsection_range.start;
+
+        // 1. Centroids + cluster_idx region (one contiguous span).
+        let centroids_start = sub_start + col.centroids_off;
+        let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let centroid_idx_region = self
+            .source
+            .range_async(centroids_start..idx_end)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
+        let cluster_idx =
+            centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
+
+        let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
+        // 2. Score centroids → top `nprobe` clusters.
+        let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
+
+        // 3. Rotate query once for the 1-bit code estimator.
+        let mut q_rot = vec![0f32; col.dim];
+        col.rot.apply(query, &mut q_rot);
+
+        // 4. Per-cluster prefix range plan (see sync `search`).
+        let _ = sub_start;
+        let cb = col.quant.code_bytes();
+        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(nprobe_eff);
+        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
+        for &(c, _) in &centroid_scores {
+            let (off, cnt) = read_cluster_entry(&cluster_idx, c);
+            if cnt == 0 {
+                continue;
+            }
+            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
+            cluster_meta.push((c, off, cnt));
+        }
+        let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
+        // Warm fast path: every prefix already resident → sync zero-copy.
+        let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
+            .iter()
+            .map(|range| self.source.try_get_range_sync(range.clone()))
+            .collect();
+        let survivor_only_rerank_fetch = true;
+        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync {
+            let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
+                let mut fetched = self
+                    .source
+                    .get_ranges_parallel_async(&[range])
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                fetched.pop()
+            } else {
+                None
+            };
+            (prefix_blocks, meta_bytes)
+        } else {
+            // Cold: codes+doc_ids prefixes (coalesced) + Sq8 meta in one
+            // concurrent batch on the caller's runtime.
+            get_cluster_ranges_coalesced_with_extra_async(
+                &self.source,
+                &cluster_prefix_ranges,
+                lazy_sq8_meta_range,
+            )
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?
+        };
+        debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
+
+        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
+        let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+        let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+            k
+        } else {
+            k.saturating_mul(rerank_mult)
+        };
+        if coarse_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let score_block =
+            |heap: &mut BoundedCoarseHeap,
+             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+                let codes_len = (cnt as usize) * cb;
+                let doc_ids_len = (cnt as usize) * 4;
+                debug_assert_eq!(
+                    block.len(),
+                    if survivor_only_rerank_fetch {
+                        codes_len + doc_ids_len
+                    } else {
+                        codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
+                    }
+                );
+                let codes = block.slice(0..codes_len);
+                let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+                score_cluster_codes_into_heap(
+                    &codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot, heap,
+                );
+            };
+        let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+            cluster_meta
+                .par_iter()
+                .zip(cluster_blocks.par_iter())
+                .fold(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut heap, item| {
+                        score_block(&mut heap, item);
+                        heap
+                    },
+                )
+                .reduce(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut left, right| {
+                        left.merge(right);
+                        left
+                    },
+                )
+        } else {
+            let mut heap = BoundedCoarseHeap::new(coarse_limit);
+            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+                score_block(&mut heap, item);
+            }
+            heap
+        };
+        let mut shortlist = shortlist_heap.into_vec();
+
+        if shortlist.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+            let _ = rerank_mult;
+            shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            return Ok(shortlist
+                .into_iter()
+                .map(|(did, est, _pos, _c)| (did, -est))
+                .collect());
+        }
+
+        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
+        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
+            block_by_cid.insert(c as u32, bi);
+        }
+        let stride = full_vec_bytes;
+        let mut candidates = Vec::with_capacity(shortlist.len());
+        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+            Some(Vec::with_capacity(shortlist.len()))
+        } else {
+            None
+        };
+        for &(did, _, pos, cluster_id) in &shortlist {
+            let bi = block_by_cid[&cluster_id];
+            let (_, off, cnt) = cluster_meta[bi];
+            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
+            let local = (pos - off) as usize;
+            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+                let idx = ranges.len();
+                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+                Some(idx)
+            } else {
+                None
+            };
+            candidates.push(RerankCandidate {
+                did,
+                pos,
+                cluster_id,
+                block_idx: bi,
+                full_off: full_start + local * stride,
+                full_idx,
+            });
+        }
+        let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
+            Some(
+                get_cluster_ranges_coalesced_async(&self.source, &ranges)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
         rerank_candidates_from_blocks(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
@@ -2049,6 +2261,70 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
 }
 
+/// Coalescing plan for a set of cluster-block ranges. Computed once
+/// and applied to either a sync ([`Source::get_ranges_parallel`]) or
+/// async ([`Source::get_ranges_parallel_async`]) batch fetch — the
+/// byte selection is identical regardless of which path executes it,
+/// so the sync and async vector kernels return bit-identical results.
+struct CoalescePlan {
+    /// Merged ranges to actually GET (adjacent / near-adjacent
+    /// cluster blocks fused into one request to cut the GET count).
+    fetch_ranges: Vec<Range<usize>>,
+    /// Per original input range, in input order: `(fetch_idx,
+    /// offset_in_fetch, len)` — how to slice the requested range
+    /// back out of its merged fetch block.
+    scatter: Vec<(usize, usize, usize)>,
+}
+
+/// Group `ranges` into coalesced fetch spans (same gap/overfetch rule
+/// the per-cluster cold fan-out has always used) and record how to
+/// slice each original range back out. Pure; no I/O.
+fn plan_cluster_coalesce(ranges: &[Range<usize>]) -> CoalescePlan {
+    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
+
+    // groups: (merged_range, payload_len, members[(orig_idx, range)])
+    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+    for (idx, range) in sorted {
+        if let Some((merged, payload_len, members)) = groups.last_mut() {
+            let gap = range.start.saturating_sub(merged.end);
+            let merged_end = merged.end.max(range.end);
+            let new_payload_len = *payload_len + range.len();
+            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
+            if range.start <= merged.end
+                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
+                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+            {
+                merged.end = merged_end;
+                *payload_len = new_payload_len;
+                members.push((idx, range));
+                continue;
+            }
+        }
+        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+    }
+
+    let fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
+    let mut scatter: Vec<(usize, usize, usize)> = vec![(0, 0, 0); ranges.len()];
+    for (gi, (merged_range, _, members)) in groups.iter().enumerate() {
+        for (idx, range) in members {
+            scatter[*idx] = (gi, range.start - merged_range.start, range.len());
+        }
+    }
+    CoalescePlan {
+        fetch_ranges,
+        scatter,
+    }
+}
+
+/// Slice the requested ranges back out of the fetched merged blocks.
+fn apply_coalesce(plan: &CoalescePlan, fetched: &[Bytes]) -> Vec<Bytes> {
+    plan.scatter
+        .iter()
+        .map(|&(gi, off, len)| fetched[gi].slice(off..off + len))
+        .collect()
+}
+
 fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
@@ -2057,105 +2333,65 @@ fn get_cluster_ranges_coalesced_with_extra(
     let Some(extra) = extra else {
         return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
     };
-    if ranges.is_empty() {
-        let mut fetched = source.get_ranges_parallel(&[extra])?;
-        return Ok((Vec::new(), fetched.pop()));
-    }
-
-    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
-    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
-
-    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
-    for (idx, range) in sorted {
-        if let Some((merged, payload_len, members)) = groups.last_mut() {
-            let gap = range.start.saturating_sub(merged.end);
-            let merged_end = merged.end.max(range.end);
-            let new_payload_len = *payload_len + range.len();
-            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
-            if range.start <= merged.end
-                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
-                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
-            {
-                merged.end = merged_end;
-                *payload_len = new_payload_len;
-                members.push((idx, range));
-                continue;
-            }
-        }
-        groups.push((range.clone(), range.len(), vec![(idx, range)]));
-    }
-
-    let mut fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
-    fetch_ranges.push(extra);
-    let mut fetched = source.get_ranges_parallel(&fetch_ranges)?;
+    let plan = plan_cluster_coalesce(ranges);
+    let mut fetch = plan.fetch_ranges.clone();
+    fetch.push(extra);
+    let mut fetched = source.get_ranges_parallel(&fetch)?;
     let extra_bytes = fetched.pop();
+    Ok((apply_coalesce(&plan, &fetched), extra_bytes))
+}
 
-    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
-    for ((merged_range, _, members), bytes) in groups.into_iter().zip(fetched) {
-        for (idx, range) in members {
-            let start = range.start - merged_range.start;
-            let end = start + range.len();
-            out[idx] = Some(bytes.slice(start..end));
-        }
-    }
-
-    Ok((
-        out.into_iter()
-            .map(|b| b.expect("cluster range filled by coalesced fetch"))
-            .collect(),
-        extra_bytes,
-    ))
+/// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Same
+/// coalescing plan, dispatched as one `try_join_all` batch on the
+/// caller's runtime so connections pool and the fan-out is concurrent.
+async fn get_cluster_ranges_coalesced_with_extra_async(
+    source: &Source,
+    ranges: &[Range<usize>],
+    extra: Option<Range<usize>>,
+) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+    let Some(extra) = extra else {
+        return Ok((
+            get_cluster_ranges_coalesced_async(source, ranges).await?,
+            None,
+        ));
+    };
+    let plan = plan_cluster_coalesce(ranges);
+    let mut fetch = plan.fetch_ranges.clone();
+    fetch.push(extra);
+    let mut fetched = source.get_ranges_parallel_async(&fetch).await?;
+    let extra_bytes = fetched.pop();
+    Ok((apply_coalesce(&plan, &fetched), extra_bytes))
 }
 
 fn get_cluster_ranges_coalesced(
     source: &Source,
     ranges: &[Range<usize>],
 ) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
-    if ranges.len() <= 1 {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ranges.len() == 1 {
         return source.get_ranges_parallel(ranges);
     }
+    let plan = plan_cluster_coalesce(ranges);
+    let fetched = source.get_ranges_parallel(&plan.fetch_ranges)?;
+    Ok(apply_coalesce(&plan, &fetched))
+}
 
-    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
-    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
-
-    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
-    for (idx, range) in sorted {
-        if let Some((merged, payload_len, members)) = groups.last_mut() {
-            let gap = range.start.saturating_sub(merged.end);
-            let merged_end = merged.end.max(range.end);
-            let new_payload_len = *payload_len + range.len();
-            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
-            if range.start <= merged.end
-                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
-                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
-            {
-                merged.end = merged_end;
-                *payload_len = new_payload_len;
-                members.push((idx, range));
-                continue;
-            }
-        }
-        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+/// Async sibling of [`get_cluster_ranges_coalesced`].
+async fn get_cluster_ranges_coalesced_async(
+    source: &Source,
+    ranges: &[Range<usize>],
+) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
     }
-
-    if groups.len() == ranges.len() {
-        return source.get_ranges_parallel(ranges);
+    if ranges.len() == 1 {
+        return source.get_ranges_parallel_async(ranges).await;
     }
-
-    let merged_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
-    let merged_bytes = source.get_ranges_parallel(&merged_ranges)?;
-    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
-    for ((merged_range, _, members), bytes) in groups.into_iter().zip(merged_bytes) {
-        for (idx, range) in members {
-            let start = range.start - merged_range.start;
-            out[idx] = Some(bytes.slice(start..start + range.len()));
-        }
-    }
-
-    Ok(out
-        .into_iter()
-        .map(|b| b.expect("every cluster range filled"))
-        .collect())
+    let plan = plan_cluster_coalesce(ranges);
+    let fetched = source.get_ranges_parallel_async(&plan.fetch_ranges).await?;
+    Ok(apply_coalesce(&plan, &fetched))
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
@@ -2277,6 +2513,36 @@ mod tests {
         let r2 = VectorReader::open_with(blob, &json, OpenOptions::default())
             .expect("open VectorReader");
         assert_eq!(r1.n_docs(), r2.n_docs());
+    }
+
+    #[test]
+    fn public_rerank_mult_honors_requested_value() {
+        let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let fp32 = VectorReader::open(blob, &json).expect("open fp32 VectorReader");
+        assert_eq!(fp32.public_rerank_mult("embedding", 4), 4);
+
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "embedding".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register Sq8 column");
+        for i in 0..32u32 {
+            let v: Vec<f32> = (0..16)
+                .map(|j| ((i.wrapping_mul(31) + j as u32) % 100) as f32 * 0.01)
+                .collect();
+            b.add(0, &v).expect("add to vector builder");
+        }
+        let sq8 = VectorReader::open(
+            Bytes::from(b.finish().expect("finish Sq8 vector builder")),
+            r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#,
+        )
+        .expect("open Sq8 VectorReader");
+        assert_eq!(sq8.public_rerank_mult("embedding", 4), 4);
     }
 
     #[tokio::test]

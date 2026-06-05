@@ -21,9 +21,7 @@ and as a search index by infino's reader.
 ## Quick example
 
 ```rust
-use infino::superfile::{
-    SuperfileReader, VectorSearchOptions, bm25_search, vector_search,
-};
+use infino::superfile::{SuperfileReader, VectorSearchOptions};
 use infino::superfile::fts::reader::BoolMode;
 use bytes::Bytes;
 
@@ -31,13 +29,25 @@ use bytes::Bytes;
 let bytes: Bytes = std::fs::read("my.superfile")?.into();
 let reader = SuperfileReader::open(bytes)?;
 
-// BM25 search over the embedded FTS blob:
-let hits = bm25_search(&reader, "title", "rust async", 10, BoolMode::Or)?;
+// The SuperfileReader search kernels are async: cold object-store
+// range reads are `await`ed (warm/in-memory ranges resolve without
+// yielding), so a wide fan-out can drive every segment concurrently.
+// Drive them on any runtime — here a throwaway tokio one.
+let rt = tokio::runtime::Runtime::new()?;
+rt.block_on(async {
+    // BM25 search over the embedded FTS blob:
+    let _hits = reader
+        .bm25_search("title", "rust async", 10, BoolMode::Or)
+        .await?;
 
-// kNN search over the embedded vector blob:
-let query = vec![/* dim=384 f32s */];
-let hits = vector_search(&reader, "embedding", &query, 10,
-                         VectorSearchOptions::default())?;
+    // kNN search over the embedded vector blob:
+    let query = vec![/* dim=384 f32s */];
+    let _hits = reader
+        .vector_search("embedding", &query, 10, VectorSearchOptions::default())
+        .await?;
+
+    Ok::<(), infino::superfile::ReadError>(())
+})?;
 
 // And the same bytes are a valid Parquet file — register them
 // with DataFusion / DuckDB / pyarrow and treat as a regular table.

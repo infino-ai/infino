@@ -94,6 +94,23 @@ pub fn bench(c: &mut Criterion) {
     assert_fts_self_consistent(st);
     eprintln!("[supertable_fts_search] correctness OK");
 
+    // Drive the cache to the warm (mmap-promoted) steady state through
+    // the public API before timing the hot tier. Without this the first
+    // touch of each segment faults through the lazy object-store source,
+    // so "hot" would fold in live S3 range GETs instead of resident
+    // mmap reads. See `Supertable::wait_until_warm` / supertable.md.
+    eprintln!("[supertable_fts_search] warming cache (mmap promotion)...");
+    let warm_t0 = std::time::Instant::now();
+    for (_, q) in FTS_QUERIES {
+        let _ = st.bm25_search(supertable::TEXT_COLUMN, q, TOP_K, BoolMode::Or);
+    }
+    st.wait_until_warm(Duration::from_secs(180))
+        .expect("supertable cache failed to reach warm (mmap-promoted) state");
+    eprintln!(
+        "[supertable_fts_search] cache fully warm in {:.1}s",
+        warm_t0.elapsed().as_secs_f32()
+    );
+
     let mut g = c.benchmark_group(tiers::search_group_name("supertable_fts", Tier::Hot, None));
     g.sample_size(10);
     let rss_sample = rss::PeakSampler::start_default();
@@ -217,7 +234,7 @@ fn emit_markdown() {
         supertable::N_DOCS
     ));
     body.push_str(
-        "hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`). Cold excludes the one-time manifest open. The mmap-promoted \"warm\" tier was dropped: nothing is pinned in memory, so it measured identically to hot.\n\n",
+        "hot = warm steady state: every segment mmap-promoted via the public `Supertable::wait_until_warm` before timing, so reads hit resident pages (no object-store GETs). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open.\n\n",
     );
     body.push_str(
         "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",

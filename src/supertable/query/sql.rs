@@ -111,6 +111,7 @@ impl Supertable {
                         Arc::clone(&manifest),
                         store,
                         disk_cache,
+                        reader.tombstone_cache.clone(),
                     );
                     let ctx = SessionContext::new();
                     ctx.register_table(TABLE_NAME, Arc::new(provider))

@@ -51,6 +51,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DFSchema;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -63,10 +64,15 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use roaring::RoaringBitmap;
+
 use crate::supertable::SuperfileEntry;
 use crate::supertable::manifest::Manifest;
 use crate::supertable::query::skip::{ScalarOp, ScalarPredicate, scalar_skip};
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
+use crate::supertable::tombstones::SidecarCache;
 
 /// Logical name the supertable is registered under in the
 /// DataFusion `SessionContext`. Callers reference it as
@@ -94,6 +100,16 @@ pub(crate) struct SupertableProvider {
     store: Arc<dyn SuperfileReaderCache>,
     /// Optional disk cache (storage-backed supertables).
     disk_cache: Option<Arc<DiskCacheStore>>,
+    /// Per-superfile soft-delete (tombstone) overlay. `None` for
+    /// in-memory tables with no WAL/mutation surface. When present,
+    /// [`scan`](TableProvider::scan) pushes the tombstoned rows into
+    /// each segment's Parquet read as a [`ParquetAccessPlan`] row
+    /// selection — the *lazy* delete path: deleted rows are skipped
+    /// during decode rather than materialized then dropped (the
+    /// *eager* `MemTable` path used by mutation id-capture). This
+    /// keeps the analytical SELECT path's projection/limit/row-group
+    /// pushdown intact while still honoring deletes.
+    tombstone_cache: Option<Arc<SidecarCache>>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -105,6 +121,7 @@ impl std::fmt::Debug for SupertableProvider {
             .field("schema", &self.schema)
             .field("n_superfiles", &self.manifest.superfiles.len())
             .field("has_disk_cache", &self.disk_cache.is_some())
+            .field("has_tombstone_cache", &self.tombstone_cache.is_some())
             .finish()
     }
 }
@@ -117,12 +134,14 @@ impl SupertableProvider {
         manifest: Arc<Manifest>,
         store: Arc<dyn SuperfileReaderCache>,
         disk_cache: Option<Arc<DiskCacheStore>>,
+        tombstone_cache: Option<Arc<SidecarCache>>,
     ) -> Self {
         Self {
             schema,
             manifest,
             store,
             disk_cache,
+            tombstone_cache,
         }
     }
 
@@ -216,6 +235,11 @@ impl TableProvider for SupertableProvider {
         // Expose the surviving segments' bytes to DataFusion via an
         // in-memory object store. `parquet_bytes()` is Arc-backed,
         // so `clone()` / `PutPayload::from` are refcount bumps.
+        //
+        // One `Instant::now()` for the whole scan so every per-segment
+        // tombstone lookup shares the same `SidecarCache` TTL
+        // reference (mirrors the eager `build_mem_table` path).
+        let now = std::time::Instant::now();
         let object_store = Arc::new(InMemory::new());
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(survivors.len());
         for entry in &survivors {
@@ -241,11 +265,36 @@ impl TableProvider for SupertableProvider {
                 .clone();
             let path = entry.uri.storage_path();
             let size = bytes.len() as u64;
+
+            // Lazy delete path: translate this segment's tombstone
+            // bitmap into a Parquet row selection so deleted rows are
+            // never decoded. Absent/empty overlay → full scan, zero
+            // overhead. The `local_doc_id` in the bitmap is the row's
+            // global position within the segment's Parquet body, which
+            // is exactly the coordinate `ParquetAccessPlan` selects on.
+            let access_plan = match self.tombstone_cache.as_ref() {
+                Some(cache) => {
+                    let bitmap = cache
+                        .bitmap_for(entry.superfile_id, now)
+                        .map_err(|e| DataFusionError::Execution(format!("tombstone cache: {e}")))?;
+                    if bitmap.is_empty() {
+                        None
+                    } else {
+                        tombstone_access_plan(&bytes, &bitmap)?
+                    }
+                }
+                None => None,
+            };
+
             object_store
                 .put(&ObjPath::from(path.clone()), PutPayload::from(bytes))
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            files.push(PartitionedFile::new(path, size));
+            let mut file = PartitionedFile::new(path, size);
+            if let Some(plan) = access_plan {
+                file = file.with_extensions(Arc::new(plan));
+            }
+            files.push(file);
         }
 
         let url = ObjectStoreUrl::parse(MEMORY_STORE_URL)?;
@@ -281,6 +330,83 @@ impl TableProvider for SupertableProvider {
         let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
         Ok(plan)
     }
+}
+
+/// Build a [`ParquetAccessPlan`] that skips this segment's
+/// tombstoned rows during decode, or `None` if none of the deleted
+/// `local_doc_id`s fall inside the file (so a plain full scan is
+/// correct and cheaper than attaching an all-`Scan` plan).
+///
+/// `bitmap` holds the tombstoned `local_doc_id`s, where a row's
+/// `local_doc_id` is its 0-based global position within the segment's
+/// Parquet body (row groups are laid out in append order, so global
+/// position partitions contiguously across them). For each row group
+/// we translate the deleted positions into a [`RowSelection`] of
+/// alternating select/skip runs; fully-deleted row groups are skipped
+/// outright and clean ones are left as `Scan`.
+///
+/// Parsing the footer via [`ParquetRecordBatchReaderBuilder`] only
+/// touches metadata, not column data, and only happens when the
+/// segment actually has tombstones — clean tables pay nothing.
+fn tombstone_access_plan(
+    parquet_bytes: &Bytes,
+    bitmap: &RoaringBitmap,
+) -> DfResult<Option<ParquetAccessPlan>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
+        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
+    let row_groups = builder.metadata().row_groups();
+    // Sorted ascending — `RoaringBitmap::iter` yields in order, which
+    // lets each row group binary-search its slice of deleted ids.
+    let deleted: Vec<u32> = bitmap.iter().collect();
+
+    let mut plan = ParquetAccessPlan::new_all(row_groups.len());
+    let mut base: u32 = 0;
+    let mut any = false;
+    for (idx, rg) in row_groups.iter().enumerate() {
+        let n = rg.num_rows() as u32;
+        if n == 0 {
+            continue;
+        }
+        let lo = deleted.partition_point(|&x| x < base);
+        let hi = deleted.partition_point(|&x| x < base + n);
+        let rg_deleted = &deleted[lo..hi];
+        if rg_deleted.is_empty() {
+            base += n;
+            continue;
+        }
+        any = true;
+        if rg_deleted.len() as u32 == n {
+            plan.skip(idx);
+            base += n;
+            continue;
+        }
+        // Coalesce consecutive deleted positions into single skip runs,
+        // emitting the live gaps between them as select runs.
+        let mut selectors: Vec<RowSelector> = Vec::new();
+        let mut cursor: u32 = 0; // next un-emitted position, relative to row group
+        let mut i = 0usize;
+        while i < rg_deleted.len() {
+            let start_rel = rg_deleted[i] - base;
+            if start_rel > cursor {
+                selectors.push(RowSelector::select((start_rel - cursor) as usize));
+            }
+            let mut j = i;
+            while j + 1 < rg_deleted.len() && rg_deleted[j + 1] == rg_deleted[j] + 1 {
+                j += 1;
+            }
+            let run = (rg_deleted[j] - rg_deleted[i] + 1) as usize;
+            selectors.push(RowSelector::skip(run));
+            cursor = (rg_deleted[j] - base) + 1;
+            i = j + 1;
+        }
+        if cursor < n {
+            selectors.push(RowSelector::select((n - cursor) as usize));
+        }
+        plan.scan_selection(idx, RowSelection::from(selectors));
+        base += n;
+    }
+
+    Ok(any.then_some(plan))
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's
@@ -386,9 +512,119 @@ fn row_group_predicate(
 mod tests {
     use super::*;
 
+    use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
+
+    /// Build an in-memory Parquet file of `Int64` values `0..total`
+    /// split into row groups of `rg_size` rows each.
+    fn parquet_with_row_groups(total: i64, rg_size: usize) -> Bytes {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let arr = Int64Array::from((0..total).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).expect("batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rg_size))
+            .build();
+        let mut buf = Vec::new();
+        {
+            let mut w =
+                ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(props)).expect("writer");
+            w.write(&batch).expect("write");
+            w.close().expect("close");
+        }
+        Bytes::from(buf)
+    }
+
+    /// Decode `bytes` honoring `plan`'s row-group + row selection and
+    /// return the surviving `v` values in order.
+    fn read_with_plan(bytes: &Bytes, plan: ParquetAccessPlan) -> Vec<i64> {
+        let meta = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+            .expect("meta")
+            .metadata()
+            .clone();
+        let row_groups = plan.row_group_indexes();
+        let selection = plan
+            .into_overall_row_selection(meta.row_groups())
+            .expect("overall selection");
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+            .expect("builder")
+            .with_row_groups(row_groups);
+        if let Some(sel) = selection {
+            builder = builder.with_row_selection(sel);
+        }
+        let reader = builder.build().expect("reader");
+        let mut got = Vec::new();
+        for b in reader {
+            let b = b.expect("batch");
+            let c = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 col");
+            for i in 0..c.len() {
+                got.push(c.value(i));
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn tombstone_access_plan_none_when_no_deletes_in_file() {
+        let bytes = parquet_with_row_groups(12, 4);
+        // Tombstone an id past the end of the file → nothing selected.
+        let mut bm = RoaringBitmap::new();
+        bm.insert(99);
+        assert!(
+            tombstone_access_plan(&bytes, &bm).expect("plan").is_none(),
+            "no deleted id falls inside the file → full scan (None)"
+        );
+    }
+
+    #[test]
+    fn tombstone_access_plan_skips_deleted_across_row_groups() {
+        // 3 row groups of 4 rows: rg0=0..4, rg1=4..8, rg2=8..12.
+        let bytes = parquet_with_row_groups(12, 4);
+
+        // rg0: delete 0,1 (consecutive run at the start)
+        // rg1: delete 4,5,6,7 (whole row group → Skip)
+        // rg2: delete 10 (single row mid-group)
+        let mut bm = RoaringBitmap::new();
+        for id in [0u32, 1, 4, 5, 6, 7, 10] {
+            bm.insert(id);
+        }
+
+        let plan = tombstone_access_plan(&bytes, &bm)
+            .expect("plan")
+            .expect("some deletes");
+
+        // Whole-deleted row group is skipped entirely.
+        assert!(!plan.should_scan(1), "fully-tombstoned row group 1 skipped");
+        assert!(plan.should_scan(0));
+        assert!(plan.should_scan(2));
+
+        let survivors = read_with_plan(&bytes, plan);
+        assert_eq!(survivors, vec![2, 3, 8, 9, 11]);
+    }
+
+    #[test]
+    fn tombstone_access_plan_handles_alternating_and_boundary_deletes() {
+        // Single row group of 8 rows with an alternating pattern plus
+        // the last row deleted (exercises the trailing-select branch).
+        let bytes = parquet_with_row_groups(8, 8);
+        let mut bm = RoaringBitmap::new();
+        for id in [0u32, 2, 4, 7] {
+            bm.insert(id);
+        }
+        let plan = tombstone_access_plan(&bytes, &bm)
+            .expect("plan")
+            .expect("some deletes");
+        let survivors = read_with_plan(&bytes, plan);
+        assert_eq!(survivors, vec![1, 3, 5, 6]);
+    }
 
     fn schema_xy() -> SchemaRef {
         Arc::new(Schema::new(vec![

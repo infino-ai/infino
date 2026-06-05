@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn arg_to_query_vector_parses_csv_string() {
-        let v = arg_to_query_vector(&lit("0.5, 1, -2.25")).unwrap();
+        let v = arg_to_query_vector(&lit("0.5, 1, -2.25")).expect("csv vector");
         assert_eq!(v, vec![0.5, 1.0, -2.25]);
     }
 

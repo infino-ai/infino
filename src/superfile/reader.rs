@@ -844,19 +844,20 @@ impl SuperfileReader {
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
     ///
-    /// Sync — every public surface in `src/` is sync (plan 002 Q9).
-    /// Per-range byte access routes through
-    /// [`crate::superfile::lazy_source::Source::get_range`] /
-    /// `get_ranges_parallel`, which resolve zero-copy on the sync
+    /// Async — consistent with [`Self::bm25_search`]: the reader's
+    /// search surfaces are `async` so the supertable fan-out can drive
+    /// every segment concurrently on the shared query runtime. The
+    /// public `Supertable` API remains strictly sync; it wraps these
+    /// kernels in `block_on_query` (plan 002 Q9). Per-range byte access
+    /// routes through
+    /// [`crate::superfile::lazy_source::Source::range_async`] /
+    /// `get_ranges_parallel_async`, which resolve zero-copy on the sync
     /// fast path for `Source::InMemory` and warm-cache `Source::Lazy`
-    /// (`BytesLazyByteSource`, mmap-backed). Only a cold `Source::Lazy`
-    /// miss bridges to the underlying async `LazyByteSource::range`
-    /// internally. The supertable fan-out
-    /// ([`crate::supertable::handle::SupertableReader::vector_search`])
-    /// drives this on the `reader_pool` rayon threads, so per-segment
-    /// CPU (centroid + 1-bit code scoring, rerank) runs in one pool
-    /// with work-stealing rather than oversubscribing tokio workers.
-    pub fn vector_search(
+    /// (`BytesLazyByteSource`, mmap-backed) via `try_get_range_sync`;
+    /// only a cold `Source::Lazy` miss actually `await`s an
+    /// object-store GET. The CPU steps (centroid + 1-bit code scoring,
+    /// rerank) parallelize on the global rayon pool.
+    pub async fn vector_search(
         &self,
         column: &str,
         query: &[f32],
@@ -867,7 +868,8 @@ impl SuperfileReader {
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
-        Ok(v.search(column, query, k, options.nprobe, rerank_mult)?)
+        Ok(v.search_async(column, query, k, options.nprobe, rerank_mult)
+            .await?)
     }
 }
 
@@ -1281,6 +1283,7 @@ mod tests {
         normalize(&mut q);
         let hits = r
             .vector_search("emb", &q, 1, VectorSearchOptions::default())
+            .await
             .expect("vector search");
         assert!(!hits.is_empty());
     }
@@ -1296,6 +1299,7 @@ mod tests {
         normalize(&mut q);
         let hits = r
             .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
+            .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
     }

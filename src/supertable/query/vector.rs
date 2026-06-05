@@ -52,14 +52,11 @@
 
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::reader_cache::SuperfileReaderCache;
 
 use super::SuperfileHit;
 
@@ -91,11 +88,6 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let storage = manifest.options.storage.as_ref().map(Arc::clone);
-        let tombstone_cache = self.tombstone_cache.clone();
-        let now = std::time::Instant::now();
 
         let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
             Some(list) => {
@@ -133,79 +125,35 @@ impl SupertableReader {
         // against the running k-th best distance; a static
         // heuristic cutoff is wrong. Correct first, fast second.
         //
-        // Fan-out is split by concern, mirroring the SQL resolve
-        // path (`query::exec::common`):
-        //   1. **Open** every kept segment's reader **concurrently**
-        //      on the tokio runtime — opens are async I/O (in-memory
-        //      cache hits / disk-cache cold fetches), so overlapping
-        //      them wide is the right model and warm opens cost
-        //      microseconds.
-        //   2. **Search** every segment **in parallel** on
-        //      `options.reader_pool` (rayon). The per-segment kNN
-        //      search is CPU-bound over resident bytes on the hot
-        //      path (centroid + 1-bit code scoring, then rerank);
-        //      driving it on the reader pool keeps ALL per-segment
-        //      CPU in one work-stealing pool instead of
-        //      oversubscribing the tokio workers with the inner
-        //      `par_iter` on the global pool. Bridged back to the
-        //      async caller via a oneshot so no runtime worker is
-        //      blocked. Cold lazy misses inside the search bridge
-        //      through `Source::get_range` internally.
-        let fanout_t0 = std::time::Instant::now();
-        let open_t0 = std::time::Instant::now();
-        let opened: Vec<Arc<SuperfileReader>> = futures::future::try_join_all(
-            superfiles
-                .iter()
-                .map(|entry| open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry)),
-        )
-        .await?;
-        let open_us = open_t0.elapsed().as_micros() as u64;
+        // Dispatch goes through the shared fan-out
+        // ([`query::dispatch::fanout`]) that the FTS path also uses:
+        // one `tokio::spawn` per segment on the shared query runtime
+        // opens the reader and runs the per-segment kNN kernel, both
+        // `await`ed — so cold object-store GETs across all segments
+        // are concurrent and pool connections (tokio owns the I/O).
+        // The kernel is [`SuperfileReader::vector_search`] (async,
+        // mirroring the FTS `bm25_search` path): it keeps its
+        // centroid/code scoring + rerank on the global rayon pool via
+        // `par_iter` (rayon owns the CPU). The orchestrator also warms
+        // the tombstone sidecars in one concurrent batch and drops
+        // tombstoned rows per segment.
+        let column_arc = Arc::new(column.to_owned());
+        let query_arc = Arc::new(query.to_vec());
+        let units: Vec<(Arc<SuperfileEntry>, ())> =
+            superfiles.into_iter().map(|e| (e, ())).collect();
+        let kernel = move |reader: Arc<SuperfileReader>, _params: ()| {
+            let column = Arc::clone(&column_arc);
+            let query = Arc::clone(&query_arc);
+            async move {
+                reader
+                    .vector_search(&column, &query, k, options)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))
+            }
+        };
+        let per_segment = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
 
-        // Pure-CPU phase on the reader pool. `into_par_iter`'s ordered
-        // collect preserves segment order, so `per_segment[i]` lines up
-        // with `superfiles[i]` for the post-phase tombstone filter.
-        let pool = Arc::clone(&manifest.options.reader_pool);
-        let column_owned = column.to_owned();
-        let query_owned = query.to_vec();
-        let timing_enabled = fanout_timing_enabled();
-        let inputs: Vec<Arc<SuperfileReader>> = opened;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        pool.spawn(move || {
-            let result: Result<Vec<(Vec<(u32, f32)>, u64)>, QueryError> = inputs
-                .into_par_iter()
-                .map(|reader| {
-                    let search_t0 = std::time::Instant::now();
-                    let hits = reader
-                        .vector_search(&column_owned, &query_owned, k, options)
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    Ok((hits, search_t0.elapsed().as_micros() as u64))
-                })
-                .collect();
-            let _ = tx.send(result);
-        });
-        let per_segment = rx.await.map_err(|_| {
-            QueryError::Store("vector fan-out: reader pool dropped result".into())
-        })??;
-
-        // Tombstone filtering stays on the tokio side: a cache miss
-        // refreshes the sidecar from storage (blocking I/O via the
-        // sync→async bridge), which does not belong on the CPU pool.
-        // On the hot path every `bitmap_for` is a cache hit, so this
-        // is a cheap serial pass over the already-scored segments.
-        let mut results: Vec<Vec<SuperfileHit>> = Vec::with_capacity(per_segment.len());
-        let mut searches: Vec<u64> = Vec::with_capacity(per_segment.len());
-        for (entry, (hits, search_us)) in superfiles.iter().zip(per_segment) {
-            let mut tagged = tag_hits(entry.as_ref(), hits);
-            apply_tombstone_filter(tombstone_cache.as_ref(), entry.as_ref(), &mut tagged, now)?;
-            results.push(tagged);
-            searches.push(search_us);
-        }
-
-        if timing_enabled {
-            summarize_fanout_timing(open_us, &searches, fanout_t0.elapsed().as_micros() as u64);
-        }
-
-        Ok(top_k_ascending(results, k))
+        Ok(top_k_ascending(per_segment, k))
     }
 }
 
@@ -227,104 +175,6 @@ impl Supertable {
         let reader = self.reader();
         self.block_on_query(reader.vector_search(column, query, k, options))
     }
-}
-
-/// `INFINO_FANOUT_TIMING=1` enables per-segment fan-out timing.
-fn fanout_timing_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var("INFINO_FANOUT_TIMING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// Print the aggregate open wall + per-segment search wall
-/// distribution next to the total fan-out wall. With the
-/// two-phase fan-out (concurrent opens on tokio, then parallel
-/// search on the reader pool) the key signal is `total /
-/// (open + max_search)`: ~1.0 means the search phase is fully
-/// parallel (cost is the slowest segment); ≫1.0 means the reader
-/// pool is serializing the per-segment CPU.
-fn summarize_fanout_timing(open_us: u64, search_us: &[u64], total_us: u64) {
-    let n = search_us.len();
-    if n == 0 {
-        eprintln!("[fanout-timing] no segments recorded; total={total_us}us");
-        return;
-    }
-    let mut searches: Vec<u64> = search_us.to_vec();
-    searches.sort_unstable();
-    let pct = |v: &[u64], p: f64| -> u64 {
-        let idx = (((v.len() - 1) as f64) * p).round() as usize;
-        v[idx]
-    };
-    let max_search = searches.last().copied().unwrap_or(0);
-    let ratio = total_us as f64 / (open_us + max_search).max(1) as f64;
-    eprintln!(
-        "[fanout-timing] n_seg={n} total={:.1}ms | opens(concurrent)={:.1}ms | \
-         per-seg search: p50={:.1} p90={:.1} max={:.1}ms | \
-         total/(open+max_search)={:.1}x  ({})",
-        total_us as f64 / 1000.0,
-        open_us as f64 / 1000.0,
-        pct(&searches, 0.5) as f64 / 1000.0,
-        pct(&searches, 0.9) as f64 / 1000.0,
-        max_search as f64 / 1000.0,
-        ratio,
-        if ratio <= 1.5 {
-            "PARALLEL: cost is open + slowest-segment search"
-        } else {
-            "SERIALIZED: reader-pool search is being serialized"
-        },
-    );
-}
-
-async fn open_reader(
-    store: &Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
-    storage: Option<&Arc<dyn crate::storage::StorageProvider>>,
-    entry: &SuperfileEntry,
-) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(
-        store,
-        disk_cache,
-        storage,
-        &entry.uri,
-        entry.subsection_offsets.as_ref(),
-    )
-    .await
-    .map_err(|e| QueryError::Store(e.to_string()))
-}
-
-fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
-    hits.into_iter()
-        .map(|(local_doc_id, score)| SuperfileHit {
-            segment: entry.uri,
-            local_doc_id,
-            score,
-        })
-        .collect()
-}
-
-/// Drop tombstoned `local_doc_id`s from one superfile's vector hits.
-/// Same shape + perf properties as the FTS path's filter — see
-/// `query::fts::apply_tombstone_filter` for the design rationale.
-fn apply_tombstone_filter(
-    cache: Option<&Arc<crate::supertable::tombstones::SidecarCache>>,
-    entry: &SuperfileEntry,
-    hits: &mut Vec<SuperfileHit>,
-    now: std::time::Instant,
-) -> Result<(), QueryError> {
-    let Some(cache) = cache else {
-        return Ok(());
-    };
-    let bitmap = cache
-        .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
-        return Ok(());
-    }
-    hits.retain(|h| !bitmap.contains(h.local_doc_id));
-    Ok(())
 }
 
 /// Merge per-segment hits and return the top-k by *ascending*
@@ -652,6 +502,7 @@ mod tests {
 
         let oracle_hits = oracle
             .vector_search("emb", &q, 2, opts)
+            .await
             .expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
@@ -761,8 +612,13 @@ mod tests {
             })
             .collect();
 
-        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
-            .expect("filter");
+        crate::supertable::query::dispatch::apply_tombstone_filter(
+            Some(&cache),
+            &entry,
+            &mut hits,
+            std::time::Instant::now(),
+        )
+        .expect("filter");
 
         let remaining: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
         assert_eq!(remaining, vec![0u32, 2, 4, 6, 7]);
@@ -779,8 +635,13 @@ mod tests {
             })
             .collect();
         let original = hits.clone();
-        super::apply_tombstone_filter(None, &entry, &mut hits, std::time::Instant::now())
-            .expect("no-cache");
+        crate::supertable::query::dispatch::apply_tombstone_filter(
+            None,
+            &entry,
+            &mut hits,
+            std::time::Instant::now(),
+        )
+        .expect("no-cache");
         assert_eq!(hits, original);
     }
 
@@ -804,8 +665,13 @@ mod tests {
             })
             .collect();
         let original = hits.clone();
-        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
-            .expect("filter");
+        crate::supertable::query::dispatch::apply_tombstone_filter(
+            Some(&cache),
+            &entry,
+            &mut hits,
+            std::time::Instant::now(),
+        )
+        .expect("filter");
         assert_eq!(hits, original);
     }
 }

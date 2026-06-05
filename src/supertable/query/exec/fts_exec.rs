@@ -482,10 +482,10 @@ mod tests {
 
     #[test]
     fn arg_to_bool_mode_accepts_or_and_case_insensitive_rejects_junk() {
-        assert_eq!(arg_to_bool_mode(&lit("or")).unwrap(), BoolMode::Or);
-        assert_eq!(arg_to_bool_mode(&lit("OR")).unwrap(), BoolMode::Or);
-        assert_eq!(arg_to_bool_mode(&lit("and")).unwrap(), BoolMode::And);
-        assert_eq!(arg_to_bool_mode(&lit("AND")).unwrap(), BoolMode::And);
+        assert_eq!(arg_to_bool_mode(&lit("or")).expect("or"), BoolMode::Or);
+        assert_eq!(arg_to_bool_mode(&lit("OR")).expect("OR"), BoolMode::Or);
+        assert_eq!(arg_to_bool_mode(&lit("and")).expect("and"), BoolMode::And);
+        assert_eq!(arg_to_bool_mode(&lit("AND")).expect("AND"), BoolMode::And);
         assert!(arg_to_bool_mode(&lit("xor")).is_err());
         assert!(arg_to_bool_mode(&lit(5_i64)).is_err());
     }

@@ -185,11 +185,17 @@ pub fn bench(c: &mut Criterion) {
         "[supertable_vec] correctness OK: vector recall@{TOP_K} = {recall:.3} (≥ {CORRECTNESS_RECALL_FLOOR:.2})"
     );
 
-    // Warm the shared in-process cache the way a real client does: by
-    // serving queries through the public API. No internal warm hook —
-    // production has none. A broad nprobe sweep over the correctness
-    // queries pulls every segment's data into the disk cache before we
-    // measure the hot tier (and calibration below adds many more reads).
+    // Warm the shared in-process cache the way a real serving node
+    // does: serve a few queries through the public API to kick off the
+    // background full-segment fills, then block on the public
+    // `Supertable::wait_until_warm` until every segment is actually
+    // mmap-promoted. The query replay alone does NOT make the tier hot —
+    // it leaves the segments backed by the lazy object-store source, so
+    // the "hot" measurement would really time live S3 range GETs
+    // (~seconds). `wait_until_warm` is the documented warm-readiness
+    // primitive (see supertable.md); it both waits for and drives
+    // promotion to completion, which is exactly what a node does before
+    // taking traffic.
     eprintln!("[supertable_vec] warming cache by serving queries (public API)...");
     let warm_t0 = Instant::now();
     let warm_opts = VectorSearchOptions::new().with_nprobe(CORRECTNESS_NPROBE);
@@ -197,8 +203,14 @@ pub fn bench(c: &mut Criterion) {
         let _ = vector_topk_global(st, query, TOP_K, warm_opts);
     }
     eprintln!(
-        "[supertable_vec] cache warmed via {} queries in {:.1}s",
+        "[supertable_vec] served {} warm-up queries in {:.1}s; waiting for mmap promotion...",
         g.correctness_queries.len(),
+        warm_t0.elapsed().as_secs_f32()
+    );
+    st.wait_until_warm(Duration::from_secs(180))
+        .expect("supertable cache failed to reach warm (mmap-promoted) state");
+    eprintln!(
+        "[supertable_vec] cache fully warm (all segments mmap-promoted) in {:.1}s",
         warm_t0.elapsed().as_secs_f32()
     );
 
@@ -326,7 +338,7 @@ fn emit_markdown(cal: &Calibrations) {
         crate::corpus::DIM
     ));
     body.push_str(
-        "hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open. The mmap-promoted \"warm\" tier was dropped: nothing is pinned in memory, so it measured identically to hot.\n\n",
+        "hot = warm steady state: every segment mmap-promoted via the public `Supertable::wait_until_warm` before timing, so reads hit resident pages (no object-store GETs). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open.\n\n",
     );
     body.push_str(
         "| Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",

@@ -1,7 +1,6 @@
-//! Shared hot / warm / cold storage tier helpers for canonical benches.
+//! Shared hot / cold storage tier helpers for canonical benches.
 //!
 //! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
-//! - **Warm**: same, with explicit mmap promotion before timing.
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
 //! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
@@ -10,7 +9,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use bytes::Bytes;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
@@ -34,17 +32,15 @@ const SUPERFILE_S3S_BUCKET: &str = "infino-bench-superfile";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Hot,
-    Warm,
     Cold,
 }
 
 impl Tier {
-    pub const ALL: [Tier; 3] = [Tier::Hot, Tier::Warm, Tier::Cold];
+    pub const ALL: [Tier; 2] = [Tier::Hot, Tier::Cold];
 
     pub fn label(self) -> &'static str {
         match self {
             Tier::Hot => "hot",
-            Tier::Warm => "warm",
             Tier::Cold => "cold",
         }
     }
@@ -54,8 +50,8 @@ impl Tier {
 pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) -> String {
     match tier {
         Tier::Hot => format!("{family}_hot_search"),
-        Tier::Warm | Tier::Cold => {
-            let label = storage_label.expect("warm/cold groups need a storage label");
+        Tier::Cold => {
+            let label = storage_label.expect("cold groups need a storage label");
             format!("{family}_{}_search_{label}", tier.label())
         }
     }
@@ -353,19 +349,6 @@ pub fn consumer_options(
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {
     Supertable::open(opts).expect("Supertable::open from object store")
-}
-
-/// Wait until a superfile URI is promoted to mmap (warm tier).
-pub async fn wait_for_superfile_promotion(
-    cache: &Arc<DiskCacheStore>,
-    uri: SuperfileUri,
-    timeout: Duration,
-) {
-    cache
-        .wait_until_mmap_promoted(&uri, timeout)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    let _ = cache.reader(&uri).await.expect("warm reader sanity");
 }
 
 #[allow(dead_code)]

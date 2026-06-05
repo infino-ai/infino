@@ -664,6 +664,48 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
+    /// Block until the on-disk cache has fully promoted every segment
+    /// in the current manifest to an mmap-backed reader, or `timeout`
+    /// elapses for one of them. This is the public "warm-readiness"
+    /// primitive: once it returns `Ok(())`, subsequent searches read
+    /// from resident mmap pages instead of issuing object-store range
+    /// GETs through the lazy foreground source, so latency drops from
+    /// the cold/lazy path (hundreds of ms — seconds against real S3) to
+    /// the in-memory steady state (single-digit ms).
+    ///
+    /// A real serving node calls this on startup, after `open`, to take
+    /// traffic only once its cache is hot. No-op when no disk cache is
+    /// attached, and a short-circuit when background fill is disabled
+    /// (`INFINO_DISABLE_BG_FILL`) — nothing is ever promoted then, so
+    /// there is nothing to wait for and blocking until `timeout` would
+    /// be pointless.
+    ///
+    /// Crucially, requesting promotion here is also what *drives* it to
+    /// completion: registering a promotion waiter releases the
+    /// background full-segment fill that otherwise idles behind
+    /// foreground lazy readers under steady query load. Warming purely
+    /// by replaying queries does not register that waiter, so the
+    /// segments can stay lazy/S3-backed indefinitely.
+    pub fn wait_until_warm(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), crate::supertable::reader_cache::disk::DiskCacheError> {
+        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
+            return Ok(());
+        };
+        if crate::supertable::reader_cache::disk::skip_background_fill() {
+            return Ok(());
+        }
+        let cache = Arc::clone(cache);
+        let manifest = self.inner.manifest.load_full();
+        self.block_on_query(async move {
+            for entry in manifest.superfiles.iter() {
+                cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+            }
+            Ok(())
+        })
+    }
+
     /// This handle's lease-owner id. Stamped on every WAL the
     /// handle's recovery sweep / commit pipeline acquires.
     /// Minted once at handle construction via `IdGenerator`;

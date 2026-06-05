@@ -7,8 +7,8 @@
 //!
 //! Every phase uses the production path: [`SuperfileBuilder`] →
 //! [`SuperfileReader`] → [`SuperfileReader::vector_search`]. Hot
-//! opens the finished `.parquet` in memory; warm/cold commit the same bytes
-//! to object storage and read through [`DiskCacheStore::reader`].
+//! opens the finished `.parquet` in memory; cold commits the same bytes
+//! to object storage and reads through [`DiskCacheStore::reader`].
 //!
 //! Pinned to 1M × 384. Supertable scale (10M × 384, sharded into N
 //! superfiles) lives in `benches/vector/supertable.rs`.
@@ -95,7 +95,7 @@ fn superfile_object() -> &'static tiers::SuperfileCommitted {
     SUPERFILE_OBJECT.get_or_init(|| {
         let blob = Bytes::from(superfile_bytes().to_vec());
         eprintln!(
-            "[superfile_vec] committing {N_DOCS} docs to object storage for warm/cold tiers \
+            "[superfile_vec] committing {N_DOCS} docs to object storage for the cold tier \
              (production .parquet, {} MiB)...",
             blob.len() / (1024 * 1024)
         );
@@ -200,7 +200,7 @@ fn assert_infino_self_consistent(reader: &SuperfileReader) -> f32 {
     let mut total_recall = 0.0_f32;
     for (q, truth) in qs.iter().zip(gt.iter()) {
         let hits =
-            corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
+            corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
                 .expect("vector_search");
         assert_eq!(
             hits.len(),
@@ -263,11 +263,7 @@ fn bench(c: &mut Criterion) {
     );
     let run_search = fixture::supertable::criterion_filter_selects(
         &["superfile_vec", "superfile_vector", "superfile_vec_search"],
-        &[
-            "superfile_vec_hot_search",
-            "superfile_vec_warm_search",
-            "superfile_vec_cold_search",
-        ],
+        &["superfile_vec_hot_search", "superfile_vec_cold_search"],
     );
     if !run_build && !run_search {
         return;
@@ -331,7 +327,7 @@ fn bench(c: &mut Criterion) {
                     let q = &qs[0];
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts).await
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -346,7 +342,7 @@ fn bench(c: &mut Criterion) {
         g.bench_function("infino_default_options_top10", |b| {
             b.iter(|| {
                 let hits = corpus::block_on_inmem(async {
-                    reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts)
+                    reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts).await
                 })
                 .expect("vector_search");
                 black_box(hits)
@@ -366,7 +362,7 @@ fn bench(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts).await
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -384,7 +380,7 @@ fn bench(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts).await
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -422,7 +418,7 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
     let uri: SuperfileUri = committed.uri;
     let q = &qs[0];
 
-    for tier in [Tier::Warm, Tier::Cold] {
+    for tier in [Tier::Cold] {
         let mut g = c.benchmark_group(tiers::search_group_name(
             "superfile_vec",
             tier,
@@ -431,8 +427,7 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
         g.sample_size(10);
         // Cold rebuilds a fresh cache + full S3 cold open per sample, so a
         // single sample can exceed the 5s default and criterion warns it
-        // can't fit 10 samples. Give it room (the warm/hot rows are sub-ms
-        // and finish well inside the default, so only widen cold).
+        // can't fit 10 samples. Give it room.
         if tier == Tier::Cold {
             g.measurement_time(Duration::from_secs(30));
         }
@@ -446,35 +441,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
             let bench_id = format!("infino_{label}");
 
             match tier {
-                Tier::Warm => {
-                    let storage = Arc::clone(&committed.storage);
-                    let (cache_dir, cache) = tiers::fresh_superfile_cache(storage.clone());
-                    let query = q.clone();
-                    let opts = search_opts(p, r);
-                    tiers::block_on(async {
-                        let reader = cache.reader(&uri).await.expect("warm prewarm open");
-                        tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
-                            .await;
-                        let _ = reader
-                            .vector_search(VEC_COLUMN, &query, TOP_K, opts)
-                            .expect("warm prewarm search");
-                    });
-                    let cache_ref = Arc::clone(&cache);
-                    g.bench_function(&bench_id, |b| {
-                        let query = q.clone();
-                        b.iter(|| {
-                            let hits = tiers::block_on(async {
-                                let reader = cache_ref.reader(&uri).await.expect("warm reader");
-                                reader
-                                    .vector_search(VEC_COLUMN, &query, TOP_K, opts)
-                                    .expect("vector_search")
-                            });
-                            black_box(hits)
-                        });
-                    });
-                    drop(cache);
-                    drop(cache_dir);
-                }
                 Tier::Cold => {
                     let storage = Arc::clone(&committed.storage);
                     let query = q.clone();
@@ -490,6 +456,7 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                                     let reader = cache.reader(&uri).await.expect("cold reader");
                                     let _ = reader
                                         .vector_search(VEC_COLUMN, &query, TOP_K, opts)
+                                        .await
                                         .expect("cold vector_search");
                                 });
                                 total += t0.elapsed();
@@ -507,30 +474,6 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
         let bench_id = "infino_default_options_top10";
         let default_opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
         match tier {
-            Tier::Warm => {
-                let storage = Arc::clone(&committed.storage);
-                let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
-                tiers::block_on(async {
-                    let _ = cache.reader(&uri).await.expect("open");
-                    tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
-                        .await;
-                });
-                let cache_ref = Arc::clone(&cache);
-                let query = q.clone();
-                g.bench_function(bench_id, |b| {
-                    b.iter(|| {
-                        let hits = tiers::block_on(async {
-                            let reader = cache_ref.reader(&uri).await.expect("reader");
-                            reader
-                                .vector_search(VEC_COLUMN, &query, TOP_K, default_opts)
-                                .expect("vector_search")
-                        });
-                        black_box(hits)
-                    });
-                });
-                drop(cache);
-                drop(cache_dir);
-            }
             Tier::Cold => {
                 let storage = Arc::clone(&committed.storage);
                 let query = q.clone();
@@ -545,6 +488,7 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
                                 let reader = cache.reader(&uri).await.expect("reader");
                                 let _ = reader
                                     .vector_search(VEC_COLUMN, &query, TOP_K, default_opts)
+                                    .await
                                     .expect("vector_search");
                             });
                             total += t0.elapsed();
@@ -616,14 +560,14 @@ fn emit_search_markdown() {
         "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object storage via \
-         `DiskCacheStore::reader` → `vector_search` (production cold/warm path).\n\n",
+        "Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via \
+         `DiskCacheStore::reader` → `vector_search` (production cold path).\n\n",
     );
     body.push_str(
-        "| Recall target | (p, r)     | hot        | warm       | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+        "| Recall target | (p, r)     | hot        | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|---------------|------------|------------|------------|------------|----------|------------|---------|------------|\n",
+        "|---------------|------------|------------|------------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
@@ -632,7 +576,6 @@ fn emit_search_markdown() {
         if let Some(c_inf) = cal.infino[i] {
             let id = format!("infino_{label}");
             let hot = read_mean_ns(group, &id);
-            let warm = markdown::read_tier_mean_ns("superfile_vec", "warm", &id);
             let cold = markdown::read_tier_mean_ns("superfile_vec", "cold", &id);
             let peak = rss::read_peak_rss_bytes(group, &id);
             let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
@@ -640,16 +583,15 @@ fn emit_search_markdown() {
             let p90_rss = rss::fmt_p90_rss(group, &id);
             let rss_delta = rss::fmt_peak_rss_delta(group, &id);
             body.push_str(&format!(
-                "| {row_target:13} | (p={}, r={}) | {} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
+                "| {row_target:13} | (p={}, r={}) | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
                 c_inf.probe,
                 c_inf.refine,
                 hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-                warm.map(fmt_time).unwrap_or_else(|| "—".into()),
                 cold.map(fmt_time).unwrap_or_else(|| "—".into()),
             ));
         } else {
             body.push_str(&format!(
-                "| {row_target:13} | — | — | — | — | — | — | — | — |\n"
+                "| {row_target:13} | — | — | — | — | — | — | — |\n"
             ));
         }
     }
@@ -661,8 +603,6 @@ fn emit_search_markdown() {
     body.push_str("| Metric | Value |\n");
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");
-    let def_warm =
-        markdown::read_tier_mean_ns("superfile_vec", "warm", "infino_default_options_top10");
     let def_cold =
         markdown::read_tier_mean_ns("superfile_vec", "cold", "infino_default_options_top10");
     let def_s = def.map(fmt_time).unwrap_or_else(|| "—".into());
@@ -673,10 +613,6 @@ fn emit_search_markdown() {
     let def_p90 = rss::fmt_p90_rss(group, "infino_default_options_top10");
     body.push_str(&format!(
         "| infino_default_options_top10 (hot) | {def_s} |\n"
-    ));
-    body.push_str(&format!(
-        "| infino_default_options_top10 (warm) | {} |\n",
-        def_warm.map(fmt_time).unwrap_or_else(|| "—".into())
     ));
     body.push_str(&format!(
         "| infino_default_options_top10 (cold) | {} |\n",
@@ -719,7 +655,7 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     let q = &queries_calibration()[0];
     let opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
     let t0 = Instant::now();
-    let _ = corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
+    let _ = corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
         .expect("vector_search");
     let first_q_elapsed = t0.elapsed();
 

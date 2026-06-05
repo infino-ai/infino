@@ -12,7 +12,7 @@ enter this tree's dependency graph.
 `cargo bench` runs only the regular local perf benches above. Diagnostic
 benches are opt-in via `--features bench-diagnostics`:
 
-- `object-store` — S3-compatible cold/warm lazy-fetch path over a unified 1M superfile.
+- `object-store` — S3-compatible cold lazy-fetch path over a unified 1M superfile.
 - `scale` — release-profile recall gates such as `vector_recall`.
 
 ## Invocation
@@ -93,26 +93,28 @@ Build path: `SuperfileBuilder` → unified `.parquet` (same as production supert
 <!-- BEGIN: bench/fts/superfile/search -->
 ### Superfile FTS — search (1000000 docs)
 
-Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` (production cold/warm path).
+Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` (production cold path).
 
-| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
-|----------------|------------|------------|------------|-----------|------------|-----------|------------|
+| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|------------|-----------|------------|-----------|------------|
 **OR queries:**
 
-| single_rare    | 671 ns | — | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| single_df1     | 279 ns | — | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| single_common  | 26.67 µs | 27.12 µs | 306.60 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| two_term_or    | 183.65 µs | 184.09 µs | 346.61 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_wide_or  | 2.67 ms | 2.67 ms | 396.86 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_similar_or | 11.00 ms | — | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| five_term_or   | 19.18 ms | — | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| single_rare    | 671 ns | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| single_df1     | 279 ns | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| single_common  | 26.67 µs | 306.60 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| two_term_or    | 183.65 µs | 346.61 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| three_wide_or  | 2.67 ms | 396.86 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| three_similar_or | 11.00 ms | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| five_term_or   | 19.18 ms | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
 
 **AND queries:**
 
-| two_term_and   | 232.47 µs  | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_wide_and | 4.04 ms    | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_similar_and | 6.53 ms    | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| five_term_and  | 8.01 ms    | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|------------|-----------|------------|-----------|------------|
+| two_term_and   | 232.47 µs  | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| three_wide_and | 4.04 ms    | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| three_similar_and | 6.53 ms | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| five_term_and  | 8.01 ms    | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
 
 **Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):
 
@@ -131,7 +133,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 319.28 s | 31.3 K/s | 6.25 GiB | 2.10 GiB | 3.40 GiB | +1.6% no change |
+| supertable | 268.25 s | 37.3 K/s | 6.27 GiB | 2.09 GiB | 3.52 GiB | +1.8% no change |
 
 <!-- END: bench/supertable/ingest/supertable_fts_build -->
 
@@ -167,20 +169,19 @@ hot = in-process, segments already cached (warm steady state). cold = fresh disk
 <!-- BEGIN: bench/vector/superfile/search -->
 ### Superfile vector — search (1000000 docs × dim=384, calibrated at recall targets)
 
-Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `vector_search` (production cold/warm path).
+Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `vector_search` (production cold path).
 
-| Recall target | (p, r)     | hot        | warm       | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
-|---------------|------------|------------|------------|------------|----------|------------|---------|------------|
-| 0.90          | (p=1, r=256) | 825.12 µs | 827.72 µs | 290.23 ms | 3.82 GiB | 3.80 GiB | 3.80 GiB | — |
-| 0.95          | (p=5, r=256) | 970.47 µs | 966.88 µs | 306.32 ms | 3.82 GiB | 3.80 GiB | 3.80 GiB | — |
-| 0.99          | — | — | — | — | — | — | — | — |
+| Recall target | (p, r)     | hot        | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
+|---------------|------------|------------|------------|----------|------------|---------|------------|
+| 0.90          | (p=1, r=256) | 825.12 µs | 290.23 ms | 3.82 GiB | 3.80 GiB | 3.80 GiB | — |
+| 0.95          | (p=5, r=256) | 970.47 µs | 306.32 ms | 3.82 GiB | 3.80 GiB | 3.80 GiB | — |
+| 0.99          | — | — | — | — | — | — | — |
 
 **infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):
 
 | Metric | Value |
 |--------|-------|
 | infino_default_options_top10 (hot) | 772.59 µs |
-| infino_default_options_top10 (warm) | 772.95 µs |
 | infino_default_options_top10 (cold) | 359.64 ms |
 | infino_default_options_top10_peak_rss | 3.82 GiB |
 | infino_default_options_top10_median_rss | 3.80 GiB |
@@ -195,7 +196,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 165.51 s | 60.4 K/s | 3.14 GiB | 2.38 GiB | 2.81 GiB | -0.4% no change |
+| supertable | 117.03 s | 85.5 K/s | 3.34 GiB | 2.41 GiB | 3.01 GiB | +6.8% regressed |
 
 <!-- END: bench/supertable/ingest/supertable_vec_build -->
 

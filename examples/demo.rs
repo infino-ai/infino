@@ -111,6 +111,7 @@ fn demo_superfile() -> Bytes {
         // embedding -> distance ~0 under cosine.
         let knn = reader
             .vector_search("emb", &emb, 10, VectorSearchOptions::default())
+            .await
             .expect("vector_search");
         println!("  knn  self-query -> {} hit(s): {knn:?}", knn.len());
     });

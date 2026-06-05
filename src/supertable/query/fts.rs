@@ -161,6 +161,14 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(Vec::new());
         }
+        // Warm the tombstone sidecar cache for every kept segment in
+        // one concurrent batch before the per-segment fan-out, so the
+        // in-spawn `apply_tombstone_filter` calls are all cache hits.
+        // See `SidecarCache::prefetch`.
+        if let Some(cache) = tombstone_cache.as_ref() {
+            let ids: Vec<_> = kept.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
+        }
         let work_units = build_or_work_units(&kept, mode, term_refs.len(), pool_threads);
 
         let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
@@ -299,6 +307,14 @@ impl SupertableReader {
             .collect();
         if kept.is_empty() {
             return Ok(Vec::new());
+        }
+        // Warm the tombstone sidecar cache for every kept segment in
+        // one concurrent batch before the per-segment fan-out, so the
+        // in-spawn `apply_tombstone_filter` calls are all cache hits.
+        // See `SidecarCache::prefetch`.
+        if let Some(cache) = tombstone_cache.as_ref() {
+            let ids: Vec<_> = kept.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
         }
         // Use n_terms=2 as a stand-in for "multi-term OR enabled"
         // since the prefix path always runs BoolMode::Or and the

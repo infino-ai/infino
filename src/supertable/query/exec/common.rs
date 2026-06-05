@@ -277,13 +277,16 @@ mod tests {
 
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {
-        assert_eq!(arg_to_string(&lit("emb"), "column").unwrap(), "emb");
+        assert_eq!(
+            arg_to_string(&lit("emb"), "column").expect("utf8 literal"),
+            "emb"
+        );
         assert!(arg_to_string(&lit(3_i64), "column").is_err());
     }
 
     #[test]
     fn arg_to_usize_accepts_int_rejects_negative_and_nonint() {
-        assert_eq!(arg_to_usize(&lit(10_i64), "k").unwrap(), 10);
+        assert_eq!(arg_to_usize(&lit(10_i64), "k").expect("int literal"), 10);
         assert!(arg_to_usize(&lit(-1_i64), "k").is_err());
         assert!(arg_to_usize(&lit("nope"), "k").is_err());
     }

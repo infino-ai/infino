@@ -48,7 +48,30 @@ use crate::supertable::wal::WalStore;
 /// own tombstones. Tuned to amortize the post-TTL refresh's
 /// extra storage GET across enough queries that the steady-
 /// state per-query cost stays inside the hot-path budget.
+///
+/// Applies only to *present* sidecars (a segment that actually
+/// has tombstones); absent/empty sidecars use
+/// [`DEFAULT_NEGATIVE_TTL`].
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(1);
+
+/// Negative/empty-view refresh interval — much longer than the
+/// positive TTL. The overwhelmingly common case is a segment
+/// with **no** tombstones at all (no sidecar on storage → a 404,
+/// cached as an empty bitmap). Re-GETting that 404 on the 1 s
+/// positive TTL turns every steady-state query into one
+/// object-store round trip *per segment*, which at high segment
+/// counts (a wide supertable fan-out) dominates the hot path —
+/// the serial post-search tombstone sweep becomes seconds.
+///
+/// A sidecar only appears when some process deletes a row in that
+/// segment. This process invalidates its own deletes synchronously
+/// (see [`SidecarCache::invalidate`]), so the only staleness this
+/// TTL governs is a *cross-process* delete — already an
+/// eventual-consistency concern, not a correctness one. Holding
+/// the negative view far longer than the positive one keeps the
+/// hot path GET-free in the no-deletes steady state while bounding
+/// cross-process delete visibility to this window.
+pub const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(60);
 
 /// Typed failures from cache refresh. The cache's hot path is
 /// infallible; this only surfaces when a TTL miss / first-miss
@@ -73,6 +96,7 @@ pub enum SidecarCacheError {
 pub struct SidecarCache {
     inner: DashMap<Uuid, CachedSidecar>,
     refresh_ttl: Duration,
+    negative_ttl: Duration,
     wal_store: WalStore,
 }
 
@@ -100,7 +124,78 @@ impl SidecarCache {
         Self {
             inner: DashMap::new(),
             refresh_ttl,
+            negative_ttl: DEFAULT_NEGATIVE_TTL,
             wal_store,
+        }
+    }
+
+    /// The freshness window for a given cached view: the short
+    /// positive TTL for present (non-empty) sidecars, the long
+    /// negative TTL for the absent/empty "no tombstones" view.
+    fn ttl_for_empty(&self, is_empty: bool) -> Duration {
+        if is_empty {
+            self.negative_ttl
+        } else {
+            self.refresh_ttl
+        }
+    }
+
+    /// `true` when `superfile_id` has no cached view or its view is
+    /// past the applicable freshness window.
+    fn needs_refresh(&self, superfile_id: Uuid, now: Instant) -> bool {
+        match self.inner.get(&superfile_id) {
+            Some(entry) => {
+                now.duration_since(entry.last_checked)
+                    >= self.ttl_for_empty(entry.bitmap.is_empty())
+            }
+            None => true,
+        }
+    }
+
+    /// Concurrently refresh every id whose cached view is missing or
+    /// stale, so a subsequent per-segment [`Self::bitmap_for`] sweep
+    /// is all cache hits.
+    ///
+    /// This is the hot-path entry point for a wide fan-out: it
+    /// replaces N *serial* blocking storage GETs (one per segment,
+    /// each a sync→async bridge) with a single *concurrent* batch
+    /// whose wall cost is ≈ one round trip rather than N. Ids that
+    /// are already fresh are skipped, so in the no-deletes steady
+    /// state (every view negative and within [`DEFAULT_NEGATIVE_TTL`])
+    /// this issues zero GETs. A per-id refresh error is left for the
+    /// later [`Self::bitmap_for`] call to surface; the batch never
+    /// fails as a whole.
+    pub async fn prefetch(&self, superfile_ids: &[Uuid], now: Instant) {
+        let stale: Vec<Uuid> = superfile_ids
+            .iter()
+            .copied()
+            .filter(|id| self.needs_refresh(*id, now))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let fetches = stale.into_iter().map(|id| {
+            let wal_store = self.wal_store.clone();
+            async move { (id, wal_store.get_tombstones(id).await) }
+        });
+        let results = futures::future::join_all(fetches).await;
+        for (id, result) in results {
+            let (bitmap, etag) = match result {
+                Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), Some(etag)),
+                Ok(None) => (Arc::new(RoaringBitmap::new()), None),
+                // Leave any prior entry untouched; the serial
+                // bitmap_for fallback re-attempts and surfaces the
+                // error if this id is actually consulted.
+                Err(_) => continue,
+            };
+            self.inner.insert(
+                id,
+                CachedSidecar {
+                    etag,
+                    bitmap,
+                    last_checked: now,
+                },
+            );
         }
     }
 
@@ -120,9 +215,11 @@ impl SidecarCache {
         superfile_id: Uuid,
         now: Instant,
     ) -> Result<Arc<RoaringBitmap>, SidecarCacheError> {
-        // Hot path: cached and within the freshness window.
+        // Hot path: cached and within the freshness window (long
+        // for the absent/empty "no tombstones" view, short for a
+        // present sidecar).
         if let Some(entry) = self.inner.get(&superfile_id)
-            && now.duration_since(entry.last_checked) < self.refresh_ttl
+            && now.duration_since(entry.last_checked) < self.ttl_for_empty(entry.bitmap.is_empty())
         {
             return Ok(Arc::clone(&entry.bitmap));
         }
@@ -273,6 +370,53 @@ mod tests {
         let cached = cache.bitmap_for(sf_id, now).expect("re-read");
         let collected: Vec<u32> = cached.iter().collect();
         assert_eq!(collected, vec![7u32]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prefetch_populates_all_ids_in_one_batch() {
+        let (_dir, ws, cache) = fixture();
+        // One present sidecar, the rest absent (404).
+        let present = Uuid::from_u128(0x01);
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(9);
+        ws.put_tombstones(present, None, &TombstonesSidecar { seal: None, bitmap })
+            .await
+            .expect("put");
+        let ids: Vec<Uuid> = std::iter::once(present)
+            .chain((2..32u128).map(Uuid::from_u128))
+            .collect();
+
+        let now = Instant::now();
+        cache.prefetch(&ids, now).await;
+
+        // Every id is now cached, so a follow-up sweep is GET-free.
+        assert_eq!(cache.len(), ids.len());
+        for &id in &ids {
+            assert!(!cache.needs_refresh(id, now), "id {id} should be fresh");
+        }
+        assert_eq!(
+            cache
+                .bitmap_for(present, now)
+                .expect("present")
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![9u32]
+        );
+        assert!(cache.bitmap_for(ids[1], now).expect("absent").is_empty());
+    }
+
+    #[test]
+    fn empty_view_uses_long_negative_ttl() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let ws = WalStore::new(storage);
+        // A 1 ms positive TTL would make a present sidecar instantly
+        // stale, but an absent/empty view must ride the much longer
+        // negative TTL so the no-deletes hot path stays GET-free.
+        let cache = SidecarCache::new(ws, Duration::from_millis(1));
+        assert_eq!(cache.ttl_for_empty(true), DEFAULT_NEGATIVE_TTL);
+        assert_eq!(cache.ttl_for_empty(false), Duration::from_millis(1));
     }
 
     #[test]

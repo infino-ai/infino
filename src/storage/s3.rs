@@ -262,13 +262,6 @@ fn tuned_retry_config() -> object_store::RetryConfig {
     }
 }
 
-/// Bounded re-issue budget for an S3 GET that comes back short
-/// of the requested range. Each retry fetches only the
-/// still-missing tail, so a healthy object completes on the first
-/// retry; the cap stops a genuinely-truncated object from
-/// spinning before it surfaces a definitive error.
-const MAX_SHORT_READ_RETRIES: u32 = 4;
-
 /// Application-level re-issue budget for a transient transport
 /// failure on a range GET (e.g. reqwest "error sending request"
 /// that `object_store` does not retry itself). Each attempt dials
@@ -371,18 +364,16 @@ impl StorageProvider for S3StorageProvider {
         // Completion loop. `object_store::get_range` is expected to
         // return exactly the requested span, but an S3 GET can come
         // back *short* without erroring — a body truncated by a
-        // transient transport hiccup, or a range clamped to an object
-        // smaller than the caller's cached size. A short buffer that
-        // slips through here corrupts callers in two ways: the
-        // foreground lazy reader slices past the end (panic), and the
-        // background cache fill `pwrite`s it at the chunk offset,
-        // leaving a zero gap in the mmap'd file. Re-issue the GET for
-        // the still-missing tail; surface a definitive error only when
+        // transient transport hiccup. A short buffer that slips
+        // through here corrupts callers in two ways: the foreground
+        // lazy reader slices past the end (panic), and the background
+        // cache fill `pwrite`s it at the chunk offset, leaving a zero
+        // gap in the mmap'd file. Re-issue the GET for the
+        // still-missing tail; surface a definitive error only when
         // the object genuinely can't satisfy the range.
         let mut cursor = range.start;
         let mut filled: u64 = 0;
         let mut parts: Vec<Bytes> = Vec::new();
-        let mut stalls = 0u32;
         let mut transient_retries = 0u32;
         loop {
             // Application-level retry for transient connection/transport
@@ -409,6 +400,22 @@ impl StorageProvider for S3StorageProvider {
                 }
             };
             if chunk.is_empty() {
+                // A zero-byte body for an *in-bounds* range is a
+                // transport glitch (a reset/truncated response delivered
+                // as a 200/206 with no payload), NOT a real end-of-object
+                // — object_store surfaces a genuinely past-the-end range
+                // as a typed `NotFound`/`Generic` error, never as an empty
+                // `Ok`. The original bug here treated the first empty reply
+                // as a permanent short read, which aborted cold queries
+                // mid-fan-out at scale (e.g. 0 of 120576 bytes at an offset
+                // well inside a 59 MiB segment). Re-issue with backoff (which
+                // also forces a fresh connection) and only surface the
+                // definitive short read once the transient budget is spent.
+                if transient_retries < MAX_TRANSIENT_RETRIES {
+                    tokio::time::sleep(transient_backoff(transient_retries)).await;
+                    transient_retries += 1;
+                    continue;
+                }
                 return Err(short_read(uri, range.start, want, filled));
             }
             let take = (chunk.len() as u64).min(want - filled);
@@ -422,10 +429,11 @@ impl StorageProvider for S3StorageProvider {
             if filled >= want {
                 break;
             }
-            stalls += 1;
-            if stalls > MAX_SHORT_READ_RETRIES {
-                return Err(short_read(uri, range.start, want, filled));
-            }
+            // A non-empty chunk shorter than requested is normal for a
+            // large range (S3 may split it): `filled` strictly advances
+            // every iteration, so the loop is bounded and terminates.
+            // No-progress (empty) iterations are handled above via the
+            // transient-retry budget, so there is no separate stall cap.
         }
 
         // Fast path: a single full-length response is zero-copy.

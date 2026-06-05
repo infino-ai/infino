@@ -35,8 +35,7 @@ fn search_blocking(
     k: usize,
     opts: VectorSearchOptions,
 ) -> Vec<(u32, f32)> {
-    reader
-        .vector_search("emb", query, k, opts)
+    infino_bench_utils::corpus::block_on_inmem(reader.vector_search("emb", query, k, opts))
         .expect("vector_search")
 }
 
