@@ -11,8 +11,8 @@
 //! - `supertable_smoke_via_azure_wire_protocol` — `INFINO_TEST_AZURE=1`.
 //!   Assumes Azurite is reachable at `http://127.0.0.1:10000`
 //!   (`docker run -p 10000:10000 mcr.microsoft.com/azure-storage/azurite
-//!   azurite-blob --blobHost 0.0.0.0`). The test creates its own
-//!   container.
+//!   azurite-blob --blobHost 0.0.0.0`). The test creates a fresh
+//!   container per run and deletes it on success.
 //! - `supertable_real_azure_round_trip` — `INFINO_TEST_REAL_AZURE=1` +
 //!   `AZURE_STORAGE_CONTAINER_NAME`, with account credentials from
 //!   the standard `AZURE_STORAGE_*` env chain. The container must
@@ -83,11 +83,13 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-/// Create the Azurite container via a SharedKey-signed REST PUT.
-/// object_store has no container-create call and the Azurite image
-/// ships no CLI, so this is the only programmatic path. Treats both
-/// 201 Created and 409 Conflict (already exists) as success.
-async fn ensure_emulator_container(container: &str) {
+/// Issue a SharedKey-signed container-level REST request against
+/// Azurite. object_store has no container create/delete call and the
+/// Azurite image ships no CLI, so the smoke test signs these by hand.
+async fn signed_container_request(
+    method: reqwest::Method,
+    container: &str,
+) -> reqwest::Result<reqwest::Response> {
     let date = httpdate::fmt_http_date(std::time::SystemTime::now());
     let canonical_headers = format!("x-ms-date:{date}\nx-ms-version:{STORAGE_API_VERSION}\n");
     // The emulator URL path is `/devstoreaccount1/<container>`, and the
@@ -98,7 +100,7 @@ async fn ensure_emulator_container(container: &str) {
     // VERB + 11 empty header fields (Content-*, Date, If-*, Range),
     // then the canonicalized headers and resource.
     let string_to_sign = format!(
-        "PUT\n{}{canonical_headers}{canonical_resource}",
+        "{method}\n{}{canonical_headers}{canonical_resource}",
         "\n".repeat(11)
     );
 
@@ -109,8 +111,8 @@ async fn ensure_emulator_container(container: &str) {
         .encode(hmac_sha256(&key, string_to_sign.as_bytes()));
 
     let url = format!("{EMULATOR_ENDPOINT}/{container}?restype=container");
-    let resp = match reqwest::Client::new()
-        .put(&url)
+    reqwest::Client::new()
+        .request(method, &url)
         .header("x-ms-date", &date)
         .header("x-ms-version", STORAGE_API_VERSION)
         .header("content-length", "0")
@@ -120,7 +122,12 @@ async fn ensure_emulator_container(container: &str) {
         )
         .send()
         .await
-    {
+}
+
+/// Create the run's container. Treats 201 Created and 409 Conflict
+/// (already exists) as success.
+async fn ensure_emulator_container(container: &str) {
+    let resp = match signed_container_request(reqwest::Method::PUT, container).await {
         Ok(resp) => resp,
         // The test runner does not spawn Azurite. A connect failure
         // almost always means it isn't running — tell the user how to
@@ -141,6 +148,22 @@ async fn ensure_emulator_container(container: &str) {
         status.is_success() || status.as_u16() == 409,
         "create container {container} failed: {status}\n{body}"
     );
+}
+
+/// Best-effort teardown of the run's container (202 Accepted, or 404
+/// if already gone). Runs only on the success path — a failing run
+/// leaves the container for inspection, and Azurite is disposable.
+async fn delete_emulator_container(container: &str) {
+    match signed_container_request(reqwest::Method::DELETE, container).await {
+        Ok(resp) => {
+            let status = resp.status();
+            assert!(
+                status.is_success() || status.as_u16() == 404,
+                "delete container {container} failed: {status}"
+            );
+        }
+        Err(e) => eprintln!("[azure] container cleanup skipped: {e}"),
+    }
 }
 
 fn make_cache(
@@ -350,7 +373,8 @@ async fn supertable_smoke_via_azure_wire_protocol() {
         post.n_cold_fetches, post.current_bytes
     );
 
-    eprintln!("[azure] smoke done");
+    delete_emulator_container(&container).await;
+    eprintln!("[azure] smoke done; container {container} deleted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
