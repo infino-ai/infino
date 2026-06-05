@@ -173,19 +173,19 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Recall target | (p, r)     | hot        | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|------------|------------|----------|------------|---------|------------|
-| 0.90          | (p=1, r=256) | 825.12 µs | 290.23 ms | 3.82 GiB | 3.80 GiB | 3.80 GiB | — |
-| 0.95          | (p=5, r=256) | 970.47 µs | 306.32 ms | 3.82 GiB | 3.80 GiB | 3.80 GiB | — |
-| 0.99          | — | — | — | — | — | — | — |
+| 0.90          | (p=1, r=1024) | 919.98 µs | 256.81 ms | 4.84 GiB | 4.84 GiB | 4.84 GiB | +0.6% no change |
+| 0.95          | (p=1, r=256) | 919.20 µs | 252.16 ms | 4.84 GiB | 4.84 GiB | 4.84 GiB | +0.6% no change |
+| 0.99          | (p=5, r=256) | 1.17 ms | 258.36 ms | 4.84 GiB | 4.84 GiB | 4.84 GiB | +0.6% no change |
 
 **infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):
 
 | Metric | Value |
 |--------|-------|
-| infino_default_options_top10 (hot) | 772.59 µs |
-| infino_default_options_top10 (cold) | 359.64 ms |
-| infino_default_options_top10_peak_rss | 3.82 GiB |
-| infino_default_options_top10_median_rss | 3.80 GiB |
-| infino_default_options_top10_p90_rss | 3.80 GiB |
+| infino_default_options_top10 (hot) | 707.30 µs |
+| infino_default_options_top10 (cold) | 247.40 ms |
+| infino_default_options_top10_peak_rss | 4.84 GiB |
+| infino_default_options_top10_median_rss | 4.84 GiB |
+| infino_default_options_top10_p90_rss | 4.84 GiB |
 
 <!-- END: bench/vector/superfile/search -->
 
