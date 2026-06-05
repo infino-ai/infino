@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -105,6 +105,44 @@ fn tier_runtime() -> &'static Runtime {
 
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     tier_runtime().block_on(fut)
+}
+
+/// A remote prefix to delete when the process ends. Registered only for
+/// ephemeral runs (no `INFINO_BENCH_DATASET`): each such run writes a
+/// throwaway table under a unique prefix and must not leave it behind.
+struct CleanupTarget {
+    /// Provider scoped to the bucket root, so `prefix` is listed/deleted
+    /// as an absolute path.
+    root: Arc<dyn StorageProvider>,
+    prefix: String,
+    label: &'static str,
+}
+
+static CLEANUP: Mutex<Vec<CleanupTarget>> = Mutex::new(Vec::new());
+
+/// Delete every remote prefix registered this run. Call once after the
+/// criterion groups finish (statics don't run `Drop` at process exit, so
+/// teardown is explicit). No-op for s3s-fs (its tempdir self-cleans) and
+/// for persisted runs (nothing is registered).
+pub fn cleanup_ephemeral() {
+    let targets = std::mem::take(&mut *CLEANUP.lock().expect("cleanup registry"));
+    if targets.is_empty() {
+        return;
+    }
+    block_on(async {
+        for t in targets {
+            let keys = t.root.list_with_prefix(&t.prefix).await.unwrap_or_default();
+            for key in &keys {
+                let _ = t.root.delete(key).await;
+            }
+            eprintln!(
+                "[tiers] cleaned {} objects under {} ({})",
+                keys.len(),
+                t.prefix,
+                t.label
+            );
+        }
+    });
 }
 
 pub fn real_s3_bucket_env() -> Option<String> {
@@ -291,6 +329,21 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     let prefix = unique_bench_prefix(&backend.prefix_root(prefix_default));
     let storage = backend.provider(&prefix);
     eprintln!("[tiers] {} prefix={prefix}", backend.label());
+
+    // Ephemeral runs (no persisted dataset) own this unique prefix and must
+    // delete it at the end; persisted runs (`INFINO_BENCH_DATASET`) keep the
+    // table for reuse, so they register nothing.
+    if std::env::var("INFINO_BENCH_DATASET").is_err() {
+        CLEANUP
+            .lock()
+            .expect("cleanup registry")
+            .push(CleanupTarget {
+                root: backend.provider(""),
+                prefix: prefix.clone(),
+                label: backend.label(),
+            });
+    }
+
     StorageFixture {
         storage,
         storage_label: backend.label(),

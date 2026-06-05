@@ -15,5 +15,15 @@
 //! ```
 
 use infino_bench_utils::bench::supertable;
+use infino_bench_utils::tiers;
 
-criterion::criterion_main!(supertable::benches);
+// Hand-rolled `criterion_main!` so we can delete any ephemeral remote
+// prefix after the run. Statics don't run `Drop` at process exit, so the
+// teardown is explicit; it's a no-op for s3s-fs and persisted runs.
+fn main() {
+    supertable::benches();
+    criterion::Criterion::default()
+        .configure_from_args()
+        .final_summary();
+    tiers::cleanup_ephemeral();
+}
