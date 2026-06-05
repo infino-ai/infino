@@ -21,36 +21,47 @@ and as a search index by infino's reader.
 ## Quick example
 
 ```rust
-use infino::superfile::{SuperfileReader, VectorSearchOptions};
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field, Schema};
+use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::reader::BoolMode;
-use bytes::Bytes;
+use infino::superfile::vector::distance::Metric;
+use infino::superfile::VectorSearchOptions;
+use infino::supertable::{Supertable, SupertableOptions};
 
-// Read a superfile (built via SuperfileBuilder).
-let bytes: Bytes = std::fs::read("my.superfile")?.into();
-let reader = SuperfileReader::open(bytes)?;
+const DIM: usize = 384;
 
-// The SuperfileReader search kernels are async: cold object-store
-// range reads are `await`ed (warm/in-memory ranges resolve without
-// yielding), so a wide fan-out can drive every segment concurrently.
-// Drive them on any runtime — here a throwaway tokio one.
-let rt = tokio::runtime::Runtime::new()?;
-rt.block_on(async {
-    // BM25 search over the embedded FTS blob:
-    let _hits = reader
-        .bm25_search("title", "rust async", 10, BoolMode::Or)
-        .await?;
+// A full-text `title` column + an `embedding` vector column. The `_id`
+// column is injected by the supertable — don't declare it yourself.
+let schema = Arc::new(Schema::new(vec![
+    Field::new("title", DataType::LargeUtf8, false),
+    Field::new(
+        "embedding",
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM as i32),
+        false,
+    ),
+]));
+let options = SupertableOptions::new(
+    schema,
+    vec![FtsConfig { column: "title".into() }],
+    vec![VectorConfig::new("embedding".into(), DIM, 256, 0, Metric::Cosine)],
+    None, // default tokenizer
+)?;
+let table = Supertable::open(options)?;
 
-    // kNN search over the embedded vector blob:
-    let query = vec![/* dim=384 f32s */];
-    let _hits = reader
-        .vector_search("embedding", &query, 10, VectorSearchOptions::default())
-        .await?;
+// BM25 over the FTS index — synchronous, fans out across segments for you:
+let hits = table.bm25_search("title", "rust async", 10, BoolMode::Or)?;
 
-    Ok::<(), infino::superfile::ReadError>(())
-})?;
+// kNN over the vector index:
+let query = vec![/* dim=384 f32s */];
+let hits = table.vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
 
-// And the same bytes are a valid Parquet file — register them
-// with DataFusion / DuckDB / pyarrow and treat as a regular table.
+// Or query it as SQL — DataFusion under the hood, and every segment is a
+// valid Parquet file you can also hand to DuckDB / pyarrow directly:
+let batches = table.query_sql(
+    "SELECT _id, title FROM bm25_search('title', 'rust async', 10)",
+)?;
 ```
 
 ## Development
