@@ -133,25 +133,25 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 268.25 s | 37.3 K/s | 6.27 GiB | 2.09 GiB | 3.52 GiB | +1.8% no change |
+| supertable | 313.20 s | 31.9 K/s | 6.31 GiB | 2.14 GiB | 3.39 GiB | +1.2% no change |
 
 <!-- END: bench/supertable/ingest/supertable_fts_build -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
 ### Supertable FTS — search (10000000 docs, shared combined supertable)
 
-hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`). Cold excludes the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
+hot = warm steady state: every segment mmap-promoted via the public `Supertable::wait_until_warm` before timing, so reads hit resident pages (no object-store GETs). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open.
 
 | Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |----------------|------------|------------|-----------|------------|-----------|------------|
-| single_rare    | 3.46 ms | 302.51 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| single_common  | 3.79 ms | 453.36 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| two_term_or    | 7.63 ms | 401.93 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| three_wide_or  | 11.21 ms | 438.31 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| three_similar_or | 22.32 ms | 397.82 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| five_term_or   | 37.99 ms | 473.88 ms | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| ten_term_or    | 97.57 ms | 1.55 s | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
-| prefix         | 77.12 ms | 3.37 s | 14.88 GiB | 14.81 GiB  | 14.86 GiB | —          |
+| single_rare    | 2.83 ms | 399.51 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| single_common  | 2.87 ms | 384.85 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| two_term_or    | 3.35 ms | 535.05 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| three_wide_or  | 6.37 ms | 573.50 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| three_similar_or | 13.68 ms | 558.49 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| five_term_or   | 29.00 ms | 570.43 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| ten_term_or    | 79.47 ms | 590.62 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| prefix         | 60.97 ms | 562.12 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
 
 <!-- END: bench/fts/supertable/search -->
 
@@ -196,7 +196,7 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 140.55 s | 71.1 K/s | 2.85 GiB | 2.21 GiB | 2.58 GiB | -12.2% improved |
+| supertable | 147.49 s | 67.8 K/s | 3.20 GiB | 2.40 GiB | 2.86 GiB | +11.1% regressed |
 
 <!-- END: bench/supertable/ingest/supertable_vec_build -->
 
@@ -205,7 +205,7 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 486.67 s | 20.5 K/s | 7.16 GiB | 3.55 GiB | 4.65 GiB | +0.4% no change |
+| supertable | 476.08 s | 21.0 K/s | 7.20 GiB | 3.60 GiB | 4.73 GiB | +0.4% no change |
 
 <!-- END: bench/supertable/ingest/supertable_all_build -->
 
@@ -216,8 +216,8 @@ hot = warm steady state: every segment mmap-promoted via the public `Supertable:
 
 | Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|-----|------|----------|------------|---------|------------|
-| 0.90 | (p=4, r=4) | 9.18 ms | 1.15 s | 10.08 GiB | 10.04 GiB | 10.06 GiB | +1.0% no change |
-| 0.95 | (p=8, r=4) | 10.22 ms | 1.19 s | 10.08 GiB | 10.04 GiB | 10.06 GiB | +1.0% no change |
-| 0.99 | (p=16, r=4) | 16.49 ms | 1.22 s | 10.08 GiB | 10.04 GiB | 10.06 GiB | +1.0% no change |
+| 0.90 | (p=4, r=4) | 8.74 ms | 1.10 s | 10.16 GiB | 10.13 GiB | 10.14 GiB | -2.3% no change |
+| 0.95 | (p=8, r=4) | 9.55 ms | 1.15 s | 10.16 GiB | 10.13 GiB | 10.14 GiB | -2.3% no change |
+| 0.99 | (p=16, r=4) | 16.11 ms | 1.24 s | 10.16 GiB | 10.13 GiB | 10.14 GiB | -2.3% no change |
 
 <!-- END: bench/vector/supertable/search -->
