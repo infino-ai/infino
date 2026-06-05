@@ -90,8 +90,7 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// 201 Created and 409 Conflict (already exists) as success.
 async fn ensure_emulator_container(container: &str) {
     let date = httpdate::fmt_http_date(std::time::SystemTime::now());
-    let canonical_headers =
-        format!("x-ms-date:{date}\nx-ms-version:{STORAGE_API_VERSION}\n");
+    let canonical_headers = format!("x-ms-date:{date}\nx-ms-version:{STORAGE_API_VERSION}\n");
     // The emulator URL path is `/devstoreaccount1/<container>`, and the
     // canonicalized resource is `/<account>` + that path — so the
     // account name appears twice.

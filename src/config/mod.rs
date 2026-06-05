@@ -479,7 +479,10 @@ storage:
             .merge(Yaml::string(yaml));
         let cfg = Config::from_figment(fig).expect("parse config");
         assert_eq!(cfg.storage.backend, StorageBackend::Azure);
-        assert_eq!(cfg.storage.bucket.as_deref(), Some("infino-azure-container"));
+        assert_eq!(
+            cfg.storage.bucket.as_deref(),
+            Some("infino-azure-container")
+        );
         assert_eq!(cfg.storage.prefix, "infino-real-azure-integration/example");
     }
 
