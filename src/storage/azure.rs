@@ -86,37 +86,6 @@ impl AzureStorageProvider {
         })
     }
 
-    /// Construct against a custom endpoint with explicit account-key
-    /// credentials — for self-hosted or Azure-compatible services.
-    /// `allow_http` is enabled so plain-HTTP endpoints aren't
-    /// rejected; the tuned client pool is left off for the same
-    /// reason as the emulator path.
-    pub fn new_with_endpoint(
-        endpoint: impl Into<String>,
-        container: impl Into<String>,
-        account: impl Into<String>,
-        access_key: impl Into<String>,
-    ) -> Result<Self, StorageError> {
-        let container = container.into();
-        let endpoint = endpoint.into();
-        let store = MicrosoftAzureBuilder::new()
-            .with_endpoint(endpoint.clone())
-            .with_container_name(&container)
-            .with_account(account.into())
-            .with_access_key(access_key.into())
-            .with_allow_http(true)
-            .build()
-            .map_err(|e| StorageError::Permanent {
-                uri: format!("azure://{container} @ {endpoint}"),
-                source: Box::new(e),
-            })?;
-        Ok(Self {
-            container,
-            prefix: String::new(),
-            store: Arc::new(store),
-        })
-    }
-
     /// Wrap an already-constructed `MicrosoftAzure` — for callers
     /// that want full control over the `MicrosoftAzureBuilder`.
     pub fn from_object_store(container: impl Into<String>, store: MicrosoftAzure) -> Self {
@@ -333,8 +302,8 @@ impl StorageProvider for AzureStorageProvider {
 #[cfg(test)]
 mod tests {
     //! Unit tests for the parts that don't need a live backend:
-    //! error translation, path parsing, the endpoint/emulator
-    //! constructors, and `from_object_store`. The trait impls are
+    //! error translation, path parsing, the emulator constructor,
+    //! and `from_object_store`. The trait impls are
     //! exercised end-to-end against Azurite in the gated
     //! `supertable_smoke_via_azure_wire_protocol` integration test.
     use super::*;
@@ -414,13 +383,13 @@ mod tests {
 
     #[test]
     fn path_parses_simple_uri() {
-        let p = endpoint_provider().path("foo/bar.txt").expect("parse");
+        let p = test_provider().path("foo/bar.txt").expect("parse");
         assert_eq!(p.to_string(), "foo/bar.txt");
     }
 
     #[test]
     fn path_parses_nested_uri() {
-        let p = endpoint_provider()
+        let p = test_provider()
             .path("manifest-lists/list-000042.json")
             .expect("parse");
         assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
@@ -428,30 +397,18 @@ mod tests {
 
     #[test]
     fn path_applies_prefix() {
-        let mut p = endpoint_provider();
+        let mut p = test_provider();
         p.prefix = "tbl".into();
         assert_eq!(p.key("data/seg-1"), "tbl/data/seg-1");
     }
 
     // ---- constructors --------------------------------------------------
 
-    fn endpoint_provider() -> AzureStorageProvider {
-        // Pure construction — no I/O. Targets a fake endpoint with
-        // explicit credentials so `container()` / `path()` can be
-        // tested without a live backend.
-        AzureStorageProvider::new_with_endpoint(
-            "http://127.0.0.1:1",
-            "test-container",
-            "devstoreaccount1",
-            "dGVzdC1rZXk=",
-        )
-        .expect("construct with endpoint")
-    }
-
-    #[test]
-    fn new_with_endpoint_builds_succeeds_and_exposes_container() {
-        let p = endpoint_provider();
-        assert_eq!(p.container(), "test-container");
+    fn test_provider() -> AzureStorageProvider {
+        // The emulator constructor builds without I/O, so it's a cheap
+        // way to exercise `path()` / `key()` / Debug without a backend.
+        AzureStorageProvider::new_with_emulator("test-container")
+            .expect("construct emulator provider")
     }
 
     #[test]
@@ -477,7 +434,7 @@ mod tests {
 
     #[test]
     fn debug_impl_does_not_panic() {
-        let p = endpoint_provider();
+        let p = test_provider();
         let s = format!("{p:?}");
         assert!(s.contains("AzureStorageProvider"));
     }

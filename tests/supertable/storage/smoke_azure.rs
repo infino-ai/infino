@@ -53,7 +53,6 @@ const EMULATOR_ACCOUNT: &str = "devstoreaccount1";
 const EMULATOR_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 const STORAGE_API_VERSION: &str = "2021-08-06";
-const SMOKE_CONTAINER: &str = "infino-azure-smoke";
 
 /// HMAC-SHA256 over `msg` with `key`, built directly on `Sha256` to
 /// avoid a dependency on the pre-release `hmac` crate.
@@ -262,14 +261,19 @@ async fn supertable_smoke_via_azure_wire_protocol() {
         return;
     }
 
-    ensure_emulator_container(SMOKE_CONTAINER).await;
-    eprintln!("[azure] container {SMOKE_CONTAINER} ready on {EMULATOR_ENDPOINT}");
+    // Fresh container per run so the test is idempotent against a
+    // long-lived Azurite (put_atomic is create-only and the supertable
+    // pointer lives at the container root — a reused container would
+    // collide on a second run).
+    let container = format!("infino-azure-smoke-{}", uuid::Uuid::new_v4());
+    ensure_emulator_container(&container).await;
+    eprintln!("[azure] container {container} ready on {EMULATOR_ENDPOINT}");
 
     // Provider-level smoke first — isolates "the Azure provider works
     // at all" from "the writer + cache stack works on top".
     {
         let storage: Arc<dyn StorageProvider> = Arc::new(
-            AzureStorageProvider::new_with_emulator(SMOKE_CONTAINER)
+            AzureStorageProvider::new_with_emulator(&container)
                 .expect("azure provider for probe"),
         );
         let probe_bytes = bytes::Bytes::from_static(b"hello-azure");
@@ -285,7 +289,7 @@ async fn supertable_smoke_via_azure_wire_protocol() {
     // Producer: writes through the Azure wire protocol.
     {
         let storage: Arc<dyn StorageProvider> = Arc::new(
-            AzureStorageProvider::new_with_emulator(SMOKE_CONTAINER)
+            AzureStorageProvider::new_with_emulator(&container)
                 .expect("azure provider for producer"),
         );
         let producer =
@@ -305,7 +309,7 @@ async fn supertable_smoke_via_azure_wire_protocol() {
     // Consumer: opens via the same endpoint + a disk cache. Reads
     // route through the cache → Azure get_range.
     let consumer_storage: Arc<dyn StorageProvider> = Arc::new(
-        AzureStorageProvider::new_with_emulator(SMOKE_CONTAINER)
+        AzureStorageProvider::new_with_emulator(&container)
             .expect("azure provider for consumer"),
     );
     let cache_dir = TempDir::new().expect("cache tempdir");
