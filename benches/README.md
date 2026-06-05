@@ -138,7 +138,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 <!-- BEGIN: bench/fts/supertable/search -->
 ### Supertable FTS — search (10000000 docs, shared combined supertable)
 
-hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`). Cold excludes the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
+hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs, or a real store via `INFINO_BENCH_STORE=s3|azure`). Cold excludes the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
 
 | Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |----------------|------------|------------|-----------|------------|-----------|------------|
@@ -211,7 +211,7 @@ Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object s
 <!-- BEGIN: bench/vector/supertable/search -->
 ### Supertable vector — search (10000000 docs × dim=384, calibrated at recall targets)
 
-hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs or `INFINO_REAL_S3_BUCKET`), excluding the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
+hot = in-process, segments already cached (warm steady state). cold = fresh disk cache → object-store range GETs (s3s-fs, or a real store via `INFINO_BENCH_STORE=s3|azure`), excluding the one-time manifest open. The mmap-promoted "warm" tier was dropped: nothing is pinned in memory, so it measured identically to hot.
 
 | Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|-----|------|----------|------------|---------|------------|

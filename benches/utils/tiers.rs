@@ -4,9 +4,10 @@
 //! - **Warm**: same, with explicit mmap promotion before timing.
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
-//! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
-//! for AWS S3, or `INFINO_REAL_AZURE_CONTAINER` for Azure Blob (Azure wins
-//! when both are set).
+//! Backend is chosen explicitly via `INFINO_BENCH_STORE` (`s3s_fs` default
+//! | `s3` | `azure`); `s3` reads `INFINO_REAL_S3_BUCKET`, `azure` reads
+//! `INFINO_REAL_AZURE_CONTAINER`. Never inferred from which credential is
+//! set.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -122,8 +123,50 @@ fn real_azure_container_env() -> Option<String> {
         .ok()
 }
 
-/// A real (non-emulator) object store selected by env for warm/cold tiers.
-/// Azure takes precedence over S3 when both are configured.
+/// Object store the warm/cold benches run against. Chosen **explicitly**
+/// via `INFINO_BENCH_STORE` — never inferred from which credential happens
+/// to be exported.
+#[derive(Debug, PartialEq, Eq)]
+enum BenchStore {
+    /// In-process s3s-fs emulator (default; no credentials, no network).
+    S3sFs,
+    /// A real remote object store.
+    Remote(RemoteBackend),
+}
+
+impl BenchStore {
+    /// Resolve from `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure`).
+    fn from_env() -> Self {
+        let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "s3s_fs".into());
+        Self::parse(&store, real_s3_bucket_env(), real_azure_container_env())
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Pure resolution — the chosen backend must have its location env set.
+    /// Split out so selection is unit-testable without mutating process env.
+    fn parse(
+        store: &str,
+        s3_bucket: Option<String>,
+        azure_container: Option<String>,
+    ) -> Result<Self, String> {
+        match store {
+            "s3s_fs" => Ok(Self::S3sFs),
+            "s3" => s3_bucket
+                .map(|bucket| Self::Remote(RemoteBackend::S3 { bucket }))
+                .ok_or_else(|| "INFINO_BENCH_STORE=s3 requires INFINO_REAL_S3_BUCKET".to_string()),
+            "azure" => azure_container
+                .map(|container| Self::Remote(RemoteBackend::Azure { container }))
+                .ok_or_else(|| {
+                    "INFINO_BENCH_STORE=azure requires INFINO_REAL_AZURE_CONTAINER".to_string()
+                }),
+            other => Err(format!(
+                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure)"
+            )),
+        }
+    }
+}
+
+/// A real (non-emulator) object store for warm/cold tiers.
 #[derive(Debug, PartialEq, Eq)]
 enum RemoteBackend {
     S3 { bucket: String },
@@ -131,20 +174,6 @@ enum RemoteBackend {
 }
 
 impl RemoteBackend {
-    fn from_env() -> Option<Self> {
-        Self::select(real_azure_container_env(), real_s3_bucket_env())
-    }
-
-    /// Pure selection (Azure over S3) — split out so precedence is unit-
-    /// testable without mutating process env.
-    fn select(azure_container: Option<String>, s3_bucket: Option<String>) -> Option<Self> {
-        match (azure_container, s3_bucket) {
-            (Some(container), _) => Some(Self::Azure { container }),
-            (None, Some(bucket)) => Some(Self::S3 { bucket }),
-            (None, None) => None,
-        }
-    }
-
     fn label(&self) -> &'static str {
         match self {
             Self::S3 { .. } => "real_s3",
@@ -224,45 +253,49 @@ async fn spawn_s3s_fs(s3s_bucket: &str) -> (SocketAddr, TempDir) {
 }
 
 async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture {
-    if let Some(backend) = RemoteBackend::from_env() {
-        let prefix = unique_bench_prefix(&backend.prefix_root(prefix_default));
-        let storage = backend.provider(&prefix);
-        eprintln!("[tiers] {} prefix={prefix}", backend.label());
-        StorageFixture {
-            storage,
-            storage_label: backend.label(),
-            remote: true,
-            _keepalive: StorageKeepalive::Remote,
+    // s3s-fs returns directly; the remote backends share the construction below.
+    let backend = match BenchStore::from_env() {
+        BenchStore::Remote(backend) => backend,
+        BenchStore::S3sFs => {
+            let (addr, fs_root) = spawn_s3s_fs(s3s_bucket).await;
+            let endpoint = format!("http://{addr}");
+            let storage: Arc<dyn StorageProvider> = Arc::new(
+                S3StorageProvider::new_with_endpoint(
+                    &endpoint,
+                    s3s_bucket,
+                    S3S_ACCESS_KEY,
+                    S3S_SECRET_KEY,
+                    S3S_REGION,
+                )
+                .expect("s3s-fs S3StorageProvider"),
+            );
+            eprintln!(
+                "\n\
+                 ################################################################################\n\
+                 ##  WARNING: benchmarking against the s3s-fs emulator, NOT a real object store.##\n\
+                 ##  The emulator reproduces request count and byte volume, not network         ##\n\
+                 ##  latency, so warm/cold timings here are not representative.                  ##\n\
+                 ##  Set INFINO_BENCH_STORE=s3|azure (+ the backend's container env) for real.   ##\n\
+                 ################################################################################\n\
+                 [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT a real store)\n"
+            );
+            return StorageFixture {
+                storage,
+                storage_label: "s3s_fs",
+                remote: false,
+                _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
+            };
         }
-    } else {
-        let (addr, fs_root) = spawn_s3s_fs(s3s_bucket).await;
-        let endpoint = format!("http://{addr}");
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_endpoint(
-                &endpoint,
-                s3s_bucket,
-                S3S_ACCESS_KEY,
-                S3S_SECRET_KEY,
-                S3S_REGION,
-            )
-            .expect("s3s-fs S3StorageProvider"),
-        );
-        eprintln!(
-            "\n\
-             ################################################################################\n\
-             ##  WARNING: benchmarking against the s3s-fs emulator, NOT real AWS S3.        ##\n\
-             ##  The emulator reproduces request count and byte volume, not network         ##\n\
-             ##  latency, so warm/cold timings here are not representative of S3.            ##\n\
-             ##  Set INFINO_REAL_S3_BUCKET (+ AWS creds) to benchmark against real S3.       ##\n\
-             ################################################################################\n\
-             [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT real S3)\n"
-        );
-        StorageFixture {
-            storage,
-            storage_label: "s3s_fs",
-            remote: false,
-            _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
-        }
+    };
+
+    let prefix = unique_bench_prefix(&backend.prefix_root(prefix_default));
+    let storage = backend.provider(&prefix);
+    eprintln!("[tiers] {} prefix={prefix}", backend.label());
+    StorageFixture {
+        storage,
+        storage_label: backend.label(),
+        remote: true,
+        _keepalive: StorageKeepalive::Remote,
     }
 }
 
@@ -443,30 +476,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn select_prefers_azure_over_s3() {
-        let b = RemoteBackend::select(Some("c".into()), Some("bkt".into()));
+    fn parse_defaults_to_emulator() {
         assert_eq!(
-            b,
-            Some(RemoteBackend::Azure {
-                container: "c".into()
-            })
+            BenchStore::parse("s3s_fs", None, None),
+            Ok(BenchStore::S3sFs)
         );
     }
 
     #[test]
-    fn select_falls_back_to_s3() {
-        let b = RemoteBackend::select(None, Some("bkt".into()));
+    fn parse_s3_needs_bucket() {
         assert_eq!(
-            b,
-            Some(RemoteBackend::S3 {
+            BenchStore::parse("s3", Some("bkt".into()), None),
+            Ok(BenchStore::Remote(RemoteBackend::S3 {
                 bucket: "bkt".into()
-            })
+            }))
         );
+        assert!(BenchStore::parse("s3", None, None).is_err());
     }
 
     #[test]
-    fn select_none_when_unset() {
-        assert_eq!(RemoteBackend::select(None, None), None);
+    fn parse_azure_needs_container() {
+        assert_eq!(
+            BenchStore::parse("azure", None, Some("c".into())),
+            Ok(BenchStore::Remote(RemoteBackend::Azure {
+                container: "c".into()
+            }))
+        );
+        assert!(BenchStore::parse("azure", None, None).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_store() {
+        assert!(BenchStore::parse("gcs", None, None).is_err());
+    }
+
+    #[test]
+    fn parse_does_not_infer_from_creds() {
+        // Both creds present but store=s3s_fs → still the emulator. No
+        // backend is ever picked from which credential happens to be set.
+        assert_eq!(
+            BenchStore::parse("s3s_fs", Some("bkt".into()), Some("c".into())),
+            Ok(BenchStore::S3sFs)
+        );
     }
 
     #[test]
