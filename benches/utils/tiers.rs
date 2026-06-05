@@ -67,9 +67,6 @@ pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) 
 pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
-    /// True for a real remote store (S3/Azure) that needs explicit
-    /// cleanup; false for the ephemeral in-process s3s-fs emulator.
-    pub remote: bool,
     _keepalive: StorageKeepalive,
 }
 
@@ -82,14 +79,7 @@ enum StorageKeepalive {
 pub struct SuperfileCommitted {
     pub storage: Arc<dyn StorageProvider>,
     pub uri: SuperfileUri,
-    /// Object key under the storage provider (same bytes the hot
-    /// path built — uploaded verbatim for lazy vector open).
-    pub object_path: String,
-    pub object_size: u64,
     pub storage_label: &'static str,
-    /// See [`StorageFixture::remote`].
-    pub remote: bool,
-    pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
 }
 
@@ -120,10 +110,11 @@ struct CleanupTarget {
 
 static CLEANUP: Mutex<Vec<CleanupTarget>> = Mutex::new(Vec::new());
 
-/// Delete every remote prefix registered this run. Call once after the
-/// criterion groups finish (statics don't run `Drop` at process exit, so
-/// teardown is explicit). No-op for s3s-fs (its tempdir self-cleans) and
-/// for persisted runs (nothing is registered).
+/// Delete every remote prefix registered this run. Call once from the
+/// `main` of any bench that goes through `backing_store` against a real
+/// store, after the criterion groups finish — statics don't run `Drop`
+/// at process exit, so teardown is explicit. No-op for s3s-fs (its
+/// tempdir self-cleans) and for persisted runs (nothing is registered).
 pub fn cleanup_ephemeral() {
     let targets = std::mem::take(&mut *CLEANUP.lock().expect("cleanup registry"));
     if targets.is_empty() {
@@ -301,15 +292,7 @@ async fn spawn_s3s_fs(s3s_bucket: &str) -> (SocketAddr, TempDir) {
     (addr, fs_root)
 }
 
-/// `register_cleanup`: when true, an ephemeral remote run records its
-/// unique prefix for deletion by `cleanup_ephemeral`. Only callers whose
-/// bench `main` drains the registry pass true (the supertable path); the
-/// superfile path passes false.
-async fn backing_store(
-    s3s_bucket: &str,
-    prefix_default: &str,
-    register_cleanup: bool,
-) -> StorageFixture {
+async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture {
     // s3s-fs returns directly; the remote backends share the construction below.
     let backend = match BenchStore::from_env() {
         BenchStore::Remote(backend) => backend,
@@ -339,7 +322,6 @@ async fn backing_store(
             return StorageFixture {
                 storage,
                 storage_label: "s3s_fs",
-                remote: false,
                 _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
             };
         }
@@ -352,7 +334,7 @@ async fn backing_store(
     // Ephemeral runs (no persisted dataset) own this unique prefix and must
     // delete it at the end; persisted runs (`INFINO_BENCH_DATASET`) keep the
     // table for reuse, so they register nothing.
-    if register_cleanup && std::env::var("INFINO_BENCH_DATASET").is_err() {
+    if std::env::var("INFINO_BENCH_DATASET").is_err() {
         CLEANUP
             .lock()
             .expect("cleanup registry")
@@ -366,19 +348,18 @@ async fn backing_store(
     StorageFixture {
         storage,
         storage_label: backend.label(),
-        remote: true,
         _keepalive: StorageKeepalive::Remote,
     }
 }
 
 /// Supertable-shaped backing store (10M warm/cold benches).
 pub async fn supertable_storage_fixture() -> StorageFixture {
-    backing_store(SUPERTABLE_S3S_BUCKET, "infino-supertable-bench", true).await
+    backing_store(SUPERTABLE_S3S_BUCKET, "infino-supertable-bench").await
 }
 
 /// Upload one superfile blob for superfile-shaped warm/cold benches (1M).
 pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
-    let fixture = backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench", false).await;
+    let fixture = backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await;
     let uri = SuperfileUri::new_v4();
     let path = uri.storage_path();
     fixture
@@ -394,11 +375,7 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     SuperfileCommitted {
         storage: fixture.storage,
         uri,
-        object_path: path.clone(),
-        object_size: bytes.len() as u64,
         storage_label: fixture.storage_label,
-        remote: fixture.remote,
-        cleanup_path: if fixture.remote { Some(path) } else { None },
         _keepalive: fixture._keepalive,
     }
 }

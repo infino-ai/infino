@@ -14,6 +14,15 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_vector
 //! ```
 
+use infino_bench_utils::tiers;
 use infino_bench_utils::vector_superfile;
 
-criterion::criterion_main!(vector_superfile::benches);
+// Hand-rolled `criterion_main!` so a real-backend run deletes its
+// ephemeral remote prefix after the benches (no-op for s3s-fs / persisted).
+fn main() {
+    vector_superfile::benches();
+    criterion::Criterion::default()
+        .configure_from_args()
+        .final_summary();
+    tiers::cleanup_ephemeral();
+}

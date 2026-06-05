@@ -15,5 +15,14 @@
 //! ```
 
 use infino_bench_utils::fts_superfile;
+use infino_bench_utils::tiers;
 
-criterion::criterion_main!(fts_superfile::benches);
+// Hand-rolled `criterion_main!` so a real-backend run deletes its
+// ephemeral remote prefix after the benches (no-op for s3s-fs / persisted).
+fn main() {
+    fts_superfile::benches();
+    criterion::Criterion::default()
+        .configure_from_args()
+        .final_summary();
+    tiers::cleanup_ephemeral();
+}
