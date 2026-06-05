@@ -95,10 +95,10 @@ Build path: `SuperfileBuilder` → unified `.parquet` (same as production supert
 
 Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` (production cold path).
 
-| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
-|----------------|------------|------------|-----------|------------|-----------|------------|
 **OR queries:**
 
+| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|----------------|------------|------------|-----------|------------|-----------|------------|
 | single_rare    | 671 ns | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
 | single_df1     | 279 ns | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
 | single_common  | 26.67 µs | 306.60 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |

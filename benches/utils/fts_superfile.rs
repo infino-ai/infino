@@ -775,12 +775,6 @@ fn emit_search_markdown() {
         "Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via \
          `DiskCacheStore::reader` → `bm25_search` (production cold path).\n\n",
     );
-    body.push_str(
-        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
-    );
-    body.push_str(
-        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
-    );
 
     let group = group_name::SUPERFILE_FTS_SEARCH;
     let queries_or = [
@@ -802,6 +796,12 @@ fn emit_search_markdown() {
     ];
 
     body.push_str("**OR queries:**\n\n");
+    body.push_str(
+        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
+    );
     for q in queries_or {
         let bid = format!("{q}_infino_top10");
         let hot = read_mean_ns(group, &bid);
