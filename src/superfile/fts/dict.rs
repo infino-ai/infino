@@ -18,10 +18,12 @@
 //! bytes. `DictReader` opens those bytes (zero-copy via `Bytes`) and
 //! exposes exact lookup + prefix iteration.
 
-use crate::superfile::format::FST_SEPARATOR;
-use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use std::collections::BTreeMap;
 use std::io::Write;
+
+use fst::{IntoStreamer, Map, MapBuilder, Streamer};
+
+use crate::superfile::format::FST_SEPARATOR;
 
 /// Build a canonical FST key from `(column_name, term)`.
 ///

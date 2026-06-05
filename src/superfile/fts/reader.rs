@@ -12,19 +12,22 @@
 //! constructed per call (cheap; the FST validates its header in O(1) and
 //! then it's a borrowed view).
 
-use crate::superfile::format::checksum::crc32c;
-use crate::superfile::format::{self, FST_SEPARATOR};
-use crate::superfile::fts::dict::DictReader;
-use crate::superfile::fts::fst_value::FstValue;
-use crate::superfile::fts::posting::{BLOCK_LEN, decode_block};
-use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource, Source};
-use crate::superfile::{ReadError, error::FtsError};
-use bytes::Bytes;
-use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
+
+use bytes::Bytes;
+use serde::Deserialize;
+
+use crate::superfile::format::checksum::crc32c;
+use crate::superfile::format::{self, FST_SEPARATOR};
+use crate::superfile::fts::builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE};
+use crate::superfile::fts::dict::{DictReader, make_key};
+use crate::superfile::fts::fst_value::FstValue;
+use crate::superfile::fts::posting::{BLOCK_LEN, decode_block};
+use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource, Source};
+use crate::superfile::{ReadError, error::FtsError};
 
 /// Boolean-mode for multi-term queries.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -335,7 +338,7 @@ impl FtsReader {
         }
 
         // Read doc-lengths directory: n_columns × 16-byte entries + 4-byte CRC.
-        let dir_size = n_columns * 16;
+        let dir_size = n_columns * DOC_LENGTHS_ENTRY_SIZE;
         let dir_end = doc_lengths_table_offset + dir_size;
         if dir_end + 4 > source_len {
             return Err(FtsError::Read(ReadError::MalformedVersion(
@@ -363,7 +366,7 @@ impl FtsReader {
         let mut columns = Vec::with_capacity(n_columns);
         let mut column_id_by_name = HashMap::with_capacity(n_columns);
         for (i, col_cfg) in cols.iter().enumerate() {
-            let entry_off = i * 16;
+            let entry_off = i * DOC_LENGTHS_ENTRY_SIZE;
             let column_id = u32::from_le_bytes([
                 dir_bytes[entry_off],
                 dir_bytes[entry_off + 1],
@@ -518,6 +521,16 @@ impl FtsReader {
             })
     }
 
+    /// Resolve a column name to its dense column_id, or
+    /// `FtsError::UnknownColumn` if the column isn't FTS-indexed in
+    /// this segment. Shared by every public search entry point.
+    fn resolve_column_id(&self, column: &str) -> Result<u32, FtsError> {
+        self.column_id_by_name
+            .get(column)
+            .copied()
+            .ok_or_else(|| FtsError::UnknownColumn(column.to_string()))
+    }
+
     /// Walk the FST and collect every term registered under
     /// `column`, in lex order. Used to populate per-segment FTS
     /// skip-pruning summaries (term-presence bloom + lex term
@@ -554,7 +567,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let mut full_prefix = column.as_bytes().to_vec();
-        full_prefix.push(0x1F);
+        full_prefix.push(FST_SEPARATOR);
         let column_prefix_len = full_prefix.len();
         full_prefix.extend_from_slice(term_prefix);
         let fst_bytes = self
@@ -585,11 +598,7 @@ impl FtsReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let column_id = self
-            .column_id_by_name
-            .get(column)
-            .copied()
-            .ok_or_else(|| FtsError::UnknownColumn(column.to_string()))?;
+        let column_id = self.resolve_column_id(column)?;
 
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
@@ -657,11 +666,7 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let column_id = self
-            .column_id_by_name
-            .get(column)
-            .copied()
-            .ok_or_else(|| FtsError::UnknownColumn(column.to_string()))?;
+        let column_id = self.resolve_column_id(column)?;
         if terms.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
@@ -762,110 +767,38 @@ impl FtsReader {
         let postings = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
-        if metadata_offset + 20 > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "term metadata offset out of postings region".into(),
-            )));
-        }
-        let df = read_u32_le(&postings[metadata_offset..metadata_offset + 4]) as u64;
-        // bytes [4..12] = self-offset (redundant; u64); skip
-        let postings_length =
-            read_u32_le(&postings[metadata_offset + 12..metadata_offset + 16]) as usize;
-        let num_blocks = u32::from_le_bytes([
-            postings[metadata_offset + 16],
-            postings[metadata_offset + 17],
-            postings[metadata_offset + 18],
-            postings[metadata_offset + 19],
-        ]) as usize;
+        let term_meta = TermMeta::parse(postings, metadata_offset)?;
 
-        let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, df);
+        let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
 
-        // Skip-table sits immediately after the 20-byte metadata. Each
-        // entry is 16 bytes: (last_doc_id, block_offset, max_bm25_x1000,
-        // reserved). We only need (block_offset, max_bm25) here.
-        let skip_start = metadata_offset + 20;
-        let skip_end = skip_start + num_blocks * 16;
-        if skip_end > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "skip table runs past postings region".into(),
-            )));
-        }
-
-        // Min-heap keyed by (score, doc_id) with reversed ordering so
-        // `peek()` returns the smallest-score entry. When the heap is
-        // full, `peek().score` is the current kth-best.
-        #[derive(Debug, Copy, Clone)]
-        struct HeapEntry(f32, u32);
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0 && self.1 == other.1
-            }
-        }
-        impl Eq for HeapEntry {}
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Reverse: smaller score is "greater" so heap.peek()
-                // gives the smallest. Tie-break on larger doc_id "greater"
-                // so smaller doc_id stays.
-                other
-                    .0
-                    .partial_cmp(&self.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| other.1.cmp(&self.1))
-            }
-        }
-
-        let mut heap: BinaryHeap<HeapEntry> =
-            BinaryHeap::with_capacity(k.min(num_blocks * 128).max(1));
+        // Top-k min-heap; see `TopKEntry` for the reversed ordering
+        // that makes `peek()` the current kth-best score.
+        let mut heap: BinaryHeap<TopKEntry> =
+            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * 128).max(1));
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
-        for i in 0..num_blocks {
-            let entry_off = skip_start + i * 16;
-            // bytes[entry_off..entry_off+4] = last_doc_id (unused here;
-            // useful for AND-merge seek which we don't do single-term)
-            let block_offset_in_term = u32::from_le_bytes([
-                postings[entry_off + 4],
-                postings[entry_off + 5],
-                postings[entry_off + 6],
-                postings[entry_off + 7],
-            ]) as usize;
-            let max_bm25_x1000 = u32::from_le_bytes([
-                postings[entry_off + 8],
-                postings[entry_off + 9],
-                postings[entry_off + 10],
-                postings[entry_off + 11],
-            ]);
-            let block_max_bm25 = (max_bm25_x1000 as f32) / 1000.0;
+        for i in 0..term_meta.num_blocks {
+            // last_doc_id (first tuple slot) is unused here — it serves
+            // AND-merge seeks, which single-term never does.
+            let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
 
             // BMW skip: heap full AND this block can't beat the kth-best.
             if heap.len() >= k
-                && let Some(HeapEntry(min_score, _)) = heap.peek()
+                && let Some(TopKEntry(min_score, _)) = heap.peek()
                 && block_max_bm25 <= *min_score
             {
                 continue;
             }
 
             // Locate the block's bytes.
-            let block_end_in_term = if i + 1 < num_blocks {
-                u32::from_le_bytes([
-                    postings[entry_off + 16 + 4],
-                    postings[entry_off + 16 + 5],
-                    postings[entry_off + 16 + 6],
-                    postings[entry_off + 16 + 7],
-                ]) as usize
-            } else {
-                postings_length
-            };
+            let block_end_in_term = term_meta.block_end_in_term(postings, i);
             let block_bytes = &postings
                 [metadata_offset + block_offset_in_term..metadata_offset + block_end_in_term];
+
+            //  Actual number of real docs in that block.
             let n = decode_block(block_bytes, &mut buf_d, &mut buf_t);
 
             for j in 0..n {
@@ -877,27 +810,17 @@ impl FtsReader {
                     dl_norm_k1[doc_id as usize],
                 );
                 if heap.len() < k {
-                    heap.push(HeapEntry(score, doc_id));
-                } else if let Some(HeapEntry(min_score, _)) = heap.peek()
+                    heap.push(TopKEntry(score, doc_id));
+                } else if let Some(TopKEntry(min_score, _)) = heap.peek()
                     && score > *min_score
                 {
                     heap.pop();
-                    heap.push(HeapEntry(score, doc_id));
+                    heap.push(TopKEntry(score, doc_id));
                 }
             }
         }
 
-        // Drain heap → sorted descending by score, ascending by doc_id on ties.
-        // pdqsort: top-k tuples are unique by `(score, doc_id)`
-        // (BinaryHeap drains each doc at most once), so stability
-        // isn't required.
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        Ok(out)
+        Ok(drain_top_k_desc(heap))
     }
 
     /// Build one `TermCursor` per term that resolves in the FST.
@@ -1003,38 +926,13 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
 
-        // Min-heap of (score, doc_id) for top-k. Same shape as
-        // `search_single_term_bmw`'s heap entry.
-        #[derive(Debug, Copy, Clone)]
-        struct HeapEntry(f32, u32);
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0 && self.1 == other.1
-            }
-        }
-        impl Eq for HeapEntry {}
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other
-                    .0
-                    .partial_cmp(&self.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| other.1.cmp(&self.1))
-            }
-        }
-
         // `search_multi` passes `k = usize::MAX` to gather every
         // matching doc before weighting across columns; cap initial
         // capacity at n_docs (the upper bound on distinct doc_ids in
-        // the heap) so we don't try to allocate `usize::MAX * size_of::<HeapEntry>()`.
+        // the heap) so we don't try to allocate `usize::MAX * size_of::<TopKEntry>()`.
         // The BinaryHeap grows on demand if needed.
         let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
         // Reused index buffer to avoid per-iteration allocation.
@@ -1182,15 +1080,15 @@ impl FtsReader {
 
             // Update heap.
             if heap.len() < k {
-                heap.push(HeapEntry(score, pivot_doc));
+                heap.push(TopKEntry(score, pivot_doc));
                 if heap.len() == k {
                     threshold = heap.peek().expect("non-empty").0;
                 }
-            } else if let Some(HeapEntry(min_score, _)) = heap.peek()
+            } else if let Some(TopKEntry(min_score, _)) = heap.peek()
                 && score > *min_score
             {
                 heap.pop();
-                heap.push(HeapEntry(score, pivot_doc));
+                heap.push(TopKEntry(score, pivot_doc));
                 threshold = heap.peek().expect("non-empty").0;
             }
 
@@ -1203,15 +1101,7 @@ impl FtsReader {
             }
         }
 
-        // Drain heap → sorted descending by score, ascending by doc_id on ties.
-        // pdqsort: top-k tuples unique by `(doc_id, score)`.
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        Ok(out)
+        Ok(drain_top_k_desc(heap))
     }
 
     /// Multi-term OR via Block-Max MaxScore (BMM).
@@ -1296,7 +1186,7 @@ impl FtsReader {
         cursors.sort_by_key(|c| c.block_count());
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<AndHeapEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
 
         // 2-term shape gets a specialized flat-merge inner loop: when
         // both cursors sit in their decoded block buffers, we walk the
@@ -1313,13 +1203,7 @@ impl FtsReader {
             self.run_and_intersect_general(&mut cursors, dl_norm_k1, k, &mut heap);
         }
 
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
-        out.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        Ok(out)
+        Ok(drain_top_k_desc(heap))
     }
 
     /// General `n >= 3`-term AND path. Same shape as the 2-term path:
@@ -1336,7 +1220,7 @@ impl FtsReader {
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
         k: usize,
-        heap: &mut BinaryHeap<AndHeapEntry>,
+        heap: &mut BinaryHeap<TopKEntry>,
     ) {
         'outer: loop {
             if cursors[0].is_exhausted() {
@@ -1483,7 +1367,7 @@ impl FtsReader {
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
         k: usize,
-        heap: &mut BinaryHeap<AndHeapEntry>,
+        heap: &mut BinaryHeap<TopKEntry>,
     ) {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
@@ -1643,31 +1527,8 @@ impl FtsReader {
             partial_max[i] = partial_max[i + 1] + cursors[i].term_max_bm25;
         }
 
-        #[derive(Debug, Copy, Clone)]
-        struct HeapEntry(f32, u32);
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0 && self.1 == other.1
-            }
-        }
-        impl Eq for HeapEntry {}
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other
-                    .0
-                    .partial_cmp(&self.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| other.1.cmp(&self.1))
-            }
-        }
-
         let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
         // Essential boundary: smallest f such that partial_max[f] ≤ threshold.
@@ -1767,7 +1628,7 @@ impl FtsReader {
                     }
 
                     if heap.len() < k {
-                        heap.push(HeapEntry(score, candidate));
+                        heap.push(TopKEntry(score, candidate));
                         if heap.len() == k {
                             threshold = heap.peek().expect("non-empty").0;
                             let new_f = recompute_f(&partial_max, threshold);
@@ -1778,7 +1639,7 @@ impl FtsReader {
                         }
                     } else if score > threshold {
                         heap.pop();
-                        heap.push(HeapEntry(score, candidate));
+                        heap.push(TopKEntry(score, candidate));
                         threshold = heap.peek().expect("non-empty").0;
                         let new_f = recompute_f(&partial_max, threshold);
                         if new_f != f_essential {
@@ -1927,14 +1788,14 @@ impl FtsReader {
             // gate the replace-or-skip decision against the local
             // f32 instead of paying for a heap.peek() per iter.
             if heap.len() < k {
-                heap.push(HeapEntry(score, candidate));
+                heap.push(TopKEntry(score, candidate));
                 if heap.len() == k {
                     threshold = heap.peek().expect("non-empty").0;
                     f_essential = recompute_f(&partial_max, threshold);
                 }
             } else if score > threshold {
                 heap.pop();
-                heap.push(HeapEntry(score, candidate));
+                heap.push(TopKEntry(score, candidate));
                 threshold = heap.peek().expect("non-empty").0;
                 f_essential = recompute_f(&partial_max, threshold);
             }
@@ -1950,15 +1811,7 @@ impl FtsReader {
             }
         }
 
-        // Drain heap → sorted descending by score, ascending by doc_id on ties.
-        // pdqsort: top-k tuples unique by `(doc_id, score)`.
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        Ok(out)
+        Ok(drain_top_k_desc(heap))
     }
 
     /// Exhaustive union walk for multi-term OR. No threshold-driven
@@ -2025,31 +1878,8 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
 
-        #[derive(Debug, Copy, Clone)]
-        struct HeapEntry(f32, u32);
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0 && self.1 == other.1
-            }
-        }
-        impl Eq for HeapEntry {}
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other
-                    .0
-                    .partial_cmp(&self.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| other.1.cmp(&self.1))
-            }
-        }
-
         let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
         loop {
@@ -2098,25 +1928,18 @@ impl FtsReader {
             // Top-K update. `threshold` mirrors `heap.peek().0` so
             // the replace-or-skip branch doesn't re-peek per iter.
             if heap.len() < k {
-                heap.push(HeapEntry(score, candidate));
+                heap.push(TopKEntry(score, candidate));
                 if heap.len() == k {
                     threshold = heap.peek().expect("non-empty").0;
                 }
             } else if score > threshold {
                 heap.pop();
-                heap.push(HeapEntry(score, candidate));
+                heap.push(TopKEntry(score, candidate));
                 threshold = heap.peek().expect("non-empty").0;
             }
         }
 
-        // pdqsort: top-k tuples unique by `(doc_id, score)`.
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|HeapEntry(s, d)| (d, s)).collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        Ok(out)
+        Ok(drain_top_k_desc(heap))
     }
 
     /// Multi-term OR dispatch. Routes everything to MaxScore+BMM.
@@ -2175,11 +1998,7 @@ impl FtsReader {
         k: usize,
         algo: OrAlgo,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let column_id = self
-            .column_id_by_name
-            .get(column)
-            .copied()
-            .ok_or_else(|| FtsError::UnknownColumn(column.to_string()))?;
+        let column_id = self.resolve_column_id(column)?;
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
@@ -2195,29 +2014,30 @@ impl FtsReader {
     }
 }
 
-/// Merge a `doc_id -> score` map into top-k by descending score, ties
-/// broken by ascending doc_id. Used by `search_multi`'s cross-column
-/// combiner, where the per-column scores have already been weighted
-/// and summed into `scores`.
-/// Min-heap entry shared by both AND paths (general + 2-term):
-/// `(score, doc_id)` with score-asc / doc_id-asc ordering so the
-/// heap's "greatest" is the smallest-score doc the kth-best result
-/// is gating against. `BinaryHeap::peek` then returns the current
-/// kth-best score for the pruning + tie-break checks.
+/// Top-k min-heap entry `(score, doc_id)`, shared by every search
+/// path (single-term BMW, WAND+BMW, MaxScore+BMM, exhaustive union,
+/// AND intersection, and the `search_multi` combiner).
+///
+/// Ordering is **reversed** on purpose: smaller score is "greater",
+/// so `BinaryHeap::peek()` returns the smallest-score entry. Once the
+/// heap holds k entries, `peek()` is the current kth-best score — the
+/// bar a new doc must beat (also the BMW/BMM pruning threshold).
+/// Tie-break: larger doc_id is "greater", so on equal scores the
+/// smaller doc_id survives in the heap.
 #[derive(Debug, Copy, Clone)]
-struct AndHeapEntry(f32, u32);
-impl PartialEq for AndHeapEntry {
+struct TopKEntry(f32, u32);
+impl PartialEq for TopKEntry {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0 && self.1 == other.1
     }
 }
-impl Eq for AndHeapEntry {}
-impl PartialOrd for AndHeapEntry {
+impl Eq for TopKEntry {}
+impl PartialOrd for TopKEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for AndHeapEntry {
+impl Ord for TopKEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .0
@@ -2227,47 +2047,42 @@ impl Ord for AndHeapEntry {
     }
 }
 
+/// Drain a top-k min-heap into the public result order: descending
+/// score, ascending doc_id on ties.
+///
+/// pdqsort: entries are unique by `(score, doc_id)` — every search
+/// path offers each doc_id to its heap at most once — so an unstable
+/// sort has no observable reorderings.
+fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
+    let mut out: Vec<(u32, f32)> = heap.into_iter().map(|TopKEntry(s, d)| (d, s)).collect();
+    out.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    out
+}
+
 /// Push `(score, doc_id)` into the top-k AND heap with the same
 /// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
 /// agree on score-tied docs.
 #[inline]
-fn and_heap_push(heap: &mut BinaryHeap<AndHeapEntry>, k: usize, score: f32, doc_id: u32) {
+fn and_heap_push(heap: &mut BinaryHeap<TopKEntry>, k: usize, score: f32, doc_id: u32) {
     if heap.len() < k {
-        heap.push(AndHeapEntry(score, doc_id));
+        heap.push(TopKEntry(score, doc_id));
     } else if let Some(&worst) = heap.peek()
         && (score > worst.0 || (score == worst.0 && doc_id < worst.1))
     {
         heap.pop();
-        heap.push(AndHeapEntry(score, doc_id));
+        heap.push(TopKEntry(score, doc_id));
     }
 }
 
+/// Merge a `doc_id -> score` map into top-k by descending score, ties
+/// broken by ascending doc_id. Used by `search_multi`'s cross-column
+/// combiner, where the per-column scores have already been weighted
+/// and summed into `scores`.
 fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
-    #[derive(Debug)]
-    struct Entry(u32, f32);
-    impl PartialEq for Entry {
-        fn eq(&self, other: &Self) -> bool {
-            self.1 == other.1 && self.0 == other.0
-        }
-    }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, other: &Self) -> Ordering {
-            // Min-heap by score (smaller score "greater" so it pops
-            // first); tie-break with smaller doc_id at the top.
-            other
-                .1
-                .partial_cmp(&self.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| other.0.cmp(&self.0))
-        }
-    }
-
     // Iterate in ascending doc_id order so ties resolve deterministically
     // (smaller doc_ids enter the heap first; the strict `score > peek`
     // check below means subsequent equal-score entries don't displace
@@ -2278,34 +2093,18 @@ fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     let mut sorted: Vec<(u32, f32)> = scores.into_iter().collect();
     sorted.sort_unstable_by_key(|(d, _)| *d);
 
-    let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k.min(sorted.len()).max(1));
+    let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k.min(sorted.len()).max(1));
     for (doc_id, score) in sorted {
         if heap.len() < k {
-            heap.push(Entry(doc_id, score));
-        } else if let Some(Entry(_, top_score)) = heap.peek()
+            heap.push(TopKEntry(score, doc_id));
+        } else if let Some(TopKEntry(top_score, _)) = heap.peek()
             && score > *top_score
         {
             heap.pop();
-            heap.push(Entry(doc_id, score));
+            heap.push(TopKEntry(score, doc_id));
         }
     }
-    let mut out: Vec<(u32, f32)> = heap.into_iter().map(|Entry(d, s)| (d, s)).collect();
-    // Sort descending by score, ascending by doc_id on ties.
-    // pdqsort: top-k tuples unique by `(doc_id, score)`.
-    out.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    out
-}
-
-fn make_key(column_name: &str, term: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(column_name.len() + 1 + term.len());
-    k.extend_from_slice(column_name.as_bytes());
-    k.push(FST_SEPARATOR);
-    k.extend_from_slice(term.as_bytes());
-    k
+    drain_top_k_desc(heap)
 }
 
 fn fetch_source_range(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, FtsError> {
@@ -2341,6 +2140,96 @@ fn read_u64_le(b: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&b[0..8]);
     u64::from_le_bytes(buf)
+}
+
+/// Parsed per-(column, term) metadata header from the postings
+/// region. The byte layout is documented once, on the writer side —
+/// see [`TERM_META_SIZE`] in `builder.rs` — this struct is its
+/// read-side mirror and must stay in sync with that doc.
+///
+/// [`TermMeta::parse`] is the single place that validates untrusted
+/// offsets (the FST value points here) against the postings region:
+/// both the fixed 20-byte header and the skip table it declares are
+/// bounds-checked before any caller touches a byte. Both the
+/// single-term BMW path and [`TermCursor::new`] go through here, so
+/// the header layout is interpreted in exactly one spot.
+#[derive(Debug, Copy, Clone)]
+struct TermMeta {
+    /// Document frequency — number of docs containing the term.
+    df: u64,
+    /// Byte length of the term's whole region (header + skip table +
+    /// blocks), relative to the term's `metadata_offset`.
+    postings_length: usize,
+    /// Number of PFOR blocks (= number of skip-table entries).
+    num_blocks: usize,
+    /// Absolute offset (within the postings region) of the first
+    /// skip-table entry: `metadata_offset + TERM_META_SIZE`.
+    skip_start: usize,
+}
+
+impl TermMeta {
+    /// Parse + bounds-validate the header and its skip table.
+    /// Returns `Err` (never panics) on a corrupt or malicious
+    /// `metadata_offset` — the crate-wide "untrusted input yields
+    /// `Err`, not a slice-index panic" rule.
+    fn parse(postings: &[u8], metadata_offset: usize) -> Result<Self, FtsError> {
+        if metadata_offset + TERM_META_SIZE > postings.len() {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "term metadata offset out of postings region".into(),
+            )));
+        }
+        let df = read_u32_le(&postings[metadata_offset..metadata_offset + 4]) as u64;
+        // bytes [4..12] = self-offset (redundant; u64); skip
+        let postings_length =
+            read_u32_le(&postings[metadata_offset + 12..metadata_offset + 16]) as usize;
+        let num_blocks =
+            read_u32_le(&postings[metadata_offset + 16..metadata_offset + 20]) as usize;
+
+        let skip_start = metadata_offset + TERM_META_SIZE;
+        let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
+        if skip_end > postings.len() {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "skip table runs past postings region".into(),
+            )));
+        }
+        Ok(Self {
+            df,
+            postings_length,
+            num_blocks,
+            skip_start,
+        })
+    }
+
+    /// Decode skip-table entry `i` into `(last_doc_id,
+    /// block_offset_in_term, block_max_bm25)`. `block_offset_in_term`
+    /// is relative to the term's `metadata_offset`; `block_max_bm25`
+    /// is recovered from the fixed-point `max_bm25_x1000` field. The
+    /// reserved field (entry bytes 12..16) is ignored. Per-entry on
+    /// purpose — the single-term BMW walk streams entries without
+    /// materializing a `Vec`.
+    #[inline]
+    fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, f32) {
+        debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
+        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
+        let last_doc_id = read_u32_le(&postings[entry_off..entry_off + 4]);
+        let block_offset = read_u32_le(&postings[entry_off + 4..entry_off + 8]) as usize;
+        let max_bm25_x1000 = read_u32_le(&postings[entry_off + 8..entry_off + 12]);
+        (last_doc_id, block_offset, (max_bm25_x1000 as f32) / 1000.0)
+    }
+
+    /// End offset (relative to the term's `metadata_offset`) of block
+    /// `i`'s bytes. Blocks are concatenated back-to-back, so each
+    /// block ends where the next one's `block_offset` begins; the last
+    /// block ends at `postings_length`.
+    #[inline]
+    fn block_end_in_term(&self, postings: &[u8], i: usize) -> usize {
+        if i + 1 < self.num_blocks {
+            let next_off = self.skip_start + (i + 1) * SKIP_ENTRY_SIZE;
+            read_u32_le(&postings[next_off + 4..next_off + 8]) as usize
+        } else {
+            self.postings_length
+        }
+    }
 }
 
 /// Per-term per-block metadata, parsed once at `TermCursor` construction.
@@ -2426,57 +2315,21 @@ impl TermCursor {
     fn new(term_bytes: Bytes, n_docs: u64) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
-        if metadata_offset + 20 > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "term metadata offset out of postings region".into(),
-            )));
-        }
-        let df = read_u32_le(&postings[metadata_offset..metadata_offset + 4]) as u64;
-        // bytes [4..12] = self-offset (redundant; u64); skip
-        let postings_length =
-            read_u32_le(&postings[metadata_offset + 12..metadata_offset + 16]) as usize;
-        let num_blocks = u32::from_le_bytes([
-            postings[metadata_offset + 16],
-            postings[metadata_offset + 17],
-            postings[metadata_offset + 18],
-            postings[metadata_offset + 19],
-        ]) as usize;
 
-        let idf = crate::superfile::fts::bm25::idf(n_docs, df);
+        let term_meta = TermMeta::parse(postings, metadata_offset)?;
+        let idf = crate::superfile::fts::bm25::idf(n_docs, term_meta.df);
 
-        let skip_start = metadata_offset + 20;
-        let skip_end = skip_start + num_blocks * 16;
-        if skip_end > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
-                "skip table runs past postings region".into(),
-            )));
-        }
-
-        let mut blocks: Vec<BlockMeta> = Vec::with_capacity(num_blocks);
+        let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
         let mut term_max_bm25: f32 = 0.0;
-        for i in 0..num_blocks {
-            let entry_off = skip_start + i * 16;
-            let last_doc_id = read_u32_le(&postings[entry_off..entry_off + 4]);
-            let block_offset_in_term =
-                read_u32_le(&postings[entry_off + 4..entry_off + 8]) as usize;
-            let max_bm25_x1000 = read_u32_le(&postings[entry_off + 8..entry_off + 12]);
-            let block_max_bm25 = (max_bm25_x1000 as f32) / 1000.0;
-            // bytes [12..16] = reserved.
+        for i in 0..term_meta.num_blocks {
+            let (last_doc_id, block_offset_in_term, block_max_bm25) =
+                term_meta.skip_entry(postings, i);
             term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
-            let block_byte_offset = metadata_offset + block_offset_in_term;
-            let block_byte_end = if i + 1 < num_blocks {
-                let next_entry_off = skip_start + (i + 1) * 16;
-                let next_block_offset_in_term =
-                    read_u32_le(&postings[next_entry_off + 4..next_entry_off + 8]) as usize;
-                metadata_offset + next_block_offset_in_term
-            } else {
-                metadata_offset + postings_length
-            };
             blocks.push(BlockMeta {
                 last_doc_id,
-                block_byte_offset,
-                block_byte_end,
+                block_byte_offset: metadata_offset + block_offset_in_term,
+                block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
                 block_max_bm25,
             });
         }
