@@ -1,15 +1,13 @@
-# infino Architecture Overview (GTM primer)
+# Infino Architecture Overview
 
-A plain-language tour of what infino is, how it's built, and how it
-differs from the databases, search engines, and vector databases it
-competes with. For the technical deep-dives, see
-[superfile](./superfile.md) (the segment format) and
-[supertable](./supertable.md) (the table layer). This document is the
-"why it matters" layer on top of those.
+A plain-language tour of what Infino is, how it's built, and how it
+differs from the database, search engine, and vector database alternatives. 
+For more technical detail, see [superfile](./superfile.md) (the segment format) and
+[supertable](./supertable.md) (the table layer).
 
-## The one-liner
+## What is Infino?
 
-**infino is a search-and-retrieval database that keeps your data on
+**infino is a fast retrieval engine that keeps your data on
 cheap object storage (like Amazon S3) and runs SQL, full-text (keyword)
 search, and vector (semantic) search over it from a single system.**
 
@@ -95,7 +93,7 @@ decide up front which is which.
 
 ## How this differs from what's out there
 
-First, an honest caveat: this is a **converging** market. Databases,
+First, an honest caveat: this is a **converging** space. Databases,
 search engines, and vector databases increasingly offer *all three*
 modalities — scalar, full-text, and vector — and several have moved at
 least partway toward object storage. So the interesting question is
@@ -155,7 +153,7 @@ points on a spectrum, not walls.
   where it sits relative to your other systems, and breadth beyond
   vectors.
 
-### Object-storage-native search (infino, and turbopuffer / "tpuf")
+### Object-storage-native search (Infino, Turbopuffer, Lancedb)
 
 This camp's distinction isn't "the only ones who *can*" do these things
 — it's that the architecture is **built around object storage and
@@ -168,7 +166,7 @@ multi-modal retrieval from the start**, rather than retrofitting either:
   bill each independently; spin compute down without losing data.
 - **Multi-modal as a first-class assumption**, not a later addition.
 
-Where **infino is distinctive even within this camp**:
+Where **Infino is distinctive even within this camp**:
 
 - **The segment is a valid Parquet file.** Data isn't trapped in a
   proprietary index format — the *same bytes* are readable by the open
@@ -180,10 +178,6 @@ Where **infino is distinctive even within this camp**:
   one consistency model, instead of syncing a DB + a search engine + a
   vector DB.
 
-These are differences of degree and default, not absolutes — useful
-framing in a conversation with a buyer who already runs one of the
-above.
-
 ### At a glance
 
 Read these as **design center and typical tradeoff**, not hard limits —
@@ -194,9 +188,9 @@ most systems are extending across the row over time.
 | **Traditional DB** | Transactions, single node | Scalar core; full-text + vectors added (e.g. pgvector) | Rises with total data (coupled) | Proprietary |
 | **Search engine** | Node/shard cluster | Full-text core; vectors maturing; object-storage tiers added | Lower with frozen tiers, but cluster-centric | Proprietary |
 | **Vector DB** | ANN over embeddings | Vector core; hybrid + filtering increasingly common | Varies; RAM/SSD-heavy if latency-pinned | Proprietary |
-| **infino / tpuf** | Object storage + multi-modal, by default | Scalar + full-text + vector as a baseline | Low; pay for what you query | infino: **open Parquet** |
+| **Object Store Engines** | Object storage + multi-modal, by default | Scalar + full-text + vector as a baseline | Low; pay for what you query | Infino: **open Parquet** |
 
-## What infino optimizes for
+## What Infino optimizes for
 
 - **Cost at scale.** Object storage as the source of truth means
   storing a lot of data is cheap; you pay compute only for the queries
@@ -213,10 +207,9 @@ most systems are extending across the row over time.
 - **Openness / no lock-in.** Segments are Parquet; data stays usable by
   the broader ecosystem.
 
-## Where it fits best (talking points for ICP)
+## Where it fits best
 
-Framed as *fit*, not as "everyone else is wrong" — the strongest pitch
-meets a buyer where their current stack strains:
+Infino is best for:
 
 - Large corpora where **most data is cold** but must stay searchable —
   logs, documents, product catalogs, knowledge bases, chat/email
@@ -231,13 +224,10 @@ meets a buyer where their current stack strains:
 - Workloads with **bursty or elastic query volume**, where decoupled
   compute can scale up and down against a stable storage tier.
 
-Equally fair to say where it's *not* the obvious choice: heavy
-transactional workloads belong in an OLTP database, and if you already
-run one system that comfortably handles your scale and modalities,
-"consolidate to save cost/ops" is the conversation — not "rip and
-replace."
+Equally fair to say where it's *not* the obvious choice: heavy transactional workloads belong in an OLTP database, and if you already
+run one system that comfortably handles your scale and modalities, then where Infino helps is to consolidate to save cost/ops.
 
-## A few terms you'll hear
+## A few terms you'll see through the repo
 
 - **Superfile** — one immutable segment file (columns + keyword index +
   vector index), also a valid Parquet file.
@@ -255,9 +245,3 @@ replace."
   behind fast approximate vector search.
 - **Object storage / S3** — cheap, durable, near-infinite remote
   storage used as the source of truth.
-
----
-
-*For implementation detail, hand the candidate
-[superfile.md](./superfile.md) and [supertable.md](./supertable.md);
-this overview is the positioning layer above them.*
