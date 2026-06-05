@@ -5,7 +5,8 @@
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
 //! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
-//! (or `INFINO_TEST_REAL_S3_BUCKET`) for AWS S3.
+//! for AWS S3, or `INFINO_REAL_AZURE_CONTAINER` for Azure Blob (Azure wins
+//! when both are set).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{S3StorageProvider, StorageProvider};
+use infino::supertable::storage::{AzureStorageProvider, S3StorageProvider, StorageProvider};
 use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
@@ -65,13 +66,15 @@ pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) 
 pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
-    pub real_s3: bool,
+    /// True for a real remote store (S3/Azure) that needs explicit
+    /// cleanup; false for the ephemeral in-process s3s-fs emulator.
+    pub remote: bool,
     _keepalive: StorageKeepalive,
 }
 
 enum StorageKeepalive {
     S3sFs { _fs_root: TempDir },
-    RealS3,
+    Remote,
 }
 
 /// A single superfile committed to object storage (1M tier benches).
@@ -83,7 +86,8 @@ pub struct SuperfileCommitted {
     pub object_path: String,
     pub object_size: u64,
     pub storage_label: &'static str,
-    pub real_s3: bool,
+    /// See [`StorageFixture::remote`].
+    pub remote: bool,
     pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
 }
@@ -110,6 +114,68 @@ pub fn real_s3_bucket_env() -> Option<String> {
 
 pub fn real_s3_prefix_root(default: &str) -> String {
     std::env::var("INFINO_REAL_S3_PREFIX").unwrap_or_else(|_| default.to_string())
+}
+
+fn real_azure_container_env() -> Option<String> {
+    std::env::var("INFINO_REAL_AZURE_CONTAINER")
+        .or_else(|_| std::env::var("INFINO_TEST_REAL_AZURE_CONTAINER"))
+        .ok()
+}
+
+/// A real (non-emulator) object store selected by env for warm/cold tiers.
+/// Azure takes precedence over S3 when both are configured.
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteBackend {
+    S3 { bucket: String },
+    Azure { container: String },
+}
+
+impl RemoteBackend {
+    fn from_env() -> Option<Self> {
+        Self::select(real_azure_container_env(), real_s3_bucket_env())
+    }
+
+    /// Pure selection (Azure over S3) — split out so precedence is unit-
+    /// testable without mutating process env.
+    fn select(azure_container: Option<String>, s3_bucket: Option<String>) -> Option<Self> {
+        match (azure_container, s3_bucket) {
+            (Some(container), _) => Some(Self::Azure { container }),
+            (None, Some(bucket)) => Some(Self::S3 { bucket }),
+            (None, None) => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::S3 { .. } => "real_s3",
+            Self::Azure { .. } => "real_azure",
+        }
+    }
+
+    /// Namespace root for this run's objects: a per-backend env override,
+    /// else `default`.
+    fn prefix_root(&self, default: &str) -> String {
+        match self {
+            Self::S3 { .. } => real_s3_prefix_root(default),
+            Self::Azure { .. } => {
+                std::env::var("INFINO_REAL_AZURE_PREFIX").unwrap_or_else(|_| default.to_string())
+            }
+        }
+    }
+
+    /// Provider scoped to `prefix`. The single per-backend construction
+    /// site; adding a backend is one arm here.
+    fn provider(&self, prefix: &str) -> Arc<dyn StorageProvider> {
+        match self {
+            Self::S3 { bucket } => Arc::new(
+                S3StorageProvider::new_with_prefix(bucket, prefix).expect("real S3 provider"),
+            ),
+            Self::Azure { container } => Arc::new(
+                AzureStorageProvider::new_with_prefix(container, prefix)
+                    .expect("real Azure provider"),
+            ),
+        }
+    }
 }
 
 fn unique_bench_prefix(root: &str) -> String {
@@ -158,17 +224,15 @@ async fn spawn_s3s_fs(s3s_bucket: &str) -> (SocketAddr, TempDir) {
 }
 
 async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture {
-    if let Some(bucket) = real_s3_bucket_env() {
-        let prefix = unique_bench_prefix(&real_s3_prefix_root(prefix_default));
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 provider"),
-        );
-        eprintln!("[tiers] real S3: bucket={bucket} prefix={prefix}");
+    if let Some(backend) = RemoteBackend::from_env() {
+        let prefix = unique_bench_prefix(&backend.prefix_root(prefix_default));
+        let storage = backend.provider(&prefix);
+        eprintln!("[tiers] {} prefix={prefix}", backend.label());
         StorageFixture {
             storage,
-            storage_label: "real_s3",
-            real_s3: true,
-            _keepalive: StorageKeepalive::RealS3,
+            storage_label: backend.label(),
+            remote: true,
+            _keepalive: StorageKeepalive::Remote,
         }
     } else {
         let (addr, fs_root) = spawn_s3s_fs(s3s_bucket).await;
@@ -196,7 +260,7 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
         StorageFixture {
             storage,
             storage_label: "s3s_fs",
-            real_s3: false,
+            remote: false,
             _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
         }
     }
@@ -228,8 +292,8 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
         object_path: path.clone(),
         object_size: bytes.len() as u64,
         storage_label: fixture.storage_label,
-        real_s3: fixture.real_s3,
-        cleanup_path: if fixture.real_s3 { Some(path) } else { None },
+        remote: fixture.remote,
+        cleanup_path: if fixture.remote { Some(path) } else { None },
         _keepalive: fixture._keepalive,
     }
 }
@@ -372,4 +436,48 @@ pub async fn wait_for_superfile_promotion(
 pub fn empty_pinned()
 -> Arc<dyn Fn() -> HashSet<infino::supertable::manifest::SuperfileUri> + Send + Sync> {
     Arc::new(HashSet::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_prefers_azure_over_s3() {
+        let b = RemoteBackend::select(Some("c".into()), Some("bkt".into()));
+        assert_eq!(
+            b,
+            Some(RemoteBackend::Azure {
+                container: "c".into()
+            })
+        );
+    }
+
+    #[test]
+    fn select_falls_back_to_s3() {
+        let b = RemoteBackend::select(None, Some("bkt".into()));
+        assert_eq!(
+            b,
+            Some(RemoteBackend::S3 {
+                bucket: "bkt".into()
+            })
+        );
+    }
+
+    #[test]
+    fn select_none_when_unset() {
+        assert_eq!(RemoteBackend::select(None, None), None);
+    }
+
+    #[test]
+    fn label_matches_backend() {
+        assert_eq!(
+            RemoteBackend::Azure {
+                container: "c".into()
+            }
+            .label(),
+            "real_azure"
+        );
+        assert_eq!(RemoteBackend::S3 { bucket: "b".into() }.label(), "real_s3");
+    }
 }

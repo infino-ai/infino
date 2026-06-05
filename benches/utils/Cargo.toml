@@ -25,7 +25,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 infino = { path = "../..", features = ["test-helpers"] }
 memmap2 = "0.9"
 num_cpus = "1"
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.13", features = ["aws", "azure"] }
 parquet = "58"
 rand = "0.10"
 rand_distr = "0.6"
