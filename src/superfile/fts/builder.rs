@@ -67,15 +67,6 @@
 //! 4. `finish()` (returns `Vec<u8>`) or `finish_to(impl Write)`
 //!    (streams the blob progressively to any sink).
 
-use crate::superfile::BuildError;
-use crate::superfile::format::checksum::{crc32c, crc32c_append};
-use crate::superfile::format::{self, FST_SEPARATOR};
-use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
-use crate::superfile::fts::fst_value::FstValue;
-use crate::superfile::fts::posting::{BLOCK_LEN, Block, EncodedBlock, encode_block};
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -85,7 +76,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
+
+use crate::superfile::BuildError;
+use crate::superfile::format::checksum::{crc32c, crc32c_append};
+use crate::superfile::format::{self, FST_SEPARATOR};
+use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
+use crate::superfile::fts::fst_value::FstValue;
+use crate::superfile::fts::posting::{BLOCK_LEN, Block, EncodedBlock, encode_block};
+use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 
 /// Per-column term interner table.
 ///
@@ -178,10 +179,10 @@ impl FinishProfile {
 ///
 /// `df`, `postings_length`, and `num_blocks` stay u32; only the absolute
 /// offset into the postings region needs the full u64 range.
-const TERM_META_SIZE: usize = 20;
+pub(crate) const TERM_META_SIZE: usize = 20;
 
 /// Skip-table entry size in bytes.
-const SKIP_ENTRY_SIZE: usize = 16;
+pub(crate) const SKIP_ENTRY_SIZE: usize = 16;
 
 /// Doc-lengths directory entry size in bytes (per column).
 ///
@@ -194,7 +195,7 @@ const SKIP_ENTRY_SIZE: usize = 16;
 ///
 /// Only the absolute offset needs u64; column_id and avgdl_x1000 stay
 /// u32 (bounded by column count and doc length respectively).
-const DOC_LENGTHS_ENTRY_SIZE: usize = 16;
+pub(crate) const DOC_LENGTHS_ENTRY_SIZE: usize = 16;
 
 /// Default per-column in-RAM accumulator budget before a column
 /// flushes to spill files. Mirrors `VectorBuilder::spill_threshold_bytes`
