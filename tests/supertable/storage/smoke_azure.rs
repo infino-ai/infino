@@ -14,7 +14,7 @@
 //!   azurite-blob --blobHost 0.0.0.0`). The test creates its own
 //!   container.
 //! - `supertable_real_azure_round_trip` — `INFINO_TEST_REAL_AZURE=1` +
-//!   `INFINO_TEST_REAL_AZURE_CONTAINER`, with account credentials from
+//!   `AZURE_STORAGE_CONTAINER_NAME`, with account credentials from
 //!   the standard `AZURE_STORAGE_*` env chain. The container must
 //!   already exist; the test scopes itself under a random prefix and
 //!   cleans up after.
@@ -344,17 +344,17 @@ async fn supertable_real_azure_round_trip() {
     if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {
         eprintln!(
             "supertable_real_azure_round_trip: skipped \
-             (set INFINO_TEST_REAL_AZURE=1 and INFINO_TEST_REAL_AZURE_CONTAINER to enable)"
+             (set INFINO_TEST_REAL_AZURE=1 and AZURE_STORAGE_CONTAINER_NAME to enable)"
         );
         return;
     }
 
-    let container = match std::env::var("INFINO_TEST_REAL_AZURE_CONTAINER") {
+    let container = match std::env::var("AZURE_STORAGE_CONTAINER_NAME") {
         Ok(container) => container,
         Err(_) => {
             eprintln!(
                 "supertable_real_azure_round_trip: skipped \
-                 (missing INFINO_TEST_REAL_AZURE_CONTAINER)"
+                 (missing AZURE_STORAGE_CONTAINER_NAME)"
             );
             return;
         }
