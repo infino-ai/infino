@@ -1193,166 +1193,38 @@ impl VectorReader {
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
-        // Each cluster block is `[codes_chunk][doc_ids_chunk]
-        // [full_chunk]` (interleaved layout). Score off the codes
-        // + doc_ids prefix now; the full_chunk suffix is read back
-        // for the survivors at rerank time — from the *same*
-        // already-fetched block, so rerank issues zero extra GETs.
-        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
-        // Score each probed cluster's 1-bit codes into the shortlist.
-        // The per-cluster slices are zero-copy `Bytes` views; the
-        // actual estimate scan is the hot CPU work. It runs in
-        // parallel across clusters once the candidate pool is large
-        // enough to amortize the rayon hand-off — the 10M supertable's
-        // `nprobe × segments` fan-out clears the bar, while the 1M
-        // single-superfile nprobe=1 hot path (one cluster) stays
-        // serial. Cluster scoring is order-independent: every survivor
-        // is re-sorted by estimate immediately below, so the parallel
-        // and serial shortlists rank identically.
-        let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
-        let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-            k
-        } else {
-            k.saturating_mul(rerank_mult)
+        // Score the 1-bit shortlist and build rerank references — the
+        // pure-CPU stage shared with `search_async` (see
+        // [`build_shortlist`]). Each cluster block is
+        // `[codes][doc_ids][full?]`; scoring reads the prefix, and the
+        // survivor `full[]` rows are fetched below — the only step
+        // that differs from the async path.
+        let (candidates, survivor_full_ranges) = match build_shortlist(
+            col,
+            &q_rot,
+            cb,
+            &cluster_meta,
+            &cluster_blocks,
+            survivor_only_rerank_fetch,
+            k,
+            rerank_mult,
+        ) {
+            ShortlistOutcome::Done(out) => return Ok(out),
+            ShortlistOutcome::Rerank {
+                candidates,
+                survivor_full_ranges,
+            } => (candidates, survivor_full_ranges),
         };
-        if coarse_limit == 0 {
-            return Ok(Vec::new());
-        }
-        let score_block =
-            |heap: &mut BoundedCoarseHeap,
-             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
-                let codes_len = (cnt as usize) * cb;
-                let doc_ids_len = (cnt as usize) * 4;
-                debug_assert_eq!(
-                    block.len(),
-                    if survivor_only_rerank_fetch {
-                        codes_len + doc_ids_len
-                    } else {
-                        codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
-                    }
-                );
-                let codes = block.slice(0..codes_len);
-                let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-                score_cluster_codes_into_heap(
-                    &codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot, heap,
-                );
-            };
-        let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-            cluster_meta
-                .par_iter()
-                .zip(cluster_blocks.par_iter())
-                .fold(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut heap, item| {
-                        score_block(&mut heap, item);
-                        heap
-                    },
-                )
-                .reduce(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut left, right| {
-                        left.merge(right);
-                        left
-                    },
-                )
-        } else {
-            let mut heap = BoundedCoarseHeap::new(coarse_limit);
-            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
-                score_block(&mut heap, item);
-            }
-            heap
-        };
-        let mut shortlist = shortlist_heap.into_vec();
-
-        if shortlist.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // `None` codec short-circuit. The 1-bit
-        // shortlist *is* the final ranking — there's no `full[]`
-        // region on disk and no rerank step. We:
-        //   * partial-sort the shortlist to land the top-K by
-        //     descending estimate (higher dot estimate = better
-        //     candidate),
-        //   * fully sort the retained k for a stable output
-        //     ordering, and
-        //   * flip the sign of the estimate so the returned
-        //     `(doc_id, distance)` pairs follow the standard
-        //     "smaller = closer" convention for the caller. The
-        //     value is a 1-bit-derived score, not a true metric
-        //     distance; for `None` columns recall is the
-        //     contract, not numerical agreement with fp32.
-        //
-        // `rerank_mult` is intentionally ignored here — there's
-        // nothing to refine. Storage shrinks by ~30×; recall
-        // drops 0.05-0.15 vs rerank-equipped codecs (corpus-
-        // dependent). M5 will surface the bench numbers.
-        if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-            let _ = rerank_mult;
-            shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-            return Ok(shortlist
-                .into_iter()
-                .map(|(did, est, _pos, _c)| (did, -est))
-                .collect());
-        }
-
-        // 6. Build lightweight rerank references into the cluster
-        //    blocks already in hand — no second fetch and no survivor
-        //    byte packing. Each block's `full_chunk` follows its
-        //    `[codes][doc_ids]` prefix; candidate at cluster-order
-        //    position `pos = cluster_doc_off + i` lives at in-block
-        //    offset `cnt*cb + cnt*4 + i*stride`.
-        //
-        //    Because `full[]` rides inside the per-cluster block,
-        //    the whole cold first search is just the `nprobe`
-        //    cluster-block GETs (issued in parallel above) — the
-        //    rerank step adds zero round-trips and zero extra
-        //    bytes over the wire.
-        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
-        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
-            block_by_cid.insert(c as u32, bi);
-        }
-        let stride = full_vec_bytes;
-        let mut candidates = Vec::with_capacity(shortlist.len());
-        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
-            Some(Vec::with_capacity(shortlist.len()))
-        } else {
-            None
-        };
-        for &(did, _, pos, cluster_id) in &shortlist {
-            let bi = block_by_cid[&cluster_id];
-            let (_, off, cnt) = cluster_meta[bi];
-            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
-            let local = (pos - off) as usize;
-            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
-                let idx = ranges.len();
-                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
-                Some(idx)
-            } else {
-                None
-            };
-            candidates.push(RerankCandidate {
-                did,
-                pos,
-                cluster_id,
-                block_idx: bi,
-                full_off: full_start + local * stride,
-                full_idx,
-            });
-        }
-        let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
-            // Coalesce the survivor rows: on the cold path these are
-            // scattered single-vector ranges inside each cluster's
-            // `full[]` region, so merging adjacent ones (bounded gap /
-            // overfetch) keeps the second-wave GET count down. On the
-            // warm path the underlying fetch resolves sync/zero-copy,
-            // so the coalescing is just a cheap sort.
-            Some(
+        // Coalesce the survivor rows (scattered single-vector ranges
+        // inside each cluster's `full[]` region) into a small second
+        // wave; warm ranges resolve sync/zero-copy, so this is a cheap
+        // sort.
+        let survivor_full_rows = match survivor_full_ranges {
+            Some(ranges) => Some(
                 get_cluster_ranges_coalesced(&self.source, &ranges)
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
 
         // 8. CPU-only rerank using the true metric. Sq8 columns
@@ -1470,115 +1342,34 @@ impl VectorReader {
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
-        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
-        let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
-        let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-            k
-        } else {
-            k.saturating_mul(rerank_mult)
+        // Shared pure-CPU shortlist + candidate-build stage (see
+        // [`build_shortlist`]); only the survivor-row fetch below
+        // diverges from the sync path.
+        let (candidates, survivor_full_ranges) = match build_shortlist(
+            col,
+            &q_rot,
+            cb,
+            &cluster_meta,
+            &cluster_blocks,
+            survivor_only_rerank_fetch,
+            k,
+            rerank_mult,
+        ) {
+            ShortlistOutcome::Done(out) => return Ok(out),
+            ShortlistOutcome::Rerank {
+                candidates,
+                survivor_full_ranges,
+            } => (candidates, survivor_full_ranges),
         };
-        if coarse_limit == 0 {
-            return Ok(Vec::new());
-        }
-        let score_block =
-            |heap: &mut BoundedCoarseHeap,
-             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
-                let codes_len = (cnt as usize) * cb;
-                let doc_ids_len = (cnt as usize) * 4;
-                debug_assert_eq!(
-                    block.len(),
-                    if survivor_only_rerank_fetch {
-                        codes_len + doc_ids_len
-                    } else {
-                        codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
-                    }
-                );
-                let codes = block.slice(0..codes_len);
-                let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-                score_cluster_codes_into_heap(
-                    &codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot, heap,
-                );
-            };
-        let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-            cluster_meta
-                .par_iter()
-                .zip(cluster_blocks.par_iter())
-                .fold(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut heap, item| {
-                        score_block(&mut heap, item);
-                        heap
-                    },
-                )
-                .reduce(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut left, right| {
-                        left.merge(right);
-                        left
-                    },
-                )
-        } else {
-            let mut heap = BoundedCoarseHeap::new(coarse_limit);
-            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
-                score_block(&mut heap, item);
-            }
-            heap
-        };
-        let mut shortlist = shortlist_heap.into_vec();
-
-        if shortlist.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-            let _ = rerank_mult;
-            shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-            return Ok(shortlist
-                .into_iter()
-                .map(|(did, est, _pos, _c)| (did, -est))
-                .collect());
-        }
-
-        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
-        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
-            block_by_cid.insert(c as u32, bi);
-        }
-        let stride = full_vec_bytes;
-        let mut candidates = Vec::with_capacity(shortlist.len());
-        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
-            Some(Vec::with_capacity(shortlist.len()))
-        } else {
-            None
-        };
-        for &(did, _, pos, cluster_id) in &shortlist {
-            let bi = block_by_cid[&cluster_id];
-            let (_, off, cnt) = cluster_meta[bi];
-            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
-            let local = (pos - off) as usize;
-            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
-                let idx = ranges.len();
-                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
-                Some(idx)
-            } else {
-                None
-            };
-            candidates.push(RerankCandidate {
-                did,
-                pos,
-                cluster_id,
-                block_idx: bi,
-                full_off: full_start + local * stride,
-                full_idx,
-            });
-        }
-        let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
-            Some(
+        // Survivor rerank rows in one concurrent batch on the caller's
+        // runtime; warm ranges resolve sync/zero-copy with no await.
+        let survivor_full_rows = match survivor_full_ranges {
+            Some(ranges) => Some(
                 get_cluster_ranges_coalesced_async(&self.source, &ranges)
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
 
         rerank_candidates_from_blocks(
@@ -1620,6 +1411,172 @@ impl VectorReader {
             return Ok((col, false));
         }
         Ok((col, true))
+    }
+}
+
+/// Outcome of the 1-bit shortlist + candidate-build stage shared by
+/// [`VectorReader::search`] and [`VectorReader::search_async`].
+enum ShortlistOutcome {
+    /// Final result — no rerank fetch needed: empty shortlist,
+    /// `coarse_limit == 0`, or a `RabitqOnly` column whose 1-bit
+    /// shortlist *is* the ranking.
+    Done(Vec<(u32, f32)>),
+    /// Survivors to rerank against the true metric.
+    /// `survivor_full_ranges` (when `Some`) are the per-survivor
+    /// `full[]` rows the caller fetches — sync or async, the only
+    /// step that differs between the two search paths.
+    Rerank {
+        candidates: Vec<RerankCandidate>,
+        survivor_full_ranges: Option<Vec<Range<usize>>>,
+    },
+}
+
+/// Pure-CPU stage shared by the sync and async vector search paths.
+///
+/// Scores the probed clusters' 1-bit codes into a bounded shortlist,
+/// short-circuits `RabitqOnly` columns (whose shortlist is the final
+/// ranking), and otherwise builds the rerank references plus the
+/// survivor `full[]` ranges to fetch. Holds no I/O: the caller does
+/// the survivor-row fetch (sync vs async — the sole divergence) and
+/// then runs [`rerank_candidates_from_blocks`]. Factoring this out
+/// keeps `search` / `search_async` down to their fetch waves around a
+/// single shared kernel, so the two can't drift in scoring/recall.
+#[allow(clippy::too_many_arguments)]
+fn build_shortlist(
+    col: &ColumnReader,
+    q_rot: &[f32],
+    cb: usize,
+    cluster_meta: &[(usize, u32, u32)],
+    cluster_blocks: &[Bytes],
+    survivor_only_rerank_fetch: bool,
+    k: usize,
+    rerank_mult: usize,
+) -> ShortlistOutcome {
+    let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
+    // Score each probed cluster's 1-bit codes into the shortlist.
+    // The per-cluster slices are zero-copy `Bytes` views; the actual
+    // estimate scan is the hot CPU work, parallelized across clusters
+    // once the candidate pool is large enough to amortize the rayon
+    // hand-off. Cluster scoring is order-independent: every survivor
+    // is re-sorted by estimate below, so parallel and serial
+    // shortlists rank identically.
+    let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+    let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+        k
+    } else {
+        k.saturating_mul(rerank_mult)
+    };
+    if coarse_limit == 0 {
+        return ShortlistOutcome::Done(Vec::new());
+    }
+    let score_block =
+        |heap: &mut BoundedCoarseHeap, (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+            let codes_len = (cnt as usize) * cb;
+            let doc_ids_len = (cnt as usize) * 4;
+            debug_assert_eq!(
+                block.len(),
+                if survivor_only_rerank_fetch {
+                    codes_len + doc_ids_len
+                } else {
+                    codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
+                }
+            );
+            let codes = block.slice(0..codes_len);
+            let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+            score_cluster_codes_into_heap(
+                &codes, &doc_ids, cnt, off, c as u32, &col.quant, q_rot, heap,
+            );
+        };
+    let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+        cluster_meta
+            .par_iter()
+            .zip(cluster_blocks.par_iter())
+            .fold(
+                || BoundedCoarseHeap::new(coarse_limit),
+                |mut heap, item| {
+                    score_block(&mut heap, item);
+                    heap
+                },
+            )
+            .reduce(
+                || BoundedCoarseHeap::new(coarse_limit),
+                |mut left, right| {
+                    left.merge(right);
+                    left
+                },
+            )
+    } else {
+        let mut heap = BoundedCoarseHeap::new(coarse_limit);
+        for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+            score_block(&mut heap, item);
+        }
+        heap
+    };
+    let mut shortlist = shortlist_heap.into_vec();
+
+    if shortlist.is_empty() {
+        return ShortlistOutcome::Done(Vec::new());
+    }
+
+    // `RabitqOnly` short-circuit: the 1-bit shortlist *is* the final
+    // ranking — no `full[]` region on disk, no rerank step. Partial-
+    // sort to the top-k by descending estimate, then flip the sign so
+    // the returned `(doc_id, distance)` pairs follow the standard
+    // "smaller = closer" convention. The value is a 1-bit-derived
+    // score, not a true metric distance; for these columns recall is
+    // the contract, not numerical agreement with fp32. `rerank_mult`
+    // is intentionally ignored — there's nothing to refine.
+    if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+        let _ = rerank_mult;
+        shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        return ShortlistOutcome::Done(
+            shortlist
+                .into_iter()
+                .map(|(did, est, _pos, _c)| (did, -est))
+                .collect(),
+        );
+    }
+
+    // Build lightweight rerank references into the cluster blocks
+    // already in hand — no second fetch and no survivor byte packing.
+    // Each block's `full_chunk` follows its `[codes][doc_ids]` prefix;
+    // the candidate at cluster-order position `pos` lives at in-block
+    // offset `cnt*cb + cnt*4 + local*stride`.
+    let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
+    for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
+        block_by_cid.insert(c as u32, bi);
+    }
+    let stride = full_vec_bytes;
+    let mut candidates = Vec::with_capacity(shortlist.len());
+    let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+        Some(Vec::with_capacity(shortlist.len()))
+    } else {
+        None
+    };
+    for &(did, _, pos, cluster_id) in &shortlist {
+        let bi = block_by_cid[&cluster_id];
+        let (_, off, cnt) = cluster_meta[bi];
+        let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
+        let local = (pos - off) as usize;
+        let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+            let idx = ranges.len();
+            ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+            Some(idx)
+        } else {
+            None
+        };
+        candidates.push(RerankCandidate {
+            did,
+            pos,
+            cluster_id,
+            block_idx: bi,
+            full_off: full_start + local * stride,
+            full_idx,
+        });
+    }
+    ShortlistOutcome::Rerank {
+        candidates,
+        survivor_full_ranges,
     }
 }
 

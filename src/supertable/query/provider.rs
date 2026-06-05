@@ -105,8 +105,7 @@ pub(crate) struct SupertableProvider {
     /// [`scan`](TableProvider::scan) pushes the tombstoned rows into
     /// each segment's Parquet read as a [`ParquetAccessPlan`] row
     /// selection — the *lazy* delete path: deleted rows are skipped
-    /// during decode rather than materialized then dropped (the
-    /// *eager* `MemTable` path used by mutation id-capture). This
+    /// during decode rather than materialized then dropped. This
     /// keeps the analytical SELECT path's projection/limit/row-group
     /// pushdown intact while still honoring deletes.
     tombstone_cache: Option<Arc<SidecarCache>>,
@@ -150,8 +149,8 @@ impl SupertableProvider {
     /// eager + lazy modes) and falling back to the flat
     /// `manifest.superfiles` view otherwise.
     ///
-    /// Mirrors the v1 `build_mem_table` flattening so SQL sees the
-    /// exact same segment set it did under the `MemTable` path.
+    /// Flattens to the same segment set the manifest defines, so the
+    /// SQL scan and the mutation id-capture path see identical rows.
     async fn flatten_segments(&self) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         match self.manifest.list.as_ref() {
             Some(list) => {
@@ -238,9 +237,21 @@ impl TableProvider for SupertableProvider {
         //
         // One `Instant::now()` for the whole scan so every per-segment
         // tombstone lookup shares the same `SidecarCache` TTL
-        // reference (mirrors the eager `build_mem_table` path).
+        // reference.
         let now = std::time::Instant::now();
-        let object_store = Arc::new(InMemory::new());
+
+        // Warm every surviving segment's tombstone bitmap in one
+        // batched fetch before the per-segment sweep below, mirroring
+        // the bm25 / vector fan-out (see `SidecarCache::prefetch`);
+        // each `bitmap_for` in the loop then resolves from cache.
+        if let Some(cache) = self.tombstone_cache.as_ref() {
+            let ids: Vec<_> = survivors.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
+        }
+
+        // In-memory object store exposing the surviving segment bytes
+        // to DataFusion's Parquet source for the duration of this scan.
+        let mem_store = Arc::new(InMemory::new());
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(survivors.len());
         for entry in &survivors {
             let reader = crate::supertable::query::superfile_reader::superfile_reader(
@@ -286,7 +297,7 @@ impl TableProvider for SupertableProvider {
                 None => None,
             };
 
-            object_store
+            mem_store
                 .put(&ObjPath::from(path.clone()), PutPayload::from(bytes))
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -300,7 +311,7 @@ impl TableProvider for SupertableProvider {
         let url = ObjectStoreUrl::parse(MEMORY_STORE_URL)?;
         state
             .runtime_env()
-            .register_object_store(url.as_ref(), object_store);
+            .register_object_store(url.as_ref(), mem_store);
 
         // Tier 2 — DataFusion-owned row-group / page pruning. Hand
         // the same predicate to ParquetSource as a physical expr;

@@ -224,16 +224,10 @@ into fixed-size chunks driven in parallel, which lowers peak memory
 during the write and limits the cost of a transient backend failure
 mid-upload.
 
-Range reads are exact-or-error. A read for a byte range returns
-exactly that many bytes or a typed error — never a short buffer. If the
-backend returns a truncated or clamped range (a body cut short by a
-transport hiccup, or a range past the object's real end), the missing
-tail is re-fetched to complete the range, and a genuinely unsatisfiable
-range surfaces as an error rather than silently feeding a partial slice
-to a reader. Transient transport failures on an idempotent range GET
-(for example a send failure on a pooled connection the backend closed)
-are retried with backoff, so the burst of concurrent range GETs a cold
-query fans out does not surface a flaky connection as a read failure.
+Range reads are exact-or-error. A read for a byte range yields exactly
+that many bytes or a typed error — a reader never sees a silently short
+buffer. Recovering from transient backend truncation or connection
+flakiness sits beneath this contract, in the storage layer.
 
 Readers may verify the segment's embedded checksums when opening it.
 This is on by default and can be turned off when the underlying
