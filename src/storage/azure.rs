@@ -32,8 +32,8 @@ pub struct AzureStorageProvider {
 
 impl AzureStorageProvider {
     /// Construct from the standard Azure credential chain
-    /// (`AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_ACCESS_KEY`, or
-    /// `AZURE_STORAGE_CONNECTION_STRING`) + an explicit container.
+    /// (`AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY`,
+    /// read by `from_env`) + an explicit container.
     pub fn new(container: impl Into<String>) -> Result<Self, StorageError> {
         let container = container.into();
         let store = MicrosoftAzureBuilder::from_env()
