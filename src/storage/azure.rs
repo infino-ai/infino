@@ -1,0 +1,441 @@
+//! Azure Blob-backed [`StorageProvider`].
+//!
+//! Wraps `object_store::azure::MicrosoftAzure` so the supertable
+//! exercises the same code paths on Azure as on LocalFS and S3.
+//! Azure's container is the bucket-equivalent; conditional writes
+//! (`PutMode::Create` / `PutMode::Update`) are native, so no
+//! builder flag is needed to enable them.
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::TryStreamExt;
+use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
+use object_store::path::Path as ObjPath;
+use object_store::{
+    Error as ObjError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    PutPayload, UpdateVersion,
+};
+
+use super::{ObjectMeta, StorageError, StorageProvider};
+
+/// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
+/// `MicrosoftAzure` shares its HTTP client across clones.
+#[derive(Debug)]
+pub struct AzureStorageProvider {
+    container: String,
+    prefix: String,
+    store: Arc<MicrosoftAzure>,
+}
+
+impl AzureStorageProvider {
+    /// Construct from the standard Azure credential chain
+    /// (`AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY`,
+    /// read by `from_env`) + an explicit container.
+    pub fn new(container: impl Into<String>) -> Result<Self, StorageError> {
+        let container = container.into();
+        let store = MicrosoftAzureBuilder::from_env()
+            .with_container_name(&container)
+            .with_client_options(tuned_client_options())
+            .build()
+            .map_err(|e| StorageError::Permanent {
+                uri: format!("azure://{container}"),
+                source: Box::new(e),
+            })?;
+        Ok(Self {
+            container,
+            prefix: String::new(),
+            store: Arc::new(store),
+        })
+    }
+
+    /// Construct scoped to a logical table prefix inside
+    /// `container`. The prefix is prepended to every storage URI,
+    /// isolating each table under `azure://container/prefix/`.
+    pub fn new_with_prefix(
+        container: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let mut provider = Self::new(container)?;
+        provider.prefix = normalize_prefix(prefix);
+        Ok(provider)
+    }
+
+    /// Construct against the Azurite emulator. `with_use_emulator`
+    /// injects the well-known `devstoreaccount1` credentials, the
+    /// `http://127.0.0.1:10000` endpoint, and plain-HTTP support —
+    /// so no credentials are passed and `tuned_client_options` is
+    /// deliberately not applied (it would override the emulator's
+    /// `allow_http`).
+    pub fn new_with_emulator(container: impl Into<String>) -> Result<Self, StorageError> {
+        let container = container.into();
+        let store = MicrosoftAzureBuilder::new()
+            .with_use_emulator(true)
+            .with_container_name(&container)
+            .build()
+            .map_err(|e| StorageError::Permanent {
+                uri: format!("azure://{container} @ emulator"),
+                source: Box::new(e),
+            })?;
+        Ok(Self {
+            container,
+            prefix: String::new(),
+            store: Arc::new(store),
+        })
+    }
+
+    /// Wrap an already-constructed `MicrosoftAzure` — for callers
+    /// that want full control over the `MicrosoftAzureBuilder`.
+    pub fn from_object_store(container: impl Into<String>, store: MicrosoftAzure) -> Self {
+        Self {
+            container: container.into(),
+            prefix: String::new(),
+            store: Arc::new(store),
+        }
+    }
+
+    /// Container this provider is scoped to.
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    /// Logical prefix prepended to every object path.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    fn key(&self, uri: &str) -> String {
+        let uri = uri.trim_start_matches('/');
+        if self.prefix.is_empty() {
+            uri.to_string()
+        } else {
+            format!("{}/{uri}", self.prefix)
+        }
+    }
+
+    fn path(&self, uri: &str) -> Result<ObjPath, StorageError> {
+        let key = self.key(uri);
+        ObjPath::parse(&key).map_err(|e| StorageError::Permanent {
+            uri: uri.into(),
+            source: Box::new(e),
+        })
+    }
+}
+
+fn normalize_prefix(prefix: impl Into<String>) -> String {
+    prefix.into().trim_matches('/').to_string()
+}
+
+/// Tuned HTTP client options for the object-store-native fan-out.
+///
+/// The supertable query path fans out one cold-open + cold-search
+/// batch per segment concurrently. A deep, long-lived idle pool lets
+/// the fan-out reuse warm connections instead of paying a TLS
+/// handshake RTT per range GET, which otherwise inflates the p99 tail
+/// under load.
+fn tuned_client_options() -> object_store::ClientOptions {
+    object_store::ClientOptions::new()
+        .with_pool_max_idle_per_host(1024)
+        .with_pool_idle_timeout(std::time::Duration::from_secs(90))
+        .with_connect_timeout(std::time::Duration::from_secs(5))
+}
+
+/// Translate an `object_store::Error` to our `StorageError`. Kept
+/// per-backend (not shared) so each backend's mapping can diverge if
+/// its error surface widens.
+fn translate(uri: &str, e: ObjError) -> StorageError {
+    match e {
+        ObjError::NotFound { .. } => StorageError::NotFound { uri: uri.into() },
+        ObjError::AlreadyExists { .. } | ObjError::Precondition { .. } => {
+            StorageError::PreconditionFailed { uri: uri.into() }
+        }
+        ObjError::Generic { source, .. } => StorageError::TransientExhausted {
+            uri: uri.into(),
+            source,
+        },
+        other => StorageError::Permanent {
+            uri: uri.into(),
+            source: Box::new(other),
+        },
+    }
+}
+
+#[async_trait]
+impl StorageProvider for AzureStorageProvider {
+    async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+        let path = self.path(uri)?;
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|e| translate(uri, e))?;
+        Ok(ObjectMeta {
+            size: meta.size as u64,
+            etag: meta.e_tag,
+        })
+    }
+
+    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+        let path = self.path(uri)?;
+        let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
+        // `GetResult.meta` is the version whose bytes we're about to
+        // read — etag and bytes are atomically paired, so no follow-up
+        // HEAD is needed.
+        let meta = ObjectMeta {
+            size: result.meta.size as u64,
+            etag: result.meta.e_tag.clone(),
+        };
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, meta))
+    }
+
+    async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+        let path = self.path(uri)?;
+        self.store
+            .get_range(&path, range)
+            .await
+            .map_err(|e| translate(uri, e))
+    }
+
+    /// Single-RTT tail fetch via Azure's native `Range: bytes=-len`
+    /// suffix form. The response carries the total object size in
+    /// `GetResult::meta.size`, so the caller skips a separate HEAD.
+    async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+        if len == 0 {
+            // Suffix-range of 0 isn't well-defined in HTTP; HEAD so we
+            // still return the size for parity with the default impl.
+            let meta = self.head(uri).await?;
+            return Ok((Bytes::new(), meta.size));
+        }
+        let path = self.path(uri)?;
+        let opts = GetOptions {
+            range: Some(GetRange::Suffix(len)),
+            ..Default::default()
+        };
+        let result = self
+            .store
+            .get_opts(&path, opts)
+            .await
+            .map_err(|e| translate(uri, e))?;
+        let size = result.meta.size as u64;
+        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        Ok((bytes, size))
+    }
+
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+        let path = self.path(uri)?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        self.store
+            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+            .await
+            .map(|r| r.e_tag)
+            .map_err(|e| translate(uri, e))
+    }
+
+    async fn put_if_match(
+        &self,
+        uri: &str,
+        bytes: Bytes,
+        expected_etag: Option<&str>,
+    ) -> Result<Option<String>, StorageError> {
+        let path = self.path(uri)?;
+        let opts = match expected_etag {
+            // None == create-only-if-absent.
+            None => PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+            // Some(tag) == native conditional update; Azure enforces
+            // the etag match atomically, returning 412 on conflict,
+            // which `translate` maps to `PreconditionFailed`.
+            Some(expected) => PutOptions {
+                mode: PutMode::Update(UpdateVersion {
+                    e_tag: Some(expected.to_string()),
+                    version: None,
+                }),
+                ..Default::default()
+            },
+        };
+        self.store
+            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+            .await
+            .map(|r| r.e_tag)
+            .map_err(|e| translate(uri, e))
+    }
+
+    async fn put_multipart(
+        &self,
+        uri: &str,
+    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        let path = self.path(uri)?;
+        self.store
+            .put_multipart(&path)
+            .await
+            .map_err(|e| translate(uri, e))
+    }
+
+    async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+        let path = self.path(uri)?;
+        match self.store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(ObjError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(translate(uri, e)),
+        }
+    }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out: Vec<String> = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(meta.location.to_string());
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the parts that don't need a live backend:
+    //! error translation, path parsing, the emulator constructor,
+    //! and `from_object_store`. The trait impls are
+    //! exercised end-to-end against Azurite in the gated
+    //! `supertable_smoke_via_azure_wire_protocol` integration test.
+    use super::*;
+
+    // ---- translate -----------------------------------------------------
+
+    #[test]
+    fn translate_not_found_to_typed_variant() {
+        let err = translate(
+            "some/key",
+            ObjError::NotFound {
+                path: "some/key".into(),
+                source: "raw".into(),
+            },
+        );
+        match err {
+            StorageError::NotFound { uri } => assert_eq!(uri, "some/key"),
+            other => panic!("expected NotFound; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_already_exists_to_precondition_failed() {
+        let err = translate(
+            "k",
+            ObjError::AlreadyExists {
+                path: "k".into(),
+                source: "raw".into(),
+            },
+        );
+        assert!(matches!(err, StorageError::PreconditionFailed { uri } if uri == "k"));
+    }
+
+    #[test]
+    fn translate_precondition_to_precondition_failed() {
+        let err = translate(
+            "k",
+            ObjError::Precondition {
+                path: "k".into(),
+                source: "raw".into(),
+            },
+        );
+        assert!(matches!(err, StorageError::PreconditionFailed { uri } if uri == "k"));
+    }
+
+    #[test]
+    fn translate_generic_to_transient_exhausted() {
+        let err = translate(
+            "k",
+            ObjError::Generic {
+                store: "MicrosoftAzure",
+                source: "boom".into(),
+            },
+        );
+        match err {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_other_variant_to_permanent() {
+        let err = translate(
+            "k",
+            ObjError::UnknownConfigurationKey {
+                store: "MicrosoftAzure",
+                key: "foo".into(),
+            },
+        );
+        match err {
+            StorageError::Permanent { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected Permanent; got {other:?}"),
+        }
+    }
+
+    // ---- path ----------------------------------------------------------
+
+    #[test]
+    fn path_parses_simple_uri() {
+        let p = test_provider().path("foo/bar.txt").expect("parse");
+        assert_eq!(p.to_string(), "foo/bar.txt");
+    }
+
+    #[test]
+    fn path_parses_nested_uri() {
+        let p = test_provider()
+            .path("manifest-lists/list-000042.json")
+            .expect("parse");
+        assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
+    }
+
+    #[test]
+    fn path_applies_prefix() {
+        let mut p = test_provider();
+        p.prefix = "tbl".into();
+        assert_eq!(p.key("data/seg-1"), "tbl/data/seg-1");
+    }
+
+    // ---- constructors --------------------------------------------------
+
+    fn test_provider() -> AzureStorageProvider {
+        // The emulator constructor builds without I/O, so it's a cheap
+        // way to exercise `path()` / `key()` / Debug without a backend.
+        AzureStorageProvider::new_with_emulator("test-container")
+            .expect("construct emulator provider")
+    }
+
+    #[test]
+    fn new_with_emulator_builds_and_exposes_container() {
+        let p = AzureStorageProvider::new_with_emulator("emu-container")
+            .expect("construct with emulator");
+        assert_eq!(p.container(), "emu-container");
+    }
+
+    #[test]
+    fn from_object_store_preserves_container() {
+        let store = MicrosoftAzureBuilder::new()
+            .with_endpoint("http://127.0.0.1:1".to_string())
+            .with_container_name("hatch-container")
+            .with_account("devstoreaccount1")
+            .with_access_key("dGVzdC1rZXk=")
+            .with_allow_http(true)
+            .build()
+            .expect("build MicrosoftAzure");
+        let p = AzureStorageProvider::from_object_store("hatch-container", store);
+        assert_eq!(p.container(), "hatch-container");
+    }
+
+    #[test]
+    fn debug_impl_does_not_panic() {
+        let p = test_provider();
+        let s = format!("{p:?}");
+        assert!(s.contains("AzureStorageProvider"));
+    }
+}

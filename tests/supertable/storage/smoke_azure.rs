@@ -1,0 +1,529 @@
+//! Supertable smoke through the Azure Blob wire protocol.
+//!
+//! Points `AzureStorageProvider` at a running Azurite emulator (or
+//! real Azure for the second test) and runs a commit + open + query
+//! cycle. Every storage call (head / get / get_range / put_atomic /
+//! put_if_match / delete) goes through the full Azure HTTP wire
+//! protocol; nothing short-circuits to the local filesystem.
+//!
+//! ## Gating
+//!
+//! - `supertable_smoke_via_azure_wire_protocol` — `INFINO_TEST_AZURE=1`.
+//!   Assumes Azurite is reachable at `http://127.0.0.1:10000`
+//!   (`docker run -p 10000:10000 mcr.microsoft.com/azure-storage/azurite
+//!   azurite-blob --blobHost 0.0.0.0`). The test creates a fresh
+//!   container per run and deletes it on success.
+//! - `supertable_real_azure_round_trip` — `INFINO_TEST_REAL_AZURE=1` +
+//!   `AZURE_STORAGE_CONTAINER_NAME`, with account credentials from
+//!   the standard `AZURE_STORAGE_*` env chain. The container must
+//!   already exist; the test scopes itself under a random prefix and
+//!   cleans up after.
+//!
+//! Invocation:
+//!
+//! ```text
+//! INFINO_TEST_AZURE=1 cargo test -p infino --test supertable storage::smoke_azure
+//! ```
+
+#![deny(clippy::unwrap_used)]
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use base64::Engine;
+use infino::config::{
+    Config, StorageBackend, StorageColdFetchMode, StorageSettings, SupertableSettings,
+};
+use infino::superfile::builder::{FtsConfig, VectorConfig};
+use infino::supertable::Supertable;
+use infino::supertable::query::VectorSearchOptions;
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
+use infino::supertable::storage::{AzureStorageProvider, StorageProvider};
+use infino::test_helpers::{build_title_batch, default_supertable_options};
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
+
+/// Azurite blob endpoint + well-known emulator account. These are
+/// the fixed `devstoreaccount1` credentials Azurite ships with — not
+/// secrets.
+const EMULATOR_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
+const EMULATOR_ACCOUNT: &str = "devstoreaccount1";
+// ggignore: this is Azurite's public, documented emulator key, not a secret.
+const EMULATOR_KEY: &str =
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="; // ggignore
+const STORAGE_API_VERSION: &str = "2021-08-06";
+
+/// HMAC-SHA256 over `msg` with `key`, built directly on `Sha256` to
+/// avoid a dependency on the pre-release `hmac` crate.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block_key = if key.len() > BLOCK {
+        Sha256::digest(key).to_vec()
+    } else {
+        key.to_vec()
+    };
+    block_key.resize(BLOCK, 0);
+
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= block_key[i];
+        opad[i] ^= block_key[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+/// Issue a SharedKey-signed container-level REST request against
+/// Azurite. object_store has no container create/delete call and the
+/// Azurite image ships no CLI, so the smoke test signs these by hand.
+async fn signed_container_request(
+    method: reqwest::Method,
+    container: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+    let canonical_headers = format!("x-ms-date:{date}\nx-ms-version:{STORAGE_API_VERSION}\n");
+    // The emulator URL path is `/devstoreaccount1/<container>`, and the
+    // canonicalized resource is `/<account>` + that path — so the
+    // account name appears twice.
+    let canonical_resource =
+        format!("/{EMULATOR_ACCOUNT}/{EMULATOR_ACCOUNT}/{container}\nrestype:container");
+    // VERB + 11 empty header fields (Content-*, Date, If-*, Range),
+    // then the canonicalized headers and resource.
+    let string_to_sign = format!(
+        "{method}\n{}{canonical_headers}{canonical_resource}",
+        "\n".repeat(11)
+    );
+
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(EMULATOR_KEY)
+        .expect("decode emulator key");
+    let signature = base64::engine::general_purpose::STANDARD
+        .encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+
+    let url = format!("{EMULATOR_ENDPOINT}/{container}?restype=container");
+    reqwest::Client::new()
+        .request(method, &url)
+        .header("x-ms-date", &date)
+        .header("x-ms-version", STORAGE_API_VERSION)
+        .header("content-length", "0")
+        .header(
+            "authorization",
+            format!("SharedKey {EMULATOR_ACCOUNT}:{signature}"),
+        )
+        .send()
+        .await
+}
+
+/// Create the run's container. Treats 201 Created and 409 Conflict
+/// (already exists) as success.
+async fn ensure_emulator_container(container: &str) {
+    let resp = match signed_container_request(reqwest::Method::PUT, container).await {
+        Ok(resp) => resp,
+        // The test runner does not spawn Azurite. A connect failure
+        // almost always means it isn't running — tell the user how to
+        // start it rather than surfacing a raw connection error.
+        Err(e) if e.is_connect() => panic!(
+            "Azurite is not reachable at {EMULATOR_ENDPOINT}. Start it with:\n  \
+             docker run -d --rm -p 10000:10000 \
+             mcr.microsoft.com/azure-storage/azurite \
+             azurite-blob --blobHost 0.0.0.0\n\
+             then re-run with INFINO_TEST_AZURE=1. (underlying error: {e})"
+        ),
+        Err(e) => panic!("create-container request failed: {e}"),
+    };
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success() || status.as_u16() == 409,
+        "create container {container} failed: {status}\n{body}"
+    );
+}
+
+/// Best-effort teardown of the run's container (202 Accepted, or 404
+/// if already gone). Runs only on the success path — a failing run
+/// leaves the container for inspection, and Azurite is disposable.
+async fn delete_emulator_container(container: &str) {
+    match signed_container_request(reqwest::Method::DELETE, container).await {
+        Ok(resp) => {
+            let status = resp.status();
+            assert!(
+                status.is_success() || status.as_u16() == 404,
+                "delete container {container} failed: {status}"
+            );
+        }
+        Err(e) => eprintln!("[azure] container cleanup skipped: {e}"),
+    }
+}
+
+fn make_cache(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &std::path::Path,
+) -> Arc<DiskCacheStore> {
+    let cfg = DiskCacheConfig {
+        cache_root: cache_root.to_path_buf(),
+        disk_budget_bytes: 1 << 30,
+        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        cold_fetch_streams: 4,
+        cold_fetch_chunk_bytes: 1 << 20,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        verify_crc_on_open: true,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    DiskCacheStore::new(storage, cfg, pinned).expect("cache")
+}
+
+fn fixed_list_f32(dim: usize) -> DataType {
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+    )
+}
+
+fn real_azure_options(dim: usize) -> infino::supertable::SupertableOptions {
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread writer pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(dim), false),
+    ]));
+    infino::supertable::SupertableOptions::new(
+        schema,
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent: 4,
+            rot_seed: 17,
+            metric: infino::superfile::vector::distance::Metric::Cosine,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+        }],
+        Some(infino::test_helpers::default_tokenizer()),
+    )
+    .expect("real Azure test options")
+    .with_writer_pool(pool)
+}
+
+fn real_azure_config(container: &str, prefix: &str, cache_root: &std::path::Path) -> Config {
+    Config {
+        supertable: SupertableSettings::default(),
+        storage: StorageSettings {
+            backend: StorageBackend::Azure,
+            bucket: Some(container.to_string()),
+            prefix: prefix.to_string(),
+            disk_cache_root: Some(cache_root.to_path_buf()),
+            disk_budget_bytes: 1 << 30,
+            cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
+            cold_fetch_streams: 8,
+            cold_fetch_chunk_bytes: 8 << 20,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            ..StorageSettings::default()
+        },
+    }
+}
+
+fn real_azure_batch(dim: usize) -> RecordBatch {
+    let titles = LargeStringArray::from(vec![
+        "alpha vector one",
+        "alpha vector two",
+        "bravo vector three",
+        "charlie vector four",
+        "delta vector five",
+        "echo vector six",
+        "foxtrot vector seven",
+        "golf vector eight",
+    ]);
+    let mut flat = Vec::with_capacity(titles.len() * dim);
+    for row in 0..titles.len() {
+        for d in 0..dim {
+            flat.push(if d == row % dim { 1.0 } else { 0.0 });
+        }
+    }
+    let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let values = Float32Array::from(flat);
+    let vectors = FixedSizeListArray::try_new(
+        item_field,
+        dim as i32,
+        Arc::new(values) as Arc<dyn Array>,
+        None,
+    )
+    .expect("fixed-size vector array");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(dim), false),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(vectors)]).expect("batch")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_smoke_via_azure_wire_protocol() {
+    if std::env::var("INFINO_TEST_AZURE").is_err() {
+        eprintln!(
+            "supertable_smoke_via_azure_wire_protocol: skipped (set INFINO_TEST_AZURE=1 to enable)"
+        );
+        return;
+    }
+
+    // Fresh container per run so the test is idempotent against a
+    // long-lived Azurite (put_atomic is create-only and the supertable
+    // pointer lives at the container root — a reused container would
+    // collide on a second run).
+    let container = format!("infino-azure-smoke-{}", uuid::Uuid::new_v4());
+    ensure_emulator_container(&container).await;
+    eprintln!("[azure] container {container} ready on {EMULATOR_ENDPOINT}");
+
+    // Provider-level smoke first — isolates "the Azure provider works
+    // at all" from "the writer + cache stack works on top".
+    {
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            AzureStorageProvider::new_with_emulator(&container).expect("azure provider for probe"),
+        );
+        let probe_bytes = bytes::Bytes::from_static(b"hello-azure");
+        storage
+            .put_atomic("probe/hello.txt", probe_bytes.clone())
+            .await
+            .expect("probe put_atomic");
+        let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
+        assert_eq!(got, probe_bytes, "probe round-trip mismatch");
+        eprintln!("[azure] probe round-trip OK (PUT + GET via Azure wire)");
+    }
+
+    // Producer: writes through the Azure wire protocol.
+    {
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            AzureStorageProvider::new_with_emulator(&container)
+                .expect("azure provider for producer"),
+        );
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let mut w = producer.writer().expect("producer writer");
+        w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
+            .expect("append");
+        w.commit().expect("producer commit via Azure");
+        assert_eq!(producer.manifest_id(), 1);
+        eprintln!(
+            "[azure] producer commit OK; manifest_id={}",
+            producer.manifest_id()
+        );
+    }
+
+    // Consumer: opens via the same endpoint + a disk cache. Reads
+    // route through the cache → Azure get_range.
+    let consumer_storage: Arc<dyn StorageProvider> = Arc::new(
+        AzureStorageProvider::new_with_emulator(&container).expect("azure provider for consumer"),
+    );
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&consumer_storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("Supertable::open via Azure");
+
+    assert_eq!(consumer.manifest_id(), 1, "recovered manifest_id mismatch");
+    assert_eq!(
+        consumer.reader().n_docs_total(),
+        2,
+        "recovered n_docs_total mismatch"
+    );
+    eprintln!(
+        "[azure] consumer open OK; manifest_id={} n_superfiles={} n_docs_total={}",
+        consumer.manifest_id(),
+        consumer.reader().n_superfiles(),
+        consumer.reader().n_docs_total()
+    );
+
+    let pre = cache.stats();
+    assert_eq!(pre.n_cold_fetches, 0);
+    let batches = consumer
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("query_sql via Azure");
+    assert_eq!(batches.len(), 1);
+    let post = cache.stats();
+    assert!(
+        post.n_cold_fetches >= 1,
+        "first query must cold-fetch through Azure; got n_cold_fetches={}",
+        post.n_cold_fetches
+    );
+    eprintln!(
+        "[azure] cold-fetch via Azure OK; n_cold_fetches={} cache_bytes={}",
+        post.n_cold_fetches, post.current_bytes
+    );
+
+    delete_emulator_container(&container).await;
+    eprintln!("[azure] smoke done; container {container} deleted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn supertable_real_azure_round_trip() {
+    if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "supertable_real_azure_round_trip: skipped \
+             (set INFINO_TEST_REAL_AZURE=1 and AZURE_STORAGE_CONTAINER_NAME to enable)"
+        );
+        return;
+    }
+
+    let container = match std::env::var("AZURE_STORAGE_CONTAINER_NAME") {
+        Ok(container) => container,
+        Err(_) => {
+            eprintln!(
+                "supertable_real_azure_round_trip: skipped \
+                 (missing AZURE_STORAGE_CONTAINER_NAME)"
+            );
+            return;
+        }
+    };
+    let prefix_root = std::env::var("INFINO_TEST_REAL_AZURE_PREFIX")
+        .unwrap_or_else(|_| "infino-real-azure-integration".to_string());
+    let prefix = format!("{}/{}", prefix_root.trim_matches('/'), uuid::Uuid::new_v4());
+
+    eprintln!("[real-azure] container={container} prefix={prefix}");
+
+    let cache_dir = TempDir::new().expect("real Azure cache tempdir");
+    let cfg = real_azure_config(&container, &prefix, cache_dir.path());
+    let result = async {
+        let dim = 16;
+        {
+            let producer = Supertable::create(
+                real_azure_options(dim)
+                    .apply_config(&cfg)
+                    .map_err(|e| format!("apply Azure config to producer options: {e}"))?,
+            )
+            .map_err(|e| format!("create unified supertable on real Azure: {e}"))?;
+            let mut writer = producer
+                .writer()
+                .map_err(|e| format!("real Azure producer writer: {e}"))?;
+            writer
+                .append(&real_azure_batch(dim))
+                .map_err(|e| format!("append unified vector+FTS batch: {e}"))?;
+            writer
+                .commit()
+                .map_err(|e| format!("commit unified supertable to real Azure: {e}"))?;
+            if producer.manifest_id() != 1 {
+                return Err(format!(
+                    "producer manifest_id mismatch: got {}",
+                    producer.manifest_id()
+                ));
+            }
+            eprintln!(
+                "[real-azure] producer commit OK; manifest_id={}",
+                producer.manifest_id()
+            );
+        }
+
+        let consumer = Supertable::open(
+            real_azure_options(dim)
+                .apply_config(&cfg)
+                .map_err(|e| format!("apply Azure config to consumer options: {e}"))?,
+        )
+        .map_err(|e| format!("open unified supertable from real Azure: {e}"))?;
+
+        if consumer.manifest_id() != 1 {
+            return Err(format!(
+                "recovered manifest id mismatch: got {}",
+                consumer.manifest_id()
+            ));
+        }
+        if consumer.reader().n_docs_total() != 8 {
+            return Err(format!(
+                "recovered doc count mismatch: got {}",
+                consumer.reader().n_docs_total()
+            ));
+        }
+
+        let bm25_hits = consumer
+            .bm25_search(
+                "title",
+                "alpha",
+                10,
+                infino::superfile::fts::reader::BoolMode::Or,
+            )
+            .map_err(|e| format!("cold BM25 over real Azure: {e}"))?;
+        if bm25_hits.is_empty() {
+            return Err("real Azure cold BM25 did not find alpha docs".to_string());
+        }
+
+        let mut query = vec![0.0f32; dim];
+        query[0] = 1.0;
+        let vector_hits = consumer
+            .vector_search("emb", &query, 3, VectorSearchOptions::new().with_nprobe(4))
+            .map_err(|e| format!("cold vector search over real Azure: {e}"))?;
+        if vector_hits.is_empty() {
+            return Err("real Azure cold vector search returned no hits".to_string());
+        }
+
+        let cache = consumer
+            .options()
+            .disk_cache
+            .as_ref()
+            .ok_or_else(|| "Azure config did not attach disk cache".to_string())?;
+        let stats = cache.stats();
+        if stats.n_cold_fetches < 1 {
+            return Err(format!(
+                "real Azure reads did not hydrate through lazy disk cache; stats={stats:?}"
+            ));
+        }
+        eprintln!(
+            "[real-azure] cold lazy cache OK; n_cold_fetches={} cache_bytes={}",
+            stats.n_cold_fetches, stats.current_bytes
+        );
+
+        let reader = consumer.reader();
+        let manifest = reader.manifest();
+        let list = manifest
+            .list
+            .as_ref()
+            .ok_or_else(|| "real Azure open did not recover persisted manifest list".to_string())?;
+        let mut cleanup_keys = vec![
+            "_supertable/current".to_string(),
+            infino::supertable::manifest::commit::list_uri(consumer.manifest_id()),
+        ];
+        cleanup_keys.extend(list.parts.iter().map(|p| p.uri.clone()));
+        cleanup_keys.extend(
+            manifest
+                .superfiles
+                .iter()
+                .map(|entry| entry.uri.storage_path()),
+        );
+
+        Ok::<Vec<String>, String>(cleanup_keys)
+    }
+    .await;
+
+    let cleanup_storage = AzureStorageProvider::new_with_prefix(&container, &prefix)
+        .expect("real Azure cleanup provider from env");
+    if let Ok(keys) = &result {
+        for key in keys {
+            let _ = cleanup_storage.delete(key).await;
+        }
+    } else {
+        let _ = cleanup_storage.delete("_supertable/current").await;
+    }
+    eprintln!("[real-azure] cleanup OK; deleted keys under prefix={prefix}");
+    result.expect("real Azure integration failed");
+}

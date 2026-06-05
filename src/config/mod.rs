@@ -143,6 +143,9 @@ pub enum StorageBackend {
     /// AWS S3 provider rooted at
     /// `s3://storage.bucket/storage.prefix`.
     S3,
+    /// Azure Blob provider; `storage.bucket` names the container,
+    /// rooted at `azure://storage.bucket/storage.prefix`.
+    Azure,
 }
 
 /// Config-side spelling for disk-cache cold-fetch mode. Kept
@@ -461,6 +464,26 @@ storage:
             cfg.storage.cold_fetch_mode,
             StorageColdFetchMode::LazyForegroundWithBackgroundFill
         );
+    }
+
+    #[test]
+    fn storage_azure_config_parses_container_as_bucket() {
+        let yaml = r#"
+storage:
+  backend: azure
+  bucket: infino-azure-container
+  prefix: infino-real-azure-integration/example
+"#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("parse config");
+        assert_eq!(cfg.storage.backend, StorageBackend::Azure);
+        assert_eq!(
+            cfg.storage.bucket.as_deref(),
+            Some("infino-azure-container")
+        );
+        assert_eq!(cfg.storage.prefix, "infino-real-azure-integration/example");
     }
 
     #[test]

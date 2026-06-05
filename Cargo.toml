@@ -114,7 +114,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] 
 # we pin our direct usage to 0.13 to match parquet — which is the
 # version with the conditional-put surface we need for the
 # manifest pointer's OCC + atomic-create semantics.
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.13", features = ["aws", "azure"] }
 # Async-trait erasure for `StorageProvider` (003 M1) and the
 # `LazyByteSource` trait that will land in M6. Both need to be
 # usable through `Arc<dyn ...>` for cross-layer sharing, which
@@ -228,6 +228,18 @@ futures = "0.3"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"
+
+# Azure Blob smoke test container setup. object_store exposes no
+# container-create call, and the Azurite image ships no CLI, so the
+# test creates its container with a SharedKey-signed REST PUT:
+# reqwest issues the request, sha2 backs a manual HMAC-SHA256 (avoids
+# the pre-release `hmac` crate), base64 decodes the well-known
+# emulator key, httpdate stamps the RFC1123 `x-ms-date`. All four are
+# already transitive; pinned here so the versions don't drift.
+reqwest = { version = "0.12", default-features = false }
+sha2 = "0.10"
+base64 = "0.22"
+httpdate = "1"
 
 [profile.release]
 opt-level = 3

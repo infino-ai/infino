@@ -41,7 +41,9 @@ use arrow_schema::{DataType, Schema};
 use rayon::ThreadPool;
 
 use crate::config::{Config, StorageBackend, StorageColdFetchMode};
-use crate::storage::{LocalFsStorageProvider, S3StorageProvider, StorageProvider};
+use crate::storage::{
+    AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider,
+};
 use crate::superfile::builder::{BuilderOptions, FtsConfig, VectorConfig};
 use crate::superfile::fts::tokenize::Tokenizer;
 
@@ -840,6 +842,15 @@ impl SupertableOptions {
                 })?;
                 Some(Arc::new(S3StorageProvider::new_with_prefix(
                     bucket,
+                    &cfg.storage.prefix,
+                )?) as Arc<dyn StorageProvider>)
+            }
+            StorageBackend::Azure => {
+                let container = cfg.storage.bucket.as_ref().ok_or_else(|| {
+                    BuildError::Store("storage.backend=azure requires storage.bucket".into())
+                })?;
+                Some(Arc::new(AzureStorageProvider::new_with_prefix(
+                    container,
                     &cfg.storage.prefix,
                 )?) as Arc<dyn StorageProvider>)
             }
