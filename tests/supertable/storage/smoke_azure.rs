@@ -111,7 +111,7 @@ async fn ensure_emulator_container(container: &str) {
         .encode(hmac_sha256(&key, string_to_sign.as_bytes()));
 
     let url = format!("{EMULATOR_ENDPOINT}/{container}?restype=container");
-    let resp = reqwest::Client::new()
+    let resp = match reqwest::Client::new()
         .put(&url)
         .header("x-ms-date", &date)
         .header("x-ms-version", STORAGE_API_VERSION)
@@ -122,7 +122,20 @@ async fn ensure_emulator_container(container: &str) {
         )
         .send()
         .await
-        .expect("create-container request");
+    {
+        Ok(resp) => resp,
+        // The test runner does not spawn Azurite. A connect failure
+        // almost always means it isn't running — tell the user how to
+        // start it rather than surfacing a raw connection error.
+        Err(e) if e.is_connect() => panic!(
+            "Azurite is not reachable at {EMULATOR_ENDPOINT}. Start it with:\n  \
+             docker run -d --rm -p 10000:10000 \
+             mcr.microsoft.com/azure-storage/azurite \
+             azurite-blob --blobHost 0.0.0.0\n\
+             then re-run with INFINO_TEST_AZURE=1. (underlying error: {e})"
+        ),
+        Err(e) => panic!("create-container request failed: {e}"),
+    };
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
