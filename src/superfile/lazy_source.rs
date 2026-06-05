@@ -145,7 +145,11 @@ pub enum LazyByteSourceError {
     /// being handed up truncated — a short buffer otherwise
     /// panics deep in a sub-reader's slice math.
     #[error("short read: start={start} requested={requested} got={got}")]
-    ShortRead { start: u64, requested: u64, got: u64 },
+    ShortRead {
+        start: u64,
+        requested: u64,
+        got: u64,
+    },
 }
 
 /// Backing for source-aware superfile sub-readers.
