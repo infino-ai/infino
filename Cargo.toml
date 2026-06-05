@@ -229,6 +229,18 @@ futures = "0.3"
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"
 
+# Azure Blob smoke test container setup. object_store exposes no
+# container-create call, and the Azurite image ships no CLI, so the
+# test creates its container with a SharedKey-signed REST PUT:
+# reqwest issues the request, sha2 backs a manual HMAC-SHA256 (avoids
+# the pre-release `hmac` crate), base64 decodes the well-known
+# emulator key, httpdate stamps the RFC1123 `x-ms-date`. All four are
+# already transitive; pinned here so the versions don't drift.
+reqwest = { version = "0.12", default-features = false }
+sha2 = "0.10"
+base64 = "0.22"
+httpdate = "1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

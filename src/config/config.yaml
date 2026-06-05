@@ -75,6 +75,8 @@ supertable:
 # Persistent storage wiring. Defaults to in-memory-only. Set
 # `backend: s3` plus `bucket` / `prefix` to make
 # SupertableOptions::apply_config attach an S3StorageProvider.
+# `backend: azure` attaches an AzureStorageProvider, with `bucket`
+# naming the Azure container.
 #
 # Env overrides:
 #   INFINO_STORAGE__BACKEND=s3
