@@ -273,8 +273,7 @@ async fn supertable_smoke_via_azure_wire_protocol() {
     // at all" from "the writer + cache stack works on top".
     {
         let storage: Arc<dyn StorageProvider> = Arc::new(
-            AzureStorageProvider::new_with_emulator(&container)
-                .expect("azure provider for probe"),
+            AzureStorageProvider::new_with_emulator(&container).expect("azure provider for probe"),
         );
         let probe_bytes = bytes::Bytes::from_static(b"hello-azure");
         storage
@@ -309,8 +308,7 @@ async fn supertable_smoke_via_azure_wire_protocol() {
     // Consumer: opens via the same endpoint + a disk cache. Reads
     // route through the cache → Azure get_range.
     let consumer_storage: Arc<dyn StorageProvider> = Arc::new(
-        AzureStorageProvider::new_with_emulator(&container)
-            .expect("azure provider for consumer"),
+        AzureStorageProvider::new_with_emulator(&container).expect("azure provider for consumer"),
     );
     let cache_dir = TempDir::new().expect("cache tempdir");
     let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
