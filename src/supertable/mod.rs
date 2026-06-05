@@ -43,7 +43,8 @@ pub mod writer;
 pub use crate::storage;
 
 pub use crate::storage::{
-    LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError, StorageProvider,
+    AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
+    StorageProvider,
 };
 pub use error::{BuildError, CommitError, OpenError, QueryError};
 pub use handle::{Supertable, SupertableReader};
