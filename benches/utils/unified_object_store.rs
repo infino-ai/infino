@@ -510,7 +510,7 @@ async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
         BenchFixture {
             storage,
             uri,
-            storage_label: "real_s3",
+            storage_label: "s3",
             real_s3: true,
             cleanup_path: Some(path),
             _fs_root: None,

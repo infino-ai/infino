@@ -163,14 +163,9 @@ fn calibrations(st: &Supertable, g: &grading::SupertableGrading) -> &'static Cal
 }
 
 pub fn bench(c: &mut Criterion) {
-    if !fixture::criterion_filter_selects(
-        &["supertable_vec", "supertable_vec_search"],
-        &[
-            "supertable_vec_hot_search",
-            "supertable_vec_warm_search_real_s3",
-            "supertable_vec_cold_search_real_s3",
-        ],
-    ) {
+    // No explicit group list: every emitted group name starts with the
+    // family alias, so the alias already selects them.
+    if !fixture::criterion_filter_selects(&["supertable_vec", "supertable_vec_search"], &[]) {
         return;
     }
     fixture::ensure_ingest_for_search("vector correctness/search");

@@ -52,6 +52,12 @@ impl Tier {
     }
 }
 
+/// Storage labels that can appear in a warm/cold search group name
+/// (`{family}_{tier}_search_{label}`). The emulator is `s3s_fs`; real
+/// backends use [`RemoteBackend::label`]. Markdown report generation
+/// iterates this set; a unit test guards it against `RemoteBackend::label`.
+pub const STORAGE_LABELS: &[&str] = &["s3s_fs", "s3", "azure"];
+
 /// Criterion group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
 pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) -> String {
     match tier {
@@ -216,8 +222,8 @@ enum RemoteBackend {
 impl RemoteBackend {
     fn label(&self) -> &'static str {
         match self {
-            Self::S3 { .. } => "real_s3",
-            Self::Azure { .. } => "real_azure",
+            Self::S3 { .. } => "s3",
+            Self::Azure { .. } => "azure",
         }
     }
 
@@ -576,8 +582,27 @@ mod tests {
                 container: "c".into()
             }
             .label(),
-            "real_azure"
+            "azure"
         );
-        assert_eq!(RemoteBackend::S3 { bucket: "b".into() }.label(), "real_s3");
+        assert_eq!(RemoteBackend::S3 { bucket: "b".into() }.label(), "s3");
+    }
+
+    #[test]
+    fn storage_labels_cover_every_remote_backend() {
+        // STORAGE_LABELS is the single source markdown/report code iterates;
+        // every real backend's label must be in it (plus the emulator).
+        for label in [
+            RemoteBackend::S3 { bucket: "b".into() }.label(),
+            RemoteBackend::Azure {
+                container: "c".into(),
+            }
+            .label(),
+        ] {
+            assert!(
+                STORAGE_LABELS.contains(&label),
+                "{label} missing from STORAGE_LABELS"
+            );
+        }
+        assert!(STORAGE_LABELS.contains(&"s3s_fs"));
     }
 }

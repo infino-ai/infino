@@ -79,14 +79,9 @@ fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
 }
 
 pub fn bench(c: &mut Criterion) {
-    if !fixture::criterion_filter_selects(
-        &["supertable_fts", "supertable_fts_search"],
-        &[
-            "supertable_fts_hot_search",
-            "supertable_fts_warm_search_real_s3",
-            "supertable_fts_cold_search_real_s3",
-        ],
-    ) {
+    // No explicit group list: every emitted group name starts with the
+    // family alias, so the alias already selects them.
+    if !fixture::criterion_filter_selects(&["supertable_fts", "supertable_fts_search"], &[]) {
         return;
     }
     fixture::ensure_ingest_for_search("FTS correctness/search");
