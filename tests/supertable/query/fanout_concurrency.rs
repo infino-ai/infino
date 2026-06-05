@@ -61,7 +61,10 @@ const ITERS_PER_THREAD: usize = 25;
 const WATCHDOG: Duration = Duration::from_secs(120);
 
 fn fixed_list_f32(dim: usize) -> DataType {
-    DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim as i32)
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+    )
 }
 
 fn options_title_emb() -> SupertableOptions {
@@ -241,7 +244,10 @@ fn fanout_under_concurrency_is_live_and_deterministic() {
     // is a vacuous assertion.
     assert!(!gold.bm25.is_empty(), "bm25 golden must be non-empty");
     assert!(!gold.vector.is_empty(), "vector golden must be non-empty");
-    assert!(!gold.hybrid_ids.is_empty(), "hybrid golden must be non-empty");
+    assert!(
+        !gold.hybrid_ids.is_empty(),
+        "hybrid golden must be non-empty"
+    );
     assert_eq!(gold.count, (SEGMENTS * DOCS_PER_SEGMENT) as i64);
 
     // Run the whole stress on a coordinator thread and gate it behind a

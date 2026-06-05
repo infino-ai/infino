@@ -1444,7 +1444,8 @@ impl VectorReader {
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
         let survivor_only_rerank_fetch = true;
-        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync {
+        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
+        {
             let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
                 let mut fetched = self
                     .source

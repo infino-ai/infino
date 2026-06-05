@@ -868,8 +868,10 @@ impl SuperfileReader {
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
-        Ok(v.search_async(column, query, k, options.nprobe, rerank_mult)
-            .await?)
+        Ok(
+            v.search_async(column, query, k, options.nprobe, rerank_mult)
+                .await?,
+        )
     }
 }
 

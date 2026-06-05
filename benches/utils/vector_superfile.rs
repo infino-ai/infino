@@ -199,9 +199,10 @@ fn assert_infino_self_consistent(reader: &SuperfileReader) -> f32 {
     let opts = search_opts(CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT);
     let mut total_recall = 0.0_f32;
     for (q, truth) in qs.iter().zip(gt.iter()) {
-        let hits =
-            corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
-                .expect("vector_search");
+        let hits = corpus::block_on_inmem(async {
+            reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await
+        })
+        .expect("vector_search");
         assert_eq!(
             hits.len(),
             TOP_K,
@@ -327,7 +328,9 @@ fn bench(c: &mut Criterion) {
                     let q = &qs[0];
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts).await
+                            reader
+                                .vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                                .await
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -342,7 +345,9 @@ fn bench(c: &mut Criterion) {
         g.bench_function("infino_default_options_top10", |b| {
             b.iter(|| {
                 let hits = corpus::block_on_inmem(async {
-                    reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts).await
+                    reader
+                        .vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts)
+                        .await
                 })
                 .expect("vector_search");
                 black_box(hits)
@@ -362,7 +367,9 @@ fn bench(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts).await
+                            reader
+                                .vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                                .await
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -380,7 +387,9 @@ fn bench(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let hits = corpus::block_on_inmem(async {
-                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts).await
+                            reader
+                                .vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                                .await
                         })
                         .expect("vector_search");
                         black_box(hits)
@@ -655,8 +664,9 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     let q = &queries_calibration()[0];
     let opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
     let t0 = Instant::now();
-    let _ = corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
-        .expect("vector_search");
+    let _ =
+        corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts).await })
+            .expect("vector_search");
     let first_q_elapsed = t0.elapsed();
 
     eprintln!(
