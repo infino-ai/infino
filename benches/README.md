@@ -49,6 +49,47 @@ Superfile benches (1M) build their own fixture per binary; supertable
 search groups run correctness (FTS oracle / vector recall floor) before timing
 when ingest is already available.
 
+## Object-store backends
+
+The warm/cold supertable and superfile benches run against an object
+store. The backend is chosen **explicitly** by `INFINO_BENCH_STORE` — it
+is never inferred from which credentials happen to be exported:
+
+| `INFINO_BENCH_STORE` | Store | Extra env |
+|---|---|---|
+| _unset_ / `s3s_fs` | in-process s3s-fs emulator (default, no credentials) | — |
+| `s3` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
+| `azure` | Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
+
+```sh
+# Default — emulator, no credentials, no network
+cargo bench --bench supertable_all -- supertable_fts
+
+# Real AWS S3
+INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket \
+  cargo bench --bench supertable_all -- supertable_fts
+
+# Azure Blob
+INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
+  AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... \
+  cargo bench --bench supertable_all -- supertable_fts
+```
+
+The chosen backend appears as the storage label in warm/cold group
+names (`s3s_fs` / `s3` / `azure`), e.g. `supertable_fts_cold_search_s3`.
+A run with no real backend selected writes only to the emulator.
+
+**Cleanup.** A real-backend run writes its table under a unique prefix
+and deletes it when the process exits — no manual cleanup. The emulator
+is in-process and self-cleans on drop.
+
+**Emulator caveat.** The in-process s3s-fs emulator can be unstable
+during the supertable's concurrent multi-commit ingest (dropped
+connections / commit-retry exhaustion). Use a real backend
+(`INFINO_BENCH_STORE=s3|azure`) for trustworthy object-store numbers;
+the emulator is a quick, credential-free wire-path check, best suited to
+the single-commit superfile benches.
+
 ## Code layout (`infino-bench-utils`)
 
 ```text
