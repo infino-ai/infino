@@ -50,8 +50,9 @@ use tempfile::TempDir;
 /// secrets.
 const EMULATOR_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
 const EMULATOR_ACCOUNT: &str = "devstoreaccount1";
+// ggignore: this is Azurite's public, documented emulator key, not a secret.
 const EMULATOR_KEY: &str =
-    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="; // ggignore
 const STORAGE_API_VERSION: &str = "2021-08-06";
 
 /// HMAC-SHA256 over `msg` with `key`, built directly on `Sha256` to
