@@ -47,16 +47,11 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
-use bytes::Bytes;
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::Supertable;
-use crate::supertable::manifest::Manifest;
 use crate::supertable::query::provider::{SupertableProvider, TABLE_NAME};
-use crate::supertable::reader_cache::SuperfileReaderCache;
 
 impl Supertable {
     /// Run a SQL query against this supertable's pinned snapshot.
@@ -83,65 +78,10 @@ impl Supertable {
         // [`Supertable::ensure_fresh`].
         self.ensure_fresh();
 
-        // Pin the current manifest snapshot. ArcSwap::load_full
-        // is a single atomic load + Arc clone, so this is cheap
-        // even on the hot path. The same Arc is used as the
-        // cache key (`Arc::ptr_eq` test below): commits publish
-        // a new Arc, so any committed state since the last call
-        // forces a rebuild.
-        let reader = Arc::new(self.reader());
-        let manifest = Arc::clone(reader.manifest());
-
-        // Cache hit: reuse SessionContext (provider + 3 TVFs
-        // already registered) on the same manifest. Skips the
-        // ~1.5 ms `SessionContext::new()` + register_* setup.
-        let ctx = {
-            let mut guard = self
-                .sql_session_cache()
-                .lock()
-                .expect("sql_session_cache mutex poisoned");
-            match &*guard {
-                Some((cached, ctx)) if Arc::ptr_eq(cached, &manifest) => ctx.clone(),
-                _ => {
-                    let store = Arc::clone(&self.options().store);
-                    let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-                    let scalar_schema = self.options().scalar_schema();
-                    let provider = SupertableProvider::new(
-                        Arc::clone(&scalar_schema),
-                        Arc::clone(&manifest),
-                        store,
-                        disk_cache,
-                        reader.tombstone_cache.clone(),
-                    );
-                    let ctx = SessionContext::new();
-                    ctx.register_table(TABLE_NAME, Arc::new(provider))
-                        .map_err(|e| QueryError::Plan(e.to_string()))?;
-                    // Search TVFs (vector kNN, BM25 FTS) bound to
-                    // the pinned snapshot. They lower to custom
-                    // `ExecutionPlan` nodes that call the async
-                    // kernels inside `execute()`.
-                    crate::supertable::query::exec::vector_exec::register_vector_search(
-                        &ctx,
-                        Arc::clone(&reader),
-                        Arc::clone(&scalar_schema),
-                    );
-                    crate::supertable::query::exec::fts_exec::register_bm25(
-                        &ctx,
-                        Arc::clone(&reader),
-                        Arc::clone(&scalar_schema),
-                    );
-                    // hybrid_search composes bm25 + vector with
-                    // reciprocal-rank fusion; no new kernel.
-                    crate::supertable::query::exec::hybrid_exec::register_hybrid_search(
-                        &ctx,
-                        Arc::clone(&reader),
-                        Arc::clone(&scalar_schema),
-                    );
-                    *guard = Some((Arc::clone(&manifest), ctx.clone()));
-                    ctx
-                }
-            }
-        };
+        // Build (or reuse the cached) SessionContext for the pinned
+        // snapshot — the pushdown-aware SupertableProvider plus the
+        // search TVFs. See [`Supertable::sql_session_context`].
+        let ctx = self.sql_session_context()?;
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -161,19 +101,85 @@ impl Supertable {
         self.block_on_query(drive)
     }
 
+    /// Build (or reuse the cached) [`SessionContext`] for the
+    /// current pinned manifest snapshot: the pushdown-aware
+    /// [`SupertableProvider`] registered as `supertable`, plus the
+    /// vector / BM25 / hybrid search TVFs.
+    ///
+    /// The cache keys on the manifest `Arc` — commits publish a new
+    /// `Arc`, so any committed state since the last call forces a
+    /// rebuild. A hit skips the ~1.5 ms `SessionContext::new()` +
+    /// `register_*` setup. Shared by [`query_sql`](Self::query_sql)
+    /// (SQL string) and [`scan_ids_matching`](Self::scan_ids_matching)
+    /// (programmatic `Expr`), so mutation id-capture gets the same
+    /// segment-skip + row-group/page pruning + lazy tombstone
+    /// filtering the read path uses.
+    ///
+    /// Callers apply their own freshness policy
+    /// ([`ensure_fresh`](Self::ensure_fresh)) before calling.
+    fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
+        // ArcSwap::load_full is a single atomic load + Arc clone, so
+        // pinning the snapshot is cheap even on the hot path.
+        let reader = Arc::new(self.reader());
+        let manifest = Arc::clone(reader.manifest());
+
+        let mut guard = self
+            .sql_session_cache()
+            .lock()
+            .expect("sql_session_cache mutex poisoned");
+        if let Some((cached, ctx)) = &*guard
+            && Arc::ptr_eq(cached, &manifest)
+        {
+            return Ok(ctx.clone());
+        }
+
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let provider = SupertableProvider::new(
+            Arc::clone(&scalar_schema),
+            Arc::clone(&manifest),
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table(TABLE_NAME, Arc::new(provider))
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
+        // the pinned snapshot. They lower to custom `ExecutionPlan`
+        // nodes that call the async kernels inside `execute()`.
+        crate::supertable::query::exec::vector_exec::register_vector_search(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
+        crate::supertable::query::exec::fts_exec::register_bm25(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
+        crate::supertable::query::exec::hybrid_exec::register_hybrid_search(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
+        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        Ok(ctx)
+    }
+
     /// Resolve a predicate to the matching `_id` values. Used by
     /// the writer's `delete()` / `update()` entry points to
     /// capture the target-id set at call time (step 0a in the
     /// update / delete pipeline).
     ///
-    /// Plan shape: build a `MemTable` over the current manifest,
-    /// register as `supertable`, apply `expr` as a filter via
-    /// DataFusion's `DataFrame::filter`, project just `_id`, drain
-    /// into a `Vec<i128>`. This is a deliberately separate path
-    /// from `query_sql`'s pushdown-aware [`SupertableProvider`]:
-    /// it only ever projects `_id` and never exposes a TVF, so the
-    /// simpler eager `MemTable` is sufficient and keeps the
-    /// mutation id-capture independent of the SQL provider.
+    /// Runs through the same pushdown-aware [`SupertableProvider`]
+    /// as `query_sql` (via [`sql_session_context`](Self::sql_session_context)):
+    /// `expr` is applied as a `DataFrame::filter` and the result
+    /// projected to just `_id`. Segment skip, row-group / page
+    /// pruning, and lazy tombstone filtering all apply, so a
+    /// large-table delete/update predicate never materializes every
+    /// segment into memory.
     ///
     /// Note: the resolution is against the **current** manifest
     /// snapshot, exactly like a contemporaneous `query_sql` would
@@ -191,28 +197,10 @@ impl Supertable {
         // means honoring `Strong` / `BoundedStaleness` just like the
         // read APIs do. No-op under `Snapshot` / in-memory tables.
         self.ensure_fresh();
-        let reader = self.reader();
-        let manifest = Arc::clone(reader.manifest());
-        let store = Arc::clone(&self.options().store);
-        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-        let storage = self.options().storage.as_ref().map(Arc::clone);
-        let scalar_schema = self.options().scalar_schema();
-        let tombstone_cache = reader.tombstone_cache.clone();
+        let ctx = self.sql_session_context()?;
         let id_column = self.options().id_column.clone();
 
         let drive = async move {
-            let table = build_mem_table(
-                scalar_schema,
-                manifest,
-                store,
-                disk_cache,
-                storage,
-                tombstone_cache,
-            )
-            .await?;
-            let ctx = SessionContext::new();
-            ctx.register_table(TABLE_NAME, Arc::new(table))
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
             let df = ctx
                 .table(TABLE_NAME)
                 .await
@@ -259,120 +247,6 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
         }
     }
     Ok(out)
-}
-
-/// Read every segment in the manifest and assemble a `MemTable`
-/// with one partition per segment. Used only by
-/// [`Supertable::scan_ids_matching`]; the public `query_sql` path
-/// goes through the pushdown-aware [`SupertableProvider`].
-///
-/// A `MemTable` requires at least one partition even if all
-/// partitions are empty — DataFusion errors otherwise. For an
-/// empty supertable we emit a single empty partition so the
-/// id-resolution returns an empty set instead of surfacing the
-/// planner's "No partitions provided" check to the caller.
-async fn build_mem_table(
-    schema: Arc<arrow_schema::Schema>,
-    manifest: Arc<Manifest>,
-    store: Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
-    storage: Option<Arc<dyn crate::storage::StorageProvider>>,
-    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-) -> Result<MemTable, QueryError> {
-    let superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = match manifest.list.as_ref() {
-        Some(list) => {
-            let kept: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)
-                .await?
-        }
-        None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-            manifest.as_ref(),
-        ),
-    };
-    // One `Instant::now()` for the entire pass so each
-    // per-superfile tombstone lookup shares the same TTL
-    // reference.
-    let now = std::time::Instant::now();
-    let mut partitions: Vec<Vec<RecordBatch>> = Vec::with_capacity(superfiles.len().max(1));
-    for entry in &superfiles {
-        let reader = crate::supertable::query::superfile_reader::superfile_reader(
-            &store,
-            disk_cache.as_ref(),
-            storage.as_ref(),
-            &entry.uri,
-            entry.subsection_offsets.as_ref(),
-        )
-        .await
-        .map_err(|e| QueryError::Store(e.to_string()))?;
-        let parquet = reader
-            .parquet_bytes()
-            .ok_or_else(|| {
-                QueryError::Plan(format!(
-                    "SQL pass-through requires eager-opened superfile bytes; \
-                     reader for {:?} was opened via the lazy path which does \
-                     not materialize the full segment",
-                    entry.uri
-                ))
-            })?
-            .clone();
-        let mut batches = read_all_batches(parquet)?;
-        if let Some(cache) = tombstone_cache.as_ref() {
-            apply_tombstone_filter_to_batches(cache, entry.superfile_id, &mut batches, now)?;
-        }
-        partitions.push(batches);
-    }
-    if partitions.is_empty() {
-        partitions.push(Vec::new());
-    }
-    MemTable::try_new(schema, partitions).map_err(|e| QueryError::Plan(e.to_string()))
-}
-
-/// Drop tombstoned rows from one superfile's batches before they
-/// reach DataFusion's `MemTable`. The local doc-id of row `i` in
-/// batch `b` is `row_offset(b) + i`, where `row_offset(b)` sums
-/// the lengths of all batches preceding `b` within the superfile.
-fn apply_tombstone_filter_to_batches(
-    cache: &Arc<crate::supertable::tombstones::SidecarCache>,
-    superfile_id: uuid::Uuid,
-    batches: &mut Vec<RecordBatch>,
-    now: std::time::Instant,
-) -> Result<(), QueryError> {
-    let bitmap = cache
-        .bitmap_for(superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
-        return Ok(());
-    }
-    let mut row_offset: u32 = 0;
-    let mut filtered: Vec<RecordBatch> = Vec::with_capacity(batches.len());
-    for batch in batches.drain(..) {
-        let n = batch.num_rows() as u32;
-        let mask: Vec<bool> = (0..n).map(|i| !bitmap.contains(row_offset + i)).collect();
-        if mask.iter().all(|b| *b) {
-            row_offset += n;
-            filtered.push(batch);
-            continue;
-        }
-        let mask_array = arrow_array::BooleanArray::from(mask);
-        let kept = arrow::compute::filter_record_batch(&batch, &mask_array)
-            .map_err(|e| QueryError::Parquet(format!("filter_record_batch: {e}")))?;
-        row_offset += n;
-        filtered.push(kept);
-    }
-    *batches = filtered;
-    Ok(())
-}
-
-/// Eagerly drain a parquet file into `Vec<RecordBatch>`.
-fn read_all_batches(bytes: Bytes) -> Result<Vec<RecordBatch>, QueryError> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-    let reader = builder
-        .build()
-        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-    reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| QueryError::Parquet(e.to_string()))
 }
 
 #[cfg(test)]

@@ -438,8 +438,7 @@ impl SuperfileReader {
         self.bytes.as_ref()
     }
 
-    /// Resolve in-segment row offsets to their durable identity
-    /// (007 D2 / Phase 3).
+    /// Resolve in-segment row offsets to their durable identity.
     ///
     /// Given a slice of `local_doc_id`s — the per-segment row
     /// offsets produced by [`bm25_search`](Self::bm25_search) /
@@ -612,10 +611,9 @@ impl SuperfileReader {
     /// Used by the WAL recovery sweep's `resolve_target_id`
     /// path: given a `target_id`, scan the candidate superfile to
     /// find where the row lives so the tombstone phase can mark
-    /// its bit. Currently rebuilds a `ParquetRecordBatchReader`
-    /// each call — opportunity for a follow-up that caches
-    /// parquet metadata on the reader (see TODO in module-level
-    /// comments).
+    /// its bit. Rebuilds a `ParquetRecordBatchReader` each call
+    /// (cold recovery path), rather than reusing the cached
+    /// `arrow_meta` like `take_by_local_doc_ids` does.
     pub fn id_lookup(&self, target: i128) -> Result<Option<u32>, ReadError> {
         let bytes = self.bytes.clone().ok_or_else(|| {
             ReadError::Io(std::io::Error::other(
