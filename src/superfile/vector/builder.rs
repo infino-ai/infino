@@ -425,7 +425,7 @@ impl VectorBuilder {
     /// `max_subsection_size`. Per-subsection streaming would
     /// push the floor lower still.
     ///
-    /// Object-storage callers (003) can pass a multipart upload
+    /// Object-storage callers can pass a multipart upload
     /// writer here so segment build never owns the full blob in
     /// RAM.
     pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
@@ -844,8 +844,8 @@ fn build_subsection_streaming(
     //          estimate-code bytes; `full_chunk` is the optional
     //          Fp32/Sq8 rerank payload for the same docs.
     //
-    //    New-service-only — there are no pre-013 segments to
-    //    keep readable.
+    //    Only this layout version is accepted on read; any other
+    //    value at the version slot is rejected as malformed.
     //
     //    Codec-specific shape:
     //      Fp32: empty codec_meta; full_chunk stores the fp32

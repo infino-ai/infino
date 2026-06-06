@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(RerankCodec::default(), RerankCodec::Sq8Residual);
     }
 
-    /// `Fp32`'s codec_id is zero. Pre-012 segments have all-zero
+    /// `Fp32`'s codec_id is zero. Older segments have all-zero
     /// reserved bytes in the directory-entry slot we squat on
     /// for the codec discriminator; the zero match keeps them
     /// readable as `Fp32` without a format bump.

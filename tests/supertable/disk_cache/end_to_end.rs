@@ -471,7 +471,7 @@ fn memory_budget_unset_does_not_force_sweep() {
 fn no_cache_path_still_uses_in_memory_store() {
     // Regression check: a supertable WITHOUT
     // with_disk_cache still queries via the in-memory
-    // store. This is the 002 / legacy path; covered by the
+    // store. This is the in-memory / legacy path; covered by the
     // broader test suite, but reasserted here so a future
     // refactor that accidentally engages the cache plumbing
     // unconditionally is caught.

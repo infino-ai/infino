@@ -94,7 +94,7 @@ fn rewrite_path_produces_fresh_part_id_per_commit() {
     // The "rewrite latest" path always emits a new
     // `part_id` because each rewrite is a content-
     // addressed new part. The PRIOR part becomes orphan
-    // (GC'd by 004); the new part replaces it in the list.
+    // (GC'd by compaction); the new part replaces it in the list.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));

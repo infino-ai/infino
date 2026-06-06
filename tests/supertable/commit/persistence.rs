@@ -15,8 +15,8 @@
 //!   (existing + new).
 //! - In-memory queries still work post-commit (the in-memory
 //!   store stays active for reads even with storage attached).
-//! - A supertable with NO storage attached takes the 002
-//!   path — no on-disk state, no regressions.
+//! - A supertable with NO storage attached takes the
+//!   in-memory path — no on-disk state, no regressions.
 
 #![deny(clippy::unwrap_used)]
 
@@ -197,9 +197,9 @@ fn multipart_threshold_forces_segment_through_put_multipart() {
 }
 
 #[test]
-fn no_storage_attached_takes_002_path() {
+fn no_storage_attached_takes_in_memory_path() {
     // Sanity: a supertable WITHOUT storage attached behaves
-    // exactly like 002 — no on-disk state, in-memory only.
+    // exactly like the no-storage baseline — in-memory only.
     let dir = TempDir::new().expect("tempdir");
     let st = Supertable::create(default_supertable_options()).expect("create");
 
@@ -229,7 +229,7 @@ fn no_storage_attached_takes_002_path() {
 fn committed_supertable_remains_in_memory_queryable_for_now() {
     // Storage write-through is additive — the
     // in-memory store still holds segment bytes, so existing
-    // 002 query paths keep working unchanged. Verifies no
+    // in-memory query paths keep working unchanged. Verifies no
     // regression to the FTS read path.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -258,7 +258,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
 
 #[test]
 fn manifest_id_increments_only_on_non_empty_commits() {
-    // A commit with no buffered batches is a no-op (002 invariant).
+    // A commit with no buffered batches is a no-op.
     // Storage write-through should preserve this — no spurious
     // pointer rewrites on empty commits.
     let dir = TempDir::new().expect("tempdir");

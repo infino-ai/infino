@@ -20,7 +20,7 @@
 //!     Any segment / manifest-part / manifest-list bytes
 //!     written before the crash but never referenced by a
 //!     committed pointer are **orphans**: tolerated by
-//!     readers and GC'd by 004's compaction.
+//!     readers and GC'd by compaction.
 //!   - The pointer file has been atomically replaced with
 //!     the new version → open returns the new state. The
 //!     crash happened AFTER the visibility barrier; the

@@ -108,7 +108,7 @@ use tokio::runtime::Runtime;
 
 // ─── Constants ───────────────────────────────────────────────────────
 
-const TEST_BUCKET: &str = "infino-013-bench";
+const TEST_BUCKET: &str = "infino-objstore-bench";
 const TEST_REGION: &str = "us-east-1";
 const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";

@@ -47,7 +47,7 @@
 //! Note: the writer is single-shot per supertable
 //! (`SupertableWriter` enforces an exclusive slot via
 //! `compare_exchange`), so all tests use exactly one writer
-//! thread. Multi-writer cross-process semantics live with 003's
+//! thread. Multi-writer cross-process semantics live with the
 //! object-store + lock-file design.
 
 #![deny(clippy::unwrap_used)]

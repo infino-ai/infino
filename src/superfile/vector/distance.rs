@@ -441,7 +441,7 @@ impl<'a> Sq8Kernel<'a> {
         // Per-doc inner reduction: Σ_d q_prime[d] * code[d] as f32.
         // Dispatches to AVX-512 (16-lane FMA with VPMOVZXBD widen)
         // when the runtime gate passes; otherwise the f32x8 widen-
-        // and-FMA kernel that has shipped since 012.
+        // and-FMA scalar-tier kernel.
         let qp_code_dot = sq8_dot(&self.q_prime, code_bytes, self.dim);
         // `dot(query, x_decoded) = qp_code_dot + q_dot_offset` because
         // x_decoded[d] = code[d] * scale[d] + offset[d], so

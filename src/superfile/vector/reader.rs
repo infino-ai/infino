@@ -100,7 +100,7 @@ pub struct ColumnReader {
     /// `codec_meta` region inside the subsection. `0` means
     /// "no codec_meta" (Fp32 / RabitqOnly); non-zero is only
     /// produced by codecs whose `codec_meta_bytes(...) > 0`
-    /// (`Sq8` is the only one today). In the 013 layout
+    /// (`Sq8` is the only one today). In the current layout
     /// `codec_meta` sits between `cluster_idx` and the
     /// per-cluster blocks (inside the open-time region).
     #[allow(dead_code)]
@@ -131,9 +131,9 @@ impl ColumnReader {
     /// probed cluster; the cold-first-search budget collapses
     /// to `nprobe + 1` range GETs (nprobe cluster blocks + 1
     /// rerank run) on a freshly-opened lazy reader, down from
-    /// `2 × nprobe + 1` on the 011-era split-range path.
+    /// `2 × nprobe + 1` on the older split-range path.
     ///
-    /// 013 layout: each cluster's block is
+    /// Block layout: each cluster's block is
     /// `count * (code_bytes + 4)` bytes formatted as
     /// `[codes: count*code_bytes][doc_ids: count*4]`. The
     /// per-cluster `(doc_off, count)` entry recorded in
@@ -805,10 +805,10 @@ impl VectorReader {
             // resident buffer.
             let sub_crc_pos = subsection_len - 4;
 
-            // Sub-header parse. Only one layout supported
-            // (new-service-only; no pre-013 segments to keep
-            // readable). See `format::vec::SUBSECTION_VERSION`
-            // for the byte-level spec.
+            // Sub-header parse. Only one layout version is
+            // accepted; any other value is rejected as malformed.
+            // See `format::vec::SUBSECTION_VERSION` for the
+            // byte-level spec.
             //   [ 8..12] SUBSECTION_VERSION
             //   [12..16] codec_meta_size (u32 LE)
             //   [16..24] summary_centroid_offset (u64 LE)
@@ -2847,7 +2847,7 @@ mod tests {
     //
     // The codec discriminator rides as byte 52 of the per-column
     // directory entry; the codec_meta region offset rides as bytes
-    // 12..16 of the sub-header. Both are zero on pre-012 fp32
+    // 12..16 of the sub-header. Both are zero on older fp32
     // segments. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
     // must still round-trip as a typed `MalformedVersion` at open
     // time so a future segment built by a newer binary fails loud
@@ -3668,7 +3668,7 @@ mod tests {
     // -----------------------------------------------------------------
     //
     // The 1M × 384 bench measured Sq8 recall@10 = 0.860 vs Fp32 = 0.964
-    // — well outside the plan's "< 0.005 drop on normalized embeddings"
+    // — well outside the "< 0.005 drop on normalized embeddings"
     // envelope. The hypothesis is that the **per-column** Sq8 quantizer
     // wastes most of its 256 buckets on cross-cluster spread: per-dim
     // global range across 1M docs ≈ 0.4, intra-cluster spread ≈ 0.015,
@@ -4460,7 +4460,7 @@ mod tests {
     /// ```
     ///
     /// A regression that re-introduces eager subsection
-    /// materialization (the pre-011 behaviour) or that scans
+    /// materialization (the older behaviour) or that scans
     /// `doc_ids` at open will push per-column RSS past the
     /// 10 MB ceiling and fail here rather than at the 100 M
     /// production OOM.
@@ -4567,7 +4567,7 @@ mod tests {
     //   construction (no mmap involved). The in-memory cache is the
     //   test/bench path; production attaches a `StorageProvider` and
     //   routes through the disk cache. A separate test for the
-    //   in-memory cache path isn't a 011 deliverable — that path's
+    //   in-memory cache path is out of scope here — that path's
     //   anon cost is its declared contract.
     //
     // The bench's 10M × 4-commit × num_cpus-thread shape produces
@@ -5166,7 +5166,7 @@ mod tests {
     }
 
     /// pins the `cluster_block_range` address math
-    /// against the 013 layout's per-cluster block spec
+    /// against the per-cluster block spec
     /// (`[codes: cnt*cb][doc_ids: cnt*4]`). Walks every non-
     /// empty cluster and checks the block range size matches
     /// `cnt × (cb + 4)` exactly, the start aligns with

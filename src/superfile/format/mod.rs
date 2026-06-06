@@ -81,10 +81,9 @@ pub mod vec {
     ///   `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`,
     ///   block size `count[c] * (code_bytes + 4)`.
     ///
-    /// The format is **new-service-only** — there are no pre-013
-    /// segments in production, so the reader rejects every other
-    /// value at this slot as malformed rather than carrying a v0
-    /// parse path.
+    /// Only this version is accepted on read; a segment stamped
+    /// with any other value at this slot is rejected as malformed
+    /// rather than carrying an alternate parse path.
     pub const SUBSECTION_VERSION: u32 = 2;
 }
 
