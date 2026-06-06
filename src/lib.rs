@@ -52,6 +52,13 @@ pub const BUILDER_ID: &str = concat!(
     env!("INFINO_GIT_HASH")
 );
 
+/// Engine-generic benchmark harness seam (the `FtsEngine` trait + the
+/// infino reference impl). Lets a single bench driver measure infino
+/// and other retrieval engines through identical code. Behind the
+/// `bench-harness` feature; not part of infino's stable API.
+#[cfg(feature = "bench-harness")]
+pub mod bench_harness;
+
 pub mod config;
 mod runtime_bridge;
 pub mod storage;
