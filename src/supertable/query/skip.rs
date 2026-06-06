@@ -269,6 +269,20 @@ fn segment_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
     ) else {
         return true;
     };
+    scalar_value_may_match(&min, &max, pred.op, &pred.value)
+}
+
+/// Conservative `min`/`max`-vs-`value` comparison core, shared by the
+/// segment tier ([`segment_may_match`]) and the part tier (the scalar
+/// part prune in [`crate::supertable::query::prune`]). Returns `true`
+/// (keep) on any uncertainty: null bounds, an un-coercible literal, or
+/// otherwise-incomparable values. Never a false prune.
+pub(crate) fn scalar_value_may_match(
+    min: &ScalarValue,
+    max: &ScalarValue,
+    op: ScalarOp,
+    value: &ScalarValue,
+) -> bool {
     if min.is_null() || max.is_null() {
         return true;
     }
@@ -276,13 +290,13 @@ fn segment_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
     // Utf8-literal-vs-LargeUtf8-stat (or differing int width)
     // mismatch doesn't degrade to "incomparable → keep" and lose
     // pruning power.
-    let v = match pred.value.cast_to(&min.data_type()) {
+    let v = match value.cast_to(&min.data_type()) {
         Ok(v) if !v.is_null() => v,
         _ => return true,
     };
-    let cmp_v_min = v.partial_cmp(&min);
-    let cmp_v_max = v.partial_cmp(&max);
-    match pred.op {
+    let cmp_v_min = v.partial_cmp(min);
+    let cmp_v_max = v.partial_cmp(max);
+    match op {
         // keep iff min <= v <= max
         ScalarOp::Eq => match (cmp_v_min, cmp_v_max) {
             (Some(lo), Some(hi)) => lo != Ordering::Less && hi != Ordering::Greater,
@@ -290,7 +304,7 @@ fn segment_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
         },
         // prune only when the segment is a single constant == v
         ScalarOp::NotEq => {
-            let constant = min.partial_cmp(&max) == Some(Ordering::Equal);
+            let constant = min.partial_cmp(max) == Some(Ordering::Equal);
             let equals_v = cmp_v_min == Some(Ordering::Equal);
             !(constant && equals_v)
         }

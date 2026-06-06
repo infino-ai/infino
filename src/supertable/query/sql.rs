@@ -450,6 +450,37 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_equality_on_fts_column_across_segments_is_correct() {
+        // Equality on the FTS-indexed `title` column drives the new
+        // term-bloom prune leaf (plus the scalar min/max leaf). The two
+        // segments whose bloom lacks "bravo" may be pruned, but the
+        // result must still be exactly the one matching row — proving
+        // the bloom prune never drops a match.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(0, &["x"], &["alpha"])).expect("a1");
+        w.commit().expect("c1");
+        w.append(&build_cat_batch(10, &["y"], &["bravo"])).expect("a2");
+        w.commit().expect("c2");
+        w.append(&build_cat_batch(20, &["z"], &["charlie"]))
+            .expect("a3");
+        w.commit().expect("c3");
+        assert_eq!(st.reader().n_superfiles(), 3);
+
+        assert_eq!(
+            run_count(&st, "SELECT COUNT(*) FROM supertable WHERE title = 'bravo'"),
+            1
+        );
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'nonexistent'"
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn query_sql_select_orders_ids_across_segments() {
         // Verifies row identity round-trips through MemTable +
         // DataFusion: rows planted across two superfiles come back

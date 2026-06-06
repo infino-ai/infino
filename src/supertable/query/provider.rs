@@ -70,7 +70,9 @@ use roaring::RoaringBitmap;
 
 use crate::supertable::SuperfileEntry;
 use crate::supertable::manifest::Manifest;
-use crate::supertable::query::skip::{ScalarOp, ScalarPredicate, scalar_skip};
+use crate::superfile::fts::reader::BoolMode;
+use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
+use datafusion::scalar::ScalarValue;
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
 use crate::supertable::tombstones::SidecarCache;
 
@@ -144,30 +146,47 @@ impl SupertableProvider {
         }
     }
 
-    /// Flatten the pinned manifest into the visible segment list,
-    /// honoring a persisted hierarchical `list` when present (both
-    /// eager + lazy modes) and falling back to the flat
-    /// `manifest.superfiles` view otherwise.
-    ///
-    /// Flattens to the same segment set the manifest defines, so the
-    /// SQL scan and the mutation id-capture path see identical rows.
-    async fn flatten_segments(&self) -> DfResult<Vec<Arc<SuperfileEntry>>> {
-        match self.manifest.list.as_ref() {
-            Some(list) => {
-                let kept: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-                crate::supertable::query::hierarchical_iter::load_and_flatten(
-                    self.manifest.as_ref(),
-                    &kept,
-                )
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))
+    /// Lower scalar predicates to prune leaves. Each predicate yields a
+    /// `Scalar` leaf; additionally, an equality on an FTS-indexed text
+    /// column also yields a `TermPresence` leaf so the segment's term
+    /// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
+    /// whose tokens include every token of the literal, so requiring all
+    /// of them possibly-present (`BoolMode::And`) never drops a match —
+    /// bloom false positives can only keep a segment, never drop one.
+    fn predicates_to_prune_leaves(
+        &self,
+        predicates: Vec<ScalarPredicate>,
+    ) -> Vec<crate::supertable::query::prune::PruneLeaf> {
+        use crate::supertable::query::prune::PruneLeaf;
+        let opts = &self.manifest.options;
+        let mut leaves = Vec::with_capacity(predicates.len());
+        for pred in predicates {
+            if pred.op == ScalarOp::Eq
+                && opts.fts_columns.iter().any(|c| c.column == pred.column)
+                && let Some(tok) = opts.tokenizer.as_ref()
+                && let Some(literal) = scalar_as_str(&pred.value)
+            {
+                let terms: Vec<String> = tok.tokenize(literal).collect();
+                if !terms.is_empty() {
+                    leaves.push(PruneLeaf::TermPresence {
+                        column: pred.column.clone(),
+                        terms,
+                        mode: BoolMode::And,
+                    });
+                }
             }
-            None => Ok(
-                crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-                    self.manifest.as_ref(),
-                ),
-            ),
+            leaves.push(PruneLeaf::Scalar(pred));
         }
+        leaves
+    }
+}
+
+/// Extract a UTF-8 string literal from a scalar value, if it is one.
+/// Used to tokenize an equality literal for FTS-bloom pruning.
+fn scalar_as_str(v: &ScalarValue) -> Option<&str> {
+    match v {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.as_str()),
+        _ => None,
     }
 }
 
@@ -205,16 +224,18 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let segments = self.flatten_segments().await?;
-
-        // Tier 1 — segment skip from the persisted scalar min/max.
+        // Segment selection via the shared two-tier prune. SQL lowers
+        // its `WHERE` conjuncts to scalar leaves; today that prunes at
+        // the segment tier (scalar leaves impose no part-tier
+        // constraint, matching the pre-unification "load all parts"
+        // behavior). Survivors go to DataFusion.
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
-        let keep = scalar_skip(&segments, &predicates);
-        let survivors: Vec<&Arc<SuperfileEntry>> = segments
-            .iter()
-            .zip(keep)
-            .filter_map(|(entry, keep)| keep.then_some(entry))
-            .collect();
+        let leaves = self.predicates_to_prune_leaves(predicates);
+        let survivor_entries =
+            crate::supertable::query::prune::select_segments(self.manifest.as_ref(), &leaves)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
         // Nothing survived (empty table, or every segment pruned):
         // a schema-correct empty scan. EmptyExec yields one

@@ -21,6 +21,7 @@ pub mod exec;
 pub mod fts;
 pub mod hierarchical_iter;
 pub mod provider;
+pub mod prune;
 pub mod skip;
 pub mod sql;
 pub mod superfile_reader;
