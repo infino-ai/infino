@@ -1,7 +1,6 @@
 # infino
 
-A search-optimized lakehouse format. **One file = a valid Apache Parquet
-file plus embedded BM25 + vector indexes** — readable as Parquet by
+Infino stores data in a search-optimized lakehouse format. **One file = a valid Apache Parquet file plus embedded BM25 + vector indexes** — readable as Parquet by
 [DataFusion](https://datafusion.apache.org/) /
 [DuckDB](https://duckdb.org/) /
 [pyarrow](https://arrow.apache.org/docs/python/),
