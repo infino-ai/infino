@@ -6,7 +6,8 @@
 //! Measures infino exactly as an API consumer uses it: build a unified
 //! `.parquet` superfile through [`SuperfileBuilder`], then query the
 //! embedded BM25 index through [`SuperfileReader`]. No internal hooks —
-//! the same public surface any downstream user calls.
+//! the same public surface any downstream user calls, and the same
+//! builder/tokenizer the in-tree `fts_superfile` bench uses.
 
 use std::sync::Arc;
 
@@ -14,11 +15,13 @@ use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 
+use infino::superfile::SuperfileReader;
+use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
+use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
+use infino::test_helpers::default_tokenizer;
+
 use super::{BoolMode, Capabilities, FtsEngine, Hit};
-use crate::superfile::SuperfileReader;
-use crate::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use crate::superfile::fts::reader::BoolMode as InfinoBoolMode;
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+use crate::corpus::block_on_inmem;
 
 /// Auto-injected primary-key column for the superfile schema.
 const ID_COLUMN: &str = "doc_id";
@@ -65,7 +68,6 @@ impl FtsEngine for InfinoFtsEngine {
             Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
             Field::new(index.column.as_str(), DataType::LargeUtf8, false),
         ]));
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(AsciiLowerTokenizer::new());
         let opts = BuilderOptions::new(
             schema.clone(),
             ID_COLUMN,
@@ -73,7 +75,7 @@ impl FtsEngine for InfinoFtsEngine {
                 column: index.column.clone(),
             }],
             vec![],
-            Some(tokenizer),
+            Some(default_tokenizer()),
         );
         let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
         for chunk in docs.chunks(WRITE_CHUNK) {
@@ -100,7 +102,7 @@ impl FtsEngine for InfinoFtsEngine {
             BoolMode::Or => InfinoBoolMode::Or,
             BoolMode::And => InfinoBoolMode::And,
         };
-        let hits = futures::executor::block_on(reader.bm25_search_pretokenized(
+        let hits = block_on_inmem(reader.bm25_search_pretokenized(
             index.column.as_str(),
             terms,
             k,
@@ -136,14 +138,15 @@ mod tests {
             ids.contains(&0) && ids.contains(&2),
             "docs 0 and 2 contain 'quick'; got {ids:?}"
         );
-        assert!(
-            !ids.contains(&1),
-            "doc 1 has no 'quick'; got {ids:?}"
-        );
+        assert!(!ids.contains(&1), "doc 1 has no 'quick'; got {ids:?}");
 
         // AND of two terms only matches the doc containing both.
         let and_hits = InfinoFtsEngine::read(&idx, &["quick", "fox"], 10, BoolMode::And);
         let and_ids: Vec<u64> = and_hits.iter().map(|h| h.doc_id).collect();
-        assert_eq!(and_ids, vec![0], "only doc 0 has both 'quick' and 'fox': {and_ids:?}");
+        assert_eq!(
+            and_ids,
+            vec![0],
+            "only doc 0 has both 'quick' and 'fox': {and_ids:?}"
+        );
     }
 }

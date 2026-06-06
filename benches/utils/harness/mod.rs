@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Engine-generic benchmark harness seam.
+//! Engine-generic benchmark harness.
 //!
-//! Defines the [`FtsEngine`] trait so one bench driver can measure
-//! infino and other retrieval engines through identical code. infino
-//! ships the reference implementation ([`InfinoFtsEngine`]); a separate
-//! comparison crate implements the trait for other engines
-//! (Tantivy/Quickwit, LanceDB, DuckDB, CoreDB) and drives them all the
-//! same way, against a byte-identical corpus.
+//! Defines the [`FtsEngine`] trait so one driver ([`run_fts`]) can
+//! measure infino and other retrieval engines through identical code.
+//! infino ships the reference implementation ([`InfinoFtsEngine`]); the
+//! external comparison crate (`retrievalbench`) implements the trait for
+//! other engines (Tantivy, DuckDB, LanceDB, CoreDB) and drives them all
+//! the same way, against a byte-identical [`crate::corpus::MmapTextCorpus`].
 //!
 //! The three verbs the driver measures are:
 //!
@@ -16,16 +16,21 @@
 //!   - [`FtsEngine::write`] — ingest every document and seal the index
 //!     ready to query (the build phase).
 //!   - [`FtsEngine::read`]  — run a BM25 query (the search phase).
+//!
+//! Memory (RSS) and timing reuse the same [`crate::rss`] sampler the
+//! in-tree infino benches use, so internal and comparison numbers are
+//! produced by one measurement path.
 
-pub mod corpus;
 pub mod driver;
 mod infino_engine;
-pub mod rss;
 
-pub use corpus::MmapTextCorpus;
 pub use driver::{EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts};
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
-pub use rss::{PeakSampler, RssStats, current_rss_bytes, fmt_bytes};
+
+// Re-export the shared corpus + byte formatter so a comparison binary
+// has one import root for everything it needs to run `run_fts`.
+pub use crate::corpus::MmapTextCorpus;
+pub use crate::rss::{RssStats, fmt_bytes};
 
 /// Boolean combination mode for a multi-term full-text query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

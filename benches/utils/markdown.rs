@@ -39,6 +39,14 @@ pub fn emit(section: &MarkdownSection) {
     let _ = writeln!(out, "<!-- END: {} -->", section.anchor_id);
     let _ = writeln!(out);
 
+    maybe_update_readme(section);
+}
+
+/// Replace the matching README section iff `INFINO_BENCH_UPDATE_README`
+/// is set. Unlike [`emit`], this does **not** echo to stderr — callers
+/// that do their own (e.g. colored, delta-annotated) terminal rendering
+/// use this to avoid a double print.
+pub fn maybe_update_readme(section: &MarkdownSection) {
     if std::env::var_os("INFINO_BENCH_UPDATE_README").is_some() {
         let path = std::path::PathBuf::from("benches/README.md");
         if let Err(e) = update_readme(&path, section) {
@@ -94,6 +102,27 @@ pub fn fmt_time(ns: f64) -> String {
         format!("{:.2} ms", ns / 1_000_000.0)
     } else {
         format!("{:.2} s", ns / 1_000_000_000.0)
+    }
+}
+
+/// Human-readable count with K/M/B suffixes — `1000000` → `1M`,
+/// `500000` → `500K`, `12345` → `12.3K`. For doc-scale labels so a
+/// reader doesn't have to count zeros.
+pub fn fmt_count(n: usize) -> String {
+    let f = n as f64;
+    let (v, suffix) = if f >= 1e9 {
+        (f / 1e9, "B")
+    } else if f >= 1e6 {
+        (f / 1e6, "M")
+    } else if f >= 1e3 {
+        (f / 1e3, "K")
+    } else {
+        return format!("{n}");
+    };
+    if (v.fract()).abs() < f64::EPSILON {
+        format!("{v:.0}{suffix}")
+    } else {
+        format!("{v:.1}{suffix}")
     }
 }
 

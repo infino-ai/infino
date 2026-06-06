@@ -10,8 +10,10 @@
 pub mod bench;
 pub mod corpus;
 pub mod fixture;
+pub mod harness;
 pub mod ingest;
 pub mod markdown;
+pub mod report;
 pub mod rss;
 pub mod tiers;
 

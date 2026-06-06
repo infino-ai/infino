@@ -37,11 +37,6 @@ test-helpers = []
 # work or release-profile recall gates, but should not run as part of a
 # plain `cargo bench`.
 bench-diagnostics = []
-# Exposes `infino::bench_harness` — the engine-generic benchmark seam
-# (the `FtsEngine` trait + infino reference impl). Off by default;
-# enabled by the external comparison harness so it can drive infino and
-# other engines through identical code.
-bench-harness = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

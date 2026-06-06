@@ -12,8 +12,8 @@
 
 use std::time::{Duration, Instant};
 
-use super::rss::{PeakSampler, RssStats};
 use super::{BoolMode, FtsEngine, Hit};
+use crate::rss::{PeakSampler, RssStats};
 
 /// One named query in the battery.
 #[derive(Clone, Copy, Debug)]
@@ -116,19 +116,20 @@ fn percentile_duration(samples: &mut [Duration], percentile: usize) -> Duration 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench_harness::{InfinoFtsEngine, MmapTextCorpus};
+    use crate::corpus::MmapTextCorpus;
+    use crate::harness::InfinoFtsEngine;
 
     /// 1M-scale validation: drive infino through the shared `run_fts`
     /// driver and print build + per-query stats, to confirm the driver
     /// reproduces infino's known superfile-FTS numbers. Ignored by
     /// default (heavy); run explicitly:
-    /// `cargo test --features bench-harness --release -- --ignored \
+    /// `cargo test -p infino-bench-utils --release -- --ignored \
     ///  --nocapture run_fts_infino_superfile_scale`
     #[test]
     #[ignore = "1M-scale; run explicitly in --release"]
     fn run_fts_infino_superfile_scale() {
-        use crate::bench_harness::corpus::SUPERFILE_DOCS;
-        use crate::bench_harness::fmt_bytes;
+        use crate::corpus::SUPERFILE_DOCS;
+        use crate::rss::fmt_bytes;
 
         let corpus = MmapTextCorpus::generate(SUPERFILE_DOCS, 1);
         let docs = corpus.rows();
