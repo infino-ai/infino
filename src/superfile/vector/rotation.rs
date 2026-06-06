@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Random orthogonal rotation built from a deterministic seed.
 //!
 //! Sign-quantization (1-bit RaBitQ) is useless without rotation: every

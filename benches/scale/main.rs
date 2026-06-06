@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Scale bench bundle: at-scale pinned-recall assertion runners that
 //! need release-profile compilation to finish in seconds rather than
 //! minutes. Each `run()` prints single-line summaries per phase to

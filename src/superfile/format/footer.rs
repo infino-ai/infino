@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Parquet footer surgery: write the user's row groups via `parquet-rs`,
 //! splice the FTS + vector blobs between the last row group and a
 //! rewritten footer that carries `inf.*` KV metadata pointing at them.

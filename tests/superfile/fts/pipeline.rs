@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end FTS pipeline integration test.
 //!
 //! Builds a small multi-column FTS index, opens it through `FtsReader`,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Crash safety for the persisted supertable commit path on
 //! LocalFS.
 //!

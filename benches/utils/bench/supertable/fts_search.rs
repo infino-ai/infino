@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `supertable_fts_search` — FTS on the shared combined supertable.
 
 use std::hint::black_box;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Infino-only vector bench for the superfile layer:
 //!
 //!   ingest timing (1M × 384 Gaussian planted clusters, cosine)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! WAL state-document shape.
 //!
 //! Serialized as JSON, one object per WAL entry, at

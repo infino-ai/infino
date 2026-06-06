@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Supertable-internal helpers with no clear single-concern home.
 //!
 //! Discipline for what belongs here: cross-cutting helpers used by

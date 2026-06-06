@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! 1-bit RaBitQ-style sign quantizer with SIMD estimator.
 //!
 //! Each rotated f32 vector becomes one bit per dimension: 1 if positive,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end superfile pipeline: build a real superfile (Parquet
 //! body + FTS blob + vector blob), reopen it via `SuperfileReader`,
 //! exercise BM25 + vector search, and verify the bytes are still a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! In-memory reader cache.
 //!
 //! Holds every inserted segment's bytes in RAM for the

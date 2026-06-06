@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 use bytes::Bytes;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::Metric;

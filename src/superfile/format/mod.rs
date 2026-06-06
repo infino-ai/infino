@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Format-spec primitives: magic byte sequences, version strings, KV
 //! metadata key constants. Anything that defines what bytes go where in a
 //! superfile lives here.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! [`LazyByteSource`] — pulls byte ranges from an arbitrary
 //! backing (mmap, network range-fetch, broadcast subscription)
 //! so [`SuperfileReader::open_lazy`] can construct a reader

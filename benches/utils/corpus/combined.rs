@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Stream synthetic text + vector rows for supertable ingest (no full-dataset file).
 
 use rand::SeedableRng;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! **Quick-iteration harness** for the object-store cold-fetch path.
 //!
 //! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;

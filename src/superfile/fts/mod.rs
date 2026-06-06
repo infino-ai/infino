@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Full-text search subsystem — the BM25 + posting list + FST term
 //! dictionary stack lives here.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! CRC32C corruption oracle.
 //!
 //! Builds a real superfile (FTS + vector + parquet body), then for each

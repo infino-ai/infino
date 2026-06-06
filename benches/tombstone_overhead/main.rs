@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Hot-path overhead of the reader-side tombstone filter.
 //!
 //! Measures per-query latency across three supertable states so a

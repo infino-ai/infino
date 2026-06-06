@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end vector kNN pipeline integration test.
 //!
 //! Builds a multi-column vector blob, opens it, exercises kNN search.

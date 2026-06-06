@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Public-API integration coverage for the `hybrid_search` SQL TVF.
 //!
 //! `hybrid_exec.rs` carries the in-crate unit tests (RRF math, single

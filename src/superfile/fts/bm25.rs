@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 scoring math.
 //!
 //! Pure functions — no allocation, no I/O. Standard BM25 defaults:

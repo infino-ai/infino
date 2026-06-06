@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Vector kNN as a DataFusion table-valued function.
 //!
 //! `vector_search(column, query, k)` registers via `register_udtf`

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Per-column rerank codec.
 //!
 //! Each vector column picks one codec at build time:

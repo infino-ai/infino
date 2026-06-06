@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared fan-out/dispatch for the segment-parallel query paths.
 //!
 //! Vector kNN and BM25/prefix FTS both face the identical shape: a

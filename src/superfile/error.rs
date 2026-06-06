@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Typed error enums for the superfile crate.
 //!
 //! Variants live here so every module can name the same error

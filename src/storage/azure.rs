@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Azure Blob-backed [`StorageProvider`].
 //!
 //! Wraps `object_store::azure::MicrosoftAzure` so the supertable

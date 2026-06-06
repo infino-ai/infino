@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 full-text search as DataFusion table-valued functions.
 //!
 //! `bm25_search(column, query, k [, mode])` and

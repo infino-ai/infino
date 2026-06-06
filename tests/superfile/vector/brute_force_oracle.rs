@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Vector kNN oracle: IVF + RaBitQ + rerank vs O(N) exact brute force.
 //!
 //! For each query and metric, we compute the exact top-k by scanning

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! K-means clustering — 5-iteration Lloyd's algorithm.
 //!
 //! Used to derive the `n_cent` IVF centroids per vector column at

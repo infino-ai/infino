@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SupertableWriter::update` + `delete` integration tests.
 //!
 //! Drive the public mutation API end-to-end: buffer mutations

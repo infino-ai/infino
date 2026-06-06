@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! DataFusion `ExecutionPlan` nodes + table-valued functions that
 //! expose infino's retrieval kernels through the SQL surface.
 //!

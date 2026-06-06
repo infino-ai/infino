@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Recall test that exercises the reservoir sampling path
 //! end-to-end with `n_docs > sample_size`.
 //!

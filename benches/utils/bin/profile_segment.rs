@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Standalone profiling harness for the per-segment vector query path.
 //!
 //! Builds ONE supertable-segment-sized superfile (default 2.5M docs,

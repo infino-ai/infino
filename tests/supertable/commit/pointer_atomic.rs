@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Atomic-rename pointer commit.
 //!
 //! Covers the persistence primitives shipped by

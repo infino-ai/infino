@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Superfile module — the production-grade implementation of the embedded
 //! BM25 + vector format.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! List-level skip pruning — reader-side.
 //!
 //! Walks a [`ManifestList`]'s `parts` and applies the

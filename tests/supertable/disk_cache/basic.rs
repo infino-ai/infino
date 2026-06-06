@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Disk-cache layer with parallel cold fetch.
 //!
 //! Builds a tiny real superfile via `SuperfileBuilder`, puts

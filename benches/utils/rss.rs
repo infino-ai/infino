@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Resident-Set-Size sampling helper for the bench harnesses.
 //!
 //! Two surfaces:

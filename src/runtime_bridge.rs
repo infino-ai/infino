@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Sync→async bridge for sync public API on top of async storage.
 //!
 //! The supertable's public surface (writer.commit, reader queries,

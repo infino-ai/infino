@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Supertable smoke through the Azure Blob wire protocol.
 //!
 //! Points `AzureStorageProvider` at a running Azurite emulator (or

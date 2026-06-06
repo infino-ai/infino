@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Distance kernels — portable f32x8 SIMD via `wide`.
 //!
 //! Three metrics: cosine (`1 − dot` after unit-norm), squared L2,

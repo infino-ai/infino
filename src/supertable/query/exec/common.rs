@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared machinery for the search TVFs' custom `ExecutionPlan`s.
 //!
 //! All search TVFs (`vector_search`, `bm25_search`,

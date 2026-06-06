@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Open-format compatibility oracle: a superfile, read via vanilla
 //! DataFusion, must return exact expected counts and column values
 //! for the planted corpus.

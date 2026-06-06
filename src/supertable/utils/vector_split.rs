@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Split FixedSizeList vector columns out of an input `RecordBatch`.
 //!
 //! Supertable's append API takes a single `RecordBatch` carrying

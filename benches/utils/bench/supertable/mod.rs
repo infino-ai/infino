@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Combined 10M FTS + vector supertable benchmarks (`supertable_all`).
 
 pub mod query;

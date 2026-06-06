@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Storage provider abstraction over object stores.
 //!
 //! Wraps the `object_store` crate with a narrower, supertable-

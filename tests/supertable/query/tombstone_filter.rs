@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Reader-side tombstone-filter integration tests.
 //!
 //! Verifies that a row tombstoned by the WAL pipeline's

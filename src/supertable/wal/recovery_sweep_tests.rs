@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Recovery-sweep white-box tests.
 //!
 //! These drive `Supertable::open` against a pre-seeded

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! OCC on the manifest pointer (cross-process commits).
 //!
 //! Two children fork, each commits concurrently, and the test

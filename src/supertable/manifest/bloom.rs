@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS term-presence bloom filter.
 //!
 //! One bloom per (segment, FTS column). Built once at commit time

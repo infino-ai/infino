@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared bench fixtures: deterministic corpora, query batteries,
 //! brute-force ground truth, recall calibration, and thin builder
 //! wrappers around infino's public API.

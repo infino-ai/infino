@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Measured vector recall on a realistic-shape 10K × 384 corpus.
 //!
 //! Recall@k is the fraction of true top-k neighbors (by exact

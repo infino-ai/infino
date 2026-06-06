@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS superfile bench bundle (infino-only). Supertable FTS benches
 //! live in `benches/supertable/main.rs`, where they share one combined
 //! 10M-row supertable with the vector supertable benches.

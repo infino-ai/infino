@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Supertable ingest timing — three apples-to-apples shapes:
 //! `supertable_fts_build` (vs Tantivy), `supertable_vec_build` (vs Lance
 //! vector-only), and `supertable_all_build` (combined, vs combined Lance).

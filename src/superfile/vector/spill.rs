@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Streaming spill primitives for the bounded-memory build path.
 //!
 //! Two cooperating abstractions:

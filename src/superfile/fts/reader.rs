@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS blob reader. Multi-column BM25 search.
 //!
 //! Opens the byte layout produced by [`super::builder::FtsBuilder::finish`]

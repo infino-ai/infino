@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Superfile-layer integration tests.
 //!
 //! One test binary (`cargo test --test superfile`) covers:

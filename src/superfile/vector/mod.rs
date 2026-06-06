@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Vector subsystem — IVF + 1-bit RaBitQ + full-precision rerank.
 //!
 //! Layered as: pure-math primitives (`distance`, `quant`,

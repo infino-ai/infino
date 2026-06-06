@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Canonical digest of `SupertableOptions`.
 //!
 //! [`compute_options_hash`] produces a deterministic

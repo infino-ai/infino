@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS blob builder. Multi-column FTS index assembly.
 //!
 //! `FtsBuilder` accumulates posting records across all FTS-indexed

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 correctness oracle for the superfile FTS pipeline.
 //!
 //! Indexes a planted 60-doc corpus and asserts that infino's

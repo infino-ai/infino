@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Convenience builders for test fixtures.
 //!
 //! Three test contexts share these helpers:

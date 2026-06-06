@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared markdown summary emitter for the infino-only bench harnesses.
 //!
 //! After criterion finishes timing, each topic's bench function builds

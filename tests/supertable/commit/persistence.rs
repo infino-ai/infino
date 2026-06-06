@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Writer write-through to storage.
 //!
 //! Covers the persistence path the writer takes when

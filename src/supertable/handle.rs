@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `Supertable` + `SupertableReader` — the in-memory handle.
 //!
 //! `Supertable::create(opts).expect("create")` returns a clone-shared handle holding

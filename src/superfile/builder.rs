@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Top-level superfile builder.
 //!
 //! **Naming convention.** `SuperfileBuilder` is a single-shot

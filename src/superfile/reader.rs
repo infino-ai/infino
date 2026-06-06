@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Top-level superfile reader.
 //!
 //! `SuperfileReader::open(bytes)` parses the Parquet footer's `inf.*`

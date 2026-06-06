@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Single combined supertable ingest + search consumer for `supertable_all`.
 
 use std::sync::{Arc, OnceLock};

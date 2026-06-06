@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Single-shot profile harness for `FtsBuilder` at the same 1M-doc
 //! Zipfian corpus the Criterion superfile FTS build bench uses.
 //!

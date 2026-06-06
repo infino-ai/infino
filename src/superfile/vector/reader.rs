@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Vector blob reader. Multi-column kNN search via IVF + 1-bit RaBitQ
 //! shortlist + full-precision rerank.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! 128-bit Snowflake-style id generator for the supertable's
 //! auto-injected `_id` column.
 //!

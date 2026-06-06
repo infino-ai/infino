@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `ColdFetchMode::LazyForegroundWithBackgroundFill`
 //! integration. The cold path returns a lazy reader
 //! immediately (paying only the cold-open byte budget

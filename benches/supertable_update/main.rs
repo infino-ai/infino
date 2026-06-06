@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end update / delete throughput bench.
 //!
 //! Ingests a baseline corpus into a supertable, then drives a

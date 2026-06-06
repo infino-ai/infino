@@ -2,6 +2,7 @@
 name = "infino"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via
 # `[[bench]]` below. Without this, shared helper files like

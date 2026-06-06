@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! WAL pipeline orchestrators for the update / delete state machines.
 //!
 //! Two phases live here:

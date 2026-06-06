@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! SIMD primitives for the Sq8 build pipeline.
 //!
 //! Owns the per-tier (scalar/`wide`/AVX2/AVX-512) implementations of

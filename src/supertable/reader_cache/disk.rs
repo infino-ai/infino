@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! [`DiskCacheStore`] — Tier 1 cache wrapping a
 //! [`StorageProvider`] with parallel cold-fetch + LRU
 //! eviction.

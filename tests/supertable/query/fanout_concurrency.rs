@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Concurrency stress for the shared query fan-out
 //! (`supertable::query::dispatch::fanout`) — the tokio-I/O /
 //! rayon-CPU orchestration that backs `bm25_search`, `vector_search`,

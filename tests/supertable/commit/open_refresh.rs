@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `Supertable::open` + read-path freshness (`Consistency`).
 //!
 //! Covers, entirely through the public API:

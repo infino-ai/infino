@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Runtime SIMD dispatch gates for the vector + bloom kernels.
 //!
 //! Sibling to `distance.rs` because multiple kernels across the

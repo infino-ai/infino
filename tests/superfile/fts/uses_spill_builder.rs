@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Production-wiring integration test for the spill-backed FTS
 //! builder. Confirms that `SuperfileBuilder::finish` flows through
 //! `FtsBuilder::finish` → `finish_to`, exercising the partition-

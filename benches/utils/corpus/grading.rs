@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Recall grading for supertable vector benches: queries + brute-force top-k.
 //!
 //! Does **not** mmap the full corpus. Regenerates the same synthetic stream as

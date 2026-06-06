@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Infino-only FTS bench for the superfile layer:
 //!
 //!   ingest timing (single-thread + rayon-sharded multi-thread)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Per-`ManifestPart` aggregate skip summaries — writer-side.
 //!
 //! When the writer commits a manifest part containing N

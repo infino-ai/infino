@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Supertable smoke through the S3 wire protocol.
 //!
 //! Stands up an in-process s3s-fs server on a random port,

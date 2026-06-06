@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `ManifestPart` — one node of the two-tier manifest.
 //!
 //! A part is a bounded collection of `SuperfileEntry` records,

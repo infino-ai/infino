@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Smallest possible end-to-end tour of the stack:
 //!
 //!   A. superfile  — feed one document, then BM25 *and* vector kNN

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `ManifestList` — the top-tier of the two-tier hierarchical manifest.
 //! A small JSON document (~MB even at 1M superfiles) that references one or
 //! more [`ManifestPart`] files by URI + content hash, carries the

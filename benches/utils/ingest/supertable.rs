@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Combined FTS + vector supertable ingest to object storage.
 
 use std::sync::Arc;

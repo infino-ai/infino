@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Tiered segment-bytes lookup.
 //!
 //! [`superfile_reader`] is the single accessor the query paths

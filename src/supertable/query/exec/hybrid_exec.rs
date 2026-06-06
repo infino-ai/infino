@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Hybrid retrieval (BM25 × vector) as a DataFusion table-valued
 //! function.
 //!

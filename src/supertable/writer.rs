@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SupertableWriter` — the single-writer append + commit path.
 //!
 //! **Naming convention.** `SupertableWriter` is a long-lived
