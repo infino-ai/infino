@@ -179,6 +179,27 @@ impl SupertableProvider {
         }
         leaves
     }
+
+    /// Lower `filters` to prune leaves and return the segments that
+    /// survive the two-tier prune — exactly the inputs the scan hands to
+    /// DataFusion.
+    async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
+        let predicates = exprs_to_scalar_predicates(filters, &self.schema);
+        let leaves = self.predicates_to_prune_leaves(predicates);
+        crate::supertable::query::prune::select_segments(self.manifest.as_ref(), &leaves)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
+    }
+
+    /// Test hook: how many segments survive pruning for `filters` — the
+    /// observable behind "did the index prune more than min/max?".
+    #[cfg(test)]
+    pub(crate) async fn surviving_segment_count(&self, filters: &[Expr]) -> usize {
+        self.select_survivors(filters)
+            .await
+            .expect("select survivors")
+            .len()
+    }
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -224,17 +245,10 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // Segment selection via the shared two-tier prune. SQL lowers
-        // its `WHERE` conjuncts to scalar leaves; today that prunes at
-        // the segment tier (scalar leaves impose no part-tier
-        // constraint, matching the pre-unification "load all parts"
-        // behavior). Survivors go to DataFusion.
-        let predicates = exprs_to_scalar_predicates(filters, &self.schema);
-        let leaves = self.predicates_to_prune_leaves(predicates);
-        let survivor_entries =
-            crate::supertable::query::prune::select_segments(self.manifest.as_ref(), &leaves)
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        // Segment selection via the shared two-tier prune (the same
+        // path FTS search uses); see `select_survivors`. Survivors go to
+        // DataFusion.
+        let survivor_entries = self.select_survivors(filters).await?;
         let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
         // Nothing survived (empty table, or every segment pruned):
@@ -544,10 +558,14 @@ fn row_group_predicate(
 mod tests {
     use super::*;
 
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
+
+    use crate::superfile::builder::FtsConfig;
+    use crate::supertable::{Supertable, SupertableOptions};
+    use crate::test_helpers::default_tokenizer;
 
     /// Build an in-memory Parquet file of `Int64` values `0..total`
     /// split into row groups of `rg_size` rows each.
@@ -726,5 +744,108 @@ mod tests {
         // x + 1 (arithmetic) — not a comparison, no predicate.
         let preds = exprs_to_scalar_predicates(&[col("x") + lit(1_i64)], &s);
         assert!(preds.is_empty());
+    }
+
+    // ---- Segment-prune contrast: index helps vs. doesn't ----------
+    //
+    // End-to-end through a real multi-segment supertable: count how many
+    // segments survive the scan's prune for different predicates. This
+    // is the observable proof that the embedded FTS index prunes more
+    // than the scalar min/max a plain Parquet scan relies on — and,
+    // honestly, where it doesn't (full scans, non-FTS predicates).
+
+    fn cat_title_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("category", DataType::LargeUtf8, false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    fn cat_title_opts() -> SupertableOptions {
+        // One writer thread → one segment per commit (deterministic
+        // segment counts).
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(
+            cat_title_schema(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        )
+        .expect("opts")
+        .with_writer_pool(pool)
+    }
+
+    fn cat_title_batch(cats: &[&str], titles: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            cat_title_schema(),
+            vec![
+                Arc::new(LargeStringArray::from(cats.to_vec())),
+                Arc::new(LargeStringArray::from(titles.to_vec())),
+            ],
+        )
+        .expect("batch")
+    }
+
+    #[test]
+    fn segment_prune_index_helps_vs_does_not() {
+        let st = Supertable::create(cat_title_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        // Three segments. Every segment's `title` lexicographic range
+        // spans "mango", so scalar min/max can prune none of them — but
+        // only the middle segment actually holds the token.
+        w.append(&cat_title_batch(&["lang", "lang"], &["aardvark", "zebra"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        w.append(&cat_title_batch(&["lang"], &["mango"]))
+            .expect("a2");
+        w.commit().expect("c2");
+        w.append(&cat_title_batch(&["lang", "lang"], &["delta", "sigma"]))
+            .expect("a3");
+        w.commit().expect("c3");
+        assert_eq!(st.reader().n_superfiles(), 3);
+
+        let reader = st.reader();
+        let provider = SupertableProvider::new(
+            st.options().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        // Index HELPS: the term bloom prunes the two wide-range segments
+        // that min/max could not, leaving only the real holder.
+        assert_eq!(
+            rt.block_on(provider.surviving_segment_count(&[col("title").eq(lit("mango"))])),
+            1,
+            "FTS bloom prunes to the single token holder"
+        );
+
+        // Index can't help a full scan — every segment is read.
+        assert_eq!(
+            rt.block_on(provider.surviving_segment_count(&[])),
+            3,
+            "no predicate → full scan, nothing pruned"
+        );
+
+        // Non-FTS predicate present in every segment: no bloom to use,
+        // and min/max can't prune (all categories equal) → nothing
+        // pruned. This is the honest "index doesn't help" case.
+        assert_eq!(
+            rt.block_on(provider.surviving_segment_count(&[col("category").eq(lit("lang"))])),
+            3,
+            "non-FTS predicate matching all segments prunes nothing"
+        );
     }
 }

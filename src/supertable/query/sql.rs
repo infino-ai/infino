@@ -481,6 +481,37 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_multiword_equality_on_fts_column_is_correct() {
+        // Multi-word literal: the equality lowers to a `TermPresence`
+        // leaf over {rust, async, runtime} (AND). The second segment's
+        // bloom lacks those tokens and is pruned, yet results are exact
+        // — DataFusion's FilterExec re-applies the full string equality.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(0, &["lang"], &["rust async runtime"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        w.append(&build_cat_batch(10, &["lang"], &["python data science"]))
+            .expect("a2");
+        w.commit().expect("c2");
+        assert_eq!(st.reader().n_superfiles(), 2);
+
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'rust async runtime'"
+            ),
+            1
+        );
+        // Tokens present in segment 1, but no row equals this exact
+        // string — the prune is an optimization, correctness holds.
+        assert_eq!(
+            run_count(&st, "SELECT COUNT(*) FROM supertable WHERE title = 'rust async'"),
+            0
+        );
+    }
+
+    #[test]
     fn query_sql_select_orders_ids_across_segments() {
         // Verifies row identity round-trips through MemTable +
         // DataFusion: rows planted across two superfiles come back
