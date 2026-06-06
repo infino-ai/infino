@@ -1,4 +1,4 @@
-//! Unified object-store cold/warm bench (infino-only). Stands an
+//! Unified object-store cold/warm bench. Stands an
 //! in-process `s3s-fs` server in for AWS S3 and measures the
 //! lazy cold-open + first-search path over the network for a
 //! single superfile that carries **both** a vector subsection and

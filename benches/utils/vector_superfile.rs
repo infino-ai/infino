@@ -1,4 +1,4 @@
-//! Infino-only vector bench for the superfile layer:
+//! Vector benches for the superfile layer:
 //!
 //!   ingest timing (1M × 384 Gaussian planted clusters, cosine)
 //! + calibrated kNN search at recall targets {0.90, 0.95, 0.99}

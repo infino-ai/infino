@@ -1,4 +1,4 @@
-//! Infino-only FTS bench for the superfile layer:
+//! FTS benches for the superfile layer:
 //!
 //!   ingest timing (single-thread + rayon-sharded multi-thread)
 //! + 7-query search timing
@@ -7,8 +7,8 @@
 //!
 //! Every phase uses the production path: [`SuperfileBuilder`] → unified
 //! `.parquet` → [`SuperfileReader`] → `bm25_search` / embedded [`FtsReader`].
-//! Hot opens the finished `.parquet` in memory; warm/cold commit the same bytes
-//! to object storage and read through [`DiskCacheStore::reader`].
+//! Hot opens the finished `.parquet` in memory; cold commits the same bytes
+//! to object storage and reads through [`DiskCacheStore::reader`].
 //!
 //! Pinned to 1M-doc Zipfian (200 tokens/doc, 10K vocab). The
 //! single-superfile shape is rarely much larger in production —

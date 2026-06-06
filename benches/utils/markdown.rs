@@ -1,7 +1,7 @@
-//! Shared markdown summary emitter for the infino-only bench harnesses.
+//! Shared markdown summary emitter for the bench harnesses.
 //!
 //! After criterion finishes timing, each topic's bench function builds
-//! a markdown block summarizing the infino numbers. The block is always
+//! a markdown block summarizing the numbers. The block is always
 //! written to stderr framed by sentinel comments
 //! (`<!-- BEGIN: <anchor_id> -->` / `<!-- END: <anchor_id> -->`).
 //! When `INFINO_BENCH_UPDATE_README=1` is set, the same block also

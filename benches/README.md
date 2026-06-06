@@ -1,6 +1,6 @@
 # infino benches
 
-Infino-only performance + correctness benches. Three criterion binaries:
+Performance + correctness benches. Three criterion binaries:
 
 - `superfile_fts` — FTS over one 1M-doc superfile
 - `superfile_vector` — vector search over one 1M × 384 superfile
