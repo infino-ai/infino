@@ -17,9 +17,15 @@
 //!     ready to query (the build phase).
 //!   - [`FtsEngine::read`]  — run a BM25 query (the search phase).
 
+pub mod corpus;
+pub mod driver;
 mod infino_engine;
+pub mod rss;
 
+pub use corpus::MmapTextCorpus;
+pub use driver::{EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts};
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
+pub use rss::{PeakSampler, RssStats, current_rss_bytes, fmt_bytes};
 
 /// Boolean combination mode for a multi-term full-text query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
