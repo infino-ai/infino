@@ -64,7 +64,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Squared Euclidean distance. See [`dot`] for dispatch shape.
 #[inline]
-pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if avx512_enabled() {

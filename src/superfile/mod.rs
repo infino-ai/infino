@@ -24,8 +24,6 @@ pub mod reader;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};
-pub use lazy_source::{
-    BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, PrefetchedSource,
-    Source,
-};
+pub use lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
+pub(crate) use lazy_source::{LazySubSource, PrefetchedSource};
 pub use reader::{OpenOptions, SuperfileReader, VectorSearchOptions};

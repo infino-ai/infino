@@ -159,7 +159,7 @@ pub enum LazyByteSourceError {
 /// `Lazy` is a range-fetching source: mmap, object storage, or a
 /// foreground cold-fetch subscriber.
 #[derive(Clone)]
-pub enum Source {
+pub(crate) enum Source {
     InMemory(Bytes),
     Lazy(Arc<dyn LazyByteSource>),
 }
@@ -175,15 +175,11 @@ impl std::fmt::Debug for Source {
 
 impl Source {
     /// Total backing size in bytes.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::InMemory(b) => b.len(),
             Self::Lazy(s) => s.size() as usize,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Best-effort sync fetch. Always succeeds for in-bounds
@@ -429,7 +425,7 @@ impl LazyByteSource for BytesLazyByteSource {
 /// surface as `OutOfBounds` errors with `size = self.size`,
 /// not the inner's larger size — keeps caller-visible errors
 /// scoped to the slice the caller actually sees.
-pub struct LazySubSource {
+pub(crate) struct LazySubSource {
     inner: Arc<dyn LazyByteSource>,
     /// Absolute offset of the sub-region's start inside the
     /// inner source.
@@ -497,7 +493,7 @@ impl LazyByteSource for LazySubSource {
 /// shared by every subsequent read. The Vec is read-only after
 /// the open completes, so the racy-read-during-install pattern
 /// the lazy open path actually uses is single-threaded.
-pub struct PrefetchedSource {
+pub(crate) struct PrefetchedSource {
     inner: Arc<dyn LazyByteSource>,
     /// (absolute_start, bytes). One entry per pre-fetched
     /// range. Lookup walks the vec linearly — the open-time

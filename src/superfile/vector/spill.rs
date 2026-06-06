@@ -41,7 +41,7 @@ use crate::superfile::BuildError;
 /// file is exactly `n_docs * dim * 4` bytes at `finish()` time.
 /// This matches what [`MmapVectorSource::open`] expects on the
 /// read side.
-pub struct SpillWriter {
+pub(crate) struct SpillWriter {
     path: PathBuf,
     writer: BufWriter<File>,
     bytes_written: u64,
@@ -98,17 +98,10 @@ impl SpillWriter {
 
     /// Total bytes appended through this writer. Counts bytes
     /// at the caller boundary, before the kernel flush. Used
-    /// by the bench harness + tests to confirm the spill file
-    /// grew as expected.
-    pub fn bytes_written(&self) -> u64 {
+    /// by tests to confirm the spill file grew as expected.
+    #[cfg(test)]
+    pub(crate) fn bytes_written(&self) -> u64 {
         self.bytes_written
-    }
-
-    /// Path of the underlying spill file. Stable for the
-    /// lifetime of this `SpillWriter`. Useful for tests and the
-    /// `MmapVectorSource::open` call site.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Flush the buffer to the kernel, fsync the file, and
@@ -152,6 +145,7 @@ pub trait ChunkedVectorSource {
     fn n_rows(&self) -> usize;
 
     /// Dimension of each row. The same value across all chunks.
+    #[cfg(test)]
     fn dim(&self) -> usize;
 
     /// Maximum number of rows the next `next_chunk` returns.
@@ -167,6 +161,7 @@ pub trait ChunkedVectorSource {
     /// Reset the iterator to row 0. Used by tests; the
     /// pass-2 build loop walks the source exactly once and
     /// doesn't need this.
+    #[cfg(test)]
     fn reset(&mut self);
 }
 
@@ -217,6 +212,7 @@ impl ChunkedVectorSource for InMemoryVectorSource {
         self.buf.len() / self.dim
     }
 
+    #[cfg(test)]
     fn dim(&self) -> usize {
         self.dim
     }
@@ -237,6 +233,7 @@ impl ChunkedVectorSource for InMemoryVectorSource {
         Some(&self.buf[start..end])
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.cursor = 0;
     }
@@ -305,6 +302,7 @@ impl ChunkedVectorSource for MmapVectorSource {
         self.map.len() / (self.dim * 4)
     }
 
+    #[cfg(test)]
     fn dim(&self) -> usize {
         self.dim
     }
@@ -335,6 +333,7 @@ impl ChunkedVectorSource for MmapVectorSource {
         Some(floats)
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.cursor = 0;
     }

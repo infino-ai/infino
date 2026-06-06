@@ -169,7 +169,7 @@ pub fn kmeans_with_assignments(
 /// - `assignments.len() != vectors.len() / dim`
 /// - `centroids.len() != k * dim`
 /// - `k == 0` or `dim == 0`
-pub fn assign_to_centroids(
+pub(crate) fn assign_to_centroids(
     vectors: &[f32],
     centroids: &[f32],
     dim: usize,

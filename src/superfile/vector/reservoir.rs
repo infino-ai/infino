@@ -79,7 +79,7 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
 ///
 /// The struct owns its RNG state so callers don't need to
 /// thread one through; seeding is done at construction.
-pub struct Reservoir {
+pub(crate) struct Reservoir {
     sample_size: usize,
     dim: usize,
     rng: StdRng,
@@ -166,13 +166,9 @@ impl Reservoir {
     }
 
     /// Number of vectors observed via [`Self::update`].
-    pub fn n_seen(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn n_seen(&self) -> u64 {
         self.n_seen
-    }
-
-    /// Maximum reservoir capacity (vectors).
-    pub fn sample_size(&self) -> usize {
-        self.sample_size
     }
 
     /// Current reservoir contents as a contiguous `&[f32]` of
@@ -183,10 +179,9 @@ impl Reservoir {
     }
 
     /// Same as [`Self::sample`] but consumes the reservoir,
-    /// handing back the owned buffer. Used at the pass-1 →
-    /// pass-2 boundary in 010's `finish()` to release the
-    /// reservoir's memory as soon as k-means returns.
-    pub fn into_sample(self) -> Vec<f32> {
+    /// handing back the owned buffer.
+    #[cfg(test)]
+    pub(crate) fn into_sample(self) -> Vec<f32> {
         self.buf
     }
 

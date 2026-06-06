@@ -10,7 +10,7 @@
 
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
-pub use crate::superfile::lazy_source::Source;
+pub(crate) use crate::superfile::lazy_source::Source;
 use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource};
 use crate::superfile::vector::distance::{
     Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualKernel, distance_bytes,
@@ -505,7 +505,7 @@ impl VectorReader {
     /// `open_lazy` path guarantees this via the overlay; callers
     /// constructing a `Source::Lazy` directly (tests, mmap-
     /// backed sources) must arrange equivalent residency.
-    pub fn open_with_source(
+    pub(crate) fn open_with_source(
         source: Source,
         columns_json: &str,
         opts: OpenOptions,

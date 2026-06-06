@@ -223,7 +223,7 @@ impl FtsReader {
     /// Open over an arbitrary byte source. The eager path wraps a
     /// full subsection as [`Source::InMemory`]; lazy callers can pass
     /// a range-backed source without changing the public search API.
-    pub fn open_with_source(
+    pub(crate) fn open_with_source(
         source: Source,
         columns_json: &str,
         opts: OpenOptions,
