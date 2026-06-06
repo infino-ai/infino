@@ -9,7 +9,17 @@ For more technical detail, see [superfile](./superfile.md) (the segment format) 
 
 **infino is a fast retrieval engine that keeps your data on
 cheap object storage (like Amazon S3) and runs SQL, full-text (keyword)
-search, and vector (semantic) search over it from a single system.**
+search, vector (semantic) search, and hybrid search over it from a
+single system.**
+
+These aren't three engines bolted together: SQL, keyword, and vector run
+over **one copy of the data** through **one query path**. That makes
+**hybrid search** — keyword relevance fused with vector similarity, with
+SQL filters alongside — a first-class, single-pass operation against a
+single snapshot, rather than a fan-out to separate systems whose results
+you stitch back together. For most retrieval and RAG workloads, hybrid is
+the query you actually want, and it's a primary reason to reach for
+Infino.
 
 You don't provision a big, always-on cluster sized for your *whole*
 dataset. The data lives in object storage at object-storage prices, and
@@ -62,7 +72,10 @@ A query never downloads the whole dataset. It:
 2. **Prunes** — uses small per-file summaries in the manifest
    (value ranges, a keyword "is this term present?" filter, vector
    centroids) to skip files that can't possibly match. This reads only
-   the catalog, never file contents.
+   the catalog, never file contents. The same summaries back every
+   modality through one shared pruning layer, so a hybrid query prunes
+   on scalar, keyword, *and* vector signals together before touching a
+   single byte of a segment.
 3. **Fetches only what it needs** — for surviving files it pulls just
    the relevant byte ranges from object storage (a posting list, a
    handful of vector clusters), not the whole file.
@@ -176,6 +189,13 @@ Where **Infino is distinctive even within this camp**:
   SQL, BM25, and IVF + RaBitQ vectors share one copy of the data and
   one consistency model, instead of syncing a DB + a search engine + a
   vector DB.
+- **Hybrid search is first-class, not glued on.** Because every modality
+  shares that one copy and one query path, you fuse keyword (BM25) and
+  vector relevance — with SQL filters — in a single query against a
+  single snapshot, with no second system to keep in sync and no
+  client-side result stitching. The same index machinery prunes segments
+  across SQL, full-text, and vector together, so the hybrid query is also
+  the well-pruned, cheap one.
 
 ### At a glance
 
@@ -187,16 +207,17 @@ most systems are extending across the row over time.
 | **Traditional DB** | Transactions, single node | Scalar core; full-text + vectors added (e.g. pgvector) | Rises with total data (coupled) | Proprietary |
 | **Search engine** | Node/shard cluster | Full-text core; vectors maturing; object-storage tiers added | Lower with frozen tiers, but cluster-centric | Proprietary |
 | **Vector DB** | ANN over embeddings | Vector core; hybrid + filtering increasingly common | Varies; RAM/SSD-heavy if latency-pinned | Proprietary |
-| **Object Store Engines** | Object storage + multi-modal, by default | Scalar + full-text + vector as a baseline | Low; pay for what you query | Infino: **Parquet** |
+| **Object Store Engines** | Object storage + multi-modal, by default | Scalar + full-text + vector + hybrid as a baseline | Low; pay for what you query | Infino: **Parquet** |
 
 ## What Infino optimizes for
 
 - **Cost at scale.** Object storage as the source of truth means
   storing a lot of data is cheap; you pay compute only for the queries
   you run and the hot set you cache.
-- **One system, multiple query types.** SQL filters, keyword relevance,
-  and semantic similarity over the same data — no multi-system sync,
-  no duplicated copies.
+- **One system, multiple query types — including hybrid.** SQL filters,
+  keyword relevance, and semantic similarity over the same data, fused
+  into a single hybrid query when you want both signals at once — no
+  multi-system sync, no duplicated copies, no client-side result merging.
 - **Predictable performance tiers.** Bounded ranged reads on cold data,
   local memory-mapped speed when hot, with the cache managing the
   transition automatically.
@@ -213,15 +234,21 @@ Infino is best for:
 - Large corpora where **most data is cold** but must stay searchable —
   logs, documents, product catalogs, knowledge bases, chat/email
   history — and where keeping it all hot is the cost pain.
-- **RAG and AI retrieval** that needs *both* semantic (vector) and
-  keyword/metadata filtering over the same store, where consolidating
-  onto one multi-modal system is more attractive than adding another.
+- **RAG and AI retrieval** that needs **hybrid** relevance — semantic
+  (vector) fused with keyword and metadata/SQL filtering over the same
+  store — where consolidating onto one multi-modal system beats running
+  and syncing another.
 - Teams feeling the **always-hot cost or operational weight** of their
   current setup (e.g. a large search cluster, or a separate vector DB
   kept in sync with a database) and open to a separated-compute,
   object-storage-native model.
 - Workloads with **bursty or elastic query volume**, where decoupled
   compute can scale up and down against a stable storage tier.
+- **Existing warehouse / lakehouse data** you want to search in place.
+  Because a superfile *is* a valid Parquet file, you add keyword, vector,
+  and hybrid retrieval over data already in your lakehouse's open format —
+  cutting the number of tools you operate and the cost of keeping
+  duplicate copies and separate systems in sync.
 
 Equally fair to say where it's *not* the obvious choice: heavy transactional workloads belong in an OLTP database, and if you already
 run one system that comfortably handles your scale and modalities, then where Infino helps is to consolidate to save cost/ops.
@@ -240,6 +267,9 @@ run one system that comfortably handles your scale and modalities, then where In
   summaries, before touching any file contents.
 - **BM25** — the standard keyword-relevance ranking for full-text
   search.
+- **Hybrid search** — a single query that fuses keyword (BM25) and
+  vector relevance (e.g. via reciprocal-rank fusion), optionally with
+  SQL filters, over one copy of the data and one snapshot.
 - **IVF + RaBitQ** — the clustering + compact-binary-code technique
   behind fast approximate vector search.
 - **Object storage / S3** — cheap, durable, near-infinite remote
