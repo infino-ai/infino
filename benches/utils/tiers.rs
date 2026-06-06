@@ -385,10 +385,14 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     let storage = backend.provider(&prefix);
     eprintln!("[tiers] {} prefix={prefix}", backend.label());
 
-    // Ephemeral runs (no persisted dataset) own this unique prefix and must
-    // delete it at the end; persisted runs (`INFINO_BENCH_DATASET`) keep the
-    // table for reuse, so they register nothing.
-    if std::env::var("INFINO_BENCH_DATASET").is_err() {
+    // The unique prefix is deleted after the run, unless the caller keeps it
+    // (`INFINO_BENCH_KEEP`, e.g. to inspect or re-query the table) or it's a
+    // persisted dataset run (`INFINO_BENCH_DATASET`).
+    if std::env::var_os("INFINO_BENCH_KEEP").is_some()
+        || std::env::var_os("INFINO_BENCH_DATASET").is_some()
+    {
+        eprintln!("[tiers] keeping {} prefix={prefix} (cleanup skipped)", backend.label());
+    } else {
         CLEANUP
             .lock()
             .expect("cleanup registry")

@@ -92,9 +92,11 @@ The chosen backend appears as the storage label in warm/cold group names —
 e.g. `supertable_fts_cold_search_azure_local`. The default (`s3` `local`)
 writes only to the in-process emulator.
 
-**Cleanup.** A real-backend run writes its table under a unique prefix
-and deletes it when the process exits — no manual cleanup. The emulator
-is in-process and self-cleans on drop.
+**Cleanup.** A remote/Azurite run writes its table under a unique prefix
+and deletes it when the process exits — no manual cleanup. Set
+`INFINO_BENCH_KEEP=1` to retain it instead (the kept prefix is logged, so
+you can inspect, re-query, or delete it yourself). The in-process s3s-fs
+self-cleans on drop regardless.
 
 **Emulator caveat.** `s3` `local` (in-process s3s-fs) can't survive the
 supertable's concurrent multi-commit ingest (it reuses connections it has
