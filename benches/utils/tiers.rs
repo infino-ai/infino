@@ -1,12 +1,12 @@
-//! Shared hot / cold storage tier helpers for canonical benches.
+//! Shared hot / cold storage tier helpers for the search benches.
 //!
-//! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
+//! - **Hot**: open from object storage, all segments mmap-promoted (reads
+//!   hit resident pages).
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
-//! Backend is chosen explicitly via `INFINO_BENCH_STORE` (`s3s_fs` default
-//! | `s3` | `azure`); `s3` reads `INFINO_REAL_S3_BUCKET`, `azure` reads
-//! `INFINO_REAL_AZURE_CONTAINER`. Never inferred from which credential is
-//! set.
+//! Backend is chosen on two axes — `INFINO_BENCH_STORE` (`s3` | `azure`) ×
+//! `INFINO_BENCH_MODE` (`local` | `remote`) — never inferred from which
+//! credential is set.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -48,8 +48,8 @@ impl Tier {
     }
 }
 
-/// Storage labels that can appear in a warm/cold search group name
-/// (`{family}_{tier}_search_{label}`) — one per (store, mode): `s3_local`
+/// Storage labels that can appear in a cold search group name
+/// (`{family}_cold_search_{label}`) — one per (store, mode): `s3_local`
 /// (in-process s3s-fs), `s3_remote`, `azure_local` (Azurite), `azure_remote`.
 /// Markdown report generation iterates this set; a unit test guards it
 /// against the backend `label()` methods.
@@ -69,7 +69,7 @@ pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) 
     }
 }
 
-/// Selected object-store backend for warm/cold tiers.
+/// Selected object-store backend for hot/cold tiers.
 pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
@@ -92,7 +92,7 @@ pub struct SuperfileCommitted {
 /// One runtime for the whole bench process. `spawn_s3s_fs` binds its
 /// accept loop to this runtime; creating a fresh `Runtime` per
 /// `block_on` call would drop the previous one and kill in-process
-/// s3s-fs before warm/cold tiers run.
+/// s3s-fs before the cold tier runs.
 static TIER_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn tier_runtime() -> &'static Runtime {
@@ -173,13 +173,10 @@ fn azurite_container_env() -> Option<String> {
     std::env::var("INFINO_AZURITE_CONTAINER").ok()
 }
 
-/// Object store the warm/cold benches run against. Chosen **explicitly**
-/// via `INFINO_BENCH_STORE` — never inferred from which credential happens
-/// to be exported.
-///
-/// Two orthogonal axes: `INFINO_BENCH_STORE` (`s3` | `azure`) picks the
-/// provider, `INFINO_BENCH_MODE` (`local` | `remote`) picks the deployment.
-/// The four combinations:
+/// Object store the hot/cold benches run against — two orthogonal axes,
+/// never inferred from which credential is set: `INFINO_BENCH_STORE`
+/// (`s3` | `azure`) picks the provider, `INFINO_BENCH_MODE`
+/// (`local` | `remote`) the deployment:
 ///
 /// | store | mode   | backend                         |
 /// |-------|--------|---------------------------------|
@@ -370,7 +367,7 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
                  ################################################################################\n\
                  ##  WARNING: store=s3 mode=local → in-process s3s-fs, NOT a real object store. ##\n\
                  ##  It reproduces request count and byte volume, not network latency, so       ##\n\
-                 ##  warm/cold timings here are not representative — and it can't complete the   ##\n\
+                 ##  hot/cold timings here are not representative — and it can't complete the   ##\n\
                  ##  supertable's multi-commit ingest. For a full local run use store=azure     ##\n\
                  ##  mode=local (Azurite); for real timings use mode=remote (S3 / Azure).        ##\n\
                  ################################################################################\n\
@@ -409,12 +406,12 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     }
 }
 
-/// Supertable-shaped backing store (10M warm/cold benches).
+/// Supertable-shaped backing store (10M hot/cold benches).
 pub async fn supertable_storage_fixture() -> StorageFixture {
     backing_store(SUPERTABLE_S3S_BUCKET, "infino-supertable-bench").await
 }
 
-/// Upload one superfile blob for superfile-shaped warm/cold benches (1M).
+/// Upload one superfile blob for superfile-shaped hot/cold benches (1M).
 pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     let fixture = backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await;
     let uri = SuperfileUri::new_v4();

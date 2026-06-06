@@ -1,28 +1,23 @@
-//! FTS superfile bench bundle (infino-only). Supertable FTS benches
-//! live in `benches/supertable/main.rs`, where they share one combined
-//! 10M-row supertable with the vector supertable benches.
-//!
-//! Infino-only timing and correctness — no third-party crates in
-//! the dependency graph of these benches.
+//! FTS benches over a 1M single superfile. The 10M supertable FTS benches
+//! live in `benches/supertable/main.rs`.
 //!
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench superfile_fts                         # 1M superfile FTS benches
-//! cargo bench --bench superfile_fts -- superfile_fts_build  # only superfile ingest
-//! cargo bench --bench superfile_fts -- superfile_fts_search # only superfile search
+//! cargo bench --bench superfile_fts                         # all
+//! cargo bench --bench superfile_fts -- superfile_fts_build  # ingest only
+//! cargo bench --bench superfile_fts -- superfile_fts_search # search only
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts
 //! ```
 
 use infino_bench_utils::fts_superfile;
 use infino_bench_utils::tiers;
 
-// Hand-rolled `criterion_main!` so a real-backend run deletes its
-// ephemeral remote prefix after the benches (no-op for s3s-fs / persisted).
 fn main() {
     fts_superfile::benches();
     criterion::Criterion::default()
         .configure_from_args()
         .final_summary();
+    // Statics don't run `Drop` at exit; delete ephemeral remote prefixes here.
     tiers::cleanup_ephemeral();
 }
