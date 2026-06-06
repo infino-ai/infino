@@ -482,28 +482,41 @@ impl SuperfileBuilder {
 
         // A segment has three independent build outputs: the scalar /
         // relational Parquet body (the SQL-queryable columns), the FTS
-        // blob, and the vector blob. The body encode does not read the
-        // blob contents — blobs are appended after the last row group —
-        // and FTS/vector finalization share no state. So run all three
-        // as nested rayon siblings on the shared pool: body encode in
-        // one arm, FTS‖vector in the other. Work-stealing fills idle
-        // cores when any phase hits a serial stretch. The final splice
-        // (byte appends + footer rewrite) is cheap and stays serial.
+        // blob, and the vector blob. None reads another's bytes — blobs
+        // are appended after the last row group, and FTS/vector
+        // finalization share no state — so they can run concurrently.
+        //
+        // But how to overlap them depends on the vector index. The
+        // vector finalizer already saturates every core via its own
+        // rayon `par_iter` (rotation / encode / quantize), so overlapping
+        // the *serial* Parquet body encode with it just steals a core
+        // from the bottleneck — a measured regression on vector builds.
+        // So: when a vector index is present, finalize the index blobs
+        // (FTS ‖ vector) first and encode the body afterward. When it is
+        // absent, the FTS finalizer doesn't saturate the pool, so hide
+        // the body encode behind it (body ‖ FTS). The final splice (byte
+        // appends + footer rewrite) is cheap and stays serial.
         let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
-        let (body_res, blobs_res) = rayon::join(
-            || {
-                encode_parquet_body(
-                    &self.opts.schema,
-                    &self.batches,
-                    self.opts.compression,
-                    self.opts.row_group_size,
-                    &id_page_limit,
-                )
-            },
-            || finish_index_blobs(fts_builder, vec_builder),
-        );
-        let body = body_res?;
-        let (fts_blob, vec_blob) = blobs_res?;
+        let encode_body = || {
+            encode_parquet_body(
+                &self.opts.schema,
+                &self.batches,
+                self.opts.compression,
+                self.opts.row_group_size,
+                &id_page_limit,
+            )
+        };
+        let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
+            let (fts_blob, vec_blob) = finish_index_blobs(fts_builder, vec_builder)?;
+            let body = encode_body()?;
+            (body, fts_blob, vec_blob)
+        } else {
+            let (body_res, blobs_res) =
+                rayon::join(encode_body, || finish_index_blobs(fts_builder, vec_builder));
+            let body = body_res?;
+            let (fts_blob, vec_blob) = blobs_res?;
+            (body, fts_blob, vec_blob)
+        };
 
         let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
         Ok(parts.bytes)
