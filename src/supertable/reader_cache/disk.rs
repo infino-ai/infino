@@ -31,6 +31,12 @@ pub enum DiskCacheError {
     Io(#[from] std::io::Error),
     #[error("superfile reader failed to open mmap'd bytes: {0}")]
     SuperfileOpen(String),
+    /// The cached / freshly-fetched superfile bytes failed to
+    /// parse. The source [`crate::superfile::ReadError`] chain is
+    /// preserved so callers that want variant-level detail can
+    /// match on it instead of a stringified message.
+    #[error("superfile reader failed to open bytes")]
+    SuperfileOpenRead(#[from] crate::superfile::ReadError),
     /// Eviction couldn't free enough space because every
     /// cached entry was pinned (or there were no cached
     /// entries and the incoming segment alone exceeds the
@@ -377,9 +383,8 @@ impl DiskCacheStore {
         // Range-only is also a lazy reader over object storage. A full CRC
         // scan here would turn a fallback path meant to issue targeted
         // ranges into a whole-segment read.
-        let reader = SuperfileReader::open_lazy_with(range_src, OpenOptions { verify_crc: false })
-            .await
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        let reader =
+            SuperfileReader::open_lazy_with(range_src, OpenOptions { verify_crc: false }).await?;
         Ok(Arc::new(reader))
     }
 
@@ -697,8 +702,7 @@ impl DiskCacheStore {
                 OpenOptions {
                     verify_crc: self.config.verify_crc_on_open,
                 },
-            )
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+            )?;
 
             let entry = Arc::new(CachedEntry {
                 reader: Arc::new(reader),
@@ -876,8 +880,7 @@ impl DiskCacheStore {
             OpenOptions {
                 verify_crc: self.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
         let foreground_reader = Arc::new(foreground_reader);
 
         // 4. Construct a CachedEntry with the foreground
@@ -1092,8 +1095,7 @@ impl DiskCacheStore {
                 Arc::clone(&source),
                 OpenOptions { verify_crc: false },
             )
-            .await
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+            .await?;
             (lazy_reader, total_size)
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
@@ -1109,8 +1111,7 @@ impl DiskCacheStore {
                 Arc::clone(&range_src),
                 OpenOptions { verify_crc: false },
             )
-            .await
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+            .await?;
             let size = range_src.size();
             (lazy_reader, size)
         };
@@ -1179,8 +1180,7 @@ impl DiskCacheStore {
             OpenOptions {
                 verify_crc: self.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
         let entry = Arc::new(CachedEntry {
             reader: Arc::new(reader),
             mmap: Some(mmap_arc),
@@ -1455,8 +1455,7 @@ async fn finalize_to_mmap(
             OpenOptions {
                 verify_crc: store.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
         // Replace the in-memory-backed entry with the
         // mmap-backed one — but **only if it's still
         // present**. The entry may have been evicted by a
@@ -1724,8 +1723,7 @@ async fn lazy_background_fill(
             OpenOptions {
                 verify_crc: store.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
 
         // 3. Atomically replace the lazy entry with the
         //    mmap-backed one — but only if it's still
