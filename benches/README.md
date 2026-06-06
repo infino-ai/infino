@@ -6,8 +6,7 @@ Infino-only performance + correctness benches. Three criterion binaries:
 - `superfile_vector` — vector search over one 1M × 384 superfile
 - `supertable_all` — one combined 10M-row supertable with both FTS and vector indexes
 
-These benches measure infino in isolation — no third-party crates
-enter this tree's dependency graph.
+These benches measure infino's own ingest and query performance.
 
 `cargo bench` runs only the regular local perf benches above. Diagnostic
 benches are opt-in via `--features bench-diagnostics`:
