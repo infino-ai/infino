@@ -93,14 +93,13 @@ decide up front which is which.
 
 ## How this differs from what's out there
 
-First, an honest caveat: this is a **converging** space. Databases,
-search engines, and vector databases increasingly offer *all three*
+Databases, search engines, and vector databases increasingly offer multiple
 modalities — scalar, full-text, and vector — and several have moved at
 least partway toward object storage. So the interesting question is
 rarely "can system X do vectors / keyword / SQL?" (usually: yes, in some
 form). It's about each system's **design center** — what it was built
-around from day one — and the **tradeoffs in maturity, cost, and
-operational shape** that follow at scale. The categories below are
+around from day one — and the **tradeoffs in cost and complexity
+for a given use case** that follow at scale. The categories below are
 points on a spectrum, not walls.
 
 ### Traditional databases (Postgres, MySQL, …)
