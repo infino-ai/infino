@@ -52,7 +52,10 @@ impl Tier {
 /// (`{family}_{tier}_search_{label}`). The emulator is `s3s_fs`; real
 /// backends use [`RemoteBackend::label`]. Markdown report generation
 /// iterates this set; a unit test guards it against `RemoteBackend::label`.
-pub const STORAGE_LABELS: &[&str] = &["s3s_fs", "s3", "azure"];
+pub const STORAGE_LABELS: &[&str] = &["s3s_fs", "s3", "azure", "azurite"];
+
+/// Default Azurite container (must already exist in the emulator).
+const AZURITE_CONTAINER_DEFAULT: &str = "infino-bench";
 
 /// Criterion group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
 pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) -> String {
@@ -165,6 +168,10 @@ fn real_azure_container_env() -> Option<String> {
         .ok()
 }
 
+fn azurite_container_env() -> Option<String> {
+    std::env::var("INFINO_AZURITE_CONTAINER").ok()
+}
+
 /// Object store the warm/cold benches run against. Chosen **explicitly**
 /// via `INFINO_BENCH_STORE` — never inferred from which credential happens
 /// to be exported.
@@ -177,11 +184,17 @@ enum BenchStore {
 }
 
 impl BenchStore {
-    /// Resolve from `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure`).
+    /// Resolve from `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure`
+    /// | `azurite`).
     fn from_env() -> Self {
         let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "s3s_fs".into());
-        Self::parse(&store, real_s3_bucket_env(), real_azure_container_env())
-            .unwrap_or_else(|e| panic!("{e}"))
+        Self::parse(
+            &store,
+            real_s3_bucket_env(),
+            real_azure_container_env(),
+            azurite_container_env(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Pure resolution — the chosen backend must have its location env set.
@@ -190,6 +203,7 @@ impl BenchStore {
         store: &str,
         s3_bucket: Option<String>,
         azure_container: Option<String>,
+        azurite_container: Option<String>,
     ) -> Result<Self, String> {
         match store {
             "s3s_fs" => Ok(Self::S3sFs),
@@ -201,8 +215,14 @@ impl BenchStore {
                 .ok_or_else(|| {
                     "INFINO_BENCH_STORE=azure requires INFINO_REAL_AZURE_CONTAINER".to_string()
                 }),
+            // Local Azurite emulator: credential-free (well-known
+            // devstoreaccount1), so no required env — the container defaults
+            // to `infino-bench` and must already exist in the emulator.
+            "azurite" => Ok(Self::Remote(RemoteBackend::Azurite {
+                container: azurite_container.unwrap_or_else(|| AZURITE_CONTAINER_DEFAULT.into()),
+            })),
             other => Err(format!(
-                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure)"
+                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure|azurite)"
             )),
         }
     }
@@ -213,6 +233,8 @@ impl BenchStore {
 enum RemoteBackend {
     S3 { bucket: String },
     Azure { container: String },
+    /// Local Azurite emulator (well-known credentials, no network).
+    Azurite { container: String },
 }
 
 impl RemoteBackend {
@@ -220,6 +242,7 @@ impl RemoteBackend {
         match self {
             Self::S3 { .. } => "s3",
             Self::Azure { .. } => "azure",
+            Self::Azurite { .. } => "azurite",
         }
     }
 
@@ -230,6 +253,9 @@ impl RemoteBackend {
             Self::S3 { .. } => real_s3_prefix_root(default),
             Self::Azure { .. } => {
                 std::env::var("INFINO_REAL_AZURE_PREFIX").unwrap_or_else(|_| default.to_string())
+            }
+            Self::Azurite { .. } => {
+                std::env::var("INFINO_AZURITE_PREFIX").unwrap_or_else(|_| default.to_string())
             }
         }
     }
@@ -244,6 +270,10 @@ impl RemoteBackend {
             Self::Azure { container } => Arc::new(
                 AzureStorageProvider::new_with_prefix(container, prefix)
                     .expect("real Azure provider"),
+            ),
+            Self::Azurite { container } => Arc::new(
+                AzureStorageProvider::new_with_emulator_and_prefix(container, prefix)
+                    .expect("Azurite provider"),
             ),
         }
     }
@@ -516,7 +546,7 @@ mod tests {
     #[test]
     fn parse_defaults_to_emulator() {
         assert_eq!(
-            BenchStore::parse("s3s_fs", None, None),
+            BenchStore::parse("s3s_fs", None, None, None),
             Ok(BenchStore::S3sFs)
         );
     }
@@ -524,28 +554,46 @@ mod tests {
     #[test]
     fn parse_s3_needs_bucket() {
         assert_eq!(
-            BenchStore::parse("s3", Some("bkt".into()), None),
+            BenchStore::parse("s3", Some("bkt".into()), None, None),
             Ok(BenchStore::Remote(RemoteBackend::S3 {
                 bucket: "bkt".into()
             }))
         );
-        assert!(BenchStore::parse("s3", None, None).is_err());
+        assert!(BenchStore::parse("s3", None, None, None).is_err());
     }
 
     #[test]
     fn parse_azure_needs_container() {
         assert_eq!(
-            BenchStore::parse("azure", None, Some("c".into())),
+            BenchStore::parse("azure", None, Some("c".into()), None),
             Ok(BenchStore::Remote(RemoteBackend::Azure {
                 container: "c".into()
             }))
         );
-        assert!(BenchStore::parse("azure", None, None).is_err());
+        assert!(BenchStore::parse("azure", None, None, None).is_err());
+    }
+
+    #[test]
+    fn parse_azurite_defaults_container_and_needs_no_creds() {
+        // No required env: the emulator is credential-free.
+        assert_eq!(
+            BenchStore::parse("azurite", None, None, None),
+            Ok(BenchStore::Remote(RemoteBackend::Azurite {
+                container: AZURITE_CONTAINER_DEFAULT.into()
+            }))
+        );
+        // Override honored.
+        assert_eq!(
+            BenchStore::parse("azurite", None, None, Some("custom".into())),
+            Ok(BenchStore::Remote(RemoteBackend::Azurite {
+                container: "custom".into()
+            }))
+        );
     }
 
     #[test]
     fn parse_rejects_unknown_store() {
-        assert!(BenchStore::parse("gcs", None, None).is_err());
+        assert!(BenchStore::parse("gcs", None, None, None).is_err());
     }
 
     #[test]
@@ -553,7 +601,7 @@ mod tests {
         // Both creds present but store=s3s_fs → still the emulator. No
         // backend is ever picked from which credential happens to be set.
         assert_eq!(
-            BenchStore::parse("s3s_fs", Some("bkt".into()), Some("c".into())),
+            BenchStore::parse("s3s_fs", Some("bkt".into()), Some("c".into()), None),
             Ok(BenchStore::S3sFs)
         );
     }
@@ -568,6 +616,13 @@ mod tests {
             "azure"
         );
         assert_eq!(RemoteBackend::S3 { bucket: "b".into() }.label(), "s3");
+        assert_eq!(
+            RemoteBackend::Azurite {
+                container: "c".into()
+            }
+            .label(),
+            "azurite"
+        );
     }
 
     #[test]
@@ -577,6 +632,10 @@ mod tests {
         for label in [
             RemoteBackend::S3 { bucket: "b".into() }.label(),
             RemoteBackend::Azure {
+                container: "c".into(),
+            }
+            .label(),
+            RemoteBackend::Azurite {
                 container: "c".into(),
             }
             .label(),

@@ -86,6 +86,17 @@ impl AzureStorageProvider {
         })
     }
 
+    /// Azurite-emulator variant scoped to a logical table prefix —
+    /// the emulator counterpart of [`Self::new_with_prefix`].
+    pub fn new_with_emulator_and_prefix(
+        container: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let mut provider = Self::new_with_emulator(container)?;
+        provider.prefix = normalize_prefix(prefix);
+        Ok(provider)
+    }
+
     /// Wrap an already-constructed `MicrosoftAzure` — for callers
     /// that want full control over the `MicrosoftAzureBuilder`.
     pub fn from_object_store(container: impl Into<String>, store: MicrosoftAzure) -> Self {
