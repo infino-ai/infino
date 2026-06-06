@@ -385,10 +385,10 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     let storage = backend.provider(&prefix);
     eprintln!("[tiers] {} prefix={prefix}", backend.label());
 
-    // The unique prefix is deleted after the run, unless the caller keeps it
-    // (`INFINO_BENCH_KEEP`, e.g. to inspect or re-query the table) or it's a
-    // persisted dataset run (`INFINO_BENCH_DATASET`).
-    if std::env::var_os("INFINO_BENCH_KEEP").is_some()
+    // The unique prefix is deleted after the run, unless the caller keeps the
+    // table (`INFINO_BENCH_KEEP_TABLE`, e.g. to inspect or re-query it) or it's
+    // a persisted dataset run (`INFINO_BENCH_DATASET`).
+    if std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some()
         || std::env::var_os("INFINO_BENCH_DATASET").is_some()
     {
         eprintln!("[tiers] keeping {} prefix={prefix} (cleanup skipped)", backend.label());

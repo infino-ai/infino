@@ -94,9 +94,9 @@ writes only to the in-process emulator.
 
 **Cleanup.** A remote/Azurite run writes its table under a unique prefix
 and deletes it when the process exits — no manual cleanup. Set
-`INFINO_BENCH_KEEP=1` to retain it instead (the kept prefix is logged, so
-you can inspect, re-query, or delete it yourself). The in-process s3s-fs
-self-cleans on drop regardless.
+`INFINO_BENCH_KEEP_TABLE=1` to retain the table instead (the kept prefix
+is logged, so you can inspect, re-query, or delete it yourself). The
+in-process s3s-fs self-cleans on drop regardless.
 
 **Emulator caveat.** `s3` `local` (in-process s3s-fs) can't survive the
 supertable's concurrent multi-commit ingest (it reuses connections it has
