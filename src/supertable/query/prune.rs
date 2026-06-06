@@ -39,7 +39,9 @@ use crate::supertable::manifest::part::PartId;
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
 use super::hierarchical_iter;
-use super::skip::{ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match};
+use super::skip::{
+    ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match,
+};
 
 /// One conjunct of a prune predicate: a per-column test backed by a
 /// manifest summary. The full predicate is the **conjunction** of its
@@ -197,7 +199,10 @@ pub(crate) async fn select_segments(
                 mode,
             } => {
                 let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-                and_into(&mut mask, &fts_bloom_skip(&superfiles, column, &refs, *mode));
+                and_into(
+                    &mut mask,
+                    &fts_bloom_skip(&superfiles, column, &refs, *mode),
+                );
             }
             PruneLeaf::Prefix { column, prefix } => {
                 and_into(&mut mask, &fts_prefix_skip(&superfiles, column, prefix));
@@ -569,7 +574,10 @@ mod tests {
         // the literal — so min/max keeps it, the AND-bloom prunes it.
         let a = seg("a", "z", &["rust", "tokio"]);
         let m = manifest(vec![a.clone()]);
-        assert_eq!(ids(&m, &[eq("title", "rust async")]).await, vec![a.superfile_id]);
+        assert_eq!(
+            ids(&m, &[eq("title", "rust async")]).await,
+            vec![a.superfile_id]
+        );
         assert!(
             ids(
                 &m,
@@ -602,7 +610,10 @@ mod tests {
         assert_eq!(
             ids(
                 &m,
-                &[eq("title", "mango"), term("title", &["mango"], BoolMode::And)],
+                &[
+                    eq("title", "mango"),
+                    term("title", &["mango"], BoolMode::And)
+                ],
             )
             .await,
             vec![hit.superfile_id],

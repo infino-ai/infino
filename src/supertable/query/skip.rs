@@ -434,15 +434,14 @@ mod tests {
 
     fn segment_with_centroid(column: &str, centroid: Vec<f32>, radius: f32) -> Arc<SuperfileEntry> {
         let mut e = empty_segment();
-        e.vector_summary
-            .insert(
-                column.to_string(),
-                VectorSummary {
-                    centroid,
-                    radius,
-                    clusters: crate::supertable::manifest::ClusterCentroids::empty(),
-                },
-            );
+        e.vector_summary.insert(
+            column.to_string(),
+            VectorSummary {
+                centroid,
+                radius,
+                clusters: crate::supertable::manifest::ClusterCentroids::empty(),
+            },
+        );
         Arc::new(e)
     }
 

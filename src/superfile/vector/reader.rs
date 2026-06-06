@@ -1059,7 +1059,12 @@ impl VectorReader {
             let base = col.centroids_off + c * stride;
             for d in 0..dim {
                 let s = base + d * 4;
-                centroids.push(f32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]]));
+                centroids.push(f32::from_le_bytes([
+                    sub[s],
+                    sub[s + 1],
+                    sub[s + 2],
+                    sub[s + 3],
+                ]));
             }
         }
 
@@ -1068,7 +1073,12 @@ impl VectorReader {
         let mut counts = Vec::with_capacity(n_cent);
         for c in 0..n_cent {
             let b = col.cluster_idx_off + c * 8 + 4;
-            counts.push(u32::from_le_bytes([sub[b], sub[b + 1], sub[b + 2], sub[b + 3]]));
+            counts.push(u32::from_le_bytes([
+                sub[b],
+                sub[b + 1],
+                sub[b + 2],
+                sub[b + 3],
+            ]));
         }
 
         Some((col.n_cent, dim as u32, centroids, counts))

@@ -68,13 +68,13 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
 use roaring::RoaringBitmap;
 
+use crate::superfile::fts::reader::BoolMode;
 use crate::supertable::SuperfileEntry;
 use crate::supertable::manifest::Manifest;
-use crate::superfile::fts::reader::BoolMode;
 use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
-use datafusion::scalar::ScalarValue;
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
 use crate::supertable::tombstones::SidecarCache;
+use datafusion::scalar::ScalarValue;
 
 /// Logical name the supertable is registered under in the
 /// DataFusion `SessionContext`. Callers reference it as

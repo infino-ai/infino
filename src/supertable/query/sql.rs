@@ -458,9 +458,11 @@ mod tests {
         // the bloom prune never drops a match.
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
-        w.append(&build_cat_batch(0, &["x"], &["alpha"])).expect("a1");
+        w.append(&build_cat_batch(0, &["x"], &["alpha"]))
+            .expect("a1");
         w.commit().expect("c1");
-        w.append(&build_cat_batch(10, &["y"], &["bravo"])).expect("a2");
+        w.append(&build_cat_batch(10, &["y"], &["bravo"]))
+            .expect("a2");
         w.commit().expect("c2");
         w.append(&build_cat_batch(20, &["z"], &["charlie"]))
             .expect("a3");
@@ -506,7 +508,10 @@ mod tests {
         // Tokens present in segment 1, but no row equals this exact
         // string — the prune is an optimization, correctness holds.
         assert_eq!(
-            run_count(&st, "SELECT COUNT(*) FROM supertable WHERE title = 'rust async'"),
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'rust async'"
+            ),
             0
         );
     }
