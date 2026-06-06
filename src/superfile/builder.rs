@@ -78,7 +78,7 @@
 //! format is forward-compatible without a file rewrite.
 
 use crate::superfile::BuildError;
-use crate::superfile::format::footer::{ParquetParts, write_parquet_with_blobs};
+use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
 use crate::superfile::format::{self, kv};
 use crate::superfile::fts::builder::FtsBuilder;
 use crate::superfile::fts::tokenize::Tokenizer;
@@ -179,7 +179,21 @@ pub struct BuilderOptions {
     pub row_group_size: usize,
     /// Parquet column-chunk compression.
     pub compression: Compression,
+    /// Per-column Parquet data-page size limit (uncompressed bytes)
+    /// applied to the `id_column` only. Small pages let a point
+    /// lookup (`take_by_local_doc_ids`) decompress just the tiny
+    /// page holding the requested row instead of the whole
+    /// row-group-sized page, which is the dominant `resolve_hits`
+    /// cost. Compression stays on; the only cost is a few extra
+    /// page headers + offset-index entries for the id column.
+    pub id_page_size_limit: usize,
 }
+
+/// Default per-column data-page size limit for the id column
+/// (uncompressed bytes). At 16 bytes/row (`Decimal128`) this is
+/// ~512 rows/page, vs the ~65 536-row single page a default
+/// (1 MiB) limit produces for a full row group.
+pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 
 impl BuilderOptions {
     /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
@@ -209,6 +223,7 @@ impl BuilderOptions {
                 parquet::basic::ZstdLevel::try_new(3)
                     .expect("zstd level 3 is in the valid 1..=22 range"),
             ),
+            id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
         }
     }
 }
@@ -440,16 +455,11 @@ impl SuperfileBuilder {
         }
         let n_docs = self.next_local_doc_id as u64;
 
-        let fts_blob: Vec<u8> = match self.fts_builder.take() {
-            Some(fb) => fb.finish()?,
-            None => Vec::new(),
-        };
-        let vec_blob: Vec<u8> = match self.vec_builder.take() {
-            Some(vb) => vb.finish()?,
-            None => Vec::new(),
-        };
+        let fts_builder = self.fts_builder.take();
+        let vec_builder = self.vec_builder.take();
 
-        // Assemble inf.* KV metadata.
+        // Assemble inf.* KV metadata (cheap; do it before the parallel
+        // section so the splice has it ready).
         let mut kvs: Vec<(String, String)> = vec![
             (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
             (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
@@ -470,16 +480,65 @@ impl SuperfileBuilder {
             ));
         }
 
-        let parts: ParquetParts = write_parquet_with_blobs(
-            &self.opts.schema,
-            &self.batches,
-            &fts_blob,
-            &vec_blob,
-            &kvs,
-            self.opts.compression,
-            self.opts.row_group_size,
-        )?;
+        // A segment has three independent build outputs: the scalar /
+        // relational Parquet body (the SQL-queryable columns), the FTS
+        // blob, and the vector blob. None reads another's bytes — blobs
+        // are appended after the last row group, and FTS/vector
+        // finalization share no state — so they can run concurrently.
+        //
+        // But how to overlap them depends on the vector index. The
+        // vector finalizer already saturates every core via its own
+        // rayon `par_iter` (rotation / encode / quantize), so overlapping
+        // the *serial* Parquet body encode with it just steals a core
+        // from the bottleneck — a measured regression on vector builds.
+        // So: when a vector index is present, finalize the index blobs
+        // (FTS ‖ vector) first and encode the body afterward. When it is
+        // absent, the FTS finalizer doesn't saturate the pool, so hide
+        // the body encode behind it (body ‖ FTS). The final splice (byte
+        // appends + footer rewrite) is cheap and stays serial.
+        let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
+        let encode_body = || {
+            encode_parquet_body(
+                &self.opts.schema,
+                &self.batches,
+                self.opts.compression,
+                self.opts.row_group_size,
+                &id_page_limit,
+            )
+        };
+        let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
+            let (fts_blob, vec_blob) = finish_index_blobs(fts_builder, vec_builder)?;
+            let body = encode_body()?;
+            (body, fts_blob, vec_blob)
+        } else {
+            let (body_res, blobs_res) =
+                rayon::join(encode_body, || finish_index_blobs(fts_builder, vec_builder));
+            let body = body_res?;
+            let (fts_blob, vec_blob) = blobs_res?;
+            (body, fts_blob, vec_blob)
+        };
+
+        let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
         Ok(parts.bytes)
+    }
+}
+
+/// Finish the independent embedded index blobs. Once `add_batch` has
+/// routed scalar text and vectors into their builders, FTS and vector
+/// finalization do not share mutable state, so build them as sibling
+/// rayon jobs when both indexes are present.
+fn finish_index_blobs(
+    fts_builder: Option<FtsBuilder>,
+    vec_builder: Option<VectorBuilder>,
+) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
+    match (fts_builder, vec_builder) {
+        (Some(fb), Some(vb)) => {
+            let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
+            Ok((fts?, vec?))
+        }
+        (Some(fb), None) => Ok((fb.finish()?, Vec::new())),
+        (None, Some(vb)) => Ok((Vec::new(), vb.finish()?)),
+        (None, None) => Ok((Vec::new(), Vec::new())),
     }
 }
 

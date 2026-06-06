@@ -162,7 +162,9 @@ impl FtsReader {
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, FtsError> {
-        let source_len = source.size() as usize;
+        // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
+        // the whole superfile: `source` is the FTS-scoped sub-source.
+        let fts_blob_len = source.size() as usize;
         let header = fetch_lazy_range(source.as_ref(), 0..48, "fts header").await?;
         if &header[0..8] != format::fts::MAGIC {
             return Err(FtsError::Read(ReadError::BadMagic {
@@ -184,12 +186,14 @@ impl FtsReader {
         // Prefetch the FST directory ([48..postings_offset], contiguous
         // after the header) so every later `dict_bytes()` resolves from
         // the overlay instead of a fresh GET per search, and the
-        // doc-length tail ([doc_lengths_table_offset..source_len]) so
+        // doc-length tail ([doc_lengths_table_offset..fts_blob_len]) so
         // `open_with_source` builds its BM25 norm tables without
-        // touching the source again. `source_len` is the length of this
-        // FTS subsection, not the whole superfile; the tail starts at
-        // the doc-lengths directory and includes every per-column
-        // doc-length array plus its CRC in one range GET.
+        // touching the source again. The doc-lengths region is the
+        // *trailing* region of the FTS blob (it follows the postings),
+        // so `..fts_blob_len` is the tail — directory + every per-column
+        // doc-length array + their CRCs — fetched in one range GET, not
+        // the whole blob (the FST is a separate range above; postings
+        // stay lazy).
         //
         // Both ranges are known exactly once the header is parsed and
         // neither depends on the other, so they fire **concurrently**:
@@ -203,7 +207,7 @@ impl FtsReader {
             fetch_lazy_range(source.as_ref(), 48..postings_offset, "fts/dict"),
             fetch_lazy_range(
                 source.as_ref(),
-                doc_lengths_table_offset..source_len,
+                doc_lengths_table_offset..fts_blob_len,
                 "fts/doc_lengths_tail",
             ),
         )?;
@@ -338,6 +342,14 @@ impl FtsReader {
         }
 
         // Read doc-lengths directory: n_columns × 16-byte entries + 4-byte CRC.
+        //
+        // On the lazy open path this directory — and every per-column
+        // array fetched below — falls inside the
+        // `[doc_lengths_table_offset..fts_blob_len]` tail that
+        // `open_lazy` already fetched in one GET and installed in the
+        // overlay, so these `fetch_source_range` calls resolve from the
+        // overlay with **no** per-column GETs. On the eager path the
+        // whole subsection is in memory, so they are zero-copy slices.
         let dir_size = n_columns * DOC_LENGTHS_ENTRY_SIZE;
         let dir_end = doc_lengths_table_offset + dir_size;
         if dir_end + 4 > source_len {
@@ -385,6 +397,9 @@ impl FtsReader {
             }
 
             // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte CRC.
+            // `doc_lengths_offset` lies within the prefetched doc-lengths
+            // tail, so on the lazy path this resolves from the overlay
+            // (see the directory comment above) — no per-column GET.
             let array_byte_len = 4 * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
             if array_end + 4 > source_len {

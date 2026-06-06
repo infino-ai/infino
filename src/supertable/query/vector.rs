@@ -50,18 +50,27 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
-
-use rayon::prelude::*;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
+use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::reader_cache::SuperfileReaderCache;
 
 use super::SuperfileHit;
+
+/// How to probe one segment in the vector fan-out: the globally-selected
+/// cluster ids for that segment, or — for a segment whose manifest
+/// summary carries no per-cluster centroids — a normal per-segment
+/// `nprobe` probe (fallback, never silently dropped).
+enum Probe {
+    Clusters(Vec<u32>),
+    Nprobe,
+}
 
 impl SupertableReader {
     /// Single-column vector kNN search across the pinned
@@ -91,11 +100,6 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let storage = manifest.options.storage.as_ref().map(Arc::clone);
-        let tombstone_cache = self.tombstone_cache.clone();
-        let now = std::time::Instant::now();
 
         let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
             Some(list) => {
@@ -119,93 +123,108 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Fan out to every kept segment. The part-level pruner
-        // above (`prune_parts_for_vector`) already dropped parts
-        // that cannot contain the query's neighbors; within the
-        // kept set we must search ALL segments.
+        // ---- Global cross-segment cluster selection.
         //
-        // NB: a previous version skipped segments here via a
-        // centroid-lower-bound cutoff (`best_lb * 2.0`). That was
-        // NOT a correctness-preserving bound — on a corpus where
-        // neighbors are spread across segments it silently dropped
-        // true top-k results (recall collapsed to ~0.5). Any
-        // segment-level skip must compare a real lower bound
-        // against the running k-th best distance; a static
-        // heuristic cutoff is wrong. Correct first, fast second.
-        //
-        // Fan-out is split by concern, mirroring the SQL resolve
-        // path (`query::exec::common`):
-        //   1. **Open** every kept segment's reader **concurrently**
-        //      on the tokio runtime — opens are async I/O (in-memory
-        //      cache hits / disk-cache cold fetches), so overlapping
-        //      them wide is the right model and warm opens cost
-        //      microseconds.
-        //   2. **Search** every segment **in parallel** on
-        //      `options.reader_pool` (rayon). The per-segment kNN
-        //      search is CPU-bound over resident bytes on the hot
-        //      path (centroid + 1-bit code scoring, then rerank);
-        //      driving it on the reader pool keeps ALL per-segment
-        //      CPU in one work-stealing pool instead of
-        //      oversubscribing the tokio workers with the inner
-        //      `par_iter` on the global pool. Bridged back to the
-        //      async caller via a oneshot so no runtime worker is
-        //      blocked. Cold lazy misses inside the search bridge
-        //      through `Source::get_range` internally.
-        let fanout_t0 = std::time::Instant::now();
-        let open_t0 = std::time::Instant::now();
-        let opened: Vec<Arc<SuperfileReader>> = futures::future::try_join_all(
-            superfiles
-                .iter()
-                .map(|entry| open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry)),
-        )
-        .await?;
-        let open_us = open_t0.elapsed().as_micros() as u64;
+        // Each kept segment's manifest summary carries its per-cluster
+        // (Sq8) centroids. Rank every (segment, cluster) by centroid
+        // distance to the query and probe only the globally-closest
+        // clusters — so a query touches just the segments that own a
+        // near cluster, instead of running `nprobe` in every segment.
+        // (A single per-segment centroid can't do this: a time-ordered
+        // segment is a broad mix, so its mean sits near the global
+        // centroid. Per-cluster centroids are fine-grained enough to
+        // rank.) A segment whose summary has no cluster centroids falls
+        // back to a normal per-segment `nprobe` probe — never dropped.
+        let metric = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .map(|vc| vc.metric)
+            .unwrap_or(Metric::L2Sq);
 
-        // Pure-CPU phase on the reader pool. `into_par_iter`'s ordered
-        // collect preserves segment order, so `per_segment[i]` lines up
-        // with `superfiles[i]` for the post-phase tombstone filter.
-        let pool = Arc::clone(&manifest.options.reader_pool);
-        let column_owned = column.to_owned();
-        let query_owned = query.to_vec();
-        let timing_enabled = fanout_timing_enabled();
-        let inputs: Vec<Arc<SuperfileReader>> = opened;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        pool.spawn(move || {
-            let result: Result<Vec<(Vec<(u32, f32)>, u64)>, QueryError> = inputs
-                .into_par_iter()
-                .map(|reader| {
-                    let search_t0 = std::time::Instant::now();
-                    let hits = reader
-                        .vector_search(&column_owned, &query_owned, k, options)
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    Ok((hits, search_t0.elapsed().as_micros() as u64))
-                })
-                .collect();
-            let _ = tx.send(result);
-        });
-        let per_segment = rx.await.map_err(|_| {
-            QueryError::Store("vector fan-out: reader pool dropped result".into())
-        })??;
-
-        // Tombstone filtering stays on the tokio side: a cache miss
-        // refreshes the sidecar from storage (blocking I/O via the
-        // sync→async bridge), which does not belong on the CPU pool.
-        // On the hot path every `bitmap_for` is a cache hit, so this
-        // is a cheap serial pass over the already-scored segments.
-        let mut results: Vec<Vec<SuperfileHit>> = Vec::with_capacity(per_segment.len());
-        let mut searches: Vec<u64> = Vec::with_capacity(per_segment.len());
-        for (entry, (hits, search_us)) in superfiles.iter().zip(per_segment) {
-            let mut tagged = tag_hits(entry.as_ref(), hits);
-            apply_tombstone_filter(tombstone_cache.as_ref(), entry.as_ref(), &mut tagged, now)?;
-            results.push(tagged);
-            searches.push(search_us);
+        let mut scored: Vec<(usize, u32, f32)> = Vec::new();
+        let mut fallback: Vec<usize> = Vec::new();
+        let mut deq = vec![0f32; query.len()];
+        for (si, entry) in superfiles.iter().enumerate() {
+            match entry.vector_summary.get(column) {
+                Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
+                    let cl = &vs.clusters;
+                    for c in 0..cl.n_cent as usize {
+                        if cl.counts[c] == 0 {
+                            continue;
+                        }
+                        cl.dequantize_into(c, &mut deq);
+                        scored.push((si, c as u32, distance(metric, query, &deq)));
+                    }
+                }
+                _ => fallback.push(si),
+            }
         }
 
-        if timing_enabled {
-            summarize_fanout_timing(open_us, &searches, fanout_t0.elapsed().as_micros() as u64);
+        // Global probe budget: the closest `nprobe × (eligible segments)`
+        // clusters — the same total probe count as the old per-segment
+        // `nprobe`, but selected globally, so near segments get more
+        // probes and far segments are skipped entirely. (Stage-4 recall
+        // tuning may lower this.)
+        let n_eligible = superfiles.len().saturating_sub(fallback.len());
+        let budget = options
+            .nprobe
+            .saturating_mul(n_eligible.max(1))
+            .max(options.nprobe);
+        if scored.len() > budget {
+            scored.select_nth_unstable_by(budget, |a, b| {
+                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+            });
+            scored.truncate(budget);
+        }
+        let mut per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (si, c, _) in scored {
+            per_seg.entry(si).or_default().push(c);
         }
 
-        Ok(top_k_ascending(results, k))
+        // Build fan-out units: selected segments probe their chosen
+        // clusters; fallback segments probe `nprobe` normally; segments
+        // with centroids but no globally-selected cluster are skipped
+        // (the cross-segment win).
+        let fallback: std::collections::HashSet<usize> = fallback.into_iter().collect();
+        let mut units: Vec<(Arc<SuperfileEntry>, Probe)> = Vec::new();
+        for (si, entry) in superfiles.iter().enumerate() {
+            if let Some(ids) = per_seg.remove(&si) {
+                units.push((Arc::clone(entry), Probe::Clusters(ids)));
+            } else if fallback.contains(&si) {
+                units.push((Arc::clone(entry), Probe::Nprobe));
+            }
+        }
+        if units.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fan out through the shared [`query::dispatch::fanout`] (also
+        // used by FTS): one tokio task per probed segment opens the
+        // reader and runs the kNN kernel — cold GETs across segments are
+        // concurrent (tokio owns I/O), shortlist + rerank stay on rayon.
+        // Skipped segments issue zero GETs.
+        let column_arc = Arc::new(column.to_owned());
+        let query_arc = Arc::new(query.to_vec());
+        let kernel = move |reader: Arc<SuperfileReader>, probe: Probe| {
+            let column = Arc::clone(&column_arc);
+            let query = Arc::clone(&query_arc);
+            async move {
+                let res = match probe {
+                    Probe::Clusters(ids) => {
+                        reader
+                            .vector_search_clusters(&column, &query, k, &ids, options)
+                            .await
+                    }
+                    Probe::Nprobe => reader.vector_search(&column, &query, k, options).await,
+                };
+                res.map_err(|e| QueryError::Parquet(e.to_string()))
+            }
+        };
+        let per_segment = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+
+        Ok(top_k_ascending(per_segment, k))
     }
 }
 
@@ -227,104 +246,6 @@ impl Supertable {
         let reader = self.reader();
         self.block_on_query(reader.vector_search(column, query, k, options))
     }
-}
-
-/// `INFINO_FANOUT_TIMING=1` enables per-segment fan-out timing.
-fn fanout_timing_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var("INFINO_FANOUT_TIMING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// Print the aggregate open wall + per-segment search wall
-/// distribution next to the total fan-out wall. With the
-/// two-phase fan-out (concurrent opens on tokio, then parallel
-/// search on the reader pool) the key signal is `total /
-/// (open + max_search)`: ~1.0 means the search phase is fully
-/// parallel (cost is the slowest segment); ≫1.0 means the reader
-/// pool is serializing the per-segment CPU.
-fn summarize_fanout_timing(open_us: u64, search_us: &[u64], total_us: u64) {
-    let n = search_us.len();
-    if n == 0 {
-        eprintln!("[fanout-timing] no segments recorded; total={total_us}us");
-        return;
-    }
-    let mut searches: Vec<u64> = search_us.to_vec();
-    searches.sort_unstable();
-    let pct = |v: &[u64], p: f64| -> u64 {
-        let idx = (((v.len() - 1) as f64) * p).round() as usize;
-        v[idx]
-    };
-    let max_search = searches.last().copied().unwrap_or(0);
-    let ratio = total_us as f64 / (open_us + max_search).max(1) as f64;
-    eprintln!(
-        "[fanout-timing] n_seg={n} total={:.1}ms | opens(concurrent)={:.1}ms | \
-         per-seg search: p50={:.1} p90={:.1} max={:.1}ms | \
-         total/(open+max_search)={:.1}x  ({})",
-        total_us as f64 / 1000.0,
-        open_us as f64 / 1000.0,
-        pct(&searches, 0.5) as f64 / 1000.0,
-        pct(&searches, 0.9) as f64 / 1000.0,
-        max_search as f64 / 1000.0,
-        ratio,
-        if ratio <= 1.5 {
-            "PARALLEL: cost is open + slowest-segment search"
-        } else {
-            "SERIALIZED: reader-pool search is being serialized"
-        },
-    );
-}
-
-async fn open_reader(
-    store: &Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
-    storage: Option<&Arc<dyn crate::storage::StorageProvider>>,
-    entry: &SuperfileEntry,
-) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(
-        store,
-        disk_cache,
-        storage,
-        &entry.uri,
-        entry.subsection_offsets.as_ref(),
-    )
-    .await
-    .map_err(|e| QueryError::Store(e.to_string()))
-}
-
-fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
-    hits.into_iter()
-        .map(|(local_doc_id, score)| SuperfileHit {
-            segment: entry.uri,
-            local_doc_id,
-            score,
-        })
-        .collect()
-}
-
-/// Drop tombstoned `local_doc_id`s from one superfile's vector hits.
-/// Same shape + perf properties as the FTS path's filter — see
-/// `query::fts::apply_tombstone_filter` for the design rationale.
-fn apply_tombstone_filter(
-    cache: Option<&Arc<crate::supertable::tombstones::SidecarCache>>,
-    entry: &SuperfileEntry,
-    hits: &mut Vec<SuperfileHit>,
-    now: std::time::Instant,
-) -> Result<(), QueryError> {
-    let Some(cache) = cache else {
-        return Ok(());
-    };
-    let bitmap = cache
-        .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
-        return Ok(());
-    }
-    hits.retain(|h| !bitmap.contains(h.local_doc_id));
-    Ok(())
 }
 
 /// Merge per-segment hits and return the top-k by *ascending*
@@ -599,6 +520,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vector_search_global_selection_recovers_neighbors_under_low_budget() {
+        // 10 segments × 16 one-hot docs. Query e_0's true neighbors are
+        // the 10 docs with id % dim == 0 (one per segment) at cosine
+        // distance 0; every other doc is orthogonal (distance 1). With
+        // nprobe = 1 the global budget is only 10 clusters across all 10
+        // segments — so this exercises real cross-segment cluster
+        // pruning (most of the 10 × n_cent clusters are skipped), and
+        // recall@10 must still recover the concentrated neighbors.
+        let dim = 16;
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        let n_seg = 10u64;
+        for chunk in 0..n_seg {
+            w.append(&build_vector_batch(chunk * 16, 16, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        assert_eq!(st.reader().n_superfiles(), n_seg as usize);
+
+        let mut q = vec![0f32; dim];
+        q[0] = 1.0;
+        let opts = VectorSearchOptions::new().with_nprobe(1);
+        let hits = st
+            .reader()
+            .vector_search("emb", &q, 10, opts)
+            .await
+            .expect("query");
+
+        let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
+        assert!(
+            exact_neighbors >= 9,
+            "recall@10 ≥ 0.90 under aggressive global cluster pruning; \
+             recovered {exact_neighbors}/10 exact neighbors"
+        );
+    }
+
+    #[tokio::test]
     async fn vector_search_carries_segment_uris_for_multi_segment_results() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
@@ -652,6 +611,7 @@ mod tests {
 
         let oracle_hits = oracle
             .vector_search("emb", &q, 2, opts)
+            .await
             .expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
@@ -761,8 +721,13 @@ mod tests {
             })
             .collect();
 
-        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
-            .expect("filter");
+        crate::supertable::query::dispatch::apply_tombstone_filter(
+            Some(&cache),
+            &entry,
+            &mut hits,
+            std::time::Instant::now(),
+        )
+        .expect("filter");
 
         let remaining: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
         assert_eq!(remaining, vec![0u32, 2, 4, 6, 7]);
@@ -779,8 +744,13 @@ mod tests {
             })
             .collect();
         let original = hits.clone();
-        super::apply_tombstone_filter(None, &entry, &mut hits, std::time::Instant::now())
-            .expect("no-cache");
+        crate::supertable::query::dispatch::apply_tombstone_filter(
+            None,
+            &entry,
+            &mut hits,
+            std::time::Instant::now(),
+        )
+        .expect("no-cache");
         assert_eq!(hits, original);
     }
 
@@ -804,8 +774,13 @@ mod tests {
             })
             .collect();
         let original = hits.clone();
-        super::apply_tombstone_filter(Some(&cache), &entry, &mut hits, std::time::Instant::now())
-            .expect("filter");
+        crate::supertable::query::dispatch::apply_tombstone_filter(
+            Some(&cache),
+            &entry,
+            &mut hits,
+            std::time::Instant::now(),
+        )
+        .expect("filter");
         assert_eq!(hits, original);
     }
 }

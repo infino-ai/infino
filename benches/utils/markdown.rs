@@ -108,6 +108,18 @@ pub fn fmt_throughput(elements_per_sec: f64) -> String {
     }
 }
 
+/// Ingest bandwidth (bytes per second) with MB/s / GB/s units. Decimal
+/// (1e6 / 1e9) to match the conventional "MB/s" reading. The byte count
+/// is the logical input payload processed (FTS: corpus text bytes;
+/// vector: `n_docs × dim × 4`), not the output artifact size.
+pub fn fmt_bandwidth(bytes_per_sec: f64) -> String {
+    if bytes_per_sec >= 1_000_000_000.0 {
+        format!("{:.2} GB/s", bytes_per_sec / 1_000_000_000.0)
+    } else {
+        format!("{:.1} MB/s", bytes_per_sec / 1_000_000.0)
+    }
+}
+
 // ─── estimates.json reader ────────────────────────────────────────────
 
 /// Read criterion's `mean.point_estimate` (in nanoseconds) for a given

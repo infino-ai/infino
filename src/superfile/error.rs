@@ -116,6 +116,18 @@ pub enum ReadError {
 
     #[error("vector error: {0}")]
     Vector(Box<VectorError>),
+
+    #[error("column {0:?} not found in superfile schema")]
+    UnknownColumn(String),
+
+    #[error("local_doc_id {doc_id} out of range (segment has {n_docs} docs)")]
+    DocIdOutOfRange { doc_id: u32, n_docs: u64 },
+
+    #[error("take-by-doc-id requires eager bytes; reader was opened via open_lazy")]
+    LazyReaderUnsupported,
+
+    #[error("columnar read error: {0}")]
+    Columnar(String),
 }
 
 impl From<FtsError> for ReadError {

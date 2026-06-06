@@ -64,7 +64,7 @@ fn superfile_object() -> &'static tiers::SuperfileCommitted {
     SUPERFILE_OBJECT.get_or_init(|| {
         let blob = Bytes::from(superfile_bytes().to_vec());
         eprintln!(
-            "[superfile_fts] committing {N_DOCS} docs to object storage for warm/cold tiers \
+            "[superfile_fts] committing {N_DOCS} docs to object storage for the cold tier \
              (production .parquet, {} MiB)...",
             blob.len() / (1024 * 1024)
         );
@@ -72,9 +72,9 @@ fn superfile_object() -> &'static tiers::SuperfileCommitted {
     })
 }
 
-/// Full warm/cold tier battery — every hot-search query shape is also
+/// Full cold tier battery — every hot-search query shape is also
 /// exercised against real object storage so the search summary has
-/// hot/warm/cold for all OR *and* AND shapes (cold latency is
+/// hot/cold for all OR *and* AND shapes (cold latency is
 /// fetch-bound, but we measure each shape explicitly rather than
 /// extrapolating from a 3-query sample).
 const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
@@ -411,11 +411,7 @@ fn bench(c: &mut Criterion) {
     );
     let run_search = fixture::supertable::criterion_filter_selects(
         &["superfile_fts", "superfile_fts_search"],
-        &[
-            "superfile_fts_hot_search",
-            "superfile_fts_warm_search",
-            "superfile_fts_cold_search",
-        ],
+        &["superfile_fts_hot_search", "superfile_fts_cold_search"],
     );
     if !run_build && !run_search {
         return;
@@ -655,7 +651,7 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
     let committed = superfile_object();
     let uri = committed.uri;
 
-    for tier in [Tier::Warm, Tier::Cold] {
+    for tier in [Tier::Cold] {
         let mut g = c.benchmark_group(tiers::search_group_name(
             "superfile_fts",
             tier,
@@ -663,8 +659,8 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
         ));
         g.sample_size(10);
         // Cold rebuilds a fresh cache + full S3 cold open per sample; widen
-        // only the cold groups so criterion stops warning it can't fit 10
-        // samples in the 5s default (warm/hot are sub-ms).
+        // the cold group so criterion stops warning it can't fit 10
+        // samples in the 5s default.
         if tier == Tier::Cold {
             g.measurement_time(Duration::from_secs(30));
         }
@@ -674,34 +670,6 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
             let bench_id = format!("{name}_infino_top10");
             let query = terms.join(" ");
             match tier {
-                Tier::Warm => {
-                    let storage = Arc::clone(&committed.storage);
-                    let (cache_dir, cache) = tiers::fresh_superfile_cache(storage.clone());
-                    tiers::block_on(async {
-                        let reader = cache.reader(&uri).await.expect("warm open");
-                        let _ = reader
-                            .bm25_search(FTS_COLUMN, &query, 10, mode)
-                            .await
-                            .expect("prewarm bm25");
-                        tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
-                            .await;
-                    });
-                    let cache_ref = Arc::clone(&cache);
-                    g.bench_function(&bench_id, |b| {
-                        b.iter(|| {
-                            let hits = tiers::block_on(async {
-                                let reader = cache_ref.reader(&uri).await.expect("reader");
-                                reader
-                                    .bm25_search(FTS_COLUMN, query.as_str(), 10, mode)
-                                    .await
-                                    .expect("bm25")
-                            });
-                            black_box(hits)
-                        });
-                    });
-                    drop(cache);
-                    drop(cache_dir);
-                }
                 Tier::Cold => {
                     let storage = Arc::clone(&committed.storage);
                     g.bench_function(&bench_id, |b| {
@@ -741,20 +709,25 @@ mod group_name {
 }
 
 fn emit_ingest_markdown() {
-    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_bandwidth, fmt_throughput, fmt_time, read_mean_ns};
+
+    // Logical input payload: total corpus text bytes, identical across
+    // both variants (the rayon variant shards the same corpus).
+    let input_bytes = text_corpus().total_bytes() as f64;
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Superfile FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
     body.push_str(
-        "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit).\n\n",
+        "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit). \
+         Bandwidth (MB/s) is over the logical input text payload.\n\n",
     );
     body.push_str(
-        "| Engine                       | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+        "| Engine                       | Time       | Throughput | Bandwidth  | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|------------------------------|------------|------------|-----------|------------|-----------|------------|\n",
+        "|------------------------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
     );
 
     let group = group_name::SUPERFILE_FTS_BUILD;
@@ -770,12 +743,15 @@ fn emit_ingest_markdown() {
         let thrpt = ns
             .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
             .unwrap_or_else(|| "—".into());
+        let bandwidth = ns
+            .map(|n| fmt_bandwidth(input_bytes / (n / 1e9)))
+            .unwrap_or_else(|| "—".into());
         let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
         let median_rss = rss::fmt_median_rss(group, bench_id);
         let p90_rss = rss::fmt_p90_rss(group, bench_id);
         let rss_delta = rss::fmt_peak_rss_delta(group, bench_id);
         format!(
-            "| {label:28} | {time:10} | {thrpt:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
+            "| {label:28} | {time:10} | {thrpt:10} | {bandwidth:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
         )
     };
 
@@ -804,14 +780,8 @@ fn emit_search_markdown() {
     let mut body = String::new();
     body.push_str(&format!("### Superfile FTS — search ({N_DOCS} docs)\n\n"));
     body.push_str(
-        "Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object storage via \
-         `DiskCacheStore::reader` → `bm25_search` (production cold/warm path).\n\n",
-    );
-    body.push_str(
-        "| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
-    );
-    body.push_str(
-        "|----------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
+        "Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via \
+         `DiskCacheStore::reader` → `bm25_search` (production cold path).\n\n",
     );
 
     let group = group_name::SUPERFILE_FTS_SEARCH;
@@ -834,10 +804,15 @@ fn emit_search_markdown() {
     ];
 
     body.push_str("**OR queries:**\n\n");
+    body.push_str(
+        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
+    );
     for q in queries_or {
         let bid = format!("{q}_infino_top10");
         let hot = read_mean_ns(group, &bid);
-        let warm = markdown::read_tier_mean_ns("superfile_fts", "warm", &bid);
         let cold = markdown::read_tier_mean_ns("superfile_fts", "cold", &bid);
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
@@ -846,24 +821,22 @@ fn emit_search_markdown() {
         let p90_rss = rss::fmt_p90_rss(group, &bid);
         let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
         body.push_str(&format!(
-            "| {q:14} | {} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
+            "| {q:14} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
             hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
             cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }
 
     body.push_str("\n**AND queries:**\n\n");
     body.push_str(
-        "| Query          | hot        | warm       | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|----------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
+        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
     );
     for q in queries_and {
         let bid = format!("{q}_infino_top10");
         let hot = read_mean_ns(group, &bid);
-        let warm = markdown::read_tier_mean_ns("superfile_fts", "warm", &bid);
         let cold = markdown::read_tier_mean_ns("superfile_fts", "cold", &bid);
         let rss_cell = rss::read_peak_rss_bytes(group, &bid)
             .map(rss::fmt_bytes)
@@ -872,9 +845,8 @@ fn emit_search_markdown() {
         let p90_rss = rss::fmt_p90_rss(group, &bid);
         let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
         body.push_str(&format!(
-            "| {q:14} | {} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
+            "| {q:14} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
             hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-            warm.map(fmt_time).unwrap_or_else(|| "—".into()),
             cold.map(fmt_time).unwrap_or_else(|| "—".into()),
         ));
     }

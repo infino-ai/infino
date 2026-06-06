@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
+use datafusion::execution::context::SessionContext;
 use tokio::runtime::Runtime;
 
 use super::error::{BuildError, OpenError};
@@ -74,6 +75,18 @@ pub(super) struct SupertableInner {
     /// first use rather than at `create()` so supertables that
     /// never run SQL don't pay the runtime cost.
     pub(super) query_runtime: OnceLock<Arc<Runtime>>,
+    /// Cached `SessionContext` for `query_sql`, keyed on the
+    /// manifest `Arc` it was built against. Building one is
+    /// ~1.5 ms (default optimizer rules + 3 TVF re-registrations
+    /// + provider register), so reusing it across queries on the
+    /// same snapshot is a large speedup for warm BM25 / vector
+    /// SQL where the kernel itself runs in microseconds.
+    ///
+    /// Invalidation is automatic: every commit publishes a new
+    /// `Arc<Manifest>` via `manifest.store(...)`, so on the next
+    /// `query_sql` the `Arc::ptr_eq` check fails and the cache
+    /// is rebuilt against the fresh snapshot.
+    pub(super) sql_session_cache: Mutex<Option<(Arc<Manifest>, SessionContext)>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -216,6 +229,7 @@ impl Supertable {
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
             query_runtime: OnceLock::new(),
+            sql_session_cache: Mutex::new(None),
             tombstone_cache,
             handle_id,
             last_pointer_check: Mutex::new(None),
@@ -410,6 +424,7 @@ impl Supertable {
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
             query_runtime: OnceLock::new(),
+            sql_session_cache: Mutex::new(None),
             tombstone_cache,
             handle_id,
             last_pointer_check: Mutex::new(None),
@@ -649,6 +664,48 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
+    /// Block until the on-disk cache has fully promoted every segment
+    /// in the current manifest to an mmap-backed reader, or `timeout`
+    /// elapses for one of them. This is the public "warm-readiness"
+    /// primitive: once it returns `Ok(())`, subsequent searches read
+    /// from resident mmap pages instead of issuing object-store range
+    /// GETs through the lazy foreground source, so latency drops from
+    /// the cold/lazy path (hundreds of ms — seconds against real S3) to
+    /// the in-memory steady state (single-digit ms).
+    ///
+    /// A real serving node calls this on startup, after `open`, to take
+    /// traffic only once its cache is hot. No-op when no disk cache is
+    /// attached, and a short-circuit when background fill is disabled
+    /// (`INFINO_DISABLE_BG_FILL`) — nothing is ever promoted then, so
+    /// there is nothing to wait for and blocking until `timeout` would
+    /// be pointless.
+    ///
+    /// Crucially, requesting promotion here is also what *drives* it to
+    /// completion: registering a promotion waiter releases the
+    /// background full-segment fill that otherwise idles behind
+    /// foreground lazy readers under steady query load. Warming purely
+    /// by replaying queries does not register that waiter, so the
+    /// segments can stay lazy/S3-backed indefinitely.
+    pub fn wait_until_warm(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), crate::supertable::reader_cache::disk::DiskCacheError> {
+        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
+            return Ok(());
+        };
+        if crate::supertable::reader_cache::disk::skip_background_fill() {
+            return Ok(());
+        }
+        let cache = Arc::clone(cache);
+        let manifest = self.inner.manifest.load_full();
+        self.block_on_query(async move {
+            for entry in manifest.superfiles.iter() {
+                cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+            }
+            Ok(())
+        })
+    }
+
     /// This handle's lease-owner id. Stamped on every WAL the
     /// handle's recovery sweep / commit pipeline acquires.
     /// Minted once at handle construction via `IdGenerator`;
@@ -779,6 +836,35 @@ impl Supertable {
     /// `SupertableInner`; subsequent calls clone the `Arc`.
     pub(crate) fn query_runtime(&self) -> Arc<Runtime> {
         self.inner.query_runtime()
+    }
+
+    /// Crate-internal accessor for the cached `SessionContext`
+    /// keyed on the manifest `Arc`. Used by `query_sql` to
+    /// reuse the registered provider + TVFs across queries on
+    /// the same snapshot.
+    pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
+        &self.inner.sql_session_cache
+    }
+
+    /// Diagnostic-only: returns the cached `SessionContext`
+    /// (building it on miss), bypassing the run-and-collect
+    /// path. Lets benchmarks decompose `query_sql` cost into
+    /// `ctx.sql()` (parse + analyze + logical/physical plan)
+    /// vs `DataFrame::collect()` (execute) to find where the
+    /// remaining dispatch time goes after the cache hit.
+    #[doc(hidden)]
+    pub fn __debug_cached_session(&self) -> SessionContext {
+        // Reuses the same fast path as `query_sql` — see the
+        // doc-comment on `sql_session_cache` for invalidation.
+        self.query_sql("SELECT 1 WHERE 1=0").ok();
+        let guard = self
+            .sql_session_cache()
+            .lock()
+            .expect("sql_session_cache mutex poisoned");
+        guard
+            .as_ref()
+            .map(|(_, ctx)| ctx.clone())
+            .expect("session cache must be populated after warm-up call")
     }
 }
 

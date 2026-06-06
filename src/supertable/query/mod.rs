@@ -16,8 +16,12 @@
 //! [`skip`] holds the manifest-only skip helpers (bloom +
 //! term-range + centroid) shared across the query paths.
 
+pub mod dispatch;
+pub mod exec;
 pub mod fts;
 pub mod hierarchical_iter;
+pub mod provider;
+pub mod prune;
 pub mod skip;
 pub mod sql;
 pub mod superfile_reader;

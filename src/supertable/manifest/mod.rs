@@ -360,7 +360,7 @@ pub struct SuperfileEntry {
     /// metadata to learn where each subsection lives.
     ///
     /// Populated by the writer at commit time from the
-    /// `ParquetParts` returned by `write_parquet_with_blobs` (so
+    /// `ParquetParts` returned by `splice_index_blobs` (so
     /// the values are by construction consistent with what the
     /// parquet KV metadata would later say).
     ///
@@ -635,6 +635,103 @@ pub struct VectorSummary {
     /// Maximum distance from any indexed vector in this segment to
     /// `centroid`, in the same metric the column was built with.
     pub radius: f32,
+    /// Per-cluster IVF centroids (Sq8, per-cluster calibration) for
+    /// cross-segment global cluster selection. Empty when the segment
+    /// has no vector index for this column.
+    pub clusters: ClusterCentroids,
+}
+
+/// Per-cluster IVF centroids for one vector column, Sq8-quantized with
+/// per-cluster calibration. Carried in the manifest so a query can rank
+/// every segment's clusters globally — without opening the segment —
+/// and probe only the globally-closest clusters. The 1-bit shortlist +
+/// rerank still run on the segment's on-disk compressed vectors; these
+/// drive cluster *selection* only.
+///
+/// Quantization is value-only (no metric); the selector applies the
+/// column's metric when scoring a dequantized centroid against a query.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterCentroids {
+    pub n_cent: u32,
+    pub dim: u32,
+    /// `n_cent * dim` Sq8 codes, cluster-major.
+    pub codes: Vec<u8>,
+    /// Per-cluster dequant base (min component); length `n_cent`.
+    pub mins: Vec<f32>,
+    /// Per-cluster dequant step `(max - min) / 255`; length `n_cent`.
+    pub scales: Vec<f32>,
+    /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
+    /// are skipped by the selector.
+    pub counts: Vec<u32>,
+}
+
+impl ClusterCentroids {
+    /// The "no cluster centroids" value — a segment without a vector
+    /// index for the column.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n_cent == 0
+    }
+
+    /// Sq8-quantize fp32 cluster centroids (`centroids` is cluster-major,
+    /// `n_cent * dim` floats) with per-cluster calibration: each cluster
+    /// centroid spans the full 8-bit range against its own component
+    /// min/max. `counts` is the per-cluster indexed doc count.
+    pub fn from_fp32(n_cent: u32, dim: u32, centroids: &[f32], counts: Vec<u32>) -> Self {
+        let nc = n_cent as usize;
+        let d = dim as usize;
+        let mut codes = vec![0u8; nc * d];
+        let mut mins = vec![0f32; nc];
+        let mut scales = vec![0f32; nc];
+        for c in 0..nc {
+            let src = &centroids[c * d..(c + 1) * d];
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for &v in src {
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            if !mn.is_finite() {
+                mn = 0.0;
+            }
+            if !mx.is_finite() {
+                mx = 0.0;
+            }
+            let scale = if mx > mn { (mx - mn) / 255.0 } else { 0.0 };
+            mins[c] = mn;
+            scales[c] = scale;
+            let dst = &mut codes[c * d..(c + 1) * d];
+            for (o, &v) in dst.iter_mut().zip(src) {
+                *o = if scale > 0.0 {
+                    ((v - mn) / scale).round().clamp(0.0, 255.0) as u8
+                } else {
+                    0
+                };
+            }
+        }
+        Self {
+            n_cent,
+            dim,
+            codes,
+            mins,
+            scales,
+            counts,
+        }
+    }
+
+    /// Dequantize cluster `c`'s centroid into `out` (length `dim`).
+    pub fn dequantize_into(&self, c: usize, out: &mut [f32]) {
+        let d = self.dim as usize;
+        let codes = &self.codes[c * d..(c + 1) * d];
+        let mn = self.mins[c];
+        let scale = self.scales[c];
+        for (o, &code) in out.iter_mut().zip(codes) {
+            *o = mn + code as f32 * scale;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -792,6 +889,7 @@ mod tests {
         let s = VectorSummary {
             centroid: vec![0.1, 0.2, 0.3],
             radius: 0.5,
+            clusters: ClusterCentroids::empty(),
         };
         assert_eq!(s.centroid.len(), 3);
         assert!((s.radius - 0.5).abs() < 1e-9);

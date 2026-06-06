@@ -1012,16 +1012,8 @@ impl VectorReader {
         self.columns.iter().map(|c| c.name.as_str())
     }
 
-    pub(crate) fn public_rerank_mult(&self, column: &str, base: usize) -> usize {
-        let Some(&cid) = self.column_id_by_name.get(column) else {
-            return base;
-        };
-        let col = &self.columns[cid as usize];
-        if col.rerank_codec.writes_full() {
-            base.max(20)
-        } else {
-            base
-        }
+    pub(crate) fn public_rerank_mult(&self, _column: &str, base: usize) -> usize {
+        base
     }
 
     /// Per-column summary centroid + radius, used by the storage plan
@@ -1043,6 +1035,53 @@ impl VectorReader {
             })
             .collect();
         Some((centroid, col.summary_radius))
+    }
+
+    /// The column's per-cluster IVF centroids (fp32, cluster-major,
+    /// `n_cent * dim`) plus each cluster's indexed doc count. Returns
+    /// `(n_cent, dim, centroids, counts)`. Used by the writer to stage
+    /// quantized cluster centroids into the manifest for cross-segment
+    /// global cluster selection. `None` if the column is unknown or the
+    /// centroid/cluster_idx bytes aren't resident.
+    pub fn cluster_centroids(&self, column: &str) -> Option<(u32, u32, Vec<f32>, Vec<u32>)> {
+        let cid = *self.column_id_by_name.get(column)?;
+        let col = &self.columns[cid as usize];
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
+        let n_cent = col.n_cent as usize;
+        let dim = col.dim;
+        let stride = dim * 4;
+
+        // Centroids: fp32, cluster-major, at `centroids_off`.
+        let mut centroids = Vec::with_capacity(n_cent * dim);
+        for c in 0..n_cent {
+            let base = col.centroids_off + c * stride;
+            for d in 0..dim {
+                let s = base + d * 4;
+                centroids.push(f32::from_le_bytes([
+                    sub[s],
+                    sub[s + 1],
+                    sub[s + 2],
+                    sub[s + 3],
+                ]));
+            }
+        }
+
+        // cluster_idx: `n_cent` × `(doc_off: u32, count: u32)`; we want
+        // the count (second u32 of each 8-byte entry).
+        let mut counts = Vec::with_capacity(n_cent);
+        for c in 0..n_cent {
+            let b = col.cluster_idx_off + c * 8 + 4;
+            counts.push(u32::from_le_bytes([
+                sub[b],
+                sub[b + 1],
+                sub[b + 2],
+                sub[b + 3],
+            ]));
+        }
+
+        Some((col.n_cent, dim as u32, centroids, counts))
     }
 
     /// Single-column kNN search. Returns `(local_doc_id,
@@ -1201,166 +1240,38 @@ impl VectorReader {
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
-        // Each cluster block is `[codes_chunk][doc_ids_chunk]
-        // [full_chunk]` (interleaved layout). Score off the codes
-        // + doc_ids prefix now; the full_chunk suffix is read back
-        // for the survivors at rerank time — from the *same*
-        // already-fetched block, so rerank issues zero extra GETs.
-        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
-        // Score each probed cluster's 1-bit codes into the shortlist.
-        // The per-cluster slices are zero-copy `Bytes` views; the
-        // actual estimate scan is the hot CPU work. It runs in
-        // parallel across clusters once the candidate pool is large
-        // enough to amortize the rayon hand-off — the 10M supertable's
-        // `nprobe × segments` fan-out clears the bar, while the 1M
-        // single-superfile nprobe=1 hot path (one cluster) stays
-        // serial. Cluster scoring is order-independent: every survivor
-        // is re-sorted by estimate immediately below, so the parallel
-        // and serial shortlists rank identically.
-        let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
-        let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-            k
-        } else {
-            k.saturating_mul(rerank_mult)
+        // Score the 1-bit shortlist and build rerank references — the
+        // pure-CPU stage shared with `search_async` (see
+        // [`build_shortlist`]). Each cluster block is
+        // `[codes][doc_ids][full?]`; scoring reads the prefix, and the
+        // survivor `full[]` rows are fetched below — the only step
+        // that differs from the async path.
+        let (candidates, survivor_full_ranges) = match build_shortlist(
+            col,
+            &q_rot,
+            cb,
+            &cluster_meta,
+            &cluster_blocks,
+            survivor_only_rerank_fetch,
+            k,
+            rerank_mult,
+        ) {
+            ShortlistOutcome::Done(out) => return Ok(out),
+            ShortlistOutcome::Rerank {
+                candidates,
+                survivor_full_ranges,
+            } => (candidates, survivor_full_ranges),
         };
-        if coarse_limit == 0 {
-            return Ok(Vec::new());
-        }
-        let score_block =
-            |heap: &mut BoundedCoarseHeap,
-             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
-                let codes_len = (cnt as usize) * cb;
-                let doc_ids_len = (cnt as usize) * 4;
-                debug_assert_eq!(
-                    block.len(),
-                    if survivor_only_rerank_fetch {
-                        codes_len + doc_ids_len
-                    } else {
-                        codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
-                    }
-                );
-                let codes = block.slice(0..codes_len);
-                let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-                score_cluster_codes_into_heap(
-                    &codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot, heap,
-                );
-            };
-        let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-            cluster_meta
-                .par_iter()
-                .zip(cluster_blocks.par_iter())
-                .fold(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut heap, item| {
-                        score_block(&mut heap, item);
-                        heap
-                    },
-                )
-                .reduce(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut left, right| {
-                        left.merge(right);
-                        left
-                    },
-                )
-        } else {
-            let mut heap = BoundedCoarseHeap::new(coarse_limit);
-            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
-                score_block(&mut heap, item);
-            }
-            heap
-        };
-        let mut shortlist = shortlist_heap.into_vec();
-
-        if shortlist.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // `None` codec short-circuit. The 1-bit
-        // shortlist *is* the final ranking — there's no `full[]`
-        // region on disk and no rerank step. We:
-        //   * partial-sort the shortlist to land the top-K by
-        //     descending estimate (higher dot estimate = better
-        //     candidate),
-        //   * fully sort the retained k for a stable output
-        //     ordering, and
-        //   * flip the sign of the estimate so the returned
-        //     `(doc_id, distance)` pairs follow the standard
-        //     "smaller = closer" convention for the caller. The
-        //     value is a 1-bit-derived score, not a true metric
-        //     distance; for `None` columns recall is the
-        //     contract, not numerical agreement with fp32.
-        //
-        // `rerank_mult` is intentionally ignored here — there's
-        // nothing to refine. Storage shrinks by ~30×; recall
-        // drops 0.05-0.15 vs rerank-equipped codecs (corpus-
-        // dependent). M5 will surface the bench numbers.
-        if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-            let _ = rerank_mult;
-            shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-            return Ok(shortlist
-                .into_iter()
-                .map(|(did, est, _pos, _c)| (did, -est))
-                .collect());
-        }
-
-        // 6. Build lightweight rerank references into the cluster
-        //    blocks already in hand — no second fetch and no survivor
-        //    byte packing. Each block's `full_chunk` follows its
-        //    `[codes][doc_ids]` prefix; candidate at cluster-order
-        //    position `pos = cluster_doc_off + i` lives at in-block
-        //    offset `cnt*cb + cnt*4 + i*stride`.
-        //
-        //    Because `full[]` rides inside the per-cluster block,
-        //    the whole cold first search is just the `nprobe`
-        //    cluster-block GETs (issued in parallel above) — the
-        //    rerank step adds zero round-trips and zero extra
-        //    bytes over the wire.
-        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
-        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
-            block_by_cid.insert(c as u32, bi);
-        }
-        let stride = full_vec_bytes;
-        let mut candidates = Vec::with_capacity(shortlist.len());
-        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
-            Some(Vec::with_capacity(shortlist.len()))
-        } else {
-            None
-        };
-        for &(did, _, pos, cluster_id) in &shortlist {
-            let bi = block_by_cid[&cluster_id];
-            let (_, off, cnt) = cluster_meta[bi];
-            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
-            let local = (pos - off) as usize;
-            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
-                let idx = ranges.len();
-                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
-                Some(idx)
-            } else {
-                None
-            };
-            candidates.push(RerankCandidate {
-                did,
-                pos,
-                cluster_id,
-                block_idx: bi,
-                full_off: full_start + local * stride,
-                full_idx,
-            });
-        }
-        let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
-            // Coalesce the survivor rows: on the cold path these are
-            // scattered single-vector ranges inside each cluster's
-            // `full[]` region, so merging adjacent ones (bounded gap /
-            // overfetch) keeps the second-wave GET count down. On the
-            // warm path the underlying fetch resolves sync/zero-copy,
-            // so the coalescing is just a cheap sort.
-            Some(
+        // Coalesce the survivor rows (scattered single-vector ranges
+        // inside each cluster's `full[]` region) into a small second
+        // wave; warm ranges resolve sync/zero-copy, so this is a cheap
+        // sort.
+        let survivor_full_rows = match survivor_full_ranges {
+            Some(ranges) => Some(
                 get_cluster_ranges_coalesced(&self.source, &ranges)
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
 
         // 8. CPU-only rerank using the true metric. Sq8 columns
@@ -1368,6 +1279,209 @@ impl VectorReader {
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
         //    + SIMD dot. Fp32 takes the flat dispatch.
+        rerank_candidates_from_blocks(
+            &self.source,
+            lazy_sq8_meta_bytes.as_ref(),
+            &cluster_blocks,
+            survivor_full_rows.as_deref(),
+            &candidates,
+            col,
+            query,
+            k,
+        )
+        .map_err(|e| VectorError::LazySource(e.to_string()))
+    }
+
+    /// Async sibling of [`Self::search`]. Byte-for-byte the same IVF
+    /// kernel — identical centroid scoring, coarse 1-bit shortlist,
+    /// survivor-only rerank, and the same coalesced range plans, so
+    /// recall is identical — but the three fetch waves (centroid+idx
+    /// region, per-cluster code prefixes + Sq8 meta, survivor rerank
+    /// rows) are `await`ed on the caller's runtime instead of bridged
+    /// through a per-call throwaway runtime. This is what lets the
+    /// supertable vector fan-out drive every segment concurrently on
+    /// the shared query runtime — mirroring the FTS
+    /// `bm25_search_pretokenized` path — rather than serializing cold
+    /// object-store GETs. The CPU steps (centroid/code scoring,
+    /// rerank) call the same helpers as the sync path and parallelize
+    /// on the global rayon pool; warm/in-memory ranges still resolve
+    /// sync/zero-copy via `try_get_range_sync` with no `await`.
+    pub async fn search_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_mult: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated {
+            return Ok(Vec::new());
+        }
+        let centroid_stride = col.dim * 4;
+        let sub_start = col.subsection_range.start;
+
+        // 1. Centroids + cluster_idx region (one contiguous span).
+        let centroids_start = sub_start + col.centroids_off;
+        let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let centroid_idx_region = self
+            .source
+            .range_async(centroids_start..idx_end)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
+        let cluster_idx =
+            centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
+
+        let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
+        // 2. Score centroids → top `nprobe` clusters.
+        let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
+
+        // 3. Rotate query once for the 1-bit code estimator.
+        let mut q_rot = vec![0f32; col.dim];
+        col.rot.apply(query, &mut q_rot);
+
+        // 4. Probe the centroid-scored clusters through the shared tail
+        //    (also used by the externally-selected
+        //    `search_clusters_async` path).
+        let _ = sub_start;
+        let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
+        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+            .await
+    }
+
+    /// Async IVF probe over an **externally chosen** set of cluster ids.
+    /// The cross-segment global selector picks these from the manifest's
+    /// per-cluster centroids, so this skips the segment's own centroid
+    /// scoring entirely — it fetches just the cluster index, then probes
+    /// exactly `clusters` (ids ≥ `n_cent` and empty clusters are
+    /// ignored). The shortlist + rerank are byte-for-byte the same as
+    /// [`Self::search_async`].
+    pub async fn search_clusters_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        rerank_mult: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated {
+            return Ok(Vec::new());
+        }
+        let sub_start = col.subsection_range.start;
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let cluster_idx = self
+            .source
+            .range_async(idx_start..idx_end)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let mut q_rot = vec![0f32; col.dim];
+        col.rot.apply(query, &mut q_rot);
+        let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
+        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+            .await
+    }
+
+    /// Shared async tail of the IVF probe: given a chosen set of cluster
+    /// ids plus the already-fetched cluster index, fetch each non-empty
+    /// cluster's block, build the 1-bit shortlist, and rerank to top-k.
+    /// Used by [`Self::search_async`] (clusters from this segment's
+    /// centroid scoring) and [`Self::search_clusters_async`] (clusters
+    /// from the global cross-segment selector).
+    async fn probe_clusters_async(
+        &self,
+        col: &ColumnReader,
+        query: &[f32],
+        q_rot: &[f32],
+        cluster_idx: &[u8],
+        chosen: &[usize],
+        k: usize,
+        rerank_mult: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let cb = col.quant.code_bytes();
+        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
+        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(chosen.len());
+        for &c in chosen {
+            if c >= col.n_cent as usize {
+                continue;
+            }
+            let (off, cnt) = read_cluster_entry(cluster_idx, c);
+            if cnt == 0 {
+                continue;
+            }
+            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
+            cluster_meta.push((c, off, cnt));
+        }
+        if cluster_meta.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
+        // Warm fast path: every prefix already resident → sync zero-copy.
+        let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
+            .iter()
+            .map(|range| self.source.try_get_range_sync(range.clone()))
+            .collect();
+        let survivor_only_rerank_fetch = true;
+        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
+        {
+            let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
+                let mut fetched = self
+                    .source
+                    .get_ranges_parallel_async(&[range])
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                fetched.pop()
+            } else {
+                None
+            };
+            (prefix_blocks, meta_bytes)
+        } else {
+            // Cold: codes+doc_ids prefixes (coalesced) + Sq8 meta in one
+            // concurrent batch on the caller's runtime.
+            get_cluster_ranges_coalesced_with_extra_async(
+                &self.source,
+                &cluster_prefix_ranges,
+                lazy_sq8_meta_range,
+            )
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?
+        };
+        debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
+
+        // Shared pure-CPU shortlist + candidate-build stage (see
+        // [`build_shortlist`]); only the survivor-row fetch below
+        // diverges from the sync path.
+        let (candidates, survivor_full_ranges) = match build_shortlist(
+            col,
+            q_rot,
+            cb,
+            &cluster_meta,
+            &cluster_blocks,
+            survivor_only_rerank_fetch,
+            k,
+            rerank_mult,
+        ) {
+            ShortlistOutcome::Done(out) => return Ok(out),
+            ShortlistOutcome::Rerank {
+                candidates,
+                survivor_full_ranges,
+            } => (candidates, survivor_full_ranges),
+        };
+        // Survivor rerank rows in one concurrent batch on the caller's
+        // runtime; warm ranges resolve sync/zero-copy with no await.
+        let survivor_full_rows = match survivor_full_ranges {
+            Some(ranges) => Some(
+                get_cluster_ranges_coalesced_async(&self.source, &ranges)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
+            ),
+            None => None,
+        };
+
         rerank_candidates_from_blocks(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
@@ -1407,6 +1521,172 @@ impl VectorReader {
             return Ok((col, false));
         }
         Ok((col, true))
+    }
+}
+
+/// Outcome of the 1-bit shortlist + candidate-build stage shared by
+/// [`VectorReader::search`] and [`VectorReader::search_async`].
+enum ShortlistOutcome {
+    /// Final result — no rerank fetch needed: empty shortlist,
+    /// `coarse_limit == 0`, or a `RabitqOnly` column whose 1-bit
+    /// shortlist *is* the ranking.
+    Done(Vec<(u32, f32)>),
+    /// Survivors to rerank against the true metric.
+    /// `survivor_full_ranges` (when `Some`) are the per-survivor
+    /// `full[]` rows the caller fetches — sync or async, the only
+    /// step that differs between the two search paths.
+    Rerank {
+        candidates: Vec<RerankCandidate>,
+        survivor_full_ranges: Option<Vec<Range<usize>>>,
+    },
+}
+
+/// Pure-CPU stage shared by the sync and async vector search paths.
+///
+/// Scores the probed clusters' 1-bit codes into a bounded shortlist,
+/// short-circuits `RabitqOnly` columns (whose shortlist is the final
+/// ranking), and otherwise builds the rerank references plus the
+/// survivor `full[]` ranges to fetch. Holds no I/O: the caller does
+/// the survivor-row fetch (sync vs async — the sole divergence) and
+/// then runs [`rerank_candidates_from_blocks`]. Factoring this out
+/// keeps `search` / `search_async` down to their fetch waves around a
+/// single shared kernel, so the two can't drift in scoring/recall.
+#[allow(clippy::too_many_arguments)]
+fn build_shortlist(
+    col: &ColumnReader,
+    q_rot: &[f32],
+    cb: usize,
+    cluster_meta: &[(usize, u32, u32)],
+    cluster_blocks: &[Bytes],
+    survivor_only_rerank_fetch: bool,
+    k: usize,
+    rerank_mult: usize,
+) -> ShortlistOutcome {
+    let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
+    // Score each probed cluster's 1-bit codes into the shortlist.
+    // The per-cluster slices are zero-copy `Bytes` views; the actual
+    // estimate scan is the hot CPU work, parallelized across clusters
+    // once the candidate pool is large enough to amortize the rayon
+    // hand-off. Cluster scoring is order-independent: every survivor
+    // is re-sorted by estimate below, so parallel and serial
+    // shortlists rank identically.
+    let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+    let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+        k
+    } else {
+        k.saturating_mul(rerank_mult)
+    };
+    if coarse_limit == 0 {
+        return ShortlistOutcome::Done(Vec::new());
+    }
+    let score_block =
+        |heap: &mut BoundedCoarseHeap, (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+            let codes_len = (cnt as usize) * cb;
+            let doc_ids_len = (cnt as usize) * 4;
+            debug_assert_eq!(
+                block.len(),
+                if survivor_only_rerank_fetch {
+                    codes_len + doc_ids_len
+                } else {
+                    codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
+                }
+            );
+            let codes = block.slice(0..codes_len);
+            let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+            score_cluster_codes_into_heap(
+                &codes, &doc_ids, cnt, off, c as u32, &col.quant, q_rot, heap,
+            );
+        };
+    let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+        cluster_meta
+            .par_iter()
+            .zip(cluster_blocks.par_iter())
+            .fold(
+                || BoundedCoarseHeap::new(coarse_limit),
+                |mut heap, item| {
+                    score_block(&mut heap, item);
+                    heap
+                },
+            )
+            .reduce(
+                || BoundedCoarseHeap::new(coarse_limit),
+                |mut left, right| {
+                    left.merge(right);
+                    left
+                },
+            )
+    } else {
+        let mut heap = BoundedCoarseHeap::new(coarse_limit);
+        for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+            score_block(&mut heap, item);
+        }
+        heap
+    };
+    let mut shortlist = shortlist_heap.into_vec();
+
+    if shortlist.is_empty() {
+        return ShortlistOutcome::Done(Vec::new());
+    }
+
+    // `RabitqOnly` short-circuit: the 1-bit shortlist *is* the final
+    // ranking — no `full[]` region on disk, no rerank step. Partial-
+    // sort to the top-k by descending estimate, then flip the sign so
+    // the returned `(doc_id, distance)` pairs follow the standard
+    // "smaller = closer" convention. The value is a 1-bit-derived
+    // score, not a true metric distance; for these columns recall is
+    // the contract, not numerical agreement with fp32. `rerank_mult`
+    // is intentionally ignored — there's nothing to refine.
+    if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+        let _ = rerank_mult;
+        shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        return ShortlistOutcome::Done(
+            shortlist
+                .into_iter()
+                .map(|(did, est, _pos, _c)| (did, -est))
+                .collect(),
+        );
+    }
+
+    // Build lightweight rerank references into the cluster blocks
+    // already in hand — no second fetch and no survivor byte packing.
+    // Each block's `full_chunk` follows its `[codes][doc_ids]` prefix;
+    // the candidate at cluster-order position `pos` lives at in-block
+    // offset `cnt*cb + cnt*4 + local*stride`.
+    let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
+    for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
+        block_by_cid.insert(c as u32, bi);
+    }
+    let stride = full_vec_bytes;
+    let mut candidates = Vec::with_capacity(shortlist.len());
+    let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+        Some(Vec::with_capacity(shortlist.len()))
+    } else {
+        None
+    };
+    for &(did, _, pos, cluster_id) in &shortlist {
+        let bi = block_by_cid[&cluster_id];
+        let (_, off, cnt) = cluster_meta[bi];
+        let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
+        let local = (pos - off) as usize;
+        let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+            let idx = ranges.len();
+            ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+            Some(idx)
+        } else {
+            None
+        };
+        candidates.push(RerankCandidate {
+            did,
+            pos,
+            cluster_id,
+            block_idx: bi,
+            full_off: full_start + local * stride,
+            full_idx,
+        });
+    }
+    ShortlistOutcome::Rerank {
+        candidates,
+        survivor_full_ranges,
     }
 }
 
@@ -2049,6 +2329,70 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
 }
 
+/// Coalescing plan for a set of cluster-block ranges. Computed once
+/// and applied to either a sync ([`Source::get_ranges_parallel`]) or
+/// async ([`Source::get_ranges_parallel_async`]) batch fetch — the
+/// byte selection is identical regardless of which path executes it,
+/// so the sync and async vector kernels return bit-identical results.
+struct CoalescePlan {
+    /// Merged ranges to actually GET (adjacent / near-adjacent
+    /// cluster blocks fused into one request to cut the GET count).
+    fetch_ranges: Vec<Range<usize>>,
+    /// Per original input range, in input order: `(fetch_idx,
+    /// offset_in_fetch, len)` — how to slice the requested range
+    /// back out of its merged fetch block.
+    scatter: Vec<(usize, usize, usize)>,
+}
+
+/// Group `ranges` into coalesced fetch spans (same gap/overfetch rule
+/// the per-cluster cold fan-out has always used) and record how to
+/// slice each original range back out. Pure; no I/O.
+fn plan_cluster_coalesce(ranges: &[Range<usize>]) -> CoalescePlan {
+    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
+
+    // groups: (merged_range, payload_len, members[(orig_idx, range)])
+    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+    for (idx, range) in sorted {
+        if let Some((merged, payload_len, members)) = groups.last_mut() {
+            let gap = range.start.saturating_sub(merged.end);
+            let merged_end = merged.end.max(range.end);
+            let new_payload_len = *payload_len + range.len();
+            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
+            if range.start <= merged.end
+                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
+                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+            {
+                merged.end = merged_end;
+                *payload_len = new_payload_len;
+                members.push((idx, range));
+                continue;
+            }
+        }
+        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+    }
+
+    let fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
+    let mut scatter: Vec<(usize, usize, usize)> = vec![(0, 0, 0); ranges.len()];
+    for (gi, (merged_range, _, members)) in groups.iter().enumerate() {
+        for (idx, range) in members {
+            scatter[*idx] = (gi, range.start - merged_range.start, range.len());
+        }
+    }
+    CoalescePlan {
+        fetch_ranges,
+        scatter,
+    }
+}
+
+/// Slice the requested ranges back out of the fetched merged blocks.
+fn apply_coalesce(plan: &CoalescePlan, fetched: &[Bytes]) -> Vec<Bytes> {
+    plan.scatter
+        .iter()
+        .map(|&(gi, off, len)| fetched[gi].slice(off..off + len))
+        .collect()
+}
+
 fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
@@ -2057,105 +2401,65 @@ fn get_cluster_ranges_coalesced_with_extra(
     let Some(extra) = extra else {
         return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
     };
-    if ranges.is_empty() {
-        let mut fetched = source.get_ranges_parallel(&[extra])?;
-        return Ok((Vec::new(), fetched.pop()));
-    }
-
-    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
-    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
-
-    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
-    for (idx, range) in sorted {
-        if let Some((merged, payload_len, members)) = groups.last_mut() {
-            let gap = range.start.saturating_sub(merged.end);
-            let merged_end = merged.end.max(range.end);
-            let new_payload_len = *payload_len + range.len();
-            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
-            if range.start <= merged.end
-                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
-                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
-            {
-                merged.end = merged_end;
-                *payload_len = new_payload_len;
-                members.push((idx, range));
-                continue;
-            }
-        }
-        groups.push((range.clone(), range.len(), vec![(idx, range)]));
-    }
-
-    let mut fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
-    fetch_ranges.push(extra);
-    let mut fetched = source.get_ranges_parallel(&fetch_ranges)?;
+    let plan = plan_cluster_coalesce(ranges);
+    let mut fetch = plan.fetch_ranges.clone();
+    fetch.push(extra);
+    let mut fetched = source.get_ranges_parallel(&fetch)?;
     let extra_bytes = fetched.pop();
+    Ok((apply_coalesce(&plan, &fetched), extra_bytes))
+}
 
-    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
-    for ((merged_range, _, members), bytes) in groups.into_iter().zip(fetched) {
-        for (idx, range) in members {
-            let start = range.start - merged_range.start;
-            let end = start + range.len();
-            out[idx] = Some(bytes.slice(start..end));
-        }
-    }
-
-    Ok((
-        out.into_iter()
-            .map(|b| b.expect("cluster range filled by coalesced fetch"))
-            .collect(),
-        extra_bytes,
-    ))
+/// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Same
+/// coalescing plan, dispatched as one `try_join_all` batch on the
+/// caller's runtime so connections pool and the fan-out is concurrent.
+async fn get_cluster_ranges_coalesced_with_extra_async(
+    source: &Source,
+    ranges: &[Range<usize>],
+    extra: Option<Range<usize>>,
+) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+    let Some(extra) = extra else {
+        return Ok((
+            get_cluster_ranges_coalesced_async(source, ranges).await?,
+            None,
+        ));
+    };
+    let plan = plan_cluster_coalesce(ranges);
+    let mut fetch = plan.fetch_ranges.clone();
+    fetch.push(extra);
+    let mut fetched = source.get_ranges_parallel_async(&fetch).await?;
+    let extra_bytes = fetched.pop();
+    Ok((apply_coalesce(&plan, &fetched), extra_bytes))
 }
 
 fn get_cluster_ranges_coalesced(
     source: &Source,
     ranges: &[Range<usize>],
 ) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
-    if ranges.len() <= 1 {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ranges.len() == 1 {
         return source.get_ranges_parallel(ranges);
     }
+    let plan = plan_cluster_coalesce(ranges);
+    let fetched = source.get_ranges_parallel(&plan.fetch_ranges)?;
+    Ok(apply_coalesce(&plan, &fetched))
+}
 
-    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
-    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
-
-    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
-    for (idx, range) in sorted {
-        if let Some((merged, payload_len, members)) = groups.last_mut() {
-            let gap = range.start.saturating_sub(merged.end);
-            let merged_end = merged.end.max(range.end);
-            let new_payload_len = *payload_len + range.len();
-            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
-            if range.start <= merged.end
-                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
-                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
-            {
-                merged.end = merged_end;
-                *payload_len = new_payload_len;
-                members.push((idx, range));
-                continue;
-            }
-        }
-        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+/// Async sibling of [`get_cluster_ranges_coalesced`].
+async fn get_cluster_ranges_coalesced_async(
+    source: &Source,
+    ranges: &[Range<usize>],
+) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
     }
-
-    if groups.len() == ranges.len() {
-        return source.get_ranges_parallel(ranges);
+    if ranges.len() == 1 {
+        return source.get_ranges_parallel_async(ranges).await;
     }
-
-    let merged_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
-    let merged_bytes = source.get_ranges_parallel(&merged_ranges)?;
-    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
-    for ((merged_range, _, members), bytes) in groups.into_iter().zip(merged_bytes) {
-        for (idx, range) in members {
-            let start = range.start - merged_range.start;
-            out[idx] = Some(bytes.slice(start..start + range.len()));
-        }
-    }
-
-    Ok(out
-        .into_iter()
-        .map(|b| b.expect("every cluster range filled"))
-        .collect())
+    let plan = plan_cluster_coalesce(ranges);
+    let fetched = source.get_ranges_parallel_async(&plan.fetch_ranges).await?;
+    Ok(apply_coalesce(&plan, &fetched))
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
@@ -2279,6 +2583,36 @@ mod tests {
         assert_eq!(r1.n_docs(), r2.n_docs());
     }
 
+    #[test]
+    fn public_rerank_mult_honors_requested_value() {
+        let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let fp32 = VectorReader::open(blob, &json).expect("open fp32 VectorReader");
+        assert_eq!(fp32.public_rerank_mult("embedding", 4), 4);
+
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "embedding".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register Sq8 column");
+        for i in 0..32u32 {
+            let v: Vec<f32> = (0..16)
+                .map(|j| ((i.wrapping_mul(31) + j as u32) % 100) as f32 * 0.01)
+                .collect();
+            b.add(0, &v).expect("add to vector builder");
+        }
+        let sq8 = VectorReader::open(
+            Bytes::from(b.finish().expect("finish Sq8 vector builder")),
+            r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#,
+        )
+        .expect("open Sq8 VectorReader");
+        assert_eq!(sq8.public_rerank_mult("embedding", 4), 4);
+    }
+
     #[tokio::test]
     async fn search_self_query_returns_self_as_top1() {
         let dim = 16;
@@ -2367,6 +2701,46 @@ mod tests {
         assert_eq!(centroid.len(), 16);
         assert!(radius >= 0.0);
         assert!(r.summary("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_clusters_async_probing_all_matches_full_nprobe() {
+        // The externally-selected path probing *every* cluster must
+        // recover the same top-k set as a full-nprobe `search_async` —
+        // same shortlist, same rerank. (Compared as a set: equal
+        // distances could tie-break differently across cluster-visit
+        // orders.)
+        use std::collections::HashSet;
+        let (blob, json, all) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let q = &all[0];
+        let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
+
+        let full = r
+            .search_async("v", q, k, n_cent as usize, rerank)
+            .await
+            .expect("search_async");
+        let probed = r
+            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank)
+            .await
+            .expect("search_clusters_async");
+
+        assert!(!full.is_empty(), "self-query returns hits");
+        assert_eq!(full.len(), probed.len(), "same number of hits");
+        let full_ids: HashSet<u32> = full.iter().map(|(id, _)| *id).collect();
+        let probed_ids: HashSet<u32> = probed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            full_ids, probed_ids,
+            "probing all clusters must match a full-nprobe search"
+        );
+
+        // Probing no clusters returns nothing.
+        let none = r
+            .search_clusters_async("v", q, k, &[], rerank)
+            .await
+            .expect("search_clusters_async empty");
+        assert!(none.is_empty(), "probing no clusters returns no hits");
     }
 
     // -----------------------------------------------------------------

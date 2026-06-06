@@ -708,6 +708,7 @@ mod tests {
         VectorSummary {
             centroid,
             radius: seed * 1.7,
+            clusters: crate::supertable::manifest::ClusterCentroids::empty(),
         }
     }
 

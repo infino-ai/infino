@@ -230,6 +230,12 @@ impl MmapTextCorpus {
         self.offsets.len().saturating_sub(1)
     }
 
+    /// Total logical text bytes across all docs — the ingest input
+    /// payload size, used to report build bandwidth in MB/s.
+    pub fn total_bytes(&self) -> u64 {
+        self.offsets.last().copied().unwrap_or(0) - self.offsets.first().copied().unwrap_or(0)
+    }
+
     pub fn doc(&self, idx: usize) -> &str {
         let start = self.offsets[idx] as usize;
         let end = self.offsets[idx + 1] as usize;
@@ -549,9 +555,7 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = reader
-            .vector_search(column, q, k, opts)
-            .expect("vector_search");
+        let hits = block_on_inmem(reader.vector_search(column, q, k, opts)).expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -666,8 +670,7 @@ pub fn calibrate_superfile(
                 .with_rerank_mult(refine);
             let p50 = p50_micros(
                 || {
-                    let _ = reader
-                        .vector_search(column, q, k, opts)
+                    let _ = block_on_inmem(reader.vector_search(column, q, k, opts))
                         .expect("vector_search");
                 },
                 p50_iter,

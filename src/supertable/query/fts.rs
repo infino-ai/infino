@@ -62,10 +62,8 @@ use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
-use crate::supertable::reader_cache::SuperfileReaderCache;
 
 use super::SuperfileHit;
-use super::skip::{fts_bloom_skip, fts_prefix_skip};
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -97,13 +95,8 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let storage = manifest.options.storage.as_ref().map(Arc::clone);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
-        let tombstone_cache = self.tombstone_cache.clone();
-        let now = std::time::Instant::now();
 
         // Tokenize ONCE at the orchestrator. The pre-tokenized
         // term slice is reused both for the list-level + per-
@@ -115,104 +108,62 @@ impl SupertableReader {
         let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
 
-        // Hierarchical pruning. Walk the manifest list (when
-        // persisted) → list-level bloom-union skip → lazy-
-        // load only the surviving parts → flatten → per-
-        // segment skip + fan-out. When there's no list
-        // (in-process-only supertable), fall back to the
-        // flat superfiles view directly.
-        let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
-            Some(list) => {
-                let kept = crate::supertable::manifest::list_prune::prune_parts_for_fts_terms(
-                    list,
-                    &column_owned,
-                    &term_refs,
-                    mode,
-                );
-                crate::supertable::query::hierarchical_iter::load_and_flatten(
-                    manifest.as_ref(),
-                    &kept,
-                )
-                .await?
-            }
-            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-                manifest.as_ref(),
-            ),
-        };
-        if superfiles.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mask = fts_bloom_skip(&superfiles, &column_owned, &term_refs, mode);
-
-        // Build the work-unit list. When the reader pool has more
-        // threads than there are kept superfiles AND we're on the
-        // multi-term OR hot path (where sub-range fan-out is
-        // implemented and useful), slice each segment into
-        // doc_id sub-ranges so the par_iter can saturate every pool
-        // thread. Single-term OR and AND stay on the un-ranged
-        // call: single-term BMW already finishes in microseconds,
-        // and AND uses the full-decode + HashMap path which doesn't
-        // have a range variant yet.
-        let kept: Vec<&Arc<SuperfileEntry>> = superfiles
-            .iter()
-            .zip(mask.iter())
-            .filter_map(|(entry, keep)| if *keep { Some(entry) } else { None })
-            .collect();
+        // Segment selection via the shared two-tier prune
+        // (`query::prune::select_segments`): part-level bloom-union
+        // skip → lazy-load surviving parts → per-segment bloom skip.
+        // FTS exact search is the single-`TermPresence`-leaf case of
+        // the same path SQL scalar filtering uses.
+        let kept = crate::supertable::query::prune::select_segments(
+            manifest.as_ref(),
+            &[crate::supertable::query::prune::PruneLeaf::TermPresence {
+                column: column_owned.clone(),
+                terms: term_strings.clone(),
+                mode,
+            }],
+        )
+        .await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-        let work_units = build_or_work_units(&kept, mode, term_refs.len(), pool_threads);
+
+        // Build the work-unit list. When the reader pool has more
+        // threads than there are kept superfiles AND we're on the
+        // multi-term OR hot path, slice each segment into doc_id
+        // sub-ranges so the fan-out can saturate every pool thread.
+        // Single-term OR and AND stay on the un-ranged call.
+        let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
+        let work_units = build_or_work_units(&kept_refs, mode, term_refs.len(), pool_threads);
+        let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
+            work_units.into_iter().map(|u| (u.entry, u.range)).collect();
 
         let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
         let column_arc = Arc::new(column_owned);
 
-        let handles: Vec<_> = work_units
-            .into_iter()
-            .map(|unit| {
-                let store = Arc::clone(&store);
-                let disk_cache = disk_cache.clone();
-                let storage = storage.clone();
-                let column_arc = Arc::clone(&column_arc);
-                let term_arc = Arc::clone(&term_arc);
-                let tombstone_cache = tombstone_cache.clone();
-                tokio::spawn(async move {
-                    let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &unit.entry)
-                        .await?;
-                    let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                    let hits = match unit.range {
-                        Some((start, end)) => r
-                            .bm25_search_or_range_pretokenized(
-                                &column_arc,
-                                &term_refs,
-                                k,
-                                start,
-                                end,
-                            )
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
-                        None => r
-                            .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
-                    };
-                    let mut tagged = tag_hits(&unit.entry, hits);
-                    apply_tombstone_filter(
-                        tombstone_cache.as_ref(),
-                        &unit.entry,
-                        &mut tagged,
-                        now,
-                    )?;
-                    Ok::<_, QueryError>(tagged)
-                })
-            })
-            .collect();
-
-        let per_unit: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
-            handles
-                .into_iter()
-                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
-        )
-        .await?;
+        // One shared fan-out (`query::dispatch::fanout`) — the same
+        // orchestrator the vector path uses. It warms the tombstone
+        // sidecars in one batch, opens each segment reader and runs the
+        // kernel under `tokio::spawn` so cold GETs overlap, then tags +
+        // tombstone-filters each unit's hits. The per-unit `params` is
+        // the optional doc-id sub-range; `None` searches the whole
+        // segment.
+        let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
+            let column_arc = Arc::clone(&column_arc);
+            let term_arc = Arc::clone(&term_arc);
+            async move {
+                let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                match range {
+                    Some((start, end)) => r
+                        .bm25_search_or_range_pretokenized(&column_arc, &term_refs, k, start, end)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                    None => r
+                        .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                }
+            }
+        };
+        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
 
         Ok(top_k_descending(per_unit, k))
     }
@@ -240,14 +191,9 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let storage = manifest.options.storage.as_ref().map(Arc::clone);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
-        let tombstone_cache = self.tombstone_cache.clone();
-        let now = std::time::Instant::now();
 
         // Manifest-level term-range skip uses the same
         // lowercased prefix bytes the v1 tokenizer +
@@ -256,99 +202,52 @@ impl SupertableReader {
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();
 
-        // hierarchical pruning. List-level prefix
-        // skip via term_range_union → lazy-load only the
-        // surviving parts → flatten → per-segment
-        // term-range skip + fan-out.
-        let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
-            Some(list) => {
-                let kept = crate::supertable::manifest::list_prune::prune_parts_for_fts_prefix(
-                    list,
-                    &column_owned,
-                    prefix_lower.as_bytes(),
-                );
-                crate::supertable::query::hierarchical_iter::load_and_flatten(
-                    manifest.as_ref(),
-                    &kept,
-                )
-                .await?
-            }
-            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-                manifest.as_ref(),
-            ),
-        };
-        if superfiles.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mask = fts_prefix_skip(&superfiles, &column_owned, prefix_lower.as_bytes());
-
-        // Same sub-range fan-out logic as `bm25_search` (multi-term
-        // OR path). Prefix expansion always produces ≥1 term per
-        // segment; treating each segment's expanded form as "≥2
-        // terms" for the work-unit heuristic is the common case
-        // (the bench's `term0009*` expands to 10 terms in each
-        // segment's FST). Where the prefix matches only a single
-        // term we still fan out — the extra sub-ranges become
-        // independent single-term BMM walks, marginally slower per
-        // sub-range than the un-ranged BMW path but still faster
-        // overall when threads >> superfiles.
-        let kept: Vec<&Arc<SuperfileEntry>> = superfiles
-            .iter()
-            .zip(mask.iter())
-            .filter_map(|(entry, keep)| if *keep { Some(entry) } else { None })
-            .collect();
+        // Segment selection via the shared two-tier prune — the
+        // single-`Prefix`-leaf case (part-level term-range skip →
+        // lazy-load surviving parts → per-segment term-range skip).
+        let kept = crate::supertable::query::prune::select_segments(
+            manifest.as_ref(),
+            &[crate::supertable::query::prune::PruneLeaf::Prefix {
+                column: column_owned.clone(),
+                prefix: prefix_lower.as_bytes().to_vec(),
+            }],
+        )
+        .await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-        // Use n_terms=2 as a stand-in for "multi-term OR enabled"
-        // since the prefix path always runs BoolMode::Or and the
-        // expansion typically yields ≥2 terms at the scales we
-        // care about.
-        let work_units = build_or_work_units(&kept, BoolMode::Or, 2, pool_threads);
+
+        // Same sub-range fan-out logic as `bm25_search`. `n_terms=2`
+        // stands in for "multi-term OR enabled" — the prefix path
+        // always runs BoolMode::Or and expansion typically yields ≥2
+        // terms at the scales we care about.
+        let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
+        let work_units = build_or_work_units(&kept_refs, BoolMode::Or, 2, pool_threads);
+        let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
+            work_units.into_iter().map(|u| (u.entry, u.range)).collect();
 
         let column_arc = Arc::new(column_owned);
         let prefix_arc = Arc::new(prefix_owned);
 
-        let handles: Vec<_> = work_units
-            .into_iter()
-            .map(|unit| {
-                let store = Arc::clone(&store);
-                let disk_cache = disk_cache.clone();
-                let storage = storage.clone();
-                let column_arc = Arc::clone(&column_arc);
-                let prefix_arc = Arc::clone(&prefix_arc);
-                let tombstone_cache = tombstone_cache.clone();
-                tokio::spawn(async move {
-                    let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &unit.entry)
-                        .await?;
-                    let hits = match unit.range {
-                        Some((start, end)) => r
-                            .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
-                        None => r
-                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
-                    };
-                    let mut tagged = tag_hits(&unit.entry, hits);
-                    apply_tombstone_filter(
-                        tombstone_cache.as_ref(),
-                        &unit.entry,
-                        &mut tagged,
-                        now,
-                    )?;
-                    Ok::<_, QueryError>(tagged)
-                })
-            })
-            .collect();
-
-        let per_unit: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
-            handles
-                .into_iter()
-                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
-        )
-        .await?;
+        // Shared fan-out — see `bm25_search` for the rationale; the
+        // kernel differs only in calling the prefix search variants.
+        let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
+            let column_arc = Arc::clone(&column_arc);
+            let prefix_arc = Arc::clone(&prefix_arc);
+            async move {
+                match range {
+                    Some((start, end)) => r
+                        .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                    None => r
+                        .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                }
+            }
+        };
+        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
 
         Ok(top_k_descending(per_unit, k))
     }
@@ -471,63 +370,6 @@ fn build_or_work_units(
         }
     }
     units
-}
-
-async fn open_reader(
-    store: &Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
-    storage: Option<&Arc<dyn crate::storage::StorageProvider>>,
-    entry: &SuperfileEntry,
-) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(
-        store,
-        disk_cache,
-        storage,
-        &entry.uri,
-        entry.subsection_offsets.as_ref(),
-    )
-    .await
-    .map_err(|e| QueryError::Store(e.to_string()))
-}
-
-fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
-    hits.into_iter()
-        .map(|(local_doc_id, score)| SuperfileHit {
-            segment: entry.uri,
-            local_doc_id,
-            score,
-        })
-        .collect()
-}
-
-/// Drop tombstoned `local_doc_id`s from one superfile's hit list.
-/// Looked up against the per-process [`SidecarCache`]; an absent
-/// cache (in-memory-only supertable) or an empty bitmap is the
-/// O(1) short-circuit that keeps the hot path free of work when
-/// no tombstones exist.
-///
-/// `now` is a per-query `Instant` hoisted from the orchestrator so
-/// every per-superfile call shares one timestamp for the cache's
-/// TTL check.
-///
-/// [`SidecarCache`]: crate::supertable::tombstones::SidecarCache
-fn apply_tombstone_filter(
-    cache: Option<&Arc<crate::supertable::tombstones::SidecarCache>>,
-    entry: &SuperfileEntry,
-    hits: &mut Vec<SuperfileHit>,
-    now: std::time::Instant,
-) -> Result<(), QueryError> {
-    let Some(cache) = cache else {
-        return Ok(());
-    };
-    let bitmap = cache
-        .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
-        return Ok(());
-    }
-    hits.retain(|h| !bitmap.contains(h.local_doc_id));
-    Ok(())
 }
 
 /// Merge per-segment hits and return the top-k by *descending*

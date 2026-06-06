@@ -14,42 +14,25 @@
 //!
 //! ## Strategy
 //!
-//! Each visible segment becomes one [`MemTable`] partition. At
-//! `query_sql` time we:
+//! At `query_sql` time we:
 //!
 //!   1. Pin the manifest (`self.reader()` → `Arc<Manifest>`).
-//!   2. Fetch every segment's `SuperfileReader` from the store.
-//!   3. Eagerly read all parquet row groups into `RecordBatch`es
-//!      via `ParquetRecordBatchReaderBuilder` (sync, on the calling
-//!      thread; no rayon fan-out yet).
-//!   4. Build a single `MemTable` whose partition list mirrors
-//!      the manifest order, and register it as `supertable` in a
+//!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
-//!   5. `ctx.sql(sql).await.collect().await`.
+//!   3. `ctx.sql(sql).await.collect().await`.
 //!
-//! No manifest-level skip is wired into this path in v1: every
-//! segment is scanned.
+//! The provider's `scan` does the real work — see
+//! [`crate::supertable::query::provider`]. In short, it applies
+//! **two tiers of pruning**: infino's [`scalar_skip`] drops
+//! definitely-irrelevant *segments* from the pushed-down `WHERE`
+//! predicates, then DataFusion's `ParquetSource` prunes *row
+//! groups / pages* and pushes projection + limit into the Parquet
+//! reader over the surviving segments. This replaces the v1
+//! `MemTable` path, which eagerly decoded every row group of every
+//! segment regardless of the query.
 //!
-//! TODO: replace this MemTable wrapper with a custom
-//! `TableProvider` whose `scan` consults per-segment min/max
-//! via DataFusion's `PruningPredicate` against the
-//! `ScalarStatsTable` already populated by the writer at commit
-//! time. The per-segment stats are ready; the `TableProvider`
-//! integration needs a perf bench that motivates the wiring
-//! with measured pruning gains, not speculative ones.
-//!
-//! ## Why MemTable
-//!
-//! The in-memory `SuperfileReaderCache` already holds every segment's
-//! parquet bytes; eagerly decoding them into Arrow shifts the cost
-//! from `execute()` time to `register_table()` time but doesn't
-//! change the working set. DataFusion still applies `FilterExec`
-//! above the MemTable, so per-batch predicate filtering works as
-//! expected. Per-row-group pushdown into parquet is the next
-//! optimization — the right home for it is a custom
-//! `TableProvider` that hands DataFusion a `ParquetExec` per
-//! non-pruned segment, layered on top of the manifest-level
-//! skip helpers.
+//! [`scalar_skip`]: crate::supertable::query::skip::scalar_skip
+//! [`SupertableProvider`]: crate::supertable::query::provider::SupertableProvider
 //!
 //! ## Schema
 //!
@@ -64,20 +47,11 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
-use bytes::Bytes;
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::Supertable;
-use crate::supertable::manifest::Manifest;
-use crate::supertable::reader_cache::SuperfileReaderCache;
-
-/// Logical name the supertable is registered under in the
-/// DataFusion `SessionContext`. Callers reference it as
-/// `FROM supertable` in their SQL.
-const TABLE_NAME: &str = "supertable";
+use crate::supertable::query::provider::{SupertableProvider, TABLE_NAME};
 
 impl Supertable {
     /// Run a SQL query against this supertable's pinned snapshot.
@@ -95,30 +69,22 @@ impl Supertable {
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        // Apply the read-consistency policy before pinning, so SQL
+        // honors the same freshness contract as the search APIs
+        // (`bm25_search` / `vector_search`): under `Strong` /
+        // `BoundedStaleness` this advances the in-memory snapshot to
+        // the latest published manifest; under `Snapshot` (and for
+        // in-memory tables) it is a no-op. See
+        // [`Supertable::ensure_fresh`].
         self.ensure_fresh();
-        let reader = self.reader();
-        let manifest = Arc::clone(reader.manifest());
-        let store = Arc::clone(&self.options().store);
-        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-        let storage = self.options().storage.as_ref().map(Arc::clone);
-        let scalar_schema = self.options().scalar_schema();
-        let tombstone_cache = reader.tombstone_cache.clone();
+
+        // Build (or reuse the cached) SessionContext for the pinned
+        // snapshot — the pushdown-aware SupertableProvider plus the
+        // search TVFs. See [`Supertable::sql_session_context`].
+        let ctx = self.sql_session_context()?;
 
         let sql = sql.to_owned();
-
         let drive = async move {
-            let table = build_mem_table(
-                scalar_schema,
-                manifest,
-                store,
-                disk_cache,
-                storage,
-                tombstone_cache,
-            )
-            .await?;
-            let ctx = SessionContext::new();
-            ctx.register_table(TABLE_NAME, Arc::new(table))
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -128,18 +94,78 @@ impl Supertable {
                 .map_err(|e| QueryError::Execute(e.to_string()))
         };
 
-        // same ambient-runtime detection pattern the
-        // writer's persist_commit uses. Lazy-init the owned
-        // query_runtime only when there's NO ambient runtime —
-        // calling `Builder::new_multi_thread().build()` from
-        // inside another runtime panics with "Cannot start a
-        // runtime from within a runtime". Web handlers,
-        // `#[tokio::test]`s, and any async caller now get a
-        // working query_sql.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.query_runtime().block_on(drive),
+        // Drive through the shared sync→async bridge: ambient
+        // runtime → block_in_place on the ambient handle; otherwise
+        // the lazily-built owned query_runtime. See
+        // [`Supertable::block_on_query`].
+        self.block_on_query(drive)
+    }
+
+    /// Build (or reuse the cached) [`SessionContext`] for the
+    /// current pinned manifest snapshot: the pushdown-aware
+    /// [`SupertableProvider`] registered as `supertable`, plus the
+    /// vector / BM25 / hybrid search TVFs.
+    ///
+    /// The cache keys on the manifest `Arc` — commits publish a new
+    /// `Arc`, so any committed state since the last call forces a
+    /// rebuild. A hit skips the ~1.5 ms `SessionContext::new()` +
+    /// `register_*` setup. Shared by [`query_sql`](Self::query_sql)
+    /// (SQL string) and [`scan_ids_matching`](Self::scan_ids_matching)
+    /// (programmatic `Expr`), so mutation id-capture gets the same
+    /// segment-skip + row-group/page pruning + lazy tombstone
+    /// filtering the read path uses.
+    ///
+    /// Callers apply their own freshness policy
+    /// ([`ensure_fresh`](Self::ensure_fresh)) before calling.
+    fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
+        // ArcSwap::load_full is a single atomic load + Arc clone, so
+        // pinning the snapshot is cheap even on the hot path.
+        let reader = Arc::new(self.reader());
+        let manifest = Arc::clone(reader.manifest());
+
+        let mut guard = self
+            .sql_session_cache()
+            .lock()
+            .expect("sql_session_cache mutex poisoned");
+        if let Some((cached, ctx)) = &*guard
+            && Arc::ptr_eq(cached, &manifest)
+        {
+            return Ok(ctx.clone());
         }
+
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let provider = SupertableProvider::new(
+            Arc::clone(&scalar_schema),
+            Arc::clone(&manifest),
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table(TABLE_NAME, Arc::new(provider))
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
+        // the pinned snapshot. They lower to custom `ExecutionPlan`
+        // nodes that call the async kernels inside `execute()`.
+        crate::supertable::query::exec::vector_exec::register_vector_search(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
+        crate::supertable::query::exec::fts_exec::register_bm25(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
+        crate::supertable::query::exec::hybrid_exec::register_hybrid_search(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
+        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        Ok(ctx)
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -147,11 +173,13 @@ impl Supertable {
     /// capture the target-id set at call time (step 0a in the
     /// update / delete pipeline).
     ///
-    /// Plan shape mirrors [`query_sql`]: build a `MemTable` over
-    /// the current manifest, register as `supertable`, apply
-    /// `expr` as a filter via DataFusion's `DataFrame::filter`,
-    /// project just `_id`, drain into a `Vec<i128>`. No
-    /// `TableProvider` is introduced.
+    /// Runs through the same pushdown-aware [`SupertableProvider`]
+    /// as `query_sql` (via [`sql_session_context`](Self::sql_session_context)):
+    /// `expr` is applied as a `DataFrame::filter` and the result
+    /// projected to just `_id`. Segment skip, row-group / page
+    /// pruning, and lazy tombstone filtering all apply, so a
+    /// large-table delete/update predicate never materializes every
+    /// segment into memory.
     ///
     /// Note: the resolution is against the **current** manifest
     /// snapshot, exactly like a contemporaneous `query_sql` would
@@ -163,28 +191,16 @@ impl Supertable {
         &self,
         expr: datafusion::prelude::Expr,
     ) -> Result<Vec<i128>, QueryError> {
-        let reader = self.reader();
-        let manifest = Arc::clone(reader.manifest());
-        let store = Arc::clone(&self.options().store);
-        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-        let storage = self.options().storage.as_ref().map(Arc::clone);
-        let scalar_schema = self.options().scalar_schema();
-        let tombstone_cache = reader.tombstone_cache.clone();
+        // Resolve against the freshest snapshot the consistency
+        // policy allows — the spec requires delete/update predicates
+        // to bind "against the current snapshot at call time", which
+        // means honoring `Strong` / `BoundedStaleness` just like the
+        // read APIs do. No-op under `Snapshot` / in-memory tables.
+        self.ensure_fresh();
+        let ctx = self.sql_session_context()?;
         let id_column = self.options().id_column.clone();
 
         let drive = async move {
-            let table = build_mem_table(
-                scalar_schema,
-                manifest,
-                store,
-                disk_cache,
-                storage,
-                tombstone_cache,
-            )
-            .await?;
-            let ctx = SessionContext::new();
-            ctx.register_table(TABLE_NAME, Arc::new(table))
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
             let df = ctx
                 .table(TABLE_NAME)
                 .await
@@ -200,10 +216,7 @@ impl Supertable {
             extract_id_column(&batches)
         };
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
-            Err(_) => self.query_runtime().block_on(drive),
-        }
+        self.block_on_query(drive)
     }
 }
 
@@ -234,151 +247,6 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
         }
     }
     Ok(out)
-}
-
-/// Read every segment in the manifest and assemble a `MemTable`
-/// with one partition per segment.
-///
-/// A `MemTable` requires at least one partition even if all
-/// partitions are empty — DataFusion errors otherwise. For an
-/// empty supertable we emit a single empty partition so
-/// `SELECT COUNT(*)` returns 0 and `SELECT *` yields an empty
-/// result, instead of surfacing the planner's "No partitions
-/// provided" check to the caller.
-///
-/// **M15c — hierarchical pruning.** When the manifest carries
-/// a persisted `list` (storage-backed), walk the list's parts,
-/// lazy-load each (or hit the OnceCell in eager mode), and
-/// build one MemTable partition per segment across all kept
-/// parts. SQL-level list-pruning (extracting predicates from
-/// the parsed DataFusion plan to drive a `prune_parts_for_*`
-/// call) is **deferred** — DataFusion's plan-rewrite hooks
-/// don't surface predicates until after `MemTable` providers
-/// have built their partition list, so a pushdown-aware
-/// variant requires either a custom `TableProvider` (significant
-/// new code) or a pre-parse pass. Ships the "load all
-/// parts" SQL path; exact-term BM25 + prefix BM25 + vector
-/// queries get list-prune via their dedicated entry points.
-async fn build_mem_table(
-    schema: Arc<arrow_schema::Schema>,
-    manifest: Arc<Manifest>,
-    store: Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
-    storage: Option<Arc<dyn crate::storage::StorageProvider>>,
-    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-) -> Result<MemTable, QueryError> {
-    // route through the hierarchical iterator when
-    // the manifest has a persisted list (which includes
-    // both eager + lazy modes). For in-process supertables
-    // with no list, the fallback returns the flat
-    // `manifest.superfiles` view.
-    let superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = match manifest.list.as_ref() {
-        Some(list) => {
-            let kept: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)
-                .await?
-        }
-        None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
-            manifest.as_ref(),
-        ),
-    };
-    // One `Instant::now()` for the entire SQL query so each
-    // per-superfile tombstone lookup shares the same TTL
-    // reference. Matches the FTS / vector hot-path budget.
-    let now = std::time::Instant::now();
-    let mut partitions: Vec<Vec<RecordBatch>> = Vec::with_capacity(superfiles.len().max(1));
-    for entry in &superfiles {
-        let reader = crate::supertable::query::superfile_reader::superfile_reader(
-            &store,
-            disk_cache.as_ref(),
-            storage.as_ref(),
-            &entry.uri,
-            entry.subsection_offsets.as_ref(),
-        )
-        .await
-        .map_err(|e| QueryError::Store(e.to_string()))?;
-        let parquet = reader
-            .parquet_bytes()
-            .ok_or_else(|| {
-                QueryError::Plan(format!(
-                    "SQL pass-through requires eager-opened superfile bytes; \
-                     reader for {:?} was opened via the lazy path which does \
-                     not materialize the full segment",
-                    entry.uri
-                ))
-            })?
-            .clone();
-        let mut batches = read_all_batches(parquet)?;
-        if let Some(cache) = tombstone_cache.as_ref() {
-            apply_tombstone_filter_to_batches(cache, entry.superfile_id, &mut batches, now)?;
-        }
-        partitions.push(batches);
-    }
-    if partitions.is_empty() {
-        partitions.push(Vec::new());
-    }
-    MemTable::try_new(schema, partitions).map_err(|e| QueryError::Plan(e.to_string()))
-}
-
-/// Drop tombstoned rows from one superfile's batches before they
-/// reach DataFusion's `MemTable`. The local doc-id of row `i` in
-/// batch `b` is `row_offset(b) + i`, where `row_offset(b)` sums
-/// the lengths of all batches preceding `b` within the superfile.
-///
-/// Empty-bitmap short-circuits the entire loop so a tombstone-free
-/// superfile pays nothing beyond the cache lookup.
-fn apply_tombstone_filter_to_batches(
-    cache: &Arc<crate::supertable::tombstones::SidecarCache>,
-    superfile_id: uuid::Uuid,
-    batches: &mut Vec<RecordBatch>,
-    now: std::time::Instant,
-) -> Result<(), QueryError> {
-    let bitmap = cache
-        .bitmap_for(superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
-        return Ok(());
-    }
-    let mut row_offset: u32 = 0;
-    let mut filtered: Vec<RecordBatch> = Vec::with_capacity(batches.len());
-    for batch in batches.drain(..) {
-        let n = batch.num_rows() as u32;
-        // Build a boolean mask. `true` keeps the row; `false`
-        // drops it. We allocate once per batch — the typical
-        // batch is row-group-sized (~64K rows) so this is one
-        // small allocation per superfile-batch combination.
-        let mask: Vec<bool> = (0..n).map(|i| !bitmap.contains(row_offset + i)).collect();
-        // Fast-path: every row keeps → no filter call needed.
-        if mask.iter().all(|b| *b) {
-            row_offset += n;
-            filtered.push(batch);
-            continue;
-        }
-        let mask_array = arrow_array::BooleanArray::from(mask);
-        let kept = arrow::compute::filter_record_batch(&batch, &mask_array)
-            .map_err(|e| QueryError::Parquet(format!("filter_record_batch: {e}")))?;
-        row_offset += n;
-        filtered.push(kept);
-    }
-    *batches = filtered;
-    Ok(())
-}
-
-/// Eagerly drain a parquet file into `Vec<RecordBatch>`.
-///
-/// `ParquetRecordBatchReaderBuilder::try_new(bytes)` is zero-copy:
-/// `Bytes` implements `ChunkReader` directly, so the builder reads
-/// the footer in place. `build()` returns a sync iterator yielding
-/// row-group-sized batches.
-fn read_all_batches(bytes: Bytes) -> Result<Vec<RecordBatch>, QueryError> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-    let reader = builder
-        .build()
-        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-    reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| QueryError::Parquet(e.to_string()))
 }
 
 #[cfg(test)]
@@ -582,6 +450,73 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_equality_on_fts_column_across_segments_is_correct() {
+        // Equality on the FTS-indexed `title` column drives the new
+        // term-bloom prune leaf (plus the scalar min/max leaf). The two
+        // segments whose bloom lacks "bravo" may be pruned, but the
+        // result must still be exactly the one matching row — proving
+        // the bloom prune never drops a match.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(0, &["x"], &["alpha"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        w.append(&build_cat_batch(10, &["y"], &["bravo"]))
+            .expect("a2");
+        w.commit().expect("c2");
+        w.append(&build_cat_batch(20, &["z"], &["charlie"]))
+            .expect("a3");
+        w.commit().expect("c3");
+        assert_eq!(st.reader().n_superfiles(), 3);
+
+        assert_eq!(
+            run_count(&st, "SELECT COUNT(*) FROM supertable WHERE title = 'bravo'"),
+            1
+        );
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'nonexistent'"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn query_sql_multiword_equality_on_fts_column_is_correct() {
+        // Multi-word literal: the equality lowers to a `TermPresence`
+        // leaf over {rust, async, runtime} (AND). The second segment's
+        // bloom lacks those tokens and is pruned, yet results are exact
+        // — DataFusion's FilterExec re-applies the full string equality.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(0, &["lang"], &["rust async runtime"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        w.append(&build_cat_batch(10, &["lang"], &["python data science"]))
+            .expect("a2");
+        w.commit().expect("c2");
+        assert_eq!(st.reader().n_superfiles(), 2);
+
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'rust async runtime'"
+            ),
+            1
+        );
+        // Tokens present in segment 1, but no row equals this exact
+        // string — the prune is an optimization, correctness holds.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'rust async'"
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn query_sql_select_orders_ids_across_segments() {
         // Verifies row identity round-trips through MemTable +
         // DataFusion: rows planted across two superfiles come back
@@ -637,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn query_runtime_is_cached_across_calls() {
+    fn query_sql_runtime_is_cached_across_calls() {
         // Two queries on the same supertable must share one
         // Runtime — the OnceLock guarantees this; we assert by
         // checking that both calls succeed without spawning a

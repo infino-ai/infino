@@ -21,26 +21,47 @@ and as a search index by infino's reader.
 ## Quick example
 
 ```rust
-use infino::superfile::{
-    SuperfileReader, VectorSearchOptions, bm25_search, vector_search,
-};
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field, Schema};
+use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::reader::BoolMode;
-use bytes::Bytes;
+use infino::superfile::vector::distance::Metric;
+use infino::superfile::VectorSearchOptions;
+use infino::supertable::{Supertable, SupertableOptions};
 
-// Read a superfile (built via SuperfileBuilder).
-let bytes: Bytes = std::fs::read("my.superfile")?.into();
-let reader = SuperfileReader::open(bytes)?;
+const DIM: usize = 384;
 
-// BM25 search over the embedded FTS blob:
-let hits = bm25_search(&reader, "title", "rust async", 10, BoolMode::Or)?;
+// A full-text `title` column + an `embedding` vector column. The `_id`
+// column is injected by the supertable — don't declare it yourself.
+let schema = Arc::new(Schema::new(vec![
+    Field::new("title", DataType::LargeUtf8, false),
+    Field::new(
+        "embedding",
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM as i32),
+        false,
+    ),
+]));
+let options = SupertableOptions::new(
+    schema,
+    vec![FtsConfig { column: "title".into() }],
+    vec![VectorConfig::new("embedding".into(), DIM, 256, 0, Metric::Cosine)],
+    None, // default tokenizer
+)?;
+let table = Supertable::open(options)?;
 
-// kNN search over the embedded vector blob:
+// BM25 over the FTS index — synchronous, fans out across segments for you:
+let hits = table.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+
+// kNN over the vector index:
 let query = vec![/* dim=384 f32s */];
-let hits = vector_search(&reader, "embedding", &query, 10,
-                         VectorSearchOptions::default())?;
+let hits = table.vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
 
-// And the same bytes are a valid Parquet file — register them
-// with DataFusion / DuckDB / pyarrow and treat as a regular table.
+// Or query it as SQL — DataFusion under the hood, and every segment is a
+// valid Parquet file you can also hand to DuckDB / pyarrow directly:
+let batches = table.query_sql(
+    "SELECT _id, title FROM bm25_search('title', 'rust async', 10)",
+)?;
 ```
 
 ## Development

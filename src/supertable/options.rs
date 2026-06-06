@@ -75,15 +75,6 @@ fn default_writer_thread_count() -> usize {
     num_cpus::get().div_ceil(2).max(1)
 }
 
-/// Default cap for memory-heavy vector shard builds inside a single
-/// writer commit. Derived from the writer-pool width rather than a
-/// fixed number: keep meaningful write parallelism while avoiding
-/// the pathological "one resident vector builder per writer thread"
-/// peak on large vector supertables.
-fn default_max_concurrent_vector_builds(writer_threads: usize) -> usize {
-    writer_threads.div_ceil(2).max(1)
-}
-
 /// Default reader-pool size: every logical core. Reader fan-out
 /// across non-pruned superfiles saturates this pool.
 fn default_reader_thread_count() -> usize {
@@ -186,17 +177,6 @@ pub struct SupertableOptions {
     /// Pool used by writer commit-time rayon-shard. Default:
     /// half the logical cores.
     pub writer_pool: Arc<ThreadPool>,
-    /// Upper bound on simultaneously active vector-bearing shard
-    /// builds inside one writer commit. The writer pool can still
-    /// have many threads; this cap only limits the memory-heavy
-    /// `SuperfileBuilder` work for vector columns so a wide writer
-    /// pool does not multiply the vector builder working set by the
-    /// full CPU count.
-    ///
-    /// Default: half of the writer-pool width, rounded up. This keeps
-    /// multi-writer commits parallel while bounding the vector-builder
-    /// resident set.
-    pub max_concurrent_vector_builds: usize,
     /// Where superfile bytes live. Shared across reader threads
     /// and the writer. Default: `InMemoryReaderCache`.
     pub store: Arc<dyn SuperfileReaderCache>,
@@ -499,7 +479,6 @@ impl SupertableOptions {
             tokenizer,
             reader_pool,
             writer_pool,
-            max_concurrent_vector_builds: default_max_concurrent_vector_builds(writer_threads),
             store,
             storage: None,
             disk_cache: None,
@@ -587,16 +566,6 @@ impl SupertableOptions {
     /// Override the writer thread pool.
     pub fn with_writer_pool(mut self, pool: Arc<ThreadPool>) -> Self {
         self.writer_pool = pool;
-        self
-    }
-
-    /// Bound how many vector-bearing shard builds may be active at once
-    /// inside a single writer commit. Values < 1 are clamped to 1. This
-    /// is independent of [`Self::with_writer_pool`]: callers can keep a
-    /// wide pool for scheduling while capping the resident vector-builder
-    /// working set.
-    pub fn with_max_concurrent_vector_builds(mut self, n: usize) -> Self {
-        self.max_concurrent_vector_builds = n.max(1);
         self
     }
 
@@ -788,10 +757,6 @@ impl SupertableOptions {
             .supertable
             .writer_threads
             .resolve_or_default(default_writer_thread_count());
-        let max_vector_builds = cfg
-            .supertable
-            .max_concurrent_vector_builds
-            .resolve_or_default(default_max_concurrent_vector_builds(writer_n));
 
         self.reader_pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
@@ -807,7 +772,6 @@ impl SupertableOptions {
                 .build()
                 .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
         );
-        self.max_concurrent_vector_builds = max_vector_builds;
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         if cfg.supertable.id_column != self.id_column {
@@ -1306,7 +1270,6 @@ mod tests {
 supertable:
   reader_threads: 3
   writer_threads: 5
-  max_concurrent_vector_builds: 2
   commit_threshold_size_mb: 7
 "#;
         let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
@@ -1321,7 +1284,6 @@ supertable:
         assert_eq!(opts.commit_threshold_size_mb, 7);
         assert_eq!(opts.reader_pool.current_num_threads(), 3);
         assert_eq!(opts.writer_pool.current_num_threads(), 5);
-        assert_eq!(opts.max_concurrent_vector_builds, 2);
     }
 
     #[test]
@@ -1338,10 +1300,8 @@ supertable:
 
         let reader_default = num_cpus::get().max(1);
         let writer_default = num_cpus::get().div_ceil(2).max(1);
-        let max_vector_default = writer_default.div_ceil(2).max(1);
         assert_eq!(opts.reader_pool.current_num_threads(), reader_default);
         assert_eq!(opts.writer_pool.current_num_threads(), writer_default);
-        assert_eq!(opts.max_concurrent_vector_builds, max_vector_default);
         assert_eq!(opts.commit_threshold_size_mb, 1024);
         assert_eq!(opts.id_column, "_id");
     }

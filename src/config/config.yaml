@@ -32,21 +32,12 @@
 # Env overrides (note the double underscore for nesting):
 #   INFINO_SUPERTABLE__READER_THREADS=8
 #   INFINO_SUPERTABLE__WRITER_THREADS=4
-#   INFINO_SUPERTABLE__MAX_CONCURRENT_VECTOR_BUILDS=2
 #   INFINO_SUPERTABLE__ID_COLUMN=row_id
 #   INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB=2048
 #   INFINO_SUPERTABLE__VERIFY_CRC_ON_OPEN=false
 supertable:
   reader_threads: auto
   writer_threads: auto
-
-  # Maximum number of vector-bearing shard builds active inside
-  # one writer commit. `auto` resolves from writer_threads to a
-  # bounded default, so a wide writer pool still schedules work
-  # concurrently without making every vector builder resident at
-  # the same time. Use an explicit integer after measuring a
-  # workload-specific memory/throughput point.
-  max_concurrent_vector_builds: auto
 
   # Name of the system-managed primary-key column the supertable
   # injects on every append(). The column type is fixed by the

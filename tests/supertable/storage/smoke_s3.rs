@@ -502,3 +502,145 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
     eprintln!("[real-s3] cleanup OK; deleted keys under prefix={prefix}");
     result.expect("real S3 integration failed");
 }
+
+/// TVF lane over the S3 wire protocol: exercises
+/// `bm25_search`, `vector_search`, and `hybrid_search`
+/// end-to-end through `query_sql` (DataFusion plan -> custom
+/// `TableProvider` -> custom exec -> kernel -> resolve to
+/// `_id`) against an S3-backed supertable. The existing
+/// `supertable_smoke_via_s3_wire_protocol` covers
+/// `SELECT COUNT(*)` (provider scan path); this one covers the
+/// search TVFs, which is where the retrieval engine actually
+/// earns its keep on object storage.
+///
+/// Asserts `cache.stats().n_cold_fetches` grew across the
+/// three queries — proves the TVF reads went through the
+/// s3s-fs server (HTTP get_range), not a local short-circuit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
+    if std::env::var("INFINO_TEST_S3").is_err() {
+        eprintln!(
+            "supertable_tvfs_through_query_sql_via_s3_wire_protocol: skipped \
+             (set INFINO_TEST_S3=1 to enable)"
+        );
+        return;
+    }
+
+    let (addr, _fs_root_guard) = spawn_s3s_fs().await;
+    let endpoint = format!("http://{}", addr);
+    let dim = 16;
+    eprintln!("[m16-tvf] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+
+    // Producer: writes a title (FTS) + emb (vector) batch
+    // through the S3 wire protocol.
+    {
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            S3StorageProvider::new_with_endpoint(
+                &endpoint,
+                TEST_BUCKET,
+                TEST_ACCESS_KEY,
+                TEST_SECRET_KEY,
+                TEST_REGION,
+            )
+            .expect("s3 provider for tvf producer"),
+        );
+        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)))
+            .expect("create tvf producer");
+        let mut w = producer.writer().expect("tvf producer writer");
+        w.append(&real_s3_batch(dim))
+            .expect("append unified vector+FTS batch");
+        w.commit().expect("tvf producer commit via S3");
+        assert_eq!(producer.manifest_id(), 1);
+    }
+
+    // Consumer: opens via the same S3 endpoint + a disk
+    // cache. TVF reads cold-fetch through HTTP get_range.
+    let consumer_storage: Arc<dyn StorageProvider> = Arc::new(
+        S3StorageProvider::new_with_endpoint(
+            &endpoint,
+            TEST_BUCKET,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+        )
+        .expect("s3 provider for tvf consumer"),
+    );
+    let cache_dir = TempDir::new().expect("tvf cache tempdir");
+    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+
+    let consumer = Supertable::open(
+        real_s3_options(dim)
+            .with_storage(Arc::clone(&consumer_storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("Supertable::open via S3 (tvf consumer)");
+    assert_eq!(consumer.manifest_id(), 1);
+    assert_eq!(consumer.reader().n_docs_total(), 8);
+
+    let pre = cache.stats();
+
+    // One-hot query vector at dim 0. `real_s3_batch` row 0
+    // has emb[0]=1.0, so doc 0 is the closest vector match.
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let q_csv = q
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    fn count_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    // 1. bm25_search through query_sql. The corpus has "alpha"
+    //    in exactly two titles ("alpha vector one", "alpha
+    //    vector two"), so the TVF must return >= 2 rows.
+    let bm25 = consumer
+        .query_sql("SELECT _id FROM bm25_search('title', 'alpha', 10)")
+        .expect("bm25_search via query_sql over S3");
+    assert!(
+        count_rows(&bm25) >= 2,
+        "bm25_search('alpha') should return >=2 docs over S3; got {}",
+        count_rows(&bm25)
+    );
+
+    // 2. vector_search through query_sql. k=3.
+    let vec_sql = format!("SELECT _id FROM vector_search('emb', '{q_csv}', 3)");
+    let vector = consumer
+        .query_sql(&vec_sql)
+        .expect("vector_search via query_sql over S3");
+    assert!(
+        count_rows(&vector) >= 1,
+        "vector_search returned no rows over S3"
+    );
+
+    // 3. hybrid_search through query_sql. RRF fusion over the
+    //    same two retrievers; k=5.
+    let hybrid_sql =
+        format!("SELECT _id FROM hybrid_search('title', 'alpha', 'emb', '{q_csv}', 5)");
+    let hybrid = consumer
+        .query_sql(&hybrid_sql)
+        .expect("hybrid_search via query_sql over S3");
+    let hyb_rows = count_rows(&hybrid);
+    assert!(
+        hyb_rows > 0 && hyb_rows <= 5,
+        "hybrid_search rows in (0, 5]; got {hyb_rows}"
+    );
+
+    // 4. Cold-fetch counter grew -> confirms TVF reads went
+    //    through the S3 wire path, not a local short-circuit.
+    let post = cache.stats();
+    assert!(
+        post.n_cold_fetches > pre.n_cold_fetches,
+        "TVF queries must cold-fetch through S3; pre={} post={}",
+        pre.n_cold_fetches,
+        post.n_cold_fetches
+    );
+
+    eprintln!(
+        "[m16-tvf] bm25 / vector / hybrid via query_sql over S3 OK; \
+         n_cold_fetches={} cache_bytes={}",
+        post.n_cold_fetches, post.current_bytes
+    );
+}

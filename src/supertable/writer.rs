@@ -57,6 +57,7 @@ use rayon::prelude::*;
 
 use crate::superfile::builder::SuperfileBuilder;
 
+use super::build::fanout_shards;
 use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
@@ -348,17 +349,6 @@ impl SupertableWriter {
         Ok(())
     }
 
-    /// Drain the buffer, partition across the writer pool, and
-    /// publish all shard outputs as new superfiles in one manifest
-    /// swap. No-op (returns Ok) if the buffer is empty.
-    ///
-    /// Shard count = `min(writer_pool.threads, total_rows)`. Rows
-    /// are balanced evenly across shards regardless of the user's
-    /// `append()` cadence — a single 10M-row `append` followed by
-    /// `commit` on an 8-thread pool produces 8 shards of ~1.25M
-    /// rows each, the same as 8 separate `append` calls of 1.25M
-    /// rows each. This decouples ingest parallelism from the
-    /// caller's batching pattern.
     /// Buffer a delete operation. Every row whose `_id`
     /// matches `predicate` at call time will be tombstoned by
     /// the next [`commit`] call.
@@ -808,6 +798,10 @@ impl SupertableWriter {
     /// outputs in one manifest swap. Internal-only; the public
     /// [`SupertableWriter::commit`] calls this first before
     /// driving pending mutations.
+    ///
+    /// Rows are balanced evenly across shards regardless of the
+    /// caller's `append()` cadence — many small appends followed by
+    /// one `commit` produce the same shard layout as one large append.
     fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -833,26 +827,12 @@ impl SupertableWriter {
             .collect();
         let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
 
-        let max_active_vector_builds = if self.inner.options.vector_columns.is_empty() {
-            n_shards
-        } else {
-            self.inner
-                .options
-                .max_concurrent_vector_builds
-                .max(1)
-                .min(n_shards)
-        };
-
-        let outputs: Vec<ShardOutput> = writer_pool.install(|| -> Result<Vec<_>, BuildError> {
-            let mut outputs = Vec::with_capacity(shards.len());
-            for chunk in shards.chunks(max_active_vector_builds) {
-                let mut chunk_outputs = chunk
-                    .par_iter()
-                    .map(|slice| build_one_shard(slice.as_slice(), &self.inner.options))
-                    .collect::<Result<Vec<_>, _>>()?;
-                outputs.append(&mut chunk_outputs);
-            }
-            Ok(outputs)
+        // One shared fan-out for every modality — FTS, vector, combined.
+        // No per-modality concurrency cap: rayon's work-stealing balances
+        // the inter-shard fan-out against each shard's intra-shard
+        // parallelism on the writer pool (see `build::fanout_shards`).
+        let outputs: Vec<ShardOutput> = fanout_shards(&writer_pool, &shards, |slice| {
+            build_one_shard(slice.as_slice(), &self.inner.options)
         })?;
 
         publish_superfiles(&self.inner, outputs)?;
@@ -1241,7 +1221,25 @@ fn prepare_segment(
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
             if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
-                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, radius });
+                // Stage the per-cluster centroids (Sq8) into the
+                // manifest so a query can rank this segment's clusters
+                // globally without opening the segment.
+                let clusters = vec_reader
+                    .cluster_centroids(&vc.column)
+                    .map(|(n_cent, dim, fp32, counts)| {
+                        crate::supertable::manifest::ClusterCentroids::from_fp32(
+                            n_cent, dim, &fp32, counts,
+                        )
+                    })
+                    .unwrap_or_default();
+                vector_summary.insert(
+                    vc.column.clone(),
+                    VectorSummary {
+                        centroid,
+                        radius,
+                        clusters,
+                    },
+                );
             }
         }
     }
@@ -2351,6 +2349,22 @@ mod tests {
             .expect("emb vector summary present");
         assert_eq!(vs.centroid.len(), dim);
         assert!(vs.radius >= 0.0);
+        // Per-cluster centroids are staged into the manifest for
+        // cross-segment global cluster selection.
+        assert!(
+            !vs.clusters.is_empty(),
+            "cluster centroids must be populated"
+        );
+        assert_eq!(vs.clusters.dim as usize, dim);
+        assert!(vs.clusters.n_cent >= 1);
+        assert_eq!(vs.clusters.counts.len(), vs.clusters.n_cent as usize);
+        assert_eq!(vs.clusters.mins.len(), vs.clusters.n_cent as usize);
+        assert_eq!(vs.clusters.scales.len(), vs.clusters.n_cent as usize);
+        assert_eq!(vs.clusters.codes.len(), vs.clusters.n_cent as usize * dim);
+        // Every indexed doc lands in exactly one cluster, so the
+        // per-cluster counts sum to the segment's doc count.
+        let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();
+        assert_eq!(total, seg.n_docs);
     }
 
     // ---- rayon-shard parallelism -------------------------------------

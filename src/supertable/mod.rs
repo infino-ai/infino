@@ -20,6 +20,7 @@
 //! - [`handle`] — `Supertable` (clone-shared handle) and
 //!   `SupertableReader` (snapshot-pinned reader).
 
+pub(crate) mod build;
 pub mod error;
 pub mod handle;
 pub mod lazy_source;
