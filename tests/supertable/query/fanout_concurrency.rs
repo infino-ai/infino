@@ -5,7 +5,7 @@
 //!
 //! ## The hazard this pins
 //!
-//! Every public search call is **sync** (002 Q9): it `block_on`s the
+//! Every public search call is **sync**: it `block_on`s the
 //! supertable's shared query runtime. Underneath, `fanout` spawns one
 //! tokio task per segment for the I/O wave, and each per-segment kernel
 //! offloads its scoring onto the global **rayon** pool. Driving that

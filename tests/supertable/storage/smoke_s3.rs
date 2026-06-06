@@ -1,4 +1,4 @@
-//! 003 M16 — supertable smoke through the S3 wire protocol.
+//! Supertable smoke through the S3 wire protocol.
 //!
 //! Stands up an in-process s3s-fs server on a random port,
 //! points `S3StorageProvider` at it, and runs a small
@@ -42,7 +42,7 @@
 //!   a fixed dummy credential pair. Real-AWS validation
 //!   requires AWS credentials + a test bucket; out of scope
 //!   for an in-process smoke.
-//! - Concurrent writers (M11's OCC retry is exercised
+//! - Concurrent writers (the OCC retry is exercised
 //!   end-to-end in `tests/supertable_concurrent_processes.rs`
 //!   against LocalFS; the S3 path uses S3 CAS natively, no
 //!   read-then-overwrite window, so behavior is identical
@@ -71,7 +71,7 @@ use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-const TEST_BUCKET: &str = "infino-m16-smoke";
+const TEST_BUCKET: &str = "infino-s3-smoke";
 const TEST_REGION: &str = "us-east-1";
 const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -242,7 +242,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
 
     let (addr, _fs_root_guard) = spawn_s3s_fs().await;
     let endpoint = format!("http://{}", addr);
-    eprintln!("[m16] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+    eprintln!("[s3-smoke] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
 
     // Quick provider-level smoke before invoking the full
     // writer path — isolates "the S3 provider works at all"
@@ -258,14 +258,14 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             )
             .expect("s3 provider for probe"),
         );
-        let probe_bytes = bytes::Bytes::from_static(b"hello-m16");
+        let probe_bytes = bytes::Bytes::from_static(b"hello-smoke");
         storage
             .put_atomic("probe/hello.txt", probe_bytes.clone())
             .await
             .expect("probe put_atomic");
         let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
         assert_eq!(got, probe_bytes, "probe round-trip mismatch");
-        eprintln!("[m16] probe round-trip OK (PUT + GET via S3 wire)");
+        eprintln!("[s3-smoke] probe round-trip OK (PUT + GET via S3 wire)");
     }
 
     // Producer: writes through the S3 wire protocol.
@@ -289,7 +289,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         w.commit().expect("producer commit via S3");
         assert_eq!(producer.manifest_id(), 1);
         eprintln!(
-            "[m16] producer commit OK; manifest_id={}",
+            "[s3-smoke] producer commit OK; manifest_id={}",
             producer.manifest_id()
         );
     }
@@ -324,7 +324,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         "recovered n_docs_total mismatch"
     );
     eprintln!(
-        "[m16] consumer open OK; manifest_id={} n_superfiles={} n_docs_total={}",
+        "[s3-smoke] consumer open OK; manifest_id={} n_superfiles={} n_docs_total={}",
         consumer.manifest_id(),
         consumer.reader().n_superfiles(),
         consumer.reader().n_docs_total()
@@ -345,11 +345,11 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         post.n_cold_fetches
     );
     eprintln!(
-        "[m16] cold-fetch via S3 OK; n_cold_fetches={} cache_bytes={}",
+        "[s3-smoke] cold-fetch via S3 OK; n_cold_fetches={} cache_bytes={}",
         post.n_cold_fetches, post.current_bytes
     );
 
-    eprintln!("[m16] smoke done");
+    eprintln!("[s3-smoke] smoke done");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -529,7 +529,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     let (addr, _fs_root_guard) = spawn_s3s_fs().await;
     let endpoint = format!("http://{}", addr);
     let dim = 16;
-    eprintln!("[m16-tvf] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+    eprintln!("[s3-smoke-tvf] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
 
     // Producer: writes a title (FTS) + emb (vector) batch
     // through the S3 wire protocol.
@@ -639,7 +639,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     );
 
     eprintln!(
-        "[m16-tvf] bm25 / vector / hybrid via query_sql over S3 OK; \
+        "[s3-smoke-tvf] bm25 / vector / hybrid via query_sql over S3 OK; \
          n_cold_fetches={} cache_bytes={}",
         post.n_cold_fetches, post.current_bytes
     );

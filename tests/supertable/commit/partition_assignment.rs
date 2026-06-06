@@ -1,12 +1,12 @@
-//! 003 M15a — partition-aware writer + part-reuse.
+//! Partition-aware writer + part-reuse.
 //!
-//! Covers the load-bearing M15a invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **Default strategy = `Hash{n_buckets: 1}`.** The
 //!     single-bucket Hash strategy is observationally
 //!     equivalent to today's "one part per commit" path,
-//!     so existing tests stay green AND the M15a code path
-//!     is exercised on every commit. Multi-commit
+//!     so existing tests stay green AND the partition-split
+//!     code path is exercised on every commit. Multi-commit
 //!     scenarios exercise part-reuse: each commit's
 //!     `ManifestPart` rebuilds the prior part's superfiles +
 //!     the commit's new ones.

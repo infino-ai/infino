@@ -1256,7 +1256,7 @@ mod diag {
             drop(cache_dir);
         }
 
-        // ── Phase 2b: cold-open HINTED (M6, 1 RTT parallel) ─────────
+        // ── Phase 2b: cold-open HINTED (1 RTT parallel) ─────────────
         eprintln!(
             "[diag] === cold-open HINTED via cache.reader_with_hints (3 fresh-cache iters) ==="
         );
@@ -1880,7 +1880,7 @@ mod diag {
             .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
             .unwrap_or_default();
 
-        // Mirror the writer's M7 open-blob capture: parquet tail
+        // Mirror the writer's open-blob capture: parquet tail
         // (64 KiB) + each vec/fts open range, sliced inline so the
         // diagnostic exercises the zero-open-GET cold path.
         const PARQUET_TAIL_SPEC: u64 = 64 * 1024;

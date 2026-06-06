@@ -364,8 +364,9 @@ pub struct SuperfileEntry {
     /// the values are by construction consistent with what the
     /// parquet KV metadata would later say).
     ///
-    /// `None` on segments produced by pre-M6 writers; the cold
-    /// open path falls back to the 2-RTT shape (parquet tail
+    /// `None` on segments produced by older writers that did not
+    /// stamp this field; the cold open path falls back to the
+    /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
@@ -418,7 +419,8 @@ pub struct SubsectionOffsets {
     /// postings) to 1 (postings only).
     ///
     /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
-    /// produced by pre-M7 writers, or when blob capture is disabled
+    /// produced by older writers that did not capture it, or when
+    /// blob capture is disabled
     /// — the path then falls back to fetching `vec_open_ranges` /
     /// `fts_open_ranges` over the wire.
     pub open_blob: Vec<(u64, Vec<u8>)>,

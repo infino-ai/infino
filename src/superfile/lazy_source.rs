@@ -496,7 +496,7 @@ impl LazyByteSource for LazySubSource {
 /// `open_lazy`, then the overlay is wrapped in `Arc` and
 /// shared by every subsequent read. The Vec is read-only after
 /// the open completes, so the racy-read-during-install pattern
-/// the M2 open path actually uses is single-threaded.
+/// the lazy open path actually uses is single-threaded.
 pub struct PrefetchedSource {
     inner: Arc<dyn LazyByteSource>,
     /// (absolute_start, bytes). One entry per pre-fetched

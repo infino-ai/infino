@@ -239,13 +239,13 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
 }
 
 // ============================================================
-// Plan 013 M4 — end-to-end cold-open range budget at the
-// superfile layer. The new `SuperfileReader::open_lazy`
+// End-to-end cold-open range budget at the
+// superfile layer. The `SuperfileReader::open_lazy`
 // routes through:
 //   1. `format::footer::read_parquet_metadata_lazy` — 1-2 GETs
 //      for the Parquet footer.
 //   2. `VectorReader::open_lazy` over a `LazySubSource` for
-//      the vector subsection — 2-3 GETs (M2 budget).
+//      the vector subsection — 2-3 GETs.
 //   3. One range GET for the FTS subsection (until
 //      `FtsReader::open_lazy` exists; the FTS sub-blob is
 //      bounded — typically << vector subsection).
@@ -257,7 +257,7 @@ use infino::superfile::vector::distance::normalize;
 use infino::test_helpers::default_vector_config;
 
 /// Build a small superfile that exercises both the vector and
-/// FTS sub-blobs so the M4 cold-open test can observe both
+/// FTS sub-blobs so the cold-open test can observe both
 /// sub-source paths in `open_lazy`. 4 docs × 16-dim vectors
 /// keeps the segment small but representative of the actual
 /// layout produced by `SuperfileBuilder`.
@@ -303,7 +303,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
     Bytes::from(b.finish().expect("finish"))
 }
 
-/// Plan 013 M4 — superfile-level cold-open via `open_lazy`
+/// Superfile-level cold-open via `open_lazy`
 /// stays within the documented byte budget. Asserts the upper
 /// bound (≤ 6 GETs) so adding small per-subsection follow-ups
 /// (e.g. a future codec-metadata range) doesn't silently inflate

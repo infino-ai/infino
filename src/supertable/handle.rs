@@ -321,7 +321,7 @@ impl Supertable {
         let list = list_mod::decode(&list_bytes)
             .map_err(|e| OpenError::ManifestListParse(format!("{e}")))?;
 
-        // D15: verify the caller's options match the
+        // Verify the caller's options match the
         // manifest's stamped digest. The all-zero stored
         // hash bypasses validation (legacy + synthetic
         // fixtures).
@@ -378,7 +378,7 @@ impl Supertable {
                 parts_map.insert(*pid, Arc::new(cell));
             }
         } else {
-            // Lazy path (M15b): each part gets an empty
+            // Lazy path: each part gets an empty
             // `OnceCell`; first `Manifest::part(id).await`
             // triggers a single storage GET for that part.
             // `superfile_list.superfiles` stays empty — legacy
@@ -521,7 +521,7 @@ impl Supertable {
 
         // Eager-fetch the missing ones in parallel — but
         // only when the total post-refresh part count is at
-        // or under the eager-load threshold (M15b). Above
+        // or under the eager-load threshold. Above
         // it, leave missing parts as empty `OnceCell`s for
         // lazy-load on first access, matching the lazy-open
         // semantics. Inherited parts (Arc::clone'd above)

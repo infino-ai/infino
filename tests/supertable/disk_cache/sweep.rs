@@ -1,4 +1,4 @@
-//! `MADV_DONTNEED` sweep thread — 003 M8.
+//! `MADV_DONTNEED` sweep thread.
 //!
 //! Covers:
 //! - sweep_once() advises mmap'd entries that have idled past
@@ -11,7 +11,7 @@
 //! - background thread starts when `mmap_cold_threshold_secs > 0`
 //!   and runs at the configured cadence
 //! - threshold=0 disables the sweep thread entirely
-//! - in-memory-bytes-backed entries (M7 hybrid foreground,
+//! - in-memory-bytes-backed entries (hybrid foreground,
 //!   not yet finalized) are skipped — only mmap'd entries
 //!   participate in the sweep
 
@@ -213,7 +213,7 @@ async fn recent_access_skipped_by_sweep_when_threshold_nonzero() {
 
 #[tokio::test]
 async fn in_memory_entries_not_yet_mmapped_are_skipped() {
-    // M7's hybrid path inserts an in-memory entry first,
+    // The hybrid path inserts an in-memory entry first,
     // then the background finalizer swaps it for mmap. If
     // we sweep BEFORE finalize runs, the in-memory entry
     // has `mmap: None` and the sweep skips it (it has no

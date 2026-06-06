@@ -339,7 +339,7 @@ fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
 
     // `subsection_offsets` lands as a separate
     // optional bytes field below. Parsed if present; defaulted to
-    // None for pre-M6 manifests so old parts decode losslessly
+    // None for older manifests so old parts decode losslessly
     // (the cold-open path falls back to the 2-RTT shape).
     let subsection_offsets = take_optional_bytes(&mut map, "subsection_offsets")?
         .map(|b| decode_subsection_offsets(&b))
@@ -438,7 +438,7 @@ fn take_optional_int(
 
 /// Pull an optional bytes field. Missing-key returns `Ok(None)` so
 /// new schema fields stay backward-compatible with parts emitted
-/// before they were added (plan 013 M6 `subsection_offsets`).
+/// before they were added (e.g. `subsection_offsets`).
 fn take_optional_bytes(
     map: &mut HashMap<String, AvroValue>,
     name: &'static str,

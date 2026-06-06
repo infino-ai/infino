@@ -413,7 +413,7 @@ async fn do_apply(
         // which is correct for the Hash{n_buckets=1} default.
         partition_key: Vec::new(),
         partition_hint: None,
-        // WAL-committed segments don't yet embed M7 open hints;
+        // WAL-committed segments don't yet embed open hints;
         // the reader falls back to fetching vec/fts open ranges
         // over the wire. Correct, just not 1-RTT-optimized — a
         // follow-up can mirror the writer's `build_subsection_offsets`.

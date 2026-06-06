@@ -1,4 +1,4 @@
-//! Writer write-through to storage — 003 M4.
+//! Writer write-through to storage.
 //!
 //! Covers the persistence path the writer takes when
 //! `SupertableOptions::with_storage(...)` is attached:
@@ -13,9 +13,8 @@
 //! - Two successive commits both publish (CAS works); the
 //!   second commit's manifest list references all superfiles
 //!   (existing + new).
-//! - In-memory queries still work post-commit (M5 will move
-//!   reads through the cache; M4 keeps the in-memory store
-//!   active for reads).
+//! - In-memory queries still work post-commit (the in-memory
+//!   store stays active for reads even with storage attached).
 //! - A supertable with NO storage attached takes the 002
 //!   path — no on-disk state, no regressions.
 
@@ -124,7 +123,7 @@ fn two_successive_commits_both_publish() {
     assert_eq!(n_lists, 2, "two list files (manifest_id 1 + 2)");
 
     // Manifest part count = 2 (each commit writes a fresh part
-    // under content-addressed URI; M4 single-partition mode
+    // under content-addressed URI; single-partition mode
     // means a fresh part per commit, no reuse).
     let manifests_dir = dir.path().join("manifests");
     let n_parts = std::fs::read_dir(&manifests_dir)
@@ -145,7 +144,7 @@ fn two_successive_commits_both_publish() {
 
 #[test]
 fn multipart_threshold_forces_segment_through_put_multipart() {
-    // D1: setting `put_multipart_threshold_bytes = 1` routes
+    // Setting `put_multipart_threshold_bytes = 1` routes
     // every segment through `put_multipart` instead of
     // `put_atomic`. Verifies the end-to-end shape:
     //   - commit succeeds (no panic, no error)
@@ -228,7 +227,7 @@ fn no_storage_attached_takes_002_path() {
 
 #[test]
 fn committed_supertable_remains_in_memory_queryable_for_now() {
-    // Pre-M5: storage write-through is additive — the
+    // Storage write-through is additive — the
     // in-memory store still holds segment bytes, so existing
     // 002 query paths keep working unchanged. Verifies no
     // regression to the FTS read path.
@@ -254,7 +253,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
             infino::supertable::query::fts::BoolMode::Or,
         )
         .expect("query");
-    assert_eq!(hits.len(), 1, "M4 commit must not break in-memory reads");
+    assert_eq!(hits.len(), 1, "commit must not break in-memory reads");
 }
 
 #[test]

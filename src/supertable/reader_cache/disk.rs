@@ -323,7 +323,7 @@ impl DiskCacheStore {
     /// instead of doing the parquet footer first and the
     /// subsection fetches second (2 RTTs).
     ///
-    /// `None` falls back to the pre-M6 2-RTT shape — same shape,
+    /// `None` falls back to the 2-RTT shape — same shape,
     /// slower. The other cold-fetch modes (`HybridWithPrefetch`,
     /// `RangeOnly`) ignore the hint today.
     pub async fn reader_with_hints(
@@ -508,8 +508,8 @@ impl DiskCacheStore {
     /// [`Supertable::create`](crate::supertable::Supertable::create)
     /// / [`Supertable::open`](crate::supertable::Supertable::open)
     /// to install a `Weak<SupertableInner>`-based closure
-    /// after the cache has been moved into the supertable
-    /// (M14b.1). The new closure takes effect on the next
+    /// after the cache has been moved into the supertable.
+    /// The new closure takes effect on the next
     /// eviction sweep; in-flight evictions complete with the
     /// previous closure (we clone the `Arc` before invoking).
     ///
@@ -528,7 +528,7 @@ impl DiskCacheStore {
     /// on the cache's resident memory — actual RSS is some
     /// subset (only pages that have been faulted in and not
     /// yet `madvise(MADV_DONTNEED)`'d by a sweep). Used by
-    /// [`crate::supertable::Supertable::stats`] (M14c) to
+    /// [`crate::supertable::Supertable::stats`] to
     /// report `mmap_resident_bytes` and to drive the
     /// budget-aware sweep in [`Self::sweep_for_budget`].
     pub fn current_mmap_size_bytes(&self) -> u64 {
@@ -1042,7 +1042,8 @@ impl DiskCacheStore {
                     overlay.install(*off, Bytes::copy_from_slice(bytes));
                 }
             } else {
-                // Pre-M7 fallback: fetch the open batch over the wire
+                // Fallback when no captured open blob is present:
+                // fetch the open batch over the wire
                 // (parquet tail + vec + fts ranges in parallel, 1 RTT).
                 let storage_for_parquet = Arc::clone(&self.storage);
                 let storage_for_vec = Arc::clone(&self.storage);
@@ -1645,7 +1646,7 @@ fn rollback_lazy_background_fill(
 /// resolves from mmap (zero S3 GETs).
 /// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
 /// full-segment promotion. When `INFINO_DISABLE_BG_FILL=1` (or
-/// `true`), the cold-fetch path installs the M7 open-blob overlay
+/// `true`), the cold-fetch path installs the open-blob overlay
 /// and serves the foreground query over range GETs, but never
 /// spawns the full-segment background download. Lets us measure
 /// the cold fan-out cost in isolation from the competing

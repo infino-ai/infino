@@ -35,7 +35,7 @@ pub enum ColdFetchMode {
     RangeOnly,
     /// foreground returns immediately with a
     /// [`SuperfileReader::open_lazy`]-built reader over a
-    /// [`StorageRangeSource`]; pays only the M1-M3 cold-open
+    /// [`StorageRangeSource`]; pays only the cold-open
     /// + cold-search byte budget against object storage
     /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB segment).
     /// A background task downloads the full segment to NVMe

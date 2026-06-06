@@ -1,4 +1,4 @@
-//! Atomic-rename pointer commit — 003 M3.
+//! Atomic-rename pointer commit.
 //!
 //! Covers the persistence primitives shipped by
 //! `manifest::commit`:
@@ -9,7 +9,7 @@
 //! - Second commit with a valid prev pointer succeeds.
 //! - Second commit with a STALE prev etag surfaces
 //!   `CommitError::WriteContentionExhausted` (the OCC
-//!   contention signal M11 will retry on).
+//!   contention signal the writer retries on).
 //! - **Part reuse**: a commit with `parts_to_write: []`
 //!   writes the manifest list + pointer but NO part files
 //!   (zero `put_atomic` calls into the parts namespace).
@@ -116,7 +116,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
 }
 
 /// Build a manifest list entry referencing an already-encoded
-/// part. Skip-summary aggregates left empty (M4/M9 territory).
+/// part. Skip-summary aggregates left empty here.
 fn entry_for(part: &ManifestPart) -> ManifestListEntry {
     let encoded = part_mod::encode(part, 3);
     let hash = ContentHash::of(&encoded);

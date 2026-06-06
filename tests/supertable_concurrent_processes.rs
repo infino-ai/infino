@@ -1,7 +1,7 @@
-//! 003 M11 — OCC on the manifest pointer (cross-process commits).
+//! OCC on the manifest pointer (cross-process commits).
 //!
-//! Plan §M11 calls for "fork two children, each commits
-//! concurrently, verify manifest-id sequence + final state."
+//! Two children fork, each commits concurrently, and the test
+//! verifies the manifest-id sequence + final state.
 //! This file simulates the cross-process scenario via two
 //! independent `Supertable` handles sharing the same on-disk
 //! storage. Each handle owns its own `writer_outstanding`
@@ -242,8 +242,8 @@ async fn retry_winner_sees_loser_segments_in_final_manifest() {
 /// Sequential commits across two handles — the second
 /// handle's first commit reads the persisted pointer + parts
 /// and chains its commit at manifest_id = 2 without ever
-/// hitting contention. Sanity check that the M11 path
-/// degenerates cleanly to the M10 non-contended case when no
+/// hitting contention. Sanity check that the contended-commit
+/// path degenerates cleanly to the non-contended case when no
 /// race occurs.
 #[test]
 fn sequential_commits_across_handles_no_retry_needed() {

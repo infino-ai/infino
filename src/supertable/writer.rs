@@ -951,7 +951,7 @@ fn build_one_shard(
 /// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`
 /// out of the freshly-written parquet KV metadata so the manifest
 /// can carry it forward as a [`SubsectionOffsets`]. Returns `None`
-/// if the bytes don't parse — that path falls back to the pre-M6
+/// if the bytes don't parse — that path falls back to the
 /// 2-RTT cold open shape rather than failing the publish.
 fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
     use crate::superfile::format::{footer::read_kv_metadata, kv};

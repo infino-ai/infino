@@ -1,7 +1,7 @@
-//! 003 M15b — lazy part-load above the eager-load
+//! Lazy part-load above the eager-load
 //! threshold.
 //!
-//! Covers the load-bearing M15b invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **Tiny manifest stays eager.** A supertable with 1
 //!     part + default threshold (4) eager-fetches: the
@@ -11,7 +11,7 @@
 //!   - **Large manifest goes lazy.** With > threshold
 //!     parts, open populates empty `OnceCell`s only — no
 //!     part bytes fetched. `superfile_list.superfiles` stays
-//!     empty until M15c lands the hierarchical query path.
+//!     empty until the hierarchical query path lands.
 //!   - **First `Manifest::part(id).await` lazy-loads
 //!     one.** Single storage GET for that part; the
 //!     OnceCell stays populated for subsequent calls (no
@@ -71,7 +71,7 @@ fn one_part_eager_fetches_under_default_threshold() {
 fn many_parts_skip_eager_fetch() {
     // target_superfiles_per_partition=1 + 5 single-segment
     // commits → 5 list entries, all sharing the same
-    // partition_key (the M15a split path). With default
+    // partition_key (the partition-split path). With default
     // threshold=4, 5 > 4 → lazy.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -99,8 +99,8 @@ fn many_parts_skip_eager_fetch() {
     assert_eq!(list.parts.len(), 5);
     assert!(
         m.superfile_list.superfiles.is_empty(),
-        "lazy mode leaves superfile_list.superfiles empty pending M15c; \
-         got {} superfiles",
+        "lazy mode leaves superfile_list.superfiles empty pending \
+         the hierarchical query path; got {} superfiles",
         m.superfile_list.superfiles.len()
     );
 

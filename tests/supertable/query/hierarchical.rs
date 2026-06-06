@@ -1,7 +1,7 @@
-//! 003 M15c — hierarchical query path with list-prune
+//! Hierarchical query path with list-prune
 //! integration.
 //!
-//! Covers the load-bearing M15c invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **List-level bloom-union prune.** With a
 //!     storage-backed multi-part manifest, an exact-term
@@ -13,7 +13,7 @@
 //!     `bm25_search_prefix` for a prefix that overlaps
 //!     one part's range loads only that part.
 //!   - **Vector list-prune deferred but path still
-//!     functional.** `vector_search` in M15c loads all
+//!     functional.** `vector_search` loads all
 //!     parts (iterative-cutoff prune is a follow-up); it
 //!     still must return correct results.
 //!   - **SQL list-prune deferred but path still
@@ -22,7 +22,7 @@
 //!   - **Eager-mode unchanged.** When all parts are
 //!     pre-loaded (n_parts ≤ eager_load_threshold), the
 //!     hierarchical iterator is observationally identical
-//!     to the pre-M15c flat iteration (every
+//!     to the flat iteration (every
 //!     `Manifest::part().await` hits a populated
 //!     OnceCell).
 
@@ -60,7 +60,7 @@ fn make_cache(
 }
 
 /// Build a producer that creates one part per commit (via
-/// target_superfiles_per_partition=1, the M15a split path),
+/// target_superfiles_per_partition=1, the partition-split path),
 /// then drop it. Returns the path to the storage root for
 /// the consumer to open against.
 fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
@@ -269,7 +269,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
 fn sql_loads_all_parts_returns_correct_count() {
     // SQL list-prune is deferred (DataFusion pushdown
     // through MemTable requires a custom TableProvider).
-    // M15c's SQL path loads all parts and returns correct
+    // The SQL path loads all parts and returns correct
     // aggregate results. The "loads all parts" property
     // is documented; the correctness property is asserted
     // here.
@@ -324,8 +324,8 @@ fn sql_loads_all_parts_returns_correct_count() {
 #[test]
 fn eager_mode_query_paths_observationally_unchanged() {
     // 1 part + default threshold (4) → eager mode. All
-    // query paths return the same results they did pre-
-    // M15c, and the OnceCell is populated from open (not
+    // query paths return the same results as the flat path,
+    // and the OnceCell is populated from open (not
     // first query).
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =

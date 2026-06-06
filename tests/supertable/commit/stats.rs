@@ -1,4 +1,4 @@
-//! `Supertable::stats()` — 003 M13.
+//! `Supertable::stats()`.
 //!
 //! Covers:
 //!   - Fresh `create` returns the empty-supertable stats:
@@ -93,7 +93,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
     // Producer's in-memory state after commit: list is set,
     // parts cache is empty (writer rebuilds state via
     // new_segment_list, doesn't hydrate the freshly-written
-    // part). M13 contract: report what's actually in memory.
+    // part). Contract: report what's actually in memory.
     let producer_stats = producer.stats();
     assert_eq!(producer_stats.manifest_id, 1);
     assert_eq!(
@@ -210,7 +210,7 @@ fn stats_without_disk_cache_have_none_cache_counters() {
 #[test]
 fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     // Cache attached, nothing read through it yet → all
-    // four counter fields are Some(0). This is the D6
+    // four counter fields are Some(0). This is the
     // contract: cold-fetch / eviction / madvise / entry
     // counts surface through `Supertable::stats()` even
     // before any activity, so downstream consumers can

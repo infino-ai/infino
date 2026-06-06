@@ -11,7 +11,7 @@
 //! becomes one `f32x8` register load; multiplication against the
 //! query lanes is one fused-multiply-add.
 //!
-//! ## AVX-512 fast path (plan 014 Phase 1)
+//! ## AVX-512 fast path
 //!
 //! On hosts with AVX-512F, [`BitQuantizer::estimate_dot_rotated_with_total`]
 //! takes a precomputed `q_total = Σ_d q_rot[d]` and computes the
@@ -32,9 +32,7 @@
 //! `q_total` so the per-candidate cost stays on the fast path.
 //!
 //! See `docs/architecture/superfile.md` (Vector index algorithm
-//! subsection) for the full RaBitQ rationale and recall trade-offs,
-//! and `014_simd_perf.md` in the `claude-plans` repo for the
-//! dispatch design.
+//! subsection) for the full RaBitQ rationale and recall trade-offs.
 
 use wide::{CmpGt, f32x8};
 
@@ -451,7 +449,7 @@ mod tests {
         let _q2 = q.clone();
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1) -----------------------------
+    // --- AVX-512 parity ------------------------------------------------
 
     /// Deterministic pseudo-random `f32` vector for parity tests.
     fn fake_vec(dim: usize, seed: u32) -> Vec<f32> {
@@ -531,7 +529,7 @@ mod tests {
         }
     }
 
-    // --- AVX-512 microbench (plan 014 — run by hand) -------------------
+    // --- AVX-512 microbench (run by hand) ------------------------------
     //
     // Direct head-to-head per-kernel timings. Run with:
     //

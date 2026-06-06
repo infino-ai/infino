@@ -288,7 +288,7 @@ pub struct SupertableOptions {
     /// `vector_search`, `query_sql`) iterate this flat view.
     ///
     /// **Lazy mode** leaves `Manifest.superfile_list.superfiles`
-    /// empty until the hierarchical query path (M15c) lands.
+    /// empty until the hierarchical query path lands.
     /// Until then, callers using lazy mode must drive
     /// `Manifest::part(id).await` directly; legacy
     /// flat-iteration queries return empty results.

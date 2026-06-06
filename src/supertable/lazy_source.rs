@@ -85,7 +85,7 @@ impl StorageRangeSource {
 
     /// Construct with a caller-provided size. Used by
     /// `DiskCacheStore::cold_fetch_lazy` when the cache layer
-    /// has already issued a HEAD (legacy path; M5 callers
+    /// has already issued a HEAD (callers that haven't
     /// prefer [`Self::with_unknown_size`] to skip the HEAD
     /// entirely).
     pub fn with_known_size(

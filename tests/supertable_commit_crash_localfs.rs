@@ -44,7 +44,7 @@
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
 //! filesystem behavior; s3s-fs's crash story is its own
-//! concern (and not gated on M12).
+//! concern.
 
 #![deny(clippy::unwrap_used)]
 
@@ -361,7 +361,7 @@ fn crash_post_list_on_second_commit_yields_v1() {
     assert_eq!(consumer.reader().n_superfiles(), 1);
 
     // Orphan v2 manifest list and v2 part are on disk —
-    // M12 tolerates them; 004's compaction GCs them.
+    // tolerated here; compaction GCs them later.
     let lists_dir = dir.join("manifest-lists");
     let n_lists = std::fs::read_dir(&lists_dir)
         .map(|rd| rd.count())

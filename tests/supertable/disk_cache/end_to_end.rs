@@ -1,7 +1,7 @@
-//! 003 M14b — disk-cache integration in the supertable
+//! Disk-cache integration in the supertable
 //! reader path.
 //!
-//! Covers the load-bearing M14b invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **Cache routing on cross-process consumer.** A
 //!     producer commits superfiles through storage + cache.
@@ -53,8 +53,8 @@ fn make_cache(
         ..Default::default()
     };
     // No-op pinned_fn for tests — pinning is a perf
-    // optimization, not a correctness requirement (cf. M14b
-    // commit notes: Arc<SuperfileReader> keeps the
+    // optimization, not a correctness requirement
+    // (Arc<SuperfileReader> keeps the
     // Arc<Mmap> alive even after the cache evicts the
     // entry, so in-flight queries finish correctly).
     let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
@@ -134,10 +134,10 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
 #[test]
 fn producer_with_cache_reads_through_cache_path() {
     // The producer commits with both storage AND cache
-    // attached. The writer's M14b refactor extracts
+    // attached. The writer extracts
     // summaries directly from the segment bytes (no
     // round-trip through options.store.put), so the
-    // in-memory tier is NOT populated. With M14b.2, the
+    // in-memory tier is NOT populated. The
     // writer additionally pre-populates the cache after
     // commit succeeds → the producer's own first query
     // hits the warm cache.
@@ -158,7 +158,7 @@ fn producer_with_cache_reads_through_cache_path() {
     w.commit().expect("commit");
     drop(w);
 
-    // M14b.2: post-commit the cache holds the warmed
+    // Post-commit the cache holds the warmed
     // segment. n_cold_fetches stays 0; n_entries == 1.
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
@@ -178,7 +178,7 @@ fn producer_with_cache_reads_through_cache_path() {
 
 #[test]
 fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
-    // M14b.2: with cache attached, the writer pre-populates
+    // With cache attached, the writer pre-populates
     // the cache after each successful commit. The
     // producer's own queries on its just-committed superfiles
     // hit the warm cache directly — no cold-fetch
@@ -386,7 +386,7 @@ fn pinned_fn_does_not_hold_supertable_alive() {
 
 #[test]
 fn memory_budget_drives_post_commit_madvise_sweep() {
-    // M14c: with both with_disk_cache + with_memory_budget,
+    // With both with_disk_cache + with_memory_budget,
     // the writer's post-commit path triggers
     // sweep_for_budget. With a budget below the working
     // set, the n_madvise_calls counter grows; without a
@@ -432,7 +432,7 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
 #[test]
 fn memory_budget_unset_does_not_force_sweep() {
     // Without with_memory_budget, the post-commit sweep
-    // doesn't fire — the cache's M8 idle-threshold sweep
+    // doesn't fire — the cache's idle-threshold sweep
     // is the only mechanism, and a sub-second test won't
     // trigger it.
     let storage_dir = TempDir::new().expect("storage tempdir");

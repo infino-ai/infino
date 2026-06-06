@@ -96,8 +96,8 @@ impl VectorConfig {
 /// in reservoir only and never compounds. design § "spill_threshold_bytes default".
 const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
-/// Per-column build-time state. After 010 M3, the column holds
-/// at most three independent buffers:
+/// Per-column build-time state. With the streaming build path
+/// the column holds at most three independent buffers:
 ///
 /// - [`Reservoir`]: bounded k-means training sample. Dropped at
 ///   the pass 1 → pass 2 boundary inside `build_subsection_streaming`.
@@ -297,7 +297,7 @@ impl VectorBuilder {
     ///
     /// The default sample size is `default_kmeans_sample_size(n_cent)`
     /// (`100K-500K` depending on `n_cent`). This override exists for
-    /// (a) the M2 sample-size sweep on synthetic recall corpora and
+    /// (a) sample-size sweeps on synthetic recall corpora and
     /// (b) future advanced callers that want to dial sample size to
     /// match a recall vs. memory trade-off they've profiled.
     ///
@@ -390,7 +390,7 @@ impl VectorBuilder {
     /// builder.
     ///
     /// Returns a `BuildError::Io` for the spill / scratch I/O
-    /// errors introduced by 010 M3. Callers that previously
+    /// errors of the streaming build. Callers that previously
     /// expected `-> Vec<u8>` need to `?` the result; the
     /// `SuperfileBuilder` shim does so already.
     pub fn finish(self) -> Result<Vec<u8>, BuildError> {
@@ -407,7 +407,6 @@ impl VectorBuilder {
 
     /// Streaming variant: write the final blob progressively to
     /// `w` without materialising it as a contiguous `Vec<u8>`.
-    /// M5.
     ///
     /// The output bytes (outer header, directory + dir CRC, each
     /// subsection, trailing outer CRC) are identical to those
@@ -423,8 +422,8 @@ impl VectorBuilder {
     /// each subsection's body); each subsection is dropped as
     /// soon as it has been written to `w`, so peak heap drops
     /// from `sum_of_subsection_sizes + final_blob_size` to
-    /// `max_subsection_size`. Per-subsection streaming (M6 / a
-    /// future plan) would push the floor lower still.
+    /// `max_subsection_size`. Per-subsection streaming would
+    /// push the floor lower still.
     ///
     /// Object-storage callers (003) can pass a multipart upload
     /// writer here so segment build never owns the full blob in
@@ -586,9 +585,8 @@ struct SubsectionBytes {
 /// Per-bucket BufWriter capacity. 64 KiB amortises one syscall
 /// per ~1300 dim=384 bucket rows (each row = 4 + code_bytes +
 /// dim*4 = ~1588 B). At very high n_cent (≥ 8192) the n_cent ×
-/// 64 KiB total dominates the resident set; M4 will revisit if
-/// profiling shows it. See plan 010 design § "Pass 2 memory
-/// footprint".
+/// 64 KiB total dominates the resident set; this is worth
+/// revisiting if profiling shows it.
 const BUCKET_BUF_SIZE: usize = 64 * 1024;
 
 /// Adaptive chunk size for pass 2: keeps `chunk_rotated`
@@ -606,7 +604,7 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
     cap_by_mem.clamp(1024, 65_536)
 }
 
-/// Build one column's subsection via the M3 streaming path.
+/// Build one column's subsection via the streaming path.
 /// Consumes the entire `ColumnState` so the reservoir +
 /// pre-spill buffer + spill file are released as soon as their
 /// contribution to the subsection is complete.
@@ -1605,8 +1603,8 @@ mod tests {
     }
 
     /// Streaming output to a `Cursor<Vec<u8>>` (the canonical
-    /// in-tree writer for testing streaming behaviour, per plan
-    /// 010 M5 acceptance criterion #4): the resulting bytes
+    /// in-tree writer for testing streaming behaviour): the
+    /// resulting bytes
     /// carry a valid outer magic + a valid trailing whole-blob
     /// CRC32C that round-trips when recomputed over the body.
     #[test]

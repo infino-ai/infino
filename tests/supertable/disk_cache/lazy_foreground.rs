@@ -1,6 +1,6 @@
-//! Plan 013 M4 — `ColdFetchMode::LazyForegroundWithBackgroundFill`
+//! `ColdFetchMode::LazyForegroundWithBackgroundFill`
 //! integration. The cold path returns a lazy reader
-//! immediately (paying only the M1-M3 cold-open byte budget
+//! immediately (paying only the cold-open byte budget
 //! against object storage), a background task waits for the
 //! foreground lazy reader to release, downloads the full
 //! segment to NVMe + mmaps it, and **any subsequent
@@ -182,7 +182,7 @@ async fn wait_for_mmap_promotion(
 // Tests.
 // ============================================================
 
-/// Plan 013 M4 — cold reader from
+/// cold reader from
 /// `LazyForegroundWithBackgroundFill` is functional
 /// immediately. The reader is FTS-queryable without waiting
 /// for the background segment fill; the warm-promotion
@@ -244,7 +244,7 @@ async fn lazy_background_fill_waits_for_foreground_reader_drop() {
     );
 }
 
-/// Plan 013 M4 — **the** invariant: after the background
+/// **the** invariant: after the background
 /// promotion completes, a second `reader(uri)` call returns
 /// the mmap-backed reader and the corresponding search
 /// resolves entirely from mmap — the counting storage proxy
@@ -311,7 +311,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
     );
 }
 
-/// Plan 013 M4 — concurrent cold readers on the same URI
+/// concurrent cold readers on the same URI
 /// coalesce through the `OnceCell` coordinator. All callers
 /// observe the same lazy reader; the background promotion
 /// runs exactly once.
@@ -347,7 +347,7 @@ async fn lazy_foreground_concurrent_cold_readers_coalesce_to_one_promotion() {
     );
 }
 
-/// Plan 013 M4 — the cold-path bandwidth profile is **2× per
+/// the cold-path bandwidth profile is **2× per
 /// cold miss** (per-query ranges + background full-segment
 /// download). This test documents that property by asserting
 /// the total `get_range` bytes are at least `segment_size`

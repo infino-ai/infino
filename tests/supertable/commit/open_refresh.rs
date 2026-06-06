@@ -1,4 +1,4 @@
-//! `Supertable::open` + read-path freshness (`Consistency`) — 003 M10.
+//! `Supertable::open` + read-path freshness (`Consistency`).
 //!
 //! Covers, entirely through the public API:
 //! - open against a persisted supertable written by another
@@ -54,10 +54,10 @@ fn open_sees_writes_made_by_a_different_handle() {
     assert_eq!(consumer.reader().n_superfiles(), 1);
     // Note: full query parity post-open requires the deferred
     // query-path integration through `DiskCacheStore` —
-    // M10's reader sees the manifest's segment list but
+    // the reader sees the manifest's segment list but
     // segment *bytes* live only in object storage and aren't
     // yet routed through the cache. That wiring is the next
-    // step. M10 validates the manifest-side open here; an
+    // step. This test validates the manifest-side open here; an
     // end-to-end query test on a post-open Supertable lands
     // when the cache-backed reader path ships.
 }
@@ -197,7 +197,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
 
 #[test]
 fn open_rejects_mismatched_options_via_options_hash() {
-    // D15: a producer commits with one schema; opening with
+    // A producer commits with one schema; opening with
     // a structurally-different schema (different column
     // name) must surface a typed `OptionsHashMismatch`
     // before any decode work happens.
@@ -252,7 +252,7 @@ fn open_rejects_mismatched_options_via_options_hash() {
 
 #[test]
 fn open_with_matching_options_succeeds_under_options_hash_validation() {
-    // D15 happy path: producer + consumer with identical
+    // Happy path: producer + consumer with identical
     // options round-trip cleanly.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =

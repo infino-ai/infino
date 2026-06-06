@@ -1,7 +1,6 @@
-//! Hybrid cold-fetch (`ColdFetchMode::HybridWithPrefetch`) —
-//! 003 M7.
+//! Hybrid cold-fetch (`ColdFetchMode::HybridWithPrefetch`).
 //!
-//! Builds on the M5 disk-cache infrastructure with the
+//! Builds on the disk-cache infrastructure with the
 //! foreground-broadcast-then-finalize architecture:
 //!
 //! - Range-GETs run in parallel and feed two consumers: the

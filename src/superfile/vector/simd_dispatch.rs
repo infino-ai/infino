@@ -16,8 +16,7 @@
 //! `is_x86_feature_detected!` chain.
 //!
 //! Flipping the env var after the first call has **no effect** —
-//! gates are sticky once cached. Plan + rationale in plan 014
-//! (`014_simd_perf.md` in the `claude-plans` repo).
+//! gates are sticky once cached.
 
 use std::sync::OnceLock;
 

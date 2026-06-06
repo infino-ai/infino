@@ -1,10 +1,10 @@
-//! Disk-cache layer with parallel cold fetch — 003 M5.
+//! Disk-cache layer with parallel cold fetch.
 //!
 //! Builds a tiny real superfile via `SuperfileBuilder`, puts
 //! it into a `LocalFsStorageProvider`, wraps that in a
 //! `CountingProxy` (so we can assert on `get_range` /
 //! `head` call counts), and exercises `DiskCacheStore`
-//! through the invariants the milestone promises:
+//! through the invariants it promises:
 //!
 //! - cold miss triggers cold-fetch (range-GETs to assemble
 //!   the segment file)

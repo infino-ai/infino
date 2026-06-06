@@ -60,7 +60,7 @@ impl Default for OpenOptions {
 
 pub struct SuperfileReader {
     /// Full Parquet bytes, `Some` only for the eager [`open`]
-    /// path. The lazy [`open_lazy`] path (013 M4) drops the
+    /// path. The lazy [`open_lazy`] path drops the
     /// whole-segment hold — pass-through SQL / external-Parquet
     /// callers (`parquet_bytes`) see `None` and must take a
     /// different path. Vector + FTS queries work on either,
@@ -100,7 +100,7 @@ impl SuperfileReader {
         Self::open_with(bytes, OpenOptions::default())
     }
 
-    /// Open a superfile via a shared [`LazyByteSource`] (013 M4).
+    /// Open a superfile via a shared [`LazyByteSource`].
     ///
     /// Cold-open range budget:
     ///
@@ -427,7 +427,7 @@ impl SuperfileReader {
     /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
     ///
     /// Returns `None` for readers opened via [`open_lazy`] — the
-    /// lazy path (013 M4) does not materialize the full segment,
+    /// lazy path does not materialize the full segment,
     /// so external-Parquet pass-throughs need either the eager
     /// [`open`] path or an explicit `LazyByteSource::range(0, size)`
     /// against the source.
@@ -846,7 +846,7 @@ impl SuperfileReader {
     /// search surfaces are `async` so the supertable fan-out can drive
     /// every segment concurrently on the shared query runtime. The
     /// public `Supertable` API remains strictly sync; it wraps these
-    /// kernels in `block_on_query` (plan 002 Q9). Per-range byte access
+    /// kernels in `block_on_query`. Per-range byte access
     /// routes through
     /// [`crate::superfile::lazy_source::Source::range_async`] /
     /// `get_ranges_parallel_async`, which resolve zero-copy on the sync

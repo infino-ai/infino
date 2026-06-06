@@ -1296,7 +1296,7 @@ mod tests {
         }
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1, fp32) ------------------------
+    // --- AVX-512 parity (fp32) ------------------------------------------
 
     /// Generate a pseudo-random `f32` vector. Deterministic — uses the
     /// same monotone-noise pattern as the planted-cluster test fixtures
@@ -1432,7 +1432,7 @@ mod tests {
         assert!(!parse("yes")); // pinned: we only accept 1 / true
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1) ------------------------------
+    // --- AVX-512 parity -------------------------------------------------
 
     /// AVX-512 `sq8_dot` agrees with the `wide` baseline
     /// across a length sweep. The dot product is `Σ q_prime[d] *
@@ -1460,7 +1460,7 @@ mod tests {
         }
     }
 
-    // --- AVX2 parity (plan 014 Phase 2) ---------------------------------
+    // --- AVX2 parity ----------------------------------------------------
 
     /// AVX2 `sq8_dot_avx2` agrees with the portable wide
     /// kernel across a length sweep. Inner math is identical (FMA
@@ -1491,7 +1491,7 @@ mod tests {
         }
     }
 
-    // --- AVX-512 microbench (plan 014 — run by hand) -------------------
+    // --- AVX-512 microbench (run by hand) ------------------------------
     //
     // Direct head-to-head per-kernel timings between the AVX-512 fast
     // path and the `wide`-based AVX2 baseline. Run with:
@@ -1620,7 +1620,7 @@ mod tests {
         }
     }
 
-    // --- AVX2 microbench (plan 014 Phase 2 — run by hand) --------------
+    // --- AVX2 microbench (run by hand) ---------------------------------
     //
     // Measures the AVX2 widen-FMA paths added in Phase 2 against the
     // portable scalar-widen kernels they replace on AVX2 hosts. Run
@@ -1636,7 +1636,7 @@ mod tests {
     // parity tests + this microbench still exercise it via direct
     // call to keep the AVX2 baseline a first-class measurable tier.
 
-    // --- Unified 4-tier per-kernel microbench (plan 014) --------------
+    // --- Unified 4-tier per-kernel microbench --------------------------
     //
     // One run, every kernel × every SIMD tier × every realistic dim,
     // emitted as a single markdown table. Replaces ad-hoc per-tier
