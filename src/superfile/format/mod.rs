@@ -11,6 +11,12 @@ pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 /// File-format version. Semver string. Bump major to break compatibility.
 pub const FORMAT_VERSION: &str = "1.0.0";
 
+/// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a
+/// directory or after a subsection's payload. Defined once so the
+/// writer and reader arithmetic agree symbolically rather than via
+/// duplicated `+ 4 /* CRC */` literals.
+pub const CRC_BYTES: usize = 4;
+
 /// FTS section magic bytes and constants.
 pub mod fts {
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` + version `01`.
@@ -27,6 +33,11 @@ pub mod vec {
     pub const OUTER_MAGIC: &[u8; 8] = b"INFVEC01";
     /// 8-byte magic at the start of each per-column subsection.
     pub const SUB_MAGIC: &[u8; 8] = b"INFVECC1";
+    /// Doc-id width in bytes (`u32` little-endian) stored after each
+    /// per-cluster code block. A per-cluster block row is `code_bytes`
+    /// of quantized code followed by [`DOC_ID_BYTES`] of doc-id, so the
+    /// stride is `code_bytes + DOC_ID_BYTES`.
+    pub const DOC_ID_BYTES: usize = 4;
     /// Outer-blob version. Written at bytes [8..12] of the outer
     /// header. Bump on outer-blob-shape changes (currently 1).
     pub const VERSION: u32 = 1;

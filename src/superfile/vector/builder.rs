@@ -471,7 +471,7 @@ impl VectorBuilder {
         let directory_offset = OUTER_HEADER_SIZE as u64;
         let directory_size = (n_columns as usize) * DIR_ENTRY_SIZE;
         let mut subsection_start_off =
-            directory_offset + directory_size as u64 + 4 /* dir CRC */;
+            directory_offset + directory_size as u64 + format::CRC_BYTES as u64;
 
         // 3. Assemble directory entries with absolute offsets.
         //    Byte 52 carries the rerank-codec discriminator.
@@ -874,7 +874,7 @@ fn build_subsection_streaming(
     // already fetches, dropping cold first-search from
     // `nprobe + 1 fat-range` GETs (which over-fetched the whole
     // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
-    let per_cluster_blocks_size = n_docs * (code_bytes + 4 + per_vec_bytes);
+    let per_cluster_blocks_size = n_docs * (code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes);
 
     // Offsets relative to subsection start. Open-time region
     // (everything before `per_cluster_blocks`) lands contiguously
@@ -956,7 +956,7 @@ fn build_subsection_streaming(
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
     let mut full_block: Vec<u8> = Vec::new();
-    let cluster_stride = code_bytes + 4 + per_vec_bytes;
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
 
     let mut block_cursor = 0usize;
     for &(centroid_id, cluster_off_u32, cluster_count_u32) in &cluster_index {

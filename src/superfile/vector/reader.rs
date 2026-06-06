@@ -168,7 +168,7 @@ impl ColumnReader {
         let start = sub_start
             + self.per_cluster_blocks_off
             + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
-        let len = (cluster_count as usize) * (self.quant.code_bytes() + 4);
+        let len = (cluster_count as usize) * (self.quant.code_bytes() + format::vec::DOC_ID_BYTES);
         start..start + len
     }
 
@@ -182,7 +182,8 @@ impl ColumnReader {
         let block_start = sub_start
             + self.per_cluster_blocks_off
             + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
-        let prefix_len = (cluster_count as usize) * (self.quant.code_bytes() + 4);
+        let prefix_len =
+            (cluster_count as usize) * (self.quant.code_bytes() + format::vec::DOC_ID_BYTES);
         let start =
             block_start + prefix_len + local_idx * self.rerank_codec.per_vector_bytes(self.dim);
         start..start + self.rerank_codec.per_vector_bytes(self.dim)
@@ -193,7 +194,9 @@ impl ColumnReader {
     /// A cluster's block packs `cnt` docs at this stride as
     /// `[codes_chunk][doc_ids_chunk][full_chunk]`.
     pub(super) fn per_cluster_doc_stride(&self) -> usize {
-        self.quant.code_bytes() + 4 + self.rerank_codec.per_vector_bytes(self.dim)
+        self.quant.code_bytes()
+            + format::vec::DOC_ID_BYTES
+            + self.rerank_codec.per_vector_bytes(self.dim)
     }
 }
 
@@ -330,7 +333,7 @@ impl VectorReader {
         let n_columns = read_u32_le(&header_bytes[12..16]) as usize;
         let dir_offset = read_u64_le(&header_bytes[24..32]) as usize;
         let dir_size = n_columns * DIR_ENTRY_SIZE;
-        let dir_end = dir_offset + dir_size + 4 /* dir CRC */;
+        let dir_end = dir_offset + dir_size + format::CRC_BYTES;
         if dir_end > blob_size {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "lazy open: directory end {dir_end} exceeds blob size {blob_size}",
@@ -883,7 +886,7 @@ impl VectorReader {
             // codes, doc-id, and rerank vector interleaved per
             // cluster. Solve for n_docs from the region size.
             let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
-            let per_doc_stride = code_bytes + 4 + per_vec_bytes;
+            let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
             if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' per_cluster_blocks region {blocks_region_size} bytes \
