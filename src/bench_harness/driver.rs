@@ -118,6 +118,61 @@ mod tests {
     use super::*;
     use crate::bench_harness::{InfinoFtsEngine, MmapTextCorpus};
 
+    /// 1M-scale validation: drive infino through the shared `run_fts`
+    /// driver and print build + per-query stats, to confirm the driver
+    /// reproduces infino's known superfile-FTS numbers. Ignored by
+    /// default (heavy); run explicitly:
+    /// `cargo test --features bench-harness --release -- --ignored \
+    ///  --nocapture run_fts_infino_superfile_scale`
+    #[test]
+    #[ignore = "1M-scale; run explicitly in --release"]
+    fn run_fts_infino_superfile_scale() {
+        use crate::bench_harness::corpus::SUPERFILE_DOCS;
+        use crate::bench_harness::fmt_bytes;
+
+        let corpus = MmapTextCorpus::generate(SUPERFILE_DOCS, 1);
+        let docs = corpus.rows();
+        let queries = [
+            FtsQuery {
+                name: "single_rare",
+                terms: &["term09999"],
+                mode: BoolMode::Or,
+            },
+            FtsQuery {
+                name: "single_common",
+                terms: &["term00001"],
+                mode: BoolMode::Or,
+            },
+            FtsQuery {
+                name: "two_term_or",
+                terms: &["term00001", "term00050"],
+                mode: BoolMode::Or,
+            },
+            FtsQuery {
+                name: "two_term_and",
+                terms: &["term00001", "term00050"],
+                mode: BoolMode::And,
+            },
+        ];
+        let res = run_fts::<InfinoFtsEngine>("title", &docs, &queries, 10, 50);
+        eprintln!(
+            "[run_fts infino @{SUPERFILE_DOCS}] build wall={:.2}s peak_rss={}",
+            res.build.wall.as_secs_f64(),
+            fmt_bytes(res.build.rss.peak_rss_bytes),
+        );
+        for q in &res.queries {
+            eprintln!(
+                "  {:14} p50={:>10?}  rss={}  hits={}",
+                q.name,
+                q.p50,
+                fmt_bytes(q.rss.peak_rss_bytes),
+                q.hit_ids.len(),
+            );
+        }
+        assert!(res.build.wall > Duration::ZERO);
+        assert!(res.queries.iter().all(|q| !q.hit_ids.is_empty()));
+    }
+
     #[test]
     fn run_fts_drives_infino_end_to_end() {
         let corpus = MmapTextCorpus::generate(2_000, 7);
