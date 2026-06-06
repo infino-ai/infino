@@ -398,6 +398,48 @@ pub fn encode_vector_summary_map(map: &HashMap<String, VectorSummary>) -> Vec<u8
     out
 }
 
+pub fn decode_vector_summary_map(
+    bytes: &[u8],
+) -> Result<HashMap<String, VectorSummary>, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let n = read_u32(&mut c, "vec_map_n")? as usize;
+    let mut out = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let kl = read_u32(&mut c, "vec_key_len")? as usize;
+        let k = read_n(&mut c, kl, "vec_key")?;
+        let key = String::from_utf8(k)
+            .map_err(|e| DecodeError::ArrowIpc(format!("vec key utf-8: {e}")))?;
+        let vl = read_u32(&mut c, "vec_value_len")? as usize;
+        let v = read_n(&mut c, vl, "vec_value")?;
+        out.insert(key, decode_vector_summary(&v)?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------
+// Cursor helpers.
+// ---------------------------------------------------------
+
+fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
+    let b = read_n(c, 4, what)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+    let pos = c.position() as usize;
+    let buf = *c.get_ref();
+    if pos + n > buf.len() {
+        return Err(DecodeError::Truncated {
+            what,
+            needed: n,
+            had: buf.len().saturating_sub(pos),
+        });
+    }
+    let out = buf[pos..pos + n].to_vec();
+    c.set_position((pos + n) as u64);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod vector_summary_tests {
     use super::{decode_vector_summary, encode_vector_summary};
@@ -459,46 +501,4 @@ mod vector_summary_tests {
         assert!(got.clusters.is_empty());
         assert_eq!(got.clusters.n_cent, 0);
     }
-}
-
-pub fn decode_vector_summary_map(
-    bytes: &[u8],
-) -> Result<HashMap<String, VectorSummary>, DecodeError> {
-    let mut c = Cursor::new(bytes);
-    let n = read_u32(&mut c, "vec_map_n")? as usize;
-    let mut out = HashMap::with_capacity(n);
-    for _ in 0..n {
-        let kl = read_u32(&mut c, "vec_key_len")? as usize;
-        let k = read_n(&mut c, kl, "vec_key")?;
-        let key = String::from_utf8(k)
-            .map_err(|e| DecodeError::ArrowIpc(format!("vec key utf-8: {e}")))?;
-        let vl = read_u32(&mut c, "vec_value_len")? as usize;
-        let v = read_n(&mut c, vl, "vec_value")?;
-        out.insert(key, decode_vector_summary(&v)?);
-    }
-    Ok(out)
-}
-
-// ---------------------------------------------------------
-// Cursor helpers.
-// ---------------------------------------------------------
-
-fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
-    let b = read_n(c, 4, what)?;
-    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
-    let pos = c.position() as usize;
-    let buf = *c.get_ref();
-    if pos + n > buf.len() {
-        return Err(DecodeError::Truncated {
-            what,
-            needed: n,
-            had: buf.len().saturating_sub(pos),
-        });
-    }
-    let out = buf[pos..pos + n].to_vec();
-    c.set_position((pos + n) as u64);
-    Ok(out)
 }
