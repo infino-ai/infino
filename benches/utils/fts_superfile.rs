@@ -709,20 +709,25 @@ mod group_name {
 }
 
 fn emit_ingest_markdown() {
-    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_bandwidth, fmt_throughput, fmt_time, read_mean_ns};
+
+    // Logical input payload: total corpus text bytes, identical across
+    // both variants (the rayon variant shards the same corpus).
+    let input_bytes = text_corpus().total_bytes() as f64;
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Superfile FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
     ));
     body.push_str(
-        "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit).\n\n",
+        "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit). \
+         Bandwidth (MB/s) is over the logical input text payload.\n\n",
     );
     body.push_str(
-        "| Engine                       | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
+        "| Engine                       | Time       | Throughput | Bandwidth  | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
     );
     body.push_str(
-        "|------------------------------|------------|------------|-----------|------------|-----------|------------|\n",
+        "|------------------------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
     );
 
     let group = group_name::SUPERFILE_FTS_BUILD;
@@ -738,12 +743,15 @@ fn emit_ingest_markdown() {
         let thrpt = ns
             .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
             .unwrap_or_else(|| "—".into());
+        let bandwidth = ns
+            .map(|n| fmt_bandwidth(input_bytes / (n / 1e9)))
+            .unwrap_or_else(|| "—".into());
         let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
         let median_rss = rss::fmt_median_rss(group, bench_id);
         let p90_rss = rss::fmt_p90_rss(group, bench_id);
         let rss_delta = rss::fmt_peak_rss_delta(group, bench_id);
         format!(
-            "| {label:28} | {time:10} | {thrpt:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
+            "| {label:28} | {time:10} | {thrpt:10} | {bandwidth:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
         )
     };
 

@@ -230,6 +230,12 @@ impl MmapTextCorpus {
         self.offsets.len().saturating_sub(1)
     }
 
+    /// Total logical text bytes across all docs — the ingest input
+    /// payload size, used to report build bandwidth in MB/s.
+    pub fn total_bytes(&self) -> u64 {
+        self.offsets.last().copied().unwrap_or(0) - self.offsets.first().copied().unwrap_or(0)
+    }
+
     pub fn doc(&self, idx: usize) -> &str {
         let start = self.offsets[idx] as usize;
         let end = self.offsets[idx + 1] as usize;

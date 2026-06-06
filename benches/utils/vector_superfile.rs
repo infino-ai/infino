@@ -31,6 +31,7 @@ use arrow_array::{Decimal128Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
+use rayon::prelude::*;
 // Calibrated `(probe, refine)` is intentionally not in the criterion ID:
 // criterion's improved/regressed/noise panel only fires on exact-ID matches
 // against the previous run's baseline, and `(probe, refine)` drifts as
@@ -151,7 +152,21 @@ fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
 /// Same path as supertable commit: Arrow id column + vector slices →
 /// unified `.parquet` (Parquet body + embedded vector blob + `inf.*` KV).
 fn build_superfile_bytes(vectors: &[f32]) -> Vec<u8> {
-    let n_cent = corpus::n_cent(N_DOCS);
+    build_superfile_bytes_range(vectors, 0, N_DOCS, 0)
+}
+
+/// Build one self-contained superfile from the `[start_doc,
+/// start_doc + len)` slice of the corpus, assigning doc ids from
+/// `id_base`. `n_cent` is sized to this shard's doc count so each shard
+/// is a valid standalone superfile — the multi-segment shape supertable
+/// commit produces.
+fn build_superfile_bytes_range(
+    vectors: &[f32],
+    start_doc: usize,
+    len: usize,
+    id_base: usize,
+) -> Vec<u8> {
+    let n_cent = corpus::n_cent(len);
     let schema = ArrowArc::new(Schema::new(vec![Field::new(
         ID_COLUMN,
         DataType::Decimal128(38, 0),
@@ -173,10 +188,11 @@ fn build_superfile_bytes(vectors: &[f32]) -> Vec<u8> {
     );
     let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
     const CHUNK: usize = 65_536;
-    let mut start = 0;
-    while start < N_DOCS {
-        let len = CHUNK.min(N_DOCS - start);
-        let ids: Decimal128Array = (start as u64..(start + len) as u64)
+    let mut local = 0;
+    while local < len {
+        let batch_len = CHUNK.min(len - local);
+        let abs_start = start_doc + local;
+        let ids: Decimal128Array = ((id_base + local) as u64..(id_base + local + batch_len) as u64)
             .map(|i| Some(i as i128))
             .collect::<Decimal128Array>()
             .with_precision_and_scale(38, 0)
@@ -184,11 +200,36 @@ fn build_superfile_bytes(vectors: &[f32]) -> Vec<u8> {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![ArrowArc::new(ids)]).expect("RecordBatch");
         builder
-            .add_batch(&batch, &[&vectors[start * DIM..(start + len) * DIM]])
+            .add_batch(
+                &batch,
+                &[&vectors[abs_start * DIM..(abs_start + batch_len) * DIM]],
+            )
             .expect("add_batch");
-        start += len;
+        local += batch_len;
     }
     builder.finish().expect("SuperfileBuilder::finish")
+}
+
+/// Rayon-sharded parallel build: each shard runs its own
+/// [`SuperfileBuilder`] over its slice of the corpus and emits a
+/// self-contained `.parquet` — the same multi-segment shape supertable
+/// commit produces. Mirrors the FTS bench's `build_superfiles_rayon` so
+/// the vector ingest table reports the same 1-thread vs. rayon
+/// comparison.
+fn build_superfiles_rayon(vectors: &[f32]) -> Vec<Vec<u8>> {
+    let n_shards = rayon::current_num_threads();
+    let docs_per_shard = N_DOCS.div_ceil(n_shards);
+    (0..n_shards)
+        .into_par_iter()
+        .filter_map(|shard_idx| {
+            let start = shard_idx * docs_per_shard;
+            if start >= N_DOCS {
+                return None;
+            }
+            let len = docs_per_shard.min(N_DOCS - start);
+            Some(build_superfile_bytes_range(vectors, start, len, start))
+        })
+        .collect()
 }
 
 // ─── Correctness ──────────────────────────────────────────────────────
@@ -277,16 +318,29 @@ fn bench(c: &mut Criterion) {
         g.sample_size(10);
         g.throughput(Throughput::Elements(N_DOCS as u64));
 
-        // Peak-RSS sampler — bounds the build closure so the recorded
-        // RSS reflects this group, not earlier setup or later groups.
+        // Two variants, mirroring the FTS ingest bench: a single-thread
+        // build (one superfile) and the rayon-sharded build (one
+        // superfile per shard). Peak-RSS samplers bound each closure so
+        // the recorded RSS reflects that variant, not setup or the other
+        // variant.
+        let one_thread_id = format!("infino_1thread_{N_DOCS}docs");
+        let rayon_id = format!("infino_rayon_default_threads_{N_DOCS}docs");
+
         let rss_sample = rss::PeakSampler::start_default();
-        let bench_id = format!("infino_build_{N_DOCS}docs");
-        g.bench_function(bench_id.clone(), |b| {
+        g.bench_function(one_thread_id.clone(), |b| {
             b.iter_with_large_drop(|| build_superfile_bytes(black_box(v)));
         });
-        g.finish();
         let stats = rss_sample.stop_stats();
-        let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_BUILD, &bench_id, stats);
+        let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_BUILD, &one_thread_id, stats);
+
+        let rss_sample = rss::PeakSampler::start_default();
+        g.bench_function(rayon_id.clone(), |b| {
+            b.iter_with_large_drop(|| build_superfiles_rayon(black_box(v)));
+        });
+        let stats = rss_sample.stop_stats();
+        let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_BUILD, &rayon_id, stats);
+
+        g.finish();
 
         emit_ingest_markdown();
     }
@@ -523,33 +577,66 @@ mod group_name {
 }
 
 fn emit_ingest_markdown() {
-    use markdown::{MarkdownSection, fmt_throughput, fmt_time, read_mean_ns};
+    use markdown::{MarkdownSection, fmt_bandwidth, fmt_throughput, fmt_time, read_mean_ns};
 
     let group = group_name::SUPERFILE_VEC_BUILD;
-    let bench = format!("infino_build_{N_DOCS}docs");
-    let ns = read_mean_ns(group, &bench);
-    let peak_rss = rss::read_peak_rss_bytes(group, &bench);
+    let one_thread_id = format!("infino_1thread_{N_DOCS}docs");
+    let rayon_id = format!("infino_rayon_default_threads_{N_DOCS}docs");
+    let one_thread = read_mean_ns(group, &one_thread_id);
+    let rayon = read_mean_ns(group, &rayon_id);
+    let one_thread_rss = rss::read_peak_rss_bytes(group, &one_thread_id);
+    let rayon_rss = rss::read_peak_rss_bytes(group, &rayon_id);
+
+    // Logical input payload: the raw f32 vectors (`n_docs × dim × 4`),
+    // identical across both variants.
+    let input_bytes = (N_DOCS * DIM * std::mem::size_of::<f32>()) as f64;
 
     let mut body = String::new();
     body.push_str(&format!(
         "### Superfile vector — ingest ({N_DOCS} docs × dim={DIM}, Gaussian planted clusters, cosine)\n\n"
     ));
     body.push_str(
-        "| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+        "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit). \
+         `infino_1thread` builds one superfile (the vector builder still uses intra-segment rayon \
+         for rotation/encode); `infino_rayon_default_threads` shards the corpus across the rayon \
+         pool into one superfile per shard (the multi-segment shape supertable commit produces). \
+         Bandwidth (MB/s) is over the raw f32 vector payload.\n\n",
     );
     body.push_str(
-        "|--------|------|------------|----------|------------|---------|------------|\n",
+        "| Engine                       | Time       | Throughput | Bandwidth  | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
     );
-    let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
-    let thrpt = ns
-        .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
-        .unwrap_or_else(|| "—".into());
-    let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-    let median_rss = rss::fmt_median_rss(group, &bench);
-    let p90_rss = rss::fmt_p90_rss(group, &bench);
-    let rss_delta = rss::fmt_peak_rss_delta(group, &bench);
-    body.push_str(&format!(
-        "| infino | {time} | {thrpt} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n"
+    body.push_str(
+        "|------------------------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
+    );
+
+    let row = |label: &str, bench_id: &str, ns: Option<f64>, peak: Option<u64>| -> String {
+        let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
+        let thrpt = ns
+            .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
+            .unwrap_or_else(|| "—".into());
+        let bandwidth = ns
+            .map(|n| fmt_bandwidth(input_bytes / (n / 1e9)))
+            .unwrap_or_else(|| "—".into());
+        let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
+        let median_rss = rss::fmt_median_rss(group, bench_id);
+        let p90_rss = rss::fmt_p90_rss(group, bench_id);
+        let rss_delta = rss::fmt_peak_rss_delta(group, bench_id);
+        format!(
+            "| {label:28} | {time:10} | {thrpt:10} | {bandwidth:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
+        )
+    };
+
+    body.push_str(&row(
+        "infino_1thread",
+        &one_thread_id,
+        one_thread,
+        one_thread_rss,
+    ));
+    body.push_str(&row(
+        "infino_rayon_default_threads",
+        &rayon_id,
+        rayon,
+        rayon_rss,
     ));
 
     markdown::emit(&MarkdownSection {

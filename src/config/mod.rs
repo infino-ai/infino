@@ -83,11 +83,6 @@ pub struct SupertableSettings {
     /// Writer commit-shard pool size. `auto` resolves to
     /// `max(1, num_cpus / 2)`.
     pub writer_threads: ThreadCount,
-    /// Upper bound on vector-bearing shard builds active inside
-    /// one writer commit. Keeps `writer_threads` from multiplying
-    /// the resident vector-builder working set by the full pool
-    /// width. `auto` resolves from the configured writer-pool size.
-    pub max_concurrent_vector_builds: ThreadCount,
     /// Name of the system-managed primary-key column the
     /// supertable injects on every `append()`. Type is fixed
     /// at the supertable layer; this knob is only the column
@@ -118,7 +113,6 @@ impl Default for SupertableSettings {
         Self {
             reader_threads: ThreadCount::default(),
             writer_threads: ThreadCount::default(),
-            max_concurrent_vector_builds: ThreadCount::default(),
             id_column: default_id_column(),
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             verify_crc_on_open: DEFAULT_VERIFY_CRC_ON_OPEN,
@@ -560,10 +554,6 @@ storage:
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Auto);
-        assert_eq!(
-            cfg.supertable.max_concurrent_vector_builds,
-            ThreadCount::Auto
-        );
     }
 
     #[test]
@@ -573,16 +563,11 @@ commit_threshold_size_mb: 1024
 supertable:
   reader_threads: auto
   writer_threads: AUTO
-  max_concurrent_vector_builds: auto
 "#;
         let cfg =
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Auto);
-        assert_eq!(
-            cfg.supertable.max_concurrent_vector_builds,
-            ThreadCount::Auto
-        );
     }
 
     #[test]
@@ -592,16 +577,11 @@ commit_threshold_size_mb: 1024
 supertable:
   reader_threads: 8
   writer_threads: 4
-  max_concurrent_vector_builds: 3
 "#;
         let cfg =
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Fixed(8));
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Fixed(4));
-        assert_eq!(
-            cfg.supertable.max_concurrent_vector_builds,
-            ThreadCount::Fixed(3)
-        );
     }
 
     #[test]

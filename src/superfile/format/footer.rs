@@ -26,7 +26,8 @@ use arrow_schema::Schema;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::metadata::{
-    FileMetaData, KeyValue, ParquetMetaDataBuilder, ParquetMetaDataReader, ParquetMetaDataWriter,
+    FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
+    ParquetMetaDataWriter,
 };
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
@@ -67,26 +68,42 @@ pub enum FooterError {
     LazySource(String),
 }
 
-/// Write `batches` (matching `schema`) as Parquet, then splice the
-/// `fts_blob` and `vec_blob` between the last row group and a rewritten
-/// footer carrying `extra_kv`. Either blob may be empty (length 0) — in
-/// that case the corresponding offsets in the returned `ParquetParts`
-/// are 0 and no `inf.fts.*` / `inf.vec.*` KV keys are written.
-pub fn write_parquet_with_blobs(
+/// The encoded Parquet body — column chunks + row groups, with the
+/// parquet-rs footer stripped — plus its decoded metadata. Output of
+/// [`encode_parquet_body`], consumed by [`splice_index_blobs`].
+///
+/// This is the heavy, blob-independent half of a superfile build: it
+/// holds everything that the CPU-bound column encode produced, ready for
+/// the cheap blob splice + footer rewrite.
+pub struct EncodedBody {
+    /// Parquet bytes truncated to the end of the last row group (footer
+    /// removed) — blobs and the rewritten footer get appended here.
+    buf: Vec<u8>,
+    /// Footer metadata decoded from the original write, carried through
+    /// to the rewrite so row groups + column/offset indexes survive.
+    metadata: ParquetMetaData,
+}
+
+/// Encode `batches` (matching `schema`) into the Parquet body and strip
+/// the footer, returning an [`EncodedBody`] ready for blob splicing.
+///
+/// This is the CPU-heavy half of a superfile write (Arrow → Parquet
+/// column encode + compression) and is **independent of the FTS/vector
+/// blobs** — the blobs are only appended afterward by
+/// [`splice_index_blobs`]. So a caller can run this as a rayon sibling
+/// of index finalization (see `SuperfileBuilder::finish`).
+///
+/// Per-column data-page size limits (e.g. a small limit on the id
+/// column) keep point lookups cheap: `RowSelection` + the offset index
+/// seek to a tiny page and decompress just that, instead of a whole
+/// row-group-sized page.
+pub fn encode_parquet_body(
     schema: &Arc<Schema>,
     batches: &[RecordBatch],
-    fts_blob: &[u8],
-    vec_blob: &[u8],
-    extra_kv: &[(String, String)],
     compression: Compression,
     row_group_size: usize,
     column_page_size_limits: &[(&str, usize)],
-) -> Result<ParquetParts, FooterError> {
-    // 1. Write Parquet to an in-memory buffer. Per-column data-page
-    //    size limits (e.g. a small limit on the id column) keep point
-    //    lookups cheap: `RowSelection` + the offset index seek to a
-    //    tiny page and decompress just that, instead of a whole
-    //    row-group-sized page.
+) -> Result<EncodedBody, FooterError> {
     let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
         .set_max_row_group_row_count(Some(row_group_size));
@@ -104,7 +121,7 @@ pub fn write_parquet_with_blobs(
         writer.close()?;
     }
 
-    // 2. Locate the footer and decode it.
+    // Locate the footer and decode it.
     let n = buf.len();
     if n < 12 {
         return Err(FooterError::Malformed("parquet buffer too short"));
@@ -123,8 +140,28 @@ pub fn write_parquet_with_blobs(
     let footer_bytes = buf[footer_start..n - 8].to_vec();
     let metadata = ParquetMetaDataReader::decode_metadata(&footer_bytes)?;
 
-    // 3. Truncate to end of last row group, append blobs.
+    // Truncate to end of last row group; blobs + the rewritten footer
+    // get appended in `splice_index_blobs`.
     buf.truncate(footer_start);
+
+    Ok(EncodedBody { buf, metadata })
+}
+
+/// Splice the `fts_blob` and `vec_blob` between an [`EncodedBody`]'s last
+/// row group and a rewritten footer carrying `extra_kv` plus the blob
+/// offset/length keys. Either blob may be empty (length 0) — in that case
+/// the corresponding offsets in the returned `ParquetParts` are 0 and no
+/// `inf.fts.*` / `inf.vec.*` KV keys are written.
+///
+/// Cheap relative to [`encode_parquet_body`]: byte appends + a footer
+/// re-encode, no column work.
+pub fn splice_index_blobs(
+    body: EncodedBody,
+    fts_blob: &[u8],
+    vec_blob: &[u8],
+    extra_kv: &[(String, String)],
+) -> Result<ParquetParts, FooterError> {
+    let EncodedBody { mut buf, metadata } = body;
 
     let fts_offset = if !fts_blob.is_empty() {
         let off = buf.len() as u64;
@@ -141,13 +178,12 @@ pub fn write_parquet_with_blobs(
         0
     };
 
-    // 4. Patch KV metadata. Preserve everything parquet-rs put in the
-    //    footer (Arrow schema KV among them); append `extra_kv` plus
-    //    the `inf.fts.*` / `inf.vec.*` offsets. `FileMetaData` is
-    //    immutable, so build a new one via the public ctor with the
-    //    patched KV list and rebuild the `ParquetMetaData` around it,
-    //    carrying row groups and column / offset indexes through
-    //    unchanged.
+    // Patch KV metadata. Preserve everything parquet-rs put in the
+    // footer (Arrow schema KV among them); append `extra_kv` plus the
+    // `inf.fts.*` / `inf.vec.*` offsets. `FileMetaData` is immutable, so
+    // build a new one via the public ctor with the patched KV list and
+    // rebuild the `ParquetMetaData` around it, carrying row groups and
+    // column / offset indexes through unchanged.
     let old_fm = metadata.file_metadata();
     let mut kvs = old_fm.key_value_metadata().cloned().unwrap_or_default();
     for (k, v) in extra_kv {
@@ -187,10 +223,9 @@ pub fn write_parquet_with_blobs(
         .set_offset_index(metadata.offset_index().cloned())
         .build();
 
-    // 5. Re-encode footer. `ParquetMetaDataWriter::finish` appends
-    //    the thrift-encoded metadata + the u32 length + the PAR1
-    //    magic in one call, leaving `buf` ready to read as a
-    //    complete Parquet file.
+    // Re-encode footer. `ParquetMetaDataWriter::finish` appends the
+    // thrift-encoded metadata + the u32 length + the PAR1 magic in one
+    // call, leaving `buf` ready to read as a complete Parquet file.
     ParquetMetaDataWriter::new(&mut buf, &new_meta).finish()?;
 
     Ok(ParquetParts {
@@ -348,11 +383,35 @@ mod tests {
         .expect("build RecordBatch")
     }
 
+    /// Test-only composition of the two production phases — encode the
+    /// body then splice the blobs — exercising the exact path
+    /// `SuperfileBuilder::finish` runs, minus the rayon parallelism.
+    #[allow(clippy::too_many_arguments)]
+    fn write_with_blobs(
+        schema: &Arc<Schema>,
+        batches: &[RecordBatch],
+        fts_blob: &[u8],
+        vec_blob: &[u8],
+        extra_kv: &[(String, String)],
+        compression: Compression,
+        row_group_size: usize,
+        column_page_size_limits: &[(&str, usize)],
+    ) -> Result<ParquetParts, FooterError> {
+        let body = encode_parquet_body(
+            schema,
+            batches,
+            compression,
+            row_group_size,
+            column_page_size_limits,
+        )?;
+        splice_index_blobs(body, fts_blob, vec_blob, extra_kv)
+    }
+
     #[test]
     fn write_with_no_blobs_produces_valid_parquet() {
         let schema = small_schema();
         let batch = small_batch(&schema);
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &[],
@@ -375,7 +434,7 @@ mod tests {
         let schema = small_schema();
         let batch = small_batch(&schema);
         let fts_blob = b"FTS_BLOB_BYTES_HERE".to_vec();
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &fts_blob,
@@ -399,7 +458,7 @@ mod tests {
         let schema = small_schema();
         let batch = small_batch(&schema);
         let vec_blob = vec![0xAAu8; 256];
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &[],
@@ -424,7 +483,7 @@ mod tests {
         let batch = small_batch(&schema);
         let fts_blob = vec![0x01u8; 100];
         let vec_blob = vec![0x02u8; 200];
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &fts_blob,
@@ -448,7 +507,7 @@ mod tests {
             ("inf.format_version".to_string(), "1.0.0".to_string()),
             ("inf.id_column".to_string(), "id".to_string()),
         ];
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &[],
@@ -476,7 +535,7 @@ mod tests {
         let schema = small_schema();
         let batch = small_batch(&schema);
         let fts = vec![0xCCu8; 64];
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &fts,
@@ -552,7 +611,7 @@ mod tests {
             ("inf.format_version".to_string(), "1.0.0".to_string()),
             ("inf.id_column".to_string(), "id".to_string()),
         ];
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &[],
@@ -592,7 +651,7 @@ mod tests {
             ("inf.format_version".to_string(), "1.0.0".to_string()),
             ("inf.id_column".to_string(), "id".to_string()),
         ];
-        let parts = write_parquet_with_blobs(
+        let parts = write_with_blobs(
             &schema,
             &[batch],
             &[],

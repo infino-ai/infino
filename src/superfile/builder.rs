@@ -78,7 +78,7 @@
 //! format is forward-compatible without a file rewrite.
 
 use crate::superfile::BuildError;
-use crate::superfile::format::footer::{ParquetParts, write_parquet_with_blobs};
+use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
 use crate::superfile::format::{self, kv};
 use crate::superfile::fts::builder::FtsBuilder;
 use crate::superfile::fts::tokenize::Tokenizer;
@@ -455,16 +455,11 @@ impl SuperfileBuilder {
         }
         let n_docs = self.next_local_doc_id as u64;
 
-        let fts_blob: Vec<u8> = match self.fts_builder.take() {
-            Some(fb) => fb.finish()?,
-            None => Vec::new(),
-        };
-        let vec_blob: Vec<u8> = match self.vec_builder.take() {
-            Some(vb) => vb.finish()?,
-            None => Vec::new(),
-        };
+        let fts_builder = self.fts_builder.take();
+        let vec_builder = self.vec_builder.take();
 
-        // Assemble inf.* KV metadata.
+        // Assemble inf.* KV metadata (cheap; do it before the parallel
+        // section so the splice has it ready).
         let mut kvs: Vec<(String, String)> = vec![
             (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
             (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
@@ -485,17 +480,52 @@ impl SuperfileBuilder {
             ));
         }
 
-        let parts: ParquetParts = write_parquet_with_blobs(
-            &self.opts.schema,
-            &self.batches,
-            &fts_blob,
-            &vec_blob,
-            &kvs,
-            self.opts.compression,
-            self.opts.row_group_size,
-            &[(self.opts.id_column.as_str(), self.opts.id_page_size_limit)],
-        )?;
+        // A segment has three independent build outputs: the scalar /
+        // relational Parquet body (the SQL-queryable columns), the FTS
+        // blob, and the vector blob. The body encode does not read the
+        // blob contents — blobs are appended after the last row group —
+        // and FTS/vector finalization share no state. So run all three
+        // as nested rayon siblings on the shared pool: body encode in
+        // one arm, FTS‖vector in the other. Work-stealing fills idle
+        // cores when any phase hits a serial stretch. The final splice
+        // (byte appends + footer rewrite) is cheap and stays serial.
+        let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
+        let (body_res, blobs_res) = rayon::join(
+            || {
+                encode_parquet_body(
+                    &self.opts.schema,
+                    &self.batches,
+                    self.opts.compression,
+                    self.opts.row_group_size,
+                    &id_page_limit,
+                )
+            },
+            || finish_index_blobs(fts_builder, vec_builder),
+        );
+        let body = body_res?;
+        let (fts_blob, vec_blob) = blobs_res?;
+
+        let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
         Ok(parts.bytes)
+    }
+}
+
+/// Finish the independent embedded index blobs. Once `add_batch` has
+/// routed scalar text and vectors into their builders, FTS and vector
+/// finalization do not share mutable state, so build them as sibling
+/// rayon jobs when both indexes are present.
+fn finish_index_blobs(
+    fts_builder: Option<FtsBuilder>,
+    vec_builder: Option<VectorBuilder>,
+) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
+    match (fts_builder, vec_builder) {
+        (Some(fb), Some(vb)) => {
+            let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
+            Ok((fts?, vec?))
+        }
+        (Some(fb), None) => Ok((fb.finish()?, Vec::new())),
+        (None, Some(vb)) => Ok((Vec::new(), vb.finish()?)),
+        (None, None) => Ok((Vec::new(), Vec::new())),
     }
 }
 

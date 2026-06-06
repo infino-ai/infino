@@ -50,15 +50,27 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
+use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
 
 use super::SuperfileHit;
+
+/// How to probe one segment in the vector fan-out: the globally-selected
+/// cluster ids for that segment, or — for a segment whose manifest
+/// summary carries no per-cluster centroids — a normal per-segment
+/// `nprobe` probe (fallback, never silently dropped).
+enum Probe {
+    Clusters(Vec<u32>),
+    Nprobe,
+}
 
 impl SupertableReader {
     /// Single-column vector kNN search across the pinned
@@ -111,44 +123,103 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Fan out to every kept segment. The part-level pruner
-        // above (`prune_parts_for_vector`) already dropped parts
-        // that cannot contain the query's neighbors; within the
-        // kept set we must search ALL segments.
+        // ---- Global cross-segment cluster selection.
         //
-        // NB: a previous version skipped segments here via a
-        // centroid-lower-bound cutoff (`best_lb * 2.0`). That was
-        // NOT a correctness-preserving bound — on a corpus where
-        // neighbors are spread across segments it silently dropped
-        // true top-k results (recall collapsed to ~0.5). Any
-        // segment-level skip must compare a real lower bound
-        // against the running k-th best distance; a static
-        // heuristic cutoff is wrong. Correct first, fast second.
-        //
-        // Dispatch goes through the shared fan-out
-        // ([`query::dispatch::fanout`]) that the FTS path also uses:
-        // one `tokio::spawn` per segment on the shared query runtime
-        // opens the reader and runs the per-segment kNN kernel, both
-        // `await`ed — so cold object-store GETs across all segments
-        // are concurrent and pool connections (tokio owns the I/O).
-        // The kernel is [`SuperfileReader::vector_search`] (async,
-        // mirroring the FTS `bm25_search` path): it keeps its
-        // centroid/code scoring + rerank on the global rayon pool via
-        // `par_iter` (rayon owns the CPU). The orchestrator also warms
-        // the tombstone sidecars in one concurrent batch and drops
-        // tombstoned rows per segment.
+        // Each kept segment's manifest summary carries its per-cluster
+        // (Sq8) centroids. Rank every (segment, cluster) by centroid
+        // distance to the query and probe only the globally-closest
+        // clusters — so a query touches just the segments that own a
+        // near cluster, instead of running `nprobe` in every segment.
+        // (A single per-segment centroid can't do this: a time-ordered
+        // segment is a broad mix, so its mean sits near the global
+        // centroid. Per-cluster centroids are fine-grained enough to
+        // rank.) A segment whose summary has no cluster centroids falls
+        // back to a normal per-segment `nprobe` probe — never dropped.
+        let metric = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .map(|vc| vc.metric)
+            .unwrap_or(Metric::L2Sq);
+
+        let mut scored: Vec<(usize, u32, f32)> = Vec::new();
+        let mut fallback: Vec<usize> = Vec::new();
+        let mut deq = vec![0f32; query.len()];
+        for (si, entry) in superfiles.iter().enumerate() {
+            match entry.vector_summary.get(column) {
+                Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
+                    let cl = &vs.clusters;
+                    for c in 0..cl.n_cent as usize {
+                        if cl.counts[c] == 0 {
+                            continue;
+                        }
+                        cl.dequantize_into(c, &mut deq);
+                        scored.push((si, c as u32, distance(metric, query, &deq)));
+                    }
+                }
+                _ => fallback.push(si),
+            }
+        }
+
+        // Global probe budget: the closest `nprobe × (eligible segments)`
+        // clusters — the same total probe count as the old per-segment
+        // `nprobe`, but selected globally, so near segments get more
+        // probes and far segments are skipped entirely. (Stage-4 recall
+        // tuning may lower this.)
+        let n_eligible = superfiles.len().saturating_sub(fallback.len());
+        let budget = options
+            .nprobe
+            .saturating_mul(n_eligible.max(1))
+            .max(options.nprobe);
+        if scored.len() > budget {
+            scored.select_nth_unstable_by(budget, |a, b| {
+                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+            });
+            scored.truncate(budget);
+        }
+        let mut per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (si, c, _) in scored {
+            per_seg.entry(si).or_default().push(c);
+        }
+
+        // Build fan-out units: selected segments probe their chosen
+        // clusters; fallback segments probe `nprobe` normally; segments
+        // with centroids but no globally-selected cluster are skipped
+        // (the cross-segment win).
+        let fallback: std::collections::HashSet<usize> = fallback.into_iter().collect();
+        let mut units: Vec<(Arc<SuperfileEntry>, Probe)> = Vec::new();
+        for (si, entry) in superfiles.iter().enumerate() {
+            if let Some(ids) = per_seg.remove(&si) {
+                units.push((Arc::clone(entry), Probe::Clusters(ids)));
+            } else if fallback.contains(&si) {
+                units.push((Arc::clone(entry), Probe::Nprobe));
+            }
+        }
+        if units.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fan out through the shared [`query::dispatch::fanout`] (also
+        // used by FTS): one tokio task per probed segment opens the
+        // reader and runs the kNN kernel — cold GETs across segments are
+        // concurrent (tokio owns I/O), shortlist + rerank stay on rayon.
+        // Skipped segments issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
-        let units: Vec<(Arc<SuperfileEntry>, ())> =
-            superfiles.into_iter().map(|e| (e, ())).collect();
-        let kernel = move |reader: Arc<SuperfileReader>, _params: ()| {
+        let kernel = move |reader: Arc<SuperfileReader>, probe: Probe| {
             let column = Arc::clone(&column_arc);
             let query = Arc::clone(&query_arc);
             async move {
-                reader
-                    .vector_search(&column, &query, k, options)
-                    .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))
+                let res = match probe {
+                    Probe::Clusters(ids) => {
+                        reader
+                            .vector_search_clusters(&column, &query, k, &ids, options)
+                            .await
+                    }
+                    Probe::Nprobe => reader.vector_search(&column, &query, k, options).await,
+                };
+                res.map_err(|e| QueryError::Parquet(e.to_string()))
             }
         };
         let per_segment = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
@@ -446,6 +517,44 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(hits.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn vector_search_global_selection_recovers_neighbors_under_low_budget() {
+        // 10 segments × 16 one-hot docs. Query e_0's true neighbors are
+        // the 10 docs with id % dim == 0 (one per segment) at cosine
+        // distance 0; every other doc is orthogonal (distance 1). With
+        // nprobe = 1 the global budget is only 10 clusters across all 10
+        // segments — so this exercises real cross-segment cluster
+        // pruning (most of the 10 × n_cent clusters are skipped), and
+        // recall@10 must still recover the concentrated neighbors.
+        let dim = 16;
+        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        let n_seg = 10u64;
+        for chunk in 0..n_seg {
+            w.append(&build_vector_batch(chunk * 16, 16, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        assert_eq!(st.reader().n_superfiles(), n_seg as usize);
+
+        let mut q = vec![0f32; dim];
+        q[0] = 1.0;
+        let opts = VectorSearchOptions::new().with_nprobe(1);
+        let hits = st
+            .reader()
+            .vector_search("emb", &q, 10, opts)
+            .await
+            .expect("query");
+
+        let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
+        assert!(
+            exact_neighbors >= 9,
+            "recall@10 ≥ 0.90 under aggressive global cluster pruning; \
+             recovered {exact_neighbors}/10 exact neighbors"
+        );
     }
 
     #[tokio::test]

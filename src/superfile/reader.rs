@@ -202,7 +202,7 @@ impl SuperfileReader {
         //   fires both subsection fetches **concurrently** via
         //   `futures::try_join!`. The two subsections live at
         //   disjoint offsets (parquet body → fts → vec → footer
-        //   in the layout produced by `write_parquet_with_blobs`)
+        //   in the layout produced by `splice_index_blobs`)
         //   so neither depends on the other; on a network-backed
         //   `LazyByteSource` this collapses two serial RTTs
         //   into one parallel RTT. On warm/in-memory sources
@@ -871,6 +871,29 @@ impl SuperfileReader {
                 .await?,
         )
     }
+
+    /// As [`Self::vector_search`], but probes an **externally chosen**
+    /// set of IVF cluster ids — selected globally across segments from
+    /// the manifest's per-cluster centroids — instead of this segment's
+    /// own `nprobe` centroid scoring. `rerank_mult` is still derived from
+    /// `options`; `options.nprobe` is unused on this path.
+    pub async fn vector_search_clusters(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        options: VectorSearchOptions,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let v = self
+            .vec()
+            .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
+        let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
+        Ok(
+            v.search_clusters_async(column, query, k, clusters, rerank_mult)
+                .await?,
+        )
+    }
 }
 
 /// Tuning knobs for [`SuperfileReader::vector_search`]. Defaults
@@ -1195,24 +1218,16 @@ mod tests {
     fn open_rejects_parquet_without_inf_format_kv() {
         // Hand-build a Parquet file with no inf.* keys; it should fail
         // with MissingKv (inf.format).
-        use crate::superfile::format::footer::write_parquet_with_blobs;
+        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
         use parquet::basic::Compression;
         let schema = schema_with_text();
         let ids = decimal128_ids(vec![1u64]);
         let title = LargeStringArray::from(vec!["x"]);
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(title)])
             .expect("build RecordBatch");
-        let parts = write_parquet_with_blobs(
-            &schema,
-            &[batch],
-            &[],
-            &[],
-            &[],
-            Compression::SNAPPY,
-            1024,
-            &[],
-        )
-        .expect("write parquet with blobs");
+        let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, 1024, &[])
+            .expect("encode parquet body");
+        let parts = splice_index_blobs(body, &[], &[], &[]).expect("splice index blobs");
         let err = SuperfileReader::open(Bytes::from(parts.bytes)).expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
     }

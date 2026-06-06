@@ -587,7 +587,22 @@ fn build_vector_summary(
     };
     for vc in &options.vector_columns {
         if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
-            out.insert(vc.column.clone(), VectorSummary { centroid, radius });
+            let clusters = vec_reader
+                .cluster_centroids(&vc.column)
+                .map(|(n_cent, dim, fp32, counts)| {
+                    crate::supertable::manifest::ClusterCentroids::from_fp32(
+                        n_cent, dim, &fp32, counts,
+                    )
+                })
+                .unwrap_or_default();
+            out.insert(
+                vc.column.clone(),
+                VectorSummary {
+                    centroid,
+                    radius,
+                    clusters,
+                },
+            );
         }
     }
     out

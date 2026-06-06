@@ -1037,6 +1037,43 @@ impl VectorReader {
         Some((centroid, col.summary_radius))
     }
 
+    /// The column's per-cluster IVF centroids (fp32, cluster-major,
+    /// `n_cent * dim`) plus each cluster's indexed doc count. Returns
+    /// `(n_cent, dim, centroids, counts)`. Used by the writer to stage
+    /// quantized cluster centroids into the manifest for cross-segment
+    /// global cluster selection. `None` if the column is unknown or the
+    /// centroid/cluster_idx bytes aren't resident.
+    pub fn cluster_centroids(&self, column: &str) -> Option<(u32, u32, Vec<f32>, Vec<u32>)> {
+        let cid = *self.column_id_by_name.get(column)?;
+        let col = &self.columns[cid as usize];
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
+        let n_cent = col.n_cent as usize;
+        let dim = col.dim;
+        let stride = dim * 4;
+
+        // Centroids: fp32, cluster-major, at `centroids_off`.
+        let mut centroids = Vec::with_capacity(n_cent * dim);
+        for c in 0..n_cent {
+            let base = col.centroids_off + c * stride;
+            for d in 0..dim {
+                let s = base + d * 4;
+                centroids.push(f32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]]));
+            }
+        }
+
+        // cluster_idx: `n_cent` × `(doc_off: u32, count: u32)`; we want
+        // the count (second u32 of each 8-byte entry).
+        let mut counts = Vec::with_capacity(n_cent);
+        for c in 0..n_cent {
+            let b = col.cluster_idx_off + c * 8 + 4;
+            counts.push(u32::from_le_bytes([sub[b], sub[b + 1], sub[b + 2], sub[b + 3]]));
+        }
+
+        Some((col.n_cent, dim as u32, centroids, counts))
+    }
+
     /// Single-column kNN search. Returns `(local_doc_id,
     /// distance)` sorted ascending by distance (smaller = closer
     /// for every metric).
@@ -1296,18 +1333,81 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
 
-        // 4. Per-cluster prefix range plan (see sync `search`).
+        // 4. Probe the centroid-scored clusters through the shared tail
+        //    (also used by the externally-selected
+        //    `search_clusters_async` path).
         let _ = sub_start;
+        let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
+        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+            .await
+    }
+
+    /// Async IVF probe over an **externally chosen** set of cluster ids.
+    /// The cross-segment global selector picks these from the manifest's
+    /// per-cluster centroids, so this skips the segment's own centroid
+    /// scoring entirely — it fetches just the cluster index, then probes
+    /// exactly `clusters` (ids ≥ `n_cent` and empty clusters are
+    /// ignored). The shortlist + rerank are byte-for-byte the same as
+    /// [`Self::search_async`].
+    pub async fn search_clusters_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        rerank_mult: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated {
+            return Ok(Vec::new());
+        }
+        let sub_start = col.subsection_range.start;
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let cluster_idx = self
+            .source
+            .range_async(idx_start..idx_end)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let mut q_rot = vec![0f32; col.dim];
+        col.rot.apply(query, &mut q_rot);
+        let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
+        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+            .await
+    }
+
+    /// Shared async tail of the IVF probe: given a chosen set of cluster
+    /// ids plus the already-fetched cluster index, fetch each non-empty
+    /// cluster's block, build the 1-bit shortlist, and rerank to top-k.
+    /// Used by [`Self::search_async`] (clusters from this segment's
+    /// centroid scoring) and [`Self::search_clusters_async`] (clusters
+    /// from the global cross-segment selector).
+    async fn probe_clusters_async(
+        &self,
+        col: &ColumnReader,
+        query: &[f32],
+        q_rot: &[f32],
+        cluster_idx: &[u8],
+        chosen: &[usize],
+        k: usize,
+        rerank_mult: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
-        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(nprobe_eff);
-        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
-        for &(c, _) in &centroid_scores {
-            let (off, cnt) = read_cluster_entry(&cluster_idx, c);
+        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
+        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(chosen.len());
+        for &c in chosen {
+            if c >= col.n_cent as usize {
+                continue;
+            }
+            let (off, cnt) = read_cluster_entry(cluster_idx, c);
             if cnt == 0 {
                 continue;
             }
             cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
             cluster_meta.push((c, off, cnt));
+        }
+        if cluster_meta.is_empty() {
+            return Ok(Vec::new());
         }
         let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
         // Warm fast path: every prefix already resident → sync zero-copy.
@@ -1347,7 +1447,7 @@ impl VectorReader {
         // diverges from the sync path.
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            &q_rot,
+            q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
@@ -2591,6 +2691,46 @@ mod tests {
         assert_eq!(centroid.len(), 16);
         assert!(radius >= 0.0);
         assert!(r.summary("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_clusters_async_probing_all_matches_full_nprobe() {
+        // The externally-selected path probing *every* cluster must
+        // recover the same top-k set as a full-nprobe `search_async` —
+        // same shortlist, same rerank. (Compared as a set: equal
+        // distances could tie-break differently across cluster-visit
+        // orders.)
+        use std::collections::HashSet;
+        let (blob, json, all) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let q = &all[0];
+        let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
+
+        let full = r
+            .search_async("v", q, k, n_cent as usize, rerank)
+            .await
+            .expect("search_async");
+        let probed = r
+            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank)
+            .await
+            .expect("search_clusters_async");
+
+        assert!(!full.is_empty(), "self-query returns hits");
+        assert_eq!(full.len(), probed.len(), "same number of hits");
+        let full_ids: HashSet<u32> = full.iter().map(|(id, _)| *id).collect();
+        let probed_ids: HashSet<u32> = probed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            full_ids, probed_ids,
+            "probing all clusters must match a full-nprobe search"
+        );
+
+        // Probing no clusters returns nothing.
+        let none = r
+            .search_clusters_async("v", q, k, &[], rerank)
+            .await
+            .expect("search_clusters_async empty");
+        assert!(none.is_empty(), "probing no clusters returns no hits");
     }
 
     // -----------------------------------------------------------------

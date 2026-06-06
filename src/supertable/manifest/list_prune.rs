@@ -321,6 +321,7 @@ mod tests {
                 VectorSummary {
                     centroid: c,
                     radius: vec_radius,
+                    clusters: crate::supertable::manifest::ClusterCentroids::empty(),
                 },
             );
         }
