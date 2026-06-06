@@ -15,8 +15,9 @@
 //!     from `new_segment_list`).
 //!   - `Supertable::open`'s eager-fetch populates
 //!     `n_manifest_parts_loaded == n_manifest_parts`.
-//!   - `process_rss_bytes` is non-zero and within ±10% of an
-//!     independent reading from the `memory-stats` crate
+//!   - `process_rss_bytes` is non-zero and falls within a
+//!     self-calibrating bracket around independent readings from
+//!     the `memory-stats` crate taken before and after the call
 //!     (i.e., the accessor is consistent).
 //!   - Repeat calls return updated values (no internal
 //!     caching of the snapshot).
@@ -122,7 +123,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
 }
 
 #[test]
-fn process_rss_bytes_matches_independent_reading_within_pct() {
+fn process_rss_bytes_matches_independent_reading_within_bracket() {
     // Both stats() and memory-stats::memory_stats() read the
     // same OS-reported RSS via the same crate, so back-to-back
     // calls should match closely. Under parallel cargo-test

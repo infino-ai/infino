@@ -324,7 +324,7 @@ pub async fn read_parquet_metadata_lazy(
 /// convenience wrapper around
 /// [`read_parquet_metadata_lazy`] for the common case where
 /// callers only need the `inf.*` KV map (e.g. tests + the eager
-/// open path mirroring the legacy [`read_kv_metadata`]).
+/// open path, mirroring the eager [`read_kv_metadata`]).
 pub async fn read_kv_metadata_lazy(
     source: &dyn crate::superfile::LazyByteSource,
     tail_speculative_bytes: u64,
