@@ -52,55 +52,59 @@ when ingest is already available.
 ## Object-store backends
 
 The warm/cold supertable and superfile benches run against an object
-store. The backend is chosen **explicitly** by `INFINO_BENCH_STORE` — it
-is never inferred from which credentials happen to be exported:
+store, chosen **explicitly** on two orthogonal axes — never inferred from
+which credentials happen to be exported:
 
-| `INFINO_BENCH_STORE` | Store | Extra env |
-|---|---|---|
-| _unset_ / `s3s_fs` | in-process s3s-fs emulator (default, no credentials) | — |
-| `azurite` | local Azurite emulator (no credentials) | Azurite running on `:10000` + the `infino-bench` container (override: `INFINO_AZURITE_CONTAINER`) |
-| `s3` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
-| `azure` | Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
+- `INFINO_BENCH_STORE` = `s3` (default) | `azure` — the provider.
+- `INFINO_BENCH_MODE` = `local` (default) | `remote` — the deployment.
+
+| store | mode | Backend | Extra env |
+|---|---|---|---|
+| `s3` | `local` (default) | in-process s3s-fs emulator | — |
+| `azure` | `local` | Azurite emulator | Azurite on `:10000` + the `infino-bench` container (override: `INFINO_AZURITE_CONTAINER`) |
+| `s3` | `remote` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
+| `azure` | `remote` | Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
 
 ```sh
-# Default — emulator, no credentials, no network
+# Default — s3 local = in-process s3s-fs, no credentials, no network
 cargo bench --bench supertable_all -- supertable_fts
 
-# Real AWS S3
-INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket \
-  cargo bench --bench supertable_all -- supertable_fts
-
-# Azure Blob
-INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
-  AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... \
-  cargo bench --bench supertable_all -- supertable_fts
-
-# Local Azurite emulator (credential-free, completes the full supertable path)
+# Azure local — Azurite (credential-free, completes the full supertable path)
 docker run -d --name infino-azurite -p 10000:10000 \
   mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0
 az storage container create -n infino-bench \
   --connection-string "UseDevelopmentStorage=true"
-INFINO_BENCH_STORE=azurite cargo bench --bench supertable_all -- supertable_fts
+INFINO_BENCH_STORE=azure INFINO_BENCH_MODE=local \
+  cargo bench --bench supertable_all -- supertable_fts
+
+# S3 remote — real AWS S3
+INFINO_BENCH_STORE=s3 INFINO_BENCH_MODE=remote INFINO_REAL_S3_BUCKET=my-bucket \
+  cargo bench --bench supertable_all -- supertable_fts
+
+# Azure remote — real Azure Blob
+INFINO_BENCH_STORE=azure INFINO_BENCH_MODE=remote INFINO_REAL_AZURE_CONTAINER=my-container \
+  AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... \
+  cargo bench --bench supertable_all -- supertable_fts
 ```
 
-The chosen backend appears as the storage label in warm/cold group names
-(`s3s_fs` / `azurite` / `s3` / `azure`), e.g.
-`supertable_fts_cold_search_azurite`. A run with no real backend selected
-writes only to the emulator.
+The chosen backend appears as the storage label in warm/cold group names —
+`{store}_{mode}`: `s3_local` / `s3_remote` / `azure_local` / `azure_remote`,
+e.g. `supertable_fts_cold_search_azure_local`. The default (`s3` `local`)
+writes only to the in-process emulator.
 
 **Cleanup.** A real-backend run writes its table under a unique prefix
 and deletes it when the process exits — no manual cleanup. The emulator
 is in-process and self-cleans on drop.
 
-**Emulator caveat.** The in-process **s3s-fs** emulator can't survive the
+**Emulator caveat.** `s3` `local` (in-process s3s-fs) can't survive the
 supertable's concurrent multi-commit ingest (it reuses connections it has
 already closed, and mishandles a conditional PUT replayed after a dropped
 response — the commit panics). It's fine for the single-commit superfile
 benches and as a zero-setup wire-path check, but **for a full supertable
-run locally use `azurite`** — the official Azure emulator completes the
-whole ingest → search path credential-free. For *representative timings*,
-use a real backend (`INFINO_BENCH_STORE=s3|azure`): every emulator
-(s3s-fs or Azurite) reproduces request/byte volume, not network latency.
+run locally use `azure` `local`** (Azurite) — the official Azure emulator
+completes the whole ingest → search path credential-free. For
+*representative timings* use `mode=remote` (real S3 / Azure): every
+emulator reproduces request/byte volume, not network latency.
 
 ## Code layout (`infino-bench-utils`)
 
