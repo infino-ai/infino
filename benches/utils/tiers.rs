@@ -238,10 +238,12 @@ impl BenchStore {
                      INFINO_REAL_AZURE_CONTAINER"
                         .to_string()
                 }),
-            ("s3" | "azure", other) => {
-                Err(format!("unknown INFINO_BENCH_MODE={other} (want local|remote)"))
-            }
-            (other, _) => Err(format!("unknown INFINO_BENCH_STORE={other} (want s3|azure)")),
+            ("s3" | "azure", other) => Err(format!(
+                "unknown INFINO_BENCH_MODE={other} (want local|remote)"
+            )),
+            (other, _) => Err(format!(
+                "unknown INFINO_BENCH_STORE={other} (want s3|azure)"
+            )),
         }
     }
 }
@@ -391,7 +393,10 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     if std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some()
         || std::env::var_os("INFINO_BENCH_DATASET").is_some()
     {
-        eprintln!("[tiers] keeping {} prefix={prefix} (cleanup skipped)", backend.label());
+        eprintln!(
+            "[tiers] keeping {} prefix={prefix} (cleanup skipped)",
+            backend.label()
+        );
     } else {
         CLEANUP
             .lock()
