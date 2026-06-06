@@ -81,12 +81,12 @@ which is the structured source of truth the markdown is derived from.
 <!-- BEGIN: bench/fts/superfile/ingest -->
 ### Superfile FTS — ingest (1000000 docs, Zipfian, 200 tokens/doc, 10K vocab)
 
-Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit).
+Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit). Bandwidth (MB/s) is over the logical input text payload.
 
-| Engine                       | Time       | Throughput | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
-|------------------------------|------------|------------|-----------|------------|-----------|------------|
-| infino_1thread               | 20.34 s    | 49.2 K/s   | 8.23 GiB  | 6.79 GiB   | 7.37 GiB  | —          |
-| infino_rayon_default_threads | 2.09 s     | 479.4 K/s  | 9.78 GiB  | 8.32 GiB   | 9.15 GiB  | —          |
+| Engine                       | Time       | Throughput | Bandwidth  | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|------------------------------|------------|------------|------------|-----------|------------|-----------|------------|
+| infino_1thread               | 14.89 s    | 67.2 K/s   | 135.0 MB/s | 5.87 GiB  | 4.07 GiB   | 4.76 GiB  | +0.8% no change |
+| infino_rayon_default_threads | 1.80 s     | 556.9 K/s  | 1.12 GB/s  | 7.57 GiB  | 6.31 GiB   | 7.04 GiB  | -6.3% improved |
 
 <!-- END: bench/fts/superfile/ingest -->
 
@@ -99,30 +99,33 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |----------------|------------|------------|-----------|------------|-----------|------------|
-| single_rare    | 671 ns | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| single_df1     | 279 ns | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| single_common  | 26.67 µs | 306.60 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| two_term_or    | 183.65 µs | 346.61 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_wide_or  | 2.67 ms | 396.86 ms | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_similar_or | 11.00 ms | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| five_term_or   | 19.18 ms | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| single_rare    | 582 ns | 151.47 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| single_df1     | 243 ns | 115.97 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| single_common  | 16.43 µs | 159.62 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| two_term_or    | 158.41 µs | 140.11 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| three_wide_or  | 2.29 ms | 146.34 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| three_similar_or | 9.50 ms | 162.02 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| five_term_or   | 16.58 ms | 167.05 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| ten_term_or    | 49.42 ms | 215.66 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
 
 **AND queries:**
 
 | Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |----------------|------------|------------|-----------|------------|-----------|------------|
-| two_term_and   | 232.47 µs  | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_wide_and | 4.04 ms    | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| three_similar_and | 6.53 ms | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
-| five_term_and  | 8.01 ms    | — | 8.01 GiB  | 4.74 GiB   | 4.78 GiB  | —          |
+| two_term_and   | 199.03 µs | 139.63 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| three_wide_and | 3.39 ms | 163.54 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| three_similar_and | 5.64 ms | 158.71 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| five_term_and  | 6.94 ms | 159.05 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
+| ten_term_and   | 7.99 ms | 182.98 ms | 5.56 GiB  | 3.44 GiB   | 3.51 GiB  | -5.7% improved |
 
 **Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):
 
 | Shape         | WAND+BMW   | MaxScore+BMM |
 |---------------|------------|--------------|
-| wide_3_or     | 8.93 ms    | 2.67 ms      |
-| similar_3_or  | 16.92 ms   | 11.02 ms     |
-| similar_5_or  | 47.30 ms   | 19.21 ms     |
+| wide_3_or     | 7.64 ms    | 2.31 ms      |
+| similar_3_or  | 14.14 ms   | 9.50 ms      |
+| similar_5_or  | 40.34 ms   | 16.60 ms     |
+| similar_10_or | 283.29 ms  | 49.49 ms     |
 
 <!-- END: bench/fts/superfile/search -->
 
@@ -133,7 +136,7 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 313.20 s | 31.9 K/s | 6.31 GiB | 2.14 GiB | 3.39 GiB | +1.2% no change |
+| supertable | 266.75 s | 37.5 K/s | 6.19 GiB | 2.11 GiB | 3.63 GiB | -0.6% no change |
 
 <!-- END: bench/supertable/ingest/supertable_fts_build -->
 
@@ -144,14 +147,14 @@ hot = warm steady state: every segment mmap-promoted via the public `Supertable:
 
 | Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
 |----------------|------------|------------|-----------|------------|-----------|------------|
-| single_rare    | 2.83 ms | 399.51 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| single_common  | 2.87 ms | 384.85 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| two_term_or    | 3.35 ms | 535.05 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| three_wide_or  | 6.37 ms | 573.50 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| three_similar_or | 13.68 ms | 558.49 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| five_term_or   | 29.00 ms | 570.43 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| ten_term_or    | 79.47 ms | 590.62 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
-| prefix         | 60.97 ms | 562.12 ms | 10.61 GiB | 10.51 GiB  | 10.53 GiB | +2.1% no change |
+| single_rare    | 2.78 ms | 320.45 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| single_common  | 2.79 ms | 316.83 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| two_term_or    | 3.20 ms | 434.43 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| three_wide_or  | 5.65 ms | 523.44 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| three_similar_or | 12.06 ms | 495.48 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| five_term_or   | 24.29 ms | 523.85 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| ten_term_or    | 65.30 ms | 441.77 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
+| prefix         | 51.61 ms | 484.51 ms | 10.88 GiB | 10.81 GiB  | 10.82 GiB | —          |
 
 <!-- END: bench/fts/supertable/search -->
 
@@ -160,9 +163,12 @@ hot = warm steady state: every segment mmap-promoted via the public `Supertable:
 <!-- BEGIN: bench/vector/superfile/ingest -->
 ### Superfile vector — ingest (1000000 docs × dim=384, Gaussian planted clusters, cosine)
 
-| Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
-|--------|------|------------|----------|------------|---------|------------|
-| infino | 18.89 s | 52.9 K/s | 4.15 GiB | 2.79 GiB | 3.67 GiB | — |
+Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit). `infino_1thread` builds one superfile (the vector builder still uses intra-segment rayon for rotation/encode); `infino_rayon_default_threads` shards the corpus across the rayon pool into one superfile per shard (the multi-segment shape supertable commit produces). Bandwidth (MB/s) is over the raw f32 vector payload.
+
+| Engine                       | Time       | Throughput | Bandwidth  | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |
+|------------------------------|------------|------------|------------|-----------|------------|-----------|------------|
+| infino_1thread               | 18.93 s    | 52.8 K/s   | 81.2 MB/s  | 4.36 GiB  | 1.88 GiB   | 2.88 GiB  | +0.3% no change |
+| infino_rayon_default_threads | 2.18 s     | 458.1 K/s  | 703.7 MB/s | 6.75 GiB  | 5.28 GiB   | 6.58 GiB  | -3.4% no change |
 
 <!-- END: bench/vector/superfile/ingest -->
 
@@ -173,19 +179,19 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Recall target | (p, r)     | hot        | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|------------|------------|----------|------------|---------|------------|
-| 0.90          | (p=1, r=1024) | 919.98 µs | 256.81 ms | 4.84 GiB | 4.84 GiB | 4.84 GiB | +0.6% no change |
-| 0.95          | (p=1, r=256) | 919.20 µs | 252.16 ms | 4.84 GiB | 4.84 GiB | 4.84 GiB | +0.6% no change |
-| 0.99          | (p=5, r=256) | 1.17 ms | 258.36 ms | 4.84 GiB | 4.84 GiB | 4.84 GiB | +0.6% no change |
+| 0.90          | (p=1, r=256) | 869.94 µs | 337.16 ms | 4.91 GiB | 4.13 GiB | 4.18 GiB | -0.2% no change |
+| 0.95          | (p=1, r=256) | 867.16 µs | 432.55 ms | 4.91 GiB | 4.13 GiB | 4.18 GiB | -0.2% no change |
+| 0.99          | (p=5, r=256) | 1.09 ms | 363.80 ms | 4.91 GiB | 4.13 GiB | 4.18 GiB | -0.2% no change |
 
 **infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):
 
 | Metric | Value |
 |--------|-------|
-| infino_default_options_top10 (hot) | 707.30 µs |
-| infino_default_options_top10 (cold) | 247.40 ms |
-| infino_default_options_top10_peak_rss | 4.84 GiB |
-| infino_default_options_top10_median_rss | 4.84 GiB |
-| infino_default_options_top10_p90_rss | 4.84 GiB |
+| infino_default_options_top10 (hot) | 617.41 µs |
+| infino_default_options_top10 (cold) | 281.92 ms |
+| infino_default_options_top10_peak_rss | 4.91 GiB |
+| infino_default_options_top10_median_rss | 4.13 GiB |
+| infino_default_options_top10_p90_rss | 4.18 GiB |
 
 <!-- END: bench/vector/superfile/search -->
 
@@ -196,7 +202,7 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 147.49 s | 67.8 K/s | 3.20 GiB | 2.40 GiB | 2.86 GiB | +11.1% regressed |
+| supertable | 117.66 s | 85.0 K/s | 4.92 GiB | 3.05 GiB | 4.76 GiB | — |
 
 <!-- END: bench/supertable/ingest/supertable_vec_build -->
 
@@ -205,7 +211,7 @@ Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storag
 
 | Engine | Time | Throughput | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |--------|------|------------|----------|------------|---------|------------|
-| supertable | 476.08 s | 21.0 K/s | 7.20 GiB | 3.60 GiB | 4.73 GiB | +0.4% no change |
+| supertable | 379.09 s | 26.4 K/s | 9.21 GiB | 3.71 GiB | 6.37 GiB | — |
 
 <!-- END: bench/supertable/ingest/supertable_all_build -->
 
@@ -216,8 +222,8 @@ hot = warm steady state: every segment mmap-promoted via the public `Supertable:
 
 | Recall target | (p/seg, r) | hot | cold | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |
 |---------------|------------|-----|------|----------|------------|---------|------------|
-| 0.90 | (p=4, r=4) | 8.74 ms | 1.10 s | 10.16 GiB | 10.13 GiB | 10.14 GiB | -2.3% no change |
-| 0.95 | (p=8, r=4) | 9.55 ms | 1.15 s | 10.16 GiB | 10.13 GiB | 10.14 GiB | -2.3% no change |
-| 0.99 | (p=16, r=4) | 16.11 ms | 1.24 s | 10.16 GiB | 10.13 GiB | 10.14 GiB | -2.3% no change |
+| 0.90 | (p=4, r=4) | 10.02 ms | 1.03 s | 10.35 GiB | 10.33 GiB | 10.35 GiB | — |
+| 0.95 | (p=8, r=4) | 10.73 ms | 1.07 s | 10.35 GiB | 10.33 GiB | 10.35 GiB | — |
+| 0.99 | (p=32, r=4) | 23.03 ms | 1.42 s | 10.35 GiB | 10.33 GiB | 10.35 GiB | — |
 
 <!-- END: bench/vector/supertable/search -->
