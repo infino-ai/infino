@@ -32,6 +32,33 @@ const N_DOCS: usize = 10_000;
 const N_CENT: usize = 64;
 const N_QUERIES: usize = 50;
 
+/// Per-dim Gaussian perturbation for "near-doc" realistic queries.
+const QUERY_SIGMA: f32 = 0.05;
+/// recall@K used by the gate (top-10) and the strict recall@1 check.
+const RECALL_AT_K: usize = 10;
+const RECALL_AT_ONE_K: usize = 1;
+/// Low / high nprobe operating points for the recall gates.
+const NPROBE_LOW: usize = 8;
+const NPROBE_HIGH: usize = 32;
+/// Recall floors (regression thresholds) per metric / operating point.
+const RECALL10_NPROBE_LOW_MIN: f32 = 0.90;
+const RECALL10_NPROBE_HIGH_MIN: f32 = 0.95;
+const RECALL1_NPROBE_LOW_MIN: f32 = 0.95;
+/// Corpus/query seeds per metric fixture (distinct so fixtures differ).
+const L2SQ_FIXTURE_SEED: u64 = 1;
+const L2SQ_QUERY_SEED: u64 = 100;
+const COSINE_FIXTURE_SEED: u64 = 2;
+const COSINE_QUERY_SEED: u64 = 200;
+const MONOTONIC_FIXTURE_SEED: u64 = 3;
+const MONOTONIC_QUERY_SEED: u64 = 300;
+/// Sentinel "previous recall" so the first nprobe in the monotonic
+/// sweep always passes the non-decreasing check.
+const MONOTONIC_PREV_SENTINEL: f32 = -1.0;
+/// Ordered nprobe ladder for the monotonicity regression.
+const NPROBE_MONOTONIC_SWEEP: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+/// Allowed recall drop between adjacent nprobe steps (noise band).
+const NPROBE_MONOTONIC_TOLERANCE: f32 = 0.02;
+
 fn search_blocking(
     reader: &SuperfileReader,
     query: &[f32],
@@ -75,24 +102,52 @@ fn build_fixture(seed: u64, normalize_each: bool, metric: Metric) -> (Vec<f32>, 
 }
 
 fn recall_l2sq_at_10k_dim384_meets_threshold() {
-    let (vectors, reader) = build_fixture(1, false, Metric::L2Sq);
-    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 100, false, 0.05);
+    let (vectors, reader) = build_fixture(L2SQ_FIXTURE_SEED, false, Metric::L2Sq);
+    let queries = generate_realistic_queries(
+        &vectors,
+        N_DOCS,
+        N_QUERIES,
+        L2SQ_QUERY_SEED,
+        false,
+        QUERY_SIGMA,
+    );
 
-    let r10 = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, 8);
+    let r10 = measure_recall(
+        &reader,
+        &vectors,
+        Metric::L2Sq,
+        &queries,
+        RECALL_AT_K,
+        NPROBE_LOW,
+    );
     assert!(
-        r10 >= 0.90,
+        r10 >= RECALL10_NPROBE_LOW_MIN,
         "L2Sq recall@10 at nprobe=8 below threshold: {r10:.3} < 0.90"
     );
 
-    let r10_high = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, 32);
+    let r10_high = measure_recall(
+        &reader,
+        &vectors,
+        Metric::L2Sq,
+        &queries,
+        RECALL_AT_K,
+        NPROBE_HIGH,
+    );
     assert!(
-        r10_high >= 0.95,
+        r10_high >= RECALL10_NPROBE_HIGH_MIN,
         "L2Sq recall@10 at nprobe=32 below threshold: {r10_high:.3} < 0.95"
     );
 
-    let r1 = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 1, 8);
+    let r1 = measure_recall(
+        &reader,
+        &vectors,
+        Metric::L2Sq,
+        &queries,
+        RECALL_AT_ONE_K,
+        NPROBE_LOW,
+    );
     assert!(
-        r1 >= 0.95,
+        r1 >= RECALL1_NPROBE_LOW_MIN,
         "L2Sq recall@1 at nprobe=8 below threshold: {r1:.3} < 0.95"
     );
 
@@ -102,18 +157,39 @@ fn recall_l2sq_at_10k_dim384_meets_threshold() {
 }
 
 fn recall_cosine_at_10k_dim384_meets_threshold() {
-    let (vectors, reader) = build_fixture(2, true, Metric::Cosine);
-    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 200, true, 0.05);
+    let (vectors, reader) = build_fixture(COSINE_FIXTURE_SEED, true, Metric::Cosine);
+    let queries = generate_realistic_queries(
+        &vectors,
+        N_DOCS,
+        N_QUERIES,
+        COSINE_QUERY_SEED,
+        true,
+        QUERY_SIGMA,
+    );
 
-    let r10 = measure_recall(&reader, &vectors, Metric::Cosine, &queries, 10, 8);
+    let r10 = measure_recall(
+        &reader,
+        &vectors,
+        Metric::Cosine,
+        &queries,
+        RECALL_AT_K,
+        NPROBE_LOW,
+    );
     assert!(
-        r10 >= 0.90,
+        r10 >= RECALL10_NPROBE_LOW_MIN,
         "Cosine recall@10 at nprobe=8 below threshold: {r10:.3} < 0.90"
     );
 
-    let r10_high = measure_recall(&reader, &vectors, Metric::Cosine, &queries, 10, 32);
+    let r10_high = measure_recall(
+        &reader,
+        &vectors,
+        Metric::Cosine,
+        &queries,
+        RECALL_AT_K,
+        NPROBE_HIGH,
+    );
     assert!(
-        r10_high >= 0.95,
+        r10_high >= RECALL10_NPROBE_HIGH_MIN,
         "Cosine recall@10 at nprobe=32 below threshold: {r10_high:.3} < 0.95"
     );
 
@@ -121,14 +197,28 @@ fn recall_cosine_at_10k_dim384_meets_threshold() {
 }
 
 fn recall_increases_monotonically_with_nprobe() {
-    let (vectors, reader) = build_fixture(3, false, Metric::L2Sq);
-    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 300, false, 0.05);
+    let (vectors, reader) = build_fixture(MONOTONIC_FIXTURE_SEED, false, Metric::L2Sq);
+    let queries = generate_realistic_queries(
+        &vectors,
+        N_DOCS,
+        N_QUERIES,
+        MONOTONIC_QUERY_SEED,
+        false,
+        QUERY_SIGMA,
+    );
 
-    let mut prev: f32 = -1.0;
-    for &nprobe in &[1, 2, 4, 8, 16, 32, 64] {
-        let r = measure_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, nprobe);
+    let mut prev: f32 = MONOTONIC_PREV_SENTINEL;
+    for &nprobe in NPROBE_MONOTONIC_SWEEP {
+        let r = measure_recall(
+            &reader,
+            &vectors,
+            Metric::L2Sq,
+            &queries,
+            RECALL_AT_K,
+            nprobe,
+        );
         assert!(
-            r >= prev - 0.02,
+            r >= prev - NPROBE_MONOTONIC_TOLERANCE,
             "recall regressed with more nprobe: nprobe={nprobe}, recall={r:.3}, prev={prev:.3}"
         );
         prev = r;

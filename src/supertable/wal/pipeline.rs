@@ -840,6 +840,11 @@ const SEALED_RETRY_BASE_MS: u64 = 100;
 /// hammer storage.
 const SEALED_RETRY_CAP_MS: u64 = 30_000;
 
+/// Cap on the sealed-retry backoff doubling exponent, so the shift
+/// plateaus (before [`SEALED_RETRY_CAP_MS`] clamps the result)
+/// rather than overflowing on a high attempt count.
+const SEALED_RETRY_MAX_SHIFT: u32 = 8;
+
 /// The non-idempotent fast path for the tombstone loop. For each
 /// `Pending` target in `wal_doc.tombstone_progress`: resolve →
 /// CAS-PUT the bit → CAS-update the WAL state doc. Once every
@@ -957,7 +962,7 @@ async fn resolve_and_tombstone_one(
                     });
                 }
                 let ms = SEALED_RETRY_BASE_MS
-                    .saturating_mul(1u64 << (sealed_attempts - 1).min(8))
+                    .saturating_mul(1u64 << (sealed_attempts - 1).min(SEALED_RETRY_MAX_SHIFT))
                     .min(SEALED_RETRY_CAP_MS);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 // Loop back and re-resolve against a fresh manifest.

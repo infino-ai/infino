@@ -25,6 +25,33 @@ use crate::superfile::PrefetchedSource;
 use crate::superfile::reader::{OpenOptions, SuperfileReader};
 use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
 
+/// Parquet footer tail-speculation length for cold opens. Must match
+/// `SuperfileReader::open_lazy_with` so the cold-fetch overlay covers
+/// the entire upcoming `source.tail()` read.
+const PARQUET_TAIL_SPEC_BYTES: u64 = 64 * 1024;
+
+/// Fallback vector-subsection open-range length when the manifest
+/// carries only a `(offset, len)` hint without explicit open ranges.
+/// Enough bytes to parse the vector outer header; the reader then
+/// discovers the rest.
+const VECTOR_OPEN_HEADER_FALLBACK_BYTES: u64 = 32;
+
+/// Fallback FTS open-range length under the same conditions as
+/// [`VECTOR_OPEN_HEADER_FALLBACK_BYTES`]. Enough to parse the FTS
+/// blob header.
+const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
+
+/// Poll cadence while waiting for another task to mmap-promote a
+/// segment. Short so the waiter picks up the promotion promptly
+/// without busy-spinning.
+const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Yield cadence in the background-fill upgrade loop. Gives a
+/// short-lived caller (e.g. a cold benchmark with a fresh cache per
+/// iteration) a scheduling turn to drop the cache before a
+/// full-segment fill starts.
+const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
@@ -492,7 +519,7 @@ impl DiskCacheStore {
             if self.is_mmap_promoted(uri) {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(MMAP_PROMOTION_POLL_INTERVAL).await;
         }
         Err(DiskCacheError::SuperfileOpen(format!(
             "segment {uri:?} not mmap-promoted within {timeout:?}"
@@ -1003,8 +1030,7 @@ impl DiskCacheStore {
             // Match `SuperfileReader::open_lazy_with`'s parquet tail
             // speculation length so the overlay covers the entire
             // upcoming `source.tail()` call.
-            let parquet_tail_spec: u64 = 64 * 1024;
-            let parquet_tail_len = parquet_tail_spec.min(total_size);
+            let parquet_tail_len = PARQUET_TAIL_SPEC_BYTES.min(total_size);
             let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
 
             // Seed the inner lazy readers with exact open-time metadata
@@ -1014,7 +1040,9 @@ impl DiskCacheStore {
                 offsets.vec_open_ranges.clone()
             } else {
                 match offsets.vec {
-                    Some((off, len)) if len > 0 => vec![(off, 32u64.min(len))],
+                    Some((off, len)) if len > 0 => {
+                        vec![(off, VECTOR_OPEN_HEADER_FALLBACK_BYTES.min(len))]
+                    }
                     _ => Vec::new(),
                 }
             };
@@ -1022,7 +1050,9 @@ impl DiskCacheStore {
                 offsets.fts_open_ranges.clone()
             } else {
                 match offsets.fts {
-                    Some((off, len)) if len > 0 => vec![(off, 48u64.min(len))],
+                    Some((off, len)) if len > 0 => {
+                        vec![(off, FTS_OPEN_HEADER_FALLBACK_BYTES.min(len))]
+                    }
                     _ => Vec::new(),
                 }
             };
@@ -1544,10 +1574,10 @@ async fn wait_for_lazy_foreground_release(
             // Give short-lived callers (notably cold benchmarks with a
             // fresh cache per iteration) a scheduling turn to drop the
             // cache before we start a full-segment background fill.
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
             return store.upgrade();
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
     }
 }
 

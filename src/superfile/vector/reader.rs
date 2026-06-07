@@ -31,9 +31,25 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-const OUTER_HEADER_SIZE: usize = 32;
-const DIR_ENTRY_SIZE: usize = 64;
-const SUB_HEADER_SIZE: usize = 56;
+use crate::superfile::format::vec::{
+    CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
+    dir_entry, outer_hdr, sub_hdr,
+};
+
+const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
+const DIR_ENTRY_SIZE: usize = format::vec::DIR_ENTRY_SIZE;
+const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
+
+/// Fixed-point scale for the per-subsection summary radius. The
+/// builder stores `round(radius × 100)` in a `u32`; the reader
+/// recovers the radius by dividing by this. Must match
+/// `builder::SUMMARY_RADIUS_SCALE`.
+const SUMMARY_RADIUS_SCALE: f32 = 100.0;
+
+/// Shortlist multiplier for the Sq8Residual refine pass. After the
+/// first-pass Sq8 scan, only the top `SQ8_RESIDUAL_REFINE_MULT × k`
+/// survivors are re-scored with the more expensive residual leg.
+const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
 
 /// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
 /// value is a JSON array of these in declaration order.
@@ -320,21 +336,26 @@ impl VectorReader {
                     "lazy open: outer header fetch: {e}"
                 )))
             })?;
-        if &header_bytes[0..8] != format::vec::OUTER_MAGIC {
+        if &header_bytes[0..MAGIC_BYTES] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
                 expected: format::vec::OUTER_MAGIC,
-                actual: header_bytes[0..8].to_vec(),
+                actual: header_bytes[0..MAGIC_BYTES].to_vec(),
             }));
         }
-        let version = read_u32_le(&header_bytes[8..12]);
+        let version =
+            read_u32_le(&header_bytes[outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES]);
         if version != format::vec::VERSION {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
             ))));
         }
-        let n_columns = read_u32_le(&header_bytes[12..16]) as usize;
-        let dir_offset = read_u64_le(&header_bytes[24..32]) as usize;
+        let n_columns = read_u32_le(
+            &header_bytes[outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES],
+        ) as usize;
+        let dir_offset = read_u64_le(
+            &header_bytes[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES],
+        ) as usize;
         let dir_size = n_columns * DIR_ENTRY_SIZE;
         let dir_end = dir_offset + dir_size + format::CRC_BYTES;
         if dir_end > blob_size {
@@ -358,7 +379,7 @@ impl VectorReader {
         // have to an end-to-end integrity check when
         // `verify_crc = false`.
         let dir_bytes_slice = &dir_prefetch[0..dir_size];
-        let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + 4]);
+        let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + format::CRC_BYTES]);
         let dir_crc_actual = crc32c(dir_bytes_slice);
         if dir_crc_expected != dir_crc_actual {
             return Err(VectorError::Read(ReadError::ChecksumMismatch {
@@ -376,15 +397,23 @@ impl VectorReader {
         let mut subheader_ranges = Vec::with_capacity(n_columns);
         for i in 0..n_columns {
             let entry_off = i * DIR_ENTRY_SIZE;
-            let subsection_off =
-                read_u64_le(&dir_bytes_slice[entry_off + 24..entry_off + 32]) as usize;
-            let subsection_len =
-                read_u64_le(&dir_bytes_slice[entry_off + 32..entry_off + 40]) as usize;
-            let dir_codec_meta_off =
-                read_u32_le(&dir_bytes_slice[entry_off + 56..entry_off + 60]) as usize;
-            let dir_codec_meta_size =
-                read_u32_le(&dir_bytes_slice[entry_off + 60..entry_off + 64]) as usize;
-            if subsection_len < SUB_HEADER_SIZE + 4 {
+            let subsection_off = read_u64_le(
+                &dir_bytes_slice[entry_off + dir_entry::SUBSECTION_OFF_OFF
+                    ..entry_off + dir_entry::SUBSECTION_OFF_OFF + U64_BYTES],
+            ) as usize;
+            let subsection_len = read_u64_le(
+                &dir_bytes_slice[entry_off + dir_entry::SUBSECTION_LEN_OFF
+                    ..entry_off + dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
+            ) as usize;
+            let dir_codec_meta_off = read_u32_le(
+                &dir_bytes_slice[entry_off + dir_entry::CODEC_META_OFF_OFF
+                    ..entry_off + dir_entry::CODEC_META_OFF_OFF + U32_BYTES],
+            ) as usize;
+            let dir_codec_meta_size = read_u32_le(
+                &dir_bytes_slice[entry_off + dir_entry::CODEC_META_SIZE_OFF
+                    ..entry_off + dir_entry::CODEC_META_SIZE_OFF + U32_BYTES],
+            ) as usize;
+            if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} too short ({subsection_len} bytes)"
                 ))));
@@ -435,17 +464,20 @@ impl VectorReader {
         let subheaders = subheaders_fut.await?;
 
         for (i, subsection_off, sub_header) in subheaders {
-            if &sub_header[0..8] != format::vec::SUB_MAGIC {
+            if &sub_header[0..MAGIC_BYTES] != format::vec::SUB_MAGIC {
                 return Err(VectorError::Read(ReadError::BadMagic {
                     section: "vector/subsection",
                     expected: format::vec::SUB_MAGIC,
-                    actual: sub_header[0..8].to_vec(),
+                    actual: sub_header[0..MAGIC_BYTES].to_vec(),
                 }));
             }
             overlay.install(subsection_off as u64, sub_header.clone());
             let (_, entry_off, _, subsection_len, sub_end, dir_codec_meta_off, dir_codec_meta_size) =
                 subsection_meta[i];
-            let per_cluster_blocks_off = read_u64_le(&sub_header[48..56]) as usize;
+            let per_cluster_blocks_off = read_u64_le(
+                &sub_header[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
+                    ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
+            ) as usize;
             let open_time_abs_end = subsection_off + per_cluster_blocks_off;
             if open_time_abs_end > sub_end {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
@@ -453,7 +485,9 @@ impl VectorReader {
                      exceeds subsection length {subsection_len}",
                 ))));
             }
-            let codec_meta_size = read_u32_le(&sub_header[12..16]) as usize;
+            let codec_meta_size = read_u32_le(
+                &sub_header[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES],
+            ) as usize;
 
             // Codec_meta lives at `[cluster_idx_off + n_cent*8 ..
             // per_cluster_blocks_off]`. We only need it for Sq8
@@ -463,9 +497,15 @@ impl VectorReader {
             // not the centroids / cluster_idx prefix that precedes
             // them in the subsection.
             if codec_meta_size > 0 {
-                let cluster_idx_off = read_u64_le(&sub_header[40..48]) as usize;
-                let n_cent = read_u32_le(&dir_bytes_slice[entry_off + 8..entry_off + 12]) as usize;
-                let codec_meta_off = cluster_idx_off + n_cent * 8;
+                let cluster_idx_off = read_u64_le(
+                    &sub_header
+                        [sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
+                ) as usize;
+                let n_cent = read_u32_le(
+                    &dir_bytes_slice[entry_off + dir_entry::N_CENT_OFF
+                        ..entry_off + dir_entry::N_CENT_OFF + U32_BYTES],
+                ) as usize;
+                let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
                 let codec_meta_abs_off = subsection_off + codec_meta_off;
                 if codec_meta_abs_off + codec_meta_size != open_time_abs_end {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
@@ -516,7 +556,7 @@ impl VectorReader {
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, VectorError> {
-        if source.len() < OUTER_HEADER_SIZE + 4 {
+        if source.len() < OUTER_HEADER_SIZE + format::CRC_BYTES {
             return Err(VectorError::Read(ReadError::MissingKv(
                 "vector blob header",
             )));
@@ -525,15 +565,16 @@ impl VectorReader {
         // Pull the fixed-size outer header in one fetch — five small
         // reads collapse into one `Bytes::slice`.
         let header = fetch_sync(&source, 0..OUTER_HEADER_SIZE, "outer header")?;
-        if &header[0..8] != format::vec::OUTER_MAGIC {
+        if &header[0..MAGIC_BYTES] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
                 expected: format::vec::OUTER_MAGIC,
-                actual: header[0..8].to_vec(),
+                actual: header[0..MAGIC_BYTES].to_vec(),
             }));
         }
 
-        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let version =
+            read_u32_le(&header[outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES]);
         if version != format::vec::VERSION {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
@@ -541,9 +582,12 @@ impl VectorReader {
         }
 
         let n_columns =
-            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
-        let n_docs = read_u64_le(&header[16..24]);
-        let dir_offset = read_u64_le(&header[24..32]) as usize;
+            read_u32_le(&header[outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES])
+                as usize;
+        let n_docs = read_u64_le(&header[outer_hdr::N_DOCS_OFF..outer_hdr::N_DOCS_OFF + U64_BYTES]);
+        let dir_offset =
+            read_u64_le(&header[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES])
+                as usize;
 
         // Verify directory CRC (cheap, needed before we can parallelize
         // subsection CRCs since we walk dir entries to find them).
@@ -597,7 +641,7 @@ impl VectorReader {
             let mut jobs: Vec<CrcJob> = Vec::with_capacity(n_columns + 1);
 
             let outer_total = source.len();
-            let outer_crc_pos = outer_total - 4;
+            let outer_crc_pos = outer_total - format::CRC_BYTES;
             let outer_body = fetch_sync(&source, 0..outer_crc_pos, "outer body")?;
             let outer_crc_bytes = fetch_sync(&source, outer_crc_pos..outer_total, "outer crc")?;
             jobs.push(CrcJob {
@@ -608,10 +652,14 @@ impl VectorReader {
 
             for i in 0..n_columns {
                 let entry_off = i * DIR_ENTRY_SIZE;
-                let subsection_off =
-                    read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
-                let subsection_len =
-                    read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
+                let subsection_off = read_u64_le(
+                    &dir_bytes[entry_off + dir_entry::SUBSECTION_OFF_OFF
+                        ..entry_off + dir_entry::SUBSECTION_OFF_OFF + U64_BYTES],
+                ) as usize;
+                let subsection_len = read_u64_le(
+                    &dir_bytes[entry_off + dir_entry::SUBSECTION_LEN_OFF
+                        ..entry_off + dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
+                ) as usize;
                 let sub_end = subsection_off + subsection_len;
                 if sub_end > source.len() {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
@@ -619,12 +667,12 @@ impl VectorReader {
                     ))));
                 }
                 let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
-                if sub.len() < SUB_HEADER_SIZE + 4 {
+                if sub.len() < SUB_HEADER_SIZE + format::CRC_BYTES {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "subsection {i} too short"
                     ))));
                 }
-                let sub_crc_pos = sub.len() - 4;
+                let sub_crc_pos = sub.len() - format::CRC_BYTES;
                 // `Bytes::slice` is zero-copy — no second `try_get_range_sync`
                 // round-trip needed since we already hold the subsection.
                 let sub_body = sub.slice(0..sub_crc_pos);
@@ -678,42 +726,43 @@ impl VectorReader {
         let mut column_id_by_name = HashMap::with_capacity(n_columns);
         for (i, cfg) in cols_json.iter().enumerate() {
             let entry_off = i * DIR_ENTRY_SIZE;
-            let column_id = u32::from_le_bytes([
-                dir_bytes[entry_off],
-                dir_bytes[entry_off + 1],
-                dir_bytes[entry_off + 2],
-                dir_bytes[entry_off + 3],
-            ]);
+            let column_id = read_u32_le(&dir_bytes[entry_off..entry_off + U32_BYTES]);
             if column_id != i as u32 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "vector dir entry {i} has column_id {column_id}"
                 ))));
             }
-            let dim = u32::from_le_bytes([
-                dir_bytes[entry_off + 4],
-                dir_bytes[entry_off + 5],
-                dir_bytes[entry_off + 6],
-                dir_bytes[entry_off + 7],
-            ]) as usize;
-            let n_cent = u32::from_le_bytes([
-                dir_bytes[entry_off + 8],
-                dir_bytes[entry_off + 9],
-                dir_bytes[entry_off + 10],
-                dir_bytes[entry_off + 11],
-            ]);
-            let metric_id = u32::from_le_bytes([
-                dir_bytes[entry_off + 12],
-                dir_bytes[entry_off + 13],
-                dir_bytes[entry_off + 14],
-                dir_bytes[entry_off + 15],
-            ]);
-            let rot_seed = read_u64_le(&dir_bytes[entry_off + 16..entry_off + 24]);
-            let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
-            let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
+            let dim = read_u32_le(
+                &dir_bytes
+                    [entry_off + dir_entry::DIM_OFF..entry_off + dir_entry::DIM_OFF + U32_BYTES],
+            ) as usize;
+            let n_cent = read_u32_le(
+                &dir_bytes[entry_off + dir_entry::N_CENT_OFF
+                    ..entry_off + dir_entry::N_CENT_OFF + U32_BYTES],
+            );
+            let metric_id = read_u32_le(
+                &dir_bytes[entry_off + dir_entry::METRIC_ID_OFF
+                    ..entry_off + dir_entry::METRIC_ID_OFF + U32_BYTES],
+            );
+            let rot_seed = read_u64_le(
+                &dir_bytes[entry_off + dir_entry::ROT_SEED_OFF
+                    ..entry_off + dir_entry::ROT_SEED_OFF + U64_BYTES],
+            );
+            let subsection_off = read_u64_le(
+                &dir_bytes[entry_off + dir_entry::SUBSECTION_OFF_OFF
+                    ..entry_off + dir_entry::SUBSECTION_OFF_OFF + U64_BYTES],
+            ) as usize;
+            let subsection_len = read_u64_le(
+                &dir_bytes[entry_off + dir_entry::SUBSECTION_LEN_OFF
+                    ..entry_off + dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
+            ) as usize;
             // bytes [40..48] = summary_offset (absolute), [48..52] = summary_length,
             // [52..56] = codec_id (1) + reserved (3)
-            let _summary_off_abs = read_u64_le(&dir_bytes[entry_off + 40..entry_off + 48]);
-            let codec_id = dir_bytes[entry_off + 52];
+            let _summary_off_abs = read_u64_le(
+                &dir_bytes[entry_off + dir_entry::SUMMARY_ABS_OFF
+                    ..entry_off + dir_entry::SUMMARY_ABS_OFF + U64_BYTES],
+            );
+            let codec_id = dir_bytes[entry_off + dir_entry::CODEC_ID_OFF];
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
                 VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
@@ -744,9 +793,9 @@ impl VectorReader {
                 ))));
             }
             let metric = match metric_id {
-                0 => Metric::L2Sq,
-                1 => Metric::Cosine,
-                2 => Metric::NegDot,
+                format::vec::METRIC_ID_L2SQ => Metric::L2Sq,
+                format::vec::METRIC_ID_COSINE => Metric::Cosine,
+                format::vec::METRIC_ID_NEGDOT => Metric::NegDot,
                 _ => {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "unknown metric_id {metric_id} for column '{}'",
@@ -787,7 +836,7 @@ impl VectorReader {
                     "subsection {i} runs past blob"
                 ))));
             }
-            if subsection_len < SUB_HEADER_SIZE + 4 {
+            if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} too short"
                 ))));
@@ -797,11 +846,11 @@ impl VectorReader {
                 subsection_off..subsection_off + SUB_HEADER_SIZE,
                 "sub_header",
             )?;
-            if &sub_header[0..8] != format::vec::SUB_MAGIC {
+            if &sub_header[0..MAGIC_BYTES] != format::vec::SUB_MAGIC {
                 return Err(VectorError::Read(ReadError::BadMagic {
                     section: "vector/subsection",
                     expected: format::vec::SUB_MAGIC,
-                    actual: sub_header[0..8].to_vec(),
+                    actual: sub_header[0..MAGIC_BYTES].to_vec(),
                 }));
             }
             // CRC was either already verified above in the parallel
@@ -809,7 +858,7 @@ impl VectorReader {
             // the lazy fast path. Either way `sub_crc_pos` is derived
             // from `subsection_len` (directory entry), not from a
             // resident buffer.
-            let sub_crc_pos = subsection_len - 4;
+            let sub_crc_pos = subsection_len - format::CRC_BYTES;
 
             // Sub-header parse. Only one layout version is
             // accepted; any other value is rejected as malformed.
@@ -823,7 +872,8 @@ impl VectorReader {
             //   [32..40] centroids_off (u64 LE)
             //   [40..48] cluster_idx_off (u64 LE)
             //   [48..56] per_cluster_blocks_off (u64 LE)
-            let subsection_version = read_u32_le(&sub_header[8..12]);
+            let subsection_version =
+                read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
             if subsection_version != format::vec::SUBSECTION_VERSION {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unsupported subsection layout version \
@@ -845,12 +895,26 @@ impl VectorReader {
             let codec_meta_required_zero =
                 matches!(rerank_codec, RerankCodec::Fp32 | RerankCodec::RabitqOnly);
 
-            let codec_meta_size = read_u32_le(&sub_header[12..16]) as usize;
-            let summary_off = read_u64_le(&sub_header[16..24]) as usize;
-            let summary_radius_x100 = read_u32_le(&sub_header[24..28]);
-            let centroids_off = read_u64_le(&sub_header[32..40]) as usize;
-            let cluster_idx_off = read_u64_le(&sub_header[40..48]) as usize;
-            let per_cluster_blocks_off = read_u64_le(&sub_header[48..56]) as usize;
+            let codec_meta_size = read_u32_le(
+                &sub_header[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES],
+            ) as usize;
+            let summary_off = read_u64_le(
+                &sub_header[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES],
+            ) as usize;
+            let summary_radius_x100 = read_u32_le(
+                &sub_header[sub_hdr::SUMMARY_RADIUS_X100_OFF
+                    ..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES],
+            );
+            let centroids_off = read_u64_le(
+                &sub_header[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
+            ) as usize;
+            let cluster_idx_off = read_u64_le(
+                &sub_header[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
+            ) as usize;
+            let per_cluster_blocks_off = read_u64_le(
+                &sub_header[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
+                    ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
+            ) as usize;
 
             if codec_meta_required_zero && codec_meta_size != 0 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
@@ -864,7 +928,7 @@ impl VectorReader {
             // codec_meta sits immediately after cluster_idx (when
             // non-empty); 0 means "no codec_meta" and skips the
             // sq8_meta parse below.
-            let cluster_idx_size = (n_cent as usize) * 8;
+            let cluster_idx_size = (n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
             let codec_meta_off = if codec_meta_size == 0 {
                 0
             } else {
@@ -915,7 +979,7 @@ impl VectorReader {
                 ))));
             }
 
-            let summary_radius = (summary_radius_x100 as f32) / 100.0;
+            let summary_radius = (summary_radius_x100 as f32) / SUMMARY_RADIUS_SCALE;
 
             let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
                 let meta_abs_start = subsection_off + codec_meta_off;
@@ -1079,7 +1143,7 @@ impl VectorReader {
         // the count (second u32 of each 8-byte entry).
         let mut counts = Vec::with_capacity(n_cent);
         for c in 0..n_cent {
-            let b = col.cluster_idx_off + c * 8 + 4;
+            let b = col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES + CLUSTER_IDX_COUNT_OFFSET;
             counts.push(u32::from_le_bytes([
                 sub[b],
                 sub[b + 1],
@@ -1147,7 +1211,7 @@ impl VectorReader {
         let centroids_start = sub_start + col.centroids_off;
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let idx_start = sub_start + col.cluster_idx_off;
-        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
         let centroid_idx_region = self
             .source
             .get_range(centroids_start..idx_end)
@@ -1330,7 +1394,7 @@ impl VectorReader {
         let centroids_start = sub_start + col.centroids_off;
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let idx_start = sub_start + col.cluster_idx_off;
-        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
         let centroid_idx_region = self
             .source
             .range_async(centroids_start..idx_end)
@@ -1378,7 +1442,7 @@ impl VectorReader {
         }
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
-        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
         let cluster_idx = self
             .source
             .range_async(idx_start..idx_end)
@@ -2107,7 +2171,10 @@ fn rerank_candidates_from_blocks(
                     let mut scored = scored;
                     scored
                         .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-                    let final_refine = k.saturating_mul(2).max(k).min(scored.len());
+                    let final_refine = k
+                        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
+                        .max(k)
+                        .min(scored.len());
                     scored.truncate(final_refine);
                     let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
                     scored
@@ -2246,7 +2313,10 @@ fn residual_refine_from_blocks<'a>(
     make_kernel: impl Fn(u32) -> Sq8ResidualKernel<'a>,
 ) -> Vec<(u32, f32)> {
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    let final_refine = k.saturating_mul(2).max(k).min(scored.len());
+    let final_refine = k
+        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
+        .max(k)
+        .min(scored.len());
     scored.truncate(final_refine);
     let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
     scored
@@ -5195,7 +5265,9 @@ mod tests {
             .source
             .try_get_range_sync(
                 col.subsection_range.start + col.cluster_idx_off
-                    ..col.subsection_range.start + col.cluster_idx_off + (col.n_cent as usize) * 8,
+                    ..col.subsection_range.start
+                        + col.cluster_idx_off
+                        + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES,
             )
             .expect("cluster_idx must be resident in InMemory source");
 

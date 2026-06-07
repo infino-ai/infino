@@ -53,6 +53,26 @@ const N_DOCS: usize = corpus::SUPERFILE_DOCS;
 const ID_COLUMN: &str = "doc_id";
 const FTS_COLUMN: &str = "title";
 
+/// Bytes per mebibyte, for blob-size logging.
+const BYTES_PER_MIB: usize = 1024 * 1024;
+/// RNG seed for the Zipfian text corpus (matches the FTS profile example).
+const TEXT_CORPUS_SEED: u64 = 1;
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// BM25 top-k used across the FTS-superfile correctness probes + benches.
+const TOP_K: usize = 10;
+/// Planted doc_id matched by the singleton `doc0500000` probe.
+const DF1_PROBE_DOC_ID: u32 = 500_000;
+/// Unbounded retrieval depth for the brute-force oracle (full ranking).
+const BRUTE_FORCE_UNBOUNDED_K: usize = usize::MAX;
+/// Criterion sample size for FTS-superfile benches.
+const CRITERION_SAMPLE_SIZE: usize = 10;
+/// Cold-tier measurement window (seconds).
+const COLD_MEASUREMENT_SECS: u64 = 30;
+/// Nanoseconds per second, for throughput / bandwidth markdown.
+const NS_PER_SEC: f64 = 1e9;
+
 // ─── Fixtures ────────────────────────────────────────────────────────
 
 static TEXT_CORPUS: OnceLock<corpus::MmapTextCorpus> = OnceLock::new();
@@ -69,7 +89,7 @@ fn superfile_object() -> &'static tiers::SuperfileCommitted {
         eprintln!(
             "[superfile_fts] committing {N_DOCS} docs to object storage for the cold tier \
              (production .parquet, {} MiB)...",
-            blob.len() / (1024 * 1024)
+            blob.len() / BYTES_PER_MIB
         );
         tiers::block_on(tiers::commit_superfile(&blob))
     })
@@ -163,7 +183,7 @@ const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
 ];
 
 fn text_corpus() -> &'static corpus::MmapTextCorpus {
-    TEXT_CORPUS.get_or_init(|| corpus::MmapTextCorpus::generate(N_DOCS, 1))
+    TEXT_CORPUS.get_or_init(|| corpus::MmapTextCorpus::generate(N_DOCS, TEXT_CORPUS_SEED))
 }
 
 fn superfile_reader() -> SuperfileReader {
@@ -174,7 +194,11 @@ fn superfile_reader() -> SuperfileReader {
 
 fn supertable_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
+        Field::new(
+            ID_COLUMN,
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
     ]))
 }
@@ -210,7 +234,7 @@ fn build_superfile_bytes_range(
         let ids: Decimal128Array = ((id_base + offset) as u64..(id_base + offset + len) as u64)
             .map(|i| Some(i as i128))
             .collect::<Decimal128Array>()
-            .with_precision_and_scale(38, 0)
+            .with_precision_and_scale(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE)
             .expect("decimal128");
         let titles = LargeStringArray::from(docs.chunk_strs(global_start, len));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
@@ -245,15 +269,18 @@ fn build_superfiles_rayon(docs: &corpus::MmapTextCorpus) -> Vec<Vec<u8>> {
 
 fn assert_superfile_self_consistent(reader: &SuperfileReader) {
     let hits =
-        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "doc0500000", 10, BoolMode::Or))
+        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "doc0500000", TOP_K, BoolMode::Or))
             .expect("search df=1");
     assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
-    assert_eq!(hits[0].0, 500_000, "doc0500000 should match doc_id 500000");
+    assert_eq!(
+        hits[0].0, DF1_PROBE_DOC_ID,
+        "doc0500000 should match doc_id 500000"
+    );
 
     let hits =
-        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "term00001", 10, BoolMode::Or))
+        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "term00001", TOP_K, BoolMode::Or))
             .expect("search common");
-    assert_eq!(hits.len(), 10, "common term should fill top-10");
+    assert_eq!(hits.len(), TOP_K, "common term should fill top-10");
     for w in hits.windows(2) {
         assert!(
             w[0].1 >= w[1].1,
@@ -303,14 +330,14 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
         let bmw_top10: Vec<(u32, f32)> = corpus::block_on_inmem(reader.bm25_search_pretokenized(
             FTS_COLUMN,
             terms,
-            10,
+            TOP_K,
             BoolMode::Or,
         ))
         .expect("bmw search");
         let mut brute_full = corpus::block_on_inmem(reader.bm25_search_pretokenized(
             FTS_COLUMN,
             terms,
-            usize::MAX,
+            BRUTE_FORCE_UNBOUNDED_K,
             BoolMode::Or,
         ))
         .expect("brute-force search");
@@ -319,7 +346,7 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
-        let brute_top10: Vec<(u32, f32)> = brute_full.into_iter().take(10).collect();
+        let brute_top10: Vec<(u32, f32)> = brute_full.into_iter().take(TOP_K).collect();
 
         assert_eq!(
             bmw_top10.len(),
@@ -363,7 +390,7 @@ fn bench_infino(
             let hits = corpus::block_on_inmem(r.bm25_search_pretokenized(
                 black_box(FTS_COLUMN),
                 black_box(terms),
-                black_box(10),
+                black_box(TOP_K),
                 mode,
             ))
             .expect("bm25 search");
@@ -384,7 +411,7 @@ fn bench_per_algo_probe(
             let hits = corpus::block_on_inmem(fts.search_with_algo_for_bench(
                 black_box(FTS_COLUMN),
                 black_box(terms),
-                black_box(10),
+                black_box(TOP_K),
                 OrAlgo::WandBmw,
             ))
             .expect("WAND+BMW search");
@@ -396,7 +423,7 @@ fn bench_per_algo_probe(
             let hits = corpus::block_on_inmem(fts.search_with_algo_for_bench(
                 black_box(FTS_COLUMN),
                 black_box(terms),
-                black_box(10),
+                black_box(TOP_K),
                 OrAlgo::Bmm,
             ))
             .expect("MaxScore+BMM search");
@@ -424,7 +451,7 @@ fn bench(c: &mut Criterion) {
         let n = N_DOCS;
         let docs_for_ingest = text_corpus();
         let mut g = c.benchmark_group("superfile_fts_build");
-        g.sample_size(10);
+        g.sample_size(CRITERION_SAMPLE_SIZE);
         g.throughput(Throughput::Elements(n as u64));
 
         let one_thread_id = format!("infino_1thread_{n}docs");
@@ -660,12 +687,12 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
             tier,
             Some(committed.storage_label),
         ));
-        g.sample_size(10);
+        g.sample_size(CRITERION_SAMPLE_SIZE);
         // Cold rebuilds a fresh cache + full S3 cold open per sample; widen
         // the cold group so criterion stops warning it can't fit 10
         // samples in the 5s default.
         if tier == Tier::Cold {
-            g.measurement_time(Duration::from_secs(30));
+            g.measurement_time(Duration::from_secs(COLD_MEASUREMENT_SECS));
         }
 
         for (name, terms, mode) in TIER_QUERIES {
@@ -685,7 +712,7 @@ fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
                                 tiers::block_on(async {
                                     let reader = cache.reader(&uri).await.expect("reader");
                                     let _ = reader
-                                        .bm25_search(FTS_COLUMN, &query, 10, mode)
+                                        .bm25_search(FTS_COLUMN, &query, TOP_K, mode)
                                         .await
                                         .expect("bm25");
                                 });
@@ -744,10 +771,10 @@ fn emit_ingest_markdown() {
     let row = |label: &str, bench_id: &str, ns: Option<f64>, peak: Option<u64>| -> String {
         let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
         let thrpt = ns
-            .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
+            .map(|n| fmt_throughput((N_DOCS as f64) / (n / NS_PER_SEC)))
             .unwrap_or_else(|| "—".into());
         let bandwidth = ns
-            .map(|n| fmt_bandwidth(input_bytes / (n / 1e9)))
+            .map(|n| fmt_bandwidth(input_bytes / (n / NS_PER_SEC)))
             .unwrap_or_else(|| "—".into());
         let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
         let median_rss = rss::fmt_median_rss(group, bench_id);

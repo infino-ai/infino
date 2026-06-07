@@ -150,9 +150,13 @@ impl SupertableInner {
     /// CPU lets those overlap, matching what an async caller gets.
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
         Arc::clone(self.query_runtime.get_or_init(|| {
+            // Fallback worker count when the host won't report its
+            // parallelism; small but multi-threaded so the cold-read
+            // fan-out still overlaps rather than serializing.
+            const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4);
+                .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
             Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(workers)

@@ -31,13 +31,22 @@ use infino::supertable::Supertable;
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
+/// Default baseline ingest doc count (sized to run in <1s) when
+/// `INFINO_BENCH_UPDATE_N_DOCS` is unset.
+const DEFAULT_N_DOCS: usize = 10_000;
+/// Default number of post-ingest single-row mutations when
+/// `INFINO_BENCH_UPDATE_N_MUTATIONS` is unset.
+const DEFAULT_N_MUTATIONS: usize = 20;
+/// Criterion sample size shared by the update/delete/ingest groups.
+const CRITERION_SAMPLE_SIZE: usize = 10;
+
 /// Doc count for the baseline ingest. Override via
 /// `INFINO_BENCH_UPDATE_N_DOCS`. Default sized to run in <1s.
 fn n_docs() -> usize {
     env::var("INFINO_BENCH_UPDATE_N_DOCS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(10_000)
+        .unwrap_or(DEFAULT_N_DOCS)
 }
 
 /// Number of single-row mutations to drive after ingest.
@@ -48,7 +57,7 @@ fn n_mutations() -> usize {
     env::var("INFINO_BENCH_UPDATE_N_MUTATIONS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(20)
+        .unwrap_or(DEFAULT_N_MUTATIONS)
 }
 
 /// Build a supertable + ingest a corpus of `n` rows in one
@@ -87,7 +96,7 @@ fn count_rows(st: &Supertable) -> i64 {
 fn bench_ingest(c: &mut Criterion) {
     let n = n_docs();
     let mut g = c.benchmark_group("supertable_update_ingest");
-    g.sample_size(10);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
     g.throughput(Throughput::Elements(n as u64));
     g.bench_function("baseline_ingest", |b| {
         b.iter_with_large_drop(|| build_supertable_with_ingest(black_box(n)));
@@ -103,7 +112,7 @@ fn bench_deletes(c: &mut Criterion) {
     let (_dir, st) = build_supertable_with_ingest(n);
 
     let mut g = c.benchmark_group("supertable_update_delete");
-    g.sample_size(10);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
     g.throughput(Throughput::Elements(m as u64));
     // `i` lives outside the bench closure on purpose: criterion calls
     // that closure several times (estimate, warm-up, measurement), and
@@ -164,7 +173,7 @@ fn bench_updates(c: &mut Criterion) {
     }
 
     let mut g = c.benchmark_group("supertable_update_update");
-    g.sample_size(10);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
     g.throughput(Throughput::Elements(m as u64));
     // `i` lives outside the bench closure on purpose: criterion calls
     // that closure several times (estimate, warm-up, measurement), and

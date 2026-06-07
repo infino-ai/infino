@@ -47,6 +47,20 @@ use std::time::Duration;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Bytes per kibibyte — `/proc/self/status` reports `VmRSS` in kB
+/// (actually KiB), which we convert to bytes.
+const KIB_TO_BYTES: u64 = 1024;
+/// Median percentile rank for RSS stats.
+const RSS_MEDIAN_PERCENTILE: usize = 50;
+/// P90 percentile rank for RSS stats.
+const RSS_P90_PERCENTILE: usize = 90;
+/// Divisor converting a percentile rank to a `[0, 1]` fraction.
+const PERCENT_SCALE: f64 = 100.0;
+/// Symmetric percentage band around zero within which an RSS delta is
+/// reported as "no change" rather than improved/regressed — matches
+/// Criterion's default noise tolerance.
+const RSS_DELTA_NOISE_BAND_PCT: f64 = 5.0;
+
 /// One-shot read of the calling process's current VmRSS in
 /// bytes. `None` on non-Linux hosts or if `/proc/self/status`
 /// is unavailable. The c7i.4xlarge bench host is Linux, so
@@ -59,7 +73,7 @@ pub fn current_rss_bytes() -> Option<u64> {
         // Format: `VmRSS:\t   12345 kB`
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb * 1024);
+            return Some(kb * KIB_TO_BYTES);
         }
     }
     None
@@ -93,8 +107,8 @@ impl RssStats {
         samples.sort_unstable();
         Self {
             peak_rss_bytes: *samples.last().expect("rss samples is non-empty"),
-            median_rss_bytes: percentile_nearest_rank(&samples, 50),
-            p90_rss_bytes: percentile_nearest_rank(&samples, 90),
+            median_rss_bytes: percentile_nearest_rank(&samples, RSS_MEDIAN_PERCENTILE),
+            p90_rss_bytes: percentile_nearest_rank(&samples, RSS_P90_PERCENTILE),
         }
     }
 
@@ -109,7 +123,7 @@ impl RssStats {
 
 fn percentile_nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
     debug_assert!(!sorted.is_empty());
-    let rank = ((percentile as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    let rank = ((percentile as f64 / PERCENT_SCALE) * sorted.len() as f64).ceil() as usize;
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
@@ -283,10 +297,10 @@ pub fn fmt_peak_rss_delta(group: &str, bench: &str) -> String {
     if base == 0 {
         return "—".into();
     }
-    let pct = ((new as f64 - base as f64) / base as f64) * 100.0;
-    let label = if pct <= -5.0 {
+    let pct = ((new as f64 - base as f64) / base as f64) * PERCENT_SCALE;
+    let label = if pct <= -RSS_DELTA_NOISE_BAND_PCT {
         "improved"
-    } else if pct >= 5.0 {
+    } else if pct >= RSS_DELTA_NOISE_BAND_PCT {
         "regressed"
     } else {
         "no change"
@@ -311,6 +325,18 @@ fn criterion_bench_dir(group: &str, bench: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Sampler poll interval used by the "seed at start" test (long
+    /// enough that no poll fires before `stop()`).
+    const TEST_SAMPLER_INTERVAL_MS: u64 = 1_000;
+    /// Size of the faulted-in buffer the allocation-growth test
+    /// allocates (32 MiB).
+    const TEST_ALLOC_SIZE_BYTES: usize = 32 * 1024 * 1024;
+    /// Page-touch stride used to defeat lazy fault-in.
+    const TEST_PAGE_STRIDE_BYTES: usize = 4096;
+    /// Lower bound on observed RSS growth the allocation test asserts
+    /// (16 MiB — half the allocation, leaving slack for the sampler).
+    const TEST_MIN_RSS_GROWTH_BYTES: u64 = 16 * 1024 * 1024;
+
     /// VmRSS must be non-zero on Linux during a normal test
     /// run — the test process itself has resident pages.
     /// Skipped silently on non-Linux hosts where procfs is
@@ -328,7 +354,7 @@ mod tests {
     #[test]
     fn sampler_returns_at_least_start_rss() {
         let start_rss = current_rss_bytes();
-        let s = PeakSampler::start(Duration::from_millis(1_000));
+        let s = PeakSampler::start(Duration::from_millis(TEST_SAMPLER_INTERVAL_MS));
         let peak = s.stop();
         if let Some(start) = start_rss {
             assert!(peak >= start, "peak {peak} < start {start} — seed missing");
@@ -348,15 +374,15 @@ mod tests {
         };
         let s = PeakSampler::start(Duration::from_millis(5));
         // 32 MiB faulted-in buffer.
-        let mut v: Vec<u8> = vec![0; 32 * 1024 * 1024];
-        for chunk in v.chunks_mut(4096) {
+        let mut v: Vec<u8> = vec![0; TEST_ALLOC_SIZE_BYTES];
+        for chunk in v.chunks_mut(TEST_PAGE_STRIDE_BYTES) {
             chunk[0] = 1;
         }
         std::thread::sleep(Duration::from_millis(50));
         std::hint::black_box(&v);
         let peak = s.stop();
         assert!(
-            peak >= baseline + 16 * 1024 * 1024,
+            peak >= baseline + TEST_MIN_RSS_GROWTH_BYTES,
             "sampler missed the 32 MiB faulted allocation: \
              baseline={baseline}, peak={peak}"
         );

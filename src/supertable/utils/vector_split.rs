@@ -35,6 +35,11 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use crate::supertable::error::BuildError;
 use crate::supertable::options::SupertableOptions;
 
+/// Maximum number of null row offsets collected into a
+/// `VectorColumnHasNulls` error. Bounds the error payload so a batch
+/// that is null-heavy doesn't produce an unbounded diagnostic list.
+const MAX_NULL_OFFSETS_IN_ERROR: usize = 5;
+
 /// Split vector columns out of `batch`. Returns a `RecordBatch` of
 /// scalar-only columns (matching `options.scalar_schema()`) plus a
 /// `Vec<&[f32]>` parallel to `options.vector_columns` — one slice
@@ -93,7 +98,7 @@ pub(crate) fn split_vectors<'a>(
         // No-nulls check on the FSL itself. If any row's vector is
         // NULL, refuse the batch.
         if fsl.null_count() > 0 {
-            let first_nulls = collect_first_nulls(fsl, 5);
+            let first_nulls = collect_first_nulls(fsl, MAX_NULL_OFFSETS_IN_ERROR);
             return Err(BuildError::VectorColumnHasNulls {
                 column: vc.column.clone(),
                 first_nulls,
@@ -117,7 +122,7 @@ pub(crate) fn split_vectors<'a>(
         // inner nulls would mean an individual lane is null inside
         // a non-null vector, which we also can't represent in IVF.
         if inner.null_count() > 0 {
-            let first_nulls = collect_first_nulls_primitive(inner, 5);
+            let first_nulls = collect_first_nulls_primitive(inner, MAX_NULL_OFFSETS_IN_ERROR);
             return Err(BuildError::VectorColumnHasNulls {
                 column: vc.column.clone(),
                 first_nulls,

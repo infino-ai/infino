@@ -80,6 +80,35 @@ const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
 const ID_COLUMN: &str = "doc_id";
 const VEC_COLUMN: &str = "v";
 
+/// Bytes per mebibyte (integer + float forms) for size logging.
+const BYTES_PER_MIB: usize = 1024 * 1024;
+const BYTES_PER_MIB_F64: f64 = 1024.0 * 1024.0;
+/// RNG seed for the vector corpus.
+const VECTOR_CORPUS_SEED: u64 = 1;
+/// Query seed for the correctness query set.
+const CORRECTNESS_QUERY_SEED: u64 = 17;
+/// Query seed for the calibration query set.
+const CALIBRATION_QUERY_SEED: u64 = 99;
+/// Per-dim Gaussian perturbation for "near-doc" realistic queries.
+const QUERY_SIGMA: f32 = 0.05;
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Random-rotation RNG seed for the vector index builder.
+const ROT_SEED: u64 = 7;
+/// Criterion sample size for vector-superfile benches.
+const CRITERION_SAMPLE_SIZE: usize = 10;
+/// Cold-tier measurement window (seconds).
+const COLD_MEASUREMENT_SECS: u64 = 30;
+/// Scale converting a `[0, 1]` recall target to an integer percent label.
+const RECALL_TARGET_PERCENT_SCALE: f32 = 100.0;
+/// Nanoseconds per second, for throughput / bandwidth markdown.
+const NS_PER_SEC: f64 = 1e9;
+/// Seconds-to-milliseconds factor for artifact timing display.
+const MS_PER_SEC: f64 = 1e3;
+/// Per-grid-point timing iterations for p50 calibration.
+const CALIBRATION_P50_ITERS: usize = 21;
+
 // ─── Fixtures ────────────────────────────────────────────────────────
 
 static VECTORS: OnceLock<corpus::MmapVectorCorpus> = OnceLock::new();
@@ -101,7 +130,7 @@ fn superfile_object() -> &'static tiers::SuperfileCommitted {
         eprintln!(
             "[superfile_vec] committing {N_DOCS} docs to object storage for the cold tier \
              (production .parquet, {} MiB)...",
-            blob.len() / (1024 * 1024)
+            blob.len() / BYTES_PER_MIB
         );
         tiers::block_on(tiers::commit_superfile(&blob))
     })
@@ -113,20 +142,39 @@ fn vectors() -> &'static [f32] {
             // Raw corpus fixture only. Build/search still exercise Infino's
             // normal vector builder/reader paths; the mmap avoids pinning the
             // synthetic source corpus as heap RAM.
-            corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true)
+            corpus::MmapVectorCorpus::generate(
+                N_DOCS,
+                corpus::n_cent(N_DOCS),
+                VECTOR_CORPUS_SEED,
+                true,
+            )
         })
         .as_slice()
 }
 
 fn queries_correctness() -> &'static [Vec<f32>] {
     QUERIES_CORRECTNESS.get_or_init(|| {
-        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CORRECTNESS_QUERIES, 17, true, 0.05)
+        corpus::generate_realistic_queries(
+            vectors(),
+            N_DOCS,
+            N_CORRECTNESS_QUERIES,
+            CORRECTNESS_QUERY_SEED,
+            true,
+            QUERY_SIGMA,
+        )
     })
 }
 
 fn queries_calibration() -> &'static [Vec<f32>] {
     QUERIES_CALIBRATION.get_or_init(|| {
-        corpus::generate_realistic_queries(vectors(), N_DOCS, N_CALIBRATION_QUERIES, 99, true, 0.05)
+        corpus::generate_realistic_queries(
+            vectors(),
+            N_DOCS,
+            N_CALIBRATION_QUERIES,
+            CALIBRATION_QUERY_SEED,
+            true,
+            QUERY_SIGMA,
+        )
     })
 }
 
@@ -172,7 +220,7 @@ fn build_superfile_bytes_range(
     let n_cent = corpus::n_cent(len);
     let schema = ArrowArc::new(Schema::new(vec![Field::new(
         ID_COLUMN,
-        DataType::Decimal128(38, 0),
+        DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
         false,
     )]));
     let opts = BuilderOptions::new(
@@ -183,7 +231,7 @@ fn build_superfile_bytes_range(
             column: VEC_COLUMN.into(),
             dim: DIM,
             n_cent,
-            rot_seed: 7,
+            rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
         }],
@@ -198,7 +246,7 @@ fn build_superfile_bytes_range(
         let ids: Decimal128Array = ((id_base + local) as u64..(id_base + local + batch_len) as u64)
             .map(|i| Some(i as i128))
             .collect::<Decimal128Array>()
-            .with_precision_and_scale(38, 0)
+            .with_precision_and_scale(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE)
             .expect("decimal128");
         let batch =
             RecordBatch::try_new(schema.clone(), vec![ArrowArc::new(ids)]).expect("RecordBatch");
@@ -290,7 +338,7 @@ fn calibrations() -> &'static Calibrations {
                 target,
                 PROBES,
                 REFINES,
-                21,
+                CALIBRATION_P50_ITERS,
                 TOP_K,
             );
             eprintln!("  recall ≥ {target:.2} | infino: {:?}", inf[i]);
@@ -318,7 +366,7 @@ fn bench(c: &mut Criterion) {
     if run_build {
         let v = vectors();
         let mut g = c.benchmark_group("superfile_vec_build");
-        g.sample_size(10);
+        g.sample_size(CRITERION_SAMPLE_SIZE);
         g.throughput(Throughput::Elements(N_DOCS as u64));
 
         // Two variants, mirroring the FTS ingest bench: a single-thread
@@ -369,11 +417,14 @@ fn bench(c: &mut Criterion) {
         let qs = queries_calibration();
 
         let mut g = c.benchmark_group(tiers::search_group_name("superfile_vec", Tier::Hot, None));
-        g.sample_size(10);
+        g.sample_size(CRITERION_SAMPLE_SIZE);
         let rss_sample = rss::PeakSampler::start_default();
 
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            let label = format!(
+                "recall_at_least_{:02}",
+                (target * RECALL_TARGET_PERCENT_SCALE) as u32
+            );
             if let Some(c_inf) = cal.infino[i] {
                 // Stable bench id: the calibrated (probe, refine) lives in
                 // the markdown table, not the criterion id, so criterion can
@@ -461,7 +512,10 @@ fn bench(c: &mut Criterion) {
         // group; record the same peak against each criterion id so the
         // markdown lookup matches the bench id verbatim.
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            let label = format!(
+                "recall_at_least_{:02}",
+                (target * RECALL_TARGET_PERCENT_SCALE) as u32
+            );
             if cal.infino[i].is_some() {
                 let bid = format!("infino_{label}");
                 let _ = rss::write_rss_stats(group_name::SUPERFILE_VEC_SEARCH, &bid, stats);
@@ -490,19 +544,22 @@ fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: 
             tier,
             Some(committed.storage_label),
         ));
-        g.sample_size(10);
+        g.sample_size(CRITERION_SAMPLE_SIZE);
         // Cold rebuilds a fresh cache + full S3 cold open per sample, so a
         // single sample can exceed the 5s default and criterion warns it
         // can't fit 10 samples. Give it room.
         if tier == Tier::Cold {
-            g.measurement_time(Duration::from_secs(30));
+            g.measurement_time(Duration::from_secs(COLD_MEASUREMENT_SECS));
         }
 
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
             let Some(c_inf) = cal.infino[i] else {
                 continue;
             };
-            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            let label = format!(
+                "recall_at_least_{:02}",
+                (target * RECALL_TARGET_PERCENT_SCALE) as u32
+            );
             let (p, r) = (c_inf.probe, c_inf.refine);
             let bench_id = format!("infino_{label}");
 
@@ -615,10 +672,10 @@ fn emit_ingest_markdown() {
     let row = |label: &str, bench_id: &str, ns: Option<f64>, peak: Option<u64>| -> String {
         let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
         let thrpt = ns
-            .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
+            .map(|n| fmt_throughput((N_DOCS as f64) / (n / NS_PER_SEC)))
             .unwrap_or_else(|| "—".into());
         let bandwidth = ns
-            .map(|n| fmt_bandwidth(input_bytes / (n / 1e9)))
+            .map(|n| fmt_bandwidth(input_bytes / (n / NS_PER_SEC)))
             .unwrap_or_else(|| "—".into());
         let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
         let median_rss = rss::fmt_median_rss(group, bench_id);
@@ -670,7 +727,10 @@ fn emit_search_markdown() {
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        let label = format!(
+            "recall_at_least_{:02}",
+            (target * RECALL_TARGET_PERCENT_SCALE) as u32
+        );
         let row_target = format!("{target:.2}");
         if let Some(c_inf) = cal.infino[i] {
             let id = format!("infino_{label}");
@@ -745,7 +805,7 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     let blob = build_superfile_bytes(vectors);
     let build_elapsed = t0.elapsed();
 
-    let size_mib = blob.len() as f64 / (1024.0 * 1024.0);
+    let size_mib = blob.len() as f64 / BYTES_PER_MIB_F64;
 
     let t0 = Instant::now();
     let reader = SuperfileReader::open(Bytes::from(blob)).expect("open superfile");
@@ -765,8 +825,8 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     eprintln!(
         "infino:  build {:>7.2}s  size {size_mib:>6.2} MiB  open {:>6.2} ms  first-query {:>5.2} ms",
         build_elapsed.as_secs_f64(),
-        open_elapsed.as_secs_f64() * 1e3,
-        first_q_elapsed.as_secs_f64() * 1e3,
+        open_elapsed.as_secs_f64() * MS_PER_SEC,
+        first_q_elapsed.as_secs_f64() * MS_PER_SEC,
     );
 }
 

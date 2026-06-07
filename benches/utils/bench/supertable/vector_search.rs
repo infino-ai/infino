@@ -26,6 +26,17 @@ const CALIBRATION_P50_ITERS: usize = 7;
 
 const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
 const CORRECTNESS_NPROBE: usize = 16;
+/// Seconds-to-microseconds factor for p50 latency samples.
+const SEC_TO_MICROS: f32 = 1e6;
+/// Mmap-promotion warm-up timeout for the hot search bench.
+const WARMUP_TIMEOUT_SECS: u64 = 180;
+/// Criterion sample size for search benches.
+const CRITERION_SAMPLE_SIZE: usize = 10;
+/// Measurement window (seconds) for the cold-tier search bench.
+const COLD_MEASUREMENT_SECS: u64 = 30;
+/// Scale converting a `[0, 1]` recall target to an integer percent
+/// for the bench label.
+const RECALL_TARGET_PERCENT_SCALE: f32 = 100.0;
 
 static CALIBRATIONS: OnceLock<Calibrations> = OnceLock::new();
 
@@ -74,7 +85,7 @@ fn measure_p50_micros(st: &Supertable, query: &[f32], options: VectorSearchOptio
     for _ in 0..CALIBRATION_P50_ITERS {
         let t0 = Instant::now();
         let _ = vector_topk_global(st, query, TOP_K, options);
-        samples.push(t0.elapsed().as_secs_f32() * 1e6);
+        samples.push(t0.elapsed().as_secs_f32() * SEC_TO_MICROS);
     }
     samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     samples[samples.len() / 2]
@@ -210,7 +221,7 @@ pub fn bench(c: &mut Criterion) {
         g.correctness_queries.len(),
         warm_t0.elapsed().as_secs_f32()
     );
-    st.wait_until_warm(Duration::from_secs(180))
+    st.wait_until_warm(Duration::from_secs(WARMUP_TIMEOUT_SECS))
         .expect("supertable cache failed to reach warm (mmap-promoted) state");
     eprintln!(
         "[supertable_vec] cache fully warm (all segments mmap-promoted) in {:.1}s",
@@ -221,11 +232,14 @@ pub fn bench(c: &mut Criterion) {
     let qs = &g.calibration_queries;
 
     let mut g_hot = c.benchmark_group(tiers::search_group_name("supertable_vec", Tier::Hot, None));
-    g_hot.sample_size(10);
+    g_hot.sample_size(CRITERION_SAMPLE_SIZE);
     let rss_sample = rss::PeakSampler::start_default();
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        let label = format!(
+            "recall_at_least_{:02}",
+            (target * RECALL_TARGET_PERCENT_SCALE) as u32
+        );
         if let Some(c_st) = cal.supertable[i] {
             let p = c_st.probe;
             g_hot.bench_function(format!("supertable_{label}"), |b| {
@@ -242,7 +256,10 @@ pub fn bench(c: &mut Criterion) {
     g_hot.finish();
     let stats = rss_sample.stop_stats();
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        let label = format!(
+            "recall_at_least_{:02}",
+            (target * RECALL_TARGET_PERCENT_SCALE) as u32
+        );
         if cal.supertable[i].is_some() {
             let bid = format!("supertable_{label}");
             let _ = rss::write_rss_stats(group_name::SUPERTABLE_VEC_SEARCH, &bid, stats);
@@ -268,14 +285,17 @@ fn bench_object_store_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32
         tier,
         Some(storage_label),
     ));
-    g.sample_size(10);
-    g.measurement_time(Duration::from_secs(30));
+    g.sample_size(CRITERION_SAMPLE_SIZE);
+    g.measurement_time(Duration::from_secs(COLD_MEASUREMENT_SECS));
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
         let Some(c_st) = cal.supertable[i] else {
             continue;
         };
-        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        let label = format!(
+            "recall_at_least_{:02}",
+            (target * RECALL_TARGET_PERCENT_SCALE) as u32
+        );
         let p = c_st.probe;
         let opts = VectorSearchOptions::new().with_nprobe(p);
         let bench_id = format!("supertable_{label}");
@@ -351,7 +371,10 @@ fn emit_markdown(cal: &Calibrations) {
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-        let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+        let label = format!(
+            "recall_at_least_{:02}",
+            (target * RECALL_TARGET_PERCENT_SCALE) as u32
+        );
         let row_target = format!("{target:.2}");
         let bid = format!("supertable_{label}");
         let (cell, hot, cold, rss_cell, median_rss, p90_rss, rss_delta) = match cal.supertable[i] {

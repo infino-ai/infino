@@ -16,6 +16,16 @@ use crate::tiers::{self, Tier};
 use crate::{markdown, rss};
 
 const TOP_K: usize = 10;
+/// Divisor selecting a mid-corpus doc for the df=1 self-consistency
+/// probe (`N_DOCS / MID_DOC_DIVISOR`).
+const MID_DOC_DIVISOR: usize = 2;
+/// Mmap-promotion warm-up timeout for the hot search bench.
+const WARMUP_TIMEOUT_SECS: u64 = 180;
+/// Criterion sample size for search benches.
+const CRITERION_SAMPLE_SIZE: usize = 10;
+/// Measurement window (seconds) for the cold-tier search bench
+/// (Criterion's 5 s default is too tight for cold object-store I/O).
+const COLD_MEASUREMENT_SECS: u64 = 30;
 
 pub const FTS_SEARCH_IDS: &[&str] = &[
     "single_rare_supertable_top10",
@@ -50,7 +60,7 @@ pub mod group_name {
 }
 
 fn assert_fts_self_consistent(st: &infino::supertable::Supertable) {
-    let probe_doc_id = (supertable::N_DOCS / 2) as u32;
+    let probe_doc_id = (supertable::N_DOCS / MID_DOC_DIVISOR) as u32;
     let probe_token = format!("doc{probe_doc_id:07}");
     let hits = st
         .bm25_search(supertable::TEXT_COLUMN, &probe_token, TOP_K, BoolMode::Or)
@@ -107,7 +117,7 @@ pub fn bench(c: &mut Criterion) {
     for (_, q) in FTS_QUERIES {
         let _ = st.bm25_search(supertable::TEXT_COLUMN, q, TOP_K, BoolMode::Or);
     }
-    st.wait_until_warm(Duration::from_secs(180))
+    st.wait_until_warm(Duration::from_secs(WARMUP_TIMEOUT_SECS))
         .expect("supertable cache failed to reach warm (mmap-promoted) state");
     eprintln!(
         "[supertable_fts_search] cache fully warm in {:.1}s",
@@ -115,7 +125,7 @@ pub fn bench(c: &mut Criterion) {
     );
 
     let mut g = c.benchmark_group(tiers::search_group_name("supertable_fts", Tier::Hot, None));
-    g.sample_size(10);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
     let rss_sample = rss::PeakSampler::start_default();
 
     for (name, q) in FTS_QUERIES {
@@ -163,8 +173,8 @@ fn bench_object_store_tiers(c: &mut Criterion) {
         tier,
         Some(storage_label),
     ));
-    g.sample_size(10);
-    g.measurement_time(Duration::from_secs(30));
+    g.sample_size(CRITERION_SAMPLE_SIZE);
+    g.measurement_time(Duration::from_secs(COLD_MEASUREMENT_SECS));
 
     for (name, q) in FTS_QUERIES {
         let bench_id = format!("{name}_supertable_top10");

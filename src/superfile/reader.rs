@@ -37,6 +37,12 @@ use parquet::arrow::arrow_reader::{
 use parquet::file::metadata::PageIndexPolicy;
 use std::sync::Arc;
 
+/// Speculative Parquet-footer tail length for a lazy open. 64 KiB
+/// covers a typical superfile footer (its `inf.*` KVs plus a single
+/// row group's column metadata — a few KiB to a few tens of KiB) in
+/// one range GET, so the cold open usually costs a single round-trip.
+const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+
 /// Per-open knobs for [`SuperfileReader::open_with`]. Defaults to
 /// safe behavior (CRC verification on); flip `verify_crc` to `false`
 /// to skip the ~132 ms scan at 1M × 384 when storage is trusted.
@@ -151,16 +157,10 @@ impl SuperfileReader {
         use parquet::arrow::parquet_to_arrow_schema;
 
         // 1. Fetch the Parquet footer (≤ 2 GETs).
-        let metadata = footer::read_parquet_metadata_lazy(
-            source.as_ref(),
-            // 64 KiB is plenty for typical superfile footers
-            // (the footer carries `inf.*` KVs + a single row
-            // group's worth of column metadata; a few KiB to
-            // a few tens of KiB).
-            64 * 1024,
-        )
-        .await
-        .map_err(ReadError::Footer)?;
+        let metadata =
+            footer::read_parquet_metadata_lazy(source.as_ref(), DEFAULT_TAIL_SPECULATIVE_BYTES)
+                .await
+                .map_err(ReadError::Footer)?;
         let kv_map = footer::extract_kv_map(&metadata).map_err(ReadError::Footer)?;
 
         // 2. Validate required KVs + format version (same

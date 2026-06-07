@@ -15,6 +15,11 @@ use crate::{markdown, rss};
 
 const BUILD_MEASUREMENT_TIME: Duration = Duration::from_secs(60 * 60);
 
+/// Criterion sample size for the (very slow) build benches.
+const CRITERION_SAMPLE_SIZE: usize = 10;
+/// Nanoseconds per second, for throughput markdown.
+const NS_PER_SEC: f64 = 1e9;
+
 pub mod group_name {
     pub const SUPERTABLE_ALL_BUILD: &str = "supertable_all_build";
     pub const SUPERTABLE_FTS_BUILD: &str = "supertable_fts_build";
@@ -74,7 +79,7 @@ fn run_build(
     n_superfiles: impl Fn() -> usize,
 ) {
     let mut g = c.benchmark_group(group);
-    g.sample_size(10);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
     g.measurement_time(BUILD_MEASUREMENT_TIME);
     g.throughput(Throughput::Elements(supertable::N_DOCS as u64));
 
@@ -119,7 +124,7 @@ fn emit_markdown(group: &str, bench: &str, shape: &str, n_superfiles: &usize) {
     );
     let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
     let thrpt = ns
-        .map(|n| fmt_throughput((supertable::N_DOCS as f64) / (n / 1e9)))
+        .map(|n| fmt_throughput((supertable::N_DOCS as f64) / (n / NS_PER_SEC)))
         .unwrap_or_else(|| "—".into());
     let rss_cell = peak_rss.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
     let median_rss = rss::fmt_median_rss(group, bench);

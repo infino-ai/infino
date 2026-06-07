@@ -646,6 +646,11 @@ pub struct VectorSummary {
     pub clusters: ClusterCentroids,
 }
 
+/// Maximum Sq8 code value. The manifest's per-cluster centroid
+/// summary quantizes each component to a single unsigned byte, so
+/// the per-cluster scale maps `[min, max]` onto `[0, SQ8_CODE_MAX]`.
+const SQ8_CODE_MAX: f32 = 255.0;
+
 /// Per-cluster IVF centroids for one vector column, Sq8-quantized with
 /// per-cluster calibration. Carried in the manifest so a query can rank
 /// every segment's clusters globally — without opening the segment —
@@ -705,13 +710,17 @@ impl ClusterCentroids {
             if !mx.is_finite() {
                 mx = 0.0;
             }
-            let scale = if mx > mn { (mx - mn) / 255.0 } else { 0.0 };
+            let scale = if mx > mn {
+                (mx - mn) / SQ8_CODE_MAX
+            } else {
+                0.0
+            };
             mins[c] = mn;
             scales[c] = scale;
             let dst = &mut codes[c * d..(c + 1) * d];
             for (o, &v) in dst.iter_mut().zip(src) {
                 *o = if scale > 0.0 {
-                    ((v - mn) / scale).round().clamp(0.0, 255.0) as u8
+                    ((v - mn) / scale).round().clamp(0.0, SQ8_CODE_MAX) as u8
                 } else {
                     0
                 };

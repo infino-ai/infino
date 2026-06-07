@@ -83,6 +83,19 @@ const N_DOCS: usize = 50_000;
 /// orchestrator's fixed costs.
 const APPEND_CHUNKS: usize = 8;
 
+/// Tombstone fraction for the 1%-deleted workload variant.
+const ONE_PERCENT_TOMBSTONE_FRACTION: f64 = 0.01;
+/// Tombstone fraction for the 10%-deleted (churned) workload variant.
+const TEN_PERCENT_TOMBSTONE_FRACTION: f64 = 0.10;
+/// Tokio worker threads for driving the WAL tombstone pipeline.
+const WAL_RUNTIME_WORKER_THREADS: usize = 2;
+/// Base synthetic WAL id, kept well clear of any real ingest ids.
+const WAL_ID_BASE: i128 = 100_000_000;
+/// Multiplier offsetting the second (churn) pass's WAL ids from the base.
+const CHURN_WAL_ID_MULTIPLIER: i128 = 2;
+/// Criterion sample size for the tombstone-overhead groups.
+const CRITERION_SAMPLE_SIZE: usize = 20;
+
 /// Top-K for the search query — sized to be representative of a
 /// real query workload's top-of-list shape.
 const TOP_K: usize = 10;
@@ -127,10 +140,10 @@ fn build_supertable(state: WorkloadState) -> (TempDir, Supertable) {
     match state {
         WorkloadState::Clean => {}
         WorkloadState::OnePercent => {
-            drive_tombstones(&st, &ws, 0.01, false);
+            drive_tombstones(&st, &ws, ONE_PERCENT_TOMBSTONE_FRACTION, false);
         }
         WorkloadState::TenPercentChurned => {
-            drive_tombstones(&st, &ws, 0.10, true);
+            drive_tombstones(&st, &ws, TEN_PERCENT_TOMBSTONE_FRACTION, true);
         }
     }
 
@@ -159,11 +172,11 @@ fn drive_tombstones(st: &Supertable, ws: &WalStore, fraction: f64, churn: bool) 
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(2)
+        .worker_threads(WAL_RUNTIME_WORKER_THREADS)
         .build()
         .expect("rt");
     rt.block_on(async move {
-        let wal_id_base: i128 = 100_000_000;
+        let wal_id_base: i128 = WAL_ID_BASE;
         for (i, &target) in targets.iter().enumerate() {
             let wal = build_delete_wal(target, wal_id_base + i as i128);
             let etag = ws.create(&wal).await.expect("wal create");
@@ -171,7 +184,8 @@ fn drive_tombstones(st: &Supertable, ws: &WalStore, fraction: f64, churn: bool) 
                 .await
                 .expect("tombstone phase");
             if churn {
-                let churn_wal = build_delete_wal(target, wal_id_base * 2 + i as i128);
+                let churn_wal =
+                    build_delete_wal(target, wal_id_base * CHURN_WAL_ID_MULTIPLIER + i as i128);
                 let churn_etag = ws.create(&churn_wal).await.expect("wal create");
                 run_tombstone_phase(st, ws, &churn_wal, &churn_etag)
                     .await
@@ -225,7 +239,7 @@ fn fixture_ten_percent_churned() -> &'static Supertable {
 
 fn bench_fts(c: &mut Criterion) {
     let mut g = c.benchmark_group("tombstone_overhead_fts");
-    g.sample_size(20);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
 
     g.bench_function("clean", |b| {
         let st = fixture_clean();
@@ -277,7 +291,7 @@ fn bench_fts(c: &mut Criterion) {
 
 fn bench_sql(c: &mut Criterion) {
     let mut g = c.benchmark_group("tombstone_overhead_sql");
-    g.sample_size(20);
+    g.sample_size(CRITERION_SAMPLE_SIZE);
 
     g.bench_function("clean", |b| {
         let st = fixture_clean();
