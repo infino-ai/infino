@@ -48,16 +48,6 @@ Superfile benches (1M) build their own fixture per binary; supertable
 search groups run correctness (FTS oracle / vector recall floor) before timing
 when ingest is already available.
 
-## Code layout (`infino-bench-utils`)
-
-```text
-corpus/     synthetic rows + recall grading (streamed, small cache file)
-ingest/     supertable append + commit → object storage
-fixture/    one 10M ingest + search consumer per process
-bench/      criterion groups (supertable ingest / FTS / vector search)
-fts_superfile.rs, vector_superfile.rs   1M superfile bodies
-```
-
 ## Result anchors
 
 Each table below is wrapped in
