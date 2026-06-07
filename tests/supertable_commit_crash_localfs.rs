@@ -78,6 +78,10 @@ const KP_SEG_SECOND: &str = "seg-2";
 const KP_LIST_SECOND: &str = "list-2";
 const KP_POINTER_SECOND: &str = "pointer-2";
 
+/// Exit code used when the crash child finishes WITHOUT aborting —
+/// signals a misconfigured kill point (distinct from a clean exit).
+const MISCONFIGURED_KILL_POINT_EXIT_CODE: i32 = 2;
+
 /// Storage wrapper that aborts the process after the N-th
 /// PUT whose URI starts with `trigger_path_prefix` returns
 /// success. Everything else is forwarded verbatim to the
@@ -221,7 +225,7 @@ fn run_crash_child(dir: PathBuf, kill_point: &str) -> ! {
         "CRASH-CHILD: completed {n_commits} commits without aborting (kill_point={kill_point}) — \
          test configuration is wrong"
     );
-    std::process::exit(2);
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
 }
 
 /// Spawn a child copy of this test binary, filtered to a

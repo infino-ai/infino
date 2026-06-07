@@ -58,6 +58,12 @@ const DOCS_PER_SEGMENT: usize = 8;
 
 const N_THREADS: usize = 16;
 const ITERS_PER_THREAD: usize = 25;
+/// Random-rotation seed for the fanout fixture's vector index.
+const VECTOR_ROT_SEED: u64 = 7;
+/// Rayon CPU pool size used to orchestrate cross-segment fanout.
+const RAYON_POOL_THREADS: usize = 4;
+/// Number of distinct query kinds cycled in the stress loop.
+const QUERY_KIND_COUNT: usize = 4;
 /// Generous upper bound: the single-threaded golden takes well under a
 /// second; if `N_THREADS × ITERS` worth of bursts can't finish in this
 /// window the fan-out has deadlocked or is pathologically starved.
@@ -76,13 +82,13 @@ fn options_title_emb() -> SupertableOptions {
     // degenerate pool.
     let writer_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("writer pool"),
     );
     let reader_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("reader pool"),
     );
@@ -95,7 +101,7 @@ fn options_title_emb() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![default_vector_config("emb", 7)],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),
     )
     .expect("valid options")
@@ -270,7 +276,7 @@ fn fanout_under_concurrency_is_live_and_deterministic() {
                         // Rotate the query order per (thread, iter) so
                         // the four shapes interleave differently across
                         // threads — maximizes runtime/pool contention.
-                        match (t + it) % 4 {
+                        match (t + it) % QUERY_KIND_COUNT {
                             0 => {
                                 if run_bm25(&st) != gold.bm25 {
                                     return Err(format!("bm25 mismatch t={t} it={it}"));

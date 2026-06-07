@@ -32,6 +32,13 @@ use std::sync::Arc;
 use infino::supertable::Supertable;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Disk-cache byte budget (1 GiB) for the stats integration cache.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk size (1 MiB).
+const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 use tempfile::TempDir;
 
 #[test]
@@ -232,10 +239,10 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cfg = DiskCacheConfig {
         cache_root: cache_dir.path().to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),

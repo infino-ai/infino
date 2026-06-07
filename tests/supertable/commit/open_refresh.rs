@@ -31,6 +31,11 @@ use infino::supertable::options::Consistency;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::{OpenError, Supertable, SupertableOptions};
 use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
+
+/// BM25 top-k for the open/refresh consistency queries.
+const BM25_TOP_K: usize = 10;
+/// Single-thread rayon pool for the mismatched-schema test.
+const RAYON_POOL_THREADS: usize = 1;
 use tempfile::TempDir;
 
 #[test]
@@ -128,7 +133,7 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
     // A strongly-consistent query re-checks the pointer and serves
     // against the latest manifest — picking up the new commit.
     let hits = consumer
-        .bm25_search("title", "added", 10, BoolMode::Or)
+        .bm25_search("title", "added", BM25_TOP_K, BoolMode::Or)
         .expect("query under strong consistency");
     assert!(!hits.is_empty(), "strong query must see the v2 row");
     assert_eq!(consumer.manifest_id(), 2);
@@ -171,7 +176,7 @@ fn strong_consistency_query_is_stable_when_pointer_unchanged() {
     // No producer commits between open and query: the pointer hasn't
     // advanced, so the strongly-consistent query stays at v1.
     let _ = consumer
-        .bm25_search("title", "only", 10, BoolMode::Or)
+        .bm25_search("title", "only", BM25_TOP_K, BoolMode::Or)
         .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
 }
@@ -192,7 +197,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
     )
     .expect("create");
     let hits = st
-        .bm25_search("title", "anything", 10, BoolMode::Or)
+        .bm25_search("title", "anything", BM25_TOP_K, BoolMode::Or)
         .expect("query on uncommitted table");
     assert!(hits.is_empty());
     assert_eq!(st.manifest_id(), 0);
@@ -229,7 +234,7 @@ fn open_rejects_mismatched_options_via_options_hash() {
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );

@@ -39,18 +39,31 @@ use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
+/// Disk-cache budget (1 GiB) for the end-to-end integration cache.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk size (1 MiB).
+const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
+/// Mmap promotion timers disabled in tests.
+const MMAP_TIMER_DISABLED_SECS: u64 = 0;
+/// Commits driven for the warm-cache idempotency test.
+const WARM_CACHE_COMMIT_COUNT: usize = 3;
+/// 1-byte memory budget forcing the post-commit madvise sweep.
+const MEMORY_BUDGET_FORCE_SWEEP_BYTES: u64 = 1;
+
 fn make_cache(
     storage: Arc<dyn StorageProvider>,
     cache_root: &std::path::Path,
 ) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30, // 1 GiB — plenty for tests
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20, // 1 MiB
-        mmap_cold_threshold_secs: 0,     // disable sweep for tests
-        mmap_sweep_interval_secs: 0,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS, // disable sweep for tests
+        mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
         ..Default::default()
@@ -260,7 +273,7 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
     )
     .expect("create");
 
-    for _i in 0..3 {
+    for _i in 0..WARM_CACHE_COMMIT_COUNT {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["title"])).expect("append");
         w.commit().expect("commit");
@@ -406,7 +419,7 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache))
-            .with_memory_budget(1),
+            .with_memory_budget(MEMORY_BUDGET_FORCE_SWEEP_BYTES),
     )
     .expect("create");
 

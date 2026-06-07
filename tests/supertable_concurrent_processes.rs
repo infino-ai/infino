@@ -30,6 +30,11 @@ use std::sync::Arc;
 use infino::supertable::Supertable;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Sentinel retry count asserted to plumb through the options builder.
+const MAX_RETRIES_SENTINEL: u32 = 42;
+/// Generous retry budget so contending commits eventually all land.
+const CONTENTION_MAX_RETRIES: u32 = 20;
 use tempfile::TempDir;
 
 /// Two independent handles racing to commit. The OCC retry
@@ -304,8 +309,8 @@ async fn max_commit_retries_is_plumbed_through_options() {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let opts = default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_max_commit_retries(42);
-        assert_eq!(opts.max_commit_retries, 42);
+            .with_max_commit_retries(MAX_RETRIES_SENTINEL);
+        assert_eq!(opts.max_commit_retries, MAX_RETRIES_SENTINEL);
     }
 
     // Concurrent commit with raised retries — same outcome
@@ -318,13 +323,13 @@ async fn max_commit_retries_is_plumbed_through_options() {
     let st_a = Supertable::create(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_max_commit_retries(20),
+            .with_max_commit_retries(CONTENTION_MAX_RETRIES),
     )
     .expect("create");
     let st_b = Supertable::create(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_max_commit_retries(20),
+            .with_max_commit_retries(CONTENTION_MAX_RETRIES),
     )
     .expect("create");
 

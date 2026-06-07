@@ -42,6 +42,9 @@ use infino::supertable::wal::state_doc::{
 };
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 
+/// Document count seeded into each crash-recovery fixture.
+const SEED_DOC_COUNT: usize = 5;
+
 fn make_disk_cache(
     storage: Arc<dyn StorageProvider>,
     cache_root: &std::path::Path,
@@ -192,7 +195,7 @@ async fn intent_with_zero_progress_recovers_clean() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let wal_id = seed_partial_state(Arc::clone(&storage), 5, 3, &[]).await;
+    let wal_id = seed_partial_state(Arc::clone(&storage), SEED_DOC_COUNT, 3, &[]).await;
     recover_and_assert_complete(Arc::clone(&storage), wal_id, 3).await;
 }
 
@@ -203,7 +206,7 @@ async fn intent_with_partial_progress_resumes_at_first_pending() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     // First entry pre-marked Tombstoned; the rest are Pending.
     let pre = [TombstoneOutcome::Tombstoned];
-    let wal_id = seed_partial_state(Arc::clone(&storage), 5, 3, &pre).await;
+    let wal_id = seed_partial_state(Arc::clone(&storage), SEED_DOC_COUNT, 3, &pre).await;
     recover_and_assert_complete(Arc::clone(&storage), wal_id, 3).await;
 }
 
@@ -216,7 +219,7 @@ async fn intent_with_all_complete_progress_just_advances_state() {
     // observe that nothing's left to do for tombstones, and
     // advance the WAL state to Complete in one CAS.
     let pre = vec![TombstoneOutcome::Tombstoned; 3];
-    let wal_id = seed_partial_state(Arc::clone(&storage), 5, 3, &pre).await;
+    let wal_id = seed_partial_state(Arc::clone(&storage), SEED_DOC_COUNT, 3, &pre).await;
     recover_and_assert_complete(Arc::clone(&storage), wal_id, 3).await;
 }
 
@@ -229,7 +232,7 @@ async fn intent_with_mix_of_outcomes_recovers_clean() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let pre = [TombstoneOutcome::Tombstoned, TombstoneOutcome::NotFound];
-    let wal_id = seed_partial_state(Arc::clone(&storage), 5, 4, &pre).await;
+    let wal_id = seed_partial_state(Arc::clone(&storage), SEED_DOC_COUNT, 4, &pre).await;
     // Expected tombstoned count after recovery: 1 (pre) + 2
     // (recovered) = 3. The NotFound entry stays NotFound.
     recover_and_assert_complete(Arc::clone(&storage), wal_id, 3).await;
@@ -241,7 +244,7 @@ async fn intent_with_all_not_found_recovers_clean() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let pre = vec![TombstoneOutcome::NotFound; 3];
-    let wal_id = seed_partial_state(Arc::clone(&storage), 5, 3, &pre).await;
+    let wal_id = seed_partial_state(Arc::clone(&storage), SEED_DOC_COUNT, 3, &pre).await;
     recover_and_assert_complete(Arc::clone(&storage), wal_id, 0).await;
 }
 
@@ -253,7 +256,7 @@ async fn recovery_is_idempotent_under_repeated_open() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let wal_id = seed_partial_state(Arc::clone(&storage), 5, 2, &[]).await;
+    let wal_id = seed_partial_state(Arc::clone(&storage), SEED_DOC_COUNT, 2, &[]).await;
     // First open drives recovery.
     recover_and_assert_complete(Arc::clone(&storage), wal_id, 2).await;
     // Second open should observe the post-state cleanly.

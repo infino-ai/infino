@@ -27,6 +27,12 @@ use std::sync::Arc;
 
 use infino::supertable::Supertable;
 use infino::supertable::manifest::commit::read_pointer;
+
+/// 1-byte multipart threshold forcing every upload through the
+/// multipart path.
+const PUT_MULTIPART_THRESHOLD_BYTES: u64 = 1;
+/// BM25 top-k for the post-commit query.
+const BM25_TOP_K: usize = 5;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
@@ -163,7 +169,7 @@ fn multipart_threshold_forces_segment_through_put_multipart() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_put_multipart_threshold_bytes(1);
+        .with_put_multipart_threshold_bytes(PUT_MULTIPART_THRESHOLD_BYTES);
     let producer = Supertable::create(opts).expect("create");
     {
         let mut w = producer.writer().expect("writer");
@@ -252,7 +258,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
         .bm25_search(
             "title",
             "nimblefox",
-            5,
+            BM25_TOP_K,
             infino::supertable::query::fts::BoolMode::Or,
         )
         .expect("query");

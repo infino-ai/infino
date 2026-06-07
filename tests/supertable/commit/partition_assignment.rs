@@ -53,6 +53,17 @@ use infino::supertable::Supertable;
 use infino::supertable::manifest::list::PartitionStrategy;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
+
+/// Commits driven per partition-assignment scenario.
+const COMMITS_PER_TEST: usize = 3;
+/// Hash-partition bucket count for the multi-bucket fixture.
+const HASH_N_BUCKETS: u32 = 4;
+/// One-day partition granularity (seconds).
+const DAY_GRANULARITY_SECS: i64 = 86_400;
+/// Single-thread rayon pool for deterministic assignment.
+const RAYON_POOL_THREADS: usize = 1;
+/// A partition key is an 8-byte big-endian bucket id.
+const PARTITION_KEY_BYTES: usize = 8;
 use tempfile::TempDir;
 
 #[test]
@@ -66,7 +77,7 @@ fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a
     let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
         .expect("create");
 
-    for _i in 0..3 {
+    for _i in 0..COMMITS_PER_TEST {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
@@ -105,7 +116,7 @@ fn rewrite_path_produces_fresh_part_id_per_commit() {
         .expect("create");
 
     let mut part_ids = Vec::new();
-    for _i in 0..3 {
+    for _i in 0..COMMITS_PER_TEST {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
@@ -139,7 +150,7 @@ fn target_superfiles_per_partition_triggers_part_split() {
         .with_target_superfiles_per_partition(2);
     let st = Supertable::create(opts).expect("create");
 
-    for _i in 0..3 {
+    for _i in 0..COMMITS_PER_TEST {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
@@ -177,7 +188,7 @@ fn hash_strategy_with_multiple_buckets_errors_without_partition_hint() {
         .with_storage(Arc::clone(&storage))
         .with_partition_strategy(PartitionStrategy::Hash {
             column: "doc_id".into(),
-            n_buckets: 4,
+            n_buckets: HASH_N_BUCKETS,
         });
     let st = Supertable::create(opts).expect("create");
 
@@ -209,7 +220,7 @@ fn time_range_strategy_on_unsupported_column_type_errors_cleanly() {
         .with_storage(Arc::clone(&storage))
         .with_partition_strategy(PartitionStrategy::TimeRange {
             column: "_id".into(),
-            granularity_secs: 86_400,
+            granularity_secs: DAY_GRANULARITY_SECS,
         });
     let st = Supertable::create(opts).expect("create");
 
@@ -245,7 +256,7 @@ fn time_range_assigns_int64_segments_to_bucket_zero() {
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );
@@ -262,7 +273,7 @@ fn time_range_assigns_int64_segments_to_bucket_zero() {
     .with_storage(Arc::clone(&storage))
     .with_partition_strategy(PartitionStrategy::TimeRange {
         column: "ts_secs".into(),
-        granularity_secs: 86_400,
+        granularity_secs: DAY_GRANULARITY_SECS,
     });
 
     let st = Supertable::create(opts).expect("create");
@@ -291,7 +302,7 @@ fn time_range_assigns_int64_segments_to_bucket_zero() {
         "single-bucket commit produces one part"
     );
     // TimeRange partition_key is 8 bytes LE bucket index.
-    assert_eq!(list.parts[0].partition_key.len(), 8);
+    assert_eq!(list.parts[0].partition_key.len(), PARTITION_KEY_BYTES);
     let bucket = u64::from_le_bytes(
         list.parts[0]
             .partition_key
@@ -319,7 +330,7 @@ fn time_range_segment_spanning_two_buckets_errors() {
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );
@@ -336,7 +347,7 @@ fn time_range_segment_spanning_two_buckets_errors() {
     .with_storage(Arc::clone(&storage))
     .with_partition_strategy(PartitionStrategy::TimeRange {
         column: "ts_secs".into(),
-        granularity_secs: 86_400,
+        granularity_secs: DAY_GRANULARITY_SECS,
     });
 
     let st = Supertable::create(opts).expect("create");
