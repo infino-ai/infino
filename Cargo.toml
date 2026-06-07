@@ -284,6 +284,11 @@ path = "benches/vector/main.rs"
 harness = false
 
 [[bench]]
+name = "sql"
+path = "benches/sql/main.rs"
+harness = false
+
+[[bench]]
 name = "supertable_all"
 path = "benches/supertable/main.rs"
 harness = false

@@ -16,4 +16,5 @@ pub mod rss;
 pub mod tiers;
 
 pub mod fts_superfile;
+pub mod sql_bench;
 pub mod vector_superfile;

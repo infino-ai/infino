@@ -6,7 +6,6 @@
 //! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
 //! (or `INFINO_TEST_REAL_S3_BUCKET`) for AWS S3.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -372,10 +371,4 @@ pub fn consumer_options(
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {
     Supertable::open(opts).expect("Supertable::open from object store")
-}
-
-#[allow(dead_code)]
-pub fn empty_pinned()
--> Arc<dyn Fn() -> HashSet<infino::supertable::manifest::SuperfileUri> + Send + Sync> {
-    Arc::new(HashSet::new)
 }

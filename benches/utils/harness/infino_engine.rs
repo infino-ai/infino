@@ -120,7 +120,7 @@ impl FtsEngine for InfinoFtsEngine {
         index.bytes = Some(bytes);
     }
 
-    fn build_at(column: &str, docs: &[(u64, &str)], writers: usize) {
+    fn parallel_write(column: &str, docs: &[(u64, &str)], writers: usize) {
         if writers <= 1 {
             std::hint::black_box(build_superfile(column, docs));
             return;

@@ -23,14 +23,21 @@
 
 pub mod driver;
 mod infino_engine;
+mod infino_sql_engine;
 mod infino_vector_engine;
+pub mod sql_driver;
 pub mod vector_driver;
 
 pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
+pub use infino_sql_engine::{InfinoSqlEngine, InfinoSqlIndex, sample_query_csv};
 pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
+pub use sql_driver::{
+    EngineSqlResult, SqlBuildStat, SqlQuery, SqlQueryStats, SqlRunConfig, run_sql,
+    run_sql_with_index,
+};
 pub use vector_driver::{
     EngineVectorResult, VectorBuildStat, VectorMetric, VectorQuery, VectorQueryStats,
     VectorRunConfig, VectorSearch, run_vector, run_vector_with_index,
@@ -107,7 +114,7 @@ pub trait FtsEngine {
     /// parallel build (infino shards across builders; Tantivy uses that
     /// many indexing threads). Lets the driver compare ingest at 1 vs N
     /// writers apples-to-apples without favoring any engine.
-    fn build_at(column: &str, docs: &[(u64, &str)], writers: usize);
+    fn parallel_write(column: &str, docs: &[(u64, &str)], writers: usize);
 
     /// BM25 top-`k` over already-tokenized `terms`, returning hits
     /// sorted by descending score. The measured query phase.
@@ -137,7 +144,7 @@ pub struct VectorHit {
 /// `create` → `write` → `read` → `close` → `delete` is the full vector
 /// lifecycle. `write` builds the canonical 1-writer queryable artifact
 /// and must retain any bytes/handles needed by later correctness, hot
-/// search, and cold upload. `build_at` is the build-throughput-only axis
+/// search, and cold upload. `parallel_write` is the build-throughput-only axis
 /// for `N writers`.
 pub trait VectorEngine {
     type Index;
@@ -154,7 +161,7 @@ pub trait VectorEngine {
 
     fn write(index: &mut Self::Index, vectors: &[f32]);
 
-    fn build_at(
+    fn parallel_write(
         column: &str,
         vectors: &[f32],
         dim: usize,
@@ -168,6 +175,48 @@ pub trait VectorEngine {
         k: usize,
         search: VectorSearch,
     ) -> Vec<VectorHit>;
+
+    fn close(index: &mut Self::Index);
+
+    fn delete(index: Self::Index);
+}
+
+/// A scalar row ingested by SQL engines.
+#[derive(Clone, Copy, Debug)]
+pub struct SqlRow<'a> {
+    pub doc_id: u64,
+    pub title: &'a str,
+    pub category: &'a str,
+    pub score: i64,
+}
+
+/// Engine-normalized SQL query output. For the benchmark tables and
+/// correctness checks we only need row count; engine-specific batches
+/// stay inside the implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlOutput {
+    pub rows: usize,
+}
+
+/// A SQL engine under comparison.
+pub trait SqlEngine {
+    type Index;
+
+    fn name() -> &'static str;
+
+    fn capabilities() -> Capabilities;
+
+    fn create() -> Self::Index;
+
+    fn open() -> Self::Index {
+        Self::create()
+    }
+
+    fn write(index: &mut Self::Index, rows: &[SqlRow<'_>]);
+
+    fn parallel_write(rows: &[SqlRow<'_>], writers: usize);
+
+    fn read(index: &Self::Index, sql: &str) -> SqlOutput;
 
     fn close(index: &mut Self::Index);
 

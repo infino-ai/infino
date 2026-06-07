@@ -110,7 +110,7 @@ pub fn run_fts_with_index<E: FtsEngine>(
     if parallel > 1 {
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
-        E::build_at(column, docs, parallel);
+        E::parallel_write(column, docs, parallel);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
         builds.push(BuildStat {

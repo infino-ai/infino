@@ -105,7 +105,7 @@ pub fn run_vector_with_index<E: VectorEngine>(
     if cfg.parallel > 1 {
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
-        E::build_at(cfg.column, vectors, cfg.dim, cfg.metric, cfg.parallel);
+        E::parallel_write(cfg.column, vectors, cfg.dim, cfg.metric, cfg.parallel);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
         builds.push(VectorBuildStat {

@@ -132,3 +132,13 @@ _Pending custom-harness migration._
 <!-- BEGIN: bench/vector/supertable/search -->
 _Pending custom-harness migration._
 <!-- END: bench/vector/supertable/search -->
+
+### SQL — in-memory supertable
+
+<!-- BEGIN: bench/sql/build -->
+_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench sql` to populate._
+<!-- END: bench/sql/build -->
+
+<!-- BEGIN: bench/sql/query -->
+_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench sql` to populate._
+<!-- END: bench/sql/query -->

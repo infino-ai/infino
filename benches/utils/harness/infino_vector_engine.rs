@@ -145,7 +145,7 @@ impl VectorEngine for InfinoVectorEngine {
         index.bytes = Some(bytes);
     }
 
-    fn build_at(
+    fn parallel_write(
         column: &str,
         vectors: &[f32],
         dim: usize,
