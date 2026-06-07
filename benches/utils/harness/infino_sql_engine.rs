@@ -18,6 +18,7 @@ use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
+use rayon::prelude::*;
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::rerank_codec::RerankCodec;
@@ -190,9 +191,10 @@ impl SqlEngine for InfinoSqlEngine {
             return;
         }
         // Parallel build: shard the rows across `writers` builders, each
-        // producing its own in-memory table. Build-only — handles dropped.
+        // producing its own in-memory table concurrently (rayon `par_chunks`,
+        // mirroring the FTS/vector engines). Build-only — handles dropped.
         let rows_per = rows.len().div_ceil(writers);
-        let built: Vec<Supertable> = rows.chunks(rows_per).map(build_supertable).collect();
+        let built: Vec<Supertable> = rows.par_chunks(rows_per).map(build_supertable).collect();
         std::hint::black_box(built);
     }
 
