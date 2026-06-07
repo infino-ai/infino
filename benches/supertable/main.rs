@@ -1,10 +1,14 @@
-//! Supertable bench bundle (infino-only).
+//! Supertable object-store bench bundle (infino-only entry point). Uses
+//! Infino's custom benchmark harness directly.
 //!
-//! Pending custom-harness migration. This target intentionally does not
-//! run the old benchmark implementation.
+//! ## Invocation
+//!
+//! ```text
+//! cargo bench --bench supertable_all
+//! INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
+//! ```
 
 fn main() {
-    eprintln!(
-        "supertable_all is pending custom-harness migration; see bench-harness-migration-plan.md"
-    );
+    infino_bench_utils::supertable_bench::run();
 }

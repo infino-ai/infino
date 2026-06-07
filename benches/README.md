@@ -101,12 +101,8 @@ _Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts` to populat
 
 ### FTS — supertable (multi-segment, 10M docs)
 
-<!-- BEGIN: bench/supertable/ingest/supertable_fts_build -->
-_Pending custom-harness migration._
-<!-- END: bench/supertable/ingest/supertable_fts_build -->
-
 <!-- BEGIN: bench/fts/supertable/search -->
-_Pending custom-harness migration._
+_Pending custom-harness search migration._
 <!-- END: bench/fts/supertable/search -->
 
 ### Vector — superfile (single-segment, 1M × 384)
@@ -119,18 +115,16 @@ _Pending `VectorEngine` migration._
 _Pending `VectorEngine` migration._
 <!-- END: bench/vector/superfile/search -->
 
+### Supertable — ingest (multi-segment, object store)
+
+<!-- BEGIN: bench/supertable/ingest -->
+_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all` to populate._
+<!-- END: bench/supertable/ingest -->
+
 ### Vector — supertable (multi-segment, 10M × 384)
 
-<!-- BEGIN: bench/supertable/ingest/supertable_vec_build -->
-_Pending custom-harness migration._
-<!-- END: bench/supertable/ingest/supertable_vec_build -->
-
-<!-- BEGIN: bench/supertable/ingest/supertable_all_build -->
-_Pending custom-harness migration._
-<!-- END: bench/supertable/ingest/supertable_all_build -->
-
 <!-- BEGIN: bench/vector/supertable/search -->
-_Pending custom-harness migration._
+_Pending custom-harness search migration._
 <!-- END: bench/vector/supertable/search -->
 
 ### SQL — in-memory supertable

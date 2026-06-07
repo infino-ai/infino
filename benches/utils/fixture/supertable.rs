@@ -32,7 +32,7 @@ pub fn ensure_ingest(reason: &str) -> &'static IngestResult {
     if INGEST.get().is_none() {
         eprintln!(
             "[supertable_all] ingesting {} docs ({} commits) to object storage for {reason}...",
-            supertable::N_DOCS,
+            supertable::n_docs(),
             supertable::N_COMMIT_CHUNKS
         );
     }
@@ -72,7 +72,7 @@ pub fn ensure_fts_ingest(reason: &str) -> &'static IngestResult {
     if FTS_INGEST.get().is_none() {
         eprintln!(
             "[supertable_fts] ingesting {} docs (FTS-only) to object storage for {reason}...",
-            supertable::N_DOCS
+            supertable::n_docs()
         );
     }
     FTS_INGEST.get_or_init(|| {
@@ -101,7 +101,7 @@ pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
     if VEC_INGEST.get().is_none() {
         eprintln!(
             "[supertable_vec] ingesting {} docs (vector-only) to object storage for {reason}...",
-            supertable::N_DOCS
+            supertable::n_docs()
         );
     }
     VEC_INGEST.get_or_init(|| {
