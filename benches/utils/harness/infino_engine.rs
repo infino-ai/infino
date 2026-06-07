@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use rayon::prelude::*;
 
 use infino::superfile::SuperfileReader;
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
@@ -29,6 +30,39 @@ const ID_COLUMN: &str = "doc_id";
 /// Rows per `add_batch` — bounds the transient RecordBatch footprint
 /// during ingest, mirroring the production commit path.
 const WRITE_CHUNK: usize = 65_536;
+
+/// Build one superfile (`.parquet` + embedded FTS blob) from `docs` with
+/// a single builder, returning the finished bytes. Shared by the
+/// queryable `write` and the build-throughput probe.
+fn build_superfile(column: &str, docs: &[(u64, &str)]) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
+        Field::new(column, DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        ID_COLUMN,
+        vec![FtsConfig {
+            column: column.to_string(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
+    for chunk in docs.chunks(WRITE_CHUNK) {
+        let ids: Decimal128Array = chunk
+            .iter()
+            .map(|(id, _)| Some(*id as i128))
+            .collect::<Decimal128Array>()
+            .with_precision_and_scale(38, 0)
+            .expect("decimal128 precision/scale");
+        let texts = LargeStringArray::from(chunk.iter().map(|(_, t)| *t).collect::<Vec<&str>>());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)])
+            .expect("RecordBatch");
+        builder.add_batch(&batch, &[]).expect("add_batch");
+    }
+    builder.finish().expect("SuperfileBuilder::finish")
+}
 
 /// infino as a comparison engine.
 pub struct InfinoFtsEngine;
@@ -64,36 +98,25 @@ impl FtsEngine for InfinoFtsEngine {
     }
 
     fn write(index: &mut Self::Index, docs: &[(u64, &str)]) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
-            Field::new(index.column.as_str(), DataType::LargeUtf8, false),
-        ]));
-        let opts = BuilderOptions::new(
-            schema.clone(),
-            ID_COLUMN,
-            vec![FtsConfig {
-                column: index.column.clone(),
-            }],
-            vec![],
-            Some(default_tokenizer()),
-        );
-        let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
-        for chunk in docs.chunks(WRITE_CHUNK) {
-            let ids: Decimal128Array = chunk
-                .iter()
-                .map(|(id, _)| Some(*id as i128))
-                .collect::<Decimal128Array>()
-                .with_precision_and_scale(38, 0)
-                .expect("decimal128 precision/scale");
-            let texts =
-                LargeStringArray::from(chunk.iter().map(|(_, t)| *t).collect::<Vec<&str>>());
-            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)])
-                .expect("RecordBatch");
-            builder.add_batch(&batch, &[]).expect("add_batch");
-        }
-        let bytes = builder.finish().expect("SuperfileBuilder::finish");
+        let bytes = build_superfile(&index.column, docs);
         index.reader =
             Some(SuperfileReader::open(Bytes::from(bytes)).expect("open SuperfileReader"));
+    }
+
+    fn build_at(column: &str, docs: &[(u64, &str)], writers: usize) {
+        if writers <= 1 {
+            std::hint::black_box(build_superfile(column, docs));
+            return;
+        }
+        // Parallel build: shard the corpus across `writers` builders,
+        // each emitting its own superfile (the same sharded-ingest shape
+        // a partitioned commit produces). Build-only — bytes discarded.
+        let shard_len = docs.len().div_ceil(writers);
+        let shards: Vec<Vec<u8>> = docs
+            .par_chunks(shard_len)
+            .map(|shard| build_superfile(column, shard))
+            .collect();
+        std::hint::black_box(shards);
     }
 
     fn read(index: &Self::Index, terms: &[&str], k: usize, mode: BoolMode) -> Vec<Hit> {

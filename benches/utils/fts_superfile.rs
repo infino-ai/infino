@@ -42,8 +42,6 @@ use std::time::{Duration, Instant};
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use rayon::prelude::*;
-
 use infino::superfile::SuperfileReader;
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
 use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
@@ -53,14 +51,14 @@ use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
 use crate::harness::{BoolMode, EngineFtsResult, FtsQuery, InfinoFtsEngine, QueryStats, run_fts};
 use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-use crate::rss::{self, PeakSampler, RssStats};
+use crate::rss::{self, RssStats};
 use crate::tiers;
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-/// Doc count for every FTS-superfile bench. Superfile shape → 1M.
-const N_DOCS: usize = corpus::SUPERFILE_DOCS;
-
+// Document count is the malleable superfile-test parameter
+// (`corpus::superfile_docs()`, default 1M, env-overridable). Captured
+// once per run into a local `n_docs`.
 const ID_COLUMN: &str = "doc_id";
 const FTS_COLUMN: &str = "title";
 
@@ -241,28 +239,6 @@ fn build_superfile_bytes_range(
         offset += len;
     }
     builder.finish().expect("SuperfileBuilder::finish")
-}
-
-/// Rayon-sharded parallel build: each shard runs its own
-/// [`SuperfileBuilder`] and emits a self-contained `.parquet` — the same
-/// multi-segment shape supertable commit produces. Infino-only ingest
-/// parallelism, so it stays measured directly rather than through the
-/// engine-generic driver.
-fn build_superfiles_rayon(docs: &MmapTextCorpus) -> Vec<Vec<u8>> {
-    let n_shards = rayon::current_num_threads();
-    let docs_per_shard = docs.n_docs().div_ceil(n_shards);
-    (0..n_shards)
-        .into_par_iter()
-        .filter_map(|shard_idx| {
-            let start = shard_idx * docs_per_shard;
-            if start >= docs.n_docs() {
-                return None;
-            }
-            let len = docs_per_shard.min(docs.n_docs() - start);
-            let id_base = shard_idx * docs_per_shard;
-            Some(build_superfile_bytes_range(docs, start, len, id_base))
-        })
-        .collect()
 }
 
 // ─── Correctness (infino-only oracle) ─────────────────────────────────
@@ -463,32 +439,34 @@ pub fn run() {
         return;
     }
 
-    eprintln!("[superfile_fts] generating {}-doc corpus...", fmt_count(N_DOCS));
-    let corpus = MmapTextCorpus::generate(N_DOCS, 1);
+    let n_docs = corpus::superfile_docs();
+    eprintln!("[superfile_fts] generating {}-doc corpus...", fmt_count(n_docs));
+    let corpus = MmapTextCorpus::generate(n_docs, 1);
     let docs = corpus.rows();
 
     // Comparable build + hot-search numbers, through the same harness
     // retrievalbench drives. One build, then the full query battery.
     eprintln!(
         "[superfile_fts] run_fts: build + {HOT_ITERS}-iter hot search over {} docs...",
-        fmt_count(N_DOCS)
+        fmt_count(n_docs)
     );
-    let result = run_fts::<InfinoFtsEngine>(FTS_COLUMN, &docs, FTS_BATTERY, K, HOT_ITERS);
+    // One build at 1 writer (the queryable single superfile) plus a
+    // build-throughput probe at N writers — both through the same
+    // engine-generic driver the comparison uses.
+    let result = run_fts::<InfinoFtsEngine>(
+        FTS_COLUMN,
+        &docs,
+        FTS_BATTERY,
+        K,
+        HOT_ITERS,
+        corpus::parallel_writers(),
+    );
 
     // Run-to-run deltas for every metric below, vs the previous run.
     let mut report = Report::load("superfile_fts");
 
     if sel.build {
-        // Infino-only: rayon-sharded parallel build, measured directly.
-        eprintln!("[superfile_fts] rayon-sharded build...");
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let shards = build_superfiles_rayon(&corpus);
-        let rayon_wall = t0.elapsed();
-        let rayon_rss = sampler.stop_stats();
-        std::hint::black_box(shards);
-
-        emit_ingest(&mut report, &corpus, &result, rayon_wall, rayon_rss);
+        emit_ingest(&mut report, n_docs, &corpus, &result);
     }
 
     if sel.search {
@@ -518,7 +496,7 @@ pub fn run() {
         let committed = tiers::block_on(tiers::commit_superfile(&Bytes::from(bytes)));
         let cold = measure_cold(&committed);
 
-        emit_search(&mut report, &result, &cold, &probes);
+        emit_search(&mut report, n_docs, &result, &cold, &probes);
     }
 
     report.save();
@@ -530,10 +508,16 @@ fn headers(cols: &[&str]) -> Vec<String> {
     cols.iter().map(|s| s.to_string()).collect()
 }
 
-fn ingest_row(label: &str, wall: Duration, stats: RssStats, input_bytes: f64) -> Vec<Cell> {
+fn ingest_row(
+    label: &str,
+    n_docs: usize,
+    wall: Duration,
+    stats: RssStats,
+    input_bytes: f64,
+) -> Vec<Cell> {
     let secs = wall.as_secs_f64();
     let ns = secs * 1e9;
-    let thr = N_DOCS as f64 / secs;
+    let thr = n_docs as f64 / secs;
     let bw = input_bytes / secs;
     vec![
         text(label),
@@ -558,19 +542,31 @@ fn ingest_row(label: &str, wall: Duration, stats: RssStats, input_bytes: f64) ->
     ]
 }
 
-fn emit_ingest(
-    report: &mut Report,
-    corpus: &MmapTextCorpus,
-    result: &EngineFtsResult,
-    rayon_wall: Duration,
-    rayon_rss: RssStats,
-) {
+fn writer_label(writers: usize) -> String {
+    if writers == 1 {
+        "1 writer".to_string()
+    } else {
+        format!("{writers} writers")
+    }
+}
+
+fn emit_ingest(report: &mut Report, n_docs: usize, corpus: &MmapTextCorpus, result: &EngineFtsResult) {
     // Logical input payload: total corpus text bytes, identical across
-    // both variants (the rayon variant shards the same corpus).
+    // every writer count (the parallel build shards the same corpus).
     let input_bytes = corpus.total_bytes() as f64;
-    // Label by concurrency: single-thread build vs the rayon-sharded
-    // build across all worker threads.
-    let n_workers = rayon::current_num_threads();
+    let rows: Vec<Vec<Cell>> = result
+        .builds
+        .iter()
+        .map(|b| {
+            ingest_row(
+                &writer_label(b.writers),
+                n_docs,
+                b.phase.wall,
+                b.phase.rss,
+                input_bytes,
+            )
+        })
+        .collect();
     let block = Block {
         subtitle: String::new(),
         headers: headers(&[
@@ -582,26 +578,19 @@ fn emit_ingest(
             "Median RSS",
             "P90 RSS",
         ]),
-        rows: vec![
-            ingest_row("1 requester", result.build.wall, result.build.rss, input_bytes),
-            ingest_row(
-                &format!("{n_workers} requesters"),
-                rayon_wall,
-                rayon_rss,
-                input_bytes,
-            ),
-        ],
+        rows,
     };
     report.emit(&Section {
         anchor: "bench/fts/superfile/ingest".into(),
         title: format!(
-            "Superfile FTS — ingest ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
-            fmt_count(N_DOCS)
+            "Superfile FTS — ingest, single-segment / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
+            fmt_count(n_docs)
         ),
         note: "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable \
-               commit). Single-thread timing comes from the engine-generic `run_fts` driver (the same \
-               one the cross-engine comparison uses); the rayon row measures infino's sharded parallel \
-               build. Bandwidth is over the logical input text payload. Δ is vs the previous run."
+               commit), through the engine-generic `run_fts` driver the cross-engine comparison also \
+               uses. Rows are by writer count: `1 writer` is the single-threaded build (and the index \
+               queries run against); `N writers` is the sharded parallel build. Bandwidth is over the \
+               logical input text payload. Δ is vs the previous run."
             .into(),
         blocks: vec![block],
     });
@@ -651,6 +640,7 @@ fn search_row(
 
 fn emit_search(
     report: &mut Report,
+    n_docs: usize,
     result: &EngineFtsResult,
     cold: &HashMap<&'static str, Duration>,
     probes: &[(&'static str, Duration, Duration)],
@@ -701,7 +691,10 @@ fn emit_search(
 
     report.emit(&Section {
         anchor: "bench/fts/superfile/search".into(),
-        title: format!("Superfile FTS — search ({} docs)", fmt_count(N_DOCS)),
+        title: format!(
+            "Superfile FTS — search, single-segment / in-memory ({} docs)",
+            fmt_count(n_docs)
+        ),
         note: "Hot = `SuperfileReader::open` in memory (p50 via the engine-generic `run_fts` driver); \
                cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` \
                (production cold path). Δ is vs the previous run."

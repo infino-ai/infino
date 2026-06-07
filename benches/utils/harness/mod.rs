@@ -24,7 +24,7 @@
 pub mod driver;
 mod infino_engine;
 
-pub use driver::{EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts};
+pub use driver::{BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts};
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
 
 // Re-export the shared corpus + byte formatter so a comparison binary
@@ -80,9 +80,18 @@ pub trait FtsEngine {
     /// Prepare an empty index for a single text column.
     fn open(column: &str) -> Self::Index;
 
-    /// Ingest all `(doc_id, text)` rows and seal the index ready to
-    /// `read`. This is the measured build/ingest phase.
+    /// Ingest all `(doc_id, text)` rows with a single writer and seal
+    /// the index ready to `read`. This is the canonical, queryable build
+    /// — the "1 writer" build row and the index every query runs against.
     fn write(index: &mut Self::Index, docs: &[(u64, &str)]);
+
+    /// Build the corpus from scratch with `writers` concurrent writers,
+    /// for the build-throughput row only — nothing queryable is kept.
+    /// `writers == 1` is the single-writer build; `> 1` is the engine's
+    /// parallel build (infino shards across builders; Tantivy uses that
+    /// many indexing threads). Lets the driver compare ingest at 1 vs N
+    /// writers apples-to-apples without favoring any engine.
+    fn build_at(column: &str, docs: &[(u64, &str)], writers: usize);
 
     /// BM25 top-`k` over already-tokenized `terms`, returning hits
     /// sorted by descending score. The measured query phase.

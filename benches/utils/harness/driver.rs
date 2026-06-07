@@ -40,11 +40,20 @@ pub struct QueryStats {
     pub hit_ids: Vec<u64>,
 }
 
-/// Everything one engine produced for the FTS modality.
+/// One build row: the writer count and its timing + memory.
+#[derive(Clone, Copy, Debug)]
+pub struct BuildStat {
+    pub writers: usize,
+    pub phase: PhaseStats,
+}
+
+/// Everything one engine produced for the FTS modality. `builds` holds
+/// one row per measured writer count (always 1, plus the parallel count
+/// when requested); queries run against the 1-writer index.
 #[derive(Clone, Debug)]
 pub struct EngineFtsResult {
     pub engine: &'static str,
-    pub build: PhaseStats,
+    pub builds: Vec<BuildStat>,
     pub queries: Vec<QueryStats>,
 }
 
@@ -53,21 +62,44 @@ pub struct EngineFtsResult {
 /// `docs` is the shared corpus (`(doc_id, text)`), built once by the
 /// caller and reused across engines so its small footprint is outside
 /// every engine's measured window. `k` is the top-k; `iters` is the
-/// number of timed query repetitions (after one warmup).
+/// number of timed query repetitions (after one warmup). `parallel` is
+/// the "N writers" build-throughput count to also measure (skipped when
+/// `<= 1`); queries always run against the single-writer index.
 pub fn run_fts<E: FtsEngine>(
     column: &str,
     docs: &[(u64, &str)],
     queries: &[FtsQuery],
     k: usize,
     iters: usize,
+    parallel: usize,
 ) -> EngineFtsResult {
-    // ── write (build + seal), isolated and measured ──────────────────
+    // ── write: 1-writer canonical build (also the queryable index) ───
     let mut index = E::open(column);
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
     E::write(&mut index, docs);
     let build_wall = t0.elapsed();
     let build_rss = sampler.stop_stats();
+    let mut builds = vec![BuildStat {
+        writers: 1,
+        phase: PhaseStats {
+            wall: build_wall,
+            rss: build_rss,
+        },
+    }];
+
+    // ── build-only throughput probe at N writers (no query index) ────
+    if parallel > 1 {
+        let sampler = PeakSampler::start_default();
+        let t0 = Instant::now();
+        E::build_at(column, docs, parallel);
+        let wall = t0.elapsed();
+        let rss = sampler.stop_stats();
+        builds.push(BuildStat {
+            writers: parallel,
+            phase: PhaseStats { wall, rss },
+        });
+    }
 
     // ── read: per-query warmup + timed iters ─────────────────────────
     let mut queries_out = Vec::with_capacity(queries.len());
@@ -95,10 +127,7 @@ pub fn run_fts<E: FtsEngine>(
 
     EngineFtsResult {
         engine: E::name(),
-        build: PhaseStats {
-            wall: build_wall,
-            rss: build_rss,
-        },
+        builds,
         queries: queries_out,
     }
 }
@@ -155,12 +184,15 @@ mod tests {
                 mode: BoolMode::And,
             },
         ];
-        let res = run_fts::<InfinoFtsEngine>("title", &docs, &queries, 10, 50);
-        eprintln!(
-            "[run_fts infino @{SUPERFILE_DOCS}] build wall={:.2}s peak_rss={}",
-            res.build.wall.as_secs_f64(),
-            fmt_bytes(res.build.rss.peak_rss_bytes),
-        );
+        let res = run_fts::<InfinoFtsEngine>("title", &docs, &queries, 10, 50, num_cpus::get());
+        for b in &res.builds {
+            eprintln!(
+                "[run_fts infino @{SUPERFILE_DOCS}] {} writer(s) build wall={:.2}s peak_rss={}",
+                b.writers,
+                b.phase.wall.as_secs_f64(),
+                fmt_bytes(b.phase.rss.peak_rss_bytes),
+            );
+        }
         for q in &res.queries {
             eprintln!(
                 "  {:14} p50={:>10?}  rss={}  hits={}",
@@ -170,7 +202,7 @@ mod tests {
                 q.hit_ids.len(),
             );
         }
-        assert!(res.build.wall > Duration::ZERO);
+        assert!(res.builds[0].phase.wall > Duration::ZERO);
         assert!(res.queries.iter().all(|q| !q.hit_ids.is_empty()));
     }
 
@@ -183,10 +215,18 @@ mod tests {
             terms: &["term00001"],
             mode: BoolMode::Or,
         }];
-        let res = run_fts::<InfinoFtsEngine>("title", &docs, &queries, 10, 3);
+        let res = run_fts::<InfinoFtsEngine>("title", &docs, &queries, 10, 3, 2);
 
         assert_eq!(res.engine, "infino");
-        assert!(res.build.wall > Duration::ZERO, "build should be timed");
+        assert!(
+            res.builds[0].phase.wall > Duration::ZERO,
+            "build should be timed"
+        );
+        assert_eq!(res.builds[0].writers, 1);
+        assert!(
+            res.builds.iter().any(|b| b.writers == 2),
+            "parallel build row should be present"
+        );
         assert_eq!(res.queries.len(), 1);
         let q = &res.queries[0];
         assert!(!q.hit_ids.is_empty(), "common term should return hits");

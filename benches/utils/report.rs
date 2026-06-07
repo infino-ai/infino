@@ -102,7 +102,7 @@ struct Rendered {
 
 fn compute_delta(prev: Option<f64>, new: f64, better: Better) -> (String, &'static str) {
     let Some(base) = prev.filter(|&b| b != 0.0) else {
-        return ("(new)".into(), C_DIM);
+        return ("new".into(), C_DIM);
     };
     let pct = (new - base) / base * 100.0;
     if pct.abs() < NOISE_BAND_PCT {
@@ -160,9 +160,12 @@ impl Report {
                 md.push_str(&format!("**{}**\n\n", block.subtitle));
                 eprintln!("\n{}", block.subtitle);
             }
-            md.push_str(&assemble(&block.headers, &grid, false));
+            // Markdown: compact GFM (GitHub aligns columns itself, so no
+            // manual padding — keeps the committed source clean).
+            md.push_str(&assemble_markdown(&block.headers, &grid));
             md.push('\n');
-            eprint!("{}", assemble(&block.headers, &grid, self.color));
+            // Terminal: padded + colored for monospace readability.
+            eprint!("{}", assemble_terminal(&block.headers, &grid, self.color));
         }
 
         markdown::maybe_update_readme(&MarkdownSection {
@@ -226,11 +229,41 @@ impl Report {
     }
 }
 
-/// Assemble an aligned table. Per column: values are right-aligned in a
-/// value sub-field, deltas left-aligned after a 2-space gutter, so both
-/// line up vertically. Widths are computed from **visible** length
-/// (ANSI escapes and multibyte glyphs excluded).
-fn assemble(headers: &[String], grid: &[Vec<Rendered>], color: bool) -> String {
+/// Compact GFM table for markdown. No manual alignment padding (GitHub
+/// renders the columns aligned); each metric cell is `value (delta)`,
+/// each text cell is just its value. Clean committed source.
+fn assemble_markdown(headers: &[String], grid: &[Vec<Rendered>]) -> String {
+    let mut s = String::new();
+    s.push('|');
+    for h in headers {
+        s.push_str(&format!(" {h} |"));
+    }
+    s.push('\n');
+    s.push('|');
+    for _ in headers {
+        s.push_str(" --- |");
+    }
+    s.push('\n');
+    for row in grid {
+        s.push('|');
+        for cell in row {
+            let c = if cell.delta.is_empty() {
+                cell.value.clone()
+            } else {
+                format!("{} ({})", cell.value, cell.delta)
+            };
+            s.push_str(&format!(" {c} |"));
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Assemble an aligned table for the terminal. Per column: values are
+/// right-aligned in a value sub-field, deltas left-aligned after a
+/// 2-space gutter, so both line up vertically. Widths are computed from
+/// **visible** length (ANSI escapes and multibyte glyphs excluded).
+fn assemble_terminal(headers: &[String], grid: &[Vec<Rendered>], color: bool) -> String {
     let ncol = headers.len();
     let mut value_w = vec![0usize; ncol];
     let mut delta_w = vec![0usize; ncol];
