@@ -1,5 +1,5 @@
 //! Single-shot profile harness for `FtsBuilder` at the same 1M-doc
-//! Zipfian corpus the Criterion superfile FTS build bench uses.
+//! Zipfian corpus the superfile FTS build bench uses.
 //!
 //! Run with:
 //! ```text

@@ -83,7 +83,7 @@ fn corpus() -> Vec<(u64, &'static str)> {
         (40, "rust cargo build release profile"),
         (41, "rust crate publish workspace"),
         (42, "rust testing cfg test mod"),
-        (43, "rust criterion benchmarks measure"),
+        (43, "rust benchmark harnesses measure"),
         (44, "compiler optimization llvm ir"),
         (45, "compiler frontend parser ast"),
         (46, "interpreter virtual machine bytecode"),

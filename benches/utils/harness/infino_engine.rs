@@ -71,7 +71,22 @@ pub struct InfinoFtsEngine;
 /// finished `.parquet` bytes, plus the indexed column name.
 pub struct InfinoFtsIndex {
     column: String,
+    bytes: Option<Vec<u8>>,
     reader: Option<SuperfileReader>,
+}
+
+impl InfinoFtsIndex {
+    /// Bytes produced by the measured 1-writer build. Used by infino's
+    /// own cold-tier bench to upload the exact artifact that was built
+    /// and searched, not a rebuilt copy.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_deref().expect("bytes requested before write")
+    }
+
+    /// Reader opened on the measured 1-writer artifact.
+    pub fn reader(&self) -> &SuperfileReader {
+        self.reader.as_ref().expect("reader requested before write")
+    }
 }
 
 impl FtsEngine for InfinoFtsEngine {
@@ -90,9 +105,10 @@ impl FtsEngine for InfinoFtsEngine {
         }
     }
 
-    fn open(column: &str) -> Self::Index {
+    fn create(column: &str) -> Self::Index {
         InfinoFtsIndex {
             column: column.to_string(),
+            bytes: None,
             reader: None,
         }
     }
@@ -100,7 +116,8 @@ impl FtsEngine for InfinoFtsEngine {
     fn write(index: &mut Self::Index, docs: &[(u64, &str)]) {
         let bytes = build_superfile(&index.column, docs);
         index.reader =
-            Some(SuperfileReader::open(Bytes::from(bytes)).expect("open SuperfileReader"));
+            Some(SuperfileReader::open(Bytes::from(bytes.clone())).expect("open SuperfileReader"));
+        index.bytes = Some(bytes);
     }
 
     fn build_at(column: &str, docs: &[(u64, &str)], writers: usize) {
@@ -120,7 +137,7 @@ impl FtsEngine for InfinoFtsEngine {
     }
 
     fn read(index: &Self::Index, terms: &[&str], k: usize, mode: BoolMode) -> Vec<Hit> {
-        let reader = index.reader.as_ref().expect("read called before write");
+        let reader = index.reader();
         let infino_mode = match mode {
             BoolMode::Or => InfinoBoolMode::Or,
             BoolMode::And => InfinoBoolMode::And,
@@ -139,6 +156,14 @@ impl FtsEngine for InfinoFtsEngine {
             })
             .collect()
     }
+
+    fn close(index: &mut Self::Index) {
+        index.reader = None;
+    }
+
+    fn delete(_index: Self::Index) {
+        // Dropping the in-memory bytes/reader releases the artifact.
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +172,7 @@ mod tests {
 
     #[test]
     fn open_write_read_roundtrip() {
-        let mut idx = InfinoFtsEngine::open("title");
+        let mut idx = InfinoFtsEngine::create("title");
         let docs: [(u64, &str); 3] = [
             (0, "the quick brown fox"),
             (1, "a lazy sleeping dog"),

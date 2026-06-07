@@ -59,7 +59,7 @@ is merged. The individual targets:
 | `make test` | `cargo test` (full suite) |
 | `make ci` | `check` + `coverage` — the pre-PR gate |
 | `make coverage` | `cargo llvm-cov --summary-only` (≥90% overall) |
-| `make bench` / `make bench-quick` | criterion benches (`bench-quick` for a fast pass) |
+| `make bench` / `make bench-quick` | custom harness benches (`bench-quick` for a fast pass) |
 | `make miri` | language-level UB detection on the FTS surface (nightly) |
 | `make asan` | LLVM AddressSanitizer on the FTS surface (nightly) |
 

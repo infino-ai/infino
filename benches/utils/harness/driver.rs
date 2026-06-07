@@ -73,6 +73,24 @@ pub fn run_fts<E: FtsEngine>(
     iters: usize,
     parallel: usize,
 ) -> EngineFtsResult {
+    let (result, mut index) = run_fts_with_index::<E>(column, docs, queries, k, iters, parallel);
+    E::close(&mut index);
+    E::delete(index);
+    result
+}
+
+/// Same as [`run_fts`], but returns the queryable 1-writer index as
+/// well. Infino's in-tree superfile bench uses this to run correctness,
+/// hot probes, and cold upload against the exact artifact that was just
+/// measured, instead of rebuilding a second copy.
+pub fn run_fts_with_index<E: FtsEngine>(
+    column: &str,
+    docs: &[(u64, &str)],
+    queries: &[FtsQuery],
+    k: usize,
+    iters: usize,
+    parallel: usize,
+) -> (EngineFtsResult, E::Index) {
     // ── write: 1-writer canonical build (also the queryable index) ───
     let mut index = E::open(column);
     let sampler = PeakSampler::start_default();
@@ -125,11 +143,14 @@ pub fn run_fts<E: FtsEngine>(
         });
     }
 
-    EngineFtsResult {
-        engine: E::name(),
-        builds,
-        queries: queries_out,
-    }
+    (
+        EngineFtsResult {
+            engine: E::name(),
+            builds,
+            queries: queries_out,
+        },
+        index,
+    )
 }
 
 /// Nearest-rank percentile of a duration sample set (sorts in place).

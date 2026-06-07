@@ -46,7 +46,7 @@ impl Tier {
     }
 }
 
-/// Criterion group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
+/// Stable report group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
 pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) -> String {
     match tier {
         Tier::Hot => format!("{family}_hot_search"),
@@ -82,6 +82,29 @@ pub struct SuperfileCommitted {
     pub real_s3: bool,
     pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
+}
+
+impl SuperfileCommitted {
+    /// Delete the uploaded object when the fixture points at real S3.
+    /// s3s-fs fixtures live under a tempdir and are cleaned up by dropping
+    /// `_keepalive`, so they do not need object-level deletion.
+    pub fn cleanup(&self) {
+        let Some(path) = self.cleanup_path.as_deref() else {
+            return;
+        };
+        let storage = Arc::clone(&self.storage);
+        let result = block_on(async move { storage.delete(path).await });
+        match result {
+            Ok(()) => eprintln!("[tiers] cleanup real S3 superfile path={path}: deleted"),
+            Err(e) => eprintln!("[tiers] cleanup real S3 superfile path={path}: {e}"),
+        }
+    }
+}
+
+impl Drop for SuperfileCommitted {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 /// One runtime for the whole bench process. `spawn_s3s_fs` binds its

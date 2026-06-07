@@ -23,12 +23,12 @@ coverage-summary:              # quick terminal summary
 # `format/` byte parsing — covered by the regular `coverage`
 # gate plus the `miri` and `asan` lanes below.
 
-# Benchmarks (criterion)
+# Benchmarks
 bench:
 	cargo bench
 
 bench-quick:
-	cargo bench -- --quick
+	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench superfile_fts
 
 # Memory safety oracles for the FTS / format `unsafe` surface.
 # The remaining `unsafe` surface is one bumpalo lifetime

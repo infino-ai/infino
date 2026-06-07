@@ -6,7 +6,7 @@
 //! `SuperfileReader::search` across an `(nprobe, rerank_mult)` grid,
 //! reporting per-config latency and recall@10.
 //!
-//! It deliberately skips the 10M build, the Criterion calibration
+//! It deliberately skips the 10M build, the full calibration
 //! sweep, and the cold/warm tier machinery — none of which a
 //! query-path profile needs — so it runs in minutes instead of hours.
 //!

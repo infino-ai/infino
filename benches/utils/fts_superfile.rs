@@ -7,7 +7,7 @@
 //! comparison (`retrievalbench`) also produces — are measured through
 //! the engine-generic harness ([`run_fts::<InfinoFtsEngine>`]), so
 //! infino's own headline numbers and its head-to-head numbers come from
-//! one measurement path, not two. No criterion here.
+//! one measurement path, not two.
 //!
 //! Layered on top are the infino-only extras that have no cross-engine
 //! analogue and stay measured directly:
@@ -39,16 +39,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
 use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
-use infino::test_helpers::default_tokenizer;
 
 use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
-use crate::harness::{BoolMode, EngineFtsResult, FtsQuery, InfinoFtsEngine, QueryStats, run_fts};
+use crate::harness::{
+    BoolMode, EngineFtsResult, FtsQuery, InfinoFtsEngine, QueryStats, run_fts_with_index,
+};
 use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 use crate::rss::{self, RssStats};
@@ -59,7 +57,6 @@ use crate::tiers;
 // Document count is the malleable superfile-test parameter
 // (`corpus::superfile_docs()`, default 1M, env-overridable). Captured
 // once per run into a local `n_docs`.
-const ID_COLUMN: &str = "doc_id";
 const FTS_COLUMN: &str = "title";
 
 /// Top-k for every search.
@@ -189,65 +186,23 @@ const PROBE_SHAPES: &[(&str, &[&str])] = &[
     ),
 ];
 
-// ─── Builder (production SuperfileBuilder) ───────────────────────────
-
-fn supertable_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
-        Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
-    ]))
-}
-
-/// Unified `.parquet` (Parquet body + embedded FTS blob + `inf.*` KV) —
-/// the same single-thread path [`InfinoFtsEngine::write`] takes, so the
-/// bytes built here match what `run_fts` builds and times.
-fn build_superfile_bytes(docs: &MmapTextCorpus) -> Vec<u8> {
-    build_superfile_bytes_range(docs, 0, docs.n_docs(), 0)
-}
-
-fn build_superfile_bytes_range(
-    docs: &MmapTextCorpus,
-    start_doc: usize,
-    len_docs: usize,
-    id_base: usize,
-) -> Vec<u8> {
-    let schema = supertable_schema();
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        ID_COLUMN,
-        vec![FtsConfig {
-            column: FTS_COLUMN.into(),
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    );
-    let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
-    const CHUNK: usize = 65_536;
-    let mut offset = 0;
-    while offset < len_docs {
-        let len = CHUNK.min(len_docs - offset);
-        let global_start = start_doc + offset;
-        let ids: Decimal128Array = ((id_base + offset) as u64..(id_base + offset + len) as u64)
-            .map(|i| Some(i as i128))
-            .collect::<Decimal128Array>()
-            .with_precision_and_scale(38, 0)
-            .expect("decimal128");
-        let titles = LargeStringArray::from(docs.chunk_strs(global_start, len));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
-            .expect("RecordBatch");
-        builder.add_batch(&batch, &[]).expect("add_batch");
-        offset += len;
-    }
-    builder.finish().expect("SuperfileBuilder::finish")
-}
-
 // ─── Correctness (infino-only oracle) ─────────────────────────────────
 
-fn assert_superfile_self_consistent(reader: &SuperfileReader) {
-    let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, "doc0500000", K, InfinoBoolMode::Or))
-        .expect("search df=1");
+fn assert_superfile_self_consistent(reader: &SuperfileReader, n_docs: usize) {
+    let probe_doc_id = n_docs / 2;
+    let probe_token = format!("doc{probe_doc_id:07}");
+    let hits = block_on_inmem(reader.bm25_search(
+        FTS_COLUMN,
+        &probe_token,
+        K,
+        InfinoBoolMode::Or,
+    ))
+    .expect("search df=1");
     assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
-    assert_eq!(hits[0].0, 500_000, "doc0500000 should match doc_id 500000");
+    assert_eq!(
+        hits[0].0 as usize, probe_doc_id,
+        "{probe_token} should match doc_id {probe_doc_id}"
+    );
 
     let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, "term00001", K, InfinoBoolMode::Or))
         .expect("search common");
@@ -453,7 +408,7 @@ pub fn run() {
     // One build at 1 writer (the queryable single superfile) plus a
     // build-throughput probe at N writers — both through the same
     // engine-generic driver the comparison uses.
-    let result = run_fts::<InfinoFtsEngine>(
+    let (result, index) = run_fts_with_index::<InfinoFtsEngine>(
         FTS_COLUMN,
         &docs,
         FTS_BATTERY,
@@ -470,13 +425,12 @@ pub fn run() {
     }
 
     if sel.search {
-        // Correctness gate: build a reader off the same single-thread
-        // bytes and verify BMW == brute-force before trusting timings.
-        eprintln!("[superfile_fts] correctness: building shared superfile for the oracle...");
-        let bytes = build_superfile_bytes(&corpus);
-        let reader = SuperfileReader::open(Bytes::from(bytes.clone())).expect("open superfile");
-        assert_superfile_self_consistent(&reader);
-        let n_bmw = assert_bmw_matches_brute_force(&reader);
+        // Correctness gate on the exact 1-writer artifact measured
+        // above. Do not rebuild another copy for the oracle.
+        eprintln!("[superfile_fts] correctness: using measured 1-writer artifact...");
+        let reader = index.reader();
+        assert_superfile_self_consistent(reader, n_docs);
+        let n_bmw = assert_bmw_matches_brute_force(reader);
         eprintln!(
             "[superfile_fts] correctness OK: self-consistent + {n_bmw} queries BMW==brute-force"
         );
@@ -484,16 +438,17 @@ pub fn run() {
         // Infino-only: per-algorithm probe (WAND+BMW vs MaxScore+BMM).
         let mut probes: Vec<(&'static str, Duration, Duration)> = Vec::new();
         for (shape, terms) in PROBE_SHAPES {
-            let wand = probe_algo_p50(&reader, terms, OrAlgo::WandBmw);
-            let bmm = probe_algo_p50(&reader, terms, OrAlgo::Bmm);
+            let wand = probe_algo_p50(reader, terms, OrAlgo::WandBmw);
+            let bmm = probe_algo_p50(reader, terms, OrAlgo::Bmm);
             probes.push((shape, wand, bmm));
         }
-        drop(reader);
-
         // Cold tier: commit the same bytes to object storage, then read
         // each query through the production cold path.
-        eprintln!("[superfile_fts] committing superfile to object storage for the cold tier...");
-        let committed = tiers::block_on(tiers::commit_superfile(&Bytes::from(bytes)));
+        eprintln!(
+            "[superfile_fts] committing measured 1-writer artifact to object storage for the cold tier..."
+        );
+        let committed =
+            tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(index.bytes())));
         let cold = measure_cold(&committed);
 
         emit_search(&mut report, n_docs, &result, &cold, &probes);

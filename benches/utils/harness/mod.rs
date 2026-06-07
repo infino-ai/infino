@@ -23,9 +23,18 @@
 
 pub mod driver;
 mod infino_engine;
+mod infino_vector_engine;
+pub mod vector_driver;
 
-pub use driver::{BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts};
+pub use driver::{
+    BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
+};
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
+pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
+pub use vector_driver::{
+    EngineVectorResult, VectorBuildStat, VectorMetric, VectorQuery, VectorQueryStats,
+    VectorRunConfig, VectorSearch, run_vector, run_vector_with_index,
+};
 
 // Re-export the shared corpus + byte formatter so a comparison binary
 // has one import root for everything it needs to run `run_fts`.
@@ -62,11 +71,11 @@ pub struct Capabilities {
 
 /// A full-text retrieval engine under comparison.
 ///
-/// `open` → `write` → `read` is the measured lifecycle. `write`
-/// performs the full ingest *and* seals the index so it is ready to
-/// query, so the build/ingest cost is attributed to `write` (not split
-/// across a later first read). The corpus is supplied by the driver, so
-/// every engine indexes byte-identical documents.
+/// `create` → `write` → `read` → `close` → `delete` is the full
+/// lifecycle. `write` performs the ingest *and* seals the index so it is
+/// ready to query, so the build/ingest cost is attributed to `write`
+/// (not split across a later first read). The corpus is supplied by the
+/// driver, so every engine indexes byte-identical documents.
 pub trait FtsEngine {
     /// Sealed, queryable index handle produced by `write`.
     type Index;
@@ -77,8 +86,15 @@ pub trait FtsEngine {
     /// Which modalities this engine implements.
     fn capabilities() -> Capabilities;
 
-    /// Prepare an empty index for a single text column.
-    fn open(column: &str) -> Self::Index;
+    /// Create an empty index/artifact for a single text column.
+    fn create(column: &str) -> Self::Index;
+
+    /// Open/prepare the handle used by the benchmark lifecycle. For
+    /// in-memory engines this usually delegates to [`FtsEngine::create`];
+    /// engines with persisted artifacts can make this distinct.
+    fn open(column: &str) -> Self::Index {
+        Self::create(column)
+    }
 
     /// Ingest all `(doc_id, text)` rows with a single writer and seal
     /// the index ready to `read`. This is the canonical, queryable build
@@ -96,4 +112,64 @@ pub trait FtsEngine {
     /// BM25 top-`k` over already-tokenized `terms`, returning hits
     /// sorted by descending score. The measured query phase.
     fn read(index: &Self::Index, terms: &[&str], k: usize, mode: BoolMode) -> Vec<Hit>;
+
+    /// Close reader/search handles while retaining enough state for
+    /// `delete`. In-memory implementations can drop transient readers.
+    fn close(index: &mut Self::Index);
+
+    /// Delete/cleanup the engine artifact. For in-memory engines this is
+    /// usually just dropping the index; object-backed engines should
+    /// remove temporary files/objects here.
+    fn delete(index: Self::Index);
+}
+
+/// One nearest-neighbor hit returned by a vector engine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorHit {
+    pub doc_id: u64,
+    /// Distance-like score where smaller is better for all metrics after
+    /// engine normalization (`NegDot` returns `-dot`).
+    pub distance: f32,
+}
+
+/// A vector retrieval engine under comparison.
+///
+/// `create` → `write` → `read` → `close` → `delete` is the full vector
+/// lifecycle. `write` builds the canonical 1-writer queryable artifact
+/// and must retain any bytes/handles needed by later correctness, hot
+/// search, and cold upload. `build_at` is the build-throughput-only axis
+/// for `N writers`.
+pub trait VectorEngine {
+    type Index;
+
+    fn name() -> &'static str;
+
+    fn capabilities() -> Capabilities;
+
+    fn create(column: &str, dim: usize, metric: VectorMetric, n_cent: usize) -> Self::Index;
+
+    fn open(column: &str, dim: usize, metric: VectorMetric, n_cent: usize) -> Self::Index {
+        Self::create(column, dim, metric, n_cent)
+    }
+
+    fn write(index: &mut Self::Index, vectors: &[f32]);
+
+    fn build_at(
+        column: &str,
+        vectors: &[f32],
+        dim: usize,
+        metric: VectorMetric,
+        writers: usize,
+    );
+
+    fn read(
+        index: &Self::Index,
+        query: &[f32],
+        k: usize,
+        search: VectorSearch,
+    ) -> Vec<VectorHit>;
+
+    fn close(index: &mut Self::Index);
+
+    fn delete(index: Self::Index);
 }

@@ -7,7 +7,7 @@
 //!
 //! The comparable build + search numbers are measured through the
 //! engine-generic harness (`run_fts::<InfinoFtsEngine>`) — the same path
-//! the cross-engine comparison uses — so there is no criterion here. The
+//! the cross-engine comparison uses. The
 //! infino-only extras (correctness oracle, per-algorithm probe,
 //! rayon-sharded build, cold S3 tier) are layered on top.
 //!

@@ -3,8 +3,8 @@
 
 //! Run-to-run delta tracking + pretty rendering for benches.
 //!
-//! Replaces criterion for our benches. A bench builds [`Section`]s of
-//! [`Block`]s of [`Cell`]s; every metric cell carries its raw comparable
+//! A bench builds [`Section`]s of [`Block`]s of [`Cell`]s; every metric
+//! cell carries its raw comparable
 //! value and a "lower/higher is better" direction. [`Report`]:
 //!
 //!   - persists **every** metric this run produced to one JSON file per
@@ -20,9 +20,9 @@
 //! committed table says what machine produced it.
 //!
 //! Baseline is the machine-local previous run — the edit/build/compare
-//! loop. There is no criterion, no bootstrap statistics: build, RSS, and
-//! cold-tier numbers don't need a hypothesis test, they need "is this
-//! run better or worse than my last one, on every number".
+//! loop. There is no bootstrap-statistics layer: build, RSS, and cold-tier
+//! numbers need "is this run better or worse than my last one, on every
+//! number".
 
 use std::collections::HashMap;
 use std::io::IsTerminal;

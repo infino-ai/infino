@@ -102,7 +102,7 @@ src/
     └── reader_cache/      ← per-process segment cache
 
 tests/                     ← integration tests, bundled by layer in [[test]] stanzas
-benches/                   ← criterion benches, bundled by topic in [[bench]] stanzas
+benches/                   ← custom harness benches, bundled by topic in [[bench]] stanzas
 docs/architecture/         ← canonical design references
 examples/                  ← runnable examples (start with `cargo run --example demo`)
 ```
