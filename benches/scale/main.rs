@@ -14,9 +14,16 @@
 mod vector_recall;
 
 fn main() {
-    let filter = std::env::args().nth(1).unwrap_or_default();
+    // `cargo bench --bench scale` forwards harness flags (e.g. `--bench`)
+    // to this binary; treat anything starting with `-` as not-a-filter so
+    // a bare invocation runs every sub-bench instead of silently matching
+    // nothing. A real filter is the first non-flag arg (e.g. `vector_recall`).
+    let filter = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .unwrap_or_default();
     let run_all = filter.is_empty();
-    let want = |needle: &str| run_all || filter.contains(needle);
+    let want = |needle: &str| run_all || needle.contains(&filter);
 
     if want("vector_recall") {
         eprintln!("[scale] --- vector_recall ---");

@@ -18,4 +18,5 @@ pub mod tiers;
 pub mod fts_superfile;
 pub mod sql_bench;
 pub mod supertable_bench;
+pub mod unified_object_store;
 pub mod vector_superfile;
