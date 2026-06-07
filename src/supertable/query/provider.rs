@@ -348,13 +348,29 @@ impl TableProvider for SupertableProvider {
             .runtime_env()
             .register_object_store(url.as_ref(), mem_store);
 
-        // Tier 2 — DataFusion-owned row-group / page pruning. Hand
-        // the same predicate to ParquetSource as a physical expr;
-        // on any lowering failure we simply skip row-group pruning
-        // (FilterExec above still guarantees correctness).
+        // Tier 2 — DataFusion-owned row-group / page pruning **and
+        // row-level filter pushdown** (late materialization). Hand the
+        // same predicate to ParquetSource as a physical expr; on any
+        // lowering failure we simply skip it (FilterExec above still
+        // guarantees correctness).
+        //
+        // The crucial bit is `with_pushdown_filters(true)`: it turns the
+        // predicate into a Parquet `RowFilter` evaluated *during* decode.
+        // Without it, DataFusion decodes every projected value (e.g. the
+        // whole high-cardinality `title` column) and only then drops
+        // non-matching rows in the `FilterExec` above — pull-up. With it,
+        // the predicate columns are decoded first, a row selection is
+        // built, and the projected payload columns are materialized only
+        // for surviving rows — push-down, touching far fewer bytes. This
+        // is the SQL counterpart to the byte-range discipline the BM25 /
+        // vector paths already follow. `reorder_filters` lets the reader
+        // evaluate cheaper / more selective predicates first.
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
         if let Some(predicate) = row_group_predicate(state, filters, &self.schema) {
-            source = source.with_predicate(predicate);
+            source = source
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .with_reorder_filters(true);
         }
 
         // Only push the LIMIT into the scan when there are no
