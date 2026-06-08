@@ -11,17 +11,17 @@ format is described in [superfile](./superfile.md).
 ## Design
 
 - **Table over segments.** A supertable is a set of immutable superfile
-  segments plus a manifest that defines the current contents of the
-  table.
+segments plus a manifest that defines the current contents of the
+table.
 - **Snapshot reads.** A reader observes a single, consistent snapshot
-  of the table for its entire lifetime, regardless of writes that land
-  afterward.
+of the table for its entire lifetime, regardless of writes that land
+afterward.
 - **Append by commit.** Writes are staged and published as a commit. A
-  commit produces new segments and a new manifest; it never mutates
-  existing segments.
+commit produces new segments and a new manifest; it never mutates
+existing segments.
 - **Pluggable storage.** Segment bytes live behind a storage backend,
-  and the table layer behaves the same way over in-memory, local-disk,
-  and object storage.
+and the table layer behaves the same way over in-memory, local-disk,
+and object storage.
 
 ## Public API
 
@@ -48,46 +48,43 @@ under the column's metric (smaller is closer); a SQL filter leaves it
 unset.
 
 - **Vector search.** k-nearest-neighbor over a vector column for a
-  query vector, returning the `k` closest rows ordered by ascending
-  distance. Per-query recall/latency knobs (number of clusters probed,
-  rerank breadth) are passed as search options.
+query vector, returning the `k` closest rows ordered by ascending
+distance. Per-query recall/latency knobs (number of clusters probed,
+rerank breadth) are passed as search options.
 - **Full-text search.** BM25 over a text column for a query string,
-  returning the `k` highest-scoring rows ordered by descending score.
-  Search options carry the boolean combination mode (match any term or
-  all terms) and default to matching any term.
+returning the `k` highest-scoring rows ordered by descending score.
+Search options carry the boolean combination mode (match any term or
+all terms) and default to matching any term.
 - **Full-text prefix search.** BM25 over a text column where the query
-  is expanded as a term prefix, returning the `k` highest-scoring rows.
+is expanded as a term prefix, returning the `k` highest-scoring rows.
 - **Token match.** The *unranked* counterpart of full-text search:
-  given a token list and a combination mode, return every row whose
-  text contains all the tokens (`And`) or any of them (`Or`). No
-  scoring and no top-k — the score is left unset. This is a set
-  membership question ("which rows match"), not a ranking.
+given a token list and a combination mode, return every row whose
+text contains all the tokens (`And`) or any of them (`Or`). No
+scoring and no top-k — the score is left unset. This is a set
+membership question ("which rows match"), not a ranking.
 - **Exact match.** Given a raw string, return every row whose stored
-  value equals that string exactly. It runs in two passes — a token
-  match prunes candidate rows from the index, then the candidates' text
-  is verified against the raw string — so it never scans the whole
-  column. Tokenization is used only to prune; the match itself is a
-  raw-string comparison. Also unranked.
+value equals that string exactly. It runs in two passes — a token
+match prunes candidate rows from the index, then the candidates' text
+is verified against the raw string — so it never scans the whole
+column. Tokenization is used only to prune; the match itself is a
+raw-string comparison. Also unranked.
 - **SQL.** A SQL query over the table's scalar and full-text columns,
-  returning the matching rows. Search is also reachable from SQL
-  through table-valued functions, so a query can filter, project, join,
-  and order search results alongside scalar columns:
+returning the matching rows. Search is also reachable from SQL
+through table-valued functions, so a query can filter, project, join,
+and order search results alongside scalar columns:
   - `vector_search(column, query, k)` — vector kNN as a relation.
   - `bm25_search(column, query, k)` and
-    `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
+  `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
   - `token_match(column, query, mode)` and `exact_match(column, value)`
-    — the unranked token / exact-match relations. Negation is then a
-    SQL composition over them (e.g. `token_match(..,'rust') EXCEPT
-    token_match(..,'compiler')`), keeping it index-bounded rather than a
-    dedicated `NOT` engine feature.
+  — the unranked token / exact-match relations. Negation is then a
+  SQL composition over them (e.g. `token_match(..,'rust') EXCEPT token_match(..,'compiler')`), keeping it index-bounded rather than a
+  dedicated `NOT` engine feature.
   - `hybrid_search(text_col, q_text, vec_col, q_vec, k)` — BM25 and
-    vector results fused with reciprocal-rank fusion into one `score`.
-
+  vector results fused with reciprocal-rank fusion into one `score`.
   Because each retriever is a relation, hybrid ranking is ordinary SQL
   composition: join or union `vector_search` and `bm25_search` and rank
   by a fusion score. `hybrid_search` packages the most common fusion as
   a single function.
-
   Each function runs against the reader's pinned snapshot and yields
   the table's `_id`, the projected scalar columns, and a `score`. Vector
   columns are never scanned as SQL columns — they live in the segment's
@@ -108,11 +105,11 @@ caller's perspective.
 
 - **Append.** Stage a batch of rows for insertion.
 - **Delete.** Stage the removal of every row matching a predicate. The
-  predicate is resolved against the current snapshot at call time.
+predicate is resolved against the current snapshot at call time.
 - **Update.** Stage a 1:1 replacement of every row matching a
-  predicate with a supplied batch of equal cardinality.
+predicate with a supplied batch of equal cardinality.
 - **Commit.** Flush all staged appends, updates, and deletes,
-  publishing a new snapshot of the table.
+publishing a new snapshot of the table.
 
 ### Lifecycle
 
@@ -143,6 +140,8 @@ flowchart TD
     s3 --> store
 ```
 
+
+
 The manifest is immutable. Each commit builds a successor manifest and
 publishes it atomically; a reader pins the manifest current at the time
 it was created and never observes a partially applied commit.
@@ -156,14 +155,14 @@ reading the segment bytes:
 
 - **Location.** A storage-backend identifier for the segment's bytes.
 - **Row range.** The segment's document count and the range of primary
-  identifiers it covers.
+identifiers it covers.
 - **Scalar statistics.** Per-column minimum and maximum values for the
-  scalar columns, used to skip segments for predicate queries.
+scalar columns, used to skip segments for predicate queries.
 - **Full-text summary.** Per text column, a term presence filter (a
-  bloom filter over the segment's terms) and the lexicographic range of
-  its terms, used to skip segments for term and prefix queries.
+bloom filter over the segment's terms) and the lexicographic range of
+its terms, used to skip segments for term and prefix queries.
 - **Vector summary.** Per vector column, a representative centroid and
-  radius, used to order and route vector queries.
+radius, used to order and route vector queries.
 
 The segment bytes themselves are held by the storage backend, not the
 manifest, so a manifest stays small and cheap to share across many
@@ -185,12 +184,12 @@ parts before touching any per-segment entry.
 Parts load on one of two paths, selected by a threshold on part count:
 
 - **Eager.** For a small number of parts, opening the table
-  parallel-fetches every part up front and exposes the flat union of
-  their entries. This is the path the flat-iteration query APIs use.
+parallel-fetches every part up front and exposes the flat union of
+their entries. This is the path the flat-iteration query APIs use.
 - **Lazy.** Above the threshold, parts are left unloaded and fetched
-  on first access, so opening a large table does not pull every part
-  into memory. Coalesced loading ensures concurrent readers of a cold
-  part share a single fetch.
+on first access, so opening a large table does not pull every part
+into memory. Coalesced loading ensures concurrent readers of a cold
+part share a single fetch.
 
 ## Commit pipeline
 
@@ -198,18 +197,18 @@ A commit turns staged record batches into new segments and a new
 manifest. It runs in the following stages:
 
 - **Stage.** Appended record batches accumulate in a write buffer. A
-  commit consumes the current buffer; a size threshold can also trigger
-  a commit automatically to bound the buffer's footprint.
+commit consumes the current buffer; a size threshold can also trigger
+a commit automatically to bound the buffer's footprint.
 - **Shard.** The buffered rows are partitioned into balanced shards so
-  that segment builds run in parallel, independent of how the caller
-  batched its appends.
+that segment builds run in parallel, independent of how the caller
+batched its appends.
 - **Build.** Each shard is built into one superfile, including its
-  full-text and vector indexes, on a worker pool.
+full-text and vector indexes, on a worker pool.
 - **Summarize.** Each new segment's manifest entry is derived — row
-  range, scalar statistics, and the full-text and vector summaries.
+range, scalar statistics, and the full-text and vector summaries.
 - **Publish.** The segment bytes are written to the storage backend and
-  a successor manifest containing the existing and new entries is
-  published atomically.
+a successor manifest containing the existing and new entries is
+published atomically.
 
 ## Storage
 
@@ -271,11 +270,11 @@ SQL, full-text, and vector search share the same fan-out shape:
 
 1. Start from the reader's pinned manifest.
 2. Use the manifest summaries to skip segments that cannot match the
-   query.
+  query.
 3. Run the per-segment query against each remaining segment in
-   parallel.
+  parallel.
 4. Merge the per-segment results into a single ranked result for the
-   table.
+  table.
 
 Skip pruning reads only the manifest summaries, never the segment
 bytes, and is always conservative: when the manifest cannot prove a
@@ -285,7 +284,7 @@ segment is irrelevant, the segment is kept. The pruning inputs are:
 - **Prefix queries** use each segment's lexicographic term range.
 - **Predicate (SQL) queries** use the per-column scalar statistics.
 - **Vector queries** use the per-column vector summary to order and
-  route work.
+route work.
 
 Pruning can remove work but never a correct result; a kept segment that
 turns out not to match only costs a per-segment query, while a segment
@@ -320,18 +319,19 @@ SQL-level fusion, not a separate engine kernel.
 ## Concurrency
 
 - **Reader/writer isolation.** Reads and writes do not block each
-  other. A reader holds an immutable manifest snapshot; a writer builds
-  new segments and a new manifest independently.
+other. A reader holds an immutable manifest snapshot; a writer builds
+new segments and a new manifest independently.
 - **Atomic publication.** A reader sees either the manifest before a
-  commit or the manifest after it, never an intermediate state.
+commit or the manifest after it, never an intermediate state.
 - **Single writer.** One writer is active per table at a time.
 - **Separate pools.** Query fan-out and segment builds use separate
-  worker pools, so background writes do not starve foreground reads.
+worker pools, so background writes do not starve foreground reads.
 
 ## Scope
 
 - Segments are immutable; updates are expressed by publishing a new
-  manifest over different segments.
+manifest over different segments.
 - One writer is active per table at a time.
 - Full-text and vector search are distinct query paths; combined
-  relevance scoring is left to the caller.
+relevance scoring is left to the caller.
+
