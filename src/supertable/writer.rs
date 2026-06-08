@@ -220,7 +220,53 @@ fn split_buffer_into_row_shards(
     shards
 }
 
+/// The public folded `update` / `delete` buffer exactly one mutation
+/// before committing, so `CommitResult.outcomes` carries exactly one
+/// entry; surface it (or a backend error if, impossibly, none landed).
+fn single_outcome(res: CommitResult) -> Result<MutationStats, crate::Error> {
+    res.outcomes
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Backend("commit produced no mutation outcome".to_string()))
+}
+
 impl Supertable {
+    /// Append one batch of rows and commit — durable when this returns.
+    ///
+    /// Folds the buffered writer + commit into a single call: one
+    /// `append` == one commit == one sealed segment, so callers batch
+    /// rows per call rather than calling once per row.
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), crate::Error> {
+        let mut w = self.writer()?;
+        w.append(batch)?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Replace every row matching `predicate` with `new_rows`, then
+    /// commit. `new_rows.num_rows()` must equal the match count.
+    /// Durable when this returns.
+    pub fn update(
+        &self,
+        predicate: datafusion::prelude::Expr,
+        new_rows: &RecordBatch,
+    ) -> Result<MutationStats, crate::Error> {
+        let mut w = self.writer()?;
+        w.update(predicate, new_rows.clone())?;
+        single_outcome(w.commit()?)
+    }
+
+    /// Tombstone every row matching `predicate`, then commit. Durable
+    /// when this returns.
+    pub fn delete(
+        &self,
+        predicate: datafusion::prelude::Expr,
+    ) -> Result<MutationStats, crate::Error> {
+        let mut w = self.writer()?;
+        w.delete(predicate)?;
+        single_outcome(w.commit()?)
+    }
+
     /// Acquire the single writer for this supertable.
     ///
     /// Returns [`BuildError::SupertableInUse`] if another

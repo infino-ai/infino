@@ -659,6 +659,12 @@ impl Supertable {
         &self.inner.options
     }
 
+    /// The user-facing Arrow schema — the columns the caller supplied.
+    /// The auto-injected `_id` is not part of this schema.
+    pub fn schema(&self) -> arrow_schema::SchemaRef {
+        self.inner.options.user_schema()
+    }
+
     /// Sync→async bridge for the public query surface. Mirrors the
     /// runtime handling in [`Supertable::query_sql`]: when a caller is
     /// already on a `multi_thread` runtime, reuse it via

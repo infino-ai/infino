@@ -57,7 +57,9 @@ pub use manifest::{
     FtsSummary, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsTable, SuperfileEntry,
     SuperfileList, SuperfileUri, VectorSummary,
 };
+pub use mutations::MutationStats;
 pub use options::SupertableOptions;
+pub use query::SearchHit;
 pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
 pub use stats::SupertableStats;
 pub use writer::SupertableWriter;
