@@ -1,10 +1,26 @@
 .PHONY: check test \
         coverage coverage-summary \
-        bench bench-quick miri asan ci clean
+        bench bench-quick miri asan ci clean \
+        public-api public-api-update
 
 check:
 	cargo fmt --check
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+
+# Public-API surface guard. Regenerates the curated public surface and
+# fails if it drifts from the committed `public-api.txt` snapshot. The
+# surface is taken WITHOUT `test-helpers`, so the internal modules — which
+# are `pub` only under that feature — stay off the contract. Any intended
+# surface change must land alongside a `make public-api-update` in the
+# same commit, so the diff is reviewed like any other contract change.
+# Requires the nightly toolchain and `cargo install cargo-public-api`.
+public-api:
+	cargo public-api --simplified > /tmp/infino-public-api.current
+	diff -u public-api.txt /tmp/infino-public-api.current \
+	  || { echo "Public API drifted. Review, then run 'make public-api-update'."; exit 1; }
+
+public-api-update:
+	cargo public-api --simplified > public-api.txt
 
 test:
 	cargo test --features test-helpers

@@ -254,11 +254,12 @@ impl Supertable {
         .map_err(|e| crate::InfinoError::Query(e.to_string()))
     }
 
+    test_visible! {
     /// Segment-local vector hits ([`SuperfileHit`], carrying
     /// `segment` + `local_doc_id`). Internal/positional — used by the
     /// correctness oracles; the public surface is
     /// [`Supertable::vector_search`]. Up to `k`, distance *ascending*.
-    pub fn vector_search_hits(
+    fn vector_search_hits(
         &self,
         column: &str,
         query: &[f32],
@@ -268,6 +269,7 @@ impl Supertable {
         self.ensure_fresh();
         let reader = self.reader();
         self.block_on_query(reader.vector_search(column, query, k, options))
+    }
     }
 }
 

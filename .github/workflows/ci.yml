@@ -45,3 +45,24 @@ jobs:
             cargo install cargo-llvm-cov --locked
           fi
       - run: make ci
+
+  public-api:
+    name: Public API surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-public-api builds rustdoc JSON, which requires nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cargo/bin
+      - name: Install cargo-public-api
+        run: |
+          if ! command -v cargo-public-api &> /dev/null; then
+            cargo install cargo-public-api --locked
+          fi
+      # Fails if the curated public surface drifts from the committed
+      # `public-api.txt` snapshot. The snapshot is taken without
+      # `test-helpers`, so internal modules stay off the contract.
+      - run: make public-api

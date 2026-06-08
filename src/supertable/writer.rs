@@ -266,6 +266,7 @@ impl Supertable {
         single_outcome(w.commit()?)
     }
 
+    test_visible! {
     /// Acquire the single writer for this supertable.
     ///
     /// Returns [`BuildError::SupertableInUse`] if another
@@ -274,7 +275,7 @@ impl Supertable {
     /// active writer slot at a time, enforced atomically; when
     /// the writer is dropped, the slot is released and a
     /// subsequent `writer()` call succeeds.
-    pub fn writer(&self) -> Result<SupertableWriter, BuildError> {
+    fn writer(&self) -> Result<SupertableWriter, BuildError> {
         match self.inner().writer_outstanding.compare_exchange(
             false,
             true,
@@ -290,6 +291,7 @@ impl Supertable {
             }),
             Err(_) => Err(BuildError::SupertableInUse),
         }
+    }
     }
 }
 

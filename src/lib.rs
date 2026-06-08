@@ -36,6 +36,17 @@
 // parameters by design (each captures a distinct stage hand-off).
 // Restructuring into a builder adds boilerplate without clarity.
 #![allow(clippy::too_many_arguments)]
+// In a normal (non-`test-helpers`) build the internal layers (`config`,
+// `storage`, the manifest + WAL + reader-cache stack) are `pub(crate)`,
+// and the curated public surface has no constructor yet — the catalog
+// API that exercises storage/config setup lands in a later milestone.
+// Until then large parts of those layers are legitimately unreferenced,
+// and their test-facing re-exports go unused. Allow that *only* in this
+// build mode: the `test-helpers` build — which CI compiles with
+// `-D warnings` and which runs every test/bench — still exercises those
+// paths, so genuinely dead code (dead even under `test-helpers`) is still
+// caught. Remove this once the public constructor wires the layers in.
+#![cfg_attr(not(feature = "test-helpers"), allow(dead_code, unused_imports))]
 
 // `mimalloc` calls into a C runtime; miri can't execute foreign
 // functions, so we fall back to the system allocator under miri.
@@ -55,15 +66,68 @@ pub const BUILDER_ID: &str = concat!(
     env!("INFINO_GIT_HASH")
 );
 
+/// Visibility shim for items the layer-isolated integration tests and
+/// benches — which are *separate* crates and so can only see `pub`
+/// items — must call, but which are not part of the curated public
+/// surface. Under `test-helpers` the item is `pub` (reachable through
+/// the then-`pub` internal modules); in a normal build it is
+/// `pub(crate)`, so it stays internally callable but off the public
+/// API. The `cargo-public-api` snapshot is generated without
+/// `test-helpers`, so these never enter the public contract.
+macro_rules! test_visible {
+    ($(#[$m:meta])* fn $($rest:tt)*) => {
+        #[cfg(feature = "test-helpers")]
+        $(#[$m])*
+        pub fn $($rest)*
+        #[cfg(not(feature = "test-helpers"))]
+        $(#[$m])*
+        pub(crate) fn $($rest)*
+    };
+}
+
+// Internal layers. `pub` in a `test-helpers` build so the layer-isolated
+// integration tests and benches can reach format/storage internals;
+// `pub(crate)` otherwise, so the curated public surface is exactly the
+// crate-root re-exports below. The `cargo-public-api` snapshot is taken
+// without `test-helpers`, keeping these subtrees off the public contract.
+#[cfg(feature = "test-helpers")]
 pub mod config;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod config;
+
+#[cfg(feature = "test-helpers")]
+pub mod storage;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod storage;
+
+#[cfg(feature = "test-helpers")]
+pub mod superfile;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod superfile;
+
+#[cfg(feature = "test-helpers")]
+pub mod supertable;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod supertable;
+
 mod error;
 mod runtime_bridge;
-pub mod storage;
-pub mod superfile;
-pub mod supertable;
+
+// ---- Curated public surface ----
+//
+// The two-handle catalog API (`Connection`) arrives with the catalog
+// milestone; today the public surface is the single-table `Supertable`
+// handle plus the value types its public methods name.
 
 /// The single public error type for the curated API.
 pub use error::InfinoError;
+/// Value types named by `Supertable`'s public method signatures.
+pub use superfile::VectorSearchOptions;
+pub use superfile::fts::reader::BoolMode;
+/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
+/// / `vector_search` / `schema`.
+pub use supertable::Supertable;
+pub use supertable::{MutationStats, SearchHit};
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)

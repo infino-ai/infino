@@ -71,6 +71,9 @@ impl Supertable {
     /// Sync API. The first call allocates a tokio Runtime
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
+    // Single-table SQL — off the public surface; catalog-level SQL is the
+    // public entry point. Reachable from tests/benches via `test-helpers`.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         // Apply the read-consistency policy before pinning, so SQL
         // honors the same freshness contract as the search APIs

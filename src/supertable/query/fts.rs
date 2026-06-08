@@ -280,11 +280,12 @@ impl Supertable {
         .map_err(|e| crate::InfinoError::Query(e.to_string()))
     }
 
+    test_visible! {
     /// Segment-local BM25 hits ([`SuperfileHit`], carrying
     /// `segment` + `local_doc_id`). Internal/positional — used by the
     /// correctness oracles; the public surface is
     /// [`Supertable::bm25_search`]. Up to `k`, BM25 score *descending*.
-    pub fn bm25_search_hits(
+    fn bm25_search_hits(
         &self,
         column: &str,
         query: &str,
@@ -295,9 +296,12 @@ impl Supertable {
         let reader = self.reader();
         self.block_on_query(reader.bm25_search(column, query, k, mode))
     }
+    }
 
     /// Prefix-expanded BM25 search — see [`Supertable::bm25_search`]
-    /// for the bridge semantics.
+    /// for the bridge semantics. Off the public surface (prefix search is
+    /// reached through SQL); used by tests/benches via `test-helpers`.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn bm25_search_prefix(
         &self,
         column: &str,
