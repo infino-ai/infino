@@ -141,7 +141,11 @@ fn chunk_batch(rows: &[(u64, &str)]) -> RecordBatch {
             .map(|&(id, _)| CATEGORIES[(id as usize) % CATEGORIES.len()])
             .collect::<Vec<_>>(),
     );
-    let ratings = Int64Array::from(rows.iter().map(|&(id, _)| (id % 100) as i64).collect::<Vec<_>>());
+    let ratings = Int64Array::from(
+        rows.iter()
+            .map(|&(id, _)| (id % 100) as i64)
+            .collect::<Vec<_>>(),
+    );
     RecordBatch::try_new(
         baseline_schema(),
         vec![Arc::new(titles), Arc::new(categories), Arc::new(ratings)],
@@ -382,14 +386,15 @@ pub fn run() {
 
         // 3. DataFusion MemTable over the already-decoded Arrow batches.
         let (mem_p50, mem_mean, mem_rows) = {
-            let provider = MemTable::try_new(baseline_schema(), vec![batches.clone()])
-                .expect("memtable");
+            let provider =
+                MemTable::try_new(baseline_schema(), vec![batches.clone()]).expect("memtable");
             let provider = Arc::new(provider);
             let mut samples = Vec::with_capacity(iters);
             // warm
             let mut rows = rt.block_on(async {
                 let ctx = SessionContext::new();
-                ctx.register_table(TABLE, provider.clone()).expect("register");
+                ctx.register_table(TABLE, provider.clone())
+                    .expect("register");
                 let df = ctx.sql(shape.sql).await.expect("mem sql");
                 count_rows(&df.collect().await.expect("mem collect"))
             });
@@ -397,7 +402,8 @@ pub fn run() {
                 let t = Instant::now();
                 let got = rt.block_on(async {
                     let ctx = SessionContext::new();
-                    ctx.register_table(TABLE, provider.clone()).expect("register");
+                    ctx.register_table(TABLE, provider.clone())
+                        .expect("register");
                     let df = ctx.sql(shape.sql).await.expect("mem sql");
                     count_rows(&df.collect().await.expect("mem collect"))
                 });
@@ -418,10 +424,26 @@ pub fn run() {
             time_path(iters, || raw_decode(&segments, shape.raw_cols, shape.keep));
 
         // Sanity: every path must agree on the result-set size.
-        assert_eq!(full_rows, df_rows, "{}: query_sql vs decomp rows", shape.name);
-        assert_eq!(full_rows, dfq_rows, "{}: query_sql vs df-parquet rows", shape.name);
-        assert_eq!(full_rows, mem_rows, "{}: query_sql vs memtable rows", shape.name);
-        assert_eq!(full_rows, raw_rows, "{}: query_sql vs raw-decode rows", shape.name);
+        assert_eq!(
+            full_rows, df_rows,
+            "{}: query_sql vs decomp rows",
+            shape.name
+        );
+        assert_eq!(
+            full_rows, dfq_rows,
+            "{}: query_sql vs df-parquet rows",
+            shape.name
+        );
+        assert_eq!(
+            full_rows, mem_rows,
+            "{}: query_sql vs memtable rows",
+            shape.name
+        );
+        assert_eq!(
+            full_rows, raw_rows,
+            "{}: query_sql vs raw-decode rows",
+            shape.name
+        );
 
         eprintln!(
             "[sql-diag] {:<16} {} {} {} {} {}   {}",
@@ -444,7 +466,9 @@ pub fn run() {
         );
         eprintln!(
             "[sql-diag] {:<16} raw parquet-rs decode floor: p50 {} / mean {}",
-            "", fmt(raw_p50), fmt(raw_mean),
+            "",
+            fmt(raw_p50),
+            fmt(raw_mean),
         );
         eprintln!();
     }

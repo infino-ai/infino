@@ -373,7 +373,10 @@ mod tests {
 
     #[test]
     fn eq_on_non_fts_column_is_unbounded() {
-        assert_eq!(plan(col("category").eq(lit("rust"))), CandidatePlan::Unbounded);
+        assert_eq!(
+            plan(col("category").eq(lit("rust"))),
+            CandidatePlan::Unbounded
+        );
     }
 
     #[test]
@@ -388,7 +391,11 @@ mod tests {
 
     #[test]
     fn and_of_fts_and_non_fts_keeps_only_fts_branch() {
-        let p = plan(col("title").eq(lit("rust")).and(col("category").eq(lit("lang"))));
+        let p = plan(
+            col("title")
+                .eq(lit("rust"))
+                .and(col("category").eq(lit("lang"))),
+        );
         assert_eq!(
             p,
             CandidatePlan::TermsAll {
@@ -400,7 +407,11 @@ mod tests {
 
     #[test]
     fn and_of_two_fts_equalities_intersects() {
-        let p = plan(col("title").eq(lit("rust")).and(col("title").eq(lit("async"))));
+        let p = plan(
+            col("title")
+                .eq(lit("rust"))
+                .and(col("title").eq(lit("async"))),
+        );
         match p {
             CandidatePlan::And(children) => assert_eq!(children.len(), 2),
             other => panic!("expected And, got {other:?}"),
@@ -409,7 +420,11 @@ mod tests {
 
     #[test]
     fn or_of_two_fts_equalities_unions() {
-        let p = plan(col("title").eq(lit("rust")).or(col("title").eq(lit("python"))));
+        let p = plan(
+            col("title")
+                .eq(lit("rust"))
+                .or(col("title").eq(lit("python"))),
+        );
         match p {
             CandidatePlan::Or(children) => assert_eq!(children.len(), 2),
             other => panic!("expected Or, got {other:?}"),
@@ -418,19 +433,29 @@ mod tests {
 
     #[test]
     fn or_with_non_fts_branch_is_unbounded() {
-        let p = plan(col("title").eq(lit("rust")).or(col("category").eq(lit("lang"))));
+        let p = plan(
+            col("title")
+                .eq(lit("rust"))
+                .or(col("category").eq(lit("lang"))),
+        );
         assert_eq!(p, CandidatePlan::Unbounded);
     }
 
     #[test]
     fn not_is_unbounded() {
-        assert_eq!(plan(!col("title").eq(lit("rust"))), CandidatePlan::Unbounded);
+        assert_eq!(
+            plan(!col("title").eq(lit("rust"))),
+            CandidatePlan::Unbounded
+        );
     }
 
     #[test]
     fn not_eq_is_unbounded() {
         // `title != 'rust'` (Operator::NotEq) can't be term-bounded.
-        assert_eq!(plan(col("title").not_eq(lit("rust"))), CandidatePlan::Unbounded);
+        assert_eq!(
+            plan(col("title").not_eq(lit("rust"))),
+            CandidatePlan::Unbounded
+        );
     }
 
     #[test]
@@ -438,7 +463,11 @@ mod tests {
         // `title = 'rust' AND NOT (title = 'compiler')` — the NOT branch
         // is un-boundable and drops out of candidate generation (verified
         // in pass 2), so candidates still come from the FTS branch.
-        let p = plan(col("title").eq(lit("rust")).and(!col("title").eq(lit("compiler"))));
+        let p = plan(
+            col("title")
+                .eq(lit("rust"))
+                .and(!col("title").eq(lit("compiler"))),
+        );
         assert_eq!(
             p,
             CandidatePlan::TermsAll {
@@ -450,7 +479,10 @@ mod tests {
 
     #[test]
     fn like_is_unbounded() {
-        assert_eq!(plan(col("title").like(lit("rust%"))), CandidatePlan::Unbounded);
+        assert_eq!(
+            plan(col("title").like(lit("rust%"))),
+            CandidatePlan::Unbounded
+        );
     }
 
     #[test]

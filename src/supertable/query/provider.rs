@@ -369,8 +369,8 @@ impl TableProvider for SupertableProvider {
                 .estimate(reader.as_ref())
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let gate = ((reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64)
-                .max(PUSHDOWN_MIN_ROWS);
+            let gate =
+                ((reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64).max(PUSHDOWN_MIN_ROWS);
             let candidates = if est > gate {
                 None
             } else {
@@ -449,8 +449,7 @@ impl TableProvider for SupertableProvider {
             crate::supertable::query::candidate::CandidatePlan::Unbounded
         );
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        if !index_bounded
-            && let Some(predicate) = row_group_predicate(state, filters, &self.schema)
+        if !index_bounded && let Some(predicate) = row_group_predicate(state, filters, &self.schema)
         {
             source = source
                 .with_predicate(predicate)
@@ -567,7 +566,10 @@ fn tombstone_access_plan(
 /// Parquet body — which partition contiguously across row groups laid
 /// out in append order. An empty `keep` produces an all-skip plan (zero
 /// rows decoded), the correct result for a segment with no candidate.
-fn selection_access_plan(parquet_bytes: &Bytes, keep: &RoaringBitmap) -> DfResult<ParquetAccessPlan> {
+fn selection_access_plan(
+    parquet_bytes: &Bytes,
+    keep: &RoaringBitmap,
+) -> DfResult<ParquetAccessPlan> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
         .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
     let row_groups = builder.metadata().row_groups();

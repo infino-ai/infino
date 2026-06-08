@@ -167,8 +167,10 @@ fn build_supertable(rows: &[SqlRow<'_>]) -> Supertable {
             LargeStringArray::from(chunk.iter().map(|r| r.title).collect::<Vec<_>>());
         // 10-bucket label by `doc_id % 10`; identical values in the
         // indexed and non-indexed copies.
-        let bucket_vals: Vec<String> =
-            chunk.iter().map(|r| format!("b{}", r.doc_id % 10)).collect();
+        let bucket_vals: Vec<String> = chunk
+            .iter()
+            .map(|r| format!("b{}", r.doc_id % 10))
+            .collect();
         let buckets =
             LargeStringArray::from(bucket_vals.iter().map(String::as_str).collect::<Vec<_>>());
         let buckets_noidx =

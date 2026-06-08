@@ -269,7 +269,10 @@ impl MatchExec {
     fn describe(&self) -> String {
         match &self.query {
             MatchQuery::Token { mode, .. } => {
-                format!("MatchExec: kind=token, column={}, mode={:?}", self.column, mode)
+                format!(
+                    "MatchExec: kind=token, column={}, mode={:?}",
+                    self.column, mode
+                )
             }
             MatchQuery::Exact { .. } => {
                 format!("MatchExec: kind=exact, column={}", self.column)
@@ -450,13 +453,13 @@ mod tests {
             1
         );
         assert_eq!(
-            rows(&st, "SELECT _id FROM exact_match('title', 'rust async runtime')"),
+            rows(
+                &st,
+                "SELECT _id FROM exact_match('title', 'rust async runtime')"
+            ),
             1
         );
-        assert_eq!(
-            rows(&st, "SELECT _id FROM exact_match('title', 'rust')"),
-            0
-        );
+        assert_eq!(rows(&st, "SELECT _id FROM exact_match('title', 'rust')"), 0);
     }
 
     #[test]
@@ -475,11 +478,13 @@ mod tests {
     fn match_tvf_arity_errors() {
         let st = demo();
         assert!(
-            st.query_sql("SELECT _id FROM token_match('title')").is_err(),
+            st.query_sql("SELECT _id FROM token_match('title')")
+                .is_err(),
             "token_match needs >= 2 args"
         );
         assert!(
-            st.query_sql("SELECT _id FROM exact_match('title')").is_err(),
+            st.query_sql("SELECT _id FROM exact_match('title')")
+                .is_err(),
             "exact_match needs 2 args"
         );
     }
@@ -488,7 +493,11 @@ mod tests {
     fn public_methods_agree_with_tvfs() {
         let st = demo();
         let method = st
-            .token_match("title", "rust systems", crate::superfile::fts::reader::BoolMode::And)
+            .token_match(
+                "title",
+                "rust systems",
+                crate::superfile::fts::reader::BoolMode::And,
+            )
             .expect("token_match");
         assert_eq!(method.len(), 1);
         let exact = st.exact_match("title", "go routines").expect("exact_match");

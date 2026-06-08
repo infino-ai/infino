@@ -633,7 +633,10 @@ mod tests {
         );
         // `!=` (NotEq) likewise.
         assert_eq!(
-            run_count(&st, "SELECT COUNT(*) FROM supertable WHERE title != 'alpha'"),
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title != 'alpha'"
+            ),
             2,
         );
         // `= AND !=`: candidates from the `title='alpha'` branch (2 rows),

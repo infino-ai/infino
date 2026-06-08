@@ -279,7 +279,9 @@ pub fn run() {
     // many-matches case where matches saturate every page so no page can
     // be skipped and the index can't win (it just adds overhead — this is
     // the case a selectivity gate must catch ahead of time).
-    eprintln!("[sql] measuring aggregate shapes over a candidate set: DataFusion only vs token_match...");
+    eprintln!(
+        "[sql] measuring aggregate shapes over a candidate set: DataFusion only vs token_match..."
+    );
     const BUCKET_IN_ALL: &str = "('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9')";
     let agg_scan = vec![
         timed_tvf(
@@ -305,7 +307,9 @@ pub fn run() {
         timed_tvf(
             &index,
             "SUM(rating) bucket IN all (1M rows)",
-            &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket_noidx IN {BUCKET_IN_ALL}"),
+            &format!(
+                "SELECT SUM(rating) AS a FROM supertable WHERE bucket_noidx IN {BUCKET_IN_ALL}"
+            ),
         ),
     ];
     let agg_idx = vec![
@@ -472,8 +476,9 @@ fn emit_query(
             .collect()
     };
     let scalar = Block {
-        subtitle: "Aggregations & count-filters (read + compute, return few rows — not the index A/B)"
-            .into(),
+        subtitle:
+            "Aggregations & count-filters (read + compute, return few rows — not the index A/B)"
+                .into(),
         headers: query_headers(),
         rows: result
             .queries
@@ -492,14 +497,16 @@ fn emit_query(
     // The honest A/B: same selective equality (1 matching row), no index
     // vs FTS index. Two blocks so the labels are unmistakable.
     let plain = Block {
-        subtitle: "Plain Scan (DataFusion only) — selective equality, 1 row (sorted vs unsorted col)"
-            .into(),
+        subtitle:
+            "Plain Scan (DataFusion only) — selective equality, 1 row (sorted vs unsorted col)"
+                .into(),
         headers: query_headers(),
         rows: to_rows(plain_scan),
     };
     let pushdown = Block {
-        subtitle: "FTS-pushdown (DataFusion + Infino) — SAME equality, 1 row (sorted vs unsorted col)"
-            .into(),
+        subtitle:
+            "FTS-pushdown (DataFusion + Infino) — SAME equality, 1 row (sorted vs unsorted col)"
+                .into(),
         headers: query_headers(),
         rows: to_rows(fts_pushdown),
     };
