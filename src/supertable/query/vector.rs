@@ -5,7 +5,7 @@
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
 //! let hits: Vec<SuperfileHit> =
-//!     supertable.vector_search("emb", &query_vec, 10, opts)?;
+//!     supertable.reader().vector_search("emb", &query_vec, 10, opts)?;
 //! ```
 //!
 //! Returns [`SuperfileHit`]s sorted by distance *ascending* —
@@ -58,7 +58,7 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
+use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileEntry;
 
 use super::SuperfileHit;
@@ -87,9 +87,9 @@ impl SupertableReader {
     /// to an empty `Vec`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`Supertable::vector_search`], which drives this via the
-    /// sync→async bridge after applying the read-consistency policy.
-    pub(crate) async fn vector_search(
+    /// [`SupertableReader::vector_search`], which drives this via the
+    /// sync→async bridge.
+    pub(crate) async fn vector_search_async(
         &self,
         column: &str,
         query: &[f32],
@@ -228,13 +228,13 @@ impl SupertableReader {
     }
 }
 
-impl Supertable {
-    /// Single-column vector kNN search over the current snapshot.
+impl SupertableReader {
+    /// Single-column vector kNN search over this reader's pinned
+    /// snapshot.
     ///
-    /// Pins a reader at call entry, applies the read-consistency
-    /// policy, and drives the internal async kernel to completion
-    /// via the sync→async bridge ([`Supertable::block_on_query`]).
-    /// Returns up to `k` hits sorted by distance *ascending*.
+    /// Drives the internal async kernel to completion via the
+    /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
+    /// to `k` hits sorted by distance *ascending*.
     pub fn vector_search(
         &self,
         column: &str,
@@ -242,9 +242,7 @@ impl Supertable {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.vector_search(column, query, k, options))
+        self.block_on(self.vector_search_async(column, query, k, options))
     }
 }
 
@@ -447,7 +445,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .vector_search_async("emb", &q, 5, VectorSearchOptions::new())
             .await
             .expect("query");
         assert!(hits.is_empty());
@@ -463,7 +461,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_search("emb", &q, 0, VectorSearchOptions::new())
+            .vector_search_async("emb", &q, 0, VectorSearchOptions::new())
             .await
             .expect("query");
         assert!(hits.is_empty());
@@ -484,7 +482,7 @@ mod tests {
             *x = (d as f32) / 100.0 + 0.001;
         }
         let hits = r
-            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .vector_search_async("emb", &q, 5, VectorSearchOptions::new())
             .await
             .expect("query");
         assert!(!hits.is_empty());
@@ -513,7 +511,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_search("emb", &q, 7, VectorSearchOptions::new())
+            .vector_search_async("emb", &q, 7, VectorSearchOptions::new())
             .await
             .expect("query");
         assert_eq!(hits.len(), 7);
@@ -545,7 +543,7 @@ mod tests {
         let opts = VectorSearchOptions::new().with_nprobe(1);
         let hits = st
             .reader()
-            .vector_search("emb", &q, 10, opts)
+            .vector_search_async("emb", &q, 10, opts)
             .await
             .expect("query");
 
@@ -571,7 +569,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_search("emb", &q, 24, VectorSearchOptions::new())
+            .vector_search_async("emb", &q, 24, VectorSearchOptions::new())
             .await
             .expect("query");
         let segment_uris: std::collections::HashSet<_> = hits.iter().map(|h| h.segment).collect();
@@ -619,7 +617,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .vector_search("emb", &q, 2, opts)
+            .vector_search_async("emb", &q, 2, opts)
             .await
             .expect("supertable query");
         let manifest = st_reader.manifest();
@@ -649,7 +647,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let err = r
-            .vector_search("nope", &q, 5, VectorSearchOptions::new())
+            .vector_search_async("nope", &q, 5, VectorSearchOptions::new())
             .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");

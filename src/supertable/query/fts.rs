@@ -4,10 +4,10 @@
 //!
 //! ```ignore
 //! let hits: Vec<SuperfileHit> =
-//!     supertable.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+//!     supertable.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
 //!
 //! let prefix_hits: Vec<SuperfileHit> =
-//!     supertable.bm25_search_prefix("title", "rus", 10)?;
+//!     supertable.reader().bm25_search_prefix("title", "rus", 10)?;
 //! ```
 //!
 //! Both methods return [`SuperfileHit`]s sorted by score *descending*
@@ -60,7 +60,7 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
+use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
 use super::SuperfileHit;
@@ -80,11 +80,11 @@ impl SupertableReader {
     /// without consulting the store.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`Supertable::bm25_search`], which drives this via the
-    /// sync→async bridge after applying the read-consistency policy.
+    /// [`SupertableReader::bm25_search`], which drives this via the
+    /// sync→async bridge.
     ///
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
-    pub(crate) async fn bm25_search(
+    pub(crate) async fn bm25_search_async(
         &self,
         column: &str,
         query: &str,
@@ -180,8 +180,8 @@ impl SupertableReader {
     /// to an empty `Vec`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`Supertable::bm25_search_prefix`].
-    pub(crate) async fn bm25_search_prefix(
+    /// [`SupertableReader::bm25_search_prefix`].
+    pub(crate) async fn bm25_search_prefix_async(
         &self,
         column: &str,
         prefix: &str,
@@ -253,13 +253,12 @@ impl SupertableReader {
     }
 }
 
-impl Supertable {
-    /// Single-column BM25 search over the current snapshot.
+impl SupertableReader {
+    /// Single-column BM25 search over this reader's pinned snapshot.
     ///
-    /// Pins a reader at call entry, applies the read-consistency
-    /// policy, and drives the internal async kernel to completion
-    /// via the sync→async bridge ([`Supertable::block_on_query`]).
-    /// Returns up to `k` hits sorted by BM25 score *descending*.
+    /// Drives the internal async kernel to completion via the
+    /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
+    /// to `k` hits sorted by BM25 score *descending*.
     pub fn bm25_search(
         &self,
         column: &str,
@@ -267,12 +266,10 @@ impl Supertable {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.bm25_search(column, query, k, mode))
+        self.block_on(self.bm25_search_async(column, query, k, mode))
     }
 
-    /// Prefix-expanded BM25 search — see [`Supertable::bm25_search`]
+    /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
     /// for the bridge semantics.
     pub fn bm25_search_prefix(
         &self,
@@ -280,9 +277,7 @@ impl Supertable {
         prefix: &str,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.bm25_search_prefix(column, prefix, k))
+        self.block_on(self.bm25_search_prefix_async(column, prefix, k))
     }
 }
 
@@ -519,7 +514,7 @@ mod tests {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_search_async("title", "rust", 5, BoolMode::Or)
             .await
             .expect("query");
         assert!(hits.is_empty());
@@ -533,7 +528,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 0, BoolMode::Or)
+            .bm25_search_async("title", "rust", 0, BoolMode::Or)
             .await
             .expect("query");
         assert!(hits.is_empty());
@@ -556,7 +551,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 4, BoolMode::Or)
+            .bm25_search_async("title", "rust", 4, BoolMode::Or)
             .await
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
@@ -579,7 +574,7 @@ mod tests {
         let r = st.reader();
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_search_async("title", "rust", 5, BoolMode::Or)
             .await
             .expect("query");
         assert_eq!(hits.len(), 2);
@@ -643,7 +638,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .bm25_search("title", "nimblefox", 5, BoolMode::Or)
+            .bm25_search_async("title", "nimblefox", 5, BoolMode::Or)
             .await
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
@@ -696,7 +691,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .bm25_search_prefix("title", "rust", 5)
+            .bm25_search_prefix_async("title", "rust", 5)
             .await
             .expect("supertable query");
         let manifest = st_reader.manifest();
@@ -727,7 +722,7 @@ mod tests {
 
         let r = st.reader();
         let hits = r
-            .bm25_search_prefix("title", "zzzz", 10)
+            .bm25_search_prefix_async("title", "zzzz", 10)
             .await
             .expect("query");
         assert!(hits.is_empty());
@@ -746,7 +741,7 @@ mod tests {
 
         let r = st.reader();
         let hits = r
-            .bm25_search_prefix("title", "RUST", 5)
+            .bm25_search_prefix_async("title", "RUST", 5)
             .await
             .expect("query");
         assert_eq!(hits.len(), 1);
@@ -761,7 +756,7 @@ mod tests {
 
         let r = st.reader();
         let err = r
-            .bm25_search("missing_column", "rust", 5, BoolMode::Or)
+            .bm25_search_async("missing_column", "rust", 5, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
@@ -779,7 +774,7 @@ mod tests {
         }
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 2, BoolMode::Or)
+            .bm25_search_async("title", "rust", 2, BoolMode::Or)
             .await
             .expect("query");
         assert_eq!(hits.len(), 2);
