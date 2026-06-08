@@ -54,7 +54,7 @@ use crate::supertable::wal::state_doc::WalId;
 ///
 /// The public surface is the three count accessors (`matched`,
 /// `n_tombstoned`, `n_not_found`); the recovery-only `wal_id` stays
-/// `pub(crate)` so [`WalId`] never enters the public API.
+/// `pub(crate)`, so it never enters the public API.
 /// `#[non_exhaustive]` keeps the type open to growth.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]

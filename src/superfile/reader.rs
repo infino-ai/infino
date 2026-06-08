@@ -899,10 +899,10 @@ impl SuperfileReader {
     }
 }
 
-/// Tuning knobs for [`SuperfileReader::vector_search`]. Defaults
-/// are picked so a caller who hasn't profiled the recall-vs-latency
-/// tradeoff still gets recall in the 0.9+ range on typical IVF
-/// setups.
+/// Tuning knobs for vector search (`Supertable::vector_search`).
+/// Defaults are picked so a caller who hasn't profiled the
+/// recall-vs-latency tradeoff still gets recall in the 0.9+ range on
+/// typical IVF setups.
 ///
 /// - `nprobe`: number of IVF clusters to scan. Higher = better recall,
 ///   slower. Default `8`, internally clamped to `[1, n_cent]`. For a

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! infino — search-optimized lakehouse format.
-//!
-//! A superfile is a valid Apache Parquet file with embedded BM25 + vector
-//! indexes. The Parquet portion is readable by vanilla DataFusion / DuckDB
-//! / pyarrow; the embedded blobs are accessible via [`SuperfileReader`].
-
+// The crate-level docs ARE the project README, so the Rust quick example
+// runs as a `cargo test --doc` doctest and can't drift from the API.
+#![doc = include_str!("../README.md")]
 // `coverage_nightly` is set by `cargo +nightly llvm-cov`. Under it we opt
 // into `#[coverage(off)]` annotations on stable-uncoverable error paths
 // (OOM handlers, overflow guards). On stable the feature flag is inert

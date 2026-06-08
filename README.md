@@ -17,44 +17,89 @@ and as a search index by infino's reader.
   commit/publish path, pluggable storage, query fan-out with
   manifest-only skip pruning, and reader/writer concurrency.
 
-## Quick example
+## Quick example in Rust
 
-A table has a full-text column (`title`) and a vector column
-(`embedding`). You append Arrow record batches, commit to seal a
-segment, then query it four ways — keyword, vector, SQL, or hybrid:
+Open a connection, create a table with a full-text index, append rows,
+then search — by keyword or with SQL across the catalog. The backend is
+chosen by the URI scheme (`memory://`, a local path, `s3://…`, `az://…`).
 
 ```rust
-use infino::supertable::Supertable;
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::VectorSearchOptions;
+use std::sync::Arc;
 
-let table = Supertable::create(options)?;     // schema + options: see examples/demo.rs
+use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, BoolMode, IndexSpec};
 
-// Ingest: append record batches, commit to publish an immutable segment.
-let mut writer = table.writer()?;
-writer.append(&batch)?;                        // columns: title (text) + embedding (vector)
-writer.commit()?;
+let db = connect("memory://")?; // or "./data", "s3://bucket/prefix"
 
-// Keyword search (BM25):
-let hits = table.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+let schema = Arc::new(Schema::new(vec![Field::new("title", DataType::LargeUtf8, false)]));
+let docs = db.create_table("docs", schema.clone(), IndexSpec::new().fts("title"))?;
 
-// Vector search (k-NN):
-let knn = table.vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
-
-// SQL (DataFusion under the hood; every segment is also valid Parquet):
-let rows = table.query_sql("SELECT _id, title FROM bm25_search('title', 'rust async', 10)")?;
-
-// Hybrid — keyword + vector fused in one query (reciprocal-rank fusion):
-let fused = table.query_sql(
-    "SELECT _id, title, score \
-     FROM hybrid_search('title', 'rust async', 'embedding', '<query vector>', 10)",
+// One `append` == one commit == one sealed, immutable segment.
+let batch = RecordBatch::try_new(
+    schema,
+    vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))],
 )?;
+docs.append(&batch)?;
+
+// Keyword search (BM25): hits carry the auto-injected `_id` + score.
+let hits = docs.bm25_search("title", "fox", 10, BoolMode::Or)?;
+assert_eq!(hits.len(), 1);
+
+// SQL across the catalog — every segment is also a valid Parquet file.
+let rows = db.query_sql("SELECT _id, title FROM docs")?;
+assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-A complete, runnable version (schema, options, building a vector
-`RecordBatch`, reading segments back as plain Parquet) is in
-[`examples/demo.rs`](examples/demo.rs) — run it with
-`cargo run --example demo`.
+Vector search is the same shape: declare a vector column with
+`IndexSpec::new().vector("embedding", 384, 256, infino::Metric::Cosine)`
+and call `vector_search`. SQL-native search — the `bm25_search` /
+`vector_search` / `hybrid_search` table functions — composes with joins
+and aggregations across catalog tables.
+
+## Quick example in Python
+
+```python
+import infino
+import pyarrow as pa
+
+db = infino.connect("memory://")              # or "./data", "s3://bucket/prefix"
+schema = pa.schema([("title", pa.large_utf8())])
+docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
+
+docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
+
+hits = docs.bm25_search("title", "fox", 10)         # [{"_id": ..., "score": ...}]
+rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
+```
+
+The Python bindings (PyO3 + maturin) live in
+[`infino-python/`](infino-python/) — see its README to build and test.
+
+## Stability
+
+The public API is what's re-exported from the crate root — `connect` /
+`connect_with`, `Connection`, `Supertable`, `IndexSpec`, `InfinoError`,
+and the value types their signatures name. It is pinned by a
+`cargo-public-api` snapshot (`public-api.txt`); any change to it is
+reviewed as a contract change in the same pull request.
+
+- **Versioning.** 0.x while the surface soaks; 1.0 once it has shipped
+  without churn for a release or two. Pre-1.0 may break, but every break
+  shows in the snapshot diff and is called out in the release notes.
+- **`#[non_exhaustive]`** on growable public enums/structs (e.g.
+  `InfinoError`, `MutationStats`), so adding a variant or field is not a
+  breaking change.
+- **Arrow / DataFusion are part of the contract.** The API is
+  Arrow-native (`RecordBatch`, `SchemaRef`, `Expr`); a major bump of
+  arrow / datafusion that changes an exposed type is a breaking change to
+  infino. The supported version range is documented and CI-tested.
+- **MSRV.** Raising the minimum Rust version is a minor bump, never a
+  patch.
+- **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
+  least one minor release first.
+- **Python.** The wheel tracks the crate version 1:1.
 
 ## Development
 

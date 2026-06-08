@@ -67,12 +67,11 @@ pub struct SuperfileHit {
 
 /// A public search hit: the stable public `_id` plus the score.
 ///
-/// `id` is the supertable's auto-injected `_id`, **not** the internal,
-/// segment-local `local_doc_id` of [`SuperfileHit`]. Returned by the
-/// public `Supertable::bm25_search` / `Supertable::vector_search`,
-/// best-scoring first. Score direction is method-dependent — same
-/// convention as [`SuperfileHit::score`] (BM25 higher-is-better;
-/// vector distance smaller-is-better).
+/// `id` is the supertable's auto-injected `_id`, **not** an internal,
+/// segment-local row offset. Returned by the public
+/// `Supertable::bm25_search` / `Supertable::vector_search`,
+/// best-scoring first. Score direction is method-dependent: BM25 is
+/// higher-is-better; vector distance is smaller-is-better.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchHit {
     /// The row's public `_id`.

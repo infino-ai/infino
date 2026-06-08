@@ -1,4 +1,4 @@
-.PHONY: check test \
+.PHONY: check test doctest \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update
@@ -88,8 +88,14 @@ asan:
 	cargo +nightly test --lib \
 	  --target $$(rustc -vV | sed -n 's|host: ||p') superfile::fts
 
+# Doctests — runs the README quick example (the crate doc via
+# `include_str!`) and any rustdoc examples. No `test-helpers`, so it
+# exercises the same curated public API a downstream user sees.
+doctest:
+	cargo test --doc
+
 # Local "pre-PR" check — same gates CI runs
-ci: check coverage
+ci: check doctest coverage
 	@echo "✓ ready to PR"
 
 clean:
