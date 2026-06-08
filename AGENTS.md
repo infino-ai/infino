@@ -147,7 +147,7 @@ tests/                     ← integration tests; the two main binaries
                              in [[test]] stanzas, plus a few standalone
                              top-level test files (e.g. the crash /
                              concurrent-process tests)
-benches/                   ← criterion benches, bundled by topic in [[bench]] stanzas
+benches/                   ← custom harness benches, bundled by topic in [[bench]] stanzas
 docs/architecture/         ← canonical design references
 examples/                  ← runnable examples (start with `cargo run --example demo`)
 ```

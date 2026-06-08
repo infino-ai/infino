@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Vector superfile bench bundle (infino-only). Supertable vector
-//! benches live in `benches/supertable/main.rs`, where they share one
-//! combined 10M-row supertable with the FTS supertable benches.
-//!
-//! Infino-only timing and correctness — no third-party crates in
-//! the dependency graph of these benches.
+//! Vector superfile bench bundle (infino-only). Uses Infino's custom
+//! benchmark harness directly.
 //!
 //! ## Invocation
 //!
@@ -19,4 +15,6 @@
 
 use infino_bench_utils::vector_superfile;
 
-criterion::criterion_main!(vector_superfile::benches);
+fn main() {
+    vector_superfile::run();
+}
