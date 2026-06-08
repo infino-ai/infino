@@ -57,6 +57,17 @@ unset.
   all terms) and default to matching any term.
 - **Full-text prefix search.** BM25 over a text column where the query
   is expanded as a term prefix, returning the `k` highest-scoring rows.
+- **Token match.** The *unranked* counterpart of full-text search:
+  given a token list and a combination mode, return every row whose
+  text contains all the tokens (`And`) or any of them (`Or`). No
+  scoring and no top-k — the score is left unset. This is a set
+  membership question ("which rows match"), not a ranking.
+- **Exact match.** Given a raw string, return every row whose stored
+  value equals that string exactly. It runs in two passes — a token
+  match prunes candidate rows from the index, then the candidates' text
+  is verified against the raw string — so it never scans the whole
+  column. Tokenization is used only to prune; the match itself is a
+  raw-string comparison. Also unranked.
 - **SQL.** A SQL query over the table's scalar and full-text columns,
   returning the matching rows. Search is also reachable from SQL
   through table-valued functions, so a query can filter, project, join,
@@ -64,6 +75,11 @@ unset.
   - `vector_search(column, query, k)` — vector kNN as a relation.
   - `bm25_search(column, query, k)` and
     `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
+  - `token_match(column, query, mode)` and `exact_match(column, value)`
+    — the unranked token / exact-match relations. Negation is then a
+    SQL composition over them (e.g. `token_match(..,'rust') EXCEPT
+    token_match(..,'compiler')`), keeping it index-bounded rather than a
+    dedicated `NOT` engine feature.
   - `hybrid_search(text_col, q_text, vec_col, q_vec, k)` — BM25 and
     vector results fused with reciprocal-rank fusion into one `score`.
 
@@ -280,13 +296,26 @@ search the single-segment reader runs) and merge globally. SQL is
 executed over the columnar (Parquet) data and does not require the
 search indexes — but it can still reach them through the search
 table-valued functions (`vector_search`, `bm25_search`,
-`bm25_search_prefix`), which run the same per-segment index fan-out and
-hand their results back into the SQL plan as a relation. Hybrid ranking
-is expressed in SQL: join or union the `vector_search` and `bm25_search`
-relations and rank by a fusion score. `hybrid_search` packages the
-common case, running the BM25 and vector kernels concurrently and fusing
-their rankings with reciprocal-rank fusion so a row found by both
-retrievers ranks above one found by a single retriever.
+`bm25_search_prefix`, `token_match`, `exact_match`), which run the same
+per-segment index fan-out and hand their results back into the SQL plan
+as a relation.
+
+A SQL `WHERE` predicate on a full-text column also uses the index
+directly, as the **row-level** companion to the segment-level term
+skip: an equality (and its `AND`/`OR`/`IN` combinations) is resolved
+through the term postings to a candidate set of rows, so only those
+rows are decoded and the engine re-checks the exact predicate over
+them — instead of decoding the whole column and filtering. A predicate
+the index cannot bound (negation, range, a non-indexed column) falls
+back to a column scan. So a selective filter on an indexed text column
+reads work proportional to the matches, not the column size. A hybrid
+ranking is then expressed *in SQL* — fuse the `vector_search` and
+`bm25_search` relations with a join/union and a fusion score. The
+`hybrid_search` table function is a convenience that packages the
+common case: it runs the BM25 and vector kernels concurrently and fuses
+the two rankings with reciprocal-rank fusion, so a row surfaced by both
+retrievers ranks above one surfaced by a single retriever. It is a
+SQL-level fusion, not a separate engine kernel.
 
 ## Concurrency
 

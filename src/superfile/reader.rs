@@ -715,6 +715,89 @@ impl SuperfileReader {
         Ok(fts.search(column, terms, k, mode).await?)
     }
 
+    /// Unranked token match: the `local_doc_id`s matching the
+    /// `tokens` under `mode` (`And` = every token, `Or` = any token),
+    /// in ascending order. No BM25 scoring. `tokens` are already
+    /// tokenized terms. Delegates to [`FtsReader::token_match`].
+    pub async fn token_match(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+    ) -> Result<Vec<u32>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.token_match(column, tokens, mode).await?)
+    }
+
+    /// Document frequency of `token` in `column` (0 if absent) — a cheap
+    /// header-only read used to estimate a predicate's match count
+    /// before running `token_match`. Delegates to
+    /// [`FtsReader::term_df`].
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_df(column, token).await?)
+    }
+
+    /// Two-pass exact match of a **raw string** `value` against
+    /// `column`'s stored values. The input is a raw string, **not**
+    /// tokens — tokenization is used only to prune candidates, never as
+    /// the match:
+    ///
+    ///   1. **Prune (index).** Tokenize `value` and `token_match` its
+    ///      tokens under `And` to get candidate rows that contain all of
+    ///      them. (An empty token set — e.g. punctuation-only `value` —
+    ///      can't prune, so every row is a candidate.)
+    ///   2. **Verify (text).** Decode `column` for those candidates and
+    ///      keep the rows whose stored value **equals `value` exactly**.
+    ///
+    /// Returns the verified `local_doc_id`s in ascending order. Works
+    /// for single-word and multi-word strings alike — the token count
+    /// only affects pruning, never the raw-string comparison.
+    pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
+        use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+        use arrow_array::Array as _;
+
+        // Pass 1 — candidate rows via the index: the term-AND of the
+        // string's tokens (a superset of the exact matches).
+        let tokens: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        let candidates: Vec<u32> = if tokens.is_empty() {
+            // No tokens to prune with: every row is a candidate.
+            (0..self.n_docs() as u32).collect()
+        } else {
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            self.token_match(column, &refs, BoolMode::And).await?
+        };
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 2 — verify raw-string equality on the decoded text.
+        let batch = self.take_by_local_doc_ids(&candidates, &[column])?;
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .ok_or_else(|| {
+                ReadError::Io(std::io::Error::other(format!(
+                    "exact_match: column '{column}' is not LargeUtf8"
+                )))
+            })?;
+        // `take_by_local_doc_ids` returns rows in `candidates` order, so
+        // row `i` is `candidates[i]`; candidates are ascending, so the
+        // kept ids stay ascending.
+        let mut out = Vec::new();
+        for (i, &doc) in candidates.iter().enumerate() {
+            if !col.is_null(i) && col.value(i) == value {
+                out.push(doc);
+            }
+        }
+        Ok(out)
+    }
+
     /// Prefix-expanded BM25 search.
     ///
     /// Expands `prefix` to the lex-ordered list of indexed terms

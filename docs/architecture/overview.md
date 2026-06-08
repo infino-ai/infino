@@ -64,8 +64,11 @@ To minimize latency and cost, infino tries to optimize data layout and data acce
    on scalar, keyword, *and* vector signals together before touching a
    single byte of a segment.
 3. **Fetches only what it needs** — for surviving files it pulls just
-  the relevant byte ranges from object storage (a posting list, a
-   handful of vector clusters), not the whole file.
+   the relevant byte ranges from object storage (a posting list, a
+   handful of vector clusters), not the whole file. This holds for SQL
+   too: a keyword filter on an indexed text column is answered from the
+   index and decodes only the matching rows, rather than scanning the
+   whole column.
 4. **Merges** the per-file results into one ranked answer.
 
 The cost model that falls out of this is the headline: **you pay for

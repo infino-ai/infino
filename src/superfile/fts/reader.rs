@@ -670,6 +670,73 @@ impl FtsReader {
         }
     }
 
+    /// Unranked token match over a **token list** — the no-scoring
+    /// sibling of [`Self::search`]. `mode = And` returns the
+    /// `local_doc_id`s present in *every* token's posting list
+    /// (intersection); `mode = Or` returns those in *any* (union), in
+    /// ascending doc-id order.
+    ///
+    /// Reuses the same [`build_term_cursors`](Self::build_term_cursors)
+    /// the scored path uses, then walks the cursors with
+    /// [`walk_cursors_unranked`] — no BM25 scoring and no top-k heap, so
+    /// nothing is ranked. Cursors traverse blocks in doc-id order, so
+    /// the result is already ascending (no re-sort).
+    pub async fn token_match(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+    ) -> Result<Vec<u32>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cursors = self.build_term_cursors(column_id, tokens).await?;
+        // AND needs every token present; a missing token ⇒ empty set.
+        if mode == BoolMode::And && cursors.len() != tokens.len() {
+            return Ok(Vec::new());
+        }
+        Ok(walk_cursors_unranked(cursors, mode))
+    }
+
+    /// Document frequency of `token` in `column` — the number of docs
+    /// containing it — read cheaply from the index **without** decoding
+    /// the posting list: an inline (df=1) term is known from the FST
+    /// value, and a PFOR term's `df` is the first 4 bytes of its 20-byte
+    /// metadata header. Returns `0` if the token isn't in the column's
+    /// dictionary. Used by the candidate planner to estimate a `WHERE`
+    /// predicate's match count *ahead of* running `token_match`, so a
+    /// predicate that would match a large fraction of the segment can
+    /// fall back to a plain scan instead of a (losing) index pushdown.
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let fst_bytes = self.dict_bytes_async().await?;
+        let dict = DictReader::open(&fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })?;
+        let col_meta = &self.columns[column_id as usize];
+        let key = make_key(&col_meta.name, token);
+        Ok(match dict.lookup(&key) {
+            None => 0,
+            Some(packed) => match FstValue::unpack(packed) {
+                FstValue::Inline { .. } => 1,
+                FstValue::Pfor {
+                    metadata_offset, ..
+                } => {
+                    // Fetch only the 20-byte header (TERM_META_SIZE);
+                    // `df` is its first 4 bytes — no posting-list decode.
+                    let fetched = self
+                        .fetch_term_postings(&[(metadata_offset as usize, TERM_META_SIZE)])
+                        .await?;
+                    let header = fetched.first().expect("one fetched header range");
+                    read_u32_le(&header.as_ref()[0..4]) as u64
+                }
+            },
+        })
+    }
+
     /// Multi-term OR BM25 search constrained to a doc_id sub-range.
     ///
     /// Same scoring semantics as [`Self::search`] in `BoolMode::Or`
@@ -2184,9 +2251,61 @@ fn read_u64_le(b: &[u8]) -> u64 {
 /// [`TermMeta::parse`] is the single place that validates untrusted
 /// offsets (the FST value points here) against the postings region:
 /// both the fixed 20-byte header and the skip table it declares are
+/// Drive already-built [`TermCursor`]s to their matching doc-ids with no
+/// scoring and no heap — the unranked analog of
+/// [`FtsReader::run_and_intersect`] (And) / the OR merge. Cursors
+/// traverse blocks in doc-id order, so the result is ascending with no
+/// extra sort. Used by [`FtsReader::token_match`].
+fn walk_cursors_unranked(mut cursors: Vec<TermCursor>, mode: BoolMode) -> Vec<u32> {
+    let mut out = Vec::new();
+    match mode {
+        BoolMode::And => {
+            // Rarest term leads so the leapfrog converges fastest — the
+            // same cursor ordering `run_and_intersect` uses.
+            cursors.sort_by_key(|c| c.block_count());
+            'and: loop {
+                if cursors[0].is_exhausted() {
+                    break;
+                }
+                let leader = cursors[0].current_doc_id();
+                let mut max_doc = leader;
+                for c in cursors[1..].iter_mut() {
+                    c.skip_to(leader);
+                    if c.is_exhausted() {
+                        break 'and;
+                    }
+                    max_doc = max_doc.max(c.current_doc_id());
+                }
+                if max_doc == leader {
+                    out.push(leader);
+                    cursors.iter_mut().for_each(TermCursor::next);
+                } else {
+                    cursors[0].skip_to(max_doc);
+                }
+            }
+        }
+        BoolMode::Or => loop {
+            let min_doc = cursors
+                .iter()
+                .filter(|c| !c.is_exhausted())
+                .map(TermCursor::current_doc_id)
+                .min();
+            let Some(min_doc) = min_doc else { break };
+            out.push(min_doc);
+            for c in cursors.iter_mut() {
+                if !c.is_exhausted() && c.current_doc_id() == min_doc {
+                    c.next();
+                }
+            }
+        },
+    }
+    out
+}
+
 /// bounds-checked before any caller touches a byte. Both the
 /// single-term BMW path and [`TermCursor::new`] go through here, so
 /// the header layout is interpreted in exactly one spot.
+
 #[derive(Debug, Copy, Clone)]
 struct TermMeta {
     /// Document frequency — number of docs containing the term.
@@ -2745,6 +2864,77 @@ mod tests {
         assert!(ids.contains(&0), "doc 0 should match");
         assert!(ids.contains(&1), "doc 1 should match");
         assert!(!ids.contains(&2), "doc 2 should not match");
+    }
+
+    #[tokio::test]
+    async fn token_match_or_unions_and_intersects_unranked() {
+        // build_blob: doc0 "rust async runtime", doc1 "tokio is a rust
+        // runtime", doc2 "java spring boot".
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+
+        // Single token → its posting list, ascending.
+        assert_eq!(
+            r.token_match("body", &["rust"], BoolMode::Or)
+                .await
+                .expect("single"),
+            vec![0, 1]
+        );
+        // OR = union (rust ∪ java).
+        assert_eq!(
+            r.token_match("body", &["rust", "java"], BoolMode::Or)
+                .await
+                .expect("or"),
+            vec![0, 1, 2]
+        );
+        // AND = intersection (rust ∩ runtime).
+        assert_eq!(
+            r.token_match("body", &["rust", "runtime"], BoolMode::And)
+                .await
+                .expect("and"),
+            vec![0, 1]
+        );
+        // AND with an absent token → empty.
+        assert!(
+            r.token_match("body", &["rust", "zzz"], BoolMode::And)
+                .await
+                .expect("and absent")
+                .is_empty()
+        );
+        // OR ignores an absent token.
+        assert_eq!(
+            r.token_match("body", &["java", "zzz"], BoolMode::Or)
+                .await
+                .expect("or absent"),
+            vec![2]
+        );
+        // Empty token list → empty.
+        assert!(
+            r.token_match("body", &[], BoolMode::And)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn token_match_doc_set_matches_bm25_for_same_terms() {
+        // token_match(Or) must return exactly the doc set bm25 ranks.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let mut bm25: Vec<u32> = r
+            .search("body", &["rust", "java"], 10, BoolMode::Or)
+            .await
+            .expect("search")
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        bm25.sort_unstable();
+        let boolean = r
+            .token_match("body", &["rust", "java"], BoolMode::Or)
+            .await
+            .expect("boolean");
+        assert_eq!(bm25, boolean, "boolean Or doc set == bm25 doc set");
     }
 
     #[tokio::test]
