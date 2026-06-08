@@ -265,27 +265,13 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
         ("three_similar_or", &["term00050", "term00051", "term00052"]),
         (
             "five_term_or",
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-            ],
+            &["term00050", "term00051", "term00052", "term00053", "term00054"],
         ),
         (
             "ten_term_or",
             &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-                "term00055",
-                "term00056",
-                "term00057",
-                "term00058",
-                "term00059",
+                "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
+                "term00056", "term00057", "term00058", "term00059",
             ],
         ),
     ];

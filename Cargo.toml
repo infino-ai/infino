@@ -290,6 +290,11 @@ path = "benches/sql/main.rs"
 harness = false
 
 [[bench]]
+name = "sql-diag"
+path = "benches/sql_diag/main.rs"
+harness = false
+
+[[bench]]
 name = "supertable_all"
 path = "benches/supertable/main.rs"
 harness = false

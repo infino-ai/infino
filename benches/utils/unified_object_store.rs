@@ -740,7 +740,7 @@ fn emit_object_store(
 // `bench()` runs the diagnostic and returns before any of the
 // criterion rows fire.
 
-mod diag {
+pub(crate) mod diag {
     use super::*;
     use async_trait::async_trait;
     use infino::storage::{ObjectMeta, StorageError};
