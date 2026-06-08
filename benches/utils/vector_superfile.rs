@@ -59,6 +59,11 @@ const DEFAULT_RERANK_MULT: usize = 20;
 
 const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
 
+/// Nanoseconds per second, for latency markdown.
+const NS_PER_SEC: f64 = 1e9;
+/// Deterministic rotation seed for the vector corpus fixture.
+const CORPUS_ROT_SEED: u64 = 1;
+
 /// (probe, refine) calibration grids. The lowest-p50 point clearing
 /// each recall target is what the search table reports.
 const PROBES: &[usize] = &[1, 5, 10, 25, 50, 100, 200, 400, 800];
@@ -84,7 +89,7 @@ fn vectors() -> &'static [f32] {
             // normal vector builder/reader paths; the mmap avoids pinning the
             // synthetic source corpus as heap RAM.
             let n = n_docs();
-            corpus::MmapVectorCorpus::generate(n, corpus::n_cent(n), 1, true)
+            corpus::MmapVectorCorpus::generate(n, corpus::n_cent(n), CORPUS_ROT_SEED, true)
         })
         .as_slice()
 }
@@ -250,7 +255,7 @@ fn timed_cold(
 
 fn build_row(label: &str, n_docs: usize, wall: Duration, stats: rss::RssStats) -> Vec<Cell> {
     let secs = wall.as_secs_f64();
-    let ns = secs * 1e9;
+    let ns = secs * NS_PER_SEC;
     let input_bytes = (n_docs * DIM * std::mem::size_of::<f32>()) as f64;
     let thr = n_docs as f64 / secs;
     let bw = input_bytes / secs;
@@ -278,8 +283,8 @@ fn build_row(label: &str, n_docs: usize, wall: Duration, stats: rss::RssStats) -
 }
 
 fn search_row(label: String, params: String, hot: Timed, cold: Duration) -> Vec<Cell> {
-    let hot_ns = hot.p50.as_secs_f64() * 1e9;
-    let cold_ns = cold.as_secs_f64() * 1e9;
+    let hot_ns = hot.p50.as_secs_f64() * NS_PER_SEC;
+    let cold_ns = cold.as_secs_f64() * NS_PER_SEC;
     vec![
         text(label),
         text(params),

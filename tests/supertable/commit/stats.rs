@@ -1,4 +1,7 @@
-//! `Supertable::stats()` — 003 M13.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! `Supertable::stats()`.
 //!
 //! Covers:
 //!   - Fresh `create` returns the empty-supertable stats:
@@ -15,8 +18,9 @@
 //!     from `new_segment_list`).
 //!   - `Supertable::open`'s eager-fetch populates
 //!     `n_manifest_parts_loaded == n_manifest_parts`.
-//!   - `process_rss_bytes` is non-zero and within ±10% of an
-//!     independent reading from the `memory-stats` crate
+//!   - `process_rss_bytes` is non-zero and falls within a
+//!     self-calibrating bracket around independent readings from
+//!     the `memory-stats` crate taken before and after the call
 //!     (i.e., the accessor is consistent).
 //!   - Repeat calls return updated values (no internal
 //!     caching of the snapshot).
@@ -28,6 +32,13 @@ use std::sync::Arc;
 use infino::supertable::Supertable;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Disk-cache byte budget (1 GiB) for the stats integration cache.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk size (1 MiB).
+const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 use tempfile::TempDir;
 
 #[test]
@@ -93,7 +104,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
     // Producer's in-memory state after commit: list is set,
     // parts cache is empty (writer rebuilds state via
     // new_segment_list, doesn't hydrate the freshly-written
-    // part). M13 contract: report what's actually in memory.
+    // part). Contract: report what's actually in memory.
     let producer_stats = producer.stats();
     assert_eq!(producer_stats.manifest_id, 1);
     assert_eq!(
@@ -122,7 +133,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
 }
 
 #[test]
-fn process_rss_bytes_matches_independent_reading_within_pct() {
+fn process_rss_bytes_matches_independent_reading_within_bracket() {
     // Both stats() and memory-stats::memory_stats() read the
     // same OS-reported RSS via the same crate, so back-to-back
     // calls should match closely. Under parallel cargo-test
@@ -210,7 +221,7 @@ fn stats_without_disk_cache_have_none_cache_counters() {
 #[test]
 fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     // Cache attached, nothing read through it yet → all
-    // four counter fields are Some(0). This is the D6
+    // four counter fields are Some(0). This is the
     // contract: cold-fetch / eviction / madvise / entry
     // counts surface through `Supertable::stats()` even
     // before any activity, so downstream consumers can
@@ -228,10 +239,10 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
     let cfg = DiskCacheConfig {
         cache_root: cache_dir.path().to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),

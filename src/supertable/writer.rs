@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SupertableWriter` — the single-writer append + commit path.
 //!
 //! **Naming convention.** `SupertableWriter` is a long-lived
@@ -76,6 +79,12 @@ use super::wal::state_doc::{
     IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
     WalStateDoc,
 };
+
+/// Zstd compression level for manifest parts and the manifest list.
+/// Level 3 is zstd's own default — a balanced ratio/speed point that
+/// keeps commit latency low while compressing the Avro-encoded
+/// manifest well. (Valid range is 1..=22.)
+const MANIFEST_ZSTD_LEVEL: i32 = 3;
 
 /// Single-writer append + commit handle.
 ///
@@ -951,7 +960,7 @@ fn build_one_shard(
 /// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`
 /// out of the freshly-written parquet KV metadata so the manifest
 /// can carry it forward as a [`SubsectionOffsets`]. Returns `None`
-/// if the bytes don't parse — that path falls back to the pre-M6
+/// if the bytes don't parse — that path falls back to the
 /// 2-RTT cold open shape rather than failing the publish.
 fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
     use crate::superfile::format::{footer::read_kv_metadata, kv};
@@ -1035,29 +1044,47 @@ fn build_open_blob(
 }
 
 fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
-    const OUTER_HEADER_SIZE: usize = 32;
-    const DIR_ENTRY_SIZE: usize = 64;
-    const SUB_HEADER_SIZE: usize = 56;
+    use crate::superfile::format::CRC_BYTES;
+    use crate::superfile::format::vec::{
+        CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE, SUB_HEADER_SIZE, U32_BYTES,
+        U64_BYTES, dir_entry, outer_hdr, sub_hdr,
+    };
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
-    if blob.len() < OUTER_HEADER_SIZE + 4 {
+    if blob.len() < OUTER_HEADER_SIZE + CRC_BYTES {
         return None;
     }
-    let n_columns = read_u32_le(blob.get(12..16)?) as usize;
-    let dir_offset = read_u64_le(blob.get(24..32)?) as usize;
+    let n_columns =
+        read_u32_le(blob.get(outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES)?)
+            as usize;
+    let dir_offset =
+        read_u64_le(blob.get(outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES)?)
+            as usize;
     let dir_size = n_columns.checked_mul(DIR_ENTRY_SIZE)?;
-    let dir_end = dir_offset.checked_add(dir_size)?.checked_add(4)?;
+    let dir_end = dir_offset.checked_add(dir_size)?.checked_add(CRC_BYTES)?;
     let dir = blob.get(dir_offset..dir_offset + dir_size)?;
 
-    let mut ranges = vec![(off + dir_offset as u64, (dir_size + 4) as u64)];
+    let mut ranges = vec![(off + dir_offset as u64, (dir_size + CRC_BYTES) as u64)];
     ranges.push((off, OUTER_HEADER_SIZE as u64));
     for i in 0..n_columns {
         let entry = i * DIR_ENTRY_SIZE;
-        let subsection_off = read_u64_le(dir.get(entry + 24..entry + 32)?) as usize;
-        let subsection_len = read_u64_le(dir.get(entry + 32..entry + 40)?) as usize;
-        let codec_meta_off = read_u32_le(dir.get(entry + 56..entry + 60)?) as usize;
-        let codec_meta_size = read_u32_le(dir.get(entry + 60..entry + 64)?) as usize;
+        let subsection_off = read_u64_le(dir.get(
+            entry + dir_entry::SUBSECTION_OFF_OFF
+                ..entry + dir_entry::SUBSECTION_OFF_OFF + U64_BYTES,
+        )?) as usize;
+        let subsection_len = read_u64_le(dir.get(
+            entry + dir_entry::SUBSECTION_LEN_OFF
+                ..entry + dir_entry::SUBSECTION_LEN_OFF + U64_BYTES,
+        )?) as usize;
+        let codec_meta_off = read_u32_le(dir.get(
+            entry + dir_entry::CODEC_META_OFF_OFF
+                ..entry + dir_entry::CODEC_META_OFF_OFF + U32_BYTES,
+        )?) as usize;
+        let codec_meta_size = read_u32_le(dir.get(
+            entry + dir_entry::CODEC_META_SIZE_OFF
+                ..entry + dir_entry::CODEC_META_SIZE_OFF + U32_BYTES,
+        )?) as usize;
         if subsection_off.checked_add(SUB_HEADER_SIZE)? > blob.len()
             || subsection_off.checked_add(subsection_len)? > blob.len()
         {
@@ -1065,10 +1092,18 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
         }
         ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
         let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
-        let centroids_off = read_u64_le(sub.get(32..40)?) as usize;
-        let cluster_idx_off = read_u64_le(sub.get(40..48)?) as usize;
-        let cluster_idx_end = cluster_idx_off
-            .checked_add(8 * read_u32_le(dir.get(entry + 8..entry + 12)?) as usize)?;
+        let centroids_off = read_u64_le(
+            sub.get(sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES)?,
+        ) as usize;
+        let cluster_idx_off = read_u64_le(
+            sub.get(sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES)?,
+        ) as usize;
+        let cluster_idx_end = cluster_idx_off.checked_add(
+            CLUSTER_IDX_ENTRY_BYTES
+                * read_u32_le(dir.get(
+                    entry + dir_entry::N_CENT_OFF..entry + dir_entry::N_CENT_OFF + U32_BYTES,
+                )?) as usize,
+        )?;
         if centroids_off < SUB_HEADER_SIZE || cluster_idx_end > subsection_len {
             return None;
         }
@@ -1090,15 +1125,19 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
 }
 
 fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
-    const FTS_HEADER_SIZE: usize = 48;
+    use crate::superfile::format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr};
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let postings_offset = read_u64_le(blob.get(32..40)?) as usize;
-    let doc_lengths_offset = read_u64_le(blob.get(40..48)?) as usize;
+    let postings_offset =
+        read_u64_le(blob.get(hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES)?)
+            as usize;
+    let doc_lengths_offset =
+        read_u64_le(blob.get(hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES)?)
+            as usize;
     if postings_offset > blob.len()
         || doc_lengths_offset > blob.len()
         || postings_offset > doc_lengths_offset
@@ -1395,14 +1434,23 @@ fn publish_superfiles(
 fn backoff_delay(attempt: u32) -> std::time::Duration {
     const BASE_MS: u64 = 10;
     const CAP_MS: u64 = 1000;
-    let exp = BASE_MS.saturating_mul(1u64 << attempt.min(6));
+    // Cap the doubling exponent so the pre-cap delay plateaus instead
+    // of overflowing the shift on a high attempt count.
+    const MAX_SHIFT: u32 = 6;
+    // Jitter is a uniform percentage in `-JITTER_RANGE_PCT..=+JITTER_RANGE_PCT`,
+    // drawn from the clock's low nanosecond bits. `JITTER_MODULUS`
+    // is `2 × JITTER_RANGE_PCT + 1` so the modulo spans the full range.
+    const JITTER_RANGE_PCT: i64 = 30;
+    const JITTER_MODULUS: u64 = 61;
+    const PERCENT_DIVISOR: i64 = 100;
+    let exp = BASE_MS.saturating_mul(1u64 << attempt.min(MAX_SHIFT));
     let capped = exp.min(CAP_MS);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
-    let jitter_pct = (nanos % 61) as i64 - 30; // -30..=30
-    let adjusted = ((capped as i64) + (capped as i64 * jitter_pct / 100)).max(1) as u64;
+    let jitter_pct = (nanos % JITTER_MODULUS) as i64 - JITTER_RANGE_PCT;
+    let adjusted = ((capped as i64) + (capped as i64 * jitter_pct / PERCENT_DIVISOR)).max(1) as u64;
     std::time::Duration::from_millis(adjusted)
 }
 
@@ -1801,7 +1849,7 @@ async fn try_commit_attempt(
         prev_etag.as_deref(),
         &new_list,
         &parts_refs,
-        3,
+        MANIFEST_ZSTD_LEVEL,
     )
     .await?;
     // Silence the unused-import warning when no path uses
@@ -1837,7 +1885,7 @@ fn build_part_and_entry(
         part_id: PartId::new_v4(),
         superfiles,
     };
-    let compressed = part_mod::encode(&part, 3);
+    let compressed = part_mod::encode(&part, MANIFEST_ZSTD_LEVEL);
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = zstd::stream::decode_all(compressed.as_slice())

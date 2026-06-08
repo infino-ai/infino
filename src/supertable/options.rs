@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SupertableOptions` — the immutable per-supertable configuration.
 //!
 //! ## Shape
@@ -103,6 +106,28 @@ pub(crate) const DECIMAL128_PRECISION: u8 = 38;
 /// comparison kernels and Parquet's stats encoding.
 pub(crate) const DECIMAL128_SCALE: i8 = 0;
 
+/// Default bounded-staleness window for read consistency — how long
+/// a hot query may reuse a manifest pointer before re-checking.
+const DEFAULT_READ_STALENESS_SECS: u64 = 1;
+/// Default soft cap on superfiles per manifest part; exceeding it
+/// triggers a part split on commit.
+const DEFAULT_TARGET_SUPERFILES_PER_PARTITION: u64 = 10_000;
+/// Default soft cap on a manifest part's compressed size (10 MiB).
+const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
+/// Default: eager-load manifest parts at open when there are at most
+/// this many (open latency vs memory trade-off).
+const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
+/// Default optimistic-commit retry budget under contention.
+const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
+/// Default writer auto-flush threshold (1 GiB, in MiB units).
+const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+/// Default object size (100 MiB) above which uploads route through
+/// multipart.
+const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
+/// Default hash-partition bucket count — a single bucket, which is
+/// observationally "no partitioning".
+const DEFAULT_PARTITION_N_BUCKETS: u32 = 1;
+
 /// Read-path freshness policy — how an open handle picks up segments
 /// committed (by this or another process) after it opened.
 ///
@@ -137,7 +162,7 @@ impl Default for Consistency {
         // dominates a hot one, so amortize it rather than pay it per
         // hot query. Strong/Snapshot are opt-in via
         // `with_read_consistency`.
-        Consistency::BoundedStaleness(std::time::Duration::from_secs(1))
+        Consistency::BoundedStaleness(std::time::Duration::from_secs(DEFAULT_READ_STALENESS_SECS))
     }
 }
 
@@ -288,7 +313,7 @@ pub struct SupertableOptions {
     /// `vector_search`, `query_sql`) iterate this flat view.
     ///
     /// **Lazy mode** leaves `Manifest.superfile_list.superfiles`
-    /// empty until the hierarchical query path (M15c) lands.
+    /// empty until the hierarchical query path lands.
     /// Until then, callers using lazy mode must drive
     /// `Manifest::part(id).await` directly; legacy
     /// flat-iteration queries return empty results.
@@ -485,12 +510,12 @@ impl SupertableOptions {
             memory_budget_bytes: None,
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
-            target_superfiles_per_partition: 10_000,
-            part_size_threshold_bytes: 10 * (1 << 20),
-            eager_load_threshold_parts: 4,
-            max_commit_retries: 10,
-            commit_threshold_size_mb: 1024,
-            put_multipart_threshold_bytes: 100 * (1 << 20),
+            target_superfiles_per_partition: DEFAULT_TARGET_SUPERFILES_PER_PARTITION,
+            part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
+            eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
+            max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
+            commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
+            put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
         })
@@ -534,7 +559,7 @@ impl SupertableOptions {
             .clone()
             .unwrap_or_else(|| PartitionStrategy::Hash {
                 column: self.id_column.clone(),
-                n_buckets: 1,
+                n_buckets: DEFAULT_PARTITION_N_BUCKETS,
             })
     }
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Per-process reader-side cache of per-superfile tombstone
 //! bitmaps.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Atomic-rename pointer commit.
 //!
 //! The persistence primitives the writer sits on:
@@ -45,7 +48,9 @@ use futures::future;
 use crate::storage::{StorageError, StorageProvider};
 use crate::supertable::error::CommitError;
 use crate::supertable::manifest::list::{self as list_mod, ManifestList};
-use crate::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
+use crate::supertable::manifest::part::{
+    self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart, PartId,
+};
 
 /// Pointer-file location under the supertable root. The only
 /// path that ever gets atomically renamed; everything else is
@@ -137,14 +142,14 @@ impl PointerFile {
                             "content_hash missing 'blake3:' prefix: {value}"
                         ))
                     })?;
-                    if hex.len() != 64 {
+                    if hex.len() != BLAKE3_HEX_LEN {
                         return Err(CommitError::PointerParse(format!(
-                            "content_hash hex must be 64 chars; got {}",
+                            "content_hash hex must be {BLAKE3_HEX_LEN} chars; got {}",
                             hex.len()
                         )));
                     }
-                    let mut bytes = [0u8; 32];
-                    for i in 0..32 {
+                    let mut bytes = [0u8; BLAKE3_DIGEST_BYTES];
+                    for i in 0..BLAKE3_DIGEST_BYTES {
                         bytes[i] =
                             u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
                                 CommitError::PointerParse(format!("content_hash hex: {hex}"))

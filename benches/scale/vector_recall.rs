@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Measured vector recall on a realistic-shape 10K × 384 corpus.
 //!
 //! Recall@k is the fraction of true top-k neighbors (by exact
@@ -43,6 +46,32 @@ const N_QUERIES: usize = 50;
 /// true neighbors, so the numbers gate clustering + quantization quality
 /// rather than shortlist depth. See the module docs.
 const BENCH_RERANK_MULT: usize = 16;
+/// Per-dim Gaussian perturbation for "near-doc" realistic queries.
+const QUERY_SIGMA: f32 = 0.05;
+/// recall@K used by the gate (top-10) and the strict recall@1 check.
+const RECALL_AT_K: usize = 10;
+const RECALL_AT_ONE_K: usize = 1;
+/// Low / high nprobe operating points for the recall gates.
+const NPROBE_LOW: usize = 8;
+const NPROBE_HIGH: usize = 32;
+/// Recall floors (regression thresholds) per metric / operating point.
+const RECALL10_NPROBE_LOW_MIN: f32 = 0.90;
+const RECALL10_NPROBE_HIGH_MIN: f32 = 0.95;
+const RECALL1_NPROBE_LOW_MIN: f32 = 0.95;
+/// Corpus/query seeds per metric fixture (distinct so fixtures differ).
+const L2SQ_FIXTURE_SEED: u64 = 1;
+const L2SQ_QUERY_SEED: u64 = 100;
+const COSINE_FIXTURE_SEED: u64 = 2;
+const COSINE_QUERY_SEED: u64 = 200;
+const MONOTONIC_FIXTURE_SEED: u64 = 3;
+const MONOTONIC_QUERY_SEED: u64 = 300;
+/// Sentinel "previous recall" so the first nprobe in the monotonic
+/// sweep always passes the non-decreasing check.
+const MONOTONIC_PREV_SENTINEL: f32 = -1.0;
+/// Ordered nprobe ladder for the monotonicity regression.
+const NPROBE_MONOTONIC_SWEEP: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+/// Allowed recall drop between adjacent nprobe steps (noise band).
+const NPROBE_MONOTONIC_TOLERANCE: f32 = 0.02;
 
 fn search_blocking(
     reader: &SuperfileReader,
@@ -145,37 +174,84 @@ fn recall_headers() -> Vec<String> {
 /// Pinned recall@k points for L2Sq + Cosine, with the regression floors
 /// the bench has always asserted (now measured at [`BENCH_RERANK_MULT`]).
 fn pinned_rows() -> Vec<Vec<Cell>> {
-    let (l2_vecs, l2_reader) = build_fixture(1, false, Metric::L2Sq);
-    let l2_q = generate_realistic_queries(&l2_vecs, N_DOCS, N_QUERIES, 100, false, 0.05);
-    let (l2_r10_np8, rss_a) = sampled_recall(&l2_reader, &l2_vecs, Metric::L2Sq, &l2_q, 10, 8);
-    let (l2_r10_np32, rss_b) = sampled_recall(&l2_reader, &l2_vecs, Metric::L2Sq, &l2_q, 10, 32);
-    let (l2_r1_np8, rss_c) = sampled_recall(&l2_reader, &l2_vecs, Metric::L2Sq, &l2_q, 1, 8);
-    assert!(
-        l2_r10_np8 >= 0.90,
-        "L2Sq recall@10 nprobe=8 {l2_r10_np8:.3} < 0.90"
+    let (l2_vecs, l2_reader) = build_fixture(L2SQ_FIXTURE_SEED, false, Metric::L2Sq);
+    let l2_q = generate_realistic_queries(
+        &l2_vecs,
+        N_DOCS,
+        N_QUERIES,
+        L2SQ_QUERY_SEED,
+        false,
+        QUERY_SIGMA,
+    );
+    let (l2_r10_np8, rss_a) = sampled_recall(
+        &l2_reader,
+        &l2_vecs,
+        Metric::L2Sq,
+        &l2_q,
+        RECALL_AT_K,
+        NPROBE_LOW,
+    );
+    let (l2_r10_np32, rss_b) = sampled_recall(
+        &l2_reader,
+        &l2_vecs,
+        Metric::L2Sq,
+        &l2_q,
+        RECALL_AT_K,
+        NPROBE_HIGH,
+    );
+    let (l2_r1_np8, rss_c) = sampled_recall(
+        &l2_reader,
+        &l2_vecs,
+        Metric::L2Sq,
+        &l2_q,
+        RECALL_AT_ONE_K,
+        NPROBE_LOW,
     );
     assert!(
-        l2_r10_np32 >= 0.95,
-        "L2Sq recall@10 nprobe=32 {l2_r10_np32:.3} < 0.95"
+        l2_r10_np8 >= RECALL10_NPROBE_LOW_MIN,
+        "L2Sq recall@10 nprobe={NPROBE_LOW} {l2_r10_np8:.3} < {RECALL10_NPROBE_LOW_MIN}"
     );
     assert!(
-        l2_r1_np8 >= 0.95,
-        "L2Sq recall@1 nprobe=8 {l2_r1_np8:.3} < 0.95"
+        l2_r10_np32 >= RECALL10_NPROBE_HIGH_MIN,
+        "L2Sq recall@10 nprobe={NPROBE_HIGH} {l2_r10_np32:.3} < {RECALL10_NPROBE_HIGH_MIN}"
+    );
+    assert!(
+        l2_r1_np8 >= RECALL1_NPROBE_LOW_MIN,
+        "L2Sq recall@1 nprobe={NPROBE_LOW} {l2_r1_np8:.3} < {RECALL1_NPROBE_LOW_MIN}"
     );
 
-    let (cos_vecs, cos_reader) = build_fixture(2, true, Metric::Cosine);
-    let cos_q = generate_realistic_queries(&cos_vecs, N_DOCS, N_QUERIES, 200, true, 0.05);
-    let (cos_r10_np8, rss_d) =
-        sampled_recall(&cos_reader, &cos_vecs, Metric::Cosine, &cos_q, 10, 8);
-    let (cos_r10_np32, rss_e) =
-        sampled_recall(&cos_reader, &cos_vecs, Metric::Cosine, &cos_q, 10, 32);
-    assert!(
-        cos_r10_np8 >= 0.90,
-        "Cosine recall@10 nprobe=8 {cos_r10_np8:.3} < 0.90"
+    let (cos_vecs, cos_reader) = build_fixture(COSINE_FIXTURE_SEED, true, Metric::Cosine);
+    let cos_q = generate_realistic_queries(
+        &cos_vecs,
+        N_DOCS,
+        N_QUERIES,
+        COSINE_QUERY_SEED,
+        true,
+        QUERY_SIGMA,
+    );
+    let (cos_r10_np8, rss_d) = sampled_recall(
+        &cos_reader,
+        &cos_vecs,
+        Metric::Cosine,
+        &cos_q,
+        RECALL_AT_K,
+        NPROBE_LOW,
+    );
+    let (cos_r10_np32, rss_e) = sampled_recall(
+        &cos_reader,
+        &cos_vecs,
+        Metric::Cosine,
+        &cos_q,
+        RECALL_AT_K,
+        NPROBE_HIGH,
     );
     assert!(
-        cos_r10_np32 >= 0.95,
-        "Cosine recall@10 nprobe=32 {cos_r10_np32:.3} < 0.95"
+        cos_r10_np8 >= RECALL10_NPROBE_LOW_MIN,
+        "Cosine recall@10 nprobe={NPROBE_LOW} {cos_r10_np8:.3} < {RECALL10_NPROBE_LOW_MIN}"
+    );
+    assert!(
+        cos_r10_np32 >= RECALL10_NPROBE_HIGH_MIN,
+        "Cosine recall@10 nprobe={NPROBE_HIGH} {cos_r10_np32:.3} < {RECALL10_NPROBE_HIGH_MIN}"
     );
 
     vec![
@@ -189,14 +265,28 @@ fn pinned_rows() -> Vec<Vec<Cell>> {
 
 /// recall@10 vs nprobe sweep (L2Sq), asserting monotonic-within-noise.
 fn nprobe_sweep_rows() -> Vec<Vec<Cell>> {
-    let (vectors, reader) = build_fixture(3, false, Metric::L2Sq);
-    let queries = generate_realistic_queries(&vectors, N_DOCS, N_QUERIES, 300, false, 0.05);
+    let (vectors, reader) = build_fixture(MONOTONIC_FIXTURE_SEED, false, Metric::L2Sq);
+    let queries = generate_realistic_queries(
+        &vectors,
+        N_DOCS,
+        N_QUERIES,
+        MONOTONIC_QUERY_SEED,
+        false,
+        QUERY_SIGMA,
+    );
     let mut rows = Vec::new();
-    let mut prev: f32 = -1.0;
-    for &nprobe in &[1, 2, 4, 8, 16, 32, 64] {
-        let (r, rss) = sampled_recall(&reader, &vectors, Metric::L2Sq, &queries, 10, nprobe);
+    let mut prev: f32 = MONOTONIC_PREV_SENTINEL;
+    for &nprobe in NPROBE_MONOTONIC_SWEEP {
+        let (r, rss) = sampled_recall(
+            &reader,
+            &vectors,
+            Metric::L2Sq,
+            &queries,
+            RECALL_AT_K,
+            nprobe,
+        );
         assert!(
-            r >= prev - 0.02,
+            r >= prev - NPROBE_MONOTONIC_TOLERANCE,
             "recall regressed with more nprobe: nprobe={nprobe}, recall={r:.3}, prev={prev:.3}"
         );
         prev = r;

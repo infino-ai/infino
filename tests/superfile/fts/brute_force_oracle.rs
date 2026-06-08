@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 correctness oracle for the superfile FTS pipeline.
 //!
 //! Indexes a planted 60-doc corpus and asserts that infino's
@@ -413,7 +416,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
         // tighter than any meaningful BM25 score gap on this corpus.
         let delta = (i_score - o_score).abs();
         assert!(
-            delta < 1e-3,
+            delta < BM25_SCORE_ABS_TOLERANCE,
             "score divergence on doc {i_doc}: infino={i_score} oracle={o_score} delta={delta}"
         );
     }
@@ -472,6 +475,22 @@ async fn oracle_long_doc_vs_short_doc_dl_norm() {
 
 const MULTI_BLOCK_N_DOCS: u64 = 1_000;
 
+/// Planting periods for the multi-block corpus terms (every Nth doc),
+/// shared by the corpus builder and the AND-truth predicate.
+const TERM_ALPHA_PERIOD: u64 = 3;
+const TERM_BETA_PERIOD: u64 = 4;
+const TERM_GAMMA_PERIOD: u64 = 5;
+const TERM_DELTA_PERIOD: u64 = 7;
+const TERM_EPSILON_PERIOD: u64 = 20;
+/// Filler-token bucket count (`no00`..`no49`) for doc-length variation.
+const FILLER_TERM_MODULUS: u64 = 50;
+/// AND top-k retrieving the full large intersection.
+const MULTI_BLOCK_AND_K: usize = 200;
+/// AND top-k for the rarer `alpha ∧ epsilon` intersection.
+const MULTI_BLOCK_RARE_AND_K: usize = 100;
+/// Score-equality tolerance comparing the two BM25 scorers.
+const BM25_SCORE_ABS_TOLERANCE: f32 = 1e-3;
+
 /// Deterministic-frequency planted corpus. Each doc is identified
 /// by its position 0..N-1 and seeded with terms based on simple
 /// mod predicates so the resulting posting list lengths are
@@ -487,25 +506,25 @@ fn build_multi_block_corpus() -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = Vec::with_capacity(MULTI_BLOCK_N_DOCS as usize);
     for d in 0..MULTI_BLOCK_N_DOCS {
         let mut toks: Vec<&'static str> = Vec::new();
-        if d.is_multiple_of(3) {
+        if d.is_multiple_of(TERM_ALPHA_PERIOD) {
             toks.push("alpha");
         }
-        if d.is_multiple_of(4) {
+        if d.is_multiple_of(TERM_BETA_PERIOD) {
             toks.push("beta");
         }
-        if d.is_multiple_of(5) {
+        if d.is_multiple_of(TERM_GAMMA_PERIOD) {
             toks.push("gamma");
         }
-        if d.is_multiple_of(7) {
+        if d.is_multiple_of(TERM_DELTA_PERIOD) {
             toks.push("delta");
         }
-        if d.is_multiple_of(20) {
+        if d.is_multiple_of(TERM_EPSILON_PERIOD) {
             toks.push("epsilon");
         }
         // Filler keeps every doc non-empty and gives a few different
         // doc lengths so dl-norm isn't a constant. Using mod-50 yields
         // 50 distinct filler terms across 1000 docs.
-        let filler = format!("no{:02}", d % 50);
+        let filler = format!("no{:02}", d % FILLER_TERM_MODULUS);
         let mut s = toks.join(" ");
         if !s.is_empty() {
             s.push(' ');
@@ -527,11 +546,11 @@ fn build_multi_block_reader(owned: &[(u64, String)]) -> SuperfileReader {
 fn multi_block_and_truth(terms: &[&str]) -> HashSet<u64> {
     let predicate = |d: u64, t: &str| -> bool {
         match t {
-            "alpha" => d.is_multiple_of(3),
-            "beta" => d.is_multiple_of(4),
-            "gamma" => d.is_multiple_of(5),
-            "delta" => d.is_multiple_of(7),
-            "epsilon" => d.is_multiple_of(20),
+            "alpha" => d.is_multiple_of(TERM_ALPHA_PERIOD),
+            "beta" => d.is_multiple_of(TERM_BETA_PERIOD),
+            "gamma" => d.is_multiple_of(TERM_GAMMA_PERIOD),
+            "delta" => d.is_multiple_of(TERM_DELTA_PERIOD),
+            "epsilon" => d.is_multiple_of(TERM_EPSILON_PERIOD),
             _ => false,
         }
     };
@@ -548,7 +567,7 @@ async fn oracle_and_multi_block_two_term_matches_brute_force() {
     // path to cross blocks on both cursors.
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
-    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta", 200)
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta", MULTI_BLOCK_AND_K)
         .await
         .into_iter()
         .collect();
@@ -568,7 +587,7 @@ async fn oracle_and_multi_block_three_term_matches_brute_force() {
     // crossings on three cursors simultaneously.
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
-    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma", 200)
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma", MULTI_BLOCK_AND_K)
         .await
         .into_iter()
         .collect();
@@ -588,10 +607,11 @@ async fn oracle_and_multi_block_four_term_matches_brute_force() {
     // and tests the `block_exhausted` early-break path.
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
-    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha beta gamma delta", 200)
-        .await
-        .into_iter()
-        .collect();
+    let infino_set: HashSet<u64> =
+        infino_top_k_and(&r, "alpha beta gamma delta", MULTI_BLOCK_AND_K)
+            .await
+            .into_iter()
+            .collect();
     let truth = multi_block_and_truth(&["alpha", "beta", "gamma", "delta"]);
     assert_eq!(
         infino_set, truth,
@@ -608,7 +628,7 @@ async fn oracle_and_multi_block_with_rare_term_short_circuits() {
     // path that crosses block_last_doc_id.
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
-    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha epsilon", 100)
+    let infino_set: HashSet<u64> = infino_top_k_and(&r, "alpha epsilon", MULTI_BLOCK_RARE_AND_K)
         .await
         .into_iter()
         .collect();

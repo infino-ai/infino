@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Recall test that exercises the reservoir sampling path
 //! end-to-end with `n_docs > sample_size`.
 //!
@@ -26,6 +29,29 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 use std::collections::HashSet;
+
+/// Random-rotation seed shared by both reservoir-recall fixtures.
+const ROT_SEED: u64 = 7;
+/// Vector dimension for both fixtures.
+const RESERVOIR_DIM: usize = 32;
+// Undersized-reservoir stress fixture (`n_docs > sample_size`).
+const RESERVOIR_N_CENT: usize = 8;
+const RESERVOIR_N_DOCS: usize = 2_000;
+const RESERVOIR_SAMPLE_SIZE: usize = 200;
+const RESERVOIR_TOP_K: usize = 10;
+const RESERVOIR_CORPUS_SEED: u64 = 42;
+/// Floor on rerank_mult for maximal-coverage retrieval.
+const RESERVOIR_RERANK_MULT_MIN: usize = 64;
+/// Conservative mean-recall pass threshold for the undersized run.
+const RESERVOIR_RECALL_FLOOR: f32 = 0.85;
+/// Query row indices probed for recall measurement.
+const RESERVOIR_QUERY_INDICES: [usize; 8] = [0, 137, 251, 503, 911, 1234, 1567, 1999];
+// Default-reservoir fixture (reservoir holds the whole corpus).
+const DEFAULT_RESERVOIR_N_CENT: usize = 4;
+const DEFAULT_RESERVOIR_N_DOCS: usize = 200;
+const DEFAULT_RESERVOIR_TOP_K: usize = 5;
+const DEFAULT_RESERVOIR_CORPUS_SEED: u64 = 19;
+const DEFAULT_RESERVOIR_RERANK_MULT: usize = 40;
 
 /// Planted-cluster corpus: `N_CLUSTERS` Gaussian centers, each
 /// with `n_docs / N_CLUSTERS` near-by samples. Centers are
@@ -96,7 +122,7 @@ fn build_reader_with_sample_size(
             column: "v".into(),
             dim,
             n_cent,
-            rot_seed: 7,
+            rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec,
         })
@@ -109,32 +135,32 @@ fn build_reader_with_sample_size(
     }
     let bytes = b.finish().expect("finish vector builder");
     let json = format!(
-        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
+        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":{ROT_SEED},"metric":"cosine"}}]"#
     );
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
 #[tokio::test]
 async fn recall_under_undersized_reservoir_matches_brute_force() {
-    let dim = 32;
-    let n_cent = 8;
-    let n_docs = 2_000;
+    let dim = RESERVOIR_DIM;
+    let n_cent = RESERVOIR_N_CENT;
+    let n_docs = RESERVOIR_N_DOCS;
     // 1/10 the corpus — well below the default 100K floor and a
     // valid stress for the sampler. At n_clusters == n_cent the
     // reservoir must capture representatives of every planted
     // center; if it doesn't, recall will drop visibly.
-    let sample_size = 200;
-    let top_k = 10;
+    let sample_size = RESERVOIR_SAMPLE_SIZE;
+    let top_k = RESERVOIR_TOP_K;
 
-    let flat = corpus(n_docs, dim, n_cent, /*seed=*/ 42);
+    let flat = corpus(n_docs, dim, n_cent, /*seed=*/ RESERVOIR_CORPUS_SEED);
 
     // Maximal-coverage retrieval: full nprobe sweep and a wide
     // rerank pool. Any recall loss here is k-means-related, not
     // IVF-pruning-related — exactly what we want to validate.
     let nprobe = n_cent;
-    let rerank_mult = (n_docs / top_k + 1).max(64);
+    let rerank_mult = (n_docs / top_k + 1).max(RESERVOIR_RERANK_MULT_MIN);
 
-    let queries: [usize; 8] = [0, 137, 251, 503, 911, 1234, 1567, 1999];
+    let queries: [usize; 8] = RESERVOIR_QUERY_INDICES;
 
     // Parameterize across every reranking codec. All three share
     // the same 0.85 recall floor on this corpus: Fp32 is bit-exact,
@@ -180,7 +206,7 @@ async fn recall_under_undersized_reservoir_matches_brute_force() {
         // the codec's rerank kernel regressed — all
         // implementation bugs.
         assert!(
-            mean_recall >= 0.85,
+            mean_recall >= RESERVOIR_RECALL_FLOOR,
             "reservoir-trained recall@{top_k} = {mean_recall:.3} \
              under sample_size={sample_size} codec={codec:?}; expected ≥ 0.85"
         );
@@ -192,12 +218,17 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
     // Sanity check: when the corpus fits inside the default
     // reservoir (which is the normal regime for unit tests), the
     // result should be self-NN-perfect just like the full-corpus path.
-    let dim = 32;
-    let n_cent = 4;
-    let n_docs = 200;
-    let top_k = 5;
+    let dim = RESERVOIR_DIM;
+    let n_cent = DEFAULT_RESERVOIR_N_CENT;
+    let n_docs = DEFAULT_RESERVOIR_N_DOCS;
+    let top_k = DEFAULT_RESERVOIR_TOP_K;
 
-    let flat = corpus(n_docs, dim, n_cent, /*seed=*/ 19);
+    let flat = corpus(
+        n_docs,
+        dim,
+        n_cent,
+        /*seed=*/ DEFAULT_RESERVOIR_CORPUS_SEED,
+    );
     // Same call site as the test above but without the override,
     // so the default sample size (100K) is in effect; reservoir
     // holds the full 200-doc corpus.
@@ -206,7 +237,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         column: "v".into(),
         dim,
         n_cent,
-        rot_seed: 7,
+        rot_seed: ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
     })
@@ -217,14 +248,14 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
     }
     let bytes = b.finish().expect("finish vector builder");
     let json = format!(
-        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
+        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":{ROT_SEED},"metric":"cosine"}}]"#
     );
     let reader = VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader");
 
     for q_idx in [0usize, 73, 142, 199] {
         let query = &flat[q_idx * dim..(q_idx + 1) * dim];
         let approx: Vec<u32> = reader
-            .search("v", query, top_k, n_cent, /*rerank_mult=*/ 40)
+            .search("v", query, top_k, n_cent, DEFAULT_RESERVOIR_RERANK_MULT)
             .expect("search")
             .into_iter()
             .map(|(d, _)| d)

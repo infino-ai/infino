@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Crash safety for the persisted supertable commit path on
 //! LocalFS.
 //!
@@ -20,7 +23,7 @@
 //!     Any segment / manifest-part / manifest-list bytes
 //!     written before the crash but never referenced by a
 //!     committed pointer are **orphans**: tolerated by
-//!     readers and GC'd by 004's compaction.
+//!     readers and GC'd by compaction.
 //!   - The pointer file has been atomically replaced with
 //!     the new version → open returns the new state. The
 //!     crash happened AFTER the visibility barrier; the
@@ -44,7 +47,7 @@
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
 //! filesystem behavior; s3s-fs's crash story is its own
-//! concern (and not gated on M12).
+//! concern.
 
 #![deny(clippy::unwrap_used)]
 
@@ -74,6 +77,10 @@ const KP_LIST_FIRST: &str = "list-1";
 const KP_SEG_SECOND: &str = "seg-2";
 const KP_LIST_SECOND: &str = "list-2";
 const KP_POINTER_SECOND: &str = "pointer-2";
+
+/// Exit code used when the crash child finishes WITHOUT aborting —
+/// signals a misconfigured kill point (distinct from a clean exit).
+const MISCONFIGURED_KILL_POINT_EXIT_CODE: i32 = 2;
 
 /// Storage wrapper that aborts the process after the N-th
 /// PUT whose URI starts with `trigger_path_prefix` returns
@@ -218,7 +225,7 @@ fn run_crash_child(dir: PathBuf, kill_point: &str) -> ! {
         "CRASH-CHILD: completed {n_commits} commits without aborting (kill_point={kill_point}) — \
          test configuration is wrong"
     );
-    std::process::exit(2);
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
 }
 
 /// Spawn a child copy of this test binary, filtered to a
@@ -361,7 +368,7 @@ fn crash_post_list_on_second_commit_yields_v1() {
     assert_eq!(consumer.reader().n_superfiles(), 1);
 
     // Orphan v2 manifest list and v2 part are on disk —
-    // M12 tolerates them; 004's compaction GCs them.
+    // tolerated here; compaction GCs them later.
     let lists_dir = dir.join("manifest-lists");
     let n_lists = std::fs::read_dir(&lists_dir)
         .map(|rd| rd.count())

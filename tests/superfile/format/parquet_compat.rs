@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Open-format compatibility oracle: a superfile, read via vanilla
 //! DataFusion, must return exact expected counts and column values
 //! for the planted corpus.
@@ -37,6 +40,25 @@ use infino::test_helpers::{decimal128_ids, default_tokenizer, default_vector_con
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Random-rotation seed for the planted superfile's vector index.
+const PARQUET_COMPAT_ROT_SEED: u64 = 7;
+/// Planted-corpus document count.
+const PARQUET_COMPAT_N_DOCS: u32 = 6;
+/// Embedding dimension (matches `default_vector_config`).
+const PARQUET_COMPAT_EMB_DIM: usize = 16;
+/// Secondary one-hot axis weight planted in each doc vector.
+const PARQUET_COMPAT_SECONDARY_WEIGHT: f32 = 0.1;
+/// Planted category distribution counts.
+const COUNT_RUST: i64 = 3;
+const COUNT_PYTHON: i64 = 2;
+const COUNT_GO: i64 = 1;
+/// Inclusive `doc_id` BETWEEN bounds for the predicate-pushdown test.
+const FILTER_LO: i128 = 102;
+const FILTER_HI: i128 = 104;
+
 /// Build a planted superfile with FTS + vector indexes alongside
 /// scalar columns. Returns the bytes ready to write to a temp file.
 ///
@@ -46,7 +68,11 @@ use tempfile::NamedTempFile;
 ///   - `score` column has known values for direct extraction
 fn build_planted_superfile() -> Bytes {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("category", DataType::LargeUtf8, false),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
@@ -56,7 +82,7 @@ fn build_planted_superfile() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![default_vector_config("emb", 7)],
+        vec![default_vector_config("emb", PARQUET_COMPAT_ROT_SEED)],
         Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -78,11 +104,12 @@ fn build_planted_superfile() -> Bytes {
     .expect("build RecordBatch");
 
     // Build deterministic unit-norm vectors so cosine doesn't NaN.
-    let mut flat = Vec::<f32>::with_capacity(6 * 16);
-    for i in 0..6u32 {
-        let mut v = vec![0.0f32; 16];
-        v[(i as usize) % 16] = 1.0;
-        v[((i as usize) + 1) % 16] = 0.1;
+    let mut flat =
+        Vec::<f32>::with_capacity(PARQUET_COMPAT_N_DOCS as usize * PARQUET_COMPAT_EMB_DIM);
+    for i in 0..PARQUET_COMPAT_N_DOCS {
+        let mut v = vec![0.0f32; PARQUET_COMPAT_EMB_DIM];
+        v[(i as usize) % PARQUET_COMPAT_EMB_DIM] = 1.0;
+        v[((i as usize) + 1) % PARQUET_COMPAT_EMB_DIM] = PARQUET_COMPAT_SECONDARY_WEIGHT;
         normalize(&mut v);
         flat.extend_from_slice(&v);
     }
@@ -128,7 +155,10 @@ async fn datafusion_reads_superfile_as_plain_parquet_count_matches() {
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("count is Int64")
         .value(0);
-    assert_eq!(n, 6, "DataFusion sees 6 rows in the superfile");
+    assert_eq!(
+        n, PARQUET_COMPAT_N_DOCS as i64,
+        "DataFusion sees 6 rows in the superfile"
+    );
 }
 
 #[tokio::test]
@@ -204,9 +234,9 @@ async fn datafusion_groupby_yields_correct_per_category_counts() {
     assert_eq!(
         got,
         vec![
-            ("go".to_string(), 1),
-            ("python".to_string(), 2),
-            ("rust".to_string(), 3),
+            ("go".to_string(), COUNT_GO),
+            ("python".to_string(), COUNT_PYTHON),
+            ("rust".to_string(), COUNT_RUST),
         ],
         "GROUP BY counts must match planted distribution"
     );
@@ -267,11 +297,11 @@ async fn datafusion_predicate_pushdown_does_not_break_on_inf_kv_metadata() {
     let ctx = datafusion_ctx_for(&f).await;
 
     let df = ctx
-        .sql(
+        .sql(&format!(
             "SELECT category, doc_id FROM docs \
-             WHERE doc_id BETWEEN 102 AND 104 \
+             WHERE doc_id BETWEEN {FILTER_LO} AND {FILTER_HI} \
              ORDER BY doc_id",
-        )
+        ))
         .await
         .expect("await async result");
     let batches = df.collect().await.expect("collect record batches");
@@ -281,5 +311,5 @@ async fn datafusion_predicate_pushdown_does_not_break_on_inf_kv_metadata() {
         .downcast_ref::<Decimal128Array>()
         .expect("downcast");
     let collected: Vec<i128> = (0..ids.len()).map(|i| ids.value(i)).collect();
-    assert_eq!(collected, vec![102, 103, 104]);
+    assert_eq!(collected, (FILTER_LO..=FILTER_HI).collect::<Vec<i128>>());
 }

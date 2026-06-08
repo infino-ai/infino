@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SupertableWriter::update` + `delete` integration tests.
 //!
 //! Drive the public mutation API end-to-end: buffer mutations
@@ -19,19 +22,32 @@ use infino::supertable::mutations::MutationError;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 
+/// Disk-cache byte budget (1 GiB) for the mutation integration cache.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams for the test disk cache.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk size (1 MiB).
+const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
+/// Background prefetch concurrency for the hybrid cache.
+const PREFETCH_CONCURRENCY: usize = 8;
+/// Mmap promotion timers disabled in tests (no idle eviction).
+const MMAP_TIMER_DISABLED_SECS: u64 = 0;
+/// BM25 top-k for post-mutation FTS queries.
+const FTS_TOP_K: usize = 10;
+
 fn make_disk_cache(
     storage: Arc<dyn StorageProvider>,
     cache_root: &std::path::Path,
 ) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
-        prefetch_concurrency: 8,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
+        prefetch_concurrency: PREFETCH_CONCURRENCY,
+        mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
+        mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
     };
@@ -101,7 +117,7 @@ async fn writer_delete_tombstones_matching_rows() {
     // Follow-up FTS query against the deleted token returns no
     // hits.
     let hits = st
-        .bm25_search("title", "bravo", 10, BoolMode::Or)
+        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or)
         .expect("fts");
     assert!(hits.is_empty(), "expected zero hits for tombstoned token");
 }

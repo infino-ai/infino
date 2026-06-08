@@ -1,7 +1,10 @@
-//! 003 M11 — OCC on the manifest pointer (cross-process commits).
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! OCC on the manifest pointer (cross-process commits).
 //!
-//! Plan §M11 calls for "fork two children, each commits
-//! concurrently, verify manifest-id sequence + final state."
+//! Two children fork, each commits concurrently, and the test
+//! verifies the manifest-id sequence + final state.
 //! This file simulates the cross-process scenario via two
 //! independent `Supertable` handles sharing the same on-disk
 //! storage. Each handle owns its own `writer_outstanding`
@@ -27,6 +30,11 @@ use std::sync::Arc;
 use infino::supertable::Supertable;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Sentinel retry count asserted to plumb through the options builder.
+const MAX_RETRIES_SENTINEL: u32 = 42;
+/// Generous retry budget so contending commits eventually all land.
+const CONTENTION_MAX_RETRIES: u32 = 20;
 use tempfile::TempDir;
 
 /// Two independent handles racing to commit. The OCC retry
@@ -242,8 +250,8 @@ async fn retry_winner_sees_loser_segments_in_final_manifest() {
 /// Sequential commits across two handles — the second
 /// handle's first commit reads the persisted pointer + parts
 /// and chains its commit at manifest_id = 2 without ever
-/// hitting contention. Sanity check that the M11 path
-/// degenerates cleanly to the M10 non-contended case when no
+/// hitting contention. Sanity check that the contended-commit
+/// path degenerates cleanly to the non-contended case when no
 /// race occurs.
 #[test]
 fn sequential_commits_across_handles_no_retry_needed() {
@@ -301,8 +309,8 @@ async fn max_commit_retries_is_plumbed_through_options() {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let opts = default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_max_commit_retries(42);
-        assert_eq!(opts.max_commit_retries, 42);
+            .with_max_commit_retries(MAX_RETRIES_SENTINEL);
+        assert_eq!(opts.max_commit_retries, MAX_RETRIES_SENTINEL);
     }
 
     // Concurrent commit with raised retries — same outcome
@@ -315,13 +323,13 @@ async fn max_commit_retries_is_plumbed_through_options() {
     let st_a = Supertable::create(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_max_commit_retries(20),
+            .with_max_commit_retries(CONTENTION_MAX_RETRIES),
     )
     .expect("create");
     let st_b = Supertable::create(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_max_commit_retries(20),
+            .with_max_commit_retries(CONTENTION_MAX_RETRIES),
     )
     .expect("create");
 

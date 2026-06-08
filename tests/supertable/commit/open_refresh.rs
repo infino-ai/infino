@@ -1,4 +1,7 @@
-//! `Supertable::open` + read-path freshness (`Consistency`) — 003 M10.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! `Supertable::open` + read-path freshness (`Consistency`).
 //!
 //! Covers, entirely through the public API:
 //! - open against a persisted supertable written by another
@@ -28,6 +31,11 @@ use infino::supertable::options::Consistency;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::{OpenError, Supertable, SupertableOptions};
 use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
+
+/// BM25 top-k for the open/refresh consistency queries.
+const BM25_TOP_K: usize = 10;
+/// Single-thread rayon pool for the mismatched-schema test.
+const RAYON_POOL_THREADS: usize = 1;
 use tempfile::TempDir;
 
 #[test]
@@ -54,10 +62,10 @@ fn open_sees_writes_made_by_a_different_handle() {
     assert_eq!(consumer.reader().n_superfiles(), 1);
     // Note: full query parity post-open requires the deferred
     // query-path integration through `DiskCacheStore` —
-    // M10's reader sees the manifest's segment list but
+    // the reader sees the manifest's segment list but
     // segment *bytes* live only in object storage and aren't
     // yet routed through the cache. That wiring is the next
-    // step. M10 validates the manifest-side open here; an
+    // step. This test validates the manifest-side open here; an
     // end-to-end query test on a post-open Supertable lands
     // when the cache-backed reader path ships.
 }
@@ -125,7 +133,7 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
     // A strongly-consistent query re-checks the pointer and serves
     // against the latest manifest — picking up the new commit.
     let hits = consumer
-        .bm25_search("title", "added", 10, BoolMode::Or)
+        .bm25_search("title", "added", BM25_TOP_K, BoolMode::Or)
         .expect("query under strong consistency");
     assert!(!hits.is_empty(), "strong query must see the v2 row");
     assert_eq!(consumer.manifest_id(), 2);
@@ -168,7 +176,7 @@ fn strong_consistency_query_is_stable_when_pointer_unchanged() {
     // No producer commits between open and query: the pointer hasn't
     // advanced, so the strongly-consistent query stays at v1.
     let _ = consumer
-        .bm25_search("title", "only", 10, BoolMode::Or)
+        .bm25_search("title", "only", BM25_TOP_K, BoolMode::Or)
         .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
 }
@@ -189,7 +197,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
     )
     .expect("create");
     let hits = st
-        .bm25_search("title", "anything", 10, BoolMode::Or)
+        .bm25_search("title", "anything", BM25_TOP_K, BoolMode::Or)
         .expect("query on uncommitted table");
     assert!(hits.is_empty());
     assert_eq!(st.manifest_id(), 0);
@@ -197,7 +205,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
 
 #[test]
 fn open_rejects_mismatched_options_via_options_hash() {
-    // D15: a producer commits with one schema; opening with
+    // A producer commits with one schema; opening with
     // a structurally-different schema (different column
     // name) must surface a typed `OptionsHashMismatch`
     // before any decode work happens.
@@ -226,7 +234,7 @@ fn open_rejects_mismatched_options_via_options_hash() {
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );
@@ -252,7 +260,7 @@ fn open_rejects_mismatched_options_via_options_hash() {
 
 #[test]
 fn open_with_matching_options_succeeds_under_options_hash_validation() {
-    // D15 happy path: producer + consumer with identical
+    // Happy path: producer + consumer with identical
     // options round-trip cleanly.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =

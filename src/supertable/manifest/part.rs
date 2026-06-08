@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `ManifestPart` — one node of the two-tier manifest.
 //!
 //! A part is a bounded collection of `SuperfileEntry` records,
@@ -31,6 +34,50 @@ use crate::supertable::manifest::{SubsectionOffsets, SuperfileEntry};
 /// supported range is `>=1.0 <2.0`.
 pub const FORMAT_VERSION: &str = "1.0";
 
+/// Blake3 digest width in bytes. Blake3 emits a 256-bit (32-byte)
+/// digest; this is the length of a [`ContentHash`]'s payload and the
+/// buffer size when decoding one from hex.
+pub(crate) const BLAKE3_DIGEST_BYTES: usize = 32;
+
+/// Length of a Blake3 digest in lowercase hex — two characters per
+/// digest byte. Used to pre-size and validate `blake3:<hex>` strings.
+pub(crate) const BLAKE3_HEX_LEN: usize = BLAKE3_DIGEST_BYTES * 2;
+
+/// Number of leading hex characters of a content hash shown in
+/// `Debug` output, trading full identification for readable logs.
+const CONTENT_HASH_DEBUG_HEX_PREFIX_LEN: usize = 8;
+
+/// Width of a little-endian `u32` field in the packed
+/// subsection-offsets blob.
+const U32_BYTES: usize = 4;
+/// Width of a little-endian `u64` field in the packed
+/// subsection-offsets blob.
+const U64_BYTES: usize = 8;
+
+/// Current `subsection_offsets` encoding version. Version 3 appends
+/// the inline open-batch blob; version 2 (still accepted on read)
+/// has none.
+const SUBSECTION_OFFSETS_VERSION_CURRENT: u8 = 3;
+/// Oldest `subsection_offsets` encoding version still accepted on
+/// read (no open-batch blob).
+const SUBSECTION_OFFSETS_VERSION_LEGACY: u8 = 2;
+
+/// Presence flag byte: the optional subsection (vec or fts) is
+/// present and its `(offset, length)` pair follows.
+const SUBSECTION_FLAG_PRESENT: u8 = 1;
+/// Presence flag byte: the optional subsection is absent.
+const SUBSECTION_FLAG_ABSENT: u8 = 0;
+
+/// Width of the Avro `fixed` id columns (`id_min` / `id_max`): a
+/// 128-bit id stored big-endian as 16 bytes. Must match the `size`
+/// in the Avro schema string.
+const ID_COLUMN_FIXED_BYTES: usize = 16;
+
+/// Avro optional-field union arm index for the `null` branch.
+const AVRO_UNION_NULL_INDEX: u32 = 0;
+/// Avro optional-field union arm index for the present-value branch.
+const AVRO_UNION_VALUE_INDEX: u32 = 1;
+
 /// Content hash of a manifest part — blake3 of the
 /// compressed (zstd) Avro bytes. The hex form is the URI
 /// suffix used in the storage layer.
@@ -40,7 +87,7 @@ pub const FORMAT_VERSION: &str = "1.0";
 /// "reuse-by-uri across manifest versions" optimization
 /// rides on.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct ContentHash(pub [u8; 32]);
+pub struct ContentHash(pub [u8; BLAKE3_DIGEST_BYTES]);
 
 impl ContentHash {
     /// Hash a byte slice.
@@ -51,7 +98,7 @@ impl ContentHash {
 
     /// Hex representation, lower-case, 64 chars.
     pub fn to_hex(&self) -> String {
-        let mut out = String::with_capacity(64);
+        let mut out = String::with_capacity(BLAKE3_HEX_LEN);
         for byte in self.0 {
             out.push_str(&format!("{byte:02x}"));
         }
@@ -63,7 +110,11 @@ impl std::fmt::Debug for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Show only the first 8 hex chars in Debug to keep
         // logs readable. Use `to_hex()` for the full form.
-        write!(f, "blake3:{}…", &self.to_hex()[..8])
+        write!(
+            f,
+            "blake3:{}…",
+            &self.to_hex()[..CONTENT_HASH_DEBUG_HEX_PREFIX_LEN]
+        )
     }
 }
 
@@ -210,11 +261,11 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                 ("n_docs".into(), AvroValue::Long(seg.n_docs as i64)),
                 (
                     "id_min".into(),
-                    AvroValue::Fixed(16, seg.id_min.to_be_bytes().to_vec()),
+                    AvroValue::Fixed(ID_COLUMN_FIXED_BYTES, seg.id_min.to_be_bytes().to_vec()),
                 ),
                 (
                     "id_max".into(),
-                    AvroValue::Fixed(16, seg.id_max.to_be_bytes().to_vec()),
+                    AvroValue::Fixed(ID_COLUMN_FIXED_BYTES, seg.id_max.to_be_bytes().to_vec()),
                 ),
                 (
                     "partition_key".into(),
@@ -223,8 +274,11 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                 (
                     "partition_hint".into(),
                     match seg.partition_hint {
-                        Some(b) => AvroValue::Union(1, Box::new(AvroValue::Int(b as i32))),
-                        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+                        Some(b) => AvroValue::Union(
+                            AVRO_UNION_VALUE_INDEX,
+                            Box::new(AvroValue::Int(b as i32)),
+                        ),
+                        None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
                     },
                 ),
                 ("scalar_stats".into(), AvroValue::Bytes(scalar_bytes)),
@@ -234,10 +288,10 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                     "subsection_offsets".into(),
                     match &seg.subsection_offsets {
                         Some(off) => AvroValue::Union(
-                            1,
+                            AVRO_UNION_VALUE_INDEX,
                             Box::new(AvroValue::Bytes(encode_subsection_offsets(off))),
                         ),
-                        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+                        None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
                     },
                 ),
             ])
@@ -339,7 +393,7 @@ fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
 
     // `subsection_offsets` lands as a separate
     // optional bytes field below. Parsed if present; defaulted to
-    // None for pre-M6 manifests so old parts decode losslessly
+    // None for older manifests so old parts decode losslessly
     // (the cold-open path falls back to the 2-RTT shape).
     let subsection_offsets = take_optional_bytes(&mut map, "subsection_offsets")?
         .map(|b| decode_subsection_offsets(&b))
@@ -410,10 +464,10 @@ fn take_i128_be(
     name: &'static str,
 ) -> Result<i128, PartParseError> {
     let bytes = match map.remove(name).ok_or(PartParseError::MissingField(name))? {
-        AvroValue::Fixed(16, b) => b,
+        AvroValue::Fixed(ID_COLUMN_FIXED_BYTES, b) => b,
         _ => return Err(PartParseError::WrongFieldType(name)),
     };
-    let arr: [u8; 16] = bytes
+    let arr: [u8; ID_COLUMN_FIXED_BYTES] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| PartParseError::WrongFieldType(name))?;
@@ -438,7 +492,7 @@ fn take_optional_int(
 
 /// Pull an optional bytes field. Missing-key returns `Ok(None)` so
 /// new schema fields stay backward-compatible with parts emitted
-/// before they were added (plan 013 M6 `subsection_offsets`).
+/// before they were added (e.g. `subsection_offsets`).
 fn take_optional_bytes(
     map: &mut HashMap<String, AvroValue>,
     name: &'static str,
@@ -473,23 +527,23 @@ fn encode_subsection_offsets(off: &SubsectionOffsets) -> Vec<u8> {
             + 4
             + off.fts_open_ranges.len() * 16,
     );
-    out.push(3u8); // version (3 adds open_blob; 2 had none)
+    out.push(SUBSECTION_OFFSETS_VERSION_CURRENT);
     out.extend_from_slice(&off.total_size.to_le_bytes());
     match off.vec {
         Some((o, l)) => {
-            out.push(1);
+            out.push(SUBSECTION_FLAG_PRESENT);
             out.extend_from_slice(&o.to_le_bytes());
             out.extend_from_slice(&l.to_le_bytes());
         }
-        None => out.push(0),
+        None => out.push(SUBSECTION_FLAG_ABSENT),
     }
     match off.fts {
         Some((o, l)) => {
-            out.push(1);
+            out.push(SUBSECTION_FLAG_PRESENT);
             out.extend_from_slice(&o.to_le_bytes());
             out.extend_from_slice(&l.to_le_bytes());
         }
-        None => out.push(0),
+        None => out.push(SUBSECTION_FLAG_ABSENT),
     }
     encode_range_list(&mut out, &off.vec_open_ranges);
     encode_range_list(&mut out, &off.fts_open_ranges);
@@ -531,22 +585,22 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
         Ok(out)
     };
     let read_u64 = |cur: &mut &[u8]| -> Result<u64, PartParseError> {
-        let b = take(cur, 8)?;
-        let arr: [u8; 8] = b
+        let b = take(cur, U64_BYTES)?;
+        let arr: [u8; U64_BYTES] = b
             .as_slice()
             .try_into()
             .map_err(|_| PartParseError::SchemaMismatch("subsection_offsets u64 read".into()))?;
         Ok(u64::from_le_bytes(arr))
     };
     let ver = take(&mut cur, 1)?[0];
-    if ver != 2 && ver != 3 {
+    if ver != SUBSECTION_OFFSETS_VERSION_LEGACY && ver != SUBSECTION_OFFSETS_VERSION_CURRENT {
         return Err(PartParseError::SchemaMismatch(format!(
             "subsection_offsets unknown version {ver}"
         )));
     }
     let total_size = read_u64(&mut cur)?;
     let vec_flag = take(&mut cur, 1)?[0];
-    let vec = if vec_flag == 1 {
+    let vec = if vec_flag == SUBSECTION_FLAG_PRESENT {
         let o = read_u64(&mut cur)?;
         let l = read_u64(&mut cur)?;
         Some((o, l))
@@ -554,7 +608,7 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
         None
     };
     let fts_flag = take(&mut cur, 1)?[0];
-    let fts = if fts_flag == 1 {
+    let fts = if fts_flag == SUBSECTION_FLAG_PRESENT {
         let o = read_u64(&mut cur)?;
         let l = read_u64(&mut cur)?;
         Some((o, l))
@@ -565,7 +619,7 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
     let fts_open_ranges = decode_range_list(&mut cur, &read_u64, &take)?;
     // Version 3 appends the inline open-batch blob; version 2 has
     // none (and leaves `cur` empty here).
-    let open_blob = if ver >= 3 {
+    let open_blob = if ver >= SUBSECTION_OFFSETS_VERSION_CURRENT {
         decode_open_blob(&mut cur, &read_u64, &take)?
     } else {
         Vec::new()
@@ -590,7 +644,7 @@ fn decode_open_blob(
     read_u64: &impl Fn(&mut &[u8]) -> Result<u64, PartParseError>,
     take: &impl Fn(&mut &[u8], usize) -> Result<Vec<u8>, PartParseError>,
 ) -> Result<Vec<(u64, Vec<u8>)>, PartParseError> {
-    let count_bytes = take(cur, 4)?;
+    let count_bytes = take(cur, U32_BYTES)?;
     let count = u32::from_le_bytes(
         count_bytes
             .as_slice()
@@ -600,7 +654,7 @@ fn decode_open_blob(
     let mut blob = Vec::with_capacity(count);
     for _ in 0..count {
         let off = read_u64(cur)?;
-        let len_bytes = take(cur, 4)?;
+        let len_bytes = take(cur, U32_BYTES)?;
         let len = u32::from_le_bytes(
             len_bytes
                 .as_slice()
@@ -618,7 +672,7 @@ fn decode_range_list(
     read_u64: &impl Fn(&mut &[u8]) -> Result<u64, PartParseError>,
     take: &impl Fn(&mut &[u8], usize) -> Result<Vec<u8>, PartParseError>,
 ) -> Result<Vec<(u64, u64)>, PartParseError> {
-    let count_bytes = take(cur, 4)?;
+    let count_bytes = take(cur, U32_BYTES)?;
     let count = u32::from_le_bytes(count_bytes.as_slice().try_into().map_err(|_| {
         PartParseError::SchemaMismatch("subsection_offsets range count read".into())
     })?) as usize;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! [`DiskCacheStore`] — Tier 1 cache wrapping a
 //! [`StorageProvider`] with parallel cold-fetch + LRU
 //! eviction.
@@ -22,6 +25,33 @@ use crate::superfile::PrefetchedSource;
 use crate::superfile::reader::{OpenOptions, SuperfileReader};
 use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
 
+/// Parquet footer tail-speculation length for cold opens. Must match
+/// `SuperfileReader::open_lazy_with` so the cold-fetch overlay covers
+/// the entire upcoming `source.tail()` read.
+const PARQUET_TAIL_SPEC_BYTES: u64 = 64 * 1024;
+
+/// Fallback vector-subsection open-range length when the manifest
+/// carries only a `(offset, len)` hint without explicit open ranges.
+/// Enough bytes to parse the vector outer header; the reader then
+/// discovers the rest.
+const VECTOR_OPEN_HEADER_FALLBACK_BYTES: u64 = 32;
+
+/// Fallback FTS open-range length under the same conditions as
+/// [`VECTOR_OPEN_HEADER_FALLBACK_BYTES`]. Enough to parse the FTS
+/// blob header.
+const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
+
+/// Poll cadence while waiting for another task to mmap-promote a
+/// segment. Short so the waiter picks up the promotion promptly
+/// without busy-spinning.
+const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Yield cadence in the background-fill upgrade loop. Gives a
+/// short-lived caller (e.g. a cold benchmark with a fresh cache per
+/// iteration) a scheduling turn to drop the cache before a
+/// full-segment fill starts.
+const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
@@ -31,6 +61,12 @@ pub enum DiskCacheError {
     Io(#[from] std::io::Error),
     #[error("superfile reader failed to open mmap'd bytes: {0}")]
     SuperfileOpen(String),
+    /// The cached / freshly-fetched superfile bytes failed to
+    /// parse. The source [`crate::superfile::ReadError`] chain is
+    /// preserved so callers that want variant-level detail can
+    /// match on it instead of a stringified message.
+    #[error("superfile reader failed to open bytes")]
+    SuperfileOpenRead(#[from] crate::superfile::ReadError),
     /// Eviction couldn't free enough space because every
     /// cached entry was pinned (or there were no cached
     /// entries and the incoming segment alone exceeds the
@@ -323,7 +359,7 @@ impl DiskCacheStore {
     /// instead of doing the parquet footer first and the
     /// subsection fetches second (2 RTTs).
     ///
-    /// `None` falls back to the pre-M6 2-RTT shape — same shape,
+    /// `None` falls back to the 2-RTT shape — same shape,
     /// slower. The other cold-fetch modes (`HybridWithPrefetch`,
     /// `RangeOnly`) ignore the hint today.
     pub async fn reader_with_hints(
@@ -377,9 +413,8 @@ impl DiskCacheStore {
         // Range-only is also a lazy reader over object storage. A full CRC
         // scan here would turn a fallback path meant to issue targeted
         // ranges into a whole-segment read.
-        let reader = SuperfileReader::open_lazy_with(range_src, OpenOptions { verify_crc: false })
-            .await
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        let reader =
+            SuperfileReader::open_lazy_with(range_src, OpenOptions { verify_crc: false }).await?;
         Ok(Arc::new(reader))
     }
 
@@ -484,7 +519,7 @@ impl DiskCacheStore {
             if self.is_mmap_promoted(uri) {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(MMAP_PROMOTION_POLL_INTERVAL).await;
         }
         Err(DiskCacheError::SuperfileOpen(format!(
             "segment {uri:?} not mmap-promoted within {timeout:?}"
@@ -508,8 +543,8 @@ impl DiskCacheStore {
     /// [`Supertable::create`](crate::supertable::Supertable::create)
     /// / [`Supertable::open`](crate::supertable::Supertable::open)
     /// to install a `Weak<SupertableInner>`-based closure
-    /// after the cache has been moved into the supertable
-    /// (M14b.1). The new closure takes effect on the next
+    /// after the cache has been moved into the supertable.
+    /// The new closure takes effect on the next
     /// eviction sweep; in-flight evictions complete with the
     /// previous closure (we clone the `Arc` before invoking).
     ///
@@ -528,7 +563,7 @@ impl DiskCacheStore {
     /// on the cache's resident memory — actual RSS is some
     /// subset (only pages that have been faulted in and not
     /// yet `madvise(MADV_DONTNEED)`'d by a sweep). Used by
-    /// [`crate::supertable::Supertable::stats`] (M14c) to
+    /// [`crate::supertable::Supertable::stats`] to
     /// report `mmap_resident_bytes` and to drive the
     /// budget-aware sweep in [`Self::sweep_for_budget`].
     pub fn current_mmap_size_bytes(&self) -> u64 {
@@ -697,8 +732,7 @@ impl DiskCacheStore {
                 OpenOptions {
                     verify_crc: self.config.verify_crc_on_open,
                 },
-            )
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+            )?;
 
             let entry = Arc::new(CachedEntry {
                 reader: Arc::new(reader),
@@ -876,8 +910,7 @@ impl DiskCacheStore {
             OpenOptions {
                 verify_crc: self.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
         let foreground_reader = Arc::new(foreground_reader);
 
         // 4. Construct a CachedEntry with the foreground
@@ -997,8 +1030,7 @@ impl DiskCacheStore {
             // Match `SuperfileReader::open_lazy_with`'s parquet tail
             // speculation length so the overlay covers the entire
             // upcoming `source.tail()` call.
-            let parquet_tail_spec: u64 = 64 * 1024;
-            let parquet_tail_len = parquet_tail_spec.min(total_size);
+            let parquet_tail_len = PARQUET_TAIL_SPEC_BYTES.min(total_size);
             let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
 
             // Seed the inner lazy readers with exact open-time metadata
@@ -1008,7 +1040,9 @@ impl DiskCacheStore {
                 offsets.vec_open_ranges.clone()
             } else {
                 match offsets.vec {
-                    Some((off, len)) if len > 0 => vec![(off, 32u64.min(len))],
+                    Some((off, len)) if len > 0 => {
+                        vec![(off, VECTOR_OPEN_HEADER_FALLBACK_BYTES.min(len))]
+                    }
                     _ => Vec::new(),
                 }
             };
@@ -1016,7 +1050,9 @@ impl DiskCacheStore {
                 offsets.fts_open_ranges.clone()
             } else {
                 match offsets.fts {
-                    Some((off, len)) if len > 0 => vec![(off, 48u64.min(len))],
+                    Some((off, len)) if len > 0 => {
+                        vec![(off, FTS_OPEN_HEADER_FALLBACK_BYTES.min(len))]
+                    }
                     _ => Vec::new(),
                 }
             };
@@ -1042,7 +1078,8 @@ impl DiskCacheStore {
                     overlay.install(*off, Bytes::copy_from_slice(bytes));
                 }
             } else {
-                // Pre-M7 fallback: fetch the open batch over the wire
+                // Fallback when no captured open blob is present:
+                // fetch the open batch over the wire
                 // (parquet tail + vec + fts ranges in parallel, 1 RTT).
                 let storage_for_parquet = Arc::clone(&self.storage);
                 let storage_for_vec = Arc::clone(&self.storage);
@@ -1091,8 +1128,7 @@ impl DiskCacheStore {
                 Arc::clone(&source),
                 OpenOptions { verify_crc: false },
             )
-            .await
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+            .await?;
             (lazy_reader, total_size)
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
@@ -1108,8 +1144,7 @@ impl DiskCacheStore {
                 Arc::clone(&range_src),
                 OpenOptions { verify_crc: false },
             )
-            .await
-            .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+            .await?;
             let size = range_src.size();
             (lazy_reader, size)
         };
@@ -1178,8 +1213,7 @@ impl DiskCacheStore {
             OpenOptions {
                 verify_crc: self.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
         let entry = Arc::new(CachedEntry {
             reader: Arc::new(reader),
             mmap: Some(mmap_arc),
@@ -1454,8 +1488,7 @@ async fn finalize_to_mmap(
             OpenOptions {
                 verify_crc: store.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
         // Replace the in-memory-backed entry with the
         // mmap-backed one — but **only if it's still
         // present**. The entry may have been evicted by a
@@ -1541,10 +1574,10 @@ async fn wait_for_lazy_foreground_release(
             // Give short-lived callers (notably cold benchmarks with a
             // fresh cache per iteration) a scheduling turn to drop the
             // cache before we start a full-segment background fill.
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
             return store.upgrade();
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
     }
 }
 
@@ -1645,7 +1678,7 @@ fn rollback_lazy_background_fill(
 /// resolves from mmap (zero S3 GETs).
 /// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
 /// full-segment promotion. When `INFINO_DISABLE_BG_FILL=1` (or
-/// `true`), the cold-fetch path installs the M7 open-blob overlay
+/// `true`), the cold-fetch path installs the open-blob overlay
 /// and serves the foreground query over range GETs, but never
 /// spawns the full-segment background download. Lets us measure
 /// the cold fan-out cost in isolation from the competing
@@ -1723,8 +1756,7 @@ async fn lazy_background_fill(
             OpenOptions {
                 verify_crc: store.config.verify_crc_on_open,
             },
-        )
-        .map_err(|e| DiskCacheError::SuperfileOpen(e.to_string()))?;
+        )?;
 
         // 3. Atomically replace the lazy entry with the
         //    mmap-backed one — but only if it's still

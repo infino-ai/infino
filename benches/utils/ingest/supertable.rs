@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Combined FTS + vector supertable ingest to object storage.
 
 use std::sync::Arc;
@@ -27,6 +30,13 @@ pub const VEC_COLUMN: &str = "emb";
 
 const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
+
+/// Random-rotation RNG seed for the bench vector index.
+const ROT_SEED: u64 = 7;
+/// Writer auto-flush threshold (MiB) per segment roll.
+const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+/// Producer memory budget (8 GiB) capping resident RSS during ingest.
+const WRITER_MEMORY_BUDGET_BYTES: u64 = 8 * (1u64 << 30);
 
 /// Result of one object-storage ingest run.
 pub struct IngestResult {
@@ -104,7 +114,7 @@ pub fn options_for(
             column: VEC_COLUMN.into(),
             dim: DIM,
             n_cent: n_cent_per_segment,
-            rot_seed: 7,
+            rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
         }]
@@ -114,7 +124,7 @@ pub fn options_for(
     let mut opts = SupertableOptions::new(schema_for(modality), fts, vector, Some(tk))
         .expect("opts")
         .with_reader_pool(pool.clone())
-        .with_commit_threshold_size_mb(1024)
+        .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
         .with_writer_pool(pool);
     if let Some(s) = storage {
         opts = opts.with_storage(s);
@@ -141,7 +151,7 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
     let opts = options_for(modality, Some(storage_backend.storage.clone()))
         .with_disk_cache(cache.clone())
-        .with_memory_budget(8 * (1u64 << 30))
+        .with_memory_budget(WRITER_MEMORY_BUDGET_BYTES)
         .with_cache_prepopulation(false);
     let st = Supertable::create(opts).expect("create supertable");
     let mut w = st.writer().expect("writer");

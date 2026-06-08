@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Lex term range — the second skip-pruning summary per FTS column.
 //!
 //! Where the bloom drives **exact-term** skip ("does this segment

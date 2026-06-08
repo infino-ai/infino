@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! K-means clustering — 5-iteration Lloyd's algorithm.
 //!
 //! Used to derive the `n_cent` IVF centroids per vector column at
@@ -28,6 +31,11 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
+
+/// Offset added to a column's `rot_seed` to seed k-means. Keeps the
+/// clustering PRNG stream distinct from the rotation stream, which is
+/// seeded from `rot_seed` directly.
+const KMEANS_SEED_OFFSET: u64 = 7;
 
 /// Run 5-iteration Lloyd k-means and return `k * dim` centroids,
 /// row-major. `vectors` is `n_docs * dim`, also row-major. Drops
@@ -68,7 +76,7 @@ pub fn kmeans_with_assignments(
     assert!(n > 0, "kmeans: at least one doc required");
     assert!(k <= n, "kmeans: k ({k}) > n_docs ({n})");
 
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(7));
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(KMEANS_SEED_OFFSET));
     let mut centroids = vec![0f32; k * dim];
 
     // Init: random sample of input vectors. (Repetition is allowed; for
@@ -169,7 +177,7 @@ pub fn kmeans_with_assignments(
 /// - `assignments.len() != vectors.len() / dim`
 /// - `centroids.len() != k * dim`
 /// - `k == 0` or `dim == 0`
-pub fn assign_to_centroids(
+pub(crate) fn assign_to_centroids(
     vectors: &[f32],
     centroids: &[f32],
     dim: usize,

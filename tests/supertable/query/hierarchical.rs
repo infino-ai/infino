@@ -1,7 +1,10 @@
-//! 003 M15c — hierarchical query path with list-prune
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Hierarchical query path with list-prune
 //! integration.
 //!
-//! Covers the load-bearing M15c invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **List-level bloom-union prune.** With a
 //!     storage-backed multi-part manifest, an exact-term
@@ -13,7 +16,7 @@
 //!     `bm25_search_prefix` for a prefix that overlaps
 //!     one part's range loads only that part.
 //!   - **Vector list-prune deferred but path still
-//!     functional.** `vector_search` in M15c loads all
+//!     functional.** `vector_search` loads all
 //!     parts (iterative-cutoff prune is a follow-up); it
 //!     still must return correct results.
 //!   - **SQL list-prune deferred but path still
@@ -22,7 +25,7 @@
 //!   - **Eager-mode unchanged.** When all parts are
 //!     pre-loaded (n_parts ≤ eager_load_threshold), the
 //!     hierarchical iterator is observationally identical
-//!     to the pre-M15c flat iteration (every
+//!     to the flat iteration (every
 //!     `Manifest::part().await` hits a populated
 //!     OnceCell).
 
@@ -37,6 +40,23 @@ use infino::supertable::Supertable;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Disk-cache byte budget (1 GiB) for the hierarchical-manifest tests.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk size (1 MiB).
+const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
+/// One superfile per manifest part (forces a multi-part list).
+const TARGET_SUPERFILES_PER_PARTITION: u64 = 1;
+/// Eager-load threshold of 0 forces lazy part loading.
+const EAGER_LOAD_THRESHOLD_FORCE_LAZY: u32 = 0;
+/// Part count for the multi-part list fixture.
+const HIERARCHICAL_PART_COUNT: usize = 5;
+/// Rows per part (each commit appends two rows).
+const ROWS_PER_PART: i64 = 2;
+/// BM25 / prefix top-k for the hierarchical queries.
+const BM25_TOP_K: usize = 10;
 use tempfile::TempDir;
 
 fn make_cache(
@@ -45,10 +65,10 @@ fn make_cache(
 ) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -60,7 +80,7 @@ fn make_cache(
 }
 
 /// Build a producer that creates one part per commit (via
-/// target_superfiles_per_partition=1, the M15a split path),
+/// target_superfiles_per_partition=1, the partition-split path),
 /// then drop it. Returns the path to the storage root for
 /// the consumer to open against.
 fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
@@ -68,7 +88,7 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
         Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(1);
+        .with_target_superfiles_per_partition(TARGET_SUPERFILES_PER_PARTITION);
     let producer = Supertable::create(opts).expect("create");
 
     // Each commit's batch uses a distinct vocabulary so the
@@ -104,7 +124,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_eager_load_threshold(0)
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
             .with_disk_cache(Arc::clone(&cache)),
     )
     .expect("open");
@@ -114,7 +134,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
         let r = consumer.reader();
         let m = r.manifest();
         let list = m.list.as_ref().expect("list");
-        assert_eq!(list.parts.len(), 5);
+        assert_eq!(list.parts.len(), HIERARCHICAL_PART_COUNT);
         let loaded = list
             .parts
             .iter()
@@ -133,7 +153,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // four parts; we expect exactly one part loaded post-
     // query.
     let hits = consumer
-        .bm25_search("title", "echo", 10, BoolMode::Or)
+        .bm25_search("title", "echo", BM25_TOP_K, BoolMode::Or)
         .expect("bm25");
     assert!(
         !hits.is_empty(),
@@ -172,7 +192,7 @@ fn bm25_term_in_no_part_loads_nothing() {
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_eager_load_threshold(0)
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
             .with_disk_cache(Arc::clone(&cache)),
     )
     .expect("open");
@@ -182,7 +202,7 @@ fn bm25_term_in_no_part_loads_nothing() {
     // zero parts loaded (other than what the bloom test
     // already rejected without needing the part bytes).
     let hits = consumer
-        .bm25_search("title", "zoo", 10, BoolMode::Or)
+        .bm25_search("title", "zoo", BM25_TOP_K, BoolMode::Or)
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
     // up non-empty if any bloom collides on 'zoo' — but
@@ -226,7 +246,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_eager_load_threshold(0)
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
             .with_disk_cache(Arc::clone(&cache)),
     )
     .expect("open");
@@ -234,7 +254,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     // Prefix "echo" — appears only in part #2. Term-range
     // union should route the prefix to one part.
     let hits = consumer
-        .bm25_search_prefix("title", "ech", 10)
+        .bm25_search_prefix("title", "ech", BM25_TOP_K)
         .expect("prefix");
     assert!(
         !hits.is_empty(),
@@ -269,7 +289,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
 fn sql_loads_all_parts_returns_correct_count() {
     // SQL list-prune is deferred (DataFusion pushdown
     // through MemTable requires a custom TableProvider).
-    // M15c's SQL path loads all parts and returns correct
+    // The SQL path loads all parts and returns correct
     // aggregate results. The "loads all parts" property
     // is documented; the correctness property is asserted
     // here.
@@ -283,7 +303,7 @@ fn sql_loads_all_parts_returns_correct_count() {
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_eager_load_threshold(0)
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
             .with_disk_cache(Arc::clone(&cache)),
     )
     .expect("open");
@@ -299,7 +319,7 @@ fn sql_loads_all_parts_returns_correct_count() {
         .as_any()
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("Int64");
-    assert_eq!(arr.value(0), 10);
+    assert_eq!(arr.value(0), HIERARCHICAL_PART_COUNT as i64 * ROWS_PER_PART);
 
     // Post: all 5 parts loaded (SQL doesn't list-prune).
     let r = consumer.reader();
@@ -316,7 +336,7 @@ fn sql_loads_all_parts_returns_correct_count() {
         })
         .count();
     assert_eq!(
-        n_loaded, 5,
+        n_loaded, HIERARCHICAL_PART_COUNT,
         "SQL loads all parts (list-pushdown deferred); got {n_loaded}/5"
     );
 }
@@ -324,8 +344,8 @@ fn sql_loads_all_parts_returns_correct_count() {
 #[test]
 fn eager_mode_query_paths_observationally_unchanged() {
     // 1 part + default threshold (4) → eager mode. All
-    // query paths return the same results they did pre-
-    // M15c, and the OnceCell is populated from open (not
+    // query paths return the same results as the flat path,
+    // and the OnceCell is populated from open (not
     // first query).
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -365,7 +385,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
 
     // BM25 hits.
     let hits = consumer
-        .bm25_search("title", "alpha", 10, BoolMode::Or)
+        .bm25_search("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("bm25");
     assert!(!hits.is_empty());
 

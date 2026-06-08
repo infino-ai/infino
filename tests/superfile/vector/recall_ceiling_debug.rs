@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 use bytes::Bytes;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::Metric;
@@ -11,19 +14,30 @@ const N_QUERIES: usize = 100;
 const QUERY_SEED: u64 = 99;
 const QUERY_SIGMA: f32 = 0.05;
 
+/// Shift between an `f32` and its high 16 bits (the bf16 payload).
+const F32_HI16_SHIFT: u32 = 16;
+/// `f32` absolute-value mask (clears the sign bit) for NaN detection.
+const F32_ABS_MASK: u32 = 0x7FFF_FFFF;
+/// `f32` bit pattern of +∞; anything greater (abs) is NaN.
+const F32_INF_BITS: u32 = 0x7F80_0000;
+/// Quiet-NaN payload bit set in the bf16 result so NaN stays NaN.
+const BF16_QUIET_NAN_BIT: u32 = 0x0040;
+/// Round-to-nearest-even bias added before truncating to bf16.
+const BF16_ROUND_BIAS: u32 = 0x7FFF;
+
 fn fp32_to_bf16_debug(x: f32) -> u16 {
     let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        ((bits >> 16) | 0x0040) as u16
+    if (bits & F32_ABS_MASK) > F32_INF_BITS {
+        ((bits >> F32_HI16_SHIFT) | BF16_QUIET_NAN_BIT) as u16
     } else {
-        let lsb = (bits >> 16) & 1;
-        let bias = 0x7FFF_u32 + lsb;
-        (bits.wrapping_add(bias) >> 16) as u16
+        let lsb = (bits >> F32_HI16_SHIFT) & 1;
+        let bias = BF16_ROUND_BIAS + lsb;
+        (bits.wrapping_add(bias) >> F32_HI16_SHIFT) as u16
     }
 }
 
 fn bf16_to_f32_debug(bf: u16) -> f32 {
-    f32::from_bits((bf as u32) << 16)
+    f32::from_bits((bf as u32) << F32_HI16_SHIFT)
 }
 
 fn read_u32_le(bytes: &[u8], off: usize) -> u32 {

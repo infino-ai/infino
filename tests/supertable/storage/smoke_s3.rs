@@ -1,4 +1,7 @@
-//! 003 M16 — supertable smoke through the S3 wire protocol.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Supertable smoke through the S3 wire protocol.
 //!
 //! Stands up an in-process s3s-fs server on a random port,
 //! points `S3StorageProvider` at it, and runs a small
@@ -42,7 +45,7 @@
 //!   a fixed dummy credential pair. Real-AWS validation
 //!   requires AWS credentials + a test bucket; out of scope
 //!   for an in-process smoke.
-//! - Concurrent writers (M11's OCC retry is exercised
+//! - Concurrent writers (the OCC retry is exercised
 //!   end-to-end in `tests/supertable_concurrent_processes.rs`
 //!   against LocalFS; the S3 path uses S3 CAS natively, no
 //!   read-then-overwrite window, so behavior is identical
@@ -65,13 +68,28 @@ use infino::supertable::query::VectorSearchOptions;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Single-thread rayon pool for deterministic S3 smoke runs.
+const RAYON_POOL_THREADS: usize = 1;
+/// Vector index shape for the S3 smoke fixture.
+const VECTOR_N_CENT: usize = 4;
+const VECTOR_ROT_SEED: u64 = 17;
+/// Embedding dimension for the vector smoke fixtures.
+const EMB_DIM: usize = 16;
+/// Expected recovered doc count for the S3 round-trip fixtures.
+const EXPECTED_N_DOCS: u64 = 8;
+/// Vector-search top-k and nprobe for the smoke ANN query.
+const VECTOR_SEARCH_K: usize = 3;
+const VECTOR_NPROBE: usize = 4;
+/// BM25 top-k for the smoke FTS query.
+const BM25_TOP_K: usize = 10;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-const TEST_BUCKET: &str = "infino-m16-smoke";
+const TEST_BUCKET: &str = "infino-s3-smoke";
 const TEST_REGION: &str = "us-east-1";
 const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -152,7 +170,7 @@ fn fixed_list_f32(dim: usize) -> DataType {
 fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("single-thread writer pool"),
     );
@@ -168,8 +186,8 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
         vec![VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: 4,
-            rot_seed: 17,
+            n_cent: VECTOR_N_CENT,
+            rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
         }],
@@ -242,7 +260,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
 
     let (addr, _fs_root_guard) = spawn_s3s_fs().await;
     let endpoint = format!("http://{}", addr);
-    eprintln!("[m16] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+    eprintln!("[s3-smoke] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
 
     // Quick provider-level smoke before invoking the full
     // writer path — isolates "the S3 provider works at all"
@@ -258,14 +276,14 @@ async fn supertable_smoke_via_s3_wire_protocol() {
             )
             .expect("s3 provider for probe"),
         );
-        let probe_bytes = bytes::Bytes::from_static(b"hello-m16");
+        let probe_bytes = bytes::Bytes::from_static(b"hello-smoke");
         storage
             .put_atomic("probe/hello.txt", probe_bytes.clone())
             .await
             .expect("probe put_atomic");
         let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
         assert_eq!(got, probe_bytes, "probe round-trip mismatch");
-        eprintln!("[m16] probe round-trip OK (PUT + GET via S3 wire)");
+        eprintln!("[s3-smoke] probe round-trip OK (PUT + GET via S3 wire)");
     }
 
     // Producer: writes through the S3 wire protocol.
@@ -289,7 +307,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         w.commit().expect("producer commit via S3");
         assert_eq!(producer.manifest_id(), 1);
         eprintln!(
-            "[m16] producer commit OK; manifest_id={}",
+            "[s3-smoke] producer commit OK; manifest_id={}",
             producer.manifest_id()
         );
     }
@@ -324,7 +342,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         "recovered n_docs_total mismatch"
     );
     eprintln!(
-        "[m16] consumer open OK; manifest_id={} n_superfiles={} n_docs_total={}",
+        "[s3-smoke] consumer open OK; manifest_id={} n_superfiles={} n_docs_total={}",
         consumer.manifest_id(),
         consumer.reader().n_superfiles(),
         consumer.reader().n_docs_total()
@@ -345,11 +363,11 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         post.n_cold_fetches
     );
     eprintln!(
-        "[m16] cold-fetch via S3 OK; n_cold_fetches={} cache_bytes={}",
+        "[s3-smoke] cold-fetch via S3 OK; n_cold_fetches={} cache_bytes={}",
         post.n_cold_fetches, post.current_bytes
     );
 
-    eprintln!("[m16] smoke done");
+    eprintln!("[s3-smoke] smoke done");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -383,7 +401,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
     let cache_dir = TempDir::new().expect("real S3 cache tempdir");
     let cfg = real_s3_config(&bucket, &prefix, cache_dir.path());
     let result = async {
-        let dim = 16;
+        let dim = EMB_DIM;
         {
             let producer = Supertable::create(
                 real_s3_options(dim)
@@ -425,7 +443,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 consumer.manifest_id()
             ));
         }
-        if consumer.reader().n_docs_total() != 8 {
+        if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
             return Err(format!(
                 "recovered doc count mismatch: got {}",
                 consumer.reader().n_docs_total()
@@ -447,7 +465,12 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         let mut query = vec![0.0f32; dim];
         query[0] = 1.0;
         let vector_hits = consumer
-            .vector_search("emb", &query, 3, VectorSearchOptions::new().with_nprobe(4))
+            .vector_search(
+                "emb",
+                &query,
+                VECTOR_SEARCH_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            )
             .map_err(|e| format!("cold vector search over real S3: {e}"))?;
         if vector_hits.is_empty() {
             return Err("real S3 cold vector search returned no hits".to_string());
@@ -528,8 +551,8 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
 
     let (addr, _fs_root_guard) = spawn_s3s_fs().await;
     let endpoint = format!("http://{}", addr);
-    let dim = 16;
-    eprintln!("[m16-tvf] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+    let dim = EMB_DIM;
+    eprintln!("[s3-smoke-tvf] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
 
     // Producer: writes a title (FTS) + emb (vector) batch
     // through the S3 wire protocol.
@@ -575,7 +598,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     )
     .expect("Supertable::open via S3 (tvf consumer)");
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_docs_total(), 8);
+    assert_eq!(consumer.reader().n_docs_total(), EXPECTED_N_DOCS);
 
     let pre = cache.stats();
 
@@ -597,7 +620,9 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     //    in exactly two titles ("alpha vector one", "alpha
     //    vector two"), so the TVF must return >= 2 rows.
     let bm25 = consumer
-        .query_sql("SELECT _id FROM bm25_search('title', 'alpha', 10)")
+        .query_sql(&format!(
+            "SELECT _id FROM bm25_search('title', 'alpha', {BM25_TOP_K})"
+        ))
         .expect("bm25_search via query_sql over S3");
     assert!(
         count_rows(&bm25) >= 2,
@@ -639,7 +664,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     );
 
     eprintln!(
-        "[m16-tvf] bm25 / vector / hybrid via query_sql over S3 OK; \
+        "[s3-smoke-tvf] bm25 / vector / hybrid via query_sql over S3 OK; \
          n_cold_fetches={} cache_bytes={}",
         post.n_cold_fetches, post.current_bytes
     );

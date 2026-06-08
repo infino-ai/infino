@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! infino — search-optimized lakehouse format.
 //!
 //! A superfile is a valid Apache Parquet file with embedded BM25 + vector

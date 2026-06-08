@@ -67,6 +67,8 @@ const HOT_ITERS: usize = 50;
 /// Cold-tier repetitions per query — each pays a fresh cache + full S3
 /// cold open, so this is deliberately small.
 const COLD_ITERS: usize = 10;
+/// Nanoseconds per second, for throughput / bandwidth markdown.
+const NS_PER_SEC: f64 = 1e9;
 
 // ─── Query battery (shared by hot search, cold tier, recall id grading) ─
 
@@ -526,7 +528,7 @@ fn ingest_row(
     input_bytes: f64,
 ) -> Vec<Cell> {
     let secs = wall.as_secs_f64();
-    let ns = secs * 1e9;
+    let ns = secs * NS_PER_SEC;
     let thr = n_docs as f64 / secs;
     let bw = input_bytes / secs;
     vec![
@@ -619,11 +621,11 @@ fn search_row(
     let mut cells = vec![text(name)];
     match by_name.get(&name) {
         Some(q) => {
-            let hot_ns = q.p50.as_secs_f64() * 1e9;
+            let hot_ns = q.p50.as_secs_f64() * NS_PER_SEC;
             cells.push(metric(hot_ns, fmt_time(hot_ns), Better::Lower));
             match cold.get(&name) {
                 Some(d) => {
-                    let ns = d.as_secs_f64() * 1e9;
+                    let ns = d.as_secs_f64() * NS_PER_SEC;
                     cells.push(metric(ns, fmt_time(ns), Better::Lower));
                 }
                 None => cells.push(text("—")),
@@ -686,8 +688,8 @@ fn emit_search(
         rows: probes
             .iter()
             .map(|(shape, wand, bmm)| {
-                let w = wand.as_secs_f64() * 1e9;
-                let b = bmm.as_secs_f64() * 1e9;
+                let w = wand.as_secs_f64() * NS_PER_SEC;
+                let b = bmm.as_secs_f64() * NS_PER_SEC;
                 vec![
                     text(*shape),
                     metric(w, fmt_time(w), Better::Lower),

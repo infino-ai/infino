@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FST-backed term dictionary.
 //!
 //! The unified FTS blob stores every `(column, term)` pair as a single FST

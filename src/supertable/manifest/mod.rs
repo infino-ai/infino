@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! In-memory manifest types: `Manifest`, `SuperfileEntry`,
 //! `ScalarStatsTable`, `FtsSummary`, `VectorSummary`.
 //!
@@ -364,8 +367,9 @@ pub struct SuperfileEntry {
     /// the values are by construction consistent with what the
     /// parquet KV metadata would later say).
     ///
-    /// `None` on segments produced by pre-M6 writers; the cold
-    /// open path falls back to the 2-RTT shape (parquet tail
+    /// `None` on segments produced by older writers that did not
+    /// stamp this field; the cold open path falls back to the
+    /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
@@ -418,7 +422,8 @@ pub struct SubsectionOffsets {
     /// postings) to 1 (postings only).
     ///
     /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
-    /// produced by pre-M7 writers, or when blob capture is disabled
+    /// produced by older writers that did not capture it, or when
+    /// blob capture is disabled
     /// — the path then falls back to fetching `vec_open_ranges` /
     /// `fts_open_ranges` over the wire.
     pub open_blob: Vec<(u64, Vec<u8>)>,
@@ -641,6 +646,11 @@ pub struct VectorSummary {
     pub clusters: ClusterCentroids,
 }
 
+/// Maximum Sq8 code value. The manifest's per-cluster centroid
+/// summary quantizes each component to a single unsigned byte, so
+/// the per-cluster scale maps `[min, max]` onto `[0, SQ8_CODE_MAX]`.
+const SQ8_CODE_MAX: f32 = 255.0;
+
 /// Per-cluster IVF centroids for one vector column, Sq8-quantized with
 /// per-cluster calibration. Carried in the manifest so a query can rank
 /// every segment's clusters globally — without opening the segment —
@@ -700,13 +710,17 @@ impl ClusterCentroids {
             if !mx.is_finite() {
                 mx = 0.0;
             }
-            let scale = if mx > mn { (mx - mn) / 255.0 } else { 0.0 };
+            let scale = if mx > mn {
+                (mx - mn) / SQ8_CODE_MAX
+            } else {
+                0.0
+            };
             mins[c] = mn;
             scales[c] = scale;
             let dst = &mut codes[c * d..(c + 1) * d];
             for (o, &v) in dst.iter_mut().zip(src) {
                 *o = if scale > 0.0 {
-                    ((v - mn) / scale).round().clamp(0.0, 255.0) as u8
+                    ((v - mn) / scale).round().clamp(0.0, SQ8_CODE_MAX) as u8
                 } else {
                     0
                 };

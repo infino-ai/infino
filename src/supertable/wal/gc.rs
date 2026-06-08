@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! GC sweep for completed WALs + orphaned arrow sidecars.
 //!
 //! Steady state: the writer's tombstone phase deletes its own

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Manifest-level skip pruning helpers.
 //!
 //! Each helper takes a pinned [`Manifest`] snapshot plus a query

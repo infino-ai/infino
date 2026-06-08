@@ -1,4 +1,7 @@
-//! `MADV_DONTNEED` sweep thread — 003 M8.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! `MADV_DONTNEED` sweep thread.
 //!
 //! Covers:
 //! - sweep_once() advises mmap'd entries that have idled past
@@ -11,7 +14,7 @@
 //! - background thread starts when `mmap_cold_threshold_secs > 0`
 //!   and runs at the configured cadence
 //! - threshold=0 disables the sweep thread entirely
-//! - in-memory-bytes-backed entries (M7 hybrid foreground,
+//! - in-memory-bytes-backed entries (hybrid foreground,
 //!   not yet finalized) are skipped — only mmap'd entries
 //!   participate in the sweep
 
@@ -34,9 +37,37 @@ use tempfile::TempDir;
 // Fixtures.
 // ============================================================
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Disk-cache budget (1 GiB) for the sweep tests.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Small cold-fetch chunk to force multi-range fetches.
+const COLD_FETCH_CHUNK_BYTES_SMALL: u64 = 64;
+/// Finalize-poll deadline (ms) when waiting for the post-commit sweep.
+const SWEEP_FINALIZE_POLL_TIMEOUT_MS: u64 = 2_000;
+/// Poll interval (ms) inside the finalize wait loop.
+const SWEEP_POLL_INTERVAL_MS: u64 = 10;
+/// Short post-cold sleep to let background work settle.
+const POST_COLD_SLEEP_MS: u64 = 50;
+/// Idle threshold + sweep interval (seconds) for the skip-fresh test.
+const SWEEP_IDLE_THRESHOLD_SECS: u64 = 3600;
+/// Sweep interval (seconds) for the background-thread-disabled test.
+const SWEEP_INTERVAL_ONE_SEC: u64 = 1;
+/// Wait (ms) proving no background ticks fire when disabled.
+const SWEEP_DISABLED_WAIT_MS: u64 = 1500;
+/// BM25 top-k for the post-sweep query.
+const FTS_TOP_K: usize = 10;
+
 fn build_test_bytes() -> Bytes {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -73,10 +104,10 @@ fn cache_with_threshold(
     let dir = TempDir::new().expect("tempdir");
     let cfg = DiskCacheConfig {
         cache_root: dir.path().to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 64,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES_SMALL,
         mmap_cold_threshold_secs: threshold_secs,
         mmap_sweep_interval_secs: sweep_interval_secs,
         eviction: Box::new(LruPolicy::new()),
@@ -112,7 +143,7 @@ async fn sweep_once_after_finalize(cache: &Arc<DiskCacheStore>, timeout_ms: u64)
         if std::time::Instant::now() >= deadline {
             return n;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(SWEEP_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -139,7 +170,7 @@ async fn sweep_once_advises_mmapped_entries_when_threshold_is_zero() {
     // in-memory entry for the mmap-backed one — sweep only
     // acts on mmap'd entries. threshold=0 means the sweep
     // thread doesn't start automatically; drive it explicitly.
-    let n_advised = sweep_once_after_finalize(&cache, 2_000).await;
+    let n_advised = sweep_once_after_finalize(&cache, SWEEP_FINALIZE_POLL_TIMEOUT_MS).await;
     assert_eq!(
         n_advised, 1,
         "threshold=0 ⇒ every mmap'd entry advised; got {n_advised}"
@@ -167,7 +198,7 @@ async fn data_remains_correct_after_madv_dontneed() {
     // Poll for finalize → sweep; pages should now be advised
     // as DontNeed once the mmap-backed entry replaces the
     // in-memory one.
-    let n_advised = sweep_once_after_finalize(&cache, 2_000).await;
+    let n_advised = sweep_once_after_finalize(&cache, SWEEP_FINALIZE_POLL_TIMEOUT_MS).await;
     assert!(n_advised >= 1, "sweep should advise at least one entry");
 
     // Acquire a fresh reader handle from the cache. The mmap
@@ -175,7 +206,7 @@ async fn data_remains_correct_after_madv_dontneed() {
     let reader = cache.reader(&uri).await.expect("warm after sweep");
     let fts = reader.fts().expect("fts");
     let hits = fts
-        .search("title", &["special"], 10, BoolMode::Or)
+        .search("title", &["special"], FTS_TOP_K, BoolMode::Or)
         .await
         .expect("bm25 after MADV_DONTNEED");
     assert_eq!(
@@ -198,9 +229,10 @@ async fn recent_access_skipped_by_sweep_when_threshold_nonzero() {
 
     // Pick a long threshold + a long cadence (1h) so the
     // background thread doesn't tick during the test.
-    let (_d, cache) = cache_with_threshold(local, 3600, 3600);
+    let (_d, cache) =
+        cache_with_threshold(local, SWEEP_IDLE_THRESHOLD_SECS, SWEEP_IDLE_THRESHOLD_SECS);
     let _r = cache.reader(&uri).await.expect("cold");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(POST_COLD_SLEEP_MS)).await;
 
     // Drive sweep explicitly. Entry is fresh → not advised.
     let n_advised = cache.sweep_once();
@@ -213,7 +245,7 @@ async fn recent_access_skipped_by_sweep_when_threshold_nonzero() {
 
 #[tokio::test]
 async fn in_memory_entries_not_yet_mmapped_are_skipped() {
-    // M7's hybrid path inserts an in-memory entry first,
+    // The hybrid path inserts an in-memory entry first,
     // then the background finalizer swaps it for mmap. If
     // we sweep BEFORE finalize runs, the in-memory entry
     // has `mmap: None` and the sweep skips it (it has no
@@ -248,7 +280,7 @@ async fn in_memory_entries_not_yet_mmapped_are_skipped() {
 
     // Now poll for the finalizer + sweep again. The entry is
     // mmap-backed; threshold=0 ⇒ advised.
-    let n_after_finalize = sweep_once_after_finalize(&cache, 2_000).await;
+    let n_after_finalize = sweep_once_after_finalize(&cache, SWEEP_FINALIZE_POLL_TIMEOUT_MS).await;
     assert_eq!(
         n_after_finalize, 1,
         "after finalize, the mmap'd entry must be advised; got {n_after_finalize}"
@@ -270,13 +302,13 @@ async fn threshold_zero_disables_background_sweep_thread() {
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
 
-    let (_d, cache) = cache_with_threshold(local, 0, 1);
+    let (_d, cache) = cache_with_threshold(local, 0, SWEEP_INTERVAL_ONE_SEC);
     let _r = cache.reader(&uri).await.expect("cold");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(POST_COLD_SLEEP_MS)).await;
 
     // Wait 1.5× the sweep interval — if the thread had
     // spawned, it would have ticked twice by now.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(SWEEP_DISABLED_WAIT_MS)).await;
     let stats = cache.stats();
     assert_eq!(
         stats.n_madvise_calls, 0,

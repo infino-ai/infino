@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! CRC32C corruption oracle.
 //!
 //! Builds a real superfile (FTS + vector + parquet body), then for each
@@ -23,9 +26,29 @@ use infino::superfile::vector::distance::normalize;
 use infino::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
 use std::sync::Arc;
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Random-rotation seed for the corruptable superfile's vector index.
+const CRC_TEST_ROT_SEED: u64 = 31;
+/// Doc count for the small corruptable superfile.
+const CRC_TEST_N_DOCS: u32 = 12;
+/// Embedding dimension (matches `default_vector_config`'s dim).
+const CRC_TEST_EMB_DIM: usize = 16;
+/// Secondary one-hot axis weight planted in each doc vector.
+const CRC_TEST_SECONDARY_WEIGHT: f32 = 0.5;
+/// Offset of the planted secondary axis relative to the primary.
+const CRC_TEST_SECONDARY_AXIS_OFFSET: usize = 3;
+/// XOR mask used to flip a byte when corrupting a CRC-protected region.
+const CORRUPTION_FLIP_MASK: u8 = 0xFF;
+
 fn build_corruptable_superfile() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -34,12 +57,12 @@ fn build_corruptable_superfile() -> Vec<u8> {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![default_vector_config("emb", 31)],
+        vec![default_vector_config("emb", CRC_TEST_ROT_SEED)],
         Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
-    let n = 12u32;
+    let n = CRC_TEST_N_DOCS;
     let ids = decimal128_ids(0..n as u64);
     let titles = LargeStringArray::from(
         (0..n)
@@ -49,12 +72,13 @@ fn build_corruptable_superfile() -> Vec<u8> {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
         .expect("build RecordBatch");
 
-    // n × 16 unit-norm vectors.
-    let mut flat = Vec::<f32>::with_capacity(n as usize * 16);
+    // n × dim unit-norm vectors.
+    let mut flat = Vec::<f32>::with_capacity(n as usize * CRC_TEST_EMB_DIM);
     for i in 0..n {
-        let mut v = vec![0.0f32; 16];
-        v[(i as usize) % 16] = 1.0;
-        v[((i as usize) + 3) % 16] = 0.5;
+        let mut v = vec![0.0f32; CRC_TEST_EMB_DIM];
+        v[(i as usize) % CRC_TEST_EMB_DIM] = 1.0;
+        v[((i as usize) + CRC_TEST_SECONDARY_AXIS_OFFSET) % CRC_TEST_EMB_DIM] =
+            CRC_TEST_SECONDARY_WEIGHT;
         normalize(&mut v);
         flat.extend_from_slice(&v);
     }
@@ -78,7 +102,7 @@ fn locate_blobs(bytes: &[u8]) -> ((usize, usize), (usize, usize)) {
 /// Flip a single byte in the buffer (XOR with 0xFF) and try to reopen
 /// the superfile. Asserts that open returns Err.
 fn assert_corruption_rejected(mut bytes: Vec<u8>, position: usize, label: &str) {
-    bytes[position] ^= 0xFF;
+    bytes[position] ^= CORRUPTION_FLIP_MASK;
     let result = SuperfileReader::open(Bytes::from(bytes));
     assert!(
         result.is_err(),
@@ -229,7 +253,7 @@ fn corruption_at_random_interior_positions_rejected() {
     for i in 0..n_samples {
         let pos = lo + (i * span) / n_samples;
         let mut copy = bytes.clone();
-        copy[pos] ^= 0xFF;
+        copy[pos] ^= CORRUPTION_FLIP_MASK;
         if SuperfileReader::open(Bytes::from(copy)).is_err() {
             rejected += 1;
         }

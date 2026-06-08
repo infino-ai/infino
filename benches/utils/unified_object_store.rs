@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! **Quick-iteration harness** for the object-store cold-fetch path.
 //!
 //! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;
@@ -107,7 +110,7 @@ use tokio::runtime::Runtime;
 
 // ─── Constants ───────────────────────────────────────────────────────
 
-const TEST_BUCKET: &str = "infino-013-bench";
+const TEST_BUCKET: &str = "infino-objstore-bench";
 const TEST_REGION: &str = "us-east-1";
 const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -150,6 +153,21 @@ const FTS_COLUMN: &str = "title";
 const FTS_QUERY_TERM: &str = "term00001";
 const FTS_MULTI_QUERY: &str = "term00001 term00002 term00003";
 
+/// Bytes per mebibyte (integer + float forms) for size logging.
+const BYTES_PER_MIB: usize = 1024 * 1024;
+const BYTES_PER_MIB_F64: f64 = 1024.0 * 1024.0;
+/// RNG seed for the vector corpus fixtures.
+const CORPUS_SEED: u64 = 1;
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Random-rotation RNG seed for the bench vector index.
+const ROT_SEED: u64 = 7;
+/// Seconds-to-milliseconds factor for diagnostic latency output.
+const MS_PER_SEC: f64 = 1e3;
+/// Microseconds-to-milliseconds divisor for range-timer output.
+const US_PER_MS: f64 = 1e3;
+
 // ─── Fixtures (built once per `cargo bench` invocation) ──────────────
 
 static SUPERFILE_BYTES: OnceLock<Bytes> = OnceLock::new();
@@ -163,7 +181,12 @@ fn query_vector() -> &'static [f32] {
     QUERY_VECTOR
         .get_or_init(|| {
             let n = quick_iter_n_docs();
-            let v = crate::corpus::MmapVectorCorpus::generate(n, crate::corpus::n_cent(n), 1, true);
+            let v = crate::corpus::MmapVectorCorpus::generate(
+                n,
+                crate::corpus::n_cent(n),
+                CORPUS_SEED,
+                true,
+            );
             // Take vector at index 0 as the query — known to
             // exist in the planted-cluster corpus + a real-
             // shape query (not orthogonal to every cluster).
@@ -185,7 +208,7 @@ fn build_superfile_bytes() -> Bytes {
     let n_cent = crate::corpus::n_cent(n);
     let dim = crate::corpus::DIM;
 
-    let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, 1, true);
+    let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, CORPUS_SEED, true);
     let vectors = vectors_mmap.as_slice();
     let text = crate::corpus::MmapTextCorpus::generate(n, 1);
 
@@ -193,7 +216,11 @@ fn build_superfile_bytes() -> Bytes {
     // text column. The vector column is a logical name only; its f32
     // buffer is passed alongside each batch, not as a schema field.
     let schema = Arc::new(Schema::new(vec![
-        Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
+        Field::new(
+            ID_COLUMN,
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -206,7 +233,7 @@ fn build_superfile_bytes() -> Bytes {
             column: VEC_COLUMN.into(),
             dim,
             n_cent,
-            rot_seed: 7,
+            rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
         }],
@@ -230,7 +257,7 @@ fn build_superfile_bytes() -> Bytes {
         let ids: Decimal128Array = (start as u64..(start + len) as u64)
             .map(|i| Some(i as i128))
             .collect::<Decimal128Array>()
-            .with_precision_and_scale(38, 0)
+            .with_precision_and_scale(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE)
             .expect("decimal128 with_precision_and_scale");
         let titles = LargeStringArray::from(
             (start..start + len)
@@ -248,7 +275,7 @@ fn build_superfile_bytes() -> Bytes {
     let bytes = builder.finish().expect("finish SuperfileBuilder");
     eprintln!(
         "[object_store_bench] unified superfile built: {} MiB in {:.1}s",
-        bytes.len() / (1024 * 1024),
+        bytes.len() / BYTES_PER_MIB,
         t0.elapsed().as_secs_f32(),
     );
     Bytes::from(bytes)
@@ -546,7 +573,7 @@ pub fn run() {
     eprintln!(
         "[object_store_bench] scale: n_docs={n}, dim={}, superfile_size={} MiB",
         crate::corpus::DIM,
-        superfile.len() / (1024 * 1024),
+        superfile.len() / BYTES_PER_MIB,
     );
 
     // Upload once to the selected object-store backend. Default remains
@@ -608,7 +635,7 @@ fn emit_object_store(
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 
     let dim = crate::corpus::DIM;
-    let superfile_mib = superfile_bytes().len() as f64 / (1024.0 * 1024.0);
+    let superfile_mib = superfile_bytes().len() as f64 / BYTES_PER_MIB_F64;
 
     let rss_cells = |stats: crate::rss::RssStats| -> Vec<Cell> {
         vec![
@@ -1001,14 +1028,14 @@ mod diag {
                  returned={} after_return={}) | \
                  bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
                  (requests=${:.9}, data=${:.9})",
-                wall.as_secs_f64() * 1e3,
-                raw_blocking.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * MS_PER_SEC,
+                raw_blocking.as_secs_f64() * MS_PER_SEC,
                 batches,
                 snap.head_count,
                 head_avg_us,
                 snap.range_count,
                 range_avg_us,
-                (snap.range_total_us as f64) / 1e3,
+                (snap.range_total_us as f64) / US_PER_MS,
                 returned_gets,
                 after_return_gets,
                 range_bytes,
@@ -1022,7 +1049,7 @@ mod diag {
                     "[diag] {name}:   foreground_only_excluding_cache_fill_chunks(>={} B): \
                      raw_block={:>7.1} ms over {:>2} batch(es) (bg_fill_gets={})",
                     bg_chunk_min,
-                    fg_raw_blocking.as_secs_f64() * 1e3,
+                    fg_raw_blocking.as_secs_f64() * MS_PER_SEC,
                     fg_batches,
                     background_fill_events,
                 );
@@ -1036,18 +1063,18 @@ mod diag {
                  returned={} after_return={}) | \
                  bytes={:>10} B ({:>7.2} MiB) | s3_cost=${:.9} \
                  (requests=${:.9}, data=${:.9})",
-                wall.as_secs_f64() * 1e3,
-                adjusted_wall.as_secs_f64() * 1e3,
-                model.ttfb.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * MS_PER_SEC,
+                adjusted_wall.as_secs_f64() * MS_PER_SEC,
+                model.ttfb.as_secs_f64() * MS_PER_SEC,
                 model.bytes_per_sec / 1_000_000.0,
                 batches,
-                raw_blocking.as_secs_f64() * 1e3,
-                model_blocking.as_secs_f64() * 1e3,
+                raw_blocking.as_secs_f64() * MS_PER_SEC,
+                model_blocking.as_secs_f64() * MS_PER_SEC,
                 snap.head_count,
                 head_avg_us,
                 snap.range_count,
                 range_avg_us,
-                (snap.range_total_us as f64) / 1e3,
+                (snap.range_total_us as f64) / US_PER_MS,
                 returned_gets,
                 after_return_gets,
                 range_bytes,
@@ -1062,10 +1089,10 @@ mod diag {
                      adjusted_s3_model={:>7.1} ms (fg_batches={:>2}, fg_raw_s3s_block={:>7.1} ms, \
                      fg_model_block={:>7.1} ms, bg_fill_gets={})",
                     bg_chunk_min,
-                    adjusted_foreground_wall.as_secs_f64() * 1e3,
+                    adjusted_foreground_wall.as_secs_f64() * MS_PER_SEC,
                     fg_batches,
-                    fg_raw_blocking.as_secs_f64() * 1e3,
-                    fg_model_blocking.as_secs_f64() * 1e3,
+                    fg_raw_blocking.as_secs_f64() * MS_PER_SEC,
+                    fg_model_blocking.as_secs_f64() * MS_PER_SEC,
                     background_fill_events,
                 );
             }
@@ -1250,7 +1277,7 @@ mod diag {
             eprintln!(
                 "[diag] raw_get_range[{label:<14}] len={:>8} B  avg={:>6.2} ms over {ITERS} iters",
                 len,
-                total.as_secs_f64() / ITERS as f64 * 1e3,
+                total.as_secs_f64() / ITERS as f64 * MS_PER_SEC,
             );
         }
         storage.reset();
@@ -1284,7 +1311,7 @@ mod diag {
             drop(cache_dir);
         }
 
-        // ── Phase 2b: cold-open HINTED (M6, 1 RTT parallel) ─────────
+        // ── Phase 2b: cold-open HINTED (1 RTT parallel) ─────────────
         eprintln!(
             "[diag] === cold-open HINTED via cache.reader_with_hints (3 fresh-cache iters) ==="
         );
@@ -1445,7 +1472,7 @@ mod diag {
 
         eprintln!(
             "[diag] === scale: n_docs={n}, superfile_size={} MiB ===",
-            superfile.len() / (1024 * 1024)
+            superfile.len() / BYTES_PER_MIB
         );
     }
 
@@ -1485,7 +1512,7 @@ mod diag {
 
         eprintln!(
             "[diag-real-s3] bucket={bucket} prefix={prefix} path={path} n_docs={n} size={} MiB",
-            superfile.len() / (1024 * 1024)
+            superfile.len() / BYTES_PER_MIB
         );
 
         let raw_storage: Arc<dyn StorageProvider> = Arc::new(
@@ -1519,7 +1546,7 @@ mod diag {
                 eprintln!(
                     "[diag-real-s3] raw_get_range[{label:<14}] len={:>8} B  avg={:>6.2} ms over {ITERS} iters",
                     len,
-                    total.as_secs_f64() / ITERS as f64 * 1e3,
+                    total.as_secs_f64() / ITERS as f64 * MS_PER_SEC,
                 );
             }
             storage.reset();
@@ -1669,7 +1696,7 @@ mod diag {
                 eprintln!(
                     "[diag-real-s3-supertable] producer commit OK; manifest_id={} build_and_commit_ms={:.1}",
                     producer.manifest_id(),
-                    build_t0.elapsed().as_secs_f64() * 1e3
+                    build_t0.elapsed().as_secs_f64() * MS_PER_SEC
                 );
             }
 
@@ -1685,7 +1712,7 @@ mod diag {
             let reader = consumer.reader();
             eprintln!(
                 "[diag-real-s3-supertable] cold_open wall={:.1} ms manifest_id={} n_superfiles={} n_docs_total={}",
-                cold_open.as_secs_f64() * 1e3,
+                cold_open.as_secs_f64() * MS_PER_SEC,
                 consumer.manifest_id(),
                 reader.n_superfiles(),
                 reader.n_docs_total()
@@ -1722,7 +1749,7 @@ mod diag {
             let cold_vec = vec_t0.elapsed();
             eprintln!(
                 "[diag-real-s3-supertable] cold_vector wall={:.1} ms hits={} nprobe={nprobe}",
-                cold_vec.as_secs_f64() * 1e3,
+                cold_vec.as_secs_f64() * MS_PER_SEC,
                 vec_hits.len()
             );
 
@@ -1733,7 +1760,7 @@ mod diag {
             let cold_bm25 = bm25_t0.elapsed();
             eprintln!(
                 "[diag-real-s3-supertable] cold_bm25 wall={:.1} ms hits={} query={FTS_QUERY_TERM}",
-                cold_bm25.as_secs_f64() * 1e3,
+                cold_bm25.as_secs_f64() * MS_PER_SEC,
                 bm25_hits.len()
             );
 
@@ -1762,9 +1789,9 @@ mod diag {
                 .stats();
             eprintln!(
                 "[diag-real-s3-supertable] warm_vector wall={:.1} ms hits={} | warm_bm25 wall={:.1} ms hits={} | cache_stats={cache_stats:?}",
-                warm_vec.as_secs_f64() * 1e3,
+                warm_vec.as_secs_f64() * MS_PER_SEC,
                 warm_vec_hits.len(),
-                warm_bm25.as_secs_f64() * 1e3,
+                warm_bm25.as_secs_f64() * MS_PER_SEC,
                 warm_bm25_hits.len()
             );
             })
@@ -1829,7 +1856,7 @@ mod diag {
                 column: VEC_COLUMN.into(),
                 dim: crate::corpus::DIM,
                 n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
-                rot_seed: 7,
+                rot_seed: ROT_SEED,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
             }],
@@ -1844,7 +1871,7 @@ mod diag {
     ) {
         let n_cent = crate::corpus::n_cent(n);
         let dim = crate::corpus::DIM;
-        let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, 1, true);
+        let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, CORPUS_SEED, true);
         let vectors = vectors_mmap.as_slice();
         let text = crate::corpus::MmapTextCorpus::generate(n, 1);
         let schema = Arc::new(Schema::new(vec![
@@ -1908,7 +1935,7 @@ mod diag {
             .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
             .unwrap_or_default();
 
-        // Mirror the writer's M7 open-blob capture: parquet tail
+        // Mirror the writer's open-blob capture: parquet tail
         // (64 KiB) + each vec/fts open range, sliced inline so the
         // diagnostic exercises the zero-open-GET cold path.
         const PARQUET_TAIL_SPEC: u64 = 64 * 1024;

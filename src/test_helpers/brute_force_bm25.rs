@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Textbook BM25 reference implementation. Computes top-k by
 //! scoring every doc directly from the BM25 formula; no inverted
 //! index, no skip table, no WAND. Used as the correctness oracle

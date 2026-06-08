@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Reservoir sampling for k-means training in the streaming
 //! `VectorBuilder`.
 //!
@@ -48,6 +51,20 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+/// Multiplier on a column's IVF centroid count to size its k-means
+/// training sample. Slightly above the FAISS-empirical 30–60× sweet
+/// spot for IVF training, picked for recall headroom.
+const KMEANS_SAMPLE_NCENT_MULT: usize = 64;
+
+/// Floor on the k-means training sample size, so builds with a small
+/// `n_cent` still see enough corpus variance to converge.
+const KMEANS_SAMPLE_SIZE_FLOOR: usize = 100_000;
+
+/// Cap on the k-means training sample size. Bounds reservoir memory
+/// (≈ 730 MB at dim=384); past this the recall gain is below gate
+/// noise.
+const KMEANS_SAMPLE_SIZE_CAP: usize = 500_000;
+
 /// Default k-means training sample size for a column with
 /// `n_cent` IVF centroids:
 ///
@@ -63,8 +80,8 @@ use rand::rngs::StdRng;
 /// that the sample stays at 500 K (≈ 730 MB at dim=384) and the
 /// gain from more training data is well below recall-gate noise.
 pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
-    let target = 64usize.saturating_mul(n_cent);
-    target.clamp(100_000, 500_000)
+    let target = KMEANS_SAMPLE_NCENT_MULT.saturating_mul(n_cent);
+    target.clamp(KMEANS_SAMPLE_SIZE_FLOOR, KMEANS_SAMPLE_SIZE_CAP)
 }
 
 /// Online reservoir for f32 vector samples.
@@ -79,7 +96,7 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
 ///
 /// The struct owns its RNG state so callers don't need to
 /// thread one through; seeding is done at construction.
-pub struct Reservoir {
+pub(crate) struct Reservoir {
     sample_size: usize,
     dim: usize,
     rng: StdRng,
@@ -166,13 +183,9 @@ impl Reservoir {
     }
 
     /// Number of vectors observed via [`Self::update`].
-    pub fn n_seen(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn n_seen(&self) -> u64 {
         self.n_seen
-    }
-
-    /// Maximum reservoir capacity (vectors).
-    pub fn sample_size(&self) -> usize {
-        self.sample_size
     }
 
     /// Current reservoir contents as a contiguous `&[f32]` of
@@ -183,10 +196,9 @@ impl Reservoir {
     }
 
     /// Same as [`Self::sample`] but consumes the reservoir,
-    /// handing back the owned buffer. Used at the pass-1 →
-    /// pass-2 boundary in 010's `finish()` to release the
-    /// reservoir's memory as soon as k-means returns.
-    pub fn into_sample(self) -> Vec<f32> {
+    /// handing back the owned buffer.
+    #[cfg(test)]
+    pub(crate) fn into_sample(self) -> Vec<f32> {
         self.buf
     }
 

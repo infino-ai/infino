@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Tiered segment-bytes lookup.
 //!
 //! [`superfile_reader`] is the single accessor the query paths
@@ -48,7 +51,7 @@ use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
 /// vector subsection, and FTS subsection GETs **in parallel**
 /// (1 RTT cold open) instead of doing the parquet footer first
 /// and the subsection fetches second (2 RTTs). `None` falls back
-/// to the pre-M6 2-RTT path — same shape, slower.
+/// to the 2-RTT path — same shape, slower.
 pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,

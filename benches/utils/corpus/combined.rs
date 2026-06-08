@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Stream synthetic text + vector rows for supertable ingest (no full-dataset file).
 
 use rand::SeedableRng;
@@ -5,6 +8,13 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::corpus::{DIM, TOKENS_PER_DOC, VOCAB_SIZE, ZipfDistribution, normalize};
+
+/// Gaussian scale of a planted cluster center (matches `corpus.rs`).
+const CENTER_GAUSSIAN_SCALE: f32 = 3.0;
+/// Per-dimension Gaussian noise around a cluster center.
+const DOC_NOISE_SIGMA: f32 = 0.3;
+/// Average bytes-per-token estimate for pre-sizing a doc `String`.
+const AVG_BYTES_PER_TOKEN: usize = 8;
 
 /// Stream the same deterministic synthetic docs as [`super::MmapTextCorpus`] +
 /// [`super::MmapVectorCorpus`], one append chunk at a time.
@@ -28,7 +38,7 @@ impl SequentialSyntheticCorpus {
                 (0..DIM)
                     .map(|_| {
                         let s: f64 = dist.sample(&mut vec_rng);
-                        (s as f32) * 3.0
+                        (s as f32) * CENTER_GAUSSIAN_SCALE
                     })
                     .collect()
             })
@@ -79,7 +89,7 @@ impl SequentialSyntheticCorpus {
         for _ in 0..len {
             let doc_id = self.doc_id;
             if gen_text {
-                let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * 8);
+                let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * AVG_BYTES_PER_TOKEN);
                 doc.push_str(&format!("doc{doc_id:07}"));
                 for _ in 0..TOKENS_PER_DOC {
                     let idx = self.zipf.sample(&mut self.text_rng);
@@ -93,7 +103,7 @@ impl SequentialSyntheticCorpus {
                 let center = &self.centers[doc_id % self.centers.len()];
                 for (j, slot) in row.iter_mut().enumerate() {
                     let s: f64 = dist.sample(&mut self.vec_rng);
-                    *slot = center[j] + (s as f32) * 0.3;
+                    *slot = center[j] + (s as f32) * DOC_NOISE_SIGMA;
                 }
                 if self.normalize_vectors {
                     normalize(&mut row);
@@ -110,13 +120,19 @@ mod tests {
     use super::*;
     use crate::corpus::{MmapTextCorpus, MmapVectorCorpus, n_cent};
 
+    /// Document count for the stream-vs-mmap equivalence fixtures.
+    const TEST_N_DOCS: usize = 256;
+    /// RNG seed shared by the stream and mmap corpora under test.
+    const TEST_CORPUS_SEED: u64 = 1;
+
     /// Streamed ingest vectors must match [`super::MmapVectorCorpus`].
     #[test]
     fn stream_matches_mmap_vector_corpus() {
-        let n_docs = 256;
+        let n_docs = TEST_N_DOCS;
         let n_cent = n_cent(n_docs);
-        let mmap = MmapVectorCorpus::generate(n_docs, n_cent, 1, true);
-        let mut stream = SequentialSyntheticCorpus::new(n_cent, 1, 1, true);
+        let mmap = MmapVectorCorpus::generate(n_docs, n_cent, TEST_CORPUS_SEED, true);
+        let mut stream =
+            SequentialSyntheticCorpus::new(n_cent, TEST_CORPUS_SEED, TEST_CORPUS_SEED, true);
         let mut titles = Vec::new();
         let mut flat = Vec::new();
         stream.fill_chunk(n_docs, &mut titles, &mut flat);
@@ -128,9 +144,14 @@ mod tests {
     /// Streamed ingest text must match [`super::MmapTextCorpus`].
     #[test]
     fn stream_matches_mmap_text_corpus() {
-        let n_docs = 256;
-        let mmap = MmapTextCorpus::generate(n_docs, 1);
-        let mut stream = SequentialSyntheticCorpus::new(n_cent(n_docs), 1, 1, true);
+        let n_docs = TEST_N_DOCS;
+        let mmap = MmapTextCorpus::generate(n_docs, TEST_CORPUS_SEED);
+        let mut stream = SequentialSyntheticCorpus::new(
+            n_cent(n_docs),
+            TEST_CORPUS_SEED,
+            TEST_CORPUS_SEED,
+            true,
+        );
         let mut titles = Vec::new();
         let mut flat = Vec::new();
         stream.fill_chunk(n_docs, &mut titles, &mut flat);

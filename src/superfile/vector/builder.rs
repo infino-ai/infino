@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Vector blob builder. Multi-column unified blob with per-column
 //! self-contained subsections.
 //!
@@ -28,22 +31,72 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::superfile::format::vec::{
+    CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES, sub_hdr,
+};
+
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
-const OUTER_HEADER_SIZE: usize = 32;
+const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
 
 /// Subsection-directory entry size in bytes.
-const DIR_ENTRY_SIZE: usize = 64;
+const DIR_ENTRY_SIZE: usize = format::vec::DIR_ENTRY_SIZE;
 
 /// Per-column sub-header size (inside each subsection).
-const SUB_HEADER_SIZE: usize = 56;
+const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
+
+/// Smallest accepted vector dimension. Below this the IVF + 1-bit
+/// quantizer carries too little signal to be worth indexing.
+const VECTOR_DIM_MIN: usize = 16;
+
+/// Largest accepted vector dimension. Caps per-vector build memory
+/// and keeps the rotation matrix (`dim × dim`) tractable.
+const VECTOR_DIM_MAX: usize = 4096;
+
+/// XOR mask applied to a column's `rot_seed` to seed the training
+/// reservoir RNG. Keeps the reservoir's PRNG stream deterministic
+/// with the column config but distinct from the rotation and
+/// k-means streams.
+const RESERVOIR_SEED_XOR_MASK: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+
+/// Lloyd k-means iteration count for pass-1 centroid training. Five
+/// is the standard turn-key default; returns diminish past it on
+/// typical embedding distributions.
+const KMEANS_ITERS: usize = 5;
+
+/// Target memory budget (~128 MiB) for one pass-2 rotated chunk
+/// (`chunk_rows × dim × 4` bytes); the chunk row count is derived
+/// from this so resident memory stays bounded independent of `dim`.
+const PASS2_CHUNK_MEM_BUDGET_BYTES: usize = 128 << 20;
+
+/// Floor on pass-2 chunk rows, keeping chunks wide enough to stay
+/// SIMD-friendly even at extreme dimensions.
+const PASS2_CHUNK_ROWS_MIN: usize = 1024;
+
+/// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
+const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
+
+/// Fixed-point scale for the per-subsection summary radius. The
+/// radius is stored as `round(radius × 100)` in a `u32` and decoded
+/// back by the reader as `value / 100.0`.
+const SUMMARY_RADIUS_SCALE: f32 = 100.0;
+
+/// Maximum Sq8 code value: each component quantizes to one unsigned
+/// byte, so the per-dim scale maps a cluster's value span onto
+/// `[0, SQ8_CODE_MAX]`.
+const SQ8_CODE_MAX: f32 = 255.0;
+
+/// Symmetric clamp bound for the Sq8Residual i8 leg. The residual is
+/// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
+/// quantized magnitude stays symmetric about zero.
+const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 
 /// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
 /// 2 = NegDot.
 fn metric_id(m: Metric) -> u32 {
     match m {
-        Metric::L2Sq => 0,
-        Metric::Cosine => 1,
-        Metric::NegDot => 2,
+        Metric::L2Sq => format::vec::METRIC_ID_L2SQ,
+        Metric::Cosine => format::vec::METRIC_ID_COSINE,
+        Metric::NegDot => format::vec::METRIC_ID_NEGDOT,
     }
 }
 
@@ -96,8 +149,8 @@ impl VectorConfig {
 /// in reservoir only and never compounds. design § "spill_threshold_bytes default".
 const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
-/// Per-column build-time state. After 010 M3, the column holds
-/// at most three independent buffers:
+/// Per-column build-time state. With the streaming build path
+/// the column holds at most three independent buffers:
 ///
 /// - [`Reservoir`]: bounded k-means training sample. Dropped at
 ///   the pass 1 → pass 2 boundary inside `build_subsection_streaming`.
@@ -249,7 +302,7 @@ impl VectorBuilder {
         if config.column.starts_with(RESERVED_PREFIX) {
             return Err(BuildError::ReservedPrefixInColumnName(config.column));
         }
-        if !(16..=4096).contains(&config.dim) {
+        if !(VECTOR_DIM_MIN..=VECTOR_DIM_MAX).contains(&config.dim) {
             return Err(BuildError::VectorDimOutOfRange {
                 column: config.column.clone(),
                 dim: config.dim,
@@ -276,7 +329,7 @@ impl VectorBuilder {
         // `rot_seed` directly) and `kmeans` (which seeds from
         // `rot_seed + 7`). Three disjoint streams, three
         // deterministic seeds, one knob on the user's end.
-        let reservoir_seed = config.rot_seed ^ 0x5a5a_5a5a_5a5a_5a5a;
+        let reservoir_seed = config.rot_seed ^ RESERVOIR_SEED_XOR_MASK;
         let reservoir = Reservoir::new(sample_size, config.dim, reservoir_seed);
         let spill_threshold_bytes = self.spill_threshold_bytes;
         self.columns.push(ColumnState {
@@ -297,7 +350,7 @@ impl VectorBuilder {
     ///
     /// The default sample size is `default_kmeans_sample_size(n_cent)`
     /// (`100K-500K` depending on `n_cent`). This override exists for
-    /// (a) the M2 sample-size sweep on synthetic recall corpora and
+    /// (a) sample-size sweeps on synthetic recall corpora and
     /// (b) future advanced callers that want to dial sample size to
     /// match a recall vs. memory trade-off they've profiled.
     ///
@@ -315,7 +368,7 @@ impl VectorBuilder {
             });
         }
         let col = &mut self.columns[idx];
-        let reservoir_seed = col.config.rot_seed ^ 0x5a5a_5a5a_5a5a_5a5a;
+        let reservoir_seed = col.config.rot_seed ^ RESERVOIR_SEED_XOR_MASK;
         col.reservoir = Reservoir::new(sample_size, col.config.dim, reservoir_seed);
         Ok(())
     }
@@ -390,7 +443,7 @@ impl VectorBuilder {
     /// builder.
     ///
     /// Returns a `BuildError::Io` for the spill / scratch I/O
-    /// errors introduced by 010 M3. Callers that previously
+    /// errors of the streaming build. Callers that previously
     /// expected `-> Vec<u8>` need to `?` the result; the
     /// `SuperfileBuilder` shim does so already.
     pub fn finish(self) -> Result<Vec<u8>, BuildError> {
@@ -407,7 +460,6 @@ impl VectorBuilder {
 
     /// Streaming variant: write the final blob progressively to
     /// `w` without materialising it as a contiguous `Vec<u8>`.
-    /// M5.
     ///
     /// The output bytes (outer header, directory + dir CRC, each
     /// subsection, trailing outer CRC) are identical to those
@@ -423,10 +475,10 @@ impl VectorBuilder {
     /// each subsection's body); each subsection is dropped as
     /// soon as it has been written to `w`, so peak heap drops
     /// from `sum_of_subsection_sizes + final_blob_size` to
-    /// `max_subsection_size`. Per-subsection streaming (M6 / a
-    /// future plan) would push the floor lower still.
+    /// `max_subsection_size`. Per-subsection streaming would
+    /// push the floor lower still.
     ///
-    /// Object-storage callers (003) can pass a multipart upload
+    /// Object-storage callers can pass a multipart upload
     /// writer here so segment build never owns the full blob in
     /// RAM.
     pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
@@ -472,7 +524,7 @@ impl VectorBuilder {
         let directory_offset = OUTER_HEADER_SIZE as u64;
         let directory_size = (n_columns as usize) * DIR_ENTRY_SIZE;
         let mut subsection_start_off =
-            directory_offset + directory_size as u64 + 4 /* dir CRC */;
+            directory_offset + directory_size as u64 + format::CRC_BYTES as u64;
 
         // 3. Assemble directory entries with absolute offsets.
         //    Byte 52 carries the rerank-codec discriminator.
@@ -586,9 +638,8 @@ struct SubsectionBytes {
 /// Per-bucket BufWriter capacity. 64 KiB amortises one syscall
 /// per ~1300 dim=384 bucket rows (each row = 4 + code_bytes +
 /// dim*4 = ~1588 B). At very high n_cent (≥ 8192) the n_cent ×
-/// 64 KiB total dominates the resident set; M4 will revisit if
-/// profiling shows it. See plan 010 design § "Pass 2 memory
-/// footprint".
+/// 64 KiB total dominates the resident set; this is worth
+/// revisiting if profiling shows it.
 const BUCKET_BUF_SIZE: usize = 64 * 1024;
 
 /// Adaptive chunk size for pass 2: keeps `chunk_rotated`
@@ -602,11 +653,11 @@ const BUCKET_BUF_SIZE: usize = 64 * 1024;
 /// chunk wide enough to stay SIMD-friendly even at extreme
 /// dimensions.
 fn chunk_rows_for_dim(dim: usize) -> usize {
-    let cap_by_mem = (128usize << 20) / (dim.max(1) * 4);
-    cap_by_mem.clamp(1024, 65_536)
+    let cap_by_mem = PASS2_CHUNK_MEM_BUDGET_BYTES / (dim.max(1) * 4);
+    cap_by_mem.clamp(PASS2_CHUNK_ROWS_MIN, PASS2_CHUNK_ROWS_MAX)
 }
 
-/// Build one column's subsection via the M3 streaming path.
+/// Build one column's subsection via the streaming path.
 /// Consumes the entire `ColumnState` so the reservoir +
 /// pre-spill buffer + spill file are released as soon as their
 /// contribution to the subsection is complete.
@@ -672,7 +723,7 @@ fn build_subsection_streaming(
     let centroids = if sample_rows == 0 || n_docs == 0 {
         vec![0.0f32; n_cent * dim]
     } else {
-        kmeans(reservoir.sample(), dim, n_cent, 5, cfg.rot_seed)
+        kmeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
     };
     // Drop the reservoir immediately — k-means has converged
     // and the sample bytes aren't needed for pass 2.
@@ -810,7 +861,7 @@ fn build_subsection_streaming(
     }
     drop(bucket_files);
 
-    let summary_radius_x100 = (summary_radius_sq_max.sqrt() * 100.0)
+    let summary_radius_x100 = (summary_radius_sq_max.sqrt() * SUMMARY_RADIUS_SCALE)
         .max(0.0)
         .min(u32::MAX as f32) as u32;
 
@@ -846,8 +897,8 @@ fn build_subsection_streaming(
     //          estimate-code bytes; `full_chunk` is the optional
     //          Fp32/Sq8 rerank payload for the same docs.
     //
-    //    New-service-only — there are no pre-013 segments to
-    //    keep readable.
+    //    Only this layout version is accepted on read; any other
+    //    value at the version slot is rejected as malformed.
     //
     //    Codec-specific shape:
     //      Fp32: empty codec_meta; full_chunk stores the fp32
@@ -864,7 +915,7 @@ fn build_subsection_streaming(
     //            top-K is the final answer.
     let summary_size = dim * 4;
     let centroids_size = n_cent * dim * 4;
-    let cluster_idx_size = n_cent * 8;
+    let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
     // v2 layout: each per-cluster block carries `codes_chunk +
@@ -876,7 +927,7 @@ fn build_subsection_streaming(
     // already fetches, dropping cold first-search from
     // `nprobe + 1 fat-range` GETs (which over-fetched the whole
     // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
-    let per_cluster_blocks_size = n_docs * (code_bytes + 4 + per_vec_bytes);
+    let per_cluster_blocks_size = n_docs * (code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes);
 
     // Offsets relative to subsection start. Open-time region
     // (everything before `per_cluster_blocks`) lands contiguously
@@ -908,14 +959,21 @@ fn build_subsection_streaming(
     //   [32..40] centroids_off (u64 LE)
     //   [40..48] cluster_idx_off (u64 LE)
     //   [48..56] per_cluster_blocks_off (u64 LE)
-    bytes[0..8].copy_from_slice(format::vec::SUB_MAGIC);
-    bytes[8..12].copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
-    bytes[12..16].copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
-    bytes[16..24].copy_from_slice(&(summary_off as u64).to_le_bytes());
-    bytes[24..28].copy_from_slice(&summary_radius_x100.to_le_bytes());
-    bytes[32..40].copy_from_slice(&(centroids_off as u64).to_le_bytes());
-    bytes[40..48].copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
-    bytes[48..56].copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
+    bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
+    bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
+        .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
+    bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
+        .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
+    bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(summary_off as u64).to_le_bytes());
+    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
+        .copy_from_slice(&summary_radius_x100.to_le_bytes());
+    bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(centroids_off as u64).to_le_bytes());
+    bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
+    bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
 
     bytes[summary_off..summary_off + summary_size]
         .copy_from_slice(bytemuck::cast_slice(&summary_centroid));
@@ -928,9 +986,11 @@ fn build_subsection_streaming(
         let mut acc_off = 0u32;
         for &centroid_id in &cluster_order {
             let cnt = bucket_counts[centroid_id];
-            let idx_base = cluster_idx_off + centroid_id * 8;
-            bytes[idx_base..idx_base + 4].copy_from_slice(&acc_off.to_le_bytes());
-            bytes[idx_base + 4..idx_base + 8].copy_from_slice(&cnt.to_le_bytes());
+            let idx_base = cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
+            bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
+                .copy_from_slice(&acc_off.to_le_bytes());
+            bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
+                .copy_from_slice(&cnt.to_le_bytes());
             cluster_index.push((centroid_id, acc_off, cnt));
             acc_off += cnt;
         }
@@ -958,7 +1018,7 @@ fn build_subsection_streaming(
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
     let mut full_block: Vec<u8> = Vec::new();
-    let cluster_stride = code_bytes + 4 + per_vec_bytes;
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
 
     let mut block_cursor = 0usize;
     for &(centroid_id, cluster_off_u32, cluster_count_u32) in &cluster_index {
@@ -1081,7 +1141,9 @@ fn encode_sq8_residual_cluster_simd(
             let base = (qc as f32) * scale_c[d] + offset_c[d];
             let step = scale_c[d] / residual_divisor;
             let rq = if step > 0.0 {
-                ((src[d] - base) / step).round().clamp(-127.0, 127.0) as i8
+                ((src[d] - base) / step)
+                    .round()
+                    .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
             } else {
                 0
             };
@@ -1109,7 +1171,7 @@ fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec
         let span = max[d] - min[d];
         if span > 0.0 && span.is_finite() {
             offset[d] = min[d];
-            scale[d] = span / 255.0;
+            scale[d] = span / SQ8_CODE_MAX;
         } else {
             offset[d] = if min[d].is_finite() { min[d] } else { 0.0 };
             scale[d] = 1.0;
@@ -1605,8 +1667,8 @@ mod tests {
     }
 
     /// Streaming output to a `Cursor<Vec<u8>>` (the canonical
-    /// in-tree writer for testing streaming behaviour, per plan
-    /// 010 M5 acceptance criterion #4): the resulting bytes
+    /// in-tree writer for testing streaming behaviour): the
+    /// resulting bytes
     /// carry a valid outer magic + a valid trailing whole-blob
     /// CRC32C that round-trips when recomputed over the body.
     #[test]

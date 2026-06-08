@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! WAL state-document shape.
 //!
 //! Serialized as JSON, one object per WAL entry, at
@@ -32,6 +35,15 @@ use uuid::Uuid;
 /// reject anything > the version they were built against.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Byte width of a 128-bit identifier (`i128`), big-endian on the
+/// wire.
+const ID_BYTE_LEN: usize = 16;
+
+/// Hex-string length of a 128-bit identifier — two lowercase hex
+/// digits per byte. This is the exact JSON-wire form, so changing it
+/// is a wire-format change.
+const ID_HEX_LEN: usize = ID_BYTE_LEN * 2;
+
 /// Parse failure for the hex form of any 128-bit identifier
 /// ([`WalId`], [`RowId`], [`SupertableHandleId`]). Carries enough context
 /// to pinpoint the offending byte position.
@@ -60,7 +72,7 @@ macro_rules! define_id_type {
             /// change here is a wire-format change.
             pub fn to_hex(self) -> String {
                 let bytes = self.0.to_be_bytes();
-                let mut out = String::with_capacity(32);
+                let mut out = String::with_capacity(ID_HEX_LEN);
                 for b in bytes {
                     // `{:02x}` always emits two lowercase hex digits.
                     use std::fmt::Write as _;
@@ -72,10 +84,10 @@ macro_rules! define_id_type {
             /// Inverse of `to_hex`. Rejects strings whose length isn't
             /// exactly 32 or that contain non-hex characters.
             pub fn from_hex(s: &str) -> Result<Self, IdParseError> {
-                if s.len() != 32 {
+                if s.len() != ID_HEX_LEN {
                     return Err(IdParseError::WrongLength { len: s.len() });
                 }
-                let mut bytes = [0u8; 16];
+                let mut bytes = [0u8; ID_BYTE_LEN];
                 for (i, byte) in bytes.iter_mut().enumerate() {
                     *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| {
                         IdParseError::InvalidHex {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `ManifestList` — the top-tier of the two-tier hierarchical manifest.
 //! A small JSON document (~MB even at 1M superfiles) that references one or
 //! more [`ManifestPart`] files by URI + content hash, carries the
@@ -19,7 +22,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::part::{ContentHash, PartId};
+use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
 
 /// Wire format version for the manifest list.
 ///
@@ -346,11 +349,11 @@ fn decode_hash(s: &str) -> Result<ContentHash, ListParseError> {
     let hex = s
         .strip_prefix("blake3:")
         .ok_or_else(|| ListParseError::BadContentHash(s.into()))?;
-    if hex.len() != 64 {
+    if hex.len() != BLAKE3_HEX_LEN {
         return Err(ListParseError::BadContentHash(s.into()));
     }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
+    let mut out = [0u8; BLAKE3_DIGEST_BYTES];
+    for i in 0..BLAKE3_DIGEST_BYTES {
         let byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
             .map_err(|_| ListParseError::BadContentHash(s.into()))?;
         out[i] = byte;

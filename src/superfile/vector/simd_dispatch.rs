@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Runtime SIMD dispatch gates for the vector + bloom kernels.
 //!
 //! Sibling to `distance.rs` because multiple kernels across the
@@ -16,8 +19,7 @@
 //! `is_x86_feature_detected!` chain.
 //!
 //! Flipping the env var after the first call has **no effect** —
-//! gates are sticky once cached. Plan + rationale in plan 014
-//! (`014_simd_perf.md` in the `claude-plans` repo).
+//! gates are sticky once cached.
 
 use std::sync::OnceLock;
 
@@ -38,7 +40,7 @@ use std::sync::OnceLock;
 /// regression isolation without rebuilding. Reads the env var
 /// exactly once on the first call.
 #[inline]
-pub fn avx512_enabled() -> bool {
+pub(crate) fn avx512_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         if disable_env_set() {
@@ -68,8 +70,9 @@ pub fn avx512_enabled() -> bool {
 /// Also implies [`avx512_enabled`] (we never enable a specialized
 /// kernel on a host without the foundation), so callers should
 /// check this gate alone.
+#[cfg(test)]
 #[inline]
-pub fn has_vpopcntdq() -> bool {
+pub(crate) fn has_vpopcntdq() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         if !avx512_enabled() {

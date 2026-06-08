@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Disk-cache runtime configuration + pluggable eviction
 //! policy.
 
@@ -35,7 +38,7 @@ pub enum ColdFetchMode {
     RangeOnly,
     /// foreground returns immediately with a
     /// [`SuperfileReader::open_lazy`]-built reader over a
-    /// [`StorageRangeSource`]; pays only the M1-M3 cold-open
+    /// [`StorageRangeSource`]; pays only the cold-open
     /// + cold-search byte budget against object storage
     /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB segment).
     /// A background task downloads the full segment to NVMe
@@ -120,17 +123,31 @@ pub struct DiskCacheConfig {
     pub verify_crc_on_open: bool,
 }
 
+/// Default Tier-1 disk-cache byte budget (10 GiB).
+const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
+/// Default number of parallel range-GET streams per cold miss.
+const DEFAULT_COLD_FETCH_STREAMS: usize = 16;
+/// Default range-GET chunk size (16 MiB); peak in-flight bytes is
+/// `streams × chunk`.
+const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 16 * (1 << 20);
+/// Default number of concurrent background full-segment fills.
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
+/// Default idle age (seconds) before an mmap is `MADV_DONTNEED`-swept.
+const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
+/// Default background mmap-sweep period (seconds, ≈ threshold / 4).
+const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+
 impl Default for DiskCacheConfig {
     fn default() -> Self {
         Self {
             cache_root: std::env::temp_dir().join("infino-disk-cache"),
-            disk_budget_bytes: 10 * (1 << 30), // 10 GiB
+            disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
             cold_fetch_mode: ColdFetchMode::default(),
-            cold_fetch_streams: 16,
-            cold_fetch_chunk_bytes: 16 * (1 << 20), // 16 MiB
-            prefetch_concurrency: 8,
-            mmap_cold_threshold_secs: 300,
-            mmap_sweep_interval_secs: 75,
+            cold_fetch_streams: DEFAULT_COLD_FETCH_STREAMS,
+            cold_fetch_chunk_bytes: DEFAULT_COLD_FETCH_CHUNK_BYTES,
+            prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
+            mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
+            mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
             eviction: Box::new(LruPolicy::new()),
             verify_crc_on_open: true,
         }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Hand-rolled binary format for one superfile's tombstone
 //! sidecar object.
 //!
@@ -58,14 +61,36 @@ const MAGIC: &[u8; 8] = b"INFTOMB\0";
 /// a typed error at decode time rather than producing garbage.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Fixed header + flag length when the sidecar is unsealed.
-/// (Magic 8 + version 4 + seal_flag 1.) The bitmap length
-/// prefix and bitmap bytes follow directly.
-const HEADER_LEN_UNSEALED: usize = 8 + 4 + 1;
+/// On-disk byte widths of the fixed header fields. The header is
+/// `MAGIC | version | seal_flag [| uuid | millis]`, followed by the
+/// bitmap length prefix and the bitmap bytes.
+const MAGIC_LEN: usize = 8;
+/// `u32` little-endian schema version width.
+const VERSION_LEN: usize = 4;
+/// Single-byte seal-flag width (one of [`SEAL_FLAG_UNSEALED`] /
+/// [`SEAL_FLAG_SEALED`]).
+const SEAL_FLAG_LEN: usize = 1;
+/// Compaction-id width in the seal payload (a 16-byte UUID).
+const SEAL_UUID_LEN: usize = 16;
+/// Sealed-at timestamp width in the seal payload (`i64` LE unix
+/// millis).
+const SEAL_TIMESTAMP_LEN: usize = 8;
+/// `u32` little-endian bitmap-length prefix width, written before
+/// the serialized RoaringBitmap so the region is self-describing.
+const BITMAP_LEN_PREFIX_LEN: usize = 4;
+
+/// Seal-flag byte meaning "no seal payload follows".
+const SEAL_FLAG_UNSEALED: u8 = 0;
+/// Seal-flag byte meaning "a 24-byte seal payload (uuid + millis)
+/// follows".
+const SEAL_FLAG_SEALED: u8 = 1;
+
+/// Fixed header + flag length when the sidecar is unsealed. The
+/// bitmap length prefix and bitmap bytes follow directly.
+const HEADER_LEN_UNSEALED: usize = MAGIC_LEN + VERSION_LEN + SEAL_FLAG_LEN;
 
 /// Header + flag + seal_payload length when sealed.
-/// (Magic 8 + version 4 + seal_flag 1 + uuid 16 + millis 8.)
-const HEADER_LEN_SEALED: usize = HEADER_LEN_UNSEALED + 16 + 8;
+const HEADER_LEN_SEALED: usize = HEADER_LEN_UNSEALED + SEAL_UUID_LEN + SEAL_TIMESTAMP_LEN;
 
 /// On-disk representation of one superfile's tombstones —
 /// already-parsed shape. `decode_sidecar` produces this from
@@ -132,7 +157,7 @@ pub fn encode_sidecar(sidecar: &TombstonesSidecar) -> Result<Vec<u8>, SidecarCod
     } else {
         HEADER_LEN_UNSEALED
     };
-    let total = header_len + 4 + bitmap_size;
+    let total = header_len + BITMAP_LEN_PREFIX_LEN + bitmap_size;
     let mut out: Vec<u8> = Vec::with_capacity(total);
 
     out.extend_from_slice(MAGIC);
@@ -140,10 +165,10 @@ pub fn encode_sidecar(sidecar: &TombstonesSidecar) -> Result<Vec<u8>, SidecarCod
 
     match &sidecar.seal {
         None => {
-            out.push(0);
+            out.push(SEAL_FLAG_UNSEALED);
         }
         Some(seal) => {
-            out.push(1);
+            out.push(SEAL_FLAG_SEALED);
             out.extend_from_slice(seal.compaction_id.as_bytes());
             let millis = seal.sealed_at.timestamp_millis();
             out.extend_from_slice(&millis.to_le_bytes());
@@ -156,7 +181,7 @@ pub fn encode_sidecar(sidecar: &TombstonesSidecar) -> Result<Vec<u8>, SidecarCod
     // the format self-consistent if `roaring` ever changes its
     // sizing function.
     let len_prefix_pos = out.len();
-    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&[0u8; BITMAP_LEN_PREFIX_LEN]);
 
     let pre_bitmap_len = out.len();
     sidecar
@@ -164,7 +189,8 @@ pub fn encode_sidecar(sidecar: &TombstonesSidecar) -> Result<Vec<u8>, SidecarCod
         .serialize_into(&mut out)
         .map_err(SidecarCodecError::BitmapEncode)?;
     let bitmap_actual = (out.len() - pre_bitmap_len) as u32;
-    out[len_prefix_pos..len_prefix_pos + 4].copy_from_slice(&bitmap_actual.to_le_bytes());
+    out[len_prefix_pos..len_prefix_pos + BITMAP_LEN_PREFIX_LEN]
+        .copy_from_slice(&bitmap_actual.to_le_bytes());
 
     Ok(out)
 }
@@ -176,8 +202,8 @@ pub fn decode_sidecar(bytes: &[u8]) -> Result<TombstonesSidecar, SidecarCodecErr
     let mut cur = Cursor::new(bytes);
 
     // 1. Magic.
-    let mut magic_buf = [0u8; 8];
-    read_exact(&mut cur, &mut magic_buf, 8, bytes.len())?;
+    let mut magic_buf = [0u8; MAGIC_LEN];
+    read_exact(&mut cur, &mut magic_buf, MAGIC_LEN, bytes.len())?;
     if &magic_buf != MAGIC {
         return Err(SidecarCodecError::BadMagic {
             expected: *MAGIC,
@@ -186,8 +212,8 @@ pub fn decode_sidecar(bytes: &[u8]) -> Result<TombstonesSidecar, SidecarCodecErr
     }
 
     // 2. Schema version.
-    let mut vbuf = [0u8; 4];
-    read_exact(&mut cur, &mut vbuf, 4, bytes.len())?;
+    let mut vbuf = [0u8; VERSION_LEN];
+    read_exact(&mut cur, &mut vbuf, VERSION_LEN, bytes.len())?;
     let version = u32::from_le_bytes(vbuf);
     if version > SCHEMA_VERSION {
         return Err(SidecarCodecError::UnsupportedVersion {
@@ -197,16 +223,16 @@ pub fn decode_sidecar(bytes: &[u8]) -> Result<TombstonesSidecar, SidecarCodecErr
     }
 
     // 3. Seal flag + optional payload.
-    let mut fbuf = [0u8; 1];
-    read_exact(&mut cur, &mut fbuf, 1, bytes.len())?;
+    let mut fbuf = [0u8; SEAL_FLAG_LEN];
+    read_exact(&mut cur, &mut fbuf, SEAL_FLAG_LEN, bytes.len())?;
     let seal = match fbuf[0] {
-        0 => None,
-        1 => {
-            let mut uuid_buf = [0u8; 16];
-            read_exact(&mut cur, &mut uuid_buf, 16, bytes.len())?;
+        SEAL_FLAG_UNSEALED => None,
+        SEAL_FLAG_SEALED => {
+            let mut uuid_buf = [0u8; SEAL_UUID_LEN];
+            read_exact(&mut cur, &mut uuid_buf, SEAL_UUID_LEN, bytes.len())?;
             let compaction_id = Uuid::from_bytes(uuid_buf);
-            let mut tbuf = [0u8; 8];
-            read_exact(&mut cur, &mut tbuf, 8, bytes.len())?;
+            let mut tbuf = [0u8; SEAL_TIMESTAMP_LEN];
+            read_exact(&mut cur, &mut tbuf, SEAL_TIMESTAMP_LEN, bytes.len())?;
             let millis = i64::from_le_bytes(tbuf);
             let sealed_at = Utc
                 .timestamp_millis_opt(millis)
@@ -221,8 +247,8 @@ pub fn decode_sidecar(bytes: &[u8]) -> Result<TombstonesSidecar, SidecarCodecErr
     };
 
     // 4. Bitmap length prefix.
-    let mut lbuf = [0u8; 4];
-    read_exact(&mut cur, &mut lbuf, 4, bytes.len())?;
+    let mut lbuf = [0u8; BITMAP_LEN_PREFIX_LEN];
+    read_exact(&mut cur, &mut lbuf, BITMAP_LEN_PREFIX_LEN, bytes.len())?;
     let bitmap_len = u32::from_le_bytes(lbuf);
     let remaining = bytes.len() - (cur.position() as usize);
     if (bitmap_len as usize) > remaining {

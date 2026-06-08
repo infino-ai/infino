@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `Supertable::query_sql` — DataFusion SQL over the supertable.
 //!
 //! ## Public API

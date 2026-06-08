@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Smallest possible end-to-end tour of the stack:
 //!
 //!   A. superfile  — feed one document, then BM25 *and* vector kNN
@@ -34,6 +37,20 @@ const DOCSTRING_2: &str = "a lazy sleeping fox";
 const DOC_ID_1: u64 = 42;
 const EMB_DIM: usize = 16;
 
+/// Decimal128 precision (max digits) for the `doc_id` primary key,
+/// matching the supertable snowflake-id type used repo-wide.
+const DOC_ID_DECIMAL_PRECISION: u8 = 38;
+/// Decimal128 scale for `doc_id` — integer ids, no fractional part.
+const DOC_ID_DECIMAL_SCALE: i8 = 0;
+/// IVF centroids for a one-document superfile segment (one cluster).
+const DEMO_N_CENT: usize = 1;
+/// Rotation-matrix RNG seed (matches the test/bench convention).
+const DEMO_ROT_SEED: u64 = 7;
+/// Non-zero component before unit-normalizing the demo embedding.
+const DEMO_EMBED_UNIT_COMPONENT: f32 = 1.0;
+/// Top-K for the demo's BM25 and vector searches.
+const SEARCH_TOP_K: usize = 10;
+
 fn main() {
     let bytes = demo_superfile();
     demo_datafusion(&bytes);
@@ -47,7 +64,11 @@ fn demo_superfile() -> Bytes {
 
     // doc_id (the required Decimal128 primary key) + one text column.
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(DOC_ID_DECIMAL_PRECISION, DOC_ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
 
@@ -63,8 +84,8 @@ fn demo_superfile() -> Bytes {
         vec![VectorConfig::new(
             "emb".into(),
             EMB_DIM,
-            1,
-            7,
+            DEMO_N_CENT,
+            DEMO_ROT_SEED,
             Metric::Cosine,
         )],
         Some(default_tokenizer()),
@@ -82,7 +103,7 @@ fn demo_superfile() -> Bytes {
 
     // One unit-norm embedding for the single doc.
     let mut emb = vec![0.0f32; EMB_DIM];
-    emb[0] = 1.0;
+    emb[0] = DEMO_EMBED_UNIT_COMPONENT;
     normalize(&mut emb);
 
     builder
@@ -101,7 +122,7 @@ fn demo_superfile() -> Bytes {
         // BM25 over the embedded FTS blob. Hits are (local_doc_id, score).
         for q in ["brown", "fox", "missing"] {
             let hits = reader
-                .bm25_search("title", q, 10, BoolMode::Or)
+                .bm25_search("title", q, SEARCH_TOP_K, BoolMode::Or)
                 .await
                 .expect("bm25_search");
             println!("  bm25 {q:>8?} -> {} hit(s): {hits:?}", hits.len());
@@ -110,7 +131,7 @@ fn demo_superfile() -> Bytes {
         // kNN over the embedded vector blob. Query with the doc's own
         // embedding -> distance ~0 under cosine.
         let knn = reader
-            .vector_search("emb", &emb, 10, VectorSearchOptions::default())
+            .vector_search("emb", &emb, SEARCH_TOP_K, VectorSearchOptions::default())
             .await
             .expect("vector_search");
         println!("  knn  self-query -> {} hit(s): {knn:?}", knn.len());
@@ -177,7 +198,7 @@ fn demo_supertable() {
     // BM25 across both segments. SuperfileHit carries the source
     // segment + local_doc_id + score.
     let hits = st
-        .bm25_search("title", "fox", 10, BoolMode::Or)
+        .bm25_search("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());
     for h in &hits {

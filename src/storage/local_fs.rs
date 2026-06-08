@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! LocalFS-backed [`StorageProvider`].
 //!
 //! Wraps `object_store::local::LocalFileSystem` so the same

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Parquet footer surgery: write the user's row groups via `parquet-rs`,
 //! splice the FTS + vector blobs between the last row group and a
 //! rewritten footer that carries `inf.*` KV metadata pointing at them.
@@ -33,6 +36,23 @@ use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Length of Parquet's trailing `PAR1` magic, in bytes.
+const PARQUET_MAGIC_LEN: usize = 4;
+
+/// Width of the little-endian `u32` footer-length field that precedes
+/// the trailing magic.
+const PARQUET_FOOTER_LEN_FIELD_BYTES: usize = 4;
+
+/// Bytes occupied by the Parquet footer suffix: the footer-length
+/// field plus the trailing `PAR1` magic. The Thrift footer metadata
+/// ends exactly this many bytes before end-of-file.
+const PARQUET_FOOTER_SUFFIX_BYTES: usize = PARQUET_FOOTER_LEN_FIELD_BYTES + PARQUET_MAGIC_LEN;
+
+/// Minimum plausible Parquet file size: a leading + trailing `PAR1`
+/// magic with a footer-length field between them. Anything shorter
+/// cannot carry a footer, so footer parsing bails early.
+const PARQUET_MIN_FILE_BYTES: usize = PARQUET_MAGIC_LEN + PARQUET_FOOTER_SUFFIX_BYTES;
 
 /// Output of a successful build.
 pub struct ParquetParts {
@@ -123,21 +143,22 @@ pub fn encode_parquet_body(
 
     // Locate the footer and decode it.
     let n = buf.len();
-    if n < 12 {
+    if n < PARQUET_MIN_FILE_BYTES {
         return Err(FooterError::Malformed("parquet buffer too short"));
     }
-    if &buf[n - 4..n] != b"PAR1" {
+    if &buf[n - PARQUET_MAGIC_LEN..n] != b"PAR1" {
         return Err(FooterError::Malformed("missing trailing PAR1 magic"));
     }
-    let footer_len_bytes: [u8; 4] = buf[n - 8..n - 4]
+    let footer_len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = buf
+        [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
         .try_into()
         .map_err(|_| FooterError::Malformed("footer length not 4 bytes"))?;
     let footer_len = u32::from_le_bytes(footer_len_bytes) as usize;
-    if n < 8 + footer_len {
+    if n < PARQUET_FOOTER_SUFFIX_BYTES + footer_len {
         return Err(FooterError::Malformed("footer length out of range"));
     }
-    let footer_start = n - 8 - footer_len;
-    let footer_bytes = buf[footer_start..n - 8].to_vec();
+    let footer_start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
+    let footer_bytes = buf[footer_start..n - PARQUET_FOOTER_SUFFIX_BYTES].to_vec();
     let metadata = ParquetMetaDataReader::decode_metadata(&footer_bytes)?;
 
     // Truncate to end of last row group; blobs + the rewritten footer
@@ -241,18 +262,21 @@ pub fn splice_index_blobs(
 /// superfile's Parquet footer.
 pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
     let n = bytes.len();
-    if n < 12 || &bytes[n - 4..n] != b"PAR1" {
+    if n < PARQUET_MIN_FILE_BYTES || &bytes[n - PARQUET_MAGIC_LEN..n] != b"PAR1" {
         return Err(FooterError::Malformed("not a Parquet file (missing PAR1)"));
     }
-    let footer_len_bytes: [u8; 4] = bytes[n - 8..n - 4]
+    let footer_len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = bytes
+        [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
         .try_into()
         .map_err(|_| FooterError::Malformed("footer length not 4 bytes"))?;
     let footer_len = u32::from_le_bytes(footer_len_bytes) as usize;
-    if n < 8 + footer_len {
+    if n < PARQUET_FOOTER_SUFFIX_BYTES + footer_len {
         return Err(FooterError::Malformed("footer length out of range"));
     }
-    let footer_start = n - 8 - footer_len;
-    let metadata = ParquetMetaDataReader::decode_metadata(&bytes[footer_start..n - 8])?;
+    let footer_start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
+    let metadata = ParquetMetaDataReader::decode_metadata(
+        &bytes[footer_start..n - PARQUET_FOOTER_SUFFIX_BYTES],
+    )?;
     extract_kv_map(&metadata)
 }
 
@@ -288,23 +312,24 @@ pub async fn read_parquet_metadata_lazy(
         .tail(tail_speculative_bytes)
         .await
         .map_err(footer_lazy_err)?;
-    if total < 12 {
+    if total < PARQUET_MIN_FILE_BYTES as u64 {
         return Err(FooterError::Malformed("not a Parquet file (too short)"));
     }
     let spec_len = tail.len() as u64;
     let spec_start = total - spec_len;
 
     let n = tail.len();
-    if &tail[n - 4..n] != b"PAR1" {
+    if &tail[n - PARQUET_MAGIC_LEN..n] != b"PAR1" {
         return Err(FooterError::Malformed("not a Parquet file (missing PAR1)"));
     }
-    let footer_len_bytes: [u8; 4] = tail[n - 8..n - 4]
+    let footer_len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = tail
+        [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
         .try_into()
         .map_err(|_| FooterError::Malformed("footer length not 4 bytes"))?;
     let footer_len = u32::from_le_bytes(footer_len_bytes) as usize;
-    let footer_end_abs = total - 8;
+    let footer_end_abs = total - PARQUET_FOOTER_SUFFIX_BYTES as u64;
     let footer_start_abs = (total as usize)
-        .checked_sub(8 + footer_len)
+        .checked_sub(PARQUET_FOOTER_SUFFIX_BYTES + footer_len)
         .ok_or(FooterError::Malformed("footer length out of range"))?;
 
     let footer_bytes: bytes::Bytes = if (footer_start_abs as u64) >= spec_start {
@@ -324,7 +349,7 @@ pub async fn read_parquet_metadata_lazy(
 /// convenience wrapper around
 /// [`read_parquet_metadata_lazy`] for the common case where
 /// callers only need the `inf.*` KV map (e.g. tests + the eager
-/// open path mirroring the legacy [`read_kv_metadata`]).
+/// open path, mirroring the eager [`read_kv_metadata`]).
 pub async fn read_kv_metadata_lazy(
     source: &dyn crate::superfile::LazyByteSource,
     tail_speculative_bytes: u64,

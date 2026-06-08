@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Format-spec primitives: magic byte sequences, version strings, KV
 //! metadata key constants. Anything that defines what bytes go where in a
 //! superfile lives here.
@@ -11,6 +14,12 @@ pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 /// File-format version. Semver string. Bump major to break compatibility.
 pub const FORMAT_VERSION: &str = "1.0.0";
 
+/// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a
+/// directory or after a subsection's payload. Defined once so the
+/// writer and reader arithmetic agree symbolically rather than via
+/// duplicated `+ 4 /* CRC */` literals.
+pub const CRC_BYTES: usize = 4;
+
 /// FTS section magic bytes and constants.
 pub mod fts {
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` + version `01`.
@@ -19,6 +28,96 @@ pub mod fts {
     /// suffix; future-proofing for a per-section version separate from
     /// section identity).
     pub const VERSION: u32 = 1;
+
+    /// Fixed-point scale for the per-column average document length.
+    /// The builder stores `round(avgdl × 1000)` in the doc-lengths
+    /// directory as a `u32` (`avgdl_x1000`); the reader recovers the
+    /// `f32` average length by dividing by this. Defined once so the
+    /// write and read paths share one scale.
+    pub const AVGDL_FIXED_POINT_SCALE: f32 = 1000.0;
+
+    /// Fixed-point scale for a posting block's max-BM25 upper bound.
+    /// The builder stores `round(max_bm25 × 1000)` in each skip-table
+    /// entry (`max_bm25_x1000`); the reader recovers the `f32` bound
+    /// by dividing by this. Drives WAND / block-max skip decisions, so
+    /// write and read must agree on the scale.
+    pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
+
+    /// Total FTS blob header size in bytes. The FST directory begins
+    /// immediately after this fixed-size header.
+    pub const HEADER_SIZE: usize = 48;
+
+    /// Width of the 8-byte FTS magic field.
+    pub const MAGIC_BYTES: usize = 8;
+    /// Width of a little-endian `u32` header field.
+    pub const U32_BYTES: usize = 4;
+    /// Width of a little-endian `u64` header field.
+    pub const U64_BYTES: usize = 8;
+
+    /// FTS blob header field offsets (48-byte header):
+    ///
+    /// ```text
+    /// [ 0.. 8] MAGIC
+    /// [ 8..12] version (u32 LE)
+    /// [12..16] n_columns (u32 LE)
+    /// [16..20] n_docs (u32 LE)
+    /// [20..24] n_terms_total (u32 LE)
+    /// [24..32] fst_offset (u64 LE)
+    /// [32..40] postings_offset (u64 LE)
+    /// [40..48] doc_lengths_table_offset (u64 LE)
+    /// ```
+    pub mod hdr {
+        /// `[8..12]` format version (`u32` LE).
+        pub const VERSION_OFF: usize = 8;
+        /// `[12..16]` column count (`u32` LE).
+        pub const N_COLUMNS_OFF: usize = 12;
+        /// `[16..20]` document count (`u32` LE).
+        pub const N_DOCS_OFF: usize = 16;
+        /// `[20..24]` total distinct `(column, term)` pairs (`u32` LE).
+        pub const N_TERMS_OFF: usize = 20;
+        /// `[24..32]` FST body offset (`u64` LE).
+        pub const FST_OFFSET_OFF: usize = 24;
+        /// `[32..40]` postings region offset (`u64` LE).
+        pub const POSTINGS_OFFSET_OFF: usize = 32;
+        /// `[40..48]` doc-lengths directory offset (`u64` LE).
+        pub const DOC_LENGTHS_DIR_OFF: usize = 40;
+    }
+
+    /// Per-term metadata header field offsets (relative to a term's
+    /// `metadata_offset`):
+    ///
+    /// ```text
+    /// [ 0.. 4] df (u32 LE)
+    /// [ 4..12] self-offset (u64 LE, redundant)
+    /// [12..16] postings_length (u32 LE)
+    /// [16..20] num_blocks (u32 LE)
+    /// ```
+    pub mod term_meta {
+        /// `[0..4]` document frequency (`u32` LE).
+        pub const DF_OFF: usize = 0;
+        /// `[12..16]` total byte length of the term's postings (`u32` LE).
+        pub const POSTINGS_LENGTH_OFF: usize = 12;
+        /// `[16..20]` number of PFOR blocks / skip-table entries (`u32` LE).
+        pub const NUM_BLOCKS_OFF: usize = 16;
+    }
+
+    /// Skip-table entry field offsets (relative to the entry start;
+    /// each entry is `SKIP_ENTRY_SIZE` bytes):
+    ///
+    /// ```text
+    /// [ 0.. 4] last_doc_id (u32 LE)
+    /// [ 4.. 8] block_offset (u32 LE, relative to term metadata start)
+    /// [ 8..12] max_bm25_x1000 (u32 LE)
+    /// [12..16] reserved (u32)
+    /// ```
+    pub mod skip_entry {
+        /// `[0..4]` largest doc-id in the block (`u32` LE).
+        pub const LAST_DOC_ID_OFF: usize = 0;
+        /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
+        pub const BLOCK_OFFSET_OFF: usize = 4;
+        /// `[8..12]` fixed-point block-max BM25 bound (`u32` LE).
+        pub const MAX_BM25_OFF: usize = 8;
+    }
 }
 
 /// Vector section magic bytes and constants.
@@ -27,6 +126,11 @@ pub mod vec {
     pub const OUTER_MAGIC: &[u8; 8] = b"INFVEC01";
     /// 8-byte magic at the start of each per-column subsection.
     pub const SUB_MAGIC: &[u8; 8] = b"INFVECC1";
+    /// Doc-id width in bytes (`u32` little-endian) stored after each
+    /// per-cluster code block. A per-cluster block row is `code_bytes`
+    /// of quantized code followed by [`DOC_ID_BYTES`] of doc-id, so the
+    /// stride is `code_bytes + DOC_ID_BYTES`.
+    pub const DOC_ID_BYTES: usize = 4;
     /// Outer-blob version. Written at bytes [8..12] of the outer
     /// header. Bump on outer-blob-shape changes (currently 1).
     pub const VERSION: u32 = 1;
@@ -81,11 +185,92 @@ pub mod vec {
     ///   `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`,
     ///   block size `count[c] * (code_bytes + 4)`.
     ///
-    /// The format is **new-service-only** — there are no pre-013
-    /// segments in production, so the reader rejects every other
-    /// value at this slot as malformed rather than carrying a v0
-    /// parse path.
+    /// Only this version is accepted on read; a segment stamped
+    /// with any other value at this slot is rejected as malformed
+    /// rather than carrying an alternate parse path.
     pub const SUBSECTION_VERSION: u32 = 2;
+
+    /// Width of a little-endian `u32` field in the vector blob.
+    pub const U32_BYTES: usize = 4;
+    /// Width of a little-endian `u64` field in the vector blob.
+    pub const U64_BYTES: usize = 8;
+    /// Width of the 8-byte section/sub-section magic.
+    pub const MAGIC_BYTES: usize = 8;
+
+    /// Outer-header size: magic + version + n_columns + n_docs +
+    /// dir_offset.
+    pub const OUTER_HEADER_SIZE: usize = 32;
+    /// Per-column subsection-directory entry size in bytes.
+    pub const DIR_ENTRY_SIZE: usize = 64;
+    /// Per-column sub-header size (inside each subsection).
+    pub const SUB_HEADER_SIZE: usize = 56;
+
+    /// On-disk `metric_id` discriminator for squared-L2 distance.
+    pub const METRIC_ID_L2SQ: u32 = 0;
+    /// On-disk `metric_id` discriminator for cosine distance.
+    pub const METRIC_ID_COSINE: u32 = 1;
+    /// On-disk `metric_id` discriminator for negated dot product.
+    pub const METRIC_ID_NEGDOT: u32 = 2;
+
+    /// Cluster-index entry size: `(doc_off: u32, count: u32)`.
+    pub const CLUSTER_IDX_ENTRY_BYTES: usize = 8;
+    /// Byte offset of the `count` field within a cluster-index entry
+    /// (it is the second `u32` of the pair).
+    pub const CLUSTER_IDX_COUNT_OFFSET: usize = 4;
+
+    /// Outer-header field offsets (see the byte map above).
+    pub mod outer_hdr {
+        /// `[8..12]` outer-blob version (`u32` LE).
+        pub const VERSION_OFF: usize = 8;
+        /// `[12..16]` column count (`u32` LE).
+        pub const N_COLUMNS_OFF: usize = 12;
+        /// `[16..24]` document count (`u64` LE).
+        pub const N_DOCS_OFF: usize = 16;
+        /// `[24..32]` directory byte offset (`u64` LE).
+        pub const DIR_OFFSET_OFF: usize = 24;
+    }
+
+    /// Per-column directory-entry field offsets (64-byte entry).
+    pub mod dir_entry {
+        /// `[+4..+8]` vector dimension (`u32` LE).
+        pub const DIM_OFF: usize = 4;
+        /// `[+8..+12]` IVF centroid count (`u32` LE).
+        pub const N_CENT_OFF: usize = 8;
+        /// `[+12..+16]` metric id (`u32` LE).
+        pub const METRIC_ID_OFF: usize = 12;
+        /// `[+16..+24]` rotation seed (`u64` LE).
+        pub const ROT_SEED_OFF: usize = 16;
+        /// `[+24..+32]` subsection byte offset (`u64` LE).
+        pub const SUBSECTION_OFF_OFF: usize = 24;
+        /// `[+32..+40]` subsection byte length (`u64` LE).
+        pub const SUBSECTION_LEN_OFF: usize = 32;
+        /// `[+40..+48]` absolute summary offset (`u64` LE).
+        pub const SUMMARY_ABS_OFF: usize = 40;
+        /// `[+52]` rerank-codec discriminator byte.
+        pub const CODEC_ID_OFF: usize = 52;
+        /// `[+56..+60]` codec-meta offset within the subsection (`u32` LE).
+        pub const CODEC_META_OFF_OFF: usize = 56;
+        /// `[+60..+64]` codec-meta size (`u32` LE).
+        pub const CODEC_META_SIZE_OFF: usize = 60;
+    }
+
+    /// Per-column sub-header field offsets (56-byte header).
+    pub mod sub_hdr {
+        /// `[8..12]` subsection layout version (`u32` LE).
+        pub const VERSION_OFF: usize = 8;
+        /// `[12..16]` codec-meta size (`u32` LE).
+        pub const CODEC_META_SIZE_OFF: usize = 12;
+        /// `[16..24]` summary-centroid offset (`u64` LE).
+        pub const SUMMARY_OFF_OFF: usize = 16;
+        /// `[24..28]` summary radius ×100 (`u32` LE).
+        pub const SUMMARY_RADIUS_X100_OFF: usize = 24;
+        /// `[32..40]` centroids offset (`u64` LE).
+        pub const CENTROIDS_OFF_OFF: usize = 32;
+        /// `[40..48]` cluster-index offset (`u64` LE).
+        pub const CLUSTER_IDX_OFF_OFF: usize = 40;
+        /// `[48..56]` per-cluster-blocks offset (`u64` LE).
+        pub const PER_CLUSTER_BLOCKS_OFF_OFF: usize = 48;
+    }
 }
 
 /// Parquet KV metadata keys, all prefixed `inf.` to match the project magic.

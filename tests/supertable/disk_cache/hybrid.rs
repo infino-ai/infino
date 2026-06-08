@@ -1,7 +1,9 @@
-//! Hybrid cold-fetch (`ColdFetchMode::HybridWithPrefetch`) —
-//! 003 M7.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Hybrid cold-fetch (`ColdFetchMode::HybridWithPrefetch`).
 //!
-//! Builds on the M5 disk-cache infrastructure with the
+//! Builds on the disk-cache infrastructure with the
 //! foreground-broadcast-then-finalize architecture:
 //!
 //! - Range-GETs run in parallel and feed two consumers: the
@@ -106,9 +108,27 @@ impl StorageProvider for CountingProxy {
 // Fixtures.
 // ============================================================
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Disk-cache budget (1 GiB) for the hybrid-cache tests.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Small cold-fetch chunk to force multi-range fetches.
+const COLD_FETCH_CHUNK_BYTES_SMALL: u64 = 64;
+/// Sleep allowing the background finalizer to run between assertions.
+const BACKGROUND_FINALIZER_SLEEP_MS: u64 = 50;
+/// Concurrent hybrid readers for the coalescing test.
+const HYBRID_CONCURRENT_READER_COUNT: usize = 50;
+
 fn build_test_bytes() -> Bytes {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -140,10 +160,10 @@ fn fresh_cache(
     let dir = TempDir::new().expect("tempdir");
     let cfg = DiskCacheConfig {
         cache_root: dir.path().to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: mode,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 64,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES_SMALL,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -205,7 +225,10 @@ async fn hybrid_bandwidth_per_cold_miss_equals_segment_size() {
     // Wait for the background finalizer to complete so we
     // measure total bandwidth (including any post-foreground
     // work — we expect zero post-foreground get_range bytes).
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        BACKGROUND_FINALIZER_SLEEP_MS,
+    ))
+    .await;
 
     let bytes_fetched = proxy.bytes();
     assert_eq!(
@@ -235,7 +258,10 @@ async fn hybrid_warm_hit_issues_zero_range_fetches() {
     let calls_after_cold = proxy.calls();
     // Let the background finalize complete so subsequent calls
     // see the mmap-backed cached entry.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        BACKGROUND_FINALIZER_SLEEP_MS,
+    ))
+    .await;
     let _r2 = cache.reader(&uri).await.expect("warm");
     assert_eq!(
         proxy.calls(),
@@ -260,8 +286,8 @@ async fn hybrid_concurrent_readers_coalesce_to_one_fetch_fan_out() {
         ColdFetchMode::HybridWithPrefetch,
     );
 
-    let mut joins = Vec::with_capacity(50);
-    for _ in 0..50 {
+    let mut joins = Vec::with_capacity(HYBRID_CONCURRENT_READER_COUNT);
+    for _ in 0..HYBRID_CONCURRENT_READER_COUNT {
         let cache = Arc::clone(&cache);
         joins.push(tokio::spawn(async move { cache.reader(&uri).await }));
     }
@@ -270,7 +296,10 @@ async fn hybrid_concurrent_readers_coalesce_to_one_fetch_fan_out() {
     }
     // Bandwidth still equals one segment size — coalescing
     // ensured exactly one fetch fan-out served all 50.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        BACKGROUND_FINALIZER_SLEEP_MS,
+    ))
+    .await;
     assert_eq!(
         proxy.bytes(),
         segment_size,

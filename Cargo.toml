@@ -2,6 +2,7 @@
 name = "infino"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via
 # `[[bench]]` below. Without this, shared helper files like
@@ -109,19 +110,19 @@ datafusion = "53"
 # tokio in [dev-dependencies] solely for the macro feature.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
 
-# Object-store backend (003 M1). `object_store` is already
+# Object-store backend. `object_store` is already
 # transitive via DataFusion 53 (0.12.5) and parquet 58 (0.13.2);
 # we pin our direct usage to 0.13 to match parquet — which is the
 # version with the conditional-put surface we need for the
 # manifest pointer's OCC + atomic-create semantics.
 object_store = { version = "0.13", features = ["aws", "azure"] }
-# Async-trait erasure for `StorageProvider` (003 M1) and the
-# `LazyByteSource` trait that will land in M6. Both need to be
+# Async-trait erasure for `StorageProvider` and the
+# `LazyByteSource` trait. Both need to be
 # usable through `Arc<dyn ...>` for cross-layer sharing, which
 # requires boxed futures.
 async-trait = "0.1"
 
-# Manifest-part serde (003 M2a). Avro for the dense per-segment
+# Manifest-part serde. Avro for the dense per-segment
 # tier (matches Iceberg's manifest-file choice at scale); zstd
 # for compression; blake3 for content-addressing.
 #
@@ -132,33 +133,33 @@ apache-avro = "0.17"
 blake3 = "1"
 zstd = "0.13"
 
-# Manifest list JSON (003 M2b). The list tier carries byte-valued
+# Manifest list JSON. The list tier carries byte-valued
 # fields (arrow-ipc schema, per-part content_hash bytes, aggregate
 # skip summaries) as base64 strings — JSON arrays of bytes would
 # bloat the list by ~3-4× and break `jq` debuggability, which is
 # the whole reason the list is JSON and not Avro.
 base64 = "0.22"
 
-# In-memory hierarchical Manifest (003 M2c). The `parts` cache
+# In-memory hierarchical Manifest. The `parts` cache
 # is a DashMap<PartId, OnceCell<Arc<ManifestPart>>> so concurrent
 # queries on a cold part coalesce to a single StorageProvider::get.
 # DashMap's sharded locking lets the manifest part hot path (cache
 # hit on a known PartId) avoid contention.
 dashmap = "6"
 
-# Manifest commit parallel issue (003 M3). `futures::join_all`
+# Manifest commit parallel issue. `futures::join_all`
 # fans out per-part PUTs alongside the manifest list PUT in
 # `commit_manifest` so hierarchical commits don't pay an extra
 # RTT vs the flat-manifest baseline.
 futures = "0.3"
 
-# Disk cache memory-map (003 M5). Tier 1 cache files are
+# Disk cache memory-map. Tier 1 cache files are
 # mmap'd; `Bytes::from_owner(Mmap)` lets the rest of the read
 # path consume cached bytes through the same `Bytes` view that
 # the in-memory store uses today.
 memmap2 = "0.9"
 
-# Process RSS for `Supertable::stats()` (003 M13). Cross-
+# Process RSS for `Supertable::stats()`. Cross-
 # platform (macOS / Linux / Windows). The crate is tiny and
 # has no transitive deps — pulls in libc on Unix and uses
 # Mach task_info on macOS / /proc/self/statm on Linux. We
@@ -177,7 +178,7 @@ memmap2 = "0.9"
 memory-stats = { version = "1.2", features = ["always_use_statm"] }
 
 # Advisory file locks for the LocalFs pointer-rename window
-# (003 D4). The LocalFs `put_if_match` is implemented as
+# The LocalFs `put_if_match` is implemented as
 # read-then-overwrite (object_store::LocalFileSystem
 # doesn't support native PutMode::Update); without a lock,
 # two processes can both see the same prior etag and race
@@ -198,7 +199,7 @@ fs4 = { version = "0.13", features = ["tokio"] }
 ferroid = { version = "2", features = ["std", "alloc", "snowflake", "basic"] }
 
 # Scratch tempdir + spill file management for the streaming
-# `VectorBuilder` (plan 010 M3). Promoted from dev-dependencies
+# `VectorBuilder`. Promoted from dev-dependencies
 # because builder.rs holds an `Arc<TempDir>` per builder to
 # back per-centroid bucket files and per-column input spills.
 tempfile = "3"

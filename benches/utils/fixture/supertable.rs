@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Single combined supertable ingest + search consumer for `supertable_all`.
 
 use std::sync::{Arc, OnceLock};
@@ -10,6 +13,10 @@ use tempfile::TempDir;
 
 use crate::ingest::supertable::{self, IngestResult, Modality};
 use crate::tiers;
+
+/// Seconds-to-nanoseconds factor for recording build time for the
+/// Criterion replay path.
+const SEC_TO_NANOS: f64 = 1e9;
 
 static INGEST: OnceLock<IngestResult> = OnceLock::new();
 static BUILD_NS: OnceLock<f64> = OnceLock::new();
@@ -39,7 +46,7 @@ pub fn ensure_ingest(reason: &str) -> &'static IngestResult {
     INGEST.get_or_init(|| {
         let t0 = Instant::now();
         let built = supertable::build_combined_on_storage();
-        let _ = BUILD_NS.set(t0.elapsed().as_secs_f64() * 1e9);
+        let _ = BUILD_NS.set(t0.elapsed().as_secs_f64() * SEC_TO_NANOS);
         eprintln!(
             "[supertable_all] ingest OK: {} superfiles ({})",
             built.n_superfiles, built.storage_label
@@ -78,7 +85,7 @@ pub fn ensure_fts_ingest(reason: &str) -> &'static IngestResult {
     FTS_INGEST.get_or_init(|| {
         let t0 = Instant::now();
         let built = supertable::build_on_storage(Modality::Fts);
-        let _ = FTS_BUILD_NS.set(t0.elapsed().as_secs_f64() * 1e9);
+        let _ = FTS_BUILD_NS.set(t0.elapsed().as_secs_f64() * SEC_TO_NANOS);
         eprintln!(
             "[supertable_fts] ingest OK: {} superfiles ({})",
             built.n_superfiles, built.storage_label
@@ -107,7 +114,7 @@ pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
     VEC_INGEST.get_or_init(|| {
         let t0 = Instant::now();
         let built = supertable::build_on_storage(Modality::Vector);
-        let _ = VEC_BUILD_NS.set(t0.elapsed().as_secs_f64() * 1e9);
+        let _ = VEC_BUILD_NS.set(t0.elapsed().as_secs_f64() * SEC_TO_NANOS);
         eprintln!(
             "[supertable_vec] ingest OK: {} superfiles ({})",
             built.n_superfiles, built.storage_label

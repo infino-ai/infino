@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 scoring math.
 //!
 //! Pure functions — no allocation, no I/O. Standard BM25 defaults:
@@ -33,6 +36,15 @@ pub const K1: f32 = 1.2;
 /// Standard BM25 default `b` — length-normalization parameter.
 pub const B: f32 = 0.75;
 
+/// Plus-half IDF smoothing term. Added to both the numerator and
+/// denominator of the IDF log argument so it stays ≥ 1 (hence
+/// `idf >= 0`) for every valid `(N, df)` — the "BM25+1" form.
+const IDF_SMOOTHING: f64 = 0.5;
+
+/// SIMD lane count for the four-wide BM25 scorer ([`f32x4`]). The
+/// multi-term path scores this many cursors at one doc per call.
+const SCORE_SIMD_LANES: usize = 4;
+
 /// BM25 inverse-document-frequency. Plus-half smoothing keeps the log
 /// argument ≥ 1, so `idf(N, df) >= 0` for all valid `(N, df)`.
 ///
@@ -42,7 +54,7 @@ pub fn idf(n_docs: u64, df: u64) -> f32 {
     debug_assert!(df <= n_docs, "df ({df}) > n_docs ({n_docs})");
     let n = n_docs as f64;
     let df = df as f64;
-    let arg = 1.0 + (n - df + 0.5) / (df + 0.5);
+    let arg = 1.0 + (n - df + IDF_SMOOTHING) / (df + IDF_SMOOTHING);
     arg.ln() as f32
 }
 
@@ -102,7 +114,11 @@ pub fn score_with_dl_norm_k1(idf_x_k1p1: f32, tf: u32, dl_norm_k1: f32) -> f32 {
 /// pipeline four divisions in parallel (the dominant cost in the
 /// scalar `score`).
 #[inline(always)]
-pub fn score_simd_x4(idfs_x_k1p1: [f32; 4], tfs: [f32; 4], dl_norm_k1: f32) -> f32 {
+pub fn score_simd_x4(
+    idfs_x_k1p1: [f32; SCORE_SIMD_LANES],
+    tfs: [f32; SCORE_SIMD_LANES],
+    dl_norm_k1: f32,
+) -> f32 {
     let idf_v = f32x4::from(idfs_x_k1p1);
     let tf_v = f32x4::from(tfs);
     let denom = tf_v + f32x4::splat(dl_norm_k1);

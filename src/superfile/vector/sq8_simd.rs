@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! SIMD primitives for the Sq8 build pipeline.
 //!
 //! Owns the per-tier (scalar/`wide`/AVX2/AVX-512) implementations of
@@ -30,6 +33,27 @@
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
+/// Maximum Sq8 code value. Sq8 quantizes each component to a single
+/// unsigned byte, so the encoder clamps the FMA result to
+/// `[0, SQ8_CODE_MAX]` before the truncating cast to `u8`.
+const SQ8_CODE_MAX: f32 = 255.0;
+
+/// Round-half-up bias folded into the per-cluster `c2` encode
+/// constant. Adding `0.5` before a truncating cast turns truncation
+/// into round-half-up, which equals round-half-away on the
+/// non-negative `[0, SQ8_CODE_MAX]` domain the encoder operates in.
+const SQ8_ROUND_HALF_BIAS: f32 = 0.5;
+
+/// Lane count of the portable `wide::f32x8` register and the AVX2
+/// 256-bit f32 register. The 8-lane kernels process this many f32s
+/// per iteration.
+const F32X8_LANES: usize = 8;
+
+/// Lane count of an AVX-512 f32 register (512-bit / 32-bit). The
+/// AVX-512 kernels process this many f32s per iteration, with an
+/// 8-lane half-tail for `dim % AVX512_F32_LANES == F32X8_LANES`.
+const AVX512_F32_LANES: usize = 16;
+
 /// Per-cluster Sq8 encode constants. Each cluster contributes one
 /// `(inv_scale[dim], c2[dim])` pair where
 ///     `c2[d] = (-offset[d]) * inv_scale[d] + 0.5`
@@ -60,7 +84,7 @@ impl Sq8EncodeConsts {
         let c2: Vec<f32> = offset
             .iter()
             .zip(inv_scale.iter())
-            .map(|(o, inv)| (-*o).mul_add(*inv, 0.5))
+            .map(|(o, inv)| (-*o).mul_add(*inv, SQ8_ROUND_HALF_BIAS))
             .collect();
         Self { inv_scale, c2 }
     }
@@ -104,18 +128,18 @@ pub(super) fn update_min_max(row: &[f32], min_slice: &mut [f32], max_slice: &mut
 fn update_min_max_wide(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
     use wide::f32x8;
     let dim = row.len();
-    let full = dim - dim % 8;
+    let full = dim - dim % F32X8_LANES;
     let mut i = 0;
     while i < full {
-        let r: [f32; 8] = row[i..i + 8].try_into().expect("len 8");
-        let mn: [f32; 8] = min_slice[i..i + 8].try_into().expect("len 8");
-        let mx: [f32; 8] = max_slice[i..i + 8].try_into().expect("len 8");
+        let r: [f32; F32X8_LANES] = row[i..i + F32X8_LANES].try_into().expect("len 8");
+        let mn: [f32; F32X8_LANES] = min_slice[i..i + F32X8_LANES].try_into().expect("len 8");
+        let mx: [f32; F32X8_LANES] = max_slice[i..i + F32X8_LANES].try_into().expect("len 8");
         let r_v = f32x8::from(r);
         let new_min = r_v.fast_min(f32x8::from(mn)).to_array();
         let new_max = r_v.fast_max(f32x8::from(mx)).to_array();
-        min_slice[i..i + 8].copy_from_slice(&new_min);
-        max_slice[i..i + 8].copy_from_slice(&new_max);
-        i += 8;
+        min_slice[i..i + F32X8_LANES].copy_from_slice(&new_min);
+        max_slice[i..i + F32X8_LANES].copy_from_slice(&new_max);
+        i += F32X8_LANES;
     }
     while i < dim {
         let x = row[i];
@@ -141,7 +165,7 @@ fn update_min_max_wide(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]
 unsafe fn update_min_max_avx2(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
     use std::arch::x86_64::*;
     let dim = row.len();
-    let full = dim - dim % 8;
+    let full = dim - dim % F32X8_LANES;
     let mut i = 0;
     // SAFETY: each iteration reads 24 bytes (one f32 lane of row,
     // min, max each at offset `i`) and writes 16 bytes (min, max
@@ -156,7 +180,7 @@ unsafe fn update_min_max_avx2(row: &[f32], min_slice: &mut [f32], max_slice: &mu
             let new_mx = _mm256_max_ps(r, mx);
             _mm256_storeu_ps(min_slice.as_mut_ptr().add(i), new_mn);
             _mm256_storeu_ps(max_slice.as_mut_ptr().add(i), new_mx);
-            i += 8;
+            i += F32X8_LANES;
         }
     }
     while i < dim {
@@ -184,7 +208,7 @@ unsafe fn update_min_max_avx2(row: &[f32], min_slice: &mut [f32], max_slice: &mu
 unsafe fn update_min_max_avx512(row: &[f32], min_slice: &mut [f32], max_slice: &mut [f32]) {
     use std::arch::x86_64::*;
     let dim = row.len();
-    let full16 = dim - dim % 16;
+    let full16 = dim - dim % AVX512_F32_LANES;
     let mut i = 0;
     // SAFETY: per-iteration windows of 16 f32s in each of row /
     // min / max; bounded by `i + 16 <= dim`. Unaligned loads /
@@ -198,12 +222,12 @@ unsafe fn update_min_max_avx512(row: &[f32], min_slice: &mut [f32], max_slice: &
             let new_mx = _mm512_max_ps(r, mx);
             _mm512_storeu_ps(min_slice.as_mut_ptr().add(i), new_mn);
             _mm512_storeu_ps(max_slice.as_mut_ptr().add(i), new_mx);
-            i += 16;
+            i += AVX512_F32_LANES;
         }
         // 8-lane half-tail for `dim % 16 == 8` (rare but
         // possible — keeps the kernel correct without falling to
         // scalar on the same iteration count).
-        if i + 8 <= dim {
+        if i + F32X8_LANES <= dim {
             let r = _mm256_loadu_ps(row.as_ptr().add(i));
             let mn = _mm256_loadu_ps(min_slice.as_ptr().add(i));
             let mx = _mm256_loadu_ps(max_slice.as_ptr().add(i));
@@ -211,7 +235,7 @@ unsafe fn update_min_max_avx512(row: &[f32], min_slice: &mut [f32], max_slice: &
             let new_mx = _mm256_max_ps(r, mx);
             _mm256_storeu_ps(min_slice.as_mut_ptr().add(i), new_mn);
             _mm256_storeu_ps(max_slice.as_mut_ptr().add(i), new_mx);
-            i += 8;
+            i += F32X8_LANES;
         }
     }
     while i < dim {
@@ -283,22 +307,22 @@ fn sq8_encode_row_wide(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &mut [u8
     use wide::f32x8;
     let dim = row.len();
     let zero = f32x8::splat(0.0);
-    let max255 = f32x8::splat(255.0);
+    let max255 = f32x8::splat(SQ8_CODE_MAX);
     let mut i = 0;
-    while i + 8 <= dim {
-        let r: [f32; 8] = row[i..i + 8].try_into().expect("len 8");
-        let inv: [f32; 8] = inv_scale[i..i + 8].try_into().expect("len 8");
-        let c: [f32; 8] = c2[i..i + 8].try_into().expect("len 8");
+    while i + F32X8_LANES <= dim {
+        let r: [f32; F32X8_LANES] = row[i..i + F32X8_LANES].try_into().expect("len 8");
+        let inv: [f32; F32X8_LANES] = inv_scale[i..i + F32X8_LANES].try_into().expect("len 8");
+        let c: [f32; F32X8_LANES] = c2[i..i + F32X8_LANES].try_into().expect("len 8");
         let q = f32x8::from(r).mul_add(f32x8::from(inv), f32x8::from(c));
         let q_clamped = q.fast_max(zero).fast_min(max255).to_array();
-        for k in 0..8 {
+        for k in 0..F32X8_LANES {
             dst[i + k] = q_clamped[k] as u8;
         }
-        i += 8;
+        i += F32X8_LANES;
     }
     while i < dim {
         let q = row[i].mul_add(inv_scale[i], c2[i]);
-        let q_clamped = q.max(0.0).min(255.0);
+        let q_clamped = q.max(0.0).min(SQ8_CODE_MAX);
         dst[i] = q_clamped as u8;
         i += 1;
     }
@@ -330,13 +354,13 @@ unsafe fn sq8_encode_row_avx2(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &
     use std::arch::x86_64::*;
     let dim = row.len();
     let zero = _mm256_setzero_ps();
-    let max255 = _mm256_set1_ps(255.0);
+    let max255 = _mm256_set1_ps(SQ8_CODE_MAX);
     let mut i = 0;
     // SAFETY: each iteration reads 8 f32 lanes from `row`,
     // `inv_scale`, `c2` at offset `i` and writes 8 bytes to
     // `dst[i..i+8]`. `i + 8 <= dim` bounds every load and store.
     unsafe {
-        while i + 8 <= dim {
+        while i + F32X8_LANES <= dim {
             let r = _mm256_loadu_ps(row.as_ptr().add(i));
             let inv = _mm256_loadu_ps(inv_scale.as_ptr().add(i));
             let c = _mm256_loadu_ps(c2.as_ptr().add(i));
@@ -360,12 +384,12 @@ unsafe fn sq8_encode_row_avx2(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &
             // Store the low 64 bits (8 bytes). Unaligned.
             let dst_ptr = dst.as_mut_ptr().add(i) as *mut i64;
             std::ptr::write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
-            i += 8;
+            i += F32X8_LANES;
         }
     }
     while i < dim {
         let q = row[i].mul_add(inv_scale[i], c2[i]);
-        let q_clamped = q.max(0.0).min(255.0);
+        let q_clamped = q.max(0.0).min(SQ8_CODE_MAX);
         dst[i] = q_clamped as u8;
         i += 1;
     }
@@ -389,13 +413,13 @@ unsafe fn sq8_encode_row_avx512(row: &[f32], inv_scale: &[f32], c2: &[f32], dst:
     use std::arch::x86_64::*;
     let dim = row.len();
     let zero = _mm512_setzero_ps();
-    let max255 = _mm512_set1_ps(255.0);
+    let max255 = _mm512_set1_ps(SQ8_CODE_MAX);
     let mut i = 0;
     // SAFETY: each iteration reads 16 f32 lanes from `row`,
     // `inv_scale`, `c2` at offset `i` and writes 16 bytes to
     // `dst[i..i+16]`. `i + 16 <= dim` bounds every load and store.
     unsafe {
-        while i + 16 <= dim {
+        while i + AVX512_F32_LANES <= dim {
             let r = _mm512_loadu_ps(row.as_ptr().add(i));
             let inv = _mm512_loadu_ps(inv_scale.as_ptr().add(i));
             let c = _mm512_loadu_ps(c2.as_ptr().add(i));
@@ -409,12 +433,12 @@ unsafe fn sq8_encode_row_avx512(row: &[f32], inv_scale: &[f32], c2: &[f32], dst:
             // values are non-negative so the bit pattern matches).
             let packed_u8 = _mm512_cvtusepi32_epi8(q_i32); // __m128i (16 bytes)
             _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed_u8);
-            i += 16;
+            i += AVX512_F32_LANES;
         }
     }
     // 8-lane half-tail for `dim % 16 == 8`.
     #[cfg(target_arch = "x86_64")]
-    if i + 8 <= dim {
+    if i + F32X8_LANES <= dim {
         // SAFETY: target_feature `avx512f` implies `avx2` + `fma`
         // are available; we just call the AVX2 path on the
         // remaining 8 lanes (no need to re-emit the same code).
@@ -422,7 +446,7 @@ unsafe fn sq8_encode_row_avx512(row: &[f32], inv_scale: &[f32], c2: &[f32], dst:
     }
     while i < dim {
         let q = row[i].mul_add(inv_scale[i], c2[i]);
-        let q_clamped = q.max(0.0).min(255.0);
+        let q_clamped = q.max(0.0).min(SQ8_CODE_MAX);
         dst[i] = q_clamped as u8;
         i += 1;
     }
@@ -448,7 +472,7 @@ unsafe fn sq8_encode_row_avx2_unsafe_tail8(
 ) {
     use std::arch::x86_64::*;
     let zero = _mm256_setzero_ps();
-    let max255 = _mm256_set1_ps(255.0);
+    let max255 = _mm256_set1_ps(SQ8_CODE_MAX);
     // SAFETY: caller-guaranteed `*i + 8 <= row.len()`.
     unsafe {
         let r = _mm256_loadu_ps(row.as_ptr().add(*i));
@@ -463,7 +487,7 @@ unsafe fn sq8_encode_row_avx2_unsafe_tail8(
         let packed_u8 = _mm_packus_epi16(packed_u16, packed_u16);
         let dst_ptr = dst.as_mut_ptr().add(*i) as *mut i64;
         std::ptr::write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
-        *i += 8;
+        *i += F32X8_LANES;
     }
 }
 

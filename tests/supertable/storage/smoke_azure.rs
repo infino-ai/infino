@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Supertable smoke through the Azure Blob wire protocol.
 //!
 //! Points `AzureStorageProvider` at a running Azurite emulator (or
@@ -42,6 +45,19 @@ use infino::supertable::query::VectorSearchOptions;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{AzureStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// Single-thread rayon pool for deterministic Azure smoke runs.
+const RAYON_POOL_THREADS: usize = 1;
+/// Vector index shape for the Azure smoke fixture.
+const VECTOR_N_CENT: usize = 4;
+const VECTOR_ROT_SEED: u64 = 17;
+/// Embedding dimension for the vector smoke fixture.
+const EMB_DIM: usize = 16;
+/// Expected recovered doc count for the Azure round-trip fixture.
+const EXPECTED_N_DOCS: u64 = 8;
+/// Vector-search top-k and nprobe for the smoke ANN query.
+const VECTOR_SEARCH_K: usize = 3;
+const VECTOR_NPROBE: usize = 4;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -197,7 +213,7 @@ fn fixed_list_f32(dim: usize) -> DataType {
 fn real_azure_options(dim: usize) -> infino::supertable::SupertableOptions {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("single-thread writer pool"),
     );
@@ -213,8 +229,8 @@ fn real_azure_options(dim: usize) -> infino::supertable::SupertableOptions {
         vec![VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: 4,
-            rot_seed: 17,
+            n_cent: VECTOR_N_CENT,
+            rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
         }],
@@ -407,7 +423,7 @@ async fn supertable_real_azure_round_trip() {
     let cache_dir = TempDir::new().expect("real Azure cache tempdir");
     let cfg = real_azure_config(&container, &prefix, cache_dir.path());
     let result = async {
-        let dim = 16;
+        let dim = EMB_DIM;
         {
             let producer = Supertable::create(
                 real_azure_options(dim)
@@ -449,7 +465,7 @@ async fn supertable_real_azure_round_trip() {
                 consumer.manifest_id()
             ));
         }
-        if consumer.reader().n_docs_total() != 8 {
+        if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
             return Err(format!(
                 "recovered doc count mismatch: got {}",
                 consumer.reader().n_docs_total()
@@ -471,7 +487,12 @@ async fn supertable_real_azure_round_trip() {
         let mut query = vec![0.0f32; dim];
         query[0] = 1.0;
         let vector_hits = consumer
-            .vector_search("emb", &query, 3, VectorSearchOptions::new().with_nprobe(4))
+            .vector_search(
+                "emb",
+                &query,
+                VECTOR_SEARCH_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            )
             .map_err(|e| format!("cold vector search over real Azure: {e}"))?;
         if vector_hits.is_empty() {
             return Err("real Azure cold vector search returned no hits".to_string());

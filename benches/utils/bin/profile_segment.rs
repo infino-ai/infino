@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Standalone profiling harness for the per-segment vector query path.
 //!
 //! Builds ONE supertable-segment-sized superfile (default 2.5M docs,
@@ -36,13 +39,30 @@ const N_QUERIES: usize = 30;
 const TOP_K: usize = 10;
 const SIGMA: f32 = 0.1;
 
+/// Default segment doc count (one 10M-shard slice) when no CLI arg.
+const DEFAULT_N_DOCS: usize = 2_500_000;
+/// Default IVF centroid count when no CLI arg (matches a supertable segment).
+const DEFAULT_N_CENT: usize = 1024;
+/// XOR mask decorrelating the query seed from the corpus seed.
+const QUERY_SEED_XOR: u64 = 0x9e37;
+/// Warm-up nprobe used to touch pages before timing.
+const WARMUP_NPROBE: usize = 16;
+/// Warm-up rerank_mult (unused by the current opts closure, but kept
+/// for parity with the timed grid).
+const WARMUP_RERANK_MULT: usize = 64;
+/// Seconds-to-milliseconds factor for latency output.
+const MS_PER_SEC: f64 = 1e3;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let n_docs: usize = args
         .next()
         .and_then(|a| a.parse().ok())
-        .unwrap_or(2_500_000);
-    let n_cent: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1024);
+        .unwrap_or(DEFAULT_N_DOCS);
+    let n_cent: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(DEFAULT_N_CENT);
 
     eprintln!(
         "[profile] building 1 segment: {n_docs} docs, n_cent={n_cent}, dim={DIM}, Sq8/Cosine"
@@ -58,8 +78,14 @@ fn main() {
         n_docs / n_cent.max(1)
     );
 
-    let queries =
-        corpus::generate_realistic_queries(&vectors, n_docs, N_QUERIES, SEED ^ 0x9e37, true, SIGMA);
+    let queries = corpus::generate_realistic_queries(
+        &vectors,
+        n_docs,
+        N_QUERIES,
+        SEED ^ QUERY_SEED_XOR,
+        true,
+        SIGMA,
+    );
 
     eprintln!("[profile] computing brute-force ground truth ({N_QUERIES} queries)...");
     let gt: Vec<Vec<u32>> = queries
@@ -71,7 +97,12 @@ fn main() {
 
     // Warm the reader (touch pages, settle the allocator) before timing.
     for q in &queries {
-        let _ = futures::executor::block_on(reader.vector_search("emb", q, TOP_K, opts(16, 64)));
+        let _ = futures::executor::block_on(reader.vector_search(
+            "emb",
+            q,
+            TOP_K,
+            opts(WARMUP_NPROBE, WARMUP_RERANK_MULT),
+        ));
     }
 
     // First block sweeps nprobe at small rerank (coarse-scan cost),
@@ -107,7 +138,7 @@ fn main() {
                 opts(nprobe, rerank_mult),
             ))
             .expect("search");
-            lats.push(t.elapsed().as_secs_f64() * 1e3);
+            lats.push(t.elapsed().as_secs_f64() * MS_PER_SEC);
             let got: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
             let hit = gt[qi].iter().filter(|d| got.contains(d)).count();
             recall_sum += hit as f64 / TOP_K as f64;

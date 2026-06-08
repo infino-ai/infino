@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Superfile module — the production-grade implementation of the embedded
 //! BM25 + vector format.
 //!
@@ -24,8 +27,6 @@ pub mod reader;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};
-pub use lazy_source::{
-    BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, PrefetchedSource,
-    Source,
-};
+pub use lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
+pub(crate) use lazy_source::{LazySubSource, PrefetchedSource};
 pub use reader::{OpenOptions, SuperfileReader, VectorSearchOptions};

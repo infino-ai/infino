@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared hot / cold storage tier helpers for canonical benches.
 //!
 //! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
@@ -23,6 +26,23 @@ use tokio::runtime::Runtime;
 const S3S_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const S3S_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 const S3S_REGION: &str = "us-east-1";
+
+/// Bytes in one gibibyte, for GiB-denominated cache budgets.
+const GIB_BYTES: u64 = 1u64 << 30;
+/// Bytes in one mebibyte.
+const MIB_BYTES: u64 = 1u64 << 20;
+/// Default ingest disk-cache budget (GiB) when no env override is set.
+const DEFAULT_INGEST_CACHE_GIB: u64 = 8;
+/// Auto-sized search cache adds `index_size / this` headroom (+10%).
+const INDEX_CACHE_HEADROOM_DIVISOR: u64 = 10;
+/// Disk-cache budget (GiB) for single-superfile tier benches.
+const SUPERFILE_CACHE_GIB: u64 = 4;
+/// Parallel cold-fetch streams used by the bench disk cache.
+const BENCH_COLD_FETCH_STREAMS: usize = 8;
+/// Cold-fetch range chunk size (8 MiB) used by the bench disk cache.
+const BENCH_COLD_FETCH_CHUNK_BYTES: u64 = 8 * MIB_BYTES;
+/// Mmap promotion timers disabled in benches (no idle eviction).
+const MMAP_TIMER_DISABLED_SECS: u64 = 0;
 
 const SUPERFILE_S3S_BUCKET: &str = "infino-bench-superfile";
 
@@ -323,7 +343,7 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     eprintln!(
         "[tiers] superfile committed: {} path={path} ({} MiB)",
         fixture.storage_label,
-        bytes.len() / (1024 * 1024)
+        bytes.len() / MIB_BYTES as usize
     );
     SuperfileCommitted {
         storage: fixture.storage,
@@ -360,7 +380,10 @@ fn supertable_search_cache_gib() -> Option<u64> {
 pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
     fresh_disk_cache_with_mode(
         storage,
-        env_gib("INFINO_SUPERTABLE_INGEST_CACHE_GIB", 8) * (1u64 << 30),
+        env_gib(
+            "INFINO_SUPERTABLE_INGEST_CACHE_GIB",
+            DEFAULT_INGEST_CACHE_GIB,
+        ) * GIB_BYTES,
         ColdFetchMode::LazyForegroundWithBackgroundFill,
     )
 }
@@ -380,27 +403,30 @@ pub fn fresh_supertable_search_cache(
     static LOG_ONCE: Once = Once::new();
 
     let budget_bytes = if let Some(explicit_gib) = supertable_search_cache_gib() {
-        let b = explicit_gib * (1u64 << 30);
+        let b = explicit_gib * GIB_BYTES;
         LOG_ONCE.call_once(|| {
             eprintln!("[tiers] search cache budget = {explicit_gib} GiB (INFINO_SUPERTABLE_SEARCH_CACHE_GIB)");
         });
         b
     } else if let Some(idx) = index_size_bytes.filter(|&s| s > 0) {
-        let b = idx + idx / 10;
+        let b = idx + idx / INDEX_CACHE_HEADROOM_DIVISOR;
         LOG_ONCE.call_once(|| {
             eprintln!(
                 "[tiers] search cache budget = {:.2} GiB (auto-sized from {:.2} GiB index + 10% headroom)",
-                b as f64 / (1u64 << 30) as f64,
-                idx as f64 / (1u64 << 30) as f64,
+                b as f64 / GIB_BYTES as f64,
+                idx as f64 / GIB_BYTES as f64,
             );
         });
         b
     } else {
-        let gib = env_gib("INFINO_SUPERTABLE_INGEST_CACHE_GIB", 8);
+        let gib = env_gib(
+            "INFINO_SUPERTABLE_INGEST_CACHE_GIB",
+            DEFAULT_INGEST_CACHE_GIB,
+        );
         LOG_ONCE.call_once(|| {
             eprintln!("[tiers] search cache budget = {gib} GiB (default)");
         });
-        gib * (1u64 << 30)
+        gib * GIB_BYTES
     };
     fresh_disk_cache_with_mode(
         storage,
@@ -413,7 +439,7 @@ pub fn fresh_supertable_search_cache(
 pub fn fresh_superfile_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
     fresh_disk_cache_with_mode(
         storage,
-        4 * (1u64 << 30),
+        SUPERFILE_CACHE_GIB * GIB_BYTES,
         ColdFetchMode::LazyForegroundWithBackgroundFill,
     )
 }
@@ -428,10 +454,10 @@ fn fresh_disk_cache_with_mode(
         cache_root: dir.path().to_path_buf(),
         disk_budget_bytes,
         cold_fetch_mode,
-        cold_fetch_streams: 8,
-        cold_fetch_chunk_bytes: 8 * (1u64 << 20),
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
+        cold_fetch_streams: BENCH_COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: BENCH_COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
+        mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: false,
         ..Default::default()

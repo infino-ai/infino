@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! S3-backed [`StorageProvider`].
 //!
 //! Wraps `object_store::aws::AmazonS3` so the same supertable
@@ -207,6 +210,41 @@ fn normalize_prefix(prefix: impl Into<String>) -> String {
     prefix.into().trim_matches('/').to_string()
 }
 
+/// Warm idle connections kept per host. A deep pool lets a wide
+/// concurrent range-GET fan-out reuse established TLS sessions
+/// rather than re-handshaking on the cold tail.
+const S3_POOL_MAX_IDLE_PER_HOST: usize = 1024;
+
+/// Client idle-connection timeout. Held below S3's ~20s server-side
+/// idle-close window so reqwest never reuses a socket S3 has already
+/// dropped (which surfaces as a transient send failure).
+const S3_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connect-phase timeout. Bounds a single slow SYN/TLS so it can't
+/// dominate the fan-out's p99; the retry layer covers genuine drops.
+const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `object_store` retry budget for real-S3 fan-out. Deep enough to
+/// ride out a transient transport error in a burst of hundreds of
+/// concurrent range GETs rather than failing the query.
+const S3_MAX_RETRIES: usize = 20;
+
+/// Overall `object_store` retry window, paired with [`S3_MAX_RETRIES`].
+const S3_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Base delay for the application-level transient-GET backoff. The
+/// nth attempt waits `base × 2^min(n, shift cap)` ms.
+const S3_TRANSIENT_BACKOFF_BASE_MS: u64 = 50;
+
+/// Cap on the backoff doubling exponent, so the delay plateaus
+/// instead of growing unboundedly with the attempt count.
+const S3_TRANSIENT_BACKOFF_MAX_SHIFT: u32 = 5;
+
+/// Ceiling on a single transient-GET backoff sleep. Brief by design:
+/// the goal is to drain a dead pooled connection, not wait out an
+/// outage.
+const S3_TRANSIENT_BACKOFF_CAP_MS: u64 = 2000;
+
 /// Tuned HTTP client options for the object-store-native fan-out.
 ///
 /// The supertable vector/FTS query path fans out one cold-open +
@@ -224,7 +262,7 @@ fn tuned_client_options() -> object_store::ClientOptions {
         // handshaking. AWS S3 in-region serves many parallel
         // range GETs per host; a deep idle pool is the difference
         // between "RTT" and "handshake + RTT" on the cold tail.
-        .with_pool_max_idle_per_host(1024)
+        .with_pool_max_idle_per_host(S3_POOL_MAX_IDLE_PER_HOST)
         // Hold idle connections long enough to span a full fan-out
         // wave plus the next query so back-to-back cold queries on a
         // fresh worker don't re-handshake — but keep this *below* S3's
@@ -236,10 +274,10 @@ fn tuned_client_options() -> object_store::ClientOptions {
         // surfaces `TransientExhausted`). 10s keeps the pool warm
         // across consecutive queries while expiring sockets before
         // S3 can close them under us.
-        .with_pool_idle_timeout(std::time::Duration::from_secs(10))
+        .with_pool_idle_timeout(S3_POOL_IDLE_TIMEOUT)
         // Bound the connect phase so a single slow SYN/TLS doesn't
         // dominate the fan-out's p99; the retry layer covers drops.
-        .with_connect_timeout(std::time::Duration::from_secs(5))
+        .with_connect_timeout(S3_CONNECT_TIMEOUT)
 }
 
 /// Tuned retry budget for real-S3 fan-out.
@@ -256,8 +294,8 @@ fn tuned_client_options() -> object_store::ClientOptions {
 /// those errors in the first place.
 fn tuned_retry_config() -> object_store::RetryConfig {
     object_store::RetryConfig {
-        max_retries: 20,
-        retry_timeout: std::time::Duration::from_secs(300),
+        max_retries: S3_MAX_RETRIES,
+        retry_timeout: S3_RETRY_TIMEOUT,
         ..Default::default()
     }
 }
@@ -283,8 +321,9 @@ fn is_retryable_transient(err: &StorageError) -> bool {
 /// dead pooled connection drain and a fresh dial succeed, not to
 /// wait out a long outage.
 fn transient_backoff(attempt: u32) -> std::time::Duration {
-    let ms = 50u64.saturating_mul(1 << attempt.min(5));
-    std::time::Duration::from_millis(ms.min(2000))
+    let ms = S3_TRANSIENT_BACKOFF_BASE_MS
+        .saturating_mul(1 << attempt.min(S3_TRANSIENT_BACKOFF_MAX_SHIFT));
+    std::time::Duration::from_millis(ms.min(S3_TRANSIENT_BACKOFF_CAP_MS))
 }
 
 /// Definitive error for a range the backing object can't satisfy

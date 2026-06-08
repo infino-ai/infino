@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Manifest-level skip pruning end-to-end.
 //!
 //! These tests are the load-bearing perf claim of the skip
@@ -44,6 +47,15 @@ use infino::supertable::reader_cache::{
 };
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::{build_title_batch, default_tokenizer, schema_id_title};
+
+/// Single-thread rayon pool for deterministic skip-pruning.
+const RAYON_POOL_THREADS: usize = 1;
+/// Four-segment corpus for the exact-term skip tests.
+const EXACT_TERM_SEGMENT_COUNT: usize = 4;
+/// BM25 / prefix top-k used across the skip-pruning queries.
+const BM25_TOP_K: usize = 5;
+/// Segments with no matching term (bloom-prune-all fixture).
+const NO_MATCH_SEGMENT_COUNT: u64 = 3;
 
 /// Decorator over an `InMemoryReaderCache` that counts
 /// per-URI `reader` calls. Wraps without behavior change.
@@ -105,7 +117,7 @@ impl SuperfileReaderCache for CountingStore {
 fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("build pool"),
     );
@@ -158,7 +170,7 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
     drop(w);
 
     let r = st.reader();
-    assert_eq!(r.n_superfiles(), 4);
+    assert_eq!(r.n_superfiles(), EXACT_TERM_SEGMENT_COUNT);
 
     // Identify the URI of segment 0 (the planted segment).
     let manifest = r.manifest();
@@ -173,7 +185,7 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
         .bm25_search(
             "title",
             "nimblefox",
-            5,
+            BM25_TOP_K,
             infino::supertable::query::fts::BoolMode::Or,
         )
         .expect("query");
@@ -222,14 +234,14 @@ fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     drop(w);
 
     let r = st.reader();
-    assert_eq!(r.n_superfiles(), 4);
+    assert_eq!(r.n_superfiles(), EXACT_TERM_SEGMENT_COUNT);
 
     let manifest = r.manifest();
     let quokka_uri = manifest.superfiles[1].uri;
 
     let before = store.snapshot();
     let hits = st
-        .bm25_search_prefix("title", "quokka", 5)
+        .bm25_search_prefix("title", "quokka", BM25_TOP_K)
         .expect("prefix query");
     assert_eq!(hits.len(), 2, "two docs in segment 1 begin with `quokka`");
     for h in &hits {
@@ -253,7 +265,7 @@ fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
 
     // Three superfiles — none contains the rare query term.
     let mut w = st.writer().expect("writer");
-    for _i in 0..3u64 {
+    for _i in 0..NO_MATCH_SEGMENT_COUNT {
         w.append(&build_title_batch(&[
             "ordinary term filler",
             "another mundane title",
@@ -268,7 +280,7 @@ fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
         .bm25_search(
             "title",
             "definitelynotpresent",
-            5,
+            BM25_TOP_K,
             infino::supertable::query::fts::BoolMode::Or,
         )
         .expect("query");
@@ -311,7 +323,7 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
         .bm25_search(
             "title",
             "alpha beta",
-            5,
+            BM25_TOP_K,
             infino::supertable::query::fts::BoolMode::And,
         )
         .expect("AND query");

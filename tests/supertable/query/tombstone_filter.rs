@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Reader-side tombstone-filter integration tests.
 //!
 //! Verifies that a row tombstoned by the WAL pipeline's
@@ -33,6 +36,15 @@ use infino::supertable::wal::state_doc::{
 };
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// BM25 top-k for the tombstone-filtered FTS query.
+const BM25_TOP_K: usize = 10;
+/// Single-thread rayon pool for deterministic tombstone filtering.
+const RAYON_POOL_THREADS: usize = 1;
+/// Random-rotation seed for the tombstone fixture's vector index.
+const VECTOR_ROT_SEED: u64 = 42;
+/// Vector-search top-k for the tombstone-filtered ANN query.
+const VECTOR_SEARCH_K: usize = 5;
 
 fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
     WalStateDoc {
@@ -99,7 +111,7 @@ async fn fts_query_excludes_tombstoned_row() {
     // post-tombstone we expect 2, and the dropped one is the
     // middle row.
     let hits = st
-        .bm25_search("title", "alpha", 10, BoolMode::Or)
+        .bm25_search("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("fts");
     assert_eq!(hits.len(), 2, "tombstoned row must be excluded");
     for hit in &hits {
@@ -240,7 +252,7 @@ async fn vector_query_excludes_tombstoned_row() {
 
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("rayon"),
     );
@@ -250,7 +262,7 @@ async fn vector_query_excludes_tombstoned_row() {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![default_vector_config("embedding", 42)],
+        vec![default_vector_config("embedding", VECTOR_ROT_SEED)],
         Some(tk),
     )
     .expect("opts")
@@ -302,7 +314,7 @@ async fn vector_query_excludes_tombstoned_row() {
     // 0) must not appear in the result list.
     let q = [0.0f32; DIM];
     let hits = st
-        .vector_search("embedding", &q, 5, VectorSearchOptions::new())
+        .vector_search("embedding", &q, VECTOR_SEARCH_K, VectorSearchOptions::new())
         .expect("vector");
     assert!(!hits.is_empty(), "expected at least one un-tombstoned hit");
     for hit in &hits {

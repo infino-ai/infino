@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS blob builder. Multi-column FTS index assembly.
 //!
 //! `FtsBuilder` accumulates posting records across all FTS-indexed
@@ -238,6 +241,22 @@ const PARTITION_BUF_SIZE: usize = 64 * 1024;
 /// - `+ 8 B`: per added posting: `(doc_id: u32, tf: u32)`.
 const ACCUM_NEW_TERM_FIXED_BYTES: usize = 24;
 const ACCUM_POSTING_BYTES: usize = 8;
+
+/// Partition size (in triples) below which the lex-rank sort uses
+/// `sort_unstable_by` instead of the counting/radix variant: under
+/// this count the histogram allocation outweighs the algorithmic
+/// savings.
+const RADIX_SORT_MIN_TRIPLES: usize = 256;
+
+/// Upper bound on the initial in-RAM chunk capacity (in triples)
+/// during external merge sort. Caps the up-front `Vec` reservation
+/// (~12 MiB of triples) when `max_partition_bytes` is large.
+const EXTERNAL_MERGE_CHUNK_CAP_TRIPLES: usize = 1024 * 1024;
+
+/// Number of triples buffered before each `write_all` when streaming
+/// a sorted partition to disk. Amortizes the syscall cost (~48 KiB
+/// per flush).
+const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 
 /// Per-column build-time state (scalar accounting only).
 struct ColumnState {
@@ -869,7 +888,7 @@ mod finish_debug {
 /// allocation outweighs the algorithmic savings.
 fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
     let n = triples.len();
-    if n < 256 {
+    if n < RADIX_SORT_MIN_TRIPLES {
         triples.sort_unstable_by(|a, b| {
             lex_rank[triple_term_id(a) as usize]
                 .cmp(&lex_rank[triple_term_id(b) as usize])
@@ -951,7 +970,8 @@ fn open_partition_sorted(
     let chunk_triples = (max_partition_bytes as usize) / TRIPLE_BYTES;
     let mut sorted_chunk_paths: Vec<PathBuf> = Vec::new();
     let mut r = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(partition_path)?);
-    let mut chunk: Vec<Triple> = Vec::with_capacity(chunk_triples.min(1024 * 1024));
+    let mut chunk: Vec<Triple> =
+        Vec::with_capacity(chunk_triples.min(EXTERNAL_MERGE_CHUNK_CAP_TRIPLES));
     let mut chunk_idx: usize = 0;
     while let Some(t) = read_one_triple(&mut r)? {
         chunk.push(t);
@@ -2326,7 +2346,9 @@ fn assemble_and_write_blob<W: Write>(
     let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * DOC_LENGTHS_ENTRY_SIZE);
     let mut arrays_buf: Vec<u8> = Vec::new();
     for i in 0..n_columns as usize {
-        let avgdl_x1000 = (avgdl_per_col[i] * 1000.0).max(0.0).min(u32::MAX as f32) as u32;
+        let avgdl_x1000 = (avgdl_per_col[i] * format::fts::AVGDL_FIXED_POINT_SCALE)
+            .max(0.0)
+            .min(u32::MAX as f32) as u32;
         dir_buf.extend_from_slice(&(i as u32).to_le_bytes());
         dir_buf.extend_from_slice(&doc_lengths_array_offset.to_le_bytes());
         dir_buf.extend_from_slice(&avgdl_x1000.to_le_bytes());
@@ -2590,7 +2612,9 @@ fn encode_and_emit_term<W: Write>(
                 min_dl_per_block[i],
                 avgdl,
             );
-            let max_bm25_x1000 = (max_bm25 * 1000.0).max(0.0).min(u32::MAX as f32) as u32;
+            let max_bm25_x1000 = (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
+                .max(0.0)
+                .min(u32::MAX as f32) as u32;
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
             term_buf.extend_from_slice(&block_offset.to_le_bytes());
             term_buf.extend_from_slice(&max_bm25_x1000.to_le_bytes());
@@ -2670,11 +2694,11 @@ fn sort_partition_to_file(
         lex_rank,
     )?;
     let mut w = BufWriter::with_capacity(PARTITION_BUF_SIZE, File::create(out_path)?);
-    let mut batch: Vec<Triple> = Vec::with_capacity(4096);
+    let mut batch: Vec<Triple> = Vec::with_capacity(SORT_OUTPUT_BATCH_TRIPLES);
     while let Some(triple) = iter.next_with(lex_rank) {
         let t = triple?;
         batch.push(t);
-        if batch.len() == 4096 {
+        if batch.len() == SORT_OUTPUT_BATCH_TRIPLES {
             #[cfg(target_endian = "little")]
             {
                 w.write_all(bytemuck::cast_slice::<Triple, u8>(&batch))?;

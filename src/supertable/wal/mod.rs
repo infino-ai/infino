@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Write-ahead-log primitives for the update / delete pipelines.
 //!
 //! ## What lives here

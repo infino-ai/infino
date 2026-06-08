@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Hybrid retrieval (BM25 × vector) as a DataFusion table-valued
 //! function.
 //!
@@ -71,6 +74,10 @@ use crate::supertable::query::SuperfileHit;
 /// SQL name the TVF is registered under.
 pub(crate) const HYBRID_SEARCH_UDTF: &str = "hybrid_search";
 
+/// Argument count for
+/// `hybrid_search(text_col, q_text, vec_col, q_vec, k)`.
+const HYBRID_SEARCH_ARG_COUNT: usize = 5;
+
 /// RRF rank-bias constant. `60` is the value from the original
 /// Cormack et al. reciprocal-rank-fusion paper and the de-facto
 /// default across engines (Elasticsearch, Weaviate, …). Larger values
@@ -115,9 +122,10 @@ impl HybridSearchFunc {
 
 impl TableFunctionImpl for HybridSearchFunc {
     fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        if args.len() != 5 {
+        if args.len() != HYBRID_SEARCH_ARG_COUNT {
             return Err(DataFusionError::Plan(format!(
-                "hybrid_search expects 5 arguments (text_col, q_text, vec_col, q_vec, k), got {}",
+                "hybrid_search expects {HYBRID_SEARCH_ARG_COUNT} arguments \
+                 (text_col, q_text, vec_col, q_vec, k), got {}",
                 args.len()
             )));
         }

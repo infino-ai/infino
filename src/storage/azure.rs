@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Azure Blob-backed [`StorageProvider`].
 //!
 //! Wraps `object_store::azure::MicrosoftAzure` so the supertable
@@ -128,6 +131,19 @@ fn normalize_prefix(prefix: impl Into<String>) -> String {
     prefix.into().trim_matches('/').to_string()
 }
 
+/// Warm idle connections kept per host, so a wide concurrent
+/// range-GET fan-out reuses established TLS sessions rather than
+/// re-handshaking on the cold tail.
+const AZURE_POOL_MAX_IDLE_PER_HOST: usize = 1024;
+
+/// Client idle-connection timeout. Longer than the S3 backend's
+/// because Azure's server-side keep-alive window is more generous.
+const AZURE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Connect-phase timeout. Bounds a single slow SYN/TLS so it can't
+/// dominate the fan-out's p99.
+const AZURE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Tuned HTTP client options for the object-store-native fan-out.
 ///
 /// The supertable query path fans out one cold-open + cold-search
@@ -137,9 +153,9 @@ fn normalize_prefix(prefix: impl Into<String>) -> String {
 /// under load.
 fn tuned_client_options() -> object_store::ClientOptions {
     object_store::ClientOptions::new()
-        .with_pool_max_idle_per_host(1024)
-        .with_pool_idle_timeout(std::time::Duration::from_secs(90))
-        .with_connect_timeout(std::time::Duration::from_secs(5))
+        .with_pool_max_idle_per_host(AZURE_POOL_MAX_IDLE_PER_HOST)
+        .with_pool_idle_timeout(AZURE_POOL_IDLE_TIMEOUT)
+        .with_connect_timeout(AZURE_CONNECT_TIMEOUT)
 }
 
 /// Translate an `object_store::Error` to our `StorageError`. Kept

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 fan-out on [`Supertable`](super::super::Supertable).
 //!
 //! ## Public API
@@ -222,7 +225,8 @@ impl SupertableReader {
         // always runs BoolMode::Or and expansion typically yields ≥2
         // terms at the scales we care about.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        let work_units = build_or_work_units(&kept_refs, BoolMode::Or, 2, pool_threads);
+        let work_units =
+            build_or_work_units(&kept_refs, BoolMode::Or, OR_FANOUT_MIN_TERMS, pool_threads);
         let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
             work_units.into_iter().map(|u| (u.entry, u.range)).collect();
 
@@ -304,6 +308,13 @@ struct WorkUnit {
 /// row-shard) are well above this floor.
 const SUBRANGE_MIN_DOCS: u32 = 50_000;
 
+/// Minimum query term count that makes OR sub-range fan-out eligible.
+/// The range-aware Block-Max MaxScore path is only wired up for
+/// multi-term OR, so single-term queries stay whole-segment. The
+/// prefix path passes this value to stand in for "multi-term OR
+/// enabled" since prefix expansion is always OR-scored.
+const OR_FANOUT_MIN_TERMS: usize = 2;
+
 /// Decide how to slice the kept superfiles into parallel work units.
 /// Returns one [`WorkUnit`] per (segment, doc_id sub-range) tuple.
 ///
@@ -325,7 +336,7 @@ fn build_or_work_units(
     n_terms: usize,
     pool_threads: usize,
 ) -> Vec<WorkUnit> {
-    let fanout_eligible = mode == BoolMode::Or && n_terms >= 2;
+    let fanout_eligible = mode == BoolMode::Or && n_terms >= OR_FANOUT_MIN_TERMS;
     let want_subranges = pool_threads.div_ceil(kept.len().max(1)).max(1);
     if !fanout_eligible || want_subranges <= 1 {
         return kept

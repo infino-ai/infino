@@ -1,10 +1,13 @@
-//! Disk-cache layer with parallel cold fetch — 003 M5.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Disk-cache layer with parallel cold fetch.
 //!
 //! Builds a tiny real superfile via `SuperfileBuilder`, puts
 //! it into a `LocalFsStorageProvider`, wraps that in a
 //! `CountingProxy` (so we can assert on `get_range` /
 //! `head` call counts), and exercises `DiskCacheStore`
-//! through the invariants the milestone promises:
+//! through the invariants it promises:
 //!
 //! - cold miss triggers cold-fetch (range-GETs to assemble
 //!   the segment file)
@@ -109,13 +112,33 @@ impl StorageProvider for CountingProxy {
     }
 }
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Generous disk-cache budget (1 GiB) used by the non-eviction tests.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams for the test cache.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Small cold-fetch chunk to force multiple ranges on tiny payloads.
+const COLD_FETCH_CHUNK_BYTES_SMALL: u64 = 64;
+/// Concurrent cold readers for the coalescing stress test.
+const CONCURRENT_COLD_READER_COUNT: usize = 100;
+/// Distinct URIs for the reservation-race test.
+const RESERVATION_RACE_URI_COUNT: u32 = 8;
+/// Sleep between LRU touches to make access ordering deterministic.
+const LRU_TOUCH_SLEEP_MS: u64 = 1;
+
 // ============================================================
 // Tiny superfile fixture.
 // ============================================================
 
 fn build_test_superfile_bytes() -> Bytes {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -149,8 +172,8 @@ fn fresh_cache_with_storage(
         cache_root: cache_dir.path().to_path_buf(),
         disk_budget_bytes: budget_bytes,
         cold_fetch_mode: infino::supertable::reader_cache::ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 64, // small to force multiple ranges on tiny payload
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES_SMALL, // force multiple ranges on tiny payload
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -175,8 +198,10 @@ async fn cold_miss_triggers_range_fetches_warm_hit_does_not() {
     let bytes = build_test_superfile_bytes();
     seed_segment(&*proxy, uri, bytes.clone()).await;
 
-    let (_cdir, cache) =
-        fresh_cache_with_storage(Arc::clone(&proxy) as Arc<dyn StorageProvider>, 1 << 30);
+    let (_cdir, cache) = fresh_cache_with_storage(
+        Arc::clone(&proxy) as Arc<dyn StorageProvider>,
+        DISK_CACHE_BUDGET_BYTES,
+    );
 
     // Cold miss: at least one head + ≥1 range fetch.
     let _r = cache.reader(&uri).await.expect("cold reader");
@@ -211,13 +236,15 @@ async fn concurrent_cold_readers_coalesce_to_one_fetch() {
     let bytes = build_test_superfile_bytes();
     seed_segment(&*proxy, uri, bytes).await;
 
-    let (_cdir, cache) =
-        fresh_cache_with_storage(Arc::clone(&proxy) as Arc<dyn StorageProvider>, 1 << 30);
+    let (_cdir, cache) = fresh_cache_with_storage(
+        Arc::clone(&proxy) as Arc<dyn StorageProvider>,
+        DISK_CACHE_BUDGET_BYTES,
+    );
 
     // Spawn 100 concurrent readers; OnceCell-coalescing
     // should produce exactly ONE cold fetch.
-    let mut joins = Vec::with_capacity(100);
-    for _ in 0..100 {
+    let mut joins = Vec::with_capacity(CONCURRENT_COLD_READER_COUNT);
+    for _ in 0..CONCURRENT_COLD_READER_COUNT {
         let cache = Arc::clone(&cache);
         joins.push(tokio::spawn(async move { cache.reader(&uri).await }));
     }
@@ -247,7 +274,7 @@ async fn reader_returns_working_superfile_reader() {
     let bytes = build_test_superfile_bytes();
     seed_segment(&*local, uri, bytes).await;
 
-    let (_cdir, cache) = fresh_cache_with_storage(Arc::clone(&local), 1 << 30);
+    let (_cdir, cache) = fresh_cache_with_storage(Arc::clone(&local), DISK_CACHE_BUDGET_BYTES);
     let reader = cache.reader(&uri).await.expect("reader");
 
     // Sanity: the mmap-backed reader exposes an FTS reader
@@ -290,8 +317,8 @@ async fn eviction_respects_pinned_set() {
         // Budget tight: fits exactly one segment, not two.
         cold_fetch_mode: infino::supertable::reader_cache::ColdFetchMode::HybridWithPrefetch,
         disk_budget_bytes: size + (size / 2),
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 64,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES_SMALL,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -339,8 +366,8 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
         // Room for ~2 superfiles.
         cold_fetch_mode: infino::supertable::reader_cache::ColdFetchMode::HybridWithPrefetch,
         disk_budget_bytes: 2 * size + (size / 4),
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 64,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES_SMALL,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -352,9 +379,9 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
     let _ra = cache.reader(&uri_a).await.expect("a");
     // Tiny sleep so B's last_access_us > A's. Avoids relying
     // on observation order alone.
-    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(LRU_TOUCH_SLEEP_MS)).await;
     let _rb = cache.reader(&uri_b).await.expect("b");
-    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(LRU_TOUCH_SLEEP_MS)).await;
     // Cold miss on C → eviction picks A (oldest unpinned).
     let _rc = cache.reader(&uri_c).await.expect("c");
 
@@ -376,7 +403,9 @@ async fn reservation_race_preserves_budget_invariant() {
     let bytes = build_test_superfile_bytes();
     let size = bytes.len() as u64;
     // Seed 8 distinct URIs.
-    let uris: Vec<SuperfileUri> = (0..8).map(|_| SuperfileUri::new_v4()).collect();
+    let uris: Vec<SuperfileUri> = (0..RESERVATION_RACE_URI_COUNT)
+        .map(|_| SuperfileUri::new_v4())
+        .collect();
     for u in &uris {
         seed_segment(&*local, *u, bytes.clone()).await;
     }
@@ -388,8 +417,8 @@ async fn reservation_race_preserves_budget_invariant() {
         cold_fetch_mode: infino::supertable::reader_cache::ColdFetchMode::HybridWithPrefetch,
         // misses, eviction will fire repeatedly.
         disk_budget_bytes: 3 * size,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 64,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES_SMALL,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
