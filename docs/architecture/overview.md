@@ -67,7 +67,10 @@ A query never downloads the whole dataset. It:
    the catalog, never file contents.
 3. **Fetches only what it needs** — for surviving files it pulls just
    the relevant byte ranges from object storage (a posting list, a
-   handful of vector clusters), not the whole file.
+   handful of vector clusters), not the whole file. This holds for SQL
+   too: a keyword filter on an indexed text column is answered from the
+   index and decodes only the matching rows, rather than scanning the
+   whole column.
 4. **Merges** the per-file results into one ranked answer.
 
 The cost model that falls out of this is the headline: **you pay for

@@ -12,4 +12,5 @@
 pub mod common;
 pub mod fts_exec;
 pub mod hybrid_exec;
+pub mod match_exec;
 pub mod vector_exec;

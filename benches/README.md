@@ -130,9 +130,54 @@ _Pending custom-harness search migration._
 ### SQL — in-memory supertable
 
 <!-- BEGIN: bench/sql/build -->
-_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench sql` to populate._
+### SQL — ingest, in-memory supertable (1M rows: title + category + score)
+
+_Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
+
+Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, through the engine-generic `run_sql` driver the cross-engine comparison also uses. Rows are by writer count: `1 writer` is the canonical build queries run against; `N writers` is the sharded parallel build. Δ is vs the previous run.
+
+| Build | Time | Throughput | Bandwidth | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 writer | 9.14 s (+0.5% ~) | 109.5 K/s (-0.5% ~) | 220.0 MB/s (-0.5% ~) | 5.02 GiB (-0.2% ~) | 3.86 GiB (-3.1% better) | 4.83 GiB (-0.6% ~) |
+| 16 writers | 5.02 s (+10.6% worse) | 199.2 K/s (-9.6% worse) | 400.4 MB/s (-9.6% worse) | 13.13 GiB (-4.2% better) | 10.66 GiB (-2.4% ~) | 12.53 GiB (-5.9% better) |
 <!-- END: bench/sql/build -->
 
 <!-- BEGIN: bench/sql/query -->
-_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench sql` to populate._
+### SQL — query, in-memory supertable (1M rows)
+
+_Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
+
+Hot p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline comparison is the last two blocks: the *same* selective equality (one matching row) run against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects the candidate row, DataFusion verifies). Same predicate, same 1-row result, so the gap is purely the index. The first block is aggregations & count-filters (read + compute, return few rows) — general engine context, not a like-for-like index comparison; there is no bare `SELECT col` row because that only measures row materialization. `Rows` is the result-set size. Δ is vs the previous run.
+
+**Aggregations & count-filters (read + compute, return few rows — not the index A/B)**
+
+| Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- |
+| agg_max_title | 158.07 ms (+1.7% ~) | 1 | 11.38 GiB (-16.9% better) | 6.14 GiB (+1.3% ~) | 10.68 GiB (-12.9% better) |
+| filter_category_count | 7.16 ms (+3.9% worse) | 1 | 5.59 GiB (+0.5% ~) | 5.54 GiB (-0.4% ~) | 5.59 GiB (+0.5% ~) |
+| filter_rating_count | 4.74 ms (-6.4% better) | 1 | 5.54 GiB (-0.4% ~) | 5.54 GiB (-0.4% ~) | 5.54 GiB (-0.4% ~) |
+| count_star | 7.10 ms (+7.5% worse) | 1 | 5.34 GiB (-0.5% ~) | 5.33 GiB (-0.5% ~) | 5.34 GiB (-0.5% ~) |
+| group_by_category | 5.09 ms (+3.8% worse) | 4 | 5.34 GiB (-0.5% ~) | 5.29 GiB (+1.9% ~) | 5.34 GiB (-0.5% ~) |
+
+**Plain Scan (DataFusion only) — selective equality, 1 matching row**
+
+| Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- |
+| WHERE title_noidx = ?   (no index) | 7.01 ms (+0.7% ~) | 1 | 5.22 GiB (+0.1% ~) | 5.21 GiB (+0.3% ~) | 5.22 GiB (+0.1% ~) |
+
+**FTS-pushdown (DataFusion + Infino) — SAME equality, 1 matching row**
+
+| Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- |
+| WHERE title = ?         (FTS index) | 17.84 ms (-2.9% ~) | 1 | 5.22 GiB (+1.5% ~) | 5.17 GiB (+1.1% ~) | 5.22 GiB (+1.5% ~) |
+
+**Search table functions (bm25 / vector / hybrid / token / exact)**
+
+| Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- |
+| bm25_search | 751.66 µs (new) | 10 | 5.09 GiB (new) | 5.08 GiB (new) | 5.09 GiB (new) |
+| vector_search | 1.23 ms (new) | 10 | 5.09 GiB (new) | 5.09 GiB (new) | 5.09 GiB (new) |
+| hybrid_search | 1.30 ms (new) | 10 | 5.09 GiB (new) | 5.09 GiB (new) | 5.09 GiB (new) |
+| token_match | 57.82 ms (new) | 1000.0K | 5.23 GiB (new) | 5.22 GiB (new) | 5.23 GiB (new) |
+| exact_match | 3.22 ms (new) | 1 | 5.21 GiB (new) | 5.21 GiB (new) | 5.21 GiB (new) |
 <!-- END: bench/sql/query -->
