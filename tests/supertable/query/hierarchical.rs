@@ -133,6 +133,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // four parts; we expect exactly one part loaded post-
     // query.
     let hits = consumer
+        .reader()
         .bm25_search("title", "echo", 10, BoolMode::Or)
         .expect("bm25");
     assert!(
@@ -182,6 +183,7 @@ fn bm25_term_in_no_part_loads_nothing() {
     // zero parts loaded (other than what the bloom test
     // already rejected without needing the part bytes).
     let hits = consumer
+        .reader()
         .bm25_search("title", "zoo", 10, BoolMode::Or)
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
@@ -234,6 +236,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     // Prefix "echo" — appears only in part #2. Term-range
     // union should route the prefix to one part.
     let hits = consumer
+        .reader()
         .bm25_search_prefix("title", "ech", 10)
         .expect("prefix");
     assert!(
@@ -365,6 +368,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
 
     // BM25 hits.
     let hits = consumer
+        .reader()
         .bm25_search("title", "alpha", 10, BoolMode::Or)
         .expect("bm25");
     assert!(!hits.is_empty());

@@ -101,6 +101,7 @@ async fn writer_delete_tombstones_matching_rows() {
     // Follow-up FTS query against the deleted token returns no
     // hits.
     let hits = st
+        .reader()
         .bm25_search("title", "bravo", 10, BoolMode::Or)
         .expect("fts");
     assert!(hits.is_empty(), "expected zero hits for tombstoned token");

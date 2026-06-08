@@ -50,12 +50,13 @@ let options = SupertableOptions::new(
 )?;
 let table = Supertable::open(options)?;
 
-// BM25 over the FTS index — synchronous, fans out across segments for you:
-let hits = table.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+// Reads run through a snapshot-pinned reader — synchronous, fans out
+// across segments for you. BM25 over the FTS index:
+let hits = table.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
 
 // kNN over the vector index:
 let query = vec![/* dim=384 f32s */];
-let hits = table.vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
+let hits = table.reader().vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
 
 // Or query it as SQL — DataFusion under the hood, and every segment is a
 // valid Parquet file you can also hand to DuckDB / pyarrow directly:

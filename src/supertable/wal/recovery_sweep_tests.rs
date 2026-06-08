@@ -123,6 +123,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     // The tombstone bit is in the sidecar; a follow-up FTS query
     // against the same handle excludes the row.
     let hits = st
+        .reader()
         .bm25_search(
             "title",
             "alpha",
@@ -269,6 +270,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     );
     // FTS query no longer returns the tombstoned row.
     let hits = st
+        .reader()
         .bm25_search(
             "title",
             "foo",
