@@ -3,7 +3,9 @@ name: Supertable Benchmark (Azure)
 # Supertable ingest benchmark on a per-run ephemeral Azure VM, in the
 # storage account's region. Compute is co-located with the bucket so
 # object-store transfers run over the Azure backbone, not the public
-# internet. The VM clones, builds, runs, and is destroyed each run.
+# internet. The VM clones and builds with an sccache compile cache backed
+# by Azure Blob (shared across branches), runs the bench, and is destroyed
+# each run.
 
 on:
   workflow_dispatch:
@@ -52,6 +54,7 @@ env:
   RG: rg-infino-bench-${{ github.run_id }}
   VM: bench-vm
   ADMIN: azureuser
+  SCCACHE_VERSION: v0.8.2
 
 jobs:
   benchmark:
@@ -66,7 +69,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Provision ephemeral VM (East US)
+      - name: Provision ephemeral VM
         id: provision
         run: |
           set -euo pipefail
@@ -117,7 +120,7 @@ jobs:
           done
           echo "::error::SSH never came up"; exit 1
 
-      - name: Clone repo + toolchain (on VM)
+      - name: Clone repo + toolchain + sccache (on VM)
         run: |
           set -eo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
@@ -127,9 +130,9 @@ jobs:
             "GH_TOKEN='${{ github.token }}' \
              REPO='${{ github.repository }}' \
              REF='${{ github.event.inputs.ref }}' \
+             SCCACHE_VERSION='${{ env.SCCACHE_VERSION }}' \
              bash -s" <<'REMOTE'
           set -euo pipefail
-          echo "Host: $(uname -srm) · $(nproc) cores · $(free -h | awk '/Mem:/{print $2}') mem"
 
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -140,6 +143,14 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential pkg-config cmake clang protobuf-compiler git
 
+          # Prebuilt sccache (static musl, glibc-agnostic).
+          if ! command -v sccache >/dev/null 2>&1; then
+            TARBALL="sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+            curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}.tar.gz" \
+              | tar -xz
+            sudo install "${TARBALL}/sccache" /usr/local/bin/sccache
+          fi
+
           rm -rf "$HOME/infino-src"
           git clone --filter=blob:none \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$HOME/infino-src"
@@ -149,15 +160,40 @@ jobs:
           echo "Checked out: $(git rev-parse --short HEAD)"
           REMOTE
 
-      - name: Warm build (on VM)
+      - name: Build (sccache, on VM)
         run: |
           set -eo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" "bash -s" <<'REMOTE'
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
+             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
           set -euo pipefail
           source "$HOME/.cargo/env"
           cd "$HOME/infino-src"
+
+          # Content-addressed compile cache in Azure Blob, shared across
+          # branches. CARGO_INCREMENTAL=0 is required (it conflicts with
+          # sccache). Reuses the bench container under a key prefix;
+          # connection string from the same account.
+          export RUSTC_WRAPPER=sccache
+          export CARGO_INCREMENTAL=0
+          export SCCACHE_AZURE_BLOB_CONTAINER="$INFINO_REAL_AZURE_CONTAINER"
+          export SCCACHE_AZURE_KEY_PREFIX=sccache
+          export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+          sccache --start-server || true
+
           cargo bench --bench supertable_all --no-run
+          sccache --show-stats || true
+
+          # Record the built binary so the run step execs it directly —
+          # no cargo in the run step means no re-fingerprint / rebuild.
+          BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name 'supertable_all-*' \
+                   -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+          test -n "$BIN" && test -x "$BIN" || { echo "::error::bench binary not found"; exit 1; }
+          echo "$BIN" > "$HOME/bench-bin"
+          echo "bench binary: $BIN"
           REMOTE
 
       - name: Run benchmark (on VM)
@@ -172,12 +208,12 @@ jobs:
              KEEP='${{ github.event.inputs.keep_table }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
           set -euo pipefail
-          source "$HOME/.cargo/env"
           cd "$HOME/infino-src"
           export INFINO_BENCH_STORE=azure
           [ "$KEEP" = "true" ] && export INFINO_BENCH_KEEP_TABLE=1
+          BIN="$(cat "$HOME/bench-bin")"
           echo "===== SUPERTABLE BENCHMARK START ====="
-          cargo bench --bench supertable_all 2>&1
+          "$BIN" 2>&1
           echo "===== SUPERTABLE BENCHMARK END ====="
           REMOTE
 
@@ -194,14 +230,17 @@ jobs:
             echo ""
           } >> "$SUMMARY"
 
-          if [ ! -s /tmp/bench.log ]; then
-            echo "::error::No bench log produced — provisioning or SSH failed (see job logs)."
-            echo "_No bench log produced — provisioning or SSH failed._" >> "$SUMMARY"
+          # Combine build + run logs (build warnings live in build.log,
+          # the report + runtime panics in bench.log), ANSI-stripped.
+          : > "$LOG"
+          for f in /tmp/build.log /tmp/bench.log; do
+            [ -s "$f" ] && sed -r 's/\x1b\[[0-9;]*m//g' "$f" >> "$LOG"
+          done
+          if [ ! -s "$LOG" ]; then
+            echo "::error::No output produced — provisioning or SSH failed (see job logs)."
+            echo "_No output produced — provisioning or SSH failed._" >> "$SUMMARY"
             exit 1
           fi
-
-          # Strip ANSI before parsing.
-          sed -r 's/\x1b\[[0-9;]*m//g' /tmp/bench.log > "$LOG"
 
           # The report banner ("══ … ══") and table are present only when
           # at least one shape succeeded.
@@ -218,8 +257,9 @@ jobs:
             echo "**❌ No report table — every shape failed.**" >> "$SUMMARY"
           fi
 
-          # Panics and errors; the panic line carries the full chain.
-          ERRORS="$(grep -nE 'panicked|HTTP error|storage error|transient error|AppendFlush|PointerParse|child exited|no shapes produced|skipped:|content-hash mismatch|short read' "$LOG" || true)"
+          # Panics, runtime errors, and compile errors (error[E…]); the
+          # panic line carries the full chain.
+          ERRORS="$(grep -nE 'panicked|error\[|HTTP error|storage error|transient error|AppendFlush|PointerParse|child exited|no shapes produced|skipped:|content-hash mismatch|short read' "$LOG" || true)"
           if [ -n "$ERRORS" ]; then
             {
               echo "### 🛑 Errors & panics"
@@ -258,7 +298,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: supertable-bench-log
-          path: /tmp/bench.log
+          path: |
+            /tmp/build.log
+            /tmp/bench.log
           if-no-files-found: warn
 
       - name: Teardown (always)
