@@ -251,7 +251,7 @@ pub fn run() {
     report.emit(&Section {
         anchor: "bench/supertable/ingest".into(),
         title: format!(
-            "Supertable — ingest, multi-segment / object-store ({} docs × dim={}, {} commits, real_s3)",
+            "Supertable — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
             fmt_count(n_docs),
             crate::corpus::DIM,
             supertable::N_COMMIT_CHUNKS
