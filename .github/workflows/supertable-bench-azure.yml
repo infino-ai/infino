@@ -1,11 +1,9 @@
 name: Supertable Benchmark (Azure)
 
-# Supertable ingest benchmark on a per-run ephemeral Azure VM, in the
-# storage account's region. Compute is co-located with the bucket so
-# object-store transfers run over the Azure backbone, not the public
-# internet. The VM clones and builds with an sccache compile cache backed
-# by Azure Blob (shared across branches), runs the bench, and is destroyed
-# each run.
+# Supertable ingest benchmark on a per-run ephemeral Azure VM in the
+# storage account's region (transfers ride the Azure backbone, not the
+# public internet). The VM builds with an sccache compile cache in Azure
+# Blob — shared across branches — runs the bench, and is torn down.
 
 on:
   workflow_dispatch:
@@ -51,8 +49,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RG: rg-infino-bench-${{ github.run_id }}
-  VM: bench-vm
+  # Pre-existing RG the bench service principal is scoped to (Contributor
+  # on this RG only). The workflow creates per-run resources inside it,
+  # never the RG itself.
+  RG: rg-infino-bench
+  VM: bench-vm-${{ github.run_id }}
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
 
@@ -76,13 +77,13 @@ jobs:
           LOC="${{ github.event.inputs.location }}"
           SIZE="${{ github.event.inputs.vm_size }}"
 
-          # Tag the RG + VM so Cost Management attributes spend by
-          # purpose / run after the group is deleted.
+          # Tag the VM so Cost Management attributes spend by purpose / run.
           TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ github.event.inputs.ref }}")
-          az group create -n "$RG" -l "$LOC" --tags "${TAGS[@]}" -o none
 
-          # No default inbound rule; the only SSH allow is the
-          # runner-IP /32 added below.
+          # Every resource is named with the unique per-run VM name so
+          # teardown can delete this run's resources by exact name (never
+          # a prefix that could match another run). No default inbound
+          # rule; the only SSH allow is the runner-IP /32 added below.
           az vm create \
             -g "$RG" -n "$VM" \
             --image Ubuntu2204 \
@@ -92,13 +93,17 @@ jobs:
             --public-ip-sku Standard \
             --os-disk-size-gb 128 \
             --nsg-rule NONE \
+            --nsg "${VM}-nsg" \
+            --public-ip-address "${VM}-pip" \
+            --vnet-name "${VM}-vnet" \
+            --subnet "${VM}-subnet" \
+            --os-disk-name "${VM}-osdisk" \
             --tags "${TAGS[@]}" \
             -o none
 
           RUNNER_IP="$(curl -s https://api.ipify.org)"
-          NSG="$(az network nsg list -g "$RG" --query "[0].name" -o tsv)"
           az network nsg rule create \
-            -g "$RG" --nsg-name "$NSG" -n allow-ssh-runner --priority 300 \
+            -g "$RG" --nsg-name "${VM}-nsg" -n allow-ssh-runner --priority 300 \
             --access Allow --protocol Tcp --direction Inbound \
             --destination-port-ranges 22 \
             --source-address-prefixes "${RUNNER_IP}/32" -o none
@@ -122,7 +127,7 @@ jobs:
 
       - name: Clone repo + toolchain + sccache (on VM)
         run: |
-          set -eo pipefail
+          set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           # Single-quoted heredoc: the body is literal; only the
           # ssh-line assignments reach the VM as env.
@@ -162,7 +167,7 @@ jobs:
 
       - name: Build (sccache, on VM)
         run: |
-          set -eo pipefail
+          set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
@@ -198,7 +203,7 @@ jobs:
 
       - name: Run benchmark (on VM)
         run: |
-          set -eo pipefail
+          set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
@@ -220,7 +225,9 @@ jobs:
       - name: Summarize results
         if: always()
         run: |
-          set -uo pipefail
+          # Best-effort parser: never abort early; exit codes are set
+          # explicitly below.
+          set +e -u -o pipefail
           SUMMARY="$GITHUB_STEP_SUMMARY"
           LOG=/tmp/bench.clean
           {
@@ -305,6 +312,19 @@ jobs:
 
       - name: Teardown (always)
         if: always()
+        env:
+          # The auto-created NIC is the only resource az names for us:
+          # "<vm>VMNic".
+          NIC: ${{ env.VM }}VMNic
         run: |
-          # Deletes the VM and all its resources in one call.
-          az group delete -n "$RG" --yes --no-wait || true
+          # Delete exactly this run's resources by name (VM is unique per
+          # run, so no name can collide with another run), keeping the
+          # shared RG. Ordered so dependencies release: VM frees the NIC
+          # and disk; the NIC frees the IP/NSG/subnet. Each is best-effort
+          # so a missing resource doesn't fail teardown.
+          az vm delete            -g "$RG" -n "$VM"          --yes        || true
+          az network nic delete   -g "$RG" -n "$NIC"                      || true
+          az disk delete          -g "$RG" -n "${VM}-osdisk" --yes        || true
+          az network public-ip delete -g "$RG" -n "${VM}-pip"             || true
+          az network nsg delete   -g "$RG" -n "${VM}-nsg"                 || true
+          az network vnet delete  -g "$RG" -n "${VM}-vnet"                || true
