@@ -67,8 +67,8 @@ use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resol
 use super::vector_exec::arg_to_query_vector;
 use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::reader::VectorSearchOptions;
-use crate::supertable::handle::SupertableReader;
 use crate::supertable::QueryError;
+use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
 use crate::supertable::query::SuperfileHit;
 

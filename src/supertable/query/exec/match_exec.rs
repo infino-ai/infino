@@ -501,7 +501,9 @@ mod tests {
             )
             .expect("token_match");
         assert_eq!(method.len(), 1);
-        let exact = reader.exact_match("title", "go routines").expect("exact_match");
+        let exact = reader
+            .exact_match("title", "go routines")
+            .expect("exact_match");
         assert_eq!(exact.len(), 1);
     }
 }
