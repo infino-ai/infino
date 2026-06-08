@@ -459,6 +459,7 @@ fn query_headers() -> Vec<String> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_query(
     report: &mut Report,
     n_docs: usize,

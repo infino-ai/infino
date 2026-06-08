@@ -12,24 +12,24 @@
 //! over the **same** data, so the cost can be attributed to a layer:
 //!
 //!   * `infino query_sql`        — the full path we want to speed up
-//!       (segment prune → in-memory object store → DataFusion
-//!       `ParquetSource` → `FilterExec` → collect).
+//!     (segment prune → in-memory object store → DataFusion
+//!     `ParquetSource` → `FilterExec` → collect).
 //!   * `  ├ parse+plan`          — `ctx.sql(...)` on the cached
-//!       `SessionContext` (planning only, no execution).
+//!     `SessionContext` (planning only, no execution).
 //!   * `  └ execute`             — `DataFrame::collect()` (the scan).
 //!   * `DataFusion / parquet`    — vanilla DataFusion reading the same
-//!       segment Parquet files from a temp dir via `register_parquet`.
-//!       Isolates infino's provider/object-store wrapper: if this
-//!       matches `query_sql`, the wrapper is free and the cost is
-//!       DataFusion's Parquet scan itself.
+//!     segment Parquet files from a temp dir via `register_parquet`.
+//!     Isolates infino's provider/object-store wrapper: if this
+//!     matches `query_sql`, the wrapper is free and the cost is
+//!     DataFusion's Parquet scan itself.
 //!   * `DataFusion / MemTable`   — DataFusion scan+filter+collect over
-//!       the already-decoded Arrow batches (no Parquet at all). The
-//!       floor for DataFusion's executor + output materialization.
+//!     the already-decoded Arrow batches (no Parquet at all). The
+//!     floor for DataFusion's executor + output materialization.
 //!   * `raw parquet-rs decode`   — `ParquetRecordBatchReaderBuilder`
-//!       decoding only the projected column(s) straight from the
-//!       segment bytes, predicate applied by hand. The floor a custom
-//!       `ExecutionPlan` that decodes our layout directly would
-//!       approach.
+//!     decoding only the projected column(s) straight from the
+//!     segment bytes, predicate applied by hand. The floor a custom
+//!     `ExecutionPlan` that decodes our layout directly would
+//!     approach.
 //!
 //! Reading the table: `query_sql − DataFusion/parquet` is infino
 //! provider overhead; `DataFusion/parquet − DataFusion/MemTable` is
