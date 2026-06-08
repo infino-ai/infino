@@ -444,6 +444,18 @@ mod tests {
 
     use crate::test_helpers::default_tokenizer as tok;
 
+    /// Drive an async future to completion on a throwaway current-thread
+    /// runtime. Used only for the single-segment `SuperfileReader`
+    /// oracle, whose search surface is async-only; the supertable
+    /// reader's own search methods are sync and need no runtime here.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
+
     fn schema_id_title() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
             "title",
@@ -520,33 +532,31 @@ mod tests {
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
     }
 
-    #[tokio::test]
-    async fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
+    #[test]
+    fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
-            .bm25_search_async("title", "rust", 5, BoolMode::Or)
-            .await
+            .bm25_search("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn bm25_search_k_zero_short_circuits() {
+    #[test]
+    fn bm25_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search_async("title", "rust", 0, BoolMode::Or)
-            .await
+            .bm25_search("title", "rust", 0, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn bm25_search_returns_descending_score_order() {
+    #[test]
+    fn bm25_search_returns_descending_score_order() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(
@@ -562,8 +572,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search_async("title", "rust", 4, BoolMode::Or)
-            .await
+            .bm25_search("title", "rust", 4, BoolMode::Or)
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
         assert_eq!(hits.len(), 3);
@@ -573,8 +582,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn bm25_search_carries_segment_uri_for_each_hit() {
+    #[test]
+    fn bm25_search_carries_segment_uri_for_each_hit() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust rust async"])).expect("a1");
@@ -585,8 +594,7 @@ mod tests {
         let r = st.reader();
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
-            .bm25_search_async("title", "rust", 5, BoolMode::Or)
-            .await
+            .bm25_search("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
         // Both segment URIs should appear.
@@ -600,8 +608,8 @@ mod tests {
         assert_eq!(uris, expected);
     }
 
-    #[tokio::test]
-    async fn bm25_search_oracle_top_k_set_matches_single_superfile() {
+    #[test]
+    fn bm25_search_oracle_top_k_set_matches_single_superfile() {
         // Plant a corpus where the top-k under BM25 is unambiguous
         // regardless of per-segment-vs-global IDF variation: 3 docs
         // contain the rare term `nimblefox`, distributed across 3
@@ -637,10 +645,11 @@ mod tests {
         assert_eq!(st.reader().n_superfiles(), 3);
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = oracle
-            .bm25_search("title", "nimblefox", 5, BoolMode::Or)
-            .await
-            .expect("oracle");
+        // Single-segment `SuperfileReader` oracle: async-only search,
+        // driven on a throwaway runtime. The supertable reader below
+        // uses its sync public API.
+        let oracle_hits =
+            block_on(oracle.bm25_search("title", "nimblefox", 5, BoolMode::Or)).expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
         let oracle_set: std::collections::HashSet<u32> =
@@ -649,8 +658,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .bm25_search_async("title", "nimblefox", 5, BoolMode::Or)
-            .await
+            .bm25_search("title", "nimblefox", 5, BoolMode::Or)
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
         // Resolve supertable hits to global doc-ids via segment
@@ -670,8 +678,8 @@ mod tests {
         assert_eq!(st_globals, oracle_set);
     }
 
-    #[tokio::test]
-    async fn bm25_search_prefix_oracle_top_k_set_matches_single_superfile() {
+    #[test]
+    fn bm25_search_prefix_oracle_top_k_set_matches_single_superfile() {
         let titles = vec![
             "rust async runtime",
             "rust embedded systems",
@@ -693,17 +701,14 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = oracle
-            .bm25_search_prefix("title", "rust", 5)
-            .await
-            .expect("oracle");
+        let oracle_hits =
+            block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .bm25_search_prefix_async("title", "rust", 5)
-            .await
+            .bm25_search_prefix("title", "rust", 5)
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -724,8 +729,8 @@ mod tests {
         assert!(st_hits.len() >= 4);
     }
 
-    #[tokio::test]
-    async fn bm25_search_prefix_unmatched_prefix_returns_empty() {
+    #[test]
+    fn bm25_search_prefix_unmatched_prefix_returns_empty() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
@@ -733,14 +738,13 @@ mod tests {
 
         let r = st.reader();
         let hits = r
-            .bm25_search_prefix_async("title", "zzzz", 10)
-            .await
+            .bm25_search_prefix("title", "zzzz", 10)
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn bm25_search_prefix_lowercases_input() {
+    #[test]
+    fn bm25_search_prefix_lowercases_input() {
         // Index stores tokenized terms (lowercased); user provides
         // mixed-case prefix; we lowercase before expansion so the
         // FST walk finds the matching subtree.
@@ -752,14 +756,13 @@ mod tests {
 
         let r = st.reader();
         let hits = r
-            .bm25_search_prefix_async("title", "RUST", 5)
-            .await
+            .bm25_search_prefix("title", "RUST", 5)
             .expect("query");
         assert_eq!(hits.len(), 1);
     }
 
-    #[tokio::test]
-    async fn bm25_search_unknown_column_errors() {
+    #[test]
+    fn bm25_search_unknown_column_errors() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust"])).expect("append");
@@ -767,14 +770,13 @@ mod tests {
 
         let r = st.reader();
         let err = r
-            .bm25_search_async("missing_column", "rust", 5, BoolMode::Or)
-            .await
+            .bm25_search("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
 
-    #[tokio::test]
-    async fn bm25_search_results_global_top_k_caps_at_k() {
+    #[test]
+    fn bm25_search_results_global_top_k_caps_at_k() {
         // 4 superfiles × 1 doc each = 4 hits; ask for k=2; expect 2.
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -785,8 +787,7 @@ mod tests {
         }
         let r = st.reader();
         let hits = r
-            .bm25_search_async("title", "rust", 2, BoolMode::Or)
-            .await
+            .bm25_search("title", "rust", 2, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
     }
