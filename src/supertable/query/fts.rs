@@ -287,8 +287,7 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-        let units: Vec<(Arc<SuperfileEntry>, ())> =
-            kept.into_iter().map(|e| (e, ())).collect();
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
@@ -338,8 +337,7 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-        let units: Vec<(Arc<SuperfileEntry>, ())> =
-            kept.into_iter().map(|e| (e, ())).collect();
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
@@ -413,11 +411,7 @@ impl Supertable {
     /// [`SuperfileReader::exact_match`](crate::superfile::SuperfileReader::exact_match)).
     /// Returns the rows whose stored value equals `value` exactly;
     /// hits are **unranked** (`score` is `0.0`).
-    pub fn exact_match(
-        &self,
-        column: &str,
-        value: &str,
-    ) -> Result<Vec<SuperfileHit>, QueryError> {
+    pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
         self.ensure_fresh();
         let reader = self.reader();
         self.block_on_query(reader.exact_match(column, value))
