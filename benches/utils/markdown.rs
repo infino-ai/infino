@@ -140,4 +140,3 @@ pub fn fmt_bandwidth(bytes_per_sec: f64) -> String {
         format!("{:.1} MB/s", bytes_per_sec / 1_000_000.0)
     }
 }
-

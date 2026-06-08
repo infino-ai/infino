@@ -90,7 +90,6 @@ impl RssStats {
             p90_rss_bytes: percentile_nearest_rank(&samples, 90),
         }
     }
-
 }
 
 fn percentile_nearest_rank(sorted: &[u64], percentile: usize) -> u64 {

@@ -106,14 +106,28 @@ const FTS_BATTERY: &[FtsQuery] = &[
     },
     FtsQuery {
         name: "five_term_or",
-        terms: &["term00050", "term00051", "term00052", "term00053", "term00054"],
+        terms: &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
         mode: BoolMode::Or,
     },
     FtsQuery {
         name: "ten_term_or",
         terms: &[
-            "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
-            "term00056", "term00057", "term00058", "term00059",
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
         ],
         mode: BoolMode::Or,
     },
@@ -134,14 +148,28 @@ const FTS_BATTERY: &[FtsQuery] = &[
     },
     FtsQuery {
         name: "five_term_and",
-        terms: &["term00050", "term00051", "term00052", "term00053", "term00054"],
+        terms: &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
         mode: BoolMode::And,
     },
     FtsQuery {
         name: "ten_term_and",
         terms: &[
-            "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
-            "term00056", "term00057", "term00058", "term00059",
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
         ],
         mode: BoolMode::And,
     },
@@ -175,13 +203,27 @@ const PROBE_SHAPES: &[(&str, &[&str])] = &[
     ("similar_3_or", &["term00050", "term00051", "term00052"]),
     (
         "similar_5_or",
-        &["term00050", "term00051", "term00052", "term00053", "term00054"],
+        &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
     ),
     (
         "similar_10_or",
         &[
-            "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
-            "term00056", "term00057", "term00058", "term00059",
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
         ],
     ),
 ];
@@ -191,13 +233,8 @@ const PROBE_SHAPES: &[(&str, &[&str])] = &[
 fn assert_superfile_self_consistent(reader: &SuperfileReader, n_docs: usize) {
     let probe_doc_id = n_docs / 2;
     let probe_token = format!("doc{probe_doc_id:07}");
-    let hits = block_on_inmem(reader.bm25_search(
-        FTS_COLUMN,
-        &probe_token,
-        K,
-        InfinoBoolMode::Or,
-    ))
-    .expect("search df=1");
+    let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, &probe_token, K, InfinoBoolMode::Or))
+        .expect("search df=1");
     assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
     assert_eq!(
         hits[0].0 as usize, probe_doc_id,
@@ -226,13 +263,27 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
         ("three_similar_or", &["term00050", "term00051", "term00052"]),
         (
             "five_term_or",
-            &["term00050", "term00051", "term00052", "term00053", "term00054"],
+            &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+            ],
         ),
         (
             "ten_term_or",
             &[
-                "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
-                "term00056", "term00057", "term00058", "term00059",
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
             ],
         ),
     ];
@@ -395,7 +446,10 @@ pub fn run() {
     }
 
     let n_docs = corpus::superfile_docs();
-    eprintln!("[superfile_fts] generating {}-doc corpus...", fmt_count(n_docs));
+    eprintln!(
+        "[superfile_fts] generating {}-doc corpus...",
+        fmt_count(n_docs)
+    );
     let corpus = MmapTextCorpus::generate(n_docs, 1);
     let docs = corpus.rows();
 
@@ -447,8 +501,9 @@ pub fn run() {
         eprintln!(
             "[superfile_fts] committing measured 1-writer artifact to object storage for the cold tier..."
         );
-        let committed =
-            tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(index.bytes())));
+        let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
+            index.bytes(),
+        )));
         let cold = measure_cold(&committed);
 
         emit_search(&mut report, n_docs, &result, &cold, &probes);
@@ -505,7 +560,12 @@ fn writer_label(writers: usize) -> String {
     }
 }
 
-fn emit_ingest(report: &mut Report, n_docs: usize, corpus: &MmapTextCorpus, result: &EngineFtsResult) {
+fn emit_ingest(
+    report: &mut Report,
+    n_docs: usize,
+    corpus: &MmapTextCorpus,
+    result: &EngineFtsResult,
+) {
     // Logical input payload: total corpus text bytes, identical across
     // every writer count (the parallel build shards the same corpus).
     let input_bytes = corpus.total_bytes() as f64;
@@ -603,14 +663,7 @@ fn emit_search(
     let by_name: HashMap<&'static str, &QueryStats> =
         result.queries.iter().map(|q| (q.name, q)).collect();
 
-    let search_headers = headers(&[
-        "Query",
-        "hot",
-        "cold",
-        "Peak RSS",
-        "Median RSS",
-        "P90 RSS",
-    ]);
+    let search_headers = headers(&["Query", "hot", "cold", "Peak RSS", "Median RSS", "P90 RSS"]);
     let or_block = Block {
         subtitle: "OR queries".into(),
         headers: search_headers.clone(),

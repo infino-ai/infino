@@ -150,17 +150,33 @@ fn pinned_rows() -> Vec<Vec<Cell>> {
     let (l2_r10_np8, rss_a) = sampled_recall(&l2_reader, &l2_vecs, Metric::L2Sq, &l2_q, 10, 8);
     let (l2_r10_np32, rss_b) = sampled_recall(&l2_reader, &l2_vecs, Metric::L2Sq, &l2_q, 10, 32);
     let (l2_r1_np8, rss_c) = sampled_recall(&l2_reader, &l2_vecs, Metric::L2Sq, &l2_q, 1, 8);
-    assert!(l2_r10_np8 >= 0.90, "L2Sq recall@10 nprobe=8 {l2_r10_np8:.3} < 0.90");
-    assert!(l2_r10_np32 >= 0.95, "L2Sq recall@10 nprobe=32 {l2_r10_np32:.3} < 0.95");
-    assert!(l2_r1_np8 >= 0.95, "L2Sq recall@1 nprobe=8 {l2_r1_np8:.3} < 0.95");
+    assert!(
+        l2_r10_np8 >= 0.90,
+        "L2Sq recall@10 nprobe=8 {l2_r10_np8:.3} < 0.90"
+    );
+    assert!(
+        l2_r10_np32 >= 0.95,
+        "L2Sq recall@10 nprobe=32 {l2_r10_np32:.3} < 0.95"
+    );
+    assert!(
+        l2_r1_np8 >= 0.95,
+        "L2Sq recall@1 nprobe=8 {l2_r1_np8:.3} < 0.95"
+    );
 
     let (cos_vecs, cos_reader) = build_fixture(2, true, Metric::Cosine);
     let cos_q = generate_realistic_queries(&cos_vecs, N_DOCS, N_QUERIES, 200, true, 0.05);
-    let (cos_r10_np8, rss_d) = sampled_recall(&cos_reader, &cos_vecs, Metric::Cosine, &cos_q, 10, 8);
+    let (cos_r10_np8, rss_d) =
+        sampled_recall(&cos_reader, &cos_vecs, Metric::Cosine, &cos_q, 10, 8);
     let (cos_r10_np32, rss_e) =
         sampled_recall(&cos_reader, &cos_vecs, Metric::Cosine, &cos_q, 10, 32);
-    assert!(cos_r10_np8 >= 0.90, "Cosine recall@10 nprobe=8 {cos_r10_np8:.3} < 0.90");
-    assert!(cos_r10_np32 >= 0.95, "Cosine recall@10 nprobe=32 {cos_r10_np32:.3} < 0.95");
+    assert!(
+        cos_r10_np8 >= 0.90,
+        "Cosine recall@10 nprobe=8 {cos_r10_np8:.3} < 0.90"
+    );
+    assert!(
+        cos_r10_np32 >= 0.95,
+        "Cosine recall@10 nprobe=32 {cos_r10_np32:.3} < 0.95"
+    );
 
     vec![
         recall_row("L2Sq · recall@10 · nprobe=8", l2_r10_np8, rss_a),

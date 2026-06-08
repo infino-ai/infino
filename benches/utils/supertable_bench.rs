@@ -72,7 +72,11 @@ impl ShapeMetrics {
     fn to_result_line(&self) -> String {
         format!(
             "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={}",
-            self.wall_ns, self.n_superfiles, self.peak_rss_bytes, self.median_rss_bytes, self.p90_rss_bytes,
+            self.wall_ns,
+            self.n_superfiles,
+            self.peak_rss_bytes,
+            self.median_rss_bytes,
+            self.p90_rss_bytes,
         )
     }
 
@@ -176,7 +180,11 @@ fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
 
 fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     let secs = m.wall_ns / 1e9;
-    let thr = if secs > 0.0 { n_docs as f64 / secs } else { 0.0 };
+    let thr = if secs > 0.0 {
+        n_docs as f64 / secs
+    } else {
+        0.0
+    };
     vec![
         text(label),
         metric(m.wall_ns, fmt_time(m.wall_ns), Better::Lower),
@@ -206,7 +214,10 @@ pub fn run() {
     // instead of a panic deep inside the first build. Checked in both the
     // parent and any spawned child (env is inherited).
     if crate::tiers::real_s3_bucket_env().is_none() {
-        eprintln!("[supertable] skipped: {}", crate::tiers::SUPERTABLE_REQUIRES_REAL_S3);
+        eprintln!(
+            "[supertable] skipped: {}",
+            crate::tiers::SUPERTABLE_REQUIRES_REAL_S3
+        );
         return;
     }
 

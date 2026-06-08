@@ -24,8 +24,6 @@ use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::tiers;
-use bytes::Bytes;
 use crate::corpus::{self, Calibrated, DIM};
 use crate::harness::{
     InfinoVectorEngine, InfinoVectorIndex, VectorEngine, VectorMetric, VectorRunConfig,
@@ -34,6 +32,8 @@ use crate::harness::{
 use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 use crate::rss;
+use crate::tiers;
+use bytes::Bytes;
 use infino::superfile::SuperfileReader;
 use infino::superfile::reader::VectorSearchOptions;
 
@@ -91,13 +91,27 @@ fn vectors() -> &'static [f32] {
 
 fn queries_correctness() -> &'static [Vec<f32>] {
     QUERIES_CORRECTNESS.get_or_init(|| {
-        corpus::generate_realistic_queries(vectors(), n_docs(), N_CORRECTNESS_QUERIES, 17, true, 0.05)
+        corpus::generate_realistic_queries(
+            vectors(),
+            n_docs(),
+            N_CORRECTNESS_QUERIES,
+            17,
+            true,
+            0.05,
+        )
     })
 }
 
 fn queries_calibration() -> &'static [Vec<f32>] {
     QUERIES_CALIBRATION.get_or_init(|| {
-        corpus::generate_realistic_queries(vectors(), n_docs(), N_CALIBRATION_QUERIES, 99, true, 0.05)
+        corpus::generate_realistic_queries(
+            vectors(),
+            n_docs(),
+            N_CALIBRATION_QUERIES,
+            99,
+            true,
+            0.05,
+        )
     })
 }
 
@@ -208,7 +222,11 @@ fn timed_hot(index: &InfinoVectorIndex, query: &[f32], search: VectorSearch) -> 
     }
 }
 
-fn timed_cold(committed: &tiers::SuperfileCommitted, query: &[f32], search: VectorSearch) -> Duration {
+fn timed_cold(
+    committed: &tiers::SuperfileCommitted,
+    query: &[f32],
+    search: VectorSearch,
+) -> Duration {
     let storage = Arc::clone(&committed.storage);
     let uri = committed.uri;
     let mut samples = Vec::with_capacity(3);
@@ -315,17 +333,14 @@ pub fn run() {
 
     let cal = local_calibrations(index.reader());
     eprintln!("[superfile_vec] committing measured 1-writer artifact to object storage...");
-    let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(index.bytes())));
+    let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
+        index.bytes(),
+    )));
     let q = &queries_calibration()[0];
 
     let mut build_rows = Vec::new();
     for b in &build_result.builds {
-        build_rows.push(build_row(
-            &writer_label(b.writers),
-            n_docs,
-            b.wall,
-            b.rss,
-        ));
+        build_rows.push(build_row(&writer_label(b.writers), n_docs, b.wall, b.rss));
     }
 
     let mut search_rows = Vec::new();
@@ -403,4 +418,3 @@ pub fn run() {
     });
     report.save();
 }
-

@@ -169,12 +169,7 @@ pub trait VectorEngine {
         writers: usize,
     );
 
-    fn read(
-        index: &Self::Index,
-        query: &[f32],
-        k: usize,
-        search: VectorSearch,
-    ) -> Vec<VectorHit>;
+    fn read(index: &Self::Index, query: &[f32], k: usize, search: VectorSearch) -> Vec<VectorHit>;
 
     fn close(index: &mut Self::Index);
 
