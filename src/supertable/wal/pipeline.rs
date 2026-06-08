@@ -667,7 +667,7 @@ pub enum TombstonePhaseOutcome {
 
     /// We ran (or finished running) the tombstone loop, advanced
     /// the WAL state to `Complete`, and report the per-outcome
-    /// counts the caller will surface to its `OperationOutcome`.
+    /// counts the caller will surface to its `MutationStats`.
     Applied {
         n_tombstoned: usize,
         n_not_found: usize,

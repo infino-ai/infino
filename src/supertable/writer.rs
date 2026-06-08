@@ -68,7 +68,7 @@ use super::manifest::{
     FtsSummary, ScalarStatsTable, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use super::mutations::{
-    CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+    CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
     PendingDelete, PendingUpdate,
 };
 use super::options::SupertableOptions;
@@ -552,7 +552,7 @@ impl SupertableWriter {
     ///    pipeline (tombstone phase only).
     ///
     /// On success returns a [`CommitResult`] with one
-    /// [`OperationOutcome`] per buffered mutation (in buffer
+    /// [`MutationStats`] per buffered mutation (in buffer
     /// order). On a mid-flush mutation failure surfaces
     /// [`CommitError::PartialCommit`] listing the WALs that DID
     /// land durably; the remaining buffered ops stay on the
@@ -561,7 +561,7 @@ impl SupertableWriter {
     /// process dies before retrying.
     ///
     /// [`CommitResult`]: crate::supertable::mutations::CommitResult
-    /// [`OperationOutcome`]: crate::supertable::mutations::OperationOutcome
+    /// [`MutationStats`]: crate::supertable::mutations::MutationStats
     /// [`CommitError::PartialCommit`]: crate::supertable::mutations::CommitError::PartialCommit
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
         // Step 1: flush appends. A failure here is atomic —
@@ -575,7 +575,7 @@ impl SupertableWriter {
         let total_mutations = self.pending_updates.len() + self.pending_deletes.len();
         let mut committed_wal_ids: Vec<crate::supertable::wal::state_doc::WalId> =
             Vec::with_capacity(total_mutations);
-        let mut outcomes: Vec<OperationOutcome> = Vec::with_capacity(total_mutations);
+        let mut outcomes: Vec<MutationStats> = Vec::with_capacity(total_mutations);
 
         // Step 2: drive pending updates in buffer order. On
         // mid-loop failure, the failed entry is dropped (its
@@ -645,10 +645,7 @@ impl SupertableWriter {
 
     /// Drive one pending update entry through its full WAL
     /// pipeline. Returns the per-op outcome on success.
-    fn drive_one_update(
-        &self,
-        entry: &PendingUpdateEntry,
-    ) -> Result<OperationOutcome, MutationError> {
+    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
         let storage = self
             .inner
             .options
@@ -722,7 +719,7 @@ impl SupertableWriter {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
             Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
-        Ok(OperationOutcome {
+        Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
             n_tombstoned,
@@ -732,10 +729,7 @@ impl SupertableWriter {
 
     /// Drive one pending delete entry through its tombstone
     /// phase. Returns the per-op outcome on success.
-    fn drive_one_delete(
-        &self,
-        entry: &PendingDeleteEntry,
-    ) -> Result<OperationOutcome, MutationError> {
+    fn drive_one_delete(&self, entry: &PendingDeleteEntry) -> Result<MutationStats, MutationError> {
         let storage = self
             .inner
             .options
@@ -795,7 +789,7 @@ impl SupertableWriter {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
             Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
-        Ok(OperationOutcome {
+        Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
             n_tombstoned,

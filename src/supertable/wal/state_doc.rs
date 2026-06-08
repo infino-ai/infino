@@ -214,7 +214,7 @@ pub enum TombstoneOutcome {
     /// No superfile in the current manifest claims this id —
     /// either a peer beat us to the tombstone, or compaction
     /// removed the row's superfile in a way that lost the id.
-    /// Surfaced to the caller in `OperationOutcome.n_not_found`.
+    /// Surfaced to the caller in `MutationStats.n_not_found`.
     NotFound,
 }
 
