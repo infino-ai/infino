@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Concurrent-readers stress + invariants.
 //!
 //! These tests cover the load-bearing reader-isolation guarantee
@@ -47,7 +50,7 @@
 //! Note: the writer is single-shot per supertable
 //! (`SupertableWriter` enforces an exclusive slot via
 //! `compare_exchange`), so all tests use exactly one writer
-//! thread. Multi-writer cross-process semantics live with 003's
+//! thread. Multi-writer cross-process semantics live with the
 //! object-store + lock-file design.
 
 #![deny(clippy::unwrap_used)]
@@ -60,6 +63,13 @@ use arrow_array::{LargeStringArray, RecordBatch};
 
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::{default_supertable_options, schema_id_title};
+
+/// Contending writer threads in the single-winner commit race.
+const CONTENDER_THREADS: usize = 4;
+/// Snapshot-stability stress: writer commits + reader fanout.
+const STRESS_COMMIT_COUNT: u64 = 50;
+const STRESS_READER_THREADS: usize = 16;
+const STRESS_PINS_PER_READER: usize = 200;
 
 fn options() -> SupertableOptions {
     default_supertable_options()
@@ -182,10 +192,10 @@ fn concurrent_readers_at_same_commit_share_arc_pointer() {
     // 4 reader threads, all racing to pin AFTER c1 but before any
     // further commit (none happens). All 4 should hold the same
     // Arc<Manifest>.
-    let barrier = Arc::new(Barrier::new(4));
+    let barrier = Arc::new(Barrier::new(CONTENDER_THREADS));
     let st = Arc::new(st);
     let mut handles = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..CONTENDER_THREADS {
         let st = Arc::clone(&st);
         let bar = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
@@ -238,9 +248,9 @@ fn many_concurrent_readers_during_writer_commits_no_inconsistencies() {
     // and asserts the pair is unchanged across the hold (the
     // load-bearing snapshot-stability guarantee).
     let st = Supertable::create(options()).expect("create");
-    let n_commits = 50u64;
-    let n_readers = 16usize;
-    let pins_per_reader = 200usize;
+    let n_commits = STRESS_COMMIT_COUNT;
+    let n_readers = STRESS_READER_THREADS;
+    let pins_per_reader = STRESS_PINS_PER_READER;
 
     let st_for_writer = st.clone();
     let writer = thread::spawn(move || {

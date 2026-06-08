@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! System-wide configuration for infino.
 //!
 //! ## Sources
@@ -215,16 +218,29 @@ impl Default for StorageSettings {
             bucket: None,
             prefix: String::new(),
             disk_cache_root: None,
-            disk_budget_bytes: 10 * (1 << 30),
+            disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
             cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
-            cold_fetch_streams: 8,
-            cold_fetch_chunk_bytes: 4 * (1 << 20),
-            prefetch_concurrency: 8,
-            mmap_cold_threshold_secs: 300,
-            mmap_sweep_interval_secs: 75,
+            cold_fetch_streams: DEFAULT_COLD_FETCH_STREAMS,
+            cold_fetch_chunk_bytes: DEFAULT_COLD_FETCH_CHUNK_BYTES,
+            prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
+            mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
+            mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
         }
     }
 }
+
+/// Default disk-cache byte budget exposed in the shipped config (10 GiB).
+const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
+/// Default parallel cold-fetch streams at the config layer.
+const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
+/// Default cold-fetch range chunk size (4 MiB).
+const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 4 * (1 << 20);
+/// Default concurrent background full-segment fills.
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
+/// Default idle age (seconds) before an mmap is swept.
+const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
+/// Default background mmap-sweep period (seconds).
+const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
 
 fn default_id_column() -> String {
     "_id".to_string()

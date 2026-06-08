@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Public types + entry points for update / delete operations.
 //!
 //! Mutations follow the buffer + commit shape that `append()`

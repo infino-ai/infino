@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SupertableProvider` — a DataFusion [`TableProvider`] that owns
 //! segment selection and hands the rest to DataFusion.
 //!

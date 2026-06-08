@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! License audit: fails the test suite if any dependency in the
 //! resolved tree is licensed under anything that isn't either:
 //!

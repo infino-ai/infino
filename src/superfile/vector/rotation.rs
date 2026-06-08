@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Random orthogonal rotation built from a deterministic seed.
 //!
 //! Sign-quantization (1-bit RaBitQ) is useless without rotation: every
@@ -20,6 +23,12 @@ use crate::superfile::vector::distance::dot;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
+
+/// Minimum row magnitude before Gram-Schmidt normalization divides by
+/// it. A row whose magnitude falls at or below this is treated as
+/// numerically zero (a near-degenerate Gaussian draw) and left
+/// unnormalized rather than blown up by division.
+const GRAM_SCHMIDT_MIN_ROW_MAGNITUDE: f32 = 1e-12;
 
 /// Row-major `dim × dim` orthonormal matrix.
 #[derive(Debug)]
@@ -53,7 +62,7 @@ impl RandomRotation {
             }
             let row_i = &mut rows[i * dim..(i + 1) * dim];
             let mag: f32 = row_i.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if mag > 1e-12 {
+            if mag > GRAM_SCHMIDT_MIN_ROW_MAGNITUDE {
                 let inv = 1.0 / mag;
                 for x in row_i.iter_mut() {
                     *x *= inv;

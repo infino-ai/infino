@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared build-side dispatch for supertable commit fan-out.
 //!
 //! Query paths use `query::dispatch` so FTS, vector, and SQL segment

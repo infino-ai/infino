@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS blob reader. Multi-column BM25 search.
 //!
 //! Opens the byte layout produced by [`super::builder::FtsBuilder::finish`]
@@ -21,6 +24,9 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::superfile::format::checksum::crc32c;
+use crate::superfile::format::fts::{
+    HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry, term_meta,
+};
 use crate::superfile::format::{self, FST_SEPARATOR};
 use crate::superfile::fts::builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE};
 use crate::superfile::fts::dict::{DictReader, make_key};
@@ -165,23 +171,27 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        let header = fetch_lazy_range(source.as_ref(), 0..48, "fts header").await?;
-        if &header[0..8] != format::fts::MAGIC {
+        let header = fetch_lazy_range(source.as_ref(), 0..FTS_HEADER_SIZE, "fts header").await?;
+        if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
             return Err(FtsError::Read(ReadError::BadMagic {
                 section: "fts",
                 expected: format::fts::MAGIC,
-                actual: header[0..8].to_vec(),
+                actual: header[0..MAGIC_BYTES].to_vec(),
             }));
         }
-        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
         if version != format::fts::VERSION {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
         }
 
-        let postings_offset = read_u64_le(&header[32..40]) as usize;
-        let doc_lengths_table_offset = read_u64_le(&header[40..48]) as usize;
+        let postings_offset =
+            read_u64_le(&header[hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES])
+                as usize;
+        let doc_lengths_table_offset =
+            read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
 
         // Prefetch the FST directory ([48..postings_offset], contiguous
         // after the header) so every later `dict_bytes()` resolves from
@@ -204,7 +214,11 @@ impl FtsReader {
         // keeping the open-time GET count minimal and avoiding
         // per-column range calls during metadata decode.
         let (fst_region, doc_lengths_tail) = futures::try_join!(
-            fetch_lazy_range(source.as_ref(), 48..postings_offset, "fts/dict"),
+            fetch_lazy_range(
+                source.as_ref(),
+                FTS_HEADER_SIZE..postings_offset,
+                "fts/dict"
+            ),
             fetch_lazy_range(
                 source.as_ref(),
                 doc_lengths_table_offset..fts_blob_len,
@@ -214,7 +228,7 @@ impl FtsReader {
 
         let mut overlay = PrefetchedSource::new(source);
         overlay.install(0, header);
-        overlay.install(48, fst_region);
+        overlay.install(FTS_HEADER_SIZE as u64, fst_region);
         overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
         Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
@@ -223,28 +237,28 @@ impl FtsReader {
     /// Open over an arbitrary byte source. The eager path wraps a
     /// full subsection as [`Source::InMemory`]; lazy callers can pass
     /// a range-backed source without changing the public search API.
-    pub fn open_with_source(
+    pub(crate) fn open_with_source(
         source: Source,
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, FtsError> {
         let source_len = source.len();
-        if source_len < 48 {
+        if source_len < FTS_HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
-        let header = fetch_source_range(&source, 0..48, "fts header")?;
+        let header = fetch_source_range(&source, 0..FTS_HEADER_SIZE, "fts header")?;
 
         // Magic check.
-        if &header[0..8] != format::fts::MAGIC {
+        if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
             return Err(FtsError::Read(ReadError::BadMagic {
                 section: "fts",
                 expected: format::fts::MAGIC,
-                actual: header[0..8].to_vec(),
+                actual: header[0..MAGIC_BYTES].to_vec(),
             }));
         }
 
         // Version check.
-        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
         if version != format::fts::VERSION {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
@@ -252,12 +266,17 @@ impl FtsReader {
         }
 
         let n_columns =
-            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
-        let n_docs = read_u32_le(&header[16..20]);
-        let n_terms_total = read_u32_le(&header[20..24]);
-        let fst_offset = read_u64_le(&header[24..32]) as usize;
-        let postings_offset = read_u64_le(&header[32..40]) as usize;
-        let doc_lengths_table_offset = read_u64_le(&header[40..48]) as usize;
+            read_u32_le(&header[hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES]) as usize;
+        let n_docs = read_u32_le(&header[hdr::N_DOCS_OFF..hdr::N_DOCS_OFF + U32_BYTES]);
+        let n_terms_total = read_u32_le(&header[hdr::N_TERMS_OFF..hdr::N_TERMS_OFF + U32_BYTES]);
+        let fst_offset =
+            read_u64_le(&header[hdr::FST_OFFSET_OFF..hdr::FST_OFFSET_OFF + U64_BYTES]) as usize;
+        let postings_offset =
+            read_u64_le(&header[hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES])
+                as usize;
+        let doc_lengths_table_offset =
+            read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
 
         // Bounds-check every offset against the blob length before
         // any slice indexing. A single byte flip in the header can
@@ -424,7 +443,7 @@ impl FtsReader {
                 }
             }
 
-            let avgdl = (avgdl_x1000 as f32) / 1000.0;
+            let avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             // Precompute per-doc length normalizer:
             //   dl_norm_k1[d] = K1 * (1 - B + B * dl[d] / avgdl)
             // For avgdl == 0 (empty column) leave the table empty;
@@ -2193,12 +2212,19 @@ impl TermMeta {
                 "term metadata offset out of postings region".into(),
             )));
         }
-        let df = read_u32_le(&postings[metadata_offset..metadata_offset + 4]) as u64;
+        let df = read_u32_le(
+            &postings[metadata_offset + term_meta::DF_OFF
+                ..metadata_offset + term_meta::DF_OFF + U32_BYTES],
+        ) as u64;
         // bytes [4..12] = self-offset (redundant; u64); skip
-        let postings_length =
-            read_u32_le(&postings[metadata_offset + 12..metadata_offset + 16]) as usize;
-        let num_blocks =
-            read_u32_le(&postings[metadata_offset + 16..metadata_offset + 20]) as usize;
+        let postings_length = read_u32_le(
+            &postings[metadata_offset + term_meta::POSTINGS_LENGTH_OFF
+                ..metadata_offset + term_meta::POSTINGS_LENGTH_OFF + U32_BYTES],
+        ) as usize;
+        let num_blocks = read_u32_le(
+            &postings[metadata_offset + term_meta::NUM_BLOCKS_OFF
+                ..metadata_offset + term_meta::NUM_BLOCKS_OFF + U32_BYTES],
+        ) as usize;
 
         let skip_start = metadata_offset + TERM_META_SIZE;
         let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
@@ -2226,10 +2252,23 @@ impl TermMeta {
     fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, f32) {
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
         let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
-        let last_doc_id = read_u32_le(&postings[entry_off..entry_off + 4]);
-        let block_offset = read_u32_le(&postings[entry_off + 4..entry_off + 8]) as usize;
-        let max_bm25_x1000 = read_u32_le(&postings[entry_off + 8..entry_off + 12]);
-        (last_doc_id, block_offset, (max_bm25_x1000 as f32) / 1000.0)
+        let last_doc_id = read_u32_le(
+            &postings[entry_off + skip_entry::LAST_DOC_ID_OFF
+                ..entry_off + skip_entry::LAST_DOC_ID_OFF + U32_BYTES],
+        );
+        let block_offset = read_u32_le(
+            &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
+                ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
+        ) as usize;
+        let max_bm25_x1000 = read_u32_le(
+            &postings[entry_off + skip_entry::MAX_BM25_OFF
+                ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
+        );
+        (
+            last_doc_id,
+            block_offset,
+            (max_bm25_x1000 as f32) / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+        )
     }
 
     /// End offset (relative to the term's `metadata_offset`) of block

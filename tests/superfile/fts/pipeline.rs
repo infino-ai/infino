@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end FTS pipeline integration test.
 //!
 //! Builds a small multi-column FTS index, opens it through `FtsReader`,
@@ -8,6 +11,24 @@ use bytes::Bytes;
 use infino::superfile::fts::builder::FtsBuilder;
 use infino::superfile::fts::reader::{BoolMode, FtsReader};
 use infino::test_helpers::default_tokenizer;
+
+/// Document count for the two-column FTS pipeline fixture.
+const FTS_PIPELINE_N_DOCS: u32 = 4;
+/// BM25 top-k used across the pipeline searches.
+const FTS_PIPELINE_SEARCH_K: usize = 10;
+/// Top-k for the explicit top-k-limit test (expects a single hit).
+const FTS_PIPELINE_TOPK_LIMIT_K: usize = 1;
+/// Multi-column BM25 weights (title weighted above body).
+const FTS_TITLE_WEIGHT: f32 = 2.0;
+const FTS_BODY_WEIGHT: f32 = 1.0;
+/// Corpus size for the Block-Max-WAND multi-block fixture.
+const BMW_CORPUS_N_DOCS: u32 = 500;
+/// Term-frequency cycle modulus (`i % BMW_TF_MODULUS + 1` → 1..=8).
+const BMW_TF_MODULUS: u32 = 8;
+/// Filler-token-count modulus, varying doc lengths.
+const BMW_FILLER_MODULUS: u32 = 20;
+/// Score-equality tolerance comparing the BMW vs multi-term paths.
+const BMW_SCORE_TOLERANCE: f32 = 1e-5;
 
 fn build_with_two_columns() -> (Bytes, String) {
     let tok = default_tokenizer();
@@ -38,19 +59,19 @@ fn build_with_two_columns() -> (Bytes, String) {
 async fn end_to_end_routing_per_column() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
-    assert_eq!(r.n_docs(), 4);
+    assert_eq!(r.n_docs(), FTS_PIPELINE_N_DOCS);
 
     // "rust" appears in title doc 0; in body doc 1. Routing must NOT
     // confuse these (column isolation).
     let title_hits = r
-        .search("title", &["rust"], 10, BoolMode::Or)
+        .search("title", &["rust"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
     let title_ids: Vec<u32> = title_hits.iter().map(|(d, _)| *d).collect();
     assert_eq!(title_ids, vec![0]);
 
     let body_hits = r
-        .search("body", &["rust"], 10, BoolMode::Or)
+        .search("body", &["rust"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
     let body_ids: Vec<u32> = body_hits.iter().map(|(d, _)| *d).collect();
@@ -63,7 +84,12 @@ async fn end_to_end_and_intersection() {
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // body: "tokio AND async" → only doc 0.
     let hits = r
-        .search("body", &["tokio", "async"], 10, BoolMode::And)
+        .search(
+            "body",
+            &["tokio", "async"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::And,
+        )
         .await
         .expect("search");
     let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -76,7 +102,12 @@ async fn end_to_end_or_union() {
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // body: "tokio OR mature" → docs 0 and 1.
     let hits = r
-        .search("body", &["tokio", "mature"], 10, BoolMode::Or)
+        .search(
+            "body",
+            &["tokio", "mature"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::Or,
+        )
         .await
         .expect("search");
     let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -90,7 +121,12 @@ async fn end_to_end_missing_term_or_drops() {
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // OR with a missing term still returns hits for the present term.
     let hits = r
-        .search("body", &["nonexistent", "tokio"], 10, BoolMode::Or)
+        .search(
+            "body",
+            &["nonexistent", "tokio"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::Or,
+        )
         .await
         .expect("search");
     let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -102,7 +138,12 @@ async fn end_to_end_missing_term_and_short_circuits() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     let hits = r
-        .search("body", &["nonexistent", "tokio"], 10, BoolMode::And)
+        .search(
+            "body",
+            &["nonexistent", "tokio"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::And,
+        )
         .await
         .expect("search");
     assert!(hits.is_empty());
@@ -112,7 +153,14 @@ async fn end_to_end_missing_term_and_short_circuits() {
 async fn end_to_end_unknown_column_errors() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
-    let err = r.search("not_a_column", &["rust"], 10, BoolMode::Or).await;
+    let err = r
+        .search(
+            "not_a_column",
+            &["rust"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::Or,
+        )
+        .await;
     assert!(err.is_err());
 }
 
@@ -121,7 +169,7 @@ async fn end_to_end_top_k_limits_results() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     let hits = r
-        .search("body", &["filler"], 1, BoolMode::Or)
+        .search("body", &["filler"], FTS_PIPELINE_TOPK_LIMIT_K, BoolMode::Or)
         .await
         .expect("FTS search");
     // Even though "filler" might match multiple docs, only 1 returned.
@@ -133,7 +181,7 @@ async fn end_to_end_score_is_positive() {
     let (blob, json) = build_with_two_columns();
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     let hits = r
-        .search("body", &["tokio"], 10, BoolMode::Or)
+        .search("body", &["tokio"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
     for (_, s) in &hits {
@@ -148,7 +196,12 @@ async fn end_to_end_search_multi_weighted_combine() {
     let r = FtsReader::open(blob, &json).expect("open FtsReader");
     // search "rust" across both columns, title weighted 2x.
     let hits = r
-        .search_multi(&[("title", 2.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
+        .search_multi(
+            &[("title", FTS_TITLE_WEIGHT), ("body", FTS_BODY_WEIGHT)],
+            "rust",
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::Or,
+        )
         .await
         .expect("FTS multi-column search");
     let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -180,14 +233,14 @@ async fn bmw_single_term_matches_brute_force() {
     // Build ~500 docs with the term "foo" appearing in every other doc
     // with varying tfs (1..=8) — produces multiple posting blocks, plenty
     // of skip-table headroom for BMW to chew on.
-    for i in 0..500u32 {
-        let n_foo = (i % 8) as usize + 1;
+    for i in 0..BMW_CORPUS_N_DOCS {
+        let n_foo = (i % BMW_TF_MODULUS) as usize + 1;
         let foos = std::iter::repeat_n("foo", n_foo)
             .collect::<Vec<_>>()
             .join(" ");
         let mut text = foos.clone();
         // Add some filler tokens so doc lengths vary.
-        for j in 0..(i % 20) {
+        for j in 0..(i % BMW_FILLER_MODULUS) {
             text.push_str(&format!(" filler{j}"));
         }
         b.add_doc(0, i, &text).expect("add doc");
@@ -198,16 +251,21 @@ async fn bmw_single_term_matches_brute_force() {
 
     // Single term → BMW path.
     let bmw_hits = r
-        .search("body", &["foo"], 10, BoolMode::Or)
+        .search("body", &["foo"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
     assert!(!bmw_hits.is_empty());
-    assert_eq!(bmw_hits.len(), 10);
+    assert_eq!(bmw_hits.len(), FTS_PIPELINE_SEARCH_K);
 
     // Two terms (one bogus, OR mode drops it) → multi-term full-decode path.
     // Should produce the same results as the BMW path.
     let mt_hits = r
-        .search("body", &["foo", "nonexistent_term_xyz"], 10, BoolMode::Or)
+        .search(
+            "body",
+            &["foo", "nonexistent_term_xyz"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::Or,
+        )
         .await
         .expect("search");
 
@@ -219,7 +277,7 @@ async fn bmw_single_term_matches_brute_force() {
     for ((d_bmw, s_bmw), (d_mt, s_mt)) in bmw_hits.iter().zip(mt_hits.iter()) {
         assert_eq!(d_bmw, d_mt);
         assert!(
-            (s_bmw - s_mt).abs() < 1e-5,
+            (s_bmw - s_mt).abs() < BMW_SCORE_TOLERANCE,
             "scores differ: BMW={s_bmw} multi-term={s_mt}"
         );
     }

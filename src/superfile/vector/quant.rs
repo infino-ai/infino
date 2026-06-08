@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! 1-bit RaBitQ-style sign quantizer with SIMD estimator.
 //!
 //! Each rotated f32 vector becomes one bit per dimension: 1 if positive,
@@ -11,7 +14,7 @@
 //! becomes one `f32x8` register load; multiplication against the
 //! query lanes is one fused-multiply-add.
 //!
-//! ## AVX-512 fast path (plan 014 Phase 1)
+//! ## AVX-512 fast path
 //!
 //! On hosts with AVX-512F, [`BitQuantizer::estimate_dot_rotated_with_total`]
 //! takes a precomputed `q_total = Σ_d q_rot[d]` and computes the
@@ -32,14 +35,38 @@
 //! `q_total` so the per-candidate cost stays on the fast path.
 //!
 //! See `docs/architecture/superfile.md` (Vector index algorithm
-//! subsection) for the full RaBitQ rationale and recall trade-offs,
-//! and `014_simd_perf.md` in the `claude-plans` repo for the
-//! dispatch design.
+//! subsection) for the full RaBitQ rationale and recall trade-offs.
 
 use wide::{CmpGt, f32x8};
 
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::avx512_enabled;
+
+/// Number of sign bits packed into one code byte (1-bit RaBitQ packs
+/// one sign per dimension, eight per byte). One `f32x8` SIMD block
+/// also covers exactly this many dimensions, so the same constant
+/// drives both the bit-packing and the per-block SIMD stride.
+const BITS_PER_CODE_BYTE: usize = 8;
+
+/// Number of distinct byte values a code byte can take (`2^8`). The
+/// sign table holds one [`BITS_PER_CODE_BYTE`]-wide `±1` expansion
+/// per pattern, so it is `SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE`
+/// floats.
+const SIGN_TABLE_BYTE_PATTERNS: usize = 256;
+
+/// RaBitQ codebook sign for a set bit.
+const RABITQ_POSITIVE_SIGN: f32 = 1.0;
+/// RaBitQ codebook sign for a clear bit.
+const RABITQ_NEGATIVE_SIGN: f32 = -1.0;
+
+/// Coefficient on `pos_sum` in the RaBitQ dot identity
+/// `dot = RABITQ_DOT_POS_COEFF·pos_sum − q_total`, where
+/// `pos_sum = Σ_{bit_d = 1} q_rot[d]`.
+const RABITQ_DOT_POS_COEFF: f32 = 2.0;
+
+/// Lane count of an AVX-512 f32 register (512-bit / 32-bit), the
+/// dims-per-iteration of the masked-add estimator.
+const AVX512_F32_LANES: usize = 16;
 
 /// 1-bit quantizer + estimator for vectors of fixed dimension `dim`.
 /// Construct once per column at index-build time; reuse for both
@@ -47,18 +74,22 @@ use crate::superfile::vector::simd_dispatch::avx512_enabled;
 #[derive(Debug, Clone)]
 pub struct BitQuantizer {
     pub dim: usize,
-    sign_table: Box<[f32; 256 * 8]>,
+    sign_table: Box<[f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE]>,
 }
 
 impl BitQuantizer {
     /// Build the sign lookup table for vectors of dimension `dim`.
     /// Cost: `256 * 8 * 4 = 8 KB` heap, computed once.
     pub fn new(dim: usize) -> Self {
-        let mut table = Box::new([0.0f32; 256 * 8]);
-        for b in 0..256usize {
-            for bit in 0..8 {
+        let mut table = Box::new([0.0f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE]);
+        for b in 0..SIGN_TABLE_BYTE_PATTERNS {
+            for bit in 0..BITS_PER_CODE_BYTE {
                 let set = (b >> bit) & 1;
-                table[b * 8 + bit] = if set == 1 { 1.0 } else { -1.0 };
+                table[b * BITS_PER_CODE_BYTE + bit] = if set == 1 {
+                    RABITQ_POSITIVE_SIGN
+                } else {
+                    RABITQ_NEGATIVE_SIGN
+                };
             }
         }
         Self {
@@ -71,7 +102,7 @@ impl BitQuantizer {
     /// `ceil(dim / 8)`.
     #[inline]
     pub fn code_bytes(&self) -> usize {
-        self.dim.div_ceil(8)
+        self.dim.div_ceil(BITS_PER_CODE_BYTE)
     }
 
     /// Encode one already-rotated f32 vector into bits. `out` must be
@@ -90,9 +121,10 @@ impl BitQuantizer {
         debug_assert_eq!(rotated.len(), self.dim);
         debug_assert_eq!(out.len(), self.code_bytes());
         let zero = f32x8::ZERO;
-        let full_bytes = self.dim / 8;
+        let full_bytes = self.dim / BITS_PER_CODE_BYTE;
         for byte_idx in 0..full_bytes {
-            let lane: [f32; 8] = rotated[byte_idx * 8..byte_idx * 8 + 8]
+            let lane: [f32; BITS_PER_CODE_BYTE] = rotated
+                [byte_idx * BITS_PER_CODE_BYTE..byte_idx * BITS_PER_CODE_BYTE + BITS_PER_CODE_BYTE]
                 .try_into()
                 .expect("slice [byte_idx*8..byte_idx*8+8] has length 8");
             let v = f32x8::from(lane);
@@ -102,7 +134,7 @@ impl BitQuantizer {
             // bit-order the scalar reference loop produces.
             out[byte_idx] = v.simd_gt(zero).to_bitmask() as u8;
         }
-        let tail_start = full_bytes * 8;
+        let tail_start = full_bytes * BITS_PER_CODE_BYTE;
         if tail_start < self.dim {
             let mut byte: u8 = 0;
             for i in 0..(self.dim - tail_start) {
@@ -170,19 +202,21 @@ impl BitQuantizer {
 /// non-AVX-512 host.
 #[inline]
 fn estimate_dot_rotated_wide(
-    sign_table: &[f32; 256 * 8],
+    sign_table: &[f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE],
     q_rot: &[f32],
     code: &[u8],
     dim: usize,
 ) -> f32 {
-    let full_bytes = dim / 8;
+    let full_bytes = dim / BITS_PER_CODE_BYTE;
     let mut acc = f32x8::ZERO;
     for byte_idx in 0..full_bytes {
         let b = code[byte_idx] as usize;
-        let signs_slice: &[f32; 8] = (&sign_table[b * 8..b * 8 + 8])
+        let signs_slice: &[f32; BITS_PER_CODE_BYTE] = (&sign_table
+            [b * BITS_PER_CODE_BYTE..b * BITS_PER_CODE_BYTE + BITS_PER_CODE_BYTE])
             .try_into()
             .expect("slice [b*8..b*8+8] has length 8");
-        let q_slice: &[f32; 8] = (&q_rot[byte_idx * 8..byte_idx * 8 + 8])
+        let q_slice: &[f32; BITS_PER_CODE_BYTE] = (&q_rot
+            [byte_idx * BITS_PER_CODE_BYTE..byte_idx * BITS_PER_CODE_BYTE + BITS_PER_CODE_BYTE])
             .try_into()
             .expect("slice [byte_idx*8..byte_idx*8+8] has length 8");
         let signs = f32x8::from(*signs_slice);
@@ -192,12 +226,16 @@ fn estimate_dot_rotated_wide(
     let mut sum: f32 = acc.reduce_add();
 
     // Tail: dims [full_bytes*8 .. dim] handled scalar.
-    let tail_start = full_bytes * 8;
+    let tail_start = full_bytes * BITS_PER_CODE_BYTE;
     if tail_start < dim {
         let byte = code[full_bytes] as usize;
         for i in 0..(dim - tail_start) {
             let bit = (byte >> i) & 1;
-            let s = if bit == 1 { 1.0 } else { -1.0 };
+            let s = if bit == 1 {
+                RABITQ_POSITIVE_SIGN
+            } else {
+                RABITQ_NEGATIVE_SIGN
+            };
             sum += q_rot[tail_start + i] * s;
         }
     }
@@ -230,7 +268,7 @@ fn estimate_dot_rotated_wide(
 unsafe fn estimate_dot_rotated_avx512(q_rot: &[f32], code: &[u8], q_total: f32, dim: usize) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(q_rot.len(), dim);
-    debug_assert_eq!(code.len(), dim.div_ceil(8));
+    debug_assert_eq!(code.len(), dim.div_ceil(BITS_PER_CODE_BYTE));
 
     // SAFETY: each iteration reads 16 fp32s from `q_rot` (guarded
     // by `i + 16 <= dim`) and 2 bytes from `code` (guarded by
@@ -242,11 +280,14 @@ unsafe fn estimate_dot_rotated_avx512(q_rot: &[f32], code: &[u8], q_total: f32, 
         let mut i: usize = 0;
         // Process 16 dims per iteration. Each iteration consumes
         // exactly 2 code bytes (16 bits = 16 lanes).
-        while i + 16 <= dim {
-            let bits = u16::from_le_bytes([code[i / 8], code[i / 8 + 1]]);
+        while i + AVX512_F32_LANES <= dim {
+            let bits = u16::from_le_bytes([
+                code[i / BITS_PER_CODE_BYTE],
+                code[i / BITS_PER_CODE_BYTE + 1],
+            ]);
             let q = _mm512_loadu_ps(q_rot.as_ptr().add(i));
             pos_sum = _mm512_mask_add_ps(pos_sum, bits, pos_sum, q);
-            i += 16;
+            i += AVX512_F32_LANES;
         }
         let mut pos: f32 = _mm512_reduce_add_ps(pos_sum);
 
@@ -257,8 +298,8 @@ unsafe fn estimate_dot_rotated_avx512(q_rot: &[f32], code: &[u8], q_total: f32, 
         // common case of `dim % 8 == 0` and `dim % 16 == 8`
         // (e.g. dim = 24, 40, 56, ... — rare but cheap to be
         // correct about).
-        if i + 8 <= dim {
-            let bits = code[i / 8];
+        if i + BITS_PER_CODE_BYTE <= dim {
+            let bits = code[i / BITS_PER_CODE_BYTE];
             let q8 = _mm256_loadu_ps(q_rot.as_ptr().add(i));
             let masked = _mm256_maskz_mov_ps(bits, q8);
             // Horizontal sum of 8 fp32. AVX-512 lacks a 256-bit
@@ -267,17 +308,17 @@ unsafe fn estimate_dot_rotated_avx512(q_rot: &[f32], code: &[u8], q_total: f32, 
             // mask off the high lanes, reduce.
             let zext = _mm512_zextps256_ps512(masked);
             pos += _mm512_reduce_add_ps(zext);
-            i += 8;
+            i += BITS_PER_CODE_BYTE;
         }
         // Scalar tail for `dim % 8 != 0`.
         while i < dim {
-            let bit = ((code[i / 8] >> (i % 8)) & 1) != 0;
+            let bit = ((code[i / BITS_PER_CODE_BYTE] >> (i % BITS_PER_CODE_BYTE)) & 1) != 0;
             if bit {
                 pos += q_rot[i];
             }
             i += 1;
         }
-        2.0 * pos - q_total
+        RABITQ_DOT_POS_COEFF * pos - q_total
     }
 }
 
@@ -451,7 +492,7 @@ mod tests {
         let _q2 = q.clone();
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1) -----------------------------
+    // --- AVX-512 parity ------------------------------------------------
 
     /// Deterministic pseudo-random `f32` vector for parity tests.
     fn fake_vec(dim: usize, seed: u32) -> Vec<f32> {
@@ -531,7 +572,7 @@ mod tests {
         }
     }
 
-    // --- AVX-512 microbench (plan 014 — run by hand) -------------------
+    // --- AVX-512 microbench (run by hand) ------------------------------
     //
     // Direct head-to-head per-kernel timings. Run with:
     //

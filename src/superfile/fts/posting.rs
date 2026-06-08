@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! PFOR-delta block codec for posting lists.
 //!
 //! Postings are encoded in fixed-size **128-doc blocks** (matching

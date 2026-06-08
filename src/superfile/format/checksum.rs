@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! CRC32C wrapper.
 //!
 //! Every section of every blob ends with a 4-byte CRC32C of its body —

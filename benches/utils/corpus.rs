@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Shared bench fixtures: deterministic corpora, query batteries,
 //! brute-force ground truth, recall calibration, and thin builder
 //! wrappers around infino's public API.
@@ -137,14 +140,51 @@ pub fn parallel_writers() -> usize {
 /// fixed value per scale band so 1M and 10M runs share a stable
 /// `n_cent`.
 pub fn n_cent(n_docs: usize) -> usize {
-    if n_docs >= 5_000_000 {
-        4096
-    } else if n_docs >= 100_000 {
-        1024
+    if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
+        N_CENT_LARGE
+    } else if n_docs >= N_CENT_MEDIUM_DOC_THRESHOLD {
+        N_CENT_MEDIUM
     } else {
-        64
+        N_CENT_SMALL
     }
 }
+
+/// Doc-count threshold (≥) at/above which the large `n_cent` band is used.
+const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
+/// IVF centroid count for the large scale band.
+const N_CENT_LARGE: usize = 4096;
+/// Doc-count threshold (≥) for the medium `n_cent` band.
+const N_CENT_MEDIUM_DOC_THRESHOLD: usize = 100_000;
+/// IVF centroid count for the medium scale band.
+const N_CENT_MEDIUM: usize = 1024;
+/// IVF centroid count for small corpora (below the medium threshold).
+const N_CENT_SMALL: usize = 64;
+
+/// Average bytes-per-token estimate used to pre-size a doc's `String`
+/// (`(TOKENS_PER_DOC + 1) * AVG_BYTES_PER_TOKEN`).
+const AVG_BYTES_PER_TOKEN: usize = 8;
+/// `BufWriter` capacity (8 MiB) for streaming a corpus to a mmap file.
+const CORPUS_WRITER_BUF_CAPACITY: usize = 8 << 20;
+/// Gaussian scale of a planted cluster center (controls cluster signal
+/// strength relative to per-doc noise).
+const CENTER_GAUSSIAN_SCALE: f32 = 3.0;
+/// Per-dimension Gaussian noise added around a cluster center.
+const DOC_NOISE_SIGMA: f32 = 0.3;
+/// Gaussian scale for pure-noise smoke queries (no planted cluster).
+const QUERY_GAUSSIAN_SCALE: f32 = 3.0;
+/// Coprime stride used to spread generated queries across the corpus
+/// (and thus across clusters).
+const QUERY_BASE_DOC_STRIDE: usize = 7919;
+/// Recall returned for an empty ground-truth set (vacuously perfect).
+const EMPTY_TRUTH_RECALL: f32 = 1.0;
+/// Seconds-to-microseconds factor for p50 latency reporting.
+const SEC_TO_MICROS: f32 = 1e6;
+/// Random-rotation RNG seed for bench vector-index builders.
+const ROT_SEED: u64 = 7;
+/// Decimal128 precision for the injected `_id` column in bench fixtures.
+const ID_DECIMAL_PRECISION: u8 = 38;
+/// Decimal128 scale for the injected `_id` column (integer ids).
+const ID_DECIMAL_SCALE: i8 = 0;
 
 // ─── Text corpus ──────────────────────────────────────────────────────
 
@@ -196,7 +236,7 @@ pub fn generate_text_corpus(n_docs: usize, seed: u64) -> Vec<String> {
     let zipf = ZipfDistribution::new(VOCAB_SIZE);
     let mut out = Vec::with_capacity(n_docs);
     for doc_id in 0..n_docs {
-        let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * 8);
+        let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * AVG_BYTES_PER_TOKEN);
         doc.push_str(&format!("doc{doc_id:07}"));
         for _ in 0..TOKENS_PER_DOC {
             let idx = zipf.sample(&mut rng);
@@ -225,7 +265,7 @@ impl MmapTextCorpus {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
         let file = File::create(&path).expect("create text corpus file");
-        let mut writer = BufWriter::with_capacity(8 << 20, file);
+        let mut writer = BufWriter::with_capacity(CORPUS_WRITER_BUF_CAPACITY, file);
         let mut rng = StdRng::seed_from_u64(seed);
         let zipf = ZipfDistribution::new(VOCAB_SIZE);
         let mut offsets = Vec::with_capacity(n_docs + 1);
@@ -327,7 +367,7 @@ pub fn generate_vector_corpus(
             (0..DIM)
                 .map(|_| {
                     let s: f64 = dist.sample(&mut rng);
-                    (s as f32) * 3.0
+                    (s as f32) * CENTER_GAUSSIAN_SCALE
                 })
                 .collect()
         })
@@ -340,7 +380,7 @@ pub fn generate_vector_corpus(
             .iter()
             .map(|&c| {
                 let s: f64 = dist.sample(&mut rng);
-                c + (s as f32) * 0.3
+                c + (s as f32) * DOC_NOISE_SIGMA
             })
             .collect();
         if normalize_each {
@@ -375,7 +415,7 @@ impl MmapVectorCorpus {
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
         let file = File::create(&path).expect("create corpus file");
-        let mut writer = BufWriter::with_capacity(8 << 20, file);
+        let mut writer = BufWriter::with_capacity(CORPUS_WRITER_BUF_CAPACITY, file);
         let mut rng = StdRng::seed_from_u64(seed);
         let dist = StandardNormal;
         let centers: Vec<Vec<f32>> = (0..n_cent)
@@ -383,7 +423,7 @@ impl MmapVectorCorpus {
                 (0..DIM)
                     .map(|_| {
                         let s: f64 = dist.sample(&mut rng);
-                        (s as f32) * 3.0
+                        (s as f32) * CENTER_GAUSSIAN_SCALE
                     })
                     .collect()
             })
@@ -393,7 +433,7 @@ impl MmapVectorCorpus {
             let center = &centers[i % n_cent];
             for (j, slot) in row.iter_mut().enumerate() {
                 let s: f64 = dist.sample(&mut rng);
-                *slot = center[j] + (s as f32) * 0.3;
+                *slot = center[j] + (s as f32) * DOC_NOISE_SIGMA;
             }
             if normalize_each {
                 normalize(&mut row);
@@ -445,7 +485,7 @@ pub fn generate_queries(n_queries: usize, seed: u64) -> Vec<Vec<f32>> {
             let mut q: Vec<f32> = (0..DIM)
                 .map(|_| {
                     let s: f64 = dist.sample(&mut rng);
-                    (s as f32) * 3.0
+                    (s as f32) * QUERY_GAUSSIAN_SCALE
                 })
                 .collect();
             normalize(&mut q);
@@ -473,7 +513,7 @@ pub fn generate_realistic_queries(
     for i in 0..n_queries {
         // Coprime stride so consecutive queries don't all sit in the
         // first planted cluster.
-        let base_idx = (i * 7919) % n_docs;
+        let base_idx = (i * QUERY_BASE_DOC_STRIDE) % n_docs;
         let off = base_idx * DIM;
         let mut q: Vec<f32> = (0..DIM)
             .map(|d| {
@@ -556,7 +596,7 @@ pub fn ground_truth(
 /// Recall@k between a predicted top-k id list and ground truth.
 pub fn recall_at_k(predicted: &[Hit], truth: &[u32]) -> f32 {
     if truth.is_empty() {
-        return 1.0;
+        return EMPTY_TRUTH_RECALL;
     }
     let truth_set: std::collections::HashSet<u32> = truth.iter().copied().collect();
     let hits = predicted
@@ -616,7 +656,7 @@ pub fn p50_micros<F: FnMut()>(mut f: F, n_iter: usize) -> f32 {
     for _ in 0..n_iter {
         let t0 = Instant::now();
         f();
-        samples.push(t0.elapsed().as_secs_f32() * 1e6);
+        samples.push(t0.elapsed().as_secs_f32() * SEC_TO_MICROS);
     }
     samples.sort_unstable_by(|a, b| a.partial_cmp(b).expect("partial_cmp"));
     samples[samples.len() / 2]
@@ -775,7 +815,7 @@ pub fn build_vector_index(
         column: "v".into(),
         dim: DIM,
         n_cent,
-        rot_seed: 7,
+        rot_seed: ROT_SEED,
         metric,
         rerank_codec: RerankCodec::Sq8Residual,
     })
@@ -810,7 +850,11 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
     // `Decimal128(38, 0)` (the supertable's snowflake id type), not
     // `UInt64` — match it so this helper actually builds.
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -823,7 +867,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             column: "emb".into(),
             dim: DIM,
             n_cent,
-            rot_seed: 7,
+            rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
         }],
@@ -834,7 +878,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
     let ids: Decimal128Array = (0..n as u64)
         .map(|i| Some(i as i128))
         .collect::<Decimal128Array>()
-        .with_precision_and_scale(38, 0)
+        .with_precision_and_scale(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE)
         .expect("decimal128 with_precision_and_scale");
     let titles = LargeStringArray::from(docs.iter().map(String::as_str).collect::<Vec<_>>());
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
@@ -852,7 +896,11 @@ pub fn build_superfile_with_metric(
 ) -> Vec<u8> {
     let n = docs.len();
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -865,7 +913,7 @@ pub fn build_superfile_with_metric(
             column: "emb".into(),
             dim: DIM,
             n_cent,
-            rot_seed: 7,
+            rot_seed: ROT_SEED,
             metric,
             rerank_codec: RerankCodec::Sq8Residual,
         }],
@@ -876,7 +924,7 @@ pub fn build_superfile_with_metric(
     let ids: Decimal128Array = (0..n as u64)
         .map(|i| Some(i as i128))
         .collect::<Decimal128Array>()
-        .with_precision_and_scale(38, 0)
+        .with_precision_and_scale(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE)
         .expect("decimal128 with_precision_and_scale");
     let titles = LargeStringArray::from(docs.iter().map(String::as_str).collect::<Vec<_>>());
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])

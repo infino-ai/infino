@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `Supertable` + `SupertableReader` — the in-memory handle.
 //!
 //! `Supertable::create(opts).expect("create")` returns a clone-shared handle holding
@@ -147,9 +150,13 @@ impl SupertableInner {
     /// CPU lets those overlap, matching what an async caller gets.
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
         Arc::clone(self.query_runtime.get_or_init(|| {
+            // Fallback worker count when the host won't report its
+            // parallelism; small but multi-threaded so the cold-read
+            // fan-out still overlaps rather than serializing.
+            const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4);
+                .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
             Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(workers)
@@ -321,7 +328,7 @@ impl Supertable {
         let list = list_mod::decode(&list_bytes)
             .map_err(|e| OpenError::ManifestListParse(format!("{e}")))?;
 
-        // D15: verify the caller's options match the
+        // Verify the caller's options match the
         // manifest's stamped digest. The all-zero stored
         // hash bypasses validation (legacy + synthetic
         // fixtures).
@@ -378,7 +385,7 @@ impl Supertable {
                 parts_map.insert(*pid, Arc::new(cell));
             }
         } else {
-            // Lazy path (M15b): each part gets an empty
+            // Lazy path: each part gets an empty
             // `OnceCell`; first `Manifest::part(id).await`
             // triggers a single storage GET for that part.
             // `superfile_list.superfiles` stays empty — legacy
@@ -521,7 +528,7 @@ impl Supertable {
 
         // Eager-fetch the missing ones in parallel — but
         // only when the total post-refresh part count is at
-        // or under the eager-load threshold (M15b). Above
+        // or under the eager-load threshold. Above
         // it, leave missing parts as empty `OnceCell`s for
         // lazy-load on first access, matching the lazy-open
         // semantics. Inherited parts (Arc::clone'd above)

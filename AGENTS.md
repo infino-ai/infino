@@ -1,12 +1,16 @@
 # Infino — notes for AI agents
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — it covers prerequisites, build, the demo, test commands, the `make ci` gates, code conventions, and the fork → branch → PR workflow. This file only covers what isn't in there: the repository map, hard boundaries, and traps that aren't obvious from the code.
+Read `[CONTRIBUTING.md](CONTRIBUTING.md)` first — it covers prerequisites, build, the demo, test commands, the `make ci` gates, code conventions, and the fork → branch → PR workflow. This file only covers what isn't in there: the repository map, hard boundaries, and traps that aren't obvious from the code.
 
 ## Project overview
 
-Infino is a Rust embedded retrieval engine. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
+**Infino is a fast retrieval engine that keeps your data on cheap object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system**. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
 
-For design references, read `docs/architecture/superfile.md` and `docs/architecture/supertable.md` before touching format or manifest code.
+For the plain-language tour — what Infino is, the mental model, and how it compares to other systems — see `docs/architecture/overview.md`. For design references, read `docs/architecture/superfile.md` and `docs/architecture/supertable.md` before touching format or manifest code.
+
+## Golden rule
+
+**Correctness > complexity > performance — in that order, always.** A correct, simple solution beats a clever or faster one. Reach for performance only after the code is correct and no more complex than it needs to be. When a change forces a trade-off between these three, the higher priority wins; if you're optimizing at the cost of correctness or simplicity, stop and reconsider.
 
 ## Rule precedence
 
@@ -14,7 +18,7 @@ When guidance disagrees, resolve in this order (closest wins):
 
 1. **Explicit user / task instructions** in the current session trump everything below.
 2. **Subdirectory `AGENTS.md`** files (when present) take precedence over this file for the scope they cover.
-3. **This file** carries the traps and boundaries; [`CONTRIBUTING.md`](CONTRIBUTING.md) carries the general contributor workflow.
+3. **This file** carries the traps and boundaries; `[CONTRIBUTING.md](CONTRIBUTING.md)` carries the general contributor workflow.
 4. **Configuration files** (`Cargo.toml`, `Makefile`, `rust-toolchain.toml`, `.github/workflows/`) are the source of truth where they overlap with anything written here — see "Sources of truth" near the end.
 
 ## Running a focused test subset
@@ -30,14 +34,18 @@ cargo test --test superfile format::crc_corruption
 # Run unit tests in one module
 cargo test --lib superfile::vector::
 
-# Single bench
-cargo bench --bench fts
-cargo bench --bench vector
+# Single bench (target names are the [[bench]] `name` fields, not the dir)
+cargo bench --bench superfile_fts
+cargo bench --bench superfile_vector
+# Other bench targets: supertable_all, object-store, scale,
+# tombstone-overhead, supertable-update
 ```
 
 ## Code style beyond CONTRIBUTING.md
 
-- **No `unsafe` outside the documented surface.** The only `unsafe` sites in `src/` are one `bumpalo` lifetime extension in `FtsBuilder::add_doc` plus small pockets of byte parsing in `superfile/format/`. New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
+- **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
+- **No code duplication.** Read the surrounding modules *before* writing new code — there is usually an existing helper that already does what you need. Refactor shared logic into one helper rather than copy-pasting; duplicated logic drifts out of sync and is a correctness hazard.
+- **No `unsafe` outside the documented surface.** `unsafe` in `src/` is concentrated in three areas: SIMD intrinsic kernels (`superfile/vector/distance.rs`, `vector/sq8_simd.rs`, `vector/quant.rs`, `superfile/fts/tokenize.rs`), memory-mapped / page-advise I/O (`supertable/reader_cache/disk.rs`, `config/`), and the one `bumpalo` lifetime extension in `FtsBuilder::add_doc`. (Note: `superfile/format/` is *safe* byte parsing — no `unsafe` there.) New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
 - **Visibility hygiene.** Items used only inside the crate are `pub(crate)`, not `pub`. Test-only methods go behind `#[cfg(test)]`, not `#[allow(dead_code)]`. The public API surface is what's re-exported from `superfile/mod.rs` and `supertable/mod.rs` — see the "Public API surface" section below.
 - **State rationale inline in comments.** Don't cite external documents or trackers a reader may not have access to; explain the reasoning directly.
 - **Use plain language in source, comments, and commit messages.** Avoid cryptic internal shorthand or tracking tags; describe the change directly.
@@ -48,11 +56,38 @@ cargo bench --bench vector
 Three lanes beyond `cargo test`:
 
 - **Brute-force oracles** under `tests/` — BM25 top-K is compared against the textbook BM25 formula on planted corpora; full-nprobe IVF is compared against brute-force exact-nearest for L2Sq / Cosine / NegDot. These are the correctness gates; if you touch scoring math or vector distance kernels, the oracles run first.
-- **Recall measurement** — recall@10 must stay ≥ 0.90 at default options on the standard test corpus.
+- **Recall measurement — the acceptance bar is recall@10 ≥ 0.99, full stop.** No change is accepted that drops vector recall@10 below 0.99 on the standard vector bench (10M-row supertable, default config); demonstrate it and report the number in the PR body. The lower floors currently hard-coded in the bench suite (recall@10 ≥ 0.90 / 0.95 in `benches/scale/vector_recall.rs`, and the 0.80 / 0.85 correctness floors) are loose regression tripwires only — **passing them is necessary but not sufficient.** The bar is 0.99.
 - **`make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`), not just when you touch `unsafe` directly. Cost: miri ~100-1000× slower than native; asan 2-3×.
 - **Property tests** — `proptest` is in dev-deps; used for round-trip invariants like PFOR encode/decode.
 
 Test deletions require explicit justification.
+
+## Performance
+
+**The north star of this repo is speed-per-dollar.** Performance *and* cost are first-class acceptance criteria for every change. A PR that regresses query latency, ingest throughput, or the cost profile (bytes fetched, object-store request count, memory / cache footprint) is rejected unless it buys a correctness fix or a deliberate, documented trade-off. The golden rule still holds — correctness and simplicity come first — but among otherwise-acceptable changes, the one that preserves or improves speed-per-dollar wins.
+
+### What `benches/` covers
+
+Criterion benches, bundled by topic in `[[bench]]` stanzas (`harness = false`). See `benches/README.md` for the full invocation guide and the recorded result tables. The default suite (`cargo bench`) runs:
+
+- **`superfile_fts`** — BM25 ingest + search over one 1M-doc superfile.
+- **`superfile_vector`** — IVF + RaBitQ ingest + search over one 1M × 384 superfile.
+- **`supertable_all`** — a combined 10M-row supertable (FTS + vector) built once and reused for ingest + FTS-search + vector-search timing; the BM25 oracle / vector-recall floor run before timing.
+- **`tombstone-overhead`** — query overhead of the delete / tombstone path.
+- **`supertable-update`** — the update / delete pipeline.
+
+Diagnostic benches are opt-in behind `--features bench-diagnostics` and are *not* run by plain `cargo bench`:
+
+- **`object-store`** — S3-compatible cold lazy-fetch path (request count + bytes fetched) over a unified 1M superfile.
+- **`scale`** — release-profile recall gates (e.g. `vector_recall`).
+
+Recorded numbers live in `benches/README.md`; the structured source of truth is criterion's `target/criterion/<group>/<bench>/new/estimates.json`.
+
+### Running the suite
+
+- **Before any material change to the codebase, run the full bench suite** (`make bench`, i.e. `cargo bench`) and keep the baseline. After your change, re-run and diff against `main` — confirm there is no latency, throughput, *or* cost (bytes / requests / memory) regression. `make bench-quick` (`cargo bench -- --quick`) is for fast inner-loop iteration only, never for the final gate.
+- This is the same bar the PR checklist enforces: the comparison against `main`, and any intentional trade-off, goes in the PR body.
+- Treat a bench run as mandatory — not optional — when you touch scoring math, distance / SIMD kernels, the quantization codecs, the commit / manifest path, or the reader cache.
 
 ## Security considerations
 
@@ -73,18 +108,21 @@ Test deletions require explicit justification.
 
 - **For non-trivial changes, open an issue first.** Describe the problem and proposed approach so the design can be discussed before code review starts.
 - **Bug fixes need a regression test** that fails before the fix and passes after. New features need coverage proportional to the surface added.
+- **Run `benches/` against current `main` before submitting.** Every PR must run the benchmark suite against `main` and confirm there are no performance *or* cost regressions. Report the comparison in the PR body, and call out any intentional trade-off explicitly (see `benches/README.md` for where results live).
+- **Recall@10 ≥ 0.99 is non-negotiable.** A PR that drops vector recall@10 below 0.99 on the standard bench is rejected regardless of any other merit. The sanity checks baked into the bench code are not the acceptance bar — 0.99 is.
 - **Don't force-push to `main` or shared branches.** Force-push your own feature branches if you need to clean up history, but never to `main`.
 - **Don't merge with red CI** or with unanswered review comments.
 - **PR title and body follow the commit-message conventions above.** No AI-attribution trailers.
 
 ## Repository layout
 
-Three-layer architecture; everything in the crate lives in one of these layers:
+Three core layers (`storage`, `superfile`, `supertable`) plus a few
+small support modules:
 
 ```
 src/
 ├── lib.rs                 ← crate root (small; declares modules)
-├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3)
+├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure)
 ├── superfile/             ← single-file format (immutable segments)
 │   ├── builder.rs         ← write path
 │   ├── reader.rs          ← read path
@@ -92,16 +130,23 @@ src/
 │   ├── fts/               ← BM25 + posting lists + tokenizer
 │   ├── vector/            ← IVF + rotation + quantization codecs
 │   └── lazy_source.rs     ← byte-source abstraction for object-store reads
-└── supertable/            ← table layer (composes many superfiles)
-    ├── handle.rs          ← Supertable, ArcSwap<Manifest>, single-writer slot
-    ├── writer.rs          ← append + commit
-    ├── manifest/          ← segment list + Bloom + min/max + partition strategies
-    ├── query/             ← cross-segment fanout (fts, vector, sql)
-    ├── tombstones/        ← runtime tombstone cache (filtering deleted rows)
-    ├── wal/               ← write-ahead log for update/delete pipeline
-    └── reader_cache/      ← per-process segment cache
+├── supertable/            ← table layer (composes many superfiles)
+│   ├── handle.rs          ← Supertable, ArcSwap<Manifest>, single-writer slot
+│   ├── writer.rs          ← append + commit
+│   ├── manifest/          ← segment list + Bloom + min/max + partition strategies
+│   ├── query/             ← cross-segment fanout (fts, vector, sql)
+│   ├── tombstones/        ← runtime tombstone cache (filtering deleted rows)
+│   ├── wal/               ← write-ahead log for update/delete pipeline
+│   └── reader_cache/      ← per-process segment cache
+├── config/                ← runtime tuning knobs (StorageSettings + defaults)
+├── runtime_bridge.rs      ← sync ↔ async runtime glue
+└── test_helpers/          ← shared test fixtures (pub for integration tests)
 
-tests/                     ← integration tests, bundled by layer in [[test]] stanzas
+tests/                     ← integration tests; the two main binaries
+                             (superfile, supertable) are bundled by layer
+                             in [[test]] stanzas, plus a few standalone
+                             top-level test files (e.g. the crash /
+                             concurrent-process tests)
 benches/                   ← custom harness benches, bundled by topic in [[bench]] stanzas
 docs/architecture/         ← canonical design references
 examples/                  ← runnable examples (start with `cargo run --example demo`)
@@ -109,19 +154,21 @@ examples/                  ← runnable examples (start with `cargo run --exampl
 
 Rule of thumb for landing a change in the right place:
 
-| If the change is about… | Edit here |
-|---|---|
-| BM25 scoring | `src/superfile/fts/bm25.rs` |
-| Posting list iteration / skip table | `src/superfile/fts/posting.rs` |
-| Vector quantization codec | `src/superfile/vector/quant.rs` |
-| Vector distance kernel (incl. SIMD) | `src/superfile/vector/distance.rs` |
-| Tokenizer | `src/superfile/fts/tokenize.rs` |
-| Partition strategy | `src/supertable/manifest/partition.rs` |
+
+| If the change is about…                     | Edit here                                                             |
+| ------------------------------------------- | --------------------------------------------------------------------- |
+| BM25 scoring                                | `src/superfile/fts/bm25.rs`                                           |
+| Posting list iteration / skip table         | `src/superfile/fts/posting.rs`                                        |
+| Vector quantization codec                   | `src/superfile/vector/quant.rs`                                       |
+| Vector distance kernel (incl. SIMD)         | `src/superfile/vector/distance.rs`                                    |
+| Tokenizer                                   | `src/superfile/fts/tokenize.rs`                                       |
+| Partition strategy                          | `src/supertable/manifest/partition.rs`                                |
 | Skip pruning (Bloom / min-max / term range) | `src/supertable/manifest/{bloom,aggregates,term_range,list_prune}.rs` |
-| Commit / writer slot / handle | `src/supertable/writer.rs` + `src/supertable/handle.rs` |
-| Tombstones (delete-path / query-filter) | `src/supertable/{wal,tombstones}/` |
-| New storage backend | `src/storage/` |
-| File-format byte layout | `src/superfile/format/` |
+| Commit / writer slot / handle               | `src/supertable/writer.rs` + `src/supertable/handle.rs`               |
+| Tombstones (delete-path / query-filter)     | `src/supertable/{wal,tombstones}/`                                    |
+| New storage backend                         | `src/storage/`                                                        |
+| File-format byte layout                     | `src/superfile/format/`                                               |
+
 
 ## Boundaries
 
@@ -140,17 +187,16 @@ Rule of thumb for landing a change in the right place:
 - Adding a new direct dependency to `Cargo.toml`
 - Changes to the on-disk format (`superfile/format/`, footer layout, blob layout, CRC discipline)
 - Changes to commit / manifest semantics (`supertable/manifest/commit.rs`, `supertable/handle.rs`, `supertable/writer.rs`)
-- Anything touching `unsafe` outside the two documented sites
+- Anything adding `unsafe` outside the existing documented areas (SIMD kernels, mmap/page-advise, the `bumpalo` extension)
 
 ### 🚫 Never propose (measured and rejected; don't bring back without genuinely new evidence)
 
-- **GPU acceleration (build or search).** Rejected on cost-first grounds. The substring `gpu` / `cuda` / `cublas` should appear nowhere in `src/`, `benches/`, `tests/`, or `Cargo.toml`.
 - **Non-Parquet file format** (e.g. a proprietary columnar layout like Lance). Search-on-Parquet is the thesis; ecosystem reuse outweighs a 30-50% storage win.
 - **WAL-based ingest** (per-row durability before commit). Rejected as a different architectural model; commit-as-durability-boundary is deliberate. Note: a WAL *does* exist in `src/supertable/wal/` for the **updates/deletes** pipeline — that's orchestration state, not ingest durability. Don't conflate.
 - **HNSW graph inside each IVF partition.** Memory cost is 80 MB / 1M docs for an 18% warm-search win; not worth it given our high-`n_cent` + 1-bit-code shape.
 - **SPFresh-style in-place IVF rebalance.** Segments are immutable by design. Updates = delete + insert via tombstones.
 - **Multi-vector / ColBERT-style per-token vectors.** Niche; better as a sidecar pattern than a format primitive.
-- **`range_concurrent(&[Range])` storage API.** `LazyByteSource::range` is already `async fn`; callers parallelize with `try_join_all` or `FuturesUnordered`.
+- `**range_concurrent(&[Range])` storage API.** `LazyByteSource::range` is already `async fn`; callers parallelize with `try_join_all` or `FuturesUnordered`.
 
 If you have a strong reason to revisit any 🚫 item, open an issue with new evidence first; don't open a PR cold.
 
@@ -158,8 +204,8 @@ If you have a strong reason to revisit any 🚫 item, open an issue with new evi
 
 The stability boundary is what's re-exported from these two module roots:
 
-- **`src/superfile/mod.rs`** — `SuperfileReader`, `SuperfileBuilder`, `VectorSearchOptions`, `OpenOptions`, `LazyByteSource`, error types, and the free functions `bm25_search` / `vector_search`.
-- **`src/supertable/mod.rs`** — `Supertable`, `SupertableReader`, `SupertableWriter`, `SupertableOptions`, `Manifest`, `SuperfileEntry`, `SuperfileUri`, `FtsSummary`, `VectorSummary`, storage providers (`LocalFsStorageProvider`, `S3StorageProvider`, `StorageProvider` trait), and error types.
+- `**src/superfile/mod.rs`** — re-exports `SuperfileReader`, `OpenOptions`, `VectorSearchOptions`, `LazyByteSource` (+ `BytesLazyByteSource`, `LazyByteSourceError`), and the error types. `SuperfileBuilder` is reachable via `pub mod builder` (not re-exported at the root). BM25 and vector search are **methods on `SuperfileReader`** (`bm25_search` / `vector_search`), not free functions.
+- `**src/supertable/mod.rs**` — `Supertable`, `SupertableReader`, `SupertableWriter`, `SupertableOptions`, `Manifest`, `SuperfileEntry`, `SuperfileUri`, `FtsSummary`, `VectorSummary`, storage providers (`LocalFsStorageProvider`, `S3StorageProvider`, `AzureStorageProvider`, `StorageProvider` trait), and error types.
 
 Anything not re-exported through one of those module roots is internal. Default new items to `pub(crate)`; if you add a `pub` item, justify why it needs to be reachable outside the crate.
 
@@ -167,11 +213,11 @@ Anything not re-exported through one of those module roots is internal. Default 
 
 When this file and a config file disagree, the config file wins. Authoritative sources:
 
-- **`Cargo.toml`** — dependencies, lint config (`#![deny(clippy::unwrap_used)]` lives in `lib.rs`), test/bench target declarations (`[[test]]` / `[[bench]]` stanzas), feature flags.
-- **`Makefile`** — canonical command set (`check`, `test`, `ci`, `coverage`, `miri`, `asan`, `bench`, `bench-quick`, `clean`).
-- **`rust-toolchain.toml`** — the exact stable Rust version pinned for this crate.
-- **`.github/workflows/`** — what CI actually runs and fails on.
-- **`docs/architecture/superfile.md`** + **`docs/architecture/supertable.md`** — design-level invariants and the rationale behind major choices.
+- `**Cargo.toml**` — dependencies, lint config (`#![deny(clippy::unwrap_used)]` lives in `lib.rs`), test/bench target declarations (`[[test]]` / `[[bench]]` stanzas), feature flags.
+- `**Makefile**` — canonical command set (`check`, `test`, `ci`, `coverage`, `miri`, `asan`, `bench`, `bench-quick`, `clean`).
+- `**rust-toolchain.toml**` — the exact stable Rust version pinned for this crate.
+- `**.github/workflows/**` — what CI actually runs and fails on.
+- `**docs/architecture/superfile.md**` + `**docs/architecture/supertable.md**` — design-level invariants and the rationale behind major choices.
 
 If a section here drifts out of sync with one of those, the config wins and this file is wrong.
 
@@ -179,4 +225,4 @@ If a section here drifts out of sync with one of those, the config wins and this
 
 Ask. Filing an issue describing the problem before writing code is always welcome — a short written proposal to react to beats a surprise PR.
 
-For project overview and quick-start, see [`README.md`](README.md).
+For project overview and quick-start, see `[README.md](README.md)`.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end superfile pipeline: build a real superfile (Parquet
 //! body + FTS blob + vector blob), reopen it via `SuperfileReader`,
 //! exercise BM25 + vector search, and verify the bytes are still a
@@ -17,9 +20,41 @@ use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Vector-column dimension for the pipeline fixture.
+const EMB_DIM: usize = 16;
+/// IVF centroid count for the pipeline fixture.
+const N_CENT: usize = 4;
+/// Random-rotation seed for the pipeline fixture's vector index.
+const ROT_SEED: u64 = 17;
+/// Planted-corpus document count.
+const N_DOCS: usize = 6;
+/// Schema field count (doc_id + title + body + score).
+const SCHEMA_FIELD_COUNT: usize = 4;
+/// BM25 / vector top-k used by the pipeline searches.
+const SEARCH_K: usize = 5;
+/// nprobe (full cluster sweep == N_CENT) for the self-query.
+const NPROBE: usize = 4;
+/// Secondary one-hot axis weight planted in each doc vector.
+const SECONDARY_AXIS_WEIGHT: f32 = 0.1;
+/// Document count for the "naked" (no-index) superfile fixture.
+const NAKED_N_DOCS: u64 = 2;
+/// Number of `add_batch` chunks in the multi-batch continuity test.
+const MULTI_BATCH_CHUNK_COUNT: u64 = 3;
+/// Per-chunk external-id stride in the multi-batch test.
+const MULTI_BATCH_ID_STRIDE: u64 = 10;
+/// BM25 top-k with headroom for the multi-batch / fts-only queries.
+const MULTI_TERM_K: usize = 10;
+
 fn pipeline_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
         Field::new("body", DataType::LargeUtf8, false),
         Field::new("score", DataType::Float32, true),
@@ -43,9 +78,9 @@ fn build_pipeline_superfile() -> Bytes {
         ],
         vec![SfVectorConfig {
             column: "emb".into(),
-            dim: 16,
-            n_cent: 4,
-            rot_seed: 17,
+            dim: EMB_DIM,
+            n_cent: N_CENT,
+            rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
         }],
@@ -86,12 +121,12 @@ fn build_pipeline_superfile() -> Bytes {
     // Build 6 deterministic unit-norm vectors with planted structure:
     // docs 0/2/5 ("rust" titles) cluster on axis 0; doc 1 on axis 1;
     // doc 3 on axis 2; doc 4 on axis 3.
-    let mut flat = Vec::<f32>::with_capacity(6 * 16);
-    let axes: [usize; 6] = [0, 1, 0, 2, 3, 0];
+    let mut flat = Vec::<f32>::with_capacity(N_DOCS * EMB_DIM);
+    let axes: [usize; N_DOCS] = [0, 1, 0, 2, 3, 0];
     for &a in &axes {
-        let mut v = vec![0.0f32; 16];
+        let mut v = vec![0.0f32; EMB_DIM];
         v[a] = 1.0;
-        v[(a + 1) % 16] = 0.1;
+        v[(a + 1) % EMB_DIM] = SECONDARY_AXIS_WEIGHT;
         normalize(&mut v);
         flat.extend_from_slice(&v);
     }
@@ -103,11 +138,11 @@ fn build_pipeline_superfile() -> Bytes {
 fn end_to_end_open_reports_correct_metadata() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
-    assert_eq!(r.n_docs(), 6);
+    assert_eq!(r.n_docs(), N_DOCS as u64);
     assert_eq!(r.id_column(), "doc_id");
     assert_eq!(r.fts_columns(), vec!["title", "body"]);
     assert_eq!(r.vector_columns(), vec!["emb"]);
-    assert_eq!(r.schema().fields().len(), 4);
+    assert_eq!(r.schema().fields().len(), SCHEMA_FIELD_COUNT);
 }
 
 #[tokio::test]
@@ -115,7 +150,7 @@ async fn end_to_end_bm25_finds_rust_docs() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
     let hits = r
-        .bm25_search("title", "rust", 5, BoolMode::Or)
+        .bm25_search("title", "rust", SEARCH_K, BoolMode::Or)
         .await
         .expect("BM25 search");
     let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -133,7 +168,7 @@ async fn end_to_end_bm25_multi_combines_columns() {
         .bm25_search_multi(
             &[("title", 1.0), ("body", 1.0)],
             "rust embedded",
-            5,
+            SEARCH_K,
             BoolMode::Or,
         )
         .await
@@ -149,12 +184,12 @@ async fn end_to_end_vector_search_recovers_self() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
     // Reconstruct doc 4's vector (axis 3 + tiny axis 4).
-    let mut q = vec![0.0f32; 16];
+    let mut q = vec![0.0f32; EMB_DIM];
     q[3] = 1.0;
-    q[4] = 0.1;
+    q[4] = SECONDARY_AXIS_WEIGHT;
     normalize(&mut q);
     let hits = r
-        .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
+        .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(NPROBE))
         .await
         .expect("vector search");
     assert_eq!(hits[0].0, 4, "self-query should recover doc 4");
@@ -177,8 +212,8 @@ fn end_to_end_parquet_round_trip() {
         .next()
         .expect("at least one batch")
         .expect("decode batch");
-    assert_eq!(batch.num_rows(), 6);
-    assert_eq!(batch.num_columns(), 4);
+    assert_eq!(batch.num_rows(), N_DOCS);
+    assert_eq!(batch.num_columns(), SCHEMA_FIELD_COUNT);
     let ids = batch
         .column(0)
         .as_any()
@@ -214,7 +249,7 @@ fn end_to_end_no_indexes_still_valid_parquet() {
     let bytes = Bytes::from(b.finish().expect("finish builder"));
 
     let r = SuperfileReader::open(bytes).expect("open superfile");
-    assert_eq!(r.n_docs(), 2);
+    assert_eq!(r.n_docs(), NAKED_N_DOCS);
     assert!(r.fts().is_none());
     assert!(r.vec().is_none());
     assert!(r.fts_columns().is_empty());
@@ -227,7 +262,7 @@ fn end_to_end_no_indexes_still_valid_parquet() {
         .expect("try_new ParquetRecordBatchReaderBuilder");
     let mut reader = builder.build().expect("build parquet reader");
     let read = reader.next().expect("batch").expect("decode batch");
-    assert_eq!(read.num_rows(), 2);
+    assert_eq!(read.num_rows(), NAKED_N_DOCS as usize);
 }
 
 #[tokio::test]
@@ -265,7 +300,7 @@ async fn end_to_end_fts_only_blob_offsets_within_file() {
     assert!(r.fts().is_some());
     assert!(r.vec().is_none());
     let hits = r
-        .bm25_search("title", "alpha", 5, BoolMode::Or)
+        .bm25_search("title", "alpha", SEARCH_K, BoolMode::Or)
         .await
         .expect("BM25 search");
     assert_eq!(hits.len(), 1);
@@ -287,8 +322,11 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
         Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-    for chunk in 0..3u64 {
-        let ids = decimal128_ids(vec![chunk * 10, chunk * 10 + 1]);
+    for chunk in 0..MULTI_BATCH_CHUNK_COUNT {
+        let ids = decimal128_ids(vec![
+            chunk * MULTI_BATCH_ID_STRIDE,
+            chunk * MULTI_BATCH_ID_STRIDE + 1,
+        ]);
         let titles = LargeStringArray::from(vec![
             format!("t{} alpha", chunk),
             format!("t{} beta", chunk),
@@ -309,9 +347,9 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
     }
     let bytes = Bytes::from(b.finish().expect("finish builder"));
     let r = SuperfileReader::open(bytes).expect("open superfile");
-    assert_eq!(r.n_docs(), 6);
+    assert_eq!(r.n_docs(), N_DOCS as u64);
     let hits = r
-        .bm25_search("title", "alpha", 10, BoolMode::Or)
+        .bm25_search("title", "alpha", MULTI_TERM_K, BoolMode::Or)
         .await
         .expect("BM25 search");
     // alpha appears at local_doc_ids 0, 2, 4 (one per chunk).

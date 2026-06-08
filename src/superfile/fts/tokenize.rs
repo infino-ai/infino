@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Tokenization.
 //!
 //! Ships one tokenizer: [`AsciiLowerTokenizer`]. The [`Tokenizer`]
@@ -15,6 +18,18 @@
 //!   - Empty tokens are never emitted.
 
 use wide::u8x16;
+
+/// Smallest byte value that is non-ASCII (has the high bit set). The
+/// v1 ASCII-only rule drops any token containing a byte `>= this`.
+const NON_ASCII_BYTE_MIN: u8 = 0x80;
+
+/// Low-16-bit mask applied to a `u8x16` comparison bitmask, keeping
+/// one bit per SIMD lane (the scan processes 16 bytes per chunk).
+const LANE_BITMASK: u32 = 0xFFFF;
+
+/// Initial capacity of the lowercase-token scratch buffer. Sized to
+/// the common case of short tokens so the hot path rarely reallocs.
+const TOKEN_SCRATCH_INITIAL_CAP: usize = 32;
 
 /// Trait every tokenizer impl must satisfy.
 ///
@@ -181,7 +196,7 @@ fn simd_skip_non_token(bytes: &[u8], mut pos: usize) -> usize {
         let is_upper = chunk.simd_ge(u8x16::splat(b'A')) & chunk.simd_le(u8x16::splat(b'Z'));
         let is_lower = chunk.simd_ge(u8x16::splat(b'a')) & chunk.simd_le(u8x16::splat(b'z'));
         let is_token = is_digit | is_upper | is_lower;
-        let mask = is_token.to_bitmask() & 0xFFFF;
+        let mask = is_token.to_bitmask() & LANE_BITMASK;
         if mask == 0 {
             pos += LANES;
         } else {
@@ -228,13 +243,14 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
         // `cmp_eq_mask_i8_m128i`, so this works for high bytes
         // even though `simd_gt`/`simd_ge` against `0x80` would
         // need an XOR-flip trick to handle signed-i8 wrap.
-        let is_high = (chunk & u8x16::splat(0x80)).simd_eq(u8x16::splat(0x80));
+        let is_high =
+            (chunk & u8x16::splat(NON_ASCII_BYTE_MIN)).simd_eq(u8x16::splat(NON_ASCII_BYTE_MIN));
         let is_token = is_digit | is_upper | is_lower;
         let is_extend = is_token | is_high;
-        let extend_mask = is_extend.to_bitmask() & 0xFFFF;
-        let upper_mask = is_upper.to_bitmask() & 0xFFFF;
-        let high_mask = is_high.to_bitmask() & 0xFFFF;
-        let non_extend = !extend_mask & 0xFFFF;
+        let extend_mask = is_extend.to_bitmask() & LANE_BITMASK;
+        let upper_mask = is_upper.to_bitmask() & LANE_BITMASK;
+        let high_mask = is_high.to_bitmask() & LANE_BITMASK;
+        let non_extend = !extend_mask & LANE_BITMASK;
         if non_extend == 0 {
             had_upper |= upper_mask != 0;
             had_non_ascii |= high_mask != 0;
@@ -254,7 +270,7 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
         if is_token_byte(b) {
             had_upper |= b.is_ascii_uppercase();
             pos += 1;
-        } else if b >= 0x80 {
+        } else if b >= NON_ASCII_BYTE_MIN {
             had_non_ascii = true;
             pos += 1;
         } else {
@@ -299,7 +315,7 @@ impl<'a> AsciiLowerIter<'a> {
         Self {
             src,
             pos: 0,
-            buf: Vec::with_capacity(32),
+            buf: Vec::with_capacity(TOKEN_SCRATCH_INITIAL_CAP),
         }
     }
 }
@@ -325,7 +341,7 @@ impl Iterator for AsciiLowerIter<'_> {
                 if is_token_byte(b) {
                     self.buf.push(b.to_ascii_lowercase());
                     self.pos += 1;
-                } else if b >= 0x80 {
+                } else if b >= NON_ASCII_BYTE_MIN {
                     // Non-ASCII byte inside a contiguous "word-ish" run —
                     // mark this run as non-ASCII and consume until a true
                     // separator. Drop the whole token.

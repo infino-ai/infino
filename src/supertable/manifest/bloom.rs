@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FTS term-presence bloom filter.
 //!
 //! One bloom per (segment, FTS column). Built once at commit time
@@ -73,6 +76,11 @@ pub const K: usize = 4;
 pub const DEFAULT_N_BLOCKS: usize = 1024;
 /// Default bloom byte size (64 KiB).
 pub const DEFAULT_BLOOM_BYTES: usize = DEFAULT_N_BLOCKS * BLOCK_BYTES;
+
+/// 64-bit golden-ratio constant (⌊2^64 / φ⌋, odd). Used as a
+/// multiplicative-avalanche mixer to decorrelate the in-block bit
+/// positions from the block index, both derived from the same hash.
+const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Term-presence bloom filter for a single FTS column in a single
 /// segment.
@@ -281,7 +289,7 @@ fn block_and_mask(h: u64, n_blocks_mask: u32) -> (usize, [u64; BLOCK_WORDS]) {
     let block_idx = ((h >> 32) as u32 & n_blocks_mask) as usize;
     // Golden-ratio multiplicative avalanche to decorrelate
     // position seeds from the block index above.
-    let h2 = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let h2 = h.wrapping_mul(GOLDEN_RATIO_U64);
     let h_low = h2 as u32;
     let h_high = (h2 >> 32) as u32;
     let block_bits_mask = (BLOCK_BITS as u32) - 1; // 511

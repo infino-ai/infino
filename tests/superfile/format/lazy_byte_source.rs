@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! `SuperfileReader::open_lazy` + `StorageRangeSource`
 //! integration — drives the lazy-open path through a real
 //! `SuperfileBuilder` and a `LocalFsStorageProvider` (the
@@ -21,6 +24,25 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// BM25 top-k for the lazy-source FTS searches.
+const LAZY_TEST_BM25_K: usize = 10;
+/// Embedding dimension for the vector+FTS lazy-open fixture.
+const LAZY_VEC_DIM: usize = 16;
+/// Secondary one-hot axis weight + offset planted in each doc vector.
+const LAZY_SECONDARY_WEIGHT: f32 = 0.5;
+const LAZY_SECONDARY_AXIS_OFFSET: usize = 3;
+/// Random-rotation seed for the lazy-open vector index.
+const LAZY_VEC_ROT_SEED: u64 = 11;
+/// BM25 top-k for the cold-open GET-budget search.
+const LAZY_COLD_OPEN_BM25_K: usize = 5;
+/// Documented cold-open range-GET budget for this non-Sq8 fixture.
+const LAZY_COLD_OPEN_MAX_GETS: usize = 7;
+/// Out-of-bounds range length used to probe `OutOfBounds` rejection.
+const LAZY_OOB_REQUEST_LEN: u64 = 1024;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{LargeStringArray, RecordBatch};
@@ -45,7 +67,11 @@ use tempfile::TempDir;
 
 fn build_test_bytes() -> Bytes {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -193,7 +219,7 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
     // The reader serves real queries — sanity check via BM25.
     let fts = reader.fts().expect("fts");
     let hits = fts
-        .search("title", &["special"], 10, BoolMode::Or)
+        .search("title", &["special"], LAZY_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("bm25");
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
@@ -224,13 +250,13 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
     let eager_hits = eager
         .fts()
         .expect("fts")
-        .search("title", &["alpha"], 10, BoolMode::Or)
+        .search("title", &["alpha"], LAZY_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("eager bm25");
     let lazy_hits = lazy
         .fts()
         .expect("fts")
-        .search("title", &["alpha"], 10, BoolMode::Or)
+        .search("title", &["alpha"], LAZY_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("lazy bm25");
     let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| *d).collect();
@@ -239,13 +265,13 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
 }
 
 // ============================================================
-// Plan 013 M4 — end-to-end cold-open range budget at the
-// superfile layer. The new `SuperfileReader::open_lazy`
+// End-to-end cold-open range budget at the
+// superfile layer. The `SuperfileReader::open_lazy`
 // routes through:
 //   1. `format::footer::read_parquet_metadata_lazy` — 1-2 GETs
 //      for the Parquet footer.
 //   2. `VectorReader::open_lazy` over a `LazySubSource` for
-//      the vector subsection — 2-3 GETs (M2 budget).
+//      the vector subsection — 2-3 GETs.
 //   3. One range GET for the FTS subsection (until
 //      `FtsReader::open_lazy` exists; the FTS sub-blob is
 //      bounded — typically << vector subsection).
@@ -257,16 +283,20 @@ use infino::superfile::vector::distance::normalize;
 use infino::test_helpers::default_vector_config;
 
 /// Build a small superfile that exercises both the vector and
-/// FTS sub-blobs so the M4 cold-open test can observe both
+/// FTS sub-blobs so the cold-open test can observe both
 /// sub-source paths in `open_lazy`. 4 docs × 16-dim vectors
 /// keeps the segment small but representative of the actual
 /// layout produced by `SuperfileBuilder`.
 fn build_vec_plus_fts_bytes() -> Bytes {
-    let dim = 16usize;
+    let dim = LAZY_VEC_DIM;
     let n = 4usize;
 
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
 
@@ -284,7 +314,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
     for i in 0..n {
         let mut v = vec![0.0f32; dim];
         v[i % dim] = 1.0;
-        v[(i + 3) % dim] = 0.5;
+        v[(i + LAZY_SECONDARY_AXIS_OFFSET) % dim] = LAZY_SECONDARY_WEIGHT;
         normalize(&mut v);
         flat.extend_from_slice(&v);
     }
@@ -295,7 +325,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![default_vector_config("emb", 11)],
+        vec![default_vector_config("emb", LAZY_VEC_ROT_SEED)],
         Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("builder");
@@ -303,7 +333,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
     Bytes::from(b.finish().expect("finish"))
 }
 
-/// Plan 013 M4 — superfile-level cold-open via `open_lazy`
+/// Superfile-level cold-open via `open_lazy`
 /// stays within the documented byte budget. Asserts the upper
 /// bound (≤ 6 GETs) so adding small per-subsection follow-ups
 /// (e.g. a future codec-metadata range) doesn't silently inflate
@@ -359,7 +389,7 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
     // combined budget is 7. The production latency target is governed by
     // serial batches and bytes; this assertion pins that open does not
     // drift back to whole-subsection/speculative reads.
-    let documented_max = 7usize;
+    let documented_max = LAZY_COLD_OPEN_MAX_GETS;
     assert!(
         n_get <= documented_max,
         "cold-open issued {n_get} GETs against a {total}-byte segment; \
@@ -375,7 +405,7 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
     let fts_hits = reader
         .fts()
         .expect("fts")
-        .search("title", &["special"], 5, BoolMode::Or)
+        .search("title", &["special"], LAZY_COLD_OPEN_BM25_K, BoolMode::Or)
         .await
         .expect("bm25");
     assert!(
@@ -401,7 +431,10 @@ async fn storage_range_source_out_of_bounds_surfaces_typed_error() {
         .await
         .expect("source");
     let size = source.size();
-    let err = source.range(size, 1024).await.expect_err("must reject");
+    let err = source
+        .range(size, LAZY_OOB_REQUEST_LEN)
+        .await
+        .expect_err("must reject");
     assert!(
         matches!(err, LazyByteSourceError::OutOfBounds { .. }),
         "expected OutOfBounds, got {err:?}"

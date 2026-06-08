@@ -1,7 +1,10 @@
-//! 003 M15b — lazy part-load above the eager-load
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Lazy part-load above the eager-load
 //! threshold.
 //!
-//! Covers the load-bearing M15b invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **Tiny manifest stays eager.** A supertable with 1
 //!     part + default threshold (4) eager-fetches: the
@@ -11,7 +14,7 @@
 //!   - **Large manifest goes lazy.** With > threshold
 //!     parts, open populates empty `OnceCell`s only — no
 //!     part bytes fetched. `superfile_list.superfiles` stays
-//!     empty until M15c lands the hierarchical query path.
+//!     empty until the hierarchical query path lands.
 //!   - **First `Manifest::part(id).await` lazy-loads
 //!     one.** Single storage GET for that part; the
 //!     OnceCell stays populated for subsequent calls (no
@@ -26,6 +29,15 @@ use std::sync::Arc;
 use infino::supertable::Supertable;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+
+/// One superfile per manifest part (forces a multi-part list).
+const TARGET_SUPERFILES_PER_PARTITION: u64 = 1;
+/// Number of parts produced to exceed the default eager threshold.
+const LAZY_MODE_PART_COUNT: usize = 5;
+/// Which 0-based part to lazy-load in the targeted-load test.
+const LAZY_LOAD_TARGET_PART_INDEX: usize = 2;
+/// Eager-load threshold of 0 forces lazy mode on a 1-part manifest.
+const EAGER_LOAD_THRESHOLD_FORCE_LAZY: u32 = 0;
 use tempfile::TempDir;
 
 #[test]
@@ -71,7 +83,7 @@ fn one_part_eager_fetches_under_default_threshold() {
 fn many_parts_skip_eager_fetch() {
     // target_superfiles_per_partition=1 + 5 single-segment
     // commits → 5 list entries, all sharing the same
-    // partition_key (the M15a split path). With default
+    // partition_key (the partition-split path). With default
     // threshold=4, 5 > 4 → lazy.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -79,9 +91,9 @@ fn many_parts_skip_eager_fetch() {
 
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(1);
+        .with_target_superfiles_per_partition(TARGET_SUPERFILES_PER_PARTITION);
     let producer = Supertable::create(producer_opts).expect("create");
-    for _i in 0..5 {
+    for _i in 0..LAZY_MODE_PART_COUNT {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
@@ -99,8 +111,8 @@ fn many_parts_skip_eager_fetch() {
     assert_eq!(list.parts.len(), 5);
     assert!(
         m.superfile_list.superfiles.is_empty(),
-        "lazy mode leaves superfile_list.superfiles empty pending M15c; \
-         got {} superfiles",
+        "lazy mode leaves superfile_list.superfiles empty pending \
+         the hierarchical query path; got {} superfiles",
         m.superfile_list.superfiles.len()
     );
 
@@ -134,9 +146,9 @@ async fn manifest_part_lazy_loads_on_first_access() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(1);
+        .with_target_superfiles_per_partition(TARGET_SUPERFILES_PER_PARTITION);
     let producer = Supertable::create(producer_opts).expect("create");
-    for _i in 0..5 {
+    for _i in 0..LAZY_MODE_PART_COUNT {
         let mut w = producer.writer().expect("writer");
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
@@ -149,7 +161,7 @@ async fn manifest_part_lazy_loads_on_first_access() {
     let r = consumer.reader();
     let m = r.manifest();
     let list = m.list.as_ref().expect("list");
-    let target_pid = list.parts[2].part_id;
+    let target_pid = list.parts[LAZY_LOAD_TARGET_PART_INDEX].part_id;
 
     // Pre-condition: target part's OnceCell empty.
     let cell = m.parts.get(&target_pid).expect("part in cache");
@@ -221,7 +233,7 @@ fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
-            .with_eager_load_threshold(0),
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY),
     )
     .expect("open");
     let r = consumer.reader();

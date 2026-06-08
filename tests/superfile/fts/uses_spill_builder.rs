@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Production-wiring integration test for the spill-backed FTS
 //! builder. Confirms that `SuperfileBuilder::finish` flows through
 //! `FtsBuilder::finish` → `finish_to`, exercising the partition-
@@ -21,9 +24,24 @@ use infino::superfile::fts::reader::BoolMode;
 use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use std::sync::Arc;
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Corpus size, chosen to populate multiple hash-partition spill files.
+const SPILL_TEST_N_DOCS: usize = 1024;
+/// FTS spill threshold override (1 byte) forcing every column to spill
+/// on the first doc, exercising the production spill pipeline.
+const SPILL_FORCE_THRESHOLD_BYTES: usize = 1;
+/// BM25 top-k for the spill-path searches.
+const SPILL_TEST_BM25_K: usize = 10;
+
 fn schema_for_test() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
         Field::new("body", DataType::LargeUtf8, false),
     ]))
@@ -36,7 +54,7 @@ fn schema_for_test() -> Arc<Schema> {
 /// production `add_doc → spill → finish_to` path is exercised end to
 /// end rather than collapsing into a single-partition shortcut.
 fn build_test_superfile() -> Bytes {
-    let n_docs: usize = 1024;
+    let n_docs: usize = SPILL_TEST_N_DOCS;
 
     let schema = schema_for_test();
     let opts = BuilderOptions::new(
@@ -63,7 +81,7 @@ fn build_test_superfile() -> Bytes {
     // accepts (`> 0` is enforced in `FtsBuilder`) and is well below
     // the first `add_doc`'s accumulator size, so every column
     // transitions to Spilled on the first doc.
-    b.set_fts_spill_threshold_bytes(1);
+    b.set_fts_spill_threshold_bytes(SPILL_FORCE_THRESHOLD_BYTES);
 
     let ids = decimal128_ids(0..n_docs as u64);
     let titles_owned: Vec<String> = (0..n_docs)
@@ -110,12 +128,12 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     // BM25 on a term that appears in every doc must hit at least
     // `k` docs. With k=10 across 1024 docs the floor is exactly 10.
     let common_hits = r
-        .bm25_search("title", "common", 10, BoolMode::Or)
+        .bm25_search("title", "common", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search common");
     assert_eq!(
         common_hits.len(),
-        10,
+        SPILL_TEST_BM25_K,
         "common term must hit at least k=10 docs"
     );
 
@@ -124,7 +142,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     // the body column gets `payload0500` only at row 500; the title
     // column never has it.
     let payload_hits = r
-        .bm25_search("body", "payload0500", 10, BoolMode::Or)
+        .bm25_search("body", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search payload0500");
     assert_eq!(
@@ -137,7 +155,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     // and vice versa. Production path keeps per-column FST keys
     // (`<col>\x1F<term>`) so this scopes correctly.
     let payload_in_title = r
-        .bm25_search("title", "payload0500", 10, BoolMode::Or)
+        .bm25_search("title", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search payload0500 in title");
     assert!(
@@ -146,7 +164,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     );
 
     let term_in_body = r
-        .bm25_search("body", "term0500", 10, BoolMode::Or)
+        .bm25_search("body", "term0500", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search term0500 in body");
     assert!(

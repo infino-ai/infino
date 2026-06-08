@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Cross-supertable `_id` uniqueness under concurrent
 //! minting.
 //!
@@ -40,6 +43,11 @@ use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCache
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::utils::idgen::IdGenerator;
 use infino::test_helpers::{default_supertable_options, schema_id_title};
+
+/// Explicit shared worker id forcing the worst-case collision scenario.
+const SHARED_WORKER_ID: u64 = 0xABCD;
+/// Ids minted per generator in the shared-worker-id uniqueness test.
+const SAME_WORKER_MINT_COUNT: usize = 10_000;
 use tempfile::TempDir;
 
 const STRESS_N_WORKERS: usize = 16;
@@ -86,9 +94,9 @@ fn stress_two_generators_with_explicit_same_worker_id_still_unique_within_one_ru
     // *within-generator* ids strictly monotonic. The test
     // doesn't claim cross-generator uniqueness in this case
     // — that's the whole point of the random worker_id.
-    let g1 = IdGenerator::with_worker_id(0xABCD);
-    let g2 = IdGenerator::with_worker_id(0xABCD);
-    let n = 10_000;
+    let g1 = IdGenerator::with_worker_id(SHARED_WORKER_ID);
+    let g2 = IdGenerator::with_worker_id(SHARED_WORKER_ID);
+    let n = SAME_WORKER_MINT_COUNT;
     let ids1: Vec<i128> = (0..n).map(|_| g1.next_id()).collect();
     let ids2: Vec<i128> = (0..n).map(|_| g2.next_id()).collect();
 

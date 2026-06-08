@@ -64,23 +64,19 @@ unset.
   - `vector_search(column, query, k)` — vector kNN as a relation.
   - `bm25_search(column, query, k)` and
     `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
+  - `hybrid_search(text_col, q_text, vec_col, q_vec, k)` — BM25 and
+    vector results fused with reciprocal-rank fusion into one `score`.
 
-  **Hybrid search is a SQL expression, not a dedicated engine call.**
-  Because each retriever is a relation, a caller fuses them in SQL —
-  join or union the `vector_search` and `bm25_search` results and rank
-  by a fusion score. The "hybrid" comes from that SQL composition.
-  `hybrid_search(text_col, q_text, vec_col, q_vec, k)` is a *convenience*
-  table function that packages the most common case (reciprocal-rank
-  fusion of the two retrievers into one `score`, higher-is-better); it
-  is one canned SQL-level fusion, not a separate kernel, and there is no
-  Rust `hybrid_search` method (unlike `vector_search` / `bm25_search`,
-  which are both Rust methods and SQL functions).
+  Because each retriever is a relation, hybrid ranking is ordinary SQL
+  composition: join or union `vector_search` and `bm25_search` and rank
+  by a fusion score. `hybrid_search` packages the most common fusion as
+  a single function.
 
   Each function runs against the reader's pinned snapshot and yields
   the table's `_id`, the projected scalar columns, and a `score`. Vector
-  columns themselves are never scanned as SQL columns — they live in the
-  segment's embedded blob — so they are reached only through the
-  `vector_search` table function (or `hybrid_search`, which calls it).
+  columns are never scanned as SQL columns — they live in the segment's
+  embedded blob — so they are reached only through `vector_search` (or
+  `hybrid_search`, which calls it).
 
 The reader also answers cheap snapshot questions — segment count,
 document count, manifest identity — without touching segment bytes. A
@@ -285,14 +281,12 @@ executed over the columnar (Parquet) data and does not require the
 search indexes — but it can still reach them through the search
 table-valued functions (`vector_search`, `bm25_search`,
 `bm25_search_prefix`), which run the same per-segment index fan-out and
-hand their results back into the SQL plan as a relation. A hybrid
-ranking is then expressed *in SQL* — fuse the `vector_search` and
-`bm25_search` relations with a join/union and a fusion score. The
-`hybrid_search` table function is a convenience that packages the
-common case: it runs the BM25 and vector kernels concurrently and fuses
-the two rankings with reciprocal-rank fusion, so a row surfaced by both
-retrievers ranks above one surfaced by a single retriever. It is a
-SQL-level fusion, not a separate engine kernel.
+hand their results back into the SQL plan as a relation. Hybrid ranking
+is expressed in SQL: join or union the `vector_search` and `bm25_search`
+relations and rank by a fusion score. `hybrid_search` packages the
+common case, running the BM25 and vector kernels concurrently and fusing
+their rankings with reciprocal-rank fusion so a row found by both
+retrievers ranks above one found by a single retriever.
 
 ## Concurrency
 

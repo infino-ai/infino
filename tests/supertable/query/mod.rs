@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 pub mod brute_force_oracle;
 pub mod fanout_concurrency;
 pub mod hierarchical;

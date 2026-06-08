@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Top-level superfile reader.
 //!
 //! `SuperfileReader::open(bytes)` parses the Parquet footer's `inf.*`
@@ -34,6 +37,12 @@ use parquet::arrow::arrow_reader::{
 use parquet::file::metadata::PageIndexPolicy;
 use std::sync::Arc;
 
+/// Speculative Parquet-footer tail length for a lazy open. 64 KiB
+/// covers a typical superfile footer (its `inf.*` KVs plus a single
+/// row group's column metadata — a few KiB to a few tens of KiB) in
+/// one range GET, so the cold open usually costs a single round-trip.
+const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+
 /// Per-open knobs for [`SuperfileReader::open_with`]. Defaults to
 /// safe behavior (CRC verification on); flip `verify_crc` to `false`
 /// to skip the ~132 ms scan at 1M × 384 when storage is trusted.
@@ -60,7 +69,7 @@ impl Default for OpenOptions {
 
 pub struct SuperfileReader {
     /// Full Parquet bytes, `Some` only for the eager [`open`]
-    /// path. The lazy [`open_lazy`] path (013 M4) drops the
+    /// path. The lazy [`open_lazy`] path drops the
     /// whole-segment hold — pass-through SQL / external-Parquet
     /// callers (`parquet_bytes`) see `None` and must take a
     /// different path. Vector + FTS queries work on either,
@@ -100,7 +109,7 @@ impl SuperfileReader {
         Self::open_with(bytes, OpenOptions::default())
     }
 
-    /// Open a superfile via a shared [`LazyByteSource`] (013 M4).
+    /// Open a superfile via a shared [`LazyByteSource`].
     ///
     /// Cold-open range budget:
     ///
@@ -148,16 +157,10 @@ impl SuperfileReader {
         use parquet::arrow::parquet_to_arrow_schema;
 
         // 1. Fetch the Parquet footer (≤ 2 GETs).
-        let metadata = footer::read_parquet_metadata_lazy(
-            source.as_ref(),
-            // 64 KiB is plenty for typical superfile footers
-            // (the footer carries `inf.*` KVs + a single row
-            // group's worth of column metadata; a few KiB to
-            // a few tens of KiB).
-            64 * 1024,
-        )
-        .await
-        .map_err(ReadError::Footer)?;
+        let metadata =
+            footer::read_parquet_metadata_lazy(source.as_ref(), DEFAULT_TAIL_SPECULATIVE_BYTES)
+                .await
+                .map_err(ReadError::Footer)?;
         let kv_map = footer::extract_kv_map(&metadata).map_err(ReadError::Footer)?;
 
         // 2. Validate required KVs + format version (same
@@ -427,7 +430,7 @@ impl SuperfileReader {
     /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
     ///
     /// Returns `None` for readers opened via [`open_lazy`] — the
-    /// lazy path (013 M4) does not materialize the full segment,
+    /// lazy path does not materialize the full segment,
     /// so external-Parquet pass-throughs need either the eager
     /// [`open`] path or an explicit `LazyByteSource::range(0, size)`
     /// against the source.
@@ -846,7 +849,7 @@ impl SuperfileReader {
     /// search surfaces are `async` so the supertable fan-out can drive
     /// every segment concurrently on the shared query runtime. The
     /// public `Supertable` API remains strictly sync; it wraps these
-    /// kernels in `block_on_query` (plan 002 Q9). Per-range byte access
+    /// kernels in `block_on_query`. Per-range byte access
     /// routes through
     /// [`crate::superfile::lazy_source::Source::range_async`] /
     /// `get_ranges_parallel_async`, which resolve zero-copy on the sync

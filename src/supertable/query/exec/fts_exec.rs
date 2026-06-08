@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! BM25 full-text search as DataFusion table-valued functions.
 //!
 //! `bm25_search(column, query, k [, mode])` and
@@ -51,6 +54,14 @@ pub(crate) const BM25_SEARCH_UDTF: &str = "bm25_search";
 /// SQL name for the prefix BM25 TVF.
 pub(crate) const BM25_PREFIX_UDTF: &str = "bm25_search_prefix";
 
+/// Minimum argument count for `bm25_search(column, query, k)`.
+const BM25_SEARCH_ARG_COUNT_MIN: usize = 3;
+/// Maximum argument count: the optional `mode` makes it
+/// `bm25_search(column, query, k, mode)`.
+const BM25_SEARCH_ARG_COUNT_MAX: usize = 4;
+/// Argument count for `bm25_search_prefix(column, prefix, k)`.
+const BM25_PREFIX_SEARCH_ARG_COUNT: usize = 3;
+
 /// Register `bm25_search` + `bm25_search_prefix` on `ctx`, bound to
 /// the query's pinned `reader` + scalar `schema`. Called from
 /// [`Supertable::query_sql`](crate::supertable::handle::Supertable::query_sql).
@@ -103,9 +114,10 @@ impl Bm25SearchFunc {
 
 impl TableFunctionImpl for Bm25SearchFunc {
     fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        if args.len() != 3 && args.len() != 4 {
+        if args.len() != BM25_SEARCH_ARG_COUNT_MIN && args.len() != BM25_SEARCH_ARG_COUNT_MAX {
             return Err(DataFusionError::Plan(format!(
-                "bm25_search expects 3 or 4 arguments (column, query, k[, mode]), got {}",
+                "bm25_search expects {BM25_SEARCH_ARG_COUNT_MIN} or {BM25_SEARCH_ARG_COUNT_MAX} \
+                 arguments (column, query, k[, mode]), got {}",
                 args.len()
             )));
         }
@@ -148,9 +160,10 @@ impl Bm25PrefixFunc {
 
 impl TableFunctionImpl for Bm25PrefixFunc {
     fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        if args.len() != 3 {
+        if args.len() != BM25_PREFIX_SEARCH_ARG_COUNT {
             return Err(DataFusionError::Plan(format!(
-                "bm25_search_prefix expects 3 arguments (column, prefix, k), got {}",
+                "bm25_search_prefix expects {BM25_PREFIX_SEARCH_ARG_COUNT} arguments \
+                 (column, prefix, k), got {}",
                 args.len()
             )));
         }

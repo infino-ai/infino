@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Query-time machinery for the supertable.
 //!
 //! Each submodule owns one query shape:

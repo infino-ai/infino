@@ -1,6 +1,9 @@
-//! Plan 013 M4 — `ColdFetchMode::LazyForegroundWithBackgroundFill`
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! `ColdFetchMode::LazyForegroundWithBackgroundFill`
 //! integration. The cold path returns a lazy reader
-//! immediately (paying only the M1-M3 cold-open byte budget
+//! immediately (paying only the cold-open byte budget
 //! against object storage), a background task waits for the
 //! foreground lazy reader to release, downloads the full
 //! segment to NVMe + mmaps it, and **any subsequent
@@ -117,9 +120,33 @@ impl StorageProvider for CountingProxy {
 // Fixtures.
 // ============================================================
 
+/// Decimal128 precision / scale for the `doc_id` column.
+const ID_DECIMAL_PRECISION: u8 = 38;
+const ID_DECIMAL_SCALE: i8 = 0;
+/// Disk-cache budget (1 GiB) for the lazy-foreground tests.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch chunk size for the lazy-foreground path.
+const LAZY_COLD_FETCH_CHUNK_BYTES: u64 = 256;
+/// BM25 top-k for the lazy-foreground searches.
+const FTS_TOP_K: usize = 10;
+/// Smaller top-k for cold/warm path searches.
+const FTS_TOP_K_SMALL: usize = 5;
+/// Hold a reader before dropping to order the background fill.
+const FOREGROUND_HOLD_SLEEP_MS: u64 = 100;
+/// Mmap-promotion wait timeout.
+const MMAP_PROMOTION_TIMEOUT_SECS: u64 = 5;
+/// Concurrent lazy readers for the coalescing test.
+const LAZY_CONCURRENT_READER_COUNT: usize = 16;
+
 fn build_fts_only_bytes() -> Bytes {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -153,10 +180,10 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
     let dir = TempDir::new().expect("tempdir");
     let cfg = DiskCacheConfig {
         cache_root: dir.path().to_path_buf(),
-        disk_budget_bytes: 1 << 30,
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 256,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: LAZY_COLD_FETCH_CHUNK_BYTES,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -182,7 +209,7 @@ async fn wait_for_mmap_promotion(
 // Tests.
 // ============================================================
 
-/// Plan 013 M4 — cold reader from
+/// cold reader from
 /// `LazyForegroundWithBackgroundFill` is functional
 /// immediately. The reader is FTS-queryable without waiting
 /// for the background segment fill; the warm-promotion
@@ -205,7 +232,7 @@ async fn lazy_foreground_cold_reader_is_queryable_immediately() {
     // the FTS subsection on demand.
     let fts = reader.fts().expect("fts");
     let hits = fts
-        .search("title", &["special"], 10, BoolMode::Or)
+        .search("title", &["special"], FTS_TOP_K, BoolMode::Or)
         .await
         .expect("bm25");
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
@@ -229,7 +256,7 @@ async fn lazy_background_fill_waits_for_foreground_reader_drop() {
 
     let reader = cache.reader(&uri).await.expect("cold reader");
     let calls_after_open = proxy.calls();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(FOREGROUND_HOLD_SLEEP_MS)).await;
     assert_eq!(
         proxy.calls(),
         calls_after_open,
@@ -237,14 +264,19 @@ async fn lazy_background_fill_waits_for_foreground_reader_drop() {
     );
 
     drop(reader);
-    wait_for_mmap_promotion(&cache, uri, Duration::from_secs(5)).await;
+    wait_for_mmap_promotion(
+        &cache,
+        uri,
+        Duration::from_secs(MMAP_PROMOTION_TIMEOUT_SECS),
+    )
+    .await;
     assert!(
         proxy.calls() > calls_after_open,
         "background fill should begin after foreground reader drops"
     );
 }
 
-/// Plan 013 M4 — **the** invariant: after the background
+/// **the** invariant: after the background
 /// promotion completes, a second `reader(uri)` call returns
 /// the mmap-backed reader and the corresponding search
 /// resolves entirely from mmap — the counting storage proxy
@@ -268,7 +300,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
         let r_cold = cache.reader(&uri).await.expect("cold reader");
         let fts = r_cold.fts().expect("fts");
         let _ = fts
-            .search("title", &["alpha"], 5, BoolMode::Or)
+            .search("title", &["alpha"], FTS_TOP_K_SMALL, BoolMode::Or)
             .await
             .expect("cold bm25");
     }
@@ -282,7 +314,12 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
     //    fill is spawned via `tokio::spawn` from the cold
     //    foreground; once it finishes, the cache entry has
     //    been atomically swapped to the mmap-backed reader.
-    wait_for_mmap_promotion(&cache, uri, Duration::from_secs(5)).await;
+    wait_for_mmap_promotion(
+        &cache,
+        uri,
+        Duration::from_secs(MMAP_PROMOTION_TIMEOUT_SECS),
+    )
+    .await;
 
     // 3. Warm reader + search — must hit the promoted
     //    mmap-backed entry and issue zero additional
@@ -292,7 +329,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
         let r_warm = cache.reader(&uri).await.expect("warm reader");
         let fts = r_warm.fts().expect("fts");
         let hits = fts
-            .search("title", &["special"], 5, BoolMode::Or)
+            .search("title", &["special"], FTS_TOP_K_SMALL, BoolMode::Or)
             .await
             .expect("warm bm25");
         assert_eq!(hits.len(), 2, "warm search must return correct results");
@@ -311,7 +348,7 @@ async fn lazy_foreground_warm_search_after_promotion_issues_zero_s3_gets() {
     );
 }
 
-/// Plan 013 M4 — concurrent cold readers on the same URI
+/// concurrent cold readers on the same URI
 /// coalesce through the `OnceCell` coordinator. All callers
 /// observe the same lazy reader; the background promotion
 /// runs exactly once.
@@ -329,8 +366,8 @@ async fn lazy_foreground_concurrent_cold_readers_coalesce_to_one_promotion() {
 
     // 16 concurrent cold readers on the same URI — all should
     // coalesce to a single background promotion.
-    let mut joins = Vec::with_capacity(16);
-    for _ in 0..16 {
+    let mut joins = Vec::with_capacity(LAZY_CONCURRENT_READER_COUNT);
+    for _ in 0..LAZY_CONCURRENT_READER_COUNT {
         let cache = Arc::clone(&cache);
         joins.push(tokio::spawn(async move { cache.reader(&uri).await }));
     }
@@ -347,7 +384,7 @@ async fn lazy_foreground_concurrent_cold_readers_coalesce_to_one_promotion() {
     );
 }
 
-/// Plan 013 M4 — the cold-path bandwidth profile is **2× per
+/// the cold-path bandwidth profile is **2× per
 /// cold miss** (per-query ranges + background full-segment
 /// download). This test documents that property by asserting
 /// the total `get_range` bytes are at least `segment_size`
@@ -369,7 +406,12 @@ async fn lazy_foreground_total_bandwidth_includes_background_fill() {
     let (_d, cache) = fresh_cache(Arc::clone(&proxy) as Arc<dyn StorageProvider>);
 
     let _r = cache.reader(&uri).await.expect("cold");
-    wait_for_mmap_promotion(&cache, uri, Duration::from_secs(5)).await;
+    wait_for_mmap_promotion(
+        &cache,
+        uri,
+        Duration::from_secs(MMAP_PROMOTION_TIMEOUT_SECS),
+    )
+    .await;
 
     let total_bytes = proxy.bytes();
     assert!(

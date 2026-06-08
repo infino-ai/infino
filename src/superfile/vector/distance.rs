@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Distance kernels — portable f32x8 SIMD via `wide`.
 //!
 //! Three metrics: cosine (`1 − dot` after unit-norm), squared L2,
@@ -22,6 +25,28 @@ use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 /// byte/CPU trade-off on the 1M × 384 cosine calibration sweep.
 pub(crate) const SQ8_RESIDUAL_DIVISOR: f32 = 16.0;
 
+/// Lane count of the portable `wide::f32x8` SIMD register (256-bit /
+/// 32-bit). The universal kernel processes this many f32s per
+/// iteration; tails handle `len % F32X8_LANES`.
+const F32X8_LANES: usize = 8;
+
+/// Lane count of an AVX-512 f32 vector register (512-bit / 32-bit).
+/// The AVX-512 kernels process this many f32s per FMA iteration.
+const AVX512_F32_LANES: usize = 16;
+
+/// Byte width of one little-endian `f32`. A byte-backed vector of
+/// dimension `d` occupies `d * F32_BYTES` bytes.
+const F32_BYTES: usize = 4;
+
+/// Cosine distance is `COSINE_DISTANCE_BASE - dot` on unit vectors,
+/// so smaller means closer without re-normalizing at query time.
+const COSINE_DISTANCE_BASE: f32 = 1.0;
+
+/// Cross-term coefficient in the squared-L2 identity
+/// `‖q − x‖² = ‖q‖² − L2_CROSS_TERM_COEFF·(q·x) + ‖x‖²`, used by the
+/// Sq8 kernels that reconstruct L2 from a fused dot product.
+const L2_CROSS_TERM_COEFF: f32 = 2.0;
+
 /// Distance metric for a vector column. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +65,7 @@ pub enum Metric {
 pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     match metric {
-        Metric::Cosine => 1.0 - dot(a, b),
+        Metric::Cosine => COSINE_DISTANCE_BASE - dot(a, b),
         Metric::L2Sq => l2_sq(a, b),
         Metric::NegDot => -dot(a, b),
     }
@@ -64,7 +89,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Squared Euclidean distance. See [`dot`] for dispatch shape.
 #[inline]
-pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if avx512_enabled() {
@@ -80,18 +105,18 @@ pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 /// without AVX-512.
 #[inline]
 fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
-    let chunks_a = a.chunks_exact(8);
-    let chunks_b = b.chunks_exact(8);
+    let chunks_a = a.chunks_exact(F32X8_LANES);
+    let chunks_b = b.chunks_exact(F32X8_LANES);
     let tail_a = chunks_a.remainder();
     let tail_b = chunks_b.remainder();
 
     let mut acc = f32x8::ZERO;
     for (ca, cb) in chunks_a.zip(chunks_b) {
         let va = f32x8::from(
-            <[f32; 8]>::try_from(ca).expect("chunks_exact(8) yields slices of length 8"),
+            <[f32; F32X8_LANES]>::try_from(ca).expect("chunks_exact(8) yields slices of length 8"),
         );
         let vb = f32x8::from(
-            <[f32; 8]>::try_from(cb).expect("chunks_exact(8) yields slices of length 8"),
+            <[f32; F32X8_LANES]>::try_from(cb).expect("chunks_exact(8) yields slices of length 8"),
         );
         acc += va * vb;
     }
@@ -105,18 +130,18 @@ fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
 /// Portable `wide::f32x8` (256-bit) squared-L2. See [`dot_wide`].
 #[inline]
 fn l2_sq_wide(a: &[f32], b: &[f32]) -> f32 {
-    let chunks_a = a.chunks_exact(8);
-    let chunks_b = b.chunks_exact(8);
+    let chunks_a = a.chunks_exact(F32X8_LANES);
+    let chunks_b = b.chunks_exact(F32X8_LANES);
     let tail_a = chunks_a.remainder();
     let tail_b = chunks_b.remainder();
 
     let mut acc = f32x8::ZERO;
     for (ca, cb) in chunks_a.zip(chunks_b) {
         let va = f32x8::from(
-            <[f32; 8]>::try_from(ca).expect("chunks_exact(8) yields slices of length 8"),
+            <[f32; F32X8_LANES]>::try_from(ca).expect("chunks_exact(8) yields slices of length 8"),
         );
         let vb = f32x8::from(
-            <[f32; 8]>::try_from(cb).expect("chunks_exact(8) yields slices of length 8"),
+            <[f32; F32X8_LANES]>::try_from(cb).expect("chunks_exact(8) yields slices of length 8"),
         );
         let d = va - vb;
         acc += d * d;
@@ -159,11 +184,11 @@ unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         let mut acc = _mm512_setzero_ps();
         let mut i = 0;
-        while i + 16 <= n {
+        while i + AVX512_F32_LANES <= n {
             let va = _mm512_loadu_ps(a.as_ptr().add(i));
             let vb = _mm512_loadu_ps(b.as_ptr().add(i));
             acc = _mm512_fmadd_ps(va, vb, acc);
-            i += 16;
+            i += AVX512_F32_LANES;
         }
         let mut sum = _mm512_reduce_add_ps(acc);
         while i < n {
@@ -189,12 +214,12 @@ unsafe fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         let mut acc = _mm512_setzero_ps();
         let mut i = 0;
-        while i + 16 <= n {
+        while i + AVX512_F32_LANES <= n {
             let va = _mm512_loadu_ps(a.as_ptr().add(i));
             let vb = _mm512_loadu_ps(b.as_ptr().add(i));
             let d = _mm512_sub_ps(va, vb);
             acc = _mm512_fmadd_ps(d, d, acc);
-            i += 16;
+            i += AVX512_F32_LANES;
         }
         let mut sum = _mm512_reduce_add_ps(acc);
         while i < n {
@@ -221,9 +246,9 @@ unsafe fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
 /// against arbitrary `Bytes` alignment.
 #[inline]
 pub fn distance_bytes(metric: Metric, query: &[f32], bytes: &[u8]) -> f32 {
-    debug_assert_eq!(query.len() * 4, bytes.len());
+    debug_assert_eq!(query.len() * F32_BYTES, bytes.len());
     match metric {
-        Metric::Cosine => 1.0 - dot_bytes(query, bytes),
+        Metric::Cosine => COSINE_DISTANCE_BASE - dot_bytes(query, bytes),
         Metric::L2Sq => l2_sq_bytes(query, bytes),
         Metric::NegDot => -dot_bytes(query, bytes),
     }
@@ -249,24 +274,24 @@ pub fn l2_sq_bytes(query: &[f32], bytes: &[u8]) -> f32 {
 fn dot_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
     let mut acc = f32x8::ZERO;
     let mut i = 0;
-    while i + 8 <= query.len() {
-        let qc: [f32; 8] = query[i..i + 8]
+    while i + F32X8_LANES <= query.len() {
+        let qc: [f32; F32X8_LANES] = query[i..i + F32X8_LANES]
             .try_into()
             .expect("slice [i..i+8] has length 8");
-        let mut bc = [0f32; 8];
+        let mut bc = [0f32; F32X8_LANES];
         for (j, slot) in bc.iter_mut().enumerate() {
-            let off = (i + j) * 4;
+            let off = (i + j) * F32_BYTES;
             *slot =
                 f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         }
         let qv = f32x8::from(qc);
         let bv = f32x8::from(bc);
         acc += qv * bv;
-        i += 8;
+        i += F32X8_LANES;
     }
     let mut sum = acc.reduce_add();
     while i < query.len() {
-        let off = i * 4;
+        let off = i * F32_BYTES;
         let b = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         sum += query[i] * b;
         i += 1;
@@ -278,13 +303,13 @@ fn dot_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
 fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
     let mut acc = f32x8::ZERO;
     let mut i = 0;
-    while i + 8 <= query.len() {
-        let qc: [f32; 8] = query[i..i + 8]
+    while i + F32X8_LANES <= query.len() {
+        let qc: [f32; F32X8_LANES] = query[i..i + F32X8_LANES]
             .try_into()
             .expect("slice [i..i+8] has length 8");
-        let mut bc = [0f32; 8];
+        let mut bc = [0f32; F32X8_LANES];
         for (j, slot) in bc.iter_mut().enumerate() {
-            let off = (i + j) * 4;
+            let off = (i + j) * F32_BYTES;
             *slot =
                 f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         }
@@ -292,11 +317,11 @@ fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
         let bv = f32x8::from(bc);
         let d = qv - bv;
         acc += d * d;
-        i += 8;
+        i += F32X8_LANES;
     }
     let mut sum = acc.reduce_add();
     while i < query.len() {
-        let off = i * 4;
+        let off = i * F32_BYTES;
         let b = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         let d = query[i] - b;
         sum += d * d;
@@ -392,17 +417,23 @@ impl<'a> Sq8Kernel<'a> {
         let mut q_prime = vec![0.0f32; dim];
         let mut q_dot_offset_acc = f32x8::ZERO;
         let mut i = 0;
-        while i + 8 <= dim {
-            let qc = f32x8::from(<[f32; 8]>::try_from(&query[i..i + 8]).expect("len-8 slice"));
-            let sc = f32x8::from(<[f32; 8]>::try_from(&scale[i..i + 8]).expect("len-8 slice"));
-            let oc = f32x8::from(<[f32; 8]>::try_from(&offset[i..i + 8]).expect("len-8 slice"));
+        while i + F32X8_LANES <= dim {
+            let qc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&query[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
+            let sc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
+            let oc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
             let qp = qc * sc;
             // Write q_prime out as 8 f32s. `wide::f32x8::to_array`
             // is the safe accessor; the per-lane copy compiles to
             // a single 32-byte mov on AVX2.
-            q_prime[i..i + 8].copy_from_slice(&qp.to_array());
+            q_prime[i..i + F32X8_LANES].copy_from_slice(&qp.to_array());
             q_dot_offset_acc += qc * oc;
-            i += 8;
+            i += F32X8_LANES;
         }
         let mut q_dot_offset: f32 = q_dot_offset_acc.reduce_add();
         while i < dim {
@@ -441,7 +472,7 @@ impl<'a> Sq8Kernel<'a> {
         // Per-doc inner reduction: Σ_d q_prime[d] * code[d] as f32.
         // Dispatches to AVX-512 (16-lane FMA with VPMOVZXBD widen)
         // when the runtime gate passes; otherwise the f32x8 widen-
-        // and-FMA kernel that has shipped since 012.
+        // and-FMA scalar-tier kernel.
         let qp_code_dot = sq8_dot(&self.q_prime, code_bytes, self.dim);
         // `dot(query, x_decoded) = qp_code_dot + q_dot_offset` because
         // x_decoded[d] = code[d] * scale[d] + offset[d], so
@@ -454,15 +485,15 @@ impl<'a> Sq8Kernel<'a> {
                     .expect("Sq8Kernel + Cosine requires per_doc_norms")
                     .sqrt();
                 if x_norm > 0.0 {
-                    1.0 - dot / x_norm
+                    COSINE_DISTANCE_BASE - dot / x_norm
                 } else {
-                    1.0 - dot
+                    COSINE_DISTANCE_BASE - dot
                 }
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
                 let x_norm_sq = norm.expect("Sq8Kernel + L2Sq requires per_doc_norms");
-                self.q_norm_sq - 2.0 * dot + x_norm_sq
+                self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
     }
@@ -517,16 +548,22 @@ impl<'a> Sq8ResidualKernel<'a> {
         let inv_residual_divisor = 1.0 / residual_divisor;
         let mut q_dot_offset_acc = f32x8::ZERO;
         let mut i = 0;
-        while i + 8 <= dim {
-            let qc = f32x8::from(<[f32; 8]>::try_from(&query[i..i + 8]).expect("len-8 slice"));
-            let sc = f32x8::from(<[f32; 8]>::try_from(&scale[i..i + 8]).expect("len-8 slice"));
-            let oc = f32x8::from(<[f32; 8]>::try_from(&offset[i..i + 8]).expect("len-8 slice"));
+        while i + F32X8_LANES <= dim {
+            let qc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&query[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
+            let sc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
+            let oc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
             let q_code_v = qc * sc;
             let q_residual_v = q_code_v * f32x8::splat(inv_residual_divisor);
-            q_code[i..i + 8].copy_from_slice(&q_code_v.to_array());
-            q_residual[i..i + 8].copy_from_slice(&q_residual_v.to_array());
+            q_code[i..i + F32X8_LANES].copy_from_slice(&q_code_v.to_array());
+            q_residual[i..i + F32X8_LANES].copy_from_slice(&q_residual_v.to_array());
             q_dot_offset_acc += qc * oc;
-            i += 8;
+            i += F32X8_LANES;
         }
         let mut q_dot_offset = q_dot_offset_acc.reduce_add();
         while i < dim {
@@ -574,22 +611,22 @@ impl<'a> Sq8ResidualKernel<'a> {
         debug_assert_eq!(residual_bytes.len(), self.dim);
         let mut acc = f32x8::ZERO;
         let mut i = 0;
-        while i + 8 <= self.dim {
-            let qc: [f32; 8] = self.q_code[i..i + 8]
+        while i + F32X8_LANES <= self.dim {
+            let qc: [f32; F32X8_LANES] = self.q_code[i..i + F32X8_LANES]
                 .try_into()
                 .expect("q_code[i..i+8] len 8");
-            let qr: [f32; 8] = self.q_residual[i..i + 8]
+            let qr: [f32; F32X8_LANES] = self.q_residual[i..i + F32X8_LANES]
                 .try_into()
                 .expect("q_residual[i..i+8] len 8");
-            let mut code = [0f32; 8];
-            let mut residual = [0f32; 8];
-            for j in 0..8 {
+            let mut code = [0f32; F32X8_LANES];
+            let mut residual = [0f32; F32X8_LANES];
+            for j in 0..F32X8_LANES {
                 code[j] = code_bytes[i + j] as f32;
                 residual[j] = i8::from_le_bytes([residual_bytes[i + j]]) as f32;
             }
             acc += f32x8::from(qc) * f32x8::from(code);
             acc += f32x8::from(qr) * f32x8::from(residual);
-            i += 8;
+            i += F32X8_LANES;
         }
         let mut cross = acc.reduce_add();
         while i < self.dim {
@@ -604,15 +641,15 @@ impl<'a> Sq8ResidualKernel<'a> {
                     .expect("Sq8ResidualKernel + Cosine requires per_doc_norms")
                     .sqrt();
                 if x_norm > 0.0 {
-                    1.0 - dot / x_norm
+                    COSINE_DISTANCE_BASE - dot / x_norm
                 } else {
-                    1.0 - dot
+                    COSINE_DISTANCE_BASE - dot
                 }
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
                 let x_norm_sq = norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
-                self.q_norm_sq - 2.0 * dot + x_norm_sq
+                self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
     }
@@ -668,16 +705,18 @@ fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     let mut acc = f32x8::ZERO;
     let mut i = 0;
-    while i + 8 <= dim {
-        let qc: [f32; 8] = q_prime[i..i + 8].try_into().expect("q_prime[i..i+8] len 8");
-        let mut bc = [0f32; 8];
+    while i + F32X8_LANES <= dim {
+        let qc: [f32; F32X8_LANES] = q_prime[i..i + F32X8_LANES]
+            .try_into()
+            .expect("q_prime[i..i+8] len 8");
+        let mut bc = [0f32; F32X8_LANES];
         for (j, slot) in bc.iter_mut().enumerate() {
             *slot = code_bytes[i + j] as f32;
         }
         let qv = f32x8::from(qc);
         let bv = f32x8::from(bc);
         acc += qv * bv;
-        i += 8;
+        i += F32X8_LANES;
     }
     let mut dot = acc.reduce_add();
     while i < dim {
@@ -715,7 +754,7 @@ unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     unsafe {
         let mut acc = _mm256_setzero_ps();
         let mut i = 0;
-        while i + 8 <= dim {
+        while i + F32X8_LANES <= dim {
             // Load 8 u8 doc codes into the low 64 bits of an xmm
             // register; the high 64 bits are zero.
             let codes_u8 = _mm_loadl_epi64(code_bytes.as_ptr().add(i) as *const __m128i);
@@ -726,7 +765,7 @@ unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
             let codes_f32 = _mm256_cvtepi32_ps(codes_i32);
             let q = _mm256_loadu_ps(q_prime.as_ptr().add(i));
             acc = _mm256_fmadd_ps(q, codes_f32, acc);
-            i += 8;
+            i += F32X8_LANES;
         }
         // Horizontal add 8 fp32 lanes. Standard hadd-tree.
         let lo = _mm256_castps256_ps128(acc);
@@ -769,7 +808,7 @@ unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 
     unsafe {
         let mut acc = _mm512_setzero_ps();
         let mut i = 0;
-        while i + 16 <= dim {
+        while i + AVX512_F32_LANES <= dim {
             // Load 16 u8 doc codes (one 128-bit lane) and widen
             // to 16 × i32 then convert to 16 × f32.
             let codes = _mm_loadu_si128(code_bytes.as_ptr().add(i) as *const __m128i);
@@ -777,7 +816,7 @@ unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 
             let codes_f32 = _mm512_cvtepi32_ps(codes_i32);
             let q = _mm512_loadu_ps(q_prime.as_ptr().add(i));
             acc = _mm512_fmadd_ps(q, codes_f32, acc);
-            i += 16;
+            i += AVX512_F32_LANES;
         }
         let mut dot = _mm512_reduce_add_ps(acc);
         while i < dim {
@@ -801,11 +840,12 @@ pub fn normalize(v: &mut [f32]) {
     let mag = {
         let mut acc = f32x8::ZERO;
         let mut tail_acc: f32 = 0.0;
-        let chunks = v.chunks_exact(8);
+        let chunks = v.chunks_exact(F32X8_LANES);
         let tail = chunks.remainder();
         for c in chunks {
             let lane = f32x8::from(
-                <[f32; 8]>::try_from(c).expect("chunks_exact(8) yields slices of length 8"),
+                <[f32; F32X8_LANES]>::try_from(c)
+                    .expect("chunks_exact(8) yields slices of length 8"),
             );
             acc += lane * lane;
         }
@@ -817,10 +857,11 @@ pub fn normalize(v: &mut [f32]) {
     if mag > 0.0 {
         let inv = 1.0 / mag;
         let inv_v = f32x8::splat(inv);
-        let mut chunks = v.chunks_exact_mut(8);
+        let mut chunks = v.chunks_exact_mut(F32X8_LANES);
         for c in chunks.by_ref() {
             let lane = f32x8::from(
-                <[f32; 8]>::try_from(&*c).expect("chunks_exact_mut(8) yields slices of length 8"),
+                <[f32; F32X8_LANES]>::try_from(&*c)
+                    .expect("chunks_exact_mut(8) yields slices of length 8"),
             );
             let scaled = lane * inv_v;
             c.copy_from_slice(&scaled.to_array());
@@ -1296,7 +1337,7 @@ mod tests {
         }
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1, fp32) ------------------------
+    // --- AVX-512 parity (fp32) ------------------------------------------
 
     /// Generate a pseudo-random `f32` vector. Deterministic — uses the
     /// same monotone-noise pattern as the planted-cluster test fixtures
@@ -1432,7 +1473,7 @@ mod tests {
         assert!(!parse("yes")); // pinned: we only accept 1 / true
     }
 
-    // --- AVX-512 parity (plan 014 Phase 1) ------------------------------
+    // --- AVX-512 parity -------------------------------------------------
 
     /// AVX-512 `sq8_dot` agrees with the `wide` baseline
     /// across a length sweep. The dot product is `Σ q_prime[d] *
@@ -1460,7 +1501,7 @@ mod tests {
         }
     }
 
-    // --- AVX2 parity (plan 014 Phase 2) ---------------------------------
+    // --- AVX2 parity ----------------------------------------------------
 
     /// AVX2 `sq8_dot_avx2` agrees with the portable wide
     /// kernel across a length sweep. Inner math is identical (FMA
@@ -1491,7 +1532,7 @@ mod tests {
         }
     }
 
-    // --- AVX-512 microbench (plan 014 — run by hand) -------------------
+    // --- AVX-512 microbench (run by hand) ------------------------------
     //
     // Direct head-to-head per-kernel timings between the AVX-512 fast
     // path and the `wide`-based AVX2 baseline. Run with:
@@ -1620,7 +1661,7 @@ mod tests {
         }
     }
 
-    // --- AVX2 microbench (plan 014 Phase 2 — run by hand) --------------
+    // --- AVX2 microbench (run by hand) ---------------------------------
     //
     // Measures the AVX2 widen-FMA paths added in Phase 2 against the
     // portable scalar-widen kernels they replace on AVX2 hosts. Run
@@ -1636,7 +1677,7 @@ mod tests {
     // parity tests + this microbench still exercise it via direct
     // call to keep the AVX2 baseline a first-class measurable tier.
 
-    // --- Unified 4-tier per-kernel microbench (plan 014) --------------
+    // --- Unified 4-tier per-kernel microbench --------------------------
     //
     // One run, every kernel × every SIMD tier × every realistic dim,
     // emitted as a single markdown table. Replaces ad-hoc per-tier

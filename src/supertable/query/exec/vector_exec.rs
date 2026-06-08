@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Vector kNN as a DataFusion table-valued function.
 //!
 //! `vector_search(column, query, k)` registers via `register_udtf`
@@ -60,6 +63,9 @@ use crate::supertable::handle::SupertableReader;
 /// SQL name the TVF is registered under.
 pub(crate) const VECTOR_SEARCH_UDTF: &str = "vector_search";
 
+/// Argument count for `vector_search(column, query_vector, k)`.
+const VECTOR_SEARCH_ARG_COUNT: usize = 3;
+
 /// Register `vector_search(column, query, k)` on `ctx`, bound to the
 /// query's pinned `reader` + scalar `schema`. Called from
 /// [`Supertable::query_sql`](crate::supertable::handle::Supertable::query_sql).
@@ -97,9 +103,10 @@ impl VectorSearchFunc {
 
 impl TableFunctionImpl for VectorSearchFunc {
     fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        if args.len() != 3 {
+        if args.len() != VECTOR_SEARCH_ARG_COUNT {
             return Err(DataFusionError::Plan(format!(
-                "vector_search expects 3 arguments (column, query_vector, k), got {}",
+                "vector_search expects {VECTOR_SEARCH_ARG_COUNT} arguments \
+                 (column, query_vector, k), got {}",
                 args.len()
             )));
         }

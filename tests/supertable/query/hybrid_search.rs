@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Public-API integration coverage for the `hybrid_search` SQL TVF.
 //!
 //! `hybrid_exec.rs` carries the in-crate unit tests (RRF math, single
@@ -32,6 +35,15 @@ use infino::test_helpers::{default_tokenizer, default_vector_config};
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
 const DIM: usize = 16;
+/// Random-rotation seed for the hybrid fixture's vector index.
+const VECTOR_ROT_SEED: u64 = 7;
+/// Rayon pool size for the deterministic hybrid query.
+const RAYON_POOL_THREADS: usize = 2;
+/// Hybrid-search top-k for the schema / score-projection queries.
+const HYBRID_SCHEMA_TOP_K: usize = 5;
+const HYBRID_SCORE_TOP_K: usize = 8;
+/// Hybrid-search top-k for the `_id`-projection query.
+const HYBRID_ID_TOP_K: usize = 16;
 
 fn fixed_list_f32(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -46,7 +58,7 @@ fn fixed_list_f32(dim: usize) -> DataType {
 fn options_title_emb() -> SupertableOptions {
     let writer_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("writer pool"),
     );
@@ -59,7 +71,7 @@ fn options_title_emb() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
         }],
-        vec![default_vector_config("emb", 7)],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),
     )
     .expect("valid options")
@@ -183,7 +195,7 @@ fn hybrid_search_star_projection_exposes_scalar_schema_plus_score() {
     let st = demo_two_segments();
     let batches = st
         .query_sql(&format!(
-            "SELECT * FROM hybrid_search('title', 'rust', 'emb', '{}', 5)",
+            "SELECT * FROM hybrid_search('title', 'rust', 'emb', '{}', {HYBRID_SCHEMA_TOP_K})",
             csv_one_hot(0)
         ))
         .expect("query_sql");
@@ -205,7 +217,7 @@ fn hybrid_search_identity_set_is_union_of_subsearches_across_segments() {
     let qv = csv_one_hot(0);
     // k ≥ the total doc count (16) so RRF never truncates the fused
     // list — the union equality only holds when |bm25 ∪ vector| ≤ k.
-    let k = 16;
+    let k = HYBRID_ID_TOP_K;
 
     let hybrid = id_set(
         &st.query_sql(&format!(
@@ -246,7 +258,7 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
     // highest RRF → emitted first.
     let res = st
         .query_sql(&format!(
-            "SELECT title, score FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
+            "SELECT title, score FROM hybrid_search('title', 'async', 'emb', '{}', {HYBRID_SCORE_TOP_K})",
             csv_one_hot(0)
         ))
         .expect("query_sql");

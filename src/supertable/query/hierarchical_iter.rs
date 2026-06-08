@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Hierarchical lazy-load helper.
 //!
 //! The bridge between the list-level prune helpers

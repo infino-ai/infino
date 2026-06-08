@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Recall grading for supertable vector benches: queries + brute-force top-k.
 //!
 //! Does **not** mmap the full corpus. Regenerates the same synthetic stream as
@@ -30,6 +33,13 @@ const QUERY_SIGMA: f32 = 0.05;
 const N_CORRECTNESS_QUERIES: usize = 20;
 const N_CALIBRATION_QUERIES: usize = 100;
 const TOP_K: usize = 10;
+
+/// Coprime stride spreading query base docs across the corpus
+/// (matches `corpus.rs`).
+const QUERY_BASE_DOC_STRIDE: usize = 7919;
+/// Doc count streamed per chunk when collecting vectors / computing
+/// ground truth.
+const STREAM_CHUNK_SIZE: usize = 65_536;
 
 /// Cached queries + ground truth for vector search benches.
 pub struct SupertableGrading {
@@ -122,7 +132,9 @@ fn compute(n_docs: usize) -> SupertableGrading {
 }
 
 fn query_base_doc_ids(n_docs: usize, n_queries: usize) -> Vec<usize> {
-    (0..n_queries).map(|i| (i * 7919) % n_docs).collect()
+    (0..n_queries)
+        .map(|i| (i * QUERY_BASE_DOC_STRIDE) % n_docs)
+        .collect()
 }
 
 fn build_queries_from_bases(
@@ -136,7 +148,7 @@ fn build_queries_from_bases(
     let dist = StandardNormal;
     let mut out = Vec::with_capacity(n_queries);
     for i in 0..n_queries {
-        let base_idx = (i * 7919) % n_docs;
+        let base_idx = (i * QUERY_BASE_DOC_STRIDE) % n_docs;
         let base = base_vectors
             .get(&base_idx)
             .unwrap_or_else(|| panic!("missing base vector for doc {base_idx}"));
@@ -158,7 +170,7 @@ fn collect_doc_vectors(n_docs: usize, doc_ids: &HashSet<usize>) -> HashMap<usize
     let mut synth = SequentialSyntheticCorpus::new(n_cent, VEC_SEED, TEXT_SEED, true);
     let mut titles = Vec::new();
     let mut flat = Vec::new();
-    let chunk_size = 65_536.min(n_docs.max(1));
+    let chunk_size = STREAM_CHUNK_SIZE.min(n_docs.max(1));
     let mut found = HashMap::with_capacity(doc_ids.len());
     let mut doc_id = 0usize;
 
@@ -190,7 +202,7 @@ fn streaming_ground_truth(n_docs: usize, queries: &[Vec<f32>], k: usize) -> Vec<
         queries.iter().map(|_| BinaryHeap::new()).collect();
     let mut titles = Vec::new();
     let mut flat = Vec::new();
-    let chunk_size = 65_536.min(n_docs.max(1));
+    let chunk_size = STREAM_CHUNK_SIZE.min(n_docs.max(1));
     let mut doc_id = 0usize;
 
     while doc_id < n_docs {
@@ -377,14 +389,22 @@ fn read_f32(cursor: &mut &[u8]) -> std::io::Result<f32> {
 mod tests {
     use super::*;
 
+    /// Tiny corpus size for the stream-vs-brute-force ground-truth test.
+    const TEST_N_DOCS: usize = 512;
+    /// Query count for the tiny-corpus ground-truth test.
+    const TEST_N_QUERIES: usize = 4;
+    /// Top-k compared between streaming and brute-force ground truth.
+    const TEST_TOP_K: usize = 5;
+
     #[test]
     fn streaming_gt_matches_brute_force_on_tiny_corpus() {
-        let n_docs = 512;
-        let queries = realistic_queries(n_docs, 4, 17, 0.05);
-        let stream_gt = streaming_ground_truth(n_docs, &queries, 5);
+        let n_docs = TEST_N_DOCS;
+        let queries =
+            realistic_queries(n_docs, TEST_N_QUERIES, CORRECTNESS_QUERY_SEED, QUERY_SIGMA);
+        let stream_gt = streaming_ground_truth(n_docs, &queries, TEST_TOP_K);
         let mmap =
             corpus::MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), VEC_SEED, true);
-        let brute = corpus::ground_truth(mmap.as_slice(), n_docs, &queries, 5);
+        let brute = corpus::ground_truth(mmap.as_slice(), n_docs, &queries, TEST_TOP_K);
         assert_eq!(stream_gt, brute);
     }
 }

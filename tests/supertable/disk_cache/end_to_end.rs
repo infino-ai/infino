@@ -1,7 +1,10 @@
-//! 003 M14b — disk-cache integration in the supertable
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Disk-cache integration in the supertable
 //! reader path.
 //!
-//! Covers the load-bearing M14b invariants:
+//! Covers the load-bearing invariants:
 //!
 //!   - **Cache routing on cross-process consumer.** A
 //!     producer commits superfiles through storage + cache.
@@ -36,25 +39,38 @@ use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
+/// Disk-cache budget (1 GiB) for the end-to-end integration cache.
+const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams.
+const COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk size (1 MiB).
+const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
+/// Mmap promotion timers disabled in tests.
+const MMAP_TIMER_DISABLED_SECS: u64 = 0;
+/// Commits driven for the warm-cache idempotency test.
+const WARM_CACHE_COMMIT_COUNT: usize = 3;
+/// 1-byte memory budget forcing the post-commit madvise sweep.
+const MEMORY_BUDGET_FORCE_SWEEP_BYTES: u64 = 1;
+
 fn make_cache(
     storage: Arc<dyn StorageProvider>,
     cache_root: &std::path::Path,
 ) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30, // 1 GiB — plenty for tests
+        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20, // 1 MiB
-        mmap_cold_threshold_secs: 0,     // disable sweep for tests
-        mmap_sweep_interval_secs: 0,
+        cold_fetch_streams: COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS, // disable sweep for tests
+        mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
         ..Default::default()
     };
     // No-op pinned_fn for tests — pinning is a perf
-    // optimization, not a correctness requirement (cf. M14b
-    // commit notes: Arc<SuperfileReader> keeps the
+    // optimization, not a correctness requirement
+    // (Arc<SuperfileReader> keeps the
     // Arc<Mmap> alive even after the cache evicts the
     // entry, so in-flight queries finish correctly).
     let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
@@ -134,10 +150,10 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
 #[test]
 fn producer_with_cache_reads_through_cache_path() {
     // The producer commits with both storage AND cache
-    // attached. The writer's M14b refactor extracts
+    // attached. The writer extracts
     // summaries directly from the segment bytes (no
     // round-trip through options.store.put), so the
-    // in-memory tier is NOT populated. With M14b.2, the
+    // in-memory tier is NOT populated. The
     // writer additionally pre-populates the cache after
     // commit succeeds → the producer's own first query
     // hits the warm cache.
@@ -158,7 +174,7 @@ fn producer_with_cache_reads_through_cache_path() {
     w.commit().expect("commit");
     drop(w);
 
-    // M14b.2: post-commit the cache holds the warmed
+    // Post-commit the cache holds the warmed
     // segment. n_cold_fetches stays 0; n_entries == 1.
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
@@ -178,7 +194,7 @@ fn producer_with_cache_reads_through_cache_path() {
 
 #[test]
 fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
-    // M14b.2: with cache attached, the writer pre-populates
+    // With cache attached, the writer pre-populates
     // the cache after each successful commit. The
     // producer's own queries on its just-committed superfiles
     // hit the warm cache directly — no cold-fetch
@@ -257,7 +273,7 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
     )
     .expect("create");
 
-    for _i in 0..3 {
+    for _i in 0..WARM_CACHE_COMMIT_COUNT {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["title"])).expect("append");
         w.commit().expect("commit");
@@ -386,7 +402,7 @@ fn pinned_fn_does_not_hold_supertable_alive() {
 
 #[test]
 fn memory_budget_drives_post_commit_madvise_sweep() {
-    // M14c: with both with_disk_cache + with_memory_budget,
+    // With both with_disk_cache + with_memory_budget,
     // the writer's post-commit path triggers
     // sweep_for_budget. With a budget below the working
     // set, the n_madvise_calls counter grows; without a
@@ -403,7 +419,7 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(Arc::clone(&cache))
-            .with_memory_budget(1),
+            .with_memory_budget(MEMORY_BUDGET_FORCE_SWEEP_BYTES),
     )
     .expect("create");
 
@@ -432,7 +448,7 @@ fn memory_budget_drives_post_commit_madvise_sweep() {
 #[test]
 fn memory_budget_unset_does_not_force_sweep() {
     // Without with_memory_budget, the post-commit sweep
-    // doesn't fire — the cache's M8 idle-threshold sweep
+    // doesn't fire — the cache's idle-threshold sweep
     // is the only mechanism, and a sub-second test won't
     // trigger it.
     let storage_dir = TempDir::new().expect("storage tempdir");
@@ -471,7 +487,7 @@ fn memory_budget_unset_does_not_force_sweep() {
 fn no_cache_path_still_uses_in_memory_store() {
     // Regression check: a supertable WITHOUT
     // with_disk_cache still queries via the in-memory
-    // store. This is the 002 / legacy path; covered by the
+    // store. This is the in-memory / legacy path; covered by the
     // broader test suite, but reasserted here so a future
     // refactor that accidentally engages the cache plumbing
     // unconditionally is caught.

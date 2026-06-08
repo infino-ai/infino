@@ -1,4 +1,7 @@
-//! Canonical digest of `SupertableOptions` (D15).
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Canonical digest of `SupertableOptions`.
 //!
 //! [`compute_options_hash`] produces a deterministic
 //! `ContentHash` over the load-bearing options fields — the
@@ -37,7 +40,7 @@
 //!
 //! Legacy / synthetic-manifest escape hatch: a stored `options_hash` of
 //! all zeros is treated as "validation skipped" by
-//! [`verify_options_hash`] — pre-D15 manifests + test fixtures that
+//! [`verify_options_hash`] — older manifests + test fixtures that
 //! construct lists manually keep opening cleanly.
 //!
 //! [`ManifestList::options_hash`]: super::list::ManifestList
@@ -128,7 +131,7 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
 /// options) against `actual` (stored on the manifest list).
 ///
 /// Returns `Ok(())` if the two match, OR if `actual` is the
-/// all-zero sentinel (pre-D15 manifests + synthetic test
+/// all-zero sentinel (older manifests + synthetic test
 /// fixtures bypass validation).
 pub fn verify_options_hash(
     expected: ContentHash,
@@ -527,7 +530,7 @@ mod tests {
 
     #[test]
     fn verify_options_hash_skips_zero_sentinel() {
-        // Pre-D15 manifests + synthetic test fixtures with an
+        // Older manifests + synthetic test fixtures with an
         // all-zero stored hash bypass validation: the caller's
         // computed hash can be anything.
         let opts = fts_opts();

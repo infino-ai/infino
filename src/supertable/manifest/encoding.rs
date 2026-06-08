@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Binary encodings for the per-segment skip-summary types
 //! that ride inside the manifest-part Avro schema as opaque
 //! `bytes` fields.

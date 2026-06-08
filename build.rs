@@ -1,8 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 use std::process::Command;
+
+/// Number of hex characters in the embedded git short hash
+/// (`INFINO_GIT_HASH`).
+const GIT_REV_SHORT_LEN: usize = 12;
 
 fn main() {
     let hash = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+        .args(["rev-parse", &format!("--short={GIT_REV_SHORT_LEN}"), "HEAD"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

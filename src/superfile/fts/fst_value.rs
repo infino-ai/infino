@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! FST-value bit layout — the inline-encoding short-circuit for
 //! `df = 1` terms.
 //!

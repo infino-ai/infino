@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Storage-level CAS primitives for WAL state documents.
 //!
 //! The whole crate's WAL-state I/O goes through `WalStore`.

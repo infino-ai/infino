@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! End-to-end update / delete throughput bench.
 //!
 //! Ingests a baseline corpus into a supertable, then drives a
@@ -41,13 +44,22 @@ use infino_bench_utils::report::{Better, Block, Cell, Report, Section, metric, t
 use infino_bench_utils::rss::{self, PeakSampler, RssStats};
 use tempfile::TempDir;
 
+/// Default baseline ingest doc count (sized to run in <1s) when
+/// `INFINO_BENCH_UPDATE_N_DOCS` is unset.
+const DEFAULT_N_DOCS: usize = 10_000;
+/// Default number of post-ingest single-row mutations when
+/// `INFINO_BENCH_UPDATE_N_MUTATIONS` is unset.
+const DEFAULT_N_MUTATIONS: usize = 20;
+/// Nanoseconds per second, for latency markdown.
+const NS_PER_SEC: f64 = 1e9;
+
 /// Doc count for the baseline ingest. Override via
 /// `INFINO_BENCH_UPDATE_N_DOCS`. Default sized to run in <1s.
 fn n_docs() -> usize {
     env::var("INFINO_BENCH_UPDATE_N_DOCS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(10_000)
+        .unwrap_or(DEFAULT_N_DOCS)
 }
 
 /// Number of single-row mutations to drive after ingest.
@@ -57,7 +69,7 @@ fn n_mutations() -> usize {
     env::var("INFINO_BENCH_UPDATE_N_MUTATIONS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(20)
+        .unwrap_or(DEFAULT_N_MUTATIONS)
 }
 
 /// Build a supertable + ingest a corpus of `n` rows in one
@@ -218,11 +230,11 @@ fn main() {
     let (delete_wall, delete_rss) = measure_deletes(n, m);
     let (update_wall, update_rss) = measure_updates(n, m);
 
-    let ingest_ns = ingest_wall.as_secs_f64() * 1e9;
+    let ingest_ns = ingest_wall.as_secs_f64() * NS_PER_SEC;
     let ingest_thr = n as f64 / ingest_wall.as_secs_f64();
 
     let mutation_row = |label: &str, wall: Duration, rss: RssStats| -> Vec<Cell> {
-        let ns = wall.as_secs_f64() * 1e9;
+        let ns = wall.as_secs_f64() * NS_PER_SEC;
         let ops = m as f64 / wall.as_secs_f64();
         let mut cells = vec![
             text(label),

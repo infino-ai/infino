@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Supertable object-store bench bundle (infino-only entry point). Uses
 //! Infino's custom benchmark harness directly.
 //!
