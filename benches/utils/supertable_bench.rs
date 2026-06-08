@@ -135,11 +135,11 @@ fn run_child_shape(key: &str) {
     let wall = t0.elapsed();
     let rss = sampler.stop_stats();
 
-    // This child wrote its own unique prefix; delete it before exiting so
-    // the real-S3 run accrues no ongoing cost (ingest-only bench — the
+    // This child wrote its own unique prefix; delete it before exiting so the
+    // real-backend run accrues no ongoing cost (ingest-only bench — the
     // artifact is not reused after the build is measured).
     if let Some(cleanup) = &built.cleanup {
-        crate::tiers::cleanup_real_s3_prefix(cleanup);
+        crate::tiers::cleanup_prefix(cleanup);
     }
 
     let metrics = ShapeMetrics {
@@ -209,15 +209,12 @@ fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
 }
 
 pub fn run() {
-    // Pre-flight: this bench only runs against real S3 (see module docs and
-    // `tiers::supertable_storage_fixture`). Fail fast with a clear message
-    // instead of a panic deep inside the first build. Checked in both the
-    // parent and any spawned child (env is inherited).
-    if crate::tiers::real_s3_bucket_env().is_none() {
-        eprintln!(
-            "[supertable] skipped: {}",
-            crate::tiers::SUPERTABLE_REQUIRES_REAL_S3
-        );
+    // Pre-flight: this bench only runs against a real object store (S3 or
+    // Azure; see `tiers::supertable_storage_fixture`). Fail fast with a clear
+    // message instead of a panic deep inside the first build. Checked in both
+    // the parent and any spawned child (env is inherited).
+    if let Err(reason) = crate::tiers::supertable_backend_check() {
+        eprintln!("[supertable] skipped: {reason}");
         return;
     }
 

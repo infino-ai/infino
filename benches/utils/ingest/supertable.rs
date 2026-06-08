@@ -44,8 +44,8 @@ pub struct IngestResult {
     pub storage_label: &'static str,
     pub n_superfiles: usize,
     pub total_index_bytes: u64,
-    /// Real-S3 prefix this build wrote under, to delete when the run ends.
-    pub cleanup: Option<tiers::S3Cleanup>,
+    /// Remote prefix this build wrote under, to delete when the run ends.
+    pub cleanup: Option<tiers::PrefixCleanup>,
 }
 
 /// Which index shapes a supertable build includes. Drives apples-to-apples
