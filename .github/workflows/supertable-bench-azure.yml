@@ -163,7 +163,7 @@ jobs:
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
-             INFINO_REAL_AZURE_CONTAINER='${{ secrets.AZURE_BENCH_CONTAINER }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ github.event.inputs.docs }}' \
              KEEP='${{ github.event.inputs.keep_table }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
