@@ -223,11 +223,10 @@ fn split_buffer_into_row_shards(
 /// The public folded `update` / `delete` buffer exactly one mutation
 /// before committing, so `CommitResult.outcomes` carries exactly one
 /// entry; surface it (or a backend error if, impossibly, none landed).
-fn single_outcome(res: CommitResult) -> Result<MutationStats, crate::Error> {
-    res.outcomes
-        .into_iter()
-        .next()
-        .ok_or_else(|| crate::Error::Backend("commit produced no mutation outcome".to_string()))
+fn single_outcome(res: CommitResult) -> Result<MutationStats, crate::InfinoError> {
+    res.outcomes.into_iter().next().ok_or_else(|| {
+        crate::InfinoError::Backend("commit produced no mutation outcome".to_string())
+    })
 }
 
 impl Supertable {
@@ -236,7 +235,7 @@ impl Supertable {
     /// Folds the buffered writer + commit into a single call: one
     /// `append` == one commit == one sealed segment, so callers batch
     /// rows per call rather than calling once per row.
-    pub fn append(&self, batch: &RecordBatch) -> Result<(), crate::Error> {
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), crate::InfinoError> {
         let mut w = self.writer()?;
         w.append(batch)?;
         w.commit()?;
@@ -250,7 +249,7 @@ impl Supertable {
         &self,
         predicate: datafusion::prelude::Expr,
         new_rows: &RecordBatch,
-    ) -> Result<MutationStats, crate::Error> {
+    ) -> Result<MutationStats, crate::InfinoError> {
         let mut w = self.writer()?;
         w.update(predicate, new_rows.clone())?;
         single_outcome(w.commit()?)
@@ -261,7 +260,7 @@ impl Supertable {
     pub fn delete(
         &self,
         predicate: datafusion::prelude::Expr,
-    ) -> Result<MutationStats, crate::Error> {
+    ) -> Result<MutationStats, crate::InfinoError> {
         let mut w = self.writer()?;
         w.delete(predicate)?;
         single_outcome(w.commit()?)

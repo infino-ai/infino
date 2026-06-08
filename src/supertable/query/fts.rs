@@ -270,14 +270,14 @@ impl Supertable {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<SearchHit>, crate::Error> {
+    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
         let hits = self.bm25_search_hits(column, query, k, mode)?;
         let reader = self.reader();
         let id_col = self.options().id_column.clone();
         self.block_on_query(crate::supertable::query::exec::common::resolve_search_hits(
             &reader, &hits, &id_col,
         ))
-        .map_err(|e| crate::Error::Query(e.to_string()))
+        .map_err(|e| crate::InfinoError::Query(e.to_string()))
     }
 
     /// Segment-local BM25 hits ([`SuperfileHit`], carrying

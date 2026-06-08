@@ -1,12 +1,15 @@
 //! The single public error type for the curated infino API.
 //!
-//! Public methods return `Result<T, Error>`. The internal per-stage
-//! error enums (`OpenError`, `BuildError`, `ReadError`, `QueryError`,
-//! `MutationError`, `CommitError`, `StorageError`) convert inward via
-//! `From`. The mappings are intentionally **coarse** — they collapse
-//! many internal variants onto a small, stable public set. `Error` is
-//! `#[non_exhaustive]`, so finer variants (or structured source
-//! chaining) can be added later without a breaking change.
+//! Public methods return `Result<T, InfinoError>`. The internal
+//! per-stage error enums (`OpenError`, `BuildError`, `ReadError`,
+//! `QueryError`, `MutationError`, `CommitError`, `StorageError`)
+//! convert inward via `From`. The mappings are intentionally **coarse**
+//! — they collapse many internal variants onto a small, stable public
+//! set. `InfinoError` is `#[non_exhaustive]`, so finer variants (or
+//! structured source chaining) can be added later without a breaking
+//! change. Named `InfinoError` (not `Error`) to avoid colliding with
+//! the `std::error::Error` trait at call sites and to read consistently
+//! alongside `DataFusionError` / `ArrowError`.
 
 use crate::storage::StorageError;
 use crate::superfile::BuildError as SuperfileBuildError;
@@ -23,7 +26,7 @@ use crate::supertable::mutations::{CommitError as MutationCommitError, MutationE
 /// keeps it open to growth without breaking downstream `match`es.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum InfinoError {
     /// A named table, object, or column was not found.
     #[error("not found: {0}")]
     NotFound(String),
@@ -55,71 +58,71 @@ pub enum Error {
     Backend(String),
 }
 
-impl From<StorageError> for Error {
+impl From<StorageError> for InfinoError {
     fn from(e: StorageError) -> Self {
         let msg = e.to_string();
         match e {
-            StorageError::NotFound { .. } => Error::NotFound(msg),
-            StorageError::PreconditionFailed { .. } => Error::AlreadyExists(msg),
+            StorageError::NotFound { .. } => InfinoError::NotFound(msg),
+            StorageError::PreconditionFailed { .. } => InfinoError::AlreadyExists(msg),
             StorageError::TransientExhausted { .. } | StorageError::Permanent { .. } => {
-                Error::Io(msg)
+                InfinoError::Io(msg)
             }
         }
     }
 }
 
-impl From<QueryError> for Error {
+impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        Error::Query(e.to_string())
+        InfinoError::Query(e.to_string())
     }
 }
 
-impl From<SuperfileReadError> for Error {
+impl From<SuperfileReadError> for InfinoError {
     fn from(e: SuperfileReadError) -> Self {
-        Error::Query(e.to_string())
+        InfinoError::Query(e.to_string())
     }
 }
 
-impl From<SuperfileBuildError> for Error {
+impl From<SuperfileBuildError> for InfinoError {
     fn from(e: SuperfileBuildError) -> Self {
-        Error::Schema(e.to_string())
+        InfinoError::Schema(e.to_string())
     }
 }
 
-impl From<SupertableBuildError> for Error {
+impl From<SupertableBuildError> for InfinoError {
     fn from(e: SupertableBuildError) -> Self {
-        Error::Schema(e.to_string())
+        InfinoError::Schema(e.to_string())
     }
 }
 
-impl From<SupertableCommitError> for Error {
+impl From<SupertableCommitError> for InfinoError {
     fn from(e: SupertableCommitError) -> Self {
-        Error::Backend(e.to_string())
+        InfinoError::Backend(e.to_string())
     }
 }
 
-impl From<OpenError> for Error {
+impl From<OpenError> for InfinoError {
     fn from(e: OpenError) -> Self {
-        Error::Backend(e.to_string())
+        InfinoError::Backend(e.to_string())
     }
 }
 
-impl From<MutationError> for Error {
+impl From<MutationError> for InfinoError {
     fn from(e: MutationError) -> Self {
         let msg = e.to_string();
         match e {
-            MutationError::PredicateEval(q) => Error::from(q),
-            MutationError::Storage(s) => Error::from(s),
+            MutationError::PredicateEval(q) => InfinoError::from(q),
+            MutationError::Storage(s) => InfinoError::from(s),
             MutationError::CardinalityMismatch { .. }
-            | MutationError::MatchCountExceedsCap { .. } => Error::Cardinality(msg),
-            MutationError::SchemaMismatch(_) => Error::Schema(msg),
-            _ => Error::Backend(msg),
+            | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
+            MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
+            _ => InfinoError::Backend(msg),
         }
     }
 }
 
-impl From<MutationCommitError> for Error {
+impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
-        Error::Backend(e.to_string())
+        InfinoError::Backend(e.to_string())
     }
 }

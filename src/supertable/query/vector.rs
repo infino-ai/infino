@@ -244,14 +244,14 @@ impl Supertable {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
-    ) -> Result<Vec<SearchHit>, crate::Error> {
+    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
         let hits = self.vector_search_hits(column, query, k, options)?;
         let reader = self.reader();
         let id_col = self.options().id_column.clone();
         self.block_on_query(crate::supertable::query::exec::common::resolve_search_hits(
             &reader, &hits, &id_col,
         ))
-        .map_err(|e| crate::Error::Query(e.to_string()))
+        .map_err(|e| crate::InfinoError::Query(e.to_string()))
     }
 
     /// Segment-local vector hits ([`SuperfileHit`], carrying
