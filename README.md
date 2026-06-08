@@ -43,11 +43,21 @@ let hits = table.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
 let query = vec![/* dim=384 f32s */];
 let knn = table.reader().vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
 
-// SQL (DataFusion under the hood; every segment is also valid Parquet):
-let rows = table.query_sql("SELECT _id, title FROM bm25_search('title', 'rust async', 10)")?;
+// Unranked retrieval — boolean token match and exact raw-value match
+// (candidate sets, no scoring); the same primitives the SQL WHERE
+// pushdown uses to answer FTS-column filters from the index:
+let any_token = table.reader().token_match("title", "rust async", BoolMode::Or)?;
+let exact = table.reader().exact_match("title", "rust async")?;
 
-// Hybrid — keyword + vector fused in one query (reciprocal-rank fusion):
-let fused = table.query_sql(
+// Hybrid — keyword + vector fused with reciprocal-rank fusion. As a method:
+let fused = table.reader().hybrid_search(
+    "title", "rust async", BoolMode::Or,
+    "embedding", &query, VectorSearchOptions::default(), 10,
+)?;
+
+// Every retriever is also a SQL table function (DataFusion under the hood;
+// each segment is valid Parquet), so you can filter, join, and fuse in SQL:
+let rows = table.query_sql(
     "SELECT _id, title, score \
      FROM hybrid_search('title', 'rust async', 'embedding', '<query vector>', 10)",
 )?;
