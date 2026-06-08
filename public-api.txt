@@ -81,6 +81,7 @@ pub fn infino::Connection::create_table(&self, &str, arrow_schema::schema::Schem
 pub fn infino::Connection::drop_table(&self, &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Connection::list_tables(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Connection::open_table(&self, &str) -> core::result::Result<infino::Supertable, infino::InfinoError>
+pub fn infino::Connection::query_sql(&self, &str) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Connection
 pub fn infino::Connection::clone(&self) -> infino::Connection
 impl core::marker::Freeze for infino::Connection

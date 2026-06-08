@@ -18,11 +18,13 @@ mod manifest;
 mod options;
 mod uri;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::execution::context::SessionContext;
 
 pub use index_spec::IndexSpec;
 pub use options::ConnectOptions;
@@ -259,6 +261,63 @@ impl Connection {
             }
         }
     }
+
+    /// Run SQL across the tables in this catalog. Every relation the query
+    /// names is resolved through the catalog and registered into one
+    /// DataFusion session, so cross-table joins and aggregations work.
+    /// Returns the collected result batches.
+    pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        let ctx = SessionContext::new();
+
+        // Resolve the relations the query names and register each that is a
+        // catalog table. Unknown names (CTEs, search TVFs, aliases) are
+        // skipped — the planner resolves those by other means or errors.
+        let statement = ctx
+            .state()
+            .sql_to_statement(sql, &datafusion::config::Dialect::Generic)
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
+        let refs = ctx
+            .state()
+            .resolve_table_references(&statement)
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
+
+        let mut seen = HashSet::new();
+        let mut handles: Vec<Supertable> = Vec::new();
+        for r in &refs {
+            let name = r.table().to_string();
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            match self.open_table(&name) {
+                Ok(table) => {
+                    table
+                        .register_into(&ctx, &name)
+                        .map_err(|e| InfinoError::Query(e.to_string()))?;
+                    handles.push(table);
+                }
+                Err(InfinoError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let sql = sql.to_owned();
+        let drive = async move {
+            let df = ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| InfinoError::Query(e.to_string()))?;
+            df.collect()
+                .await
+                .map_err(|e| InfinoError::Query(e.to_string()))
+        };
+        // Drive on an established per-supertable multi-thread query runtime
+        // (any referenced table's `block_on_query`); fall back to the shared
+        // bridge for table-free queries such as `SELECT 1`.
+        match handles.first() {
+            Some(table) => table.block_on_query(drive),
+            None => bridge_sync_to_async(drive),
+        }
+    }
 }
 
 /// Build `SupertableOptions` from a schema + lowered configs, attaching
@@ -417,6 +476,44 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         let bad = conn.create_table("has space", schema_id_title(), IndexSpec::new());
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn query_sql_resolves_tables_by_catalog_name() {
+        use arrow_array::Int64Array;
+
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append docs");
+        let more = conn
+            .create_table("more", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create more");
+        more.append(&build_title_batch(&["hello world"]))
+            .expect("append more");
+
+        // Resolved by catalog name (not the old hardcoded `supertable`).
+        let batches = conn
+            .query_sql("SELECT COUNT(*) AS n FROM docs")
+            .expect("count docs");
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 2, "docs has two rows");
+
+        // Two catalog tables registered into one query.
+        let rows: usize = conn
+            .query_sql("SELECT title FROM docs UNION ALL SELECT title FROM more")
+            .expect("union across tables")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 3, "2 from docs + 1 from more");
     }
 
     #[test]

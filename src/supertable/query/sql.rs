@@ -174,6 +174,36 @@ impl Supertable {
         Ok(ctx)
     }
 
+    /// Register this supertable's pushdown-aware provider into `ctx`
+    /// under `name`, applying the read-consistency policy first. The
+    /// catalog's multi-table [`Connection::query_sql`] calls this once
+    /// per referenced table. Returns the pinned reader so the caller can
+    /// later wire the same snapshot into search TVFs.
+    ///
+    /// [`Connection::query_sql`]: crate::Connection::query_sql
+    pub(crate) fn register_into(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+    ) -> Result<Arc<crate::supertable::handle::SupertableReader>, QueryError> {
+        self.ensure_fresh();
+        let reader = Arc::new(self.reader());
+        let manifest = Arc::clone(reader.manifest());
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let provider = SupertableProvider::new(
+            scalar_schema,
+            manifest,
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
+        ctx.register_table(name, Arc::new(provider))
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        Ok(reader)
+    }
+
     /// Resolve a predicate to the matching `_id` values. Used by
     /// the writer's `delete()` / `update()` entry points to
     /// capture the target-id set at call time (step 0a in the

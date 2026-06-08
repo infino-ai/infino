@@ -85,10 +85,19 @@ use datafusion::scalar::ScalarValue;
 /// resolving filter columns to a physical pruning predicate.
 pub(crate) const TABLE_NAME: &str = "supertable";
 
-/// Object-store URL the surviving segments are registered under
-/// for the duration of a scan. The authority is arbitrary — it's
-/// only a key into the session's object-store registry.
-const MEMORY_STORE_URL: &str = "memory://supertable/";
+/// Object-store URL *prefix* the surviving segments are registered
+/// under for a scan. The authority is arbitrary — only a key into the
+/// session's object-store registry — but it must be **unique per
+/// provider**: a multi-table catalog query registers several providers
+/// into one session, and a shared key would let one table's store
+/// overwrite another's (a segment would then read "not found"). A
+/// process-global counter makes each provider's URL distinct while
+/// keeping it stable across that provider's own scans, so the
+/// single-table cached session re-registers the same key (no growth).
+const MEMORY_STORE_URL_PREFIX: &str = "memory://supertable-";
+
+/// Monotonic source of per-provider object-store authorities.
+static STORE_URL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A [`TableProvider`] over a pinned supertable snapshot.
 ///
@@ -114,6 +123,10 @@ pub(crate) struct SupertableProvider {
     /// keeps the analytical SELECT path's projection/limit/row-group
     /// pushdown intact while still honoring deletes.
     tombstone_cache: Option<Arc<SidecarCache>>,
+    /// Per-provider object-store registry key (see
+    /// [`MEMORY_STORE_URL_PREFIX`]). Unique across providers so a
+    /// multi-table query's registrations don't collide.
+    store_url: ObjectStoreUrl,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -140,12 +153,16 @@ impl SupertableProvider {
         disk_cache: Option<Arc<DiskCacheStore>>,
         tombstone_cache: Option<Arc<SidecarCache>>,
     ) -> Self {
+        let seq = STORE_URL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let store_url = ObjectStoreUrl::parse(format!("{MEMORY_STORE_URL_PREFIX}{seq}/"))
+            .expect("invariant: a counter-derived memory store URL is always valid");
         Self {
             schema,
             manifest,
             store,
             disk_cache,
             tombstone_cache,
+            store_url,
         }
     }
 
@@ -346,7 +363,7 @@ impl TableProvider for SupertableProvider {
             files.push(file);
         }
 
-        let url = ObjectStoreUrl::parse(MEMORY_STORE_URL)?;
+        let url = self.store_url.clone();
         state
             .runtime_env()
             .register_object_store(url.as_ref(), mem_store);
