@@ -98,6 +98,41 @@ pub const SUPERFILE_DOCS: usize = 1_000_000;
 /// over the object store.
 pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
+/// Document count for the **superfile** test — a single-segment index
+/// built and queried entirely **in memory**. Defaults to
+/// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
+/// for a quicker local loop or a larger stress run.
+pub fn superfile_docs() -> usize {
+    docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
+}
+
+/// Document count for the **supertable** test — a multi-segment table
+/// committed to and queried from **object storage**. Defaults to
+/// [`SUPERTABLE_DOCS`] (10M); override with
+/// `INFINO_BENCH_SUPERTABLE_DOCS`.
+pub fn supertable_docs() -> usize {
+    docs_from_env("INFINO_BENCH_SUPERTABLE_DOCS", SUPERTABLE_DOCS)
+}
+
+/// Parse a positive doc-count override from `var`, falling back to
+/// `default` when unset, empty, unparseable, or zero.
+fn docs_from_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Parallel-writer count for the "N writers" build row — how many
+/// writers build the corpus concurrently. Applied identically to every
+/// engine (infino shards across this many builders; Tantivy uses this
+/// many indexing threads). Defaults to the machine's logical core count;
+/// override with `INFINO_BENCH_WRITERS`.
+pub fn parallel_writers() -> usize {
+    docs_from_env("INFINO_BENCH_WRITERS", num_cpus::get())
+}
+
 /// IVF cluster count. Conventionally `~sqrt(n_docs)`, snapped to a
 /// fixed value per scale band so 1M and 10M runs share a stable
 /// `n_cent`.
@@ -245,6 +280,16 @@ impl MmapTextCorpus {
     pub fn chunk_strs(&self, start: usize, len: usize) -> Vec<&str> {
         let end = (start + len).min(self.n_docs());
         (start..end).map(|idx| self.doc(idx)).collect()
+    }
+
+    /// Materialize the whole corpus as `(doc_id, text)` rows borrowing
+    /// from the mmap — the input shape the engine-generic FTS driver
+    /// feeds to every engine. `doc_id` is the dense row index, so it
+    /// doubles as the cross-engine recall id.
+    pub fn rows(&self) -> Vec<(u64, &str)> {
+        (0..self.n_docs())
+            .map(|i| (i as u64, self.doc(i)))
+            .collect()
     }
 }
 

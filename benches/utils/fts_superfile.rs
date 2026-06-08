@@ -1,99 +1,208 @@
-//! Infino-only FTS bench for the superfile layer:
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Superfile-layer FTS bench.
 //!
-//!   ingest timing (single-thread + rayon-sharded multi-thread)
-//! + 7-query search timing
-//! + 3 per-algorithm (WAND+BMW vs MaxScore+BMM) probes
-//! + correctness gates (BMW-vs-brute-force, df=1 + common-term ordering)
+//! The comparable build + search numbers — the ones the cross-engine
+//! comparison (`retrievalbench`) also produces — are measured through
+//! the engine-generic harness ([`run_fts::<InfinoFtsEngine>`]), so
+//! infino's own headline numbers and its head-to-head numbers come from
+//! one measurement path, not two.
+//!
+//! Layered on top are the infino-only extras that have no cross-engine
+//! analogue and stay measured directly:
+//!
+//!   - correctness oracle (BMW top-k == brute-force; df=1 + common-term
+//!     ordering),
+//!   - per-algorithm probe (WAND+BMW vs MaxScore+BMM),
+//!   - rayon-sharded parallel build (single-engine ingest-parallelism),
+//!   - cold tier (the same `.parquet` on object storage, read through
+//!     the production `DiskCacheStore` cold path).
 //!
 //! Every phase uses the production path: [`SuperfileBuilder`] → unified
-//! `.parquet` → [`SuperfileReader`] → `bm25_search` / embedded [`FtsReader`].
-//! Hot opens the finished `.parquet` in memory; warm/cold commit the same bytes
-//! to object storage and read through [`DiskCacheStore::reader`].
+//! `.parquet` → [`SuperfileReader`].
 //!
 //! Pinned to 1M-doc Zipfian (200 tokens/doc, 10K vocab). The
-//! single-superfile shape is rarely much larger in production —
-//! `benches/fts/supertable.rs` covers the 10M+ supertable scale.
+//! single-superfile shape is rarely much larger in production — the
+//! supertable bench covers the 10M+ scale.
 //!
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench superfile_fts -- superfile_fts_build     # only superfile ingest
-//! cargo bench --bench superfile_fts -- superfile_fts_search    # only superfile search
+//! cargo bench --bench superfile_fts                          # build + search
+//! cargo bench --bench superfile_fts -- superfile_fts_build   # ingest only
+//! cargo bench --bench superfile_fts -- superfile_fts_search  # search only
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts
 //! ```
-//!
-//! Correctness phase runs unconditionally on every invocation
-//! (criterion filters skip timing, not setup), so a filter to
-//! `superfile_fts_search` still validates the BMW oracle before
-//! timing kicks in.
 
-use crate::fixture;
-use crate::tiers::{self, Tier};
-use crate::{corpus, markdown, rss};
-use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use bytes::Bytes;
-use criterion::{Criterion, Throughput, criterion_group};
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::fts::reader::{BoolMode, OrAlgo};
-use infino::test_helpers::default_tokenizer;
-use rayon::prelude::*;
-use std::hint::black_box;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use infino::superfile::SuperfileReader;
+use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
+
+use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
+use crate::harness::{
+    BoolMode, EngineFtsResult, FtsQuery, InfinoFtsEngine, QueryStats, run_fts_with_index,
+};
+use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
+use crate::report::{Better, Block, Cell, Report, Section, metric, text};
+use crate::rss::{self, RssStats};
+use crate::tiers;
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-/// Doc count for every FTS-superfile bench. Superfile shape → 1M.
-const N_DOCS: usize = corpus::SUPERFILE_DOCS;
-
-const ID_COLUMN: &str = "doc_id";
+// Document count is the malleable superfile-test parameter
+// (`corpus::superfile_docs()`, default 1M, env-overridable). Captured
+// once per run into a local `n_docs`.
 const FTS_COLUMN: &str = "title";
 
-// ─── Fixtures ────────────────────────────────────────────────────────
+/// Top-k for every search.
+const K: usize = 10;
+/// Timed hot-search repetitions per query (after one warmup). `run_fts`
+/// reports the p50 over these.
+const HOT_ITERS: usize = 50;
+/// Cold-tier repetitions per query — each pays a fresh cache + full S3
+/// cold open, so this is deliberately small.
+const COLD_ITERS: usize = 10;
 
-static TEXT_CORPUS: OnceLock<corpus::MmapTextCorpus> = OnceLock::new();
-static SUPERFILE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-static SUPERFILE_OBJECT: OnceLock<tiers::SuperfileCommitted> = OnceLock::new();
+// ─── Query battery (shared by hot search, cold tier, recall id grading) ─
 
-fn superfile_bytes() -> &'static [u8] {
-    SUPERFILE_BYTES.get_or_init(|| build_superfile_bytes(text_corpus()))
-}
+/// The full FTS query battery. Drives the engine-generic hot search via
+/// [`run_fts`]; the cold tier re-derives its query strings + modes from
+/// the same list so hot and cold measure identical shapes.
+const FTS_BATTERY: &[FtsQuery] = &[
+    FtsQuery {
+        name: "single_rare",
+        terms: &["term09999"],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "single_df1",
+        terms: &["doc0500000"],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "single_common",
+        terms: &["term00001"],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "two_term_or",
+        terms: &["term00001", "term00050"],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "three_wide_or",
+        terms: &["term00001", "term00050", "term00100"],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "three_similar_or",
+        terms: &["term00050", "term00051", "term00052"],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "five_term_or",
+        terms: &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "ten_term_or",
+        terms: &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
+        ],
+        mode: BoolMode::Or,
+    },
+    FtsQuery {
+        name: "two_term_and",
+        terms: &["term00001", "term00050"],
+        mode: BoolMode::And,
+    },
+    FtsQuery {
+        name: "three_wide_and",
+        terms: &["term00001", "term00050", "term00100"],
+        mode: BoolMode::And,
+    },
+    FtsQuery {
+        name: "three_similar_and",
+        terms: &["term00050", "term00051", "term00052"],
+        mode: BoolMode::And,
+    },
+    FtsQuery {
+        name: "five_term_and",
+        terms: &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+        ],
+        mode: BoolMode::And,
+    },
+    FtsQuery {
+        name: "ten_term_and",
+        terms: &[
+            "term00050",
+            "term00051",
+            "term00052",
+            "term00053",
+            "term00054",
+            "term00055",
+            "term00056",
+            "term00057",
+            "term00058",
+            "term00059",
+        ],
+        mode: BoolMode::And,
+    },
+];
 
-fn superfile_object() -> &'static tiers::SuperfileCommitted {
-    SUPERFILE_OBJECT.get_or_init(|| {
-        let blob = Bytes::from(superfile_bytes().to_vec());
-        eprintln!(
-            "[superfile_fts] committing {N_DOCS} docs to object storage for the cold tier \
-             (production .parquet, {} MiB)...",
-            blob.len() / (1024 * 1024)
-        );
-        tiers::block_on(tiers::commit_superfile(&blob))
-    })
-}
+/// OR query names, in table order.
+const OR_QUERIES: &[&str] = &[
+    "single_rare",
+    "single_df1",
+    "single_common",
+    "two_term_or",
+    "three_wide_or",
+    "three_similar_or",
+    "five_term_or",
+    "ten_term_or",
+];
 
-/// Full cold tier battery — every hot-search query shape is also
-/// exercised against real object storage so the search summary has
-/// hot/cold for all OR *and* AND shapes (cold latency is
-/// fetch-bound, but we measure each shape explicitly rather than
-/// extrapolating from a 3-query sample).
-const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
-    ("single_rare", &["term09999"], BoolMode::Or),
-    ("single_df1", &["doc0500000"], BoolMode::Or),
-    ("single_common", &["term00001"], BoolMode::Or),
-    ("two_term_or", &["term00001", "term00050"], BoolMode::Or),
+/// AND query names, in table order.
+const AND_QUERIES: &[&str] = &[
+    "two_term_and",
+    "three_wide_and",
+    "three_similar_and",
+    "five_term_and",
+    "ten_term_and",
+];
+
+/// Per-algorithm probe shapes (OR-only; WAND+BMW vs MaxScore+BMM). This
+/// is an infino-internal hook with no cross-engine analogue.
+const PROBE_SHAPES: &[(&str, &[&str])] = &[
+    ("wide_3_or", &["term00001", "term00050", "term00100"]),
+    ("similar_3_or", &["term00050", "term00051", "term00052"]),
     (
-        "three_wide_or",
-        &["term00001", "term00050", "term00100"],
-        BoolMode::Or,
-    ),
-    (
-        "three_similar_or",
-        &["term00050", "term00051", "term00052"],
-        BoolMode::Or,
-    ),
-    (
-        "five_term_or",
+        "similar_5_or",
         &[
             "term00050",
             "term00051",
@@ -101,10 +210,9 @@ const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
             "term00053",
             "term00054",
         ],
-        BoolMode::Or,
     ),
     (
-        "ten_term_or",
+        "similar_10_or",
         &[
             "term00050",
             "term00051",
@@ -117,140 +225,25 @@ const TIER_QUERIES: &[(&str, &[&str], BoolMode)] = &[
             "term00058",
             "term00059",
         ],
-        BoolMode::Or,
-    ),
-    ("two_term_and", &["term00001", "term00050"], BoolMode::And),
-    (
-        "three_wide_and",
-        &["term00001", "term00050", "term00100"],
-        BoolMode::And,
-    ),
-    (
-        "three_similar_and",
-        &["term00050", "term00051", "term00052"],
-        BoolMode::And,
-    ),
-    (
-        "five_term_and",
-        &[
-            "term00050",
-            "term00051",
-            "term00052",
-            "term00053",
-            "term00054",
-        ],
-        BoolMode::And,
-    ),
-    (
-        "ten_term_and",
-        &[
-            "term00050",
-            "term00051",
-            "term00052",
-            "term00053",
-            "term00054",
-            "term00055",
-            "term00056",
-            "term00057",
-            "term00058",
-            "term00059",
-        ],
-        BoolMode::And,
     ),
 ];
 
-fn text_corpus() -> &'static corpus::MmapTextCorpus {
-    TEXT_CORPUS.get_or_init(|| corpus::MmapTextCorpus::generate(N_DOCS, 1))
-}
+// ─── Correctness (infino-only oracle) ─────────────────────────────────
 
-fn superfile_reader() -> SuperfileReader {
-    SuperfileReader::open(Bytes::from(superfile_bytes().to_vec())).expect("open superfile")
-}
-
-// ─── Builder (production SuperfileBuilder) ───────────────────────────
-
-fn supertable_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
-        Field::new(FTS_COLUMN, DataType::LargeUtf8, false),
-    ]))
-}
-
-/// Unified `.parquet` (Parquet body + embedded FTS blob + `inf.*` KV) — same
-/// path as supertable commit and `vector_superfile`.
-fn build_superfile_bytes(docs: &corpus::MmapTextCorpus) -> Vec<u8> {
-    build_superfile_bytes_range(docs, 0, docs.n_docs(), 0)
-}
-
-fn build_superfile_bytes_range(
-    docs: &corpus::MmapTextCorpus,
-    start_doc: usize,
-    len_docs: usize,
-    id_base: usize,
-) -> Vec<u8> {
-    let schema = supertable_schema();
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        ID_COLUMN,
-        vec![FtsConfig {
-            column: FTS_COLUMN.into(),
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    );
-    let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
-    const CHUNK: usize = 65_536;
-    let mut offset = 0;
-    while offset < len_docs {
-        let len = CHUNK.min(len_docs - offset);
-        let global_start = start_doc + offset;
-        let ids: Decimal128Array = ((id_base + offset) as u64..(id_base + offset + len) as u64)
-            .map(|i| Some(i as i128))
-            .collect::<Decimal128Array>()
-            .with_precision_and_scale(38, 0)
-            .expect("decimal128");
-        let titles = LargeStringArray::from(docs.chunk_strs(global_start, len));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(titles)])
-            .expect("RecordBatch");
-        builder.add_batch(&batch, &[]).expect("add_batch");
-        offset += len;
-    }
-    builder.finish().expect("SuperfileBuilder::finish")
-}
-
-/// Rayon-sharded parallel build: each shard runs its own
-/// [`SuperfileBuilder`] and emits a self-contained `.parquet` — the same
-/// multi-segment shape supertable commit produces.
-fn build_superfiles_rayon(docs: &corpus::MmapTextCorpus) -> Vec<Vec<u8>> {
-    let n_shards = rayon::current_num_threads();
-    let docs_per_shard = docs.n_docs().div_ceil(n_shards);
-    (0..n_shards)
-        .into_par_iter()
-        .filter_map(|shard_idx| {
-            let start = shard_idx * docs_per_shard;
-            if start >= docs.n_docs() {
-                return None;
-            }
-            let len = docs_per_shard.min(docs.n_docs() - start);
-            let id_base = shard_idx * docs_per_shard;
-            Some(build_superfile_bytes_range(docs, start, len, id_base))
-        })
-        .collect()
-}
-
-// ─── Correctness ──────────────────────────────────────────────────────
-
-fn assert_superfile_self_consistent(reader: &SuperfileReader) {
-    let hits =
-        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "doc0500000", 10, BoolMode::Or))
-            .expect("search df=1");
+fn assert_superfile_self_consistent(reader: &SuperfileReader, n_docs: usize) {
+    let probe_doc_id = n_docs / 2;
+    let probe_token = format!("doc{probe_doc_id:07}");
+    let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, &probe_token, K, InfinoBoolMode::Or))
+        .expect("search df=1");
     assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
-    assert_eq!(hits[0].0, 500_000, "doc0500000 should match doc_id 500000");
+    assert_eq!(
+        hits[0].0 as usize, probe_doc_id,
+        "{probe_token} should match doc_id {probe_doc_id}"
+    );
 
-    let hits =
-        corpus::block_on_inmem(reader.bm25_search(FTS_COLUMN, "term00001", 10, BoolMode::Or))
-            .expect("search common");
-    assert_eq!(hits.len(), 10, "common term should fill top-10");
+    let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, "term00001", K, InfinoBoolMode::Or))
+        .expect("search common");
+    assert_eq!(hits.len(), K, "common term should fill top-k");
     for w in hits.windows(2) {
         assert!(
             w[0].1 >= w[1].1,
@@ -297,18 +290,18 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
     const SCORE_EPSILON: f32 = 1e-4;
 
     for (label, terms) in battery {
-        let bmw_top10: Vec<(u32, f32)> = corpus::block_on_inmem(reader.bm25_search_pretokenized(
+        let bmw_top10: Vec<(u32, f32)> = block_on_inmem(reader.bm25_search_pretokenized(
             FTS_COLUMN,
             terms,
-            10,
-            BoolMode::Or,
+            K,
+            InfinoBoolMode::Or,
         ))
         .expect("bmw search");
-        let mut brute_full = corpus::block_on_inmem(reader.bm25_search_pretokenized(
+        let mut brute_full = block_on_inmem(reader.bm25_search_pretokenized(
             FTS_COLUMN,
             terms,
             usize::MAX,
-            BoolMode::Or,
+            InfinoBoolMode::Or,
         ))
         .expect("brute-force search");
         brute_full.sort_by(|a, b| {
@@ -316,7 +309,7 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
-        let brute_top10: Vec<(u32, f32)> = brute_full.into_iter().take(10).collect();
+        let brute_top10: Vec<(u32, f32)> = brute_full.into_iter().take(K).collect();
 
         assert_eq!(
             bmw_top10.len(),
@@ -346,527 +339,374 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
     battery.len()
 }
 
-// ─── Bench helpers ────────────────────────────────────────────────────
+// ─── Manual timing helpers (infino-only extras) ───────────────────────
 
-fn bench_infino(
-    c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
-    name: &str,
-    r: &SuperfileReader,
-    terms: &'static [&'static str],
-    mode: BoolMode,
-) {
-    c.bench_function(format!("{name}_infino_top10"), |b| {
-        b.iter(|| {
-            let hits = corpus::block_on_inmem(r.bm25_search_pretokenized(
-                black_box(FTS_COLUMN),
-                black_box(terms),
-                black_box(10),
-                mode,
-            ))
-            .expect("bm25 search");
-            black_box(hits)
-        });
-    });
+/// Nearest-rank p50 of a duration set (sorts in place).
+fn p50(samples: &mut [Duration]) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    samples.sort_unstable();
+    samples[(samples.len() - 1) / 2]
 }
 
-fn bench_per_algo_probe(
-    c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
-    name: &str,
-    r: &SuperfileReader,
-    terms: &'static [&'static str],
-) {
-    let fts = r.fts().expect("FTS subsection");
-    c.bench_function(format!("{name}_wand_top10"), |b| {
-        b.iter(|| {
-            let hits = corpus::block_on_inmem(fts.search_with_algo_for_bench(
-                black_box(FTS_COLUMN),
-                black_box(terms),
-                black_box(10),
-                OrAlgo::WandBmw,
-            ))
-            .expect("WAND+BMW search");
-            black_box(hits)
-        });
-    });
-    c.bench_function(format!("{name}_bmm_top10"), |b| {
-        b.iter(|| {
-            let hits = corpus::block_on_inmem(fts.search_with_algo_for_bench(
-                black_box(FTS_COLUMN),
-                black_box(terms),
-                black_box(10),
-                OrAlgo::Bmm,
-            ))
-            .expect("MaxScore+BMM search");
-            black_box(hits)
-        });
-    });
-}
-
-// ─── Bench entry ──────────────────────────────────────────────────────
-
-fn bench(c: &mut Criterion) {
-    let run_build = fixture::supertable::criterion_filter_selects(
-        &["superfile_fts", "superfile_fts_build"],
-        &["superfile_fts_build"],
-    );
-    let run_search = fixture::supertable::criterion_filter_selects(
-        &["superfile_fts", "superfile_fts_search"],
-        &["superfile_fts_hot_search", "superfile_fts_cold_search"],
-    );
-    if !run_build && !run_search {
-        return;
-    }
-
-    if run_build {
-        let n = N_DOCS;
-        let docs_for_ingest = text_corpus();
-        let mut g = c.benchmark_group("superfile_fts_build");
-        g.sample_size(10);
-        g.throughput(Throughput::Elements(n as u64));
-
-        let one_thread_id = format!("infino_1thread_{n}docs");
-        let rayon_id = format!("infino_rayon_default_threads_{n}docs");
-        let rss_sample = rss::PeakSampler::start_default();
-        g.bench_function(one_thread_id.clone(), |b| {
-            b.iter_with_large_drop(|| build_superfile_bytes(black_box(docs_for_ingest)));
-        });
-        let stats = rss_sample.stop_stats();
-        let _ = rss::write_rss_stats(group_name::SUPERFILE_FTS_BUILD, &one_thread_id, stats);
-
-        let rss_sample = rss::PeakSampler::start_default();
-        g.bench_function(rayon_id.clone(), |b| {
-            b.iter_with_large_drop(|| build_superfiles_rayon(black_box(docs_for_ingest)));
-        });
-        let stats = rss_sample.stop_stats();
-        let _ = rss::write_rss_stats(group_name::SUPERFILE_FTS_BUILD, &rayon_id, stats);
-
-        g.finish();
-
-        emit_ingest_markdown();
-    }
-    if !run_search {
-        return;
-    }
-
-    eprintln!(
-        "[fts/superfile] correctness: building shared superfile for correctness/search ({N_DOCS} docs)..."
-    );
-    let r = superfile_reader();
-    assert_superfile_self_consistent(&r);
-    let n_bmw = assert_bmw_matches_brute_force(&r);
-    eprintln!(
-        "[fts/superfile] correctness OK: superfile self-consistent + {n_bmw} queries BMW==brute-force"
-    );
-
-    {
-        let mut g = c.benchmark_group(tiers::search_group_name("superfile_fts", Tier::Hot, None));
-        let rss_sample = rss::PeakSampler::start_default();
-
-        bench_infino(&mut g, "single_rare", &r, &["term09999"], BoolMode::Or);
-        bench_infino(&mut g, "single_df1", &r, &["doc0500000"], BoolMode::Or);
-        bench_infino(&mut g, "single_common", &r, &["term00001"], BoolMode::Or);
-        bench_infino(
-            &mut g,
-            "two_term_or",
-            &r,
-            &["term00001", "term00050"],
-            BoolMode::Or,
-        );
-        bench_infino(
-            &mut g,
-            "three_wide_or",
-            &r,
-            &["term00001", "term00050", "term00100"],
-            BoolMode::Or,
-        );
-        bench_infino(
-            &mut g,
-            "three_similar_or",
-            &r,
-            &["term00050", "term00051", "term00052"],
-            BoolMode::Or,
-        );
-        bench_infino(
-            &mut g,
-            "five_term_or",
-            &r,
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-            ],
-            BoolMode::Or,
-        );
-        bench_infino(
-            &mut g,
-            "ten_term_or",
-            &r,
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-                "term00055",
-                "term00056",
-                "term00057",
-                "term00058",
-                "term00059",
-            ],
-            BoolMode::Or,
-        );
-        bench_infino(
-            &mut g,
-            "two_term_and",
-            &r,
-            &["term00001", "term00050"],
-            BoolMode::And,
-        );
-        bench_infino(
-            &mut g,
-            "three_wide_and",
-            &r,
-            &["term00001", "term00050", "term00100"],
-            BoolMode::And,
-        );
-        bench_infino(
-            &mut g,
-            "three_similar_and",
-            &r,
-            &["term00050", "term00051", "term00052"],
-            BoolMode::And,
-        );
-        bench_infino(
-            &mut g,
-            "five_term_and",
-            &r,
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-            ],
-            BoolMode::And,
-        );
-        bench_infino(
-            &mut g,
-            "ten_term_and",
-            &r,
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-                "term00055",
-                "term00056",
-                "term00057",
-                "term00058",
-                "term00059",
-            ],
-            BoolMode::And,
-        );
-
-        bench_per_algo_probe(
-            &mut g,
-            "wide_3_or",
-            &r,
-            &["term00001", "term00050", "term00100"],
-        );
-        bench_per_algo_probe(
-            &mut g,
-            "similar_3_or",
-            &r,
-            &["term00050", "term00051", "term00052"],
-        );
-        bench_per_algo_probe(
-            &mut g,
-            "similar_5_or",
-            &r,
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-            ],
-        );
-        bench_per_algo_probe(
-            &mut g,
-            "similar_10_or",
-            &r,
-            &[
-                "term00050",
-                "term00051",
-                "term00052",
-                "term00053",
-                "term00054",
-                "term00055",
-                "term00056",
-                "term00057",
-                "term00058",
-                "term00059",
-            ],
-        );
-
-        g.finish();
-        let stats = rss_sample.stop_stats();
-        let search_ids = [
-            "single_rare_infino_top10",
-            "single_df1_infino_top10",
-            "single_common_infino_top10",
-            "two_term_or_infino_top10",
-            "three_wide_or_infino_top10",
-            "three_similar_or_infino_top10",
-            "five_term_or_infino_top10",
-            "ten_term_or_infino_top10",
-            "two_term_and_infino_top10",
-            "three_wide_and_infino_top10",
-            "three_similar_and_infino_top10",
-            "five_term_and_infino_top10",
-            "ten_term_and_infino_top10",
-            "wide_3_or_wand_top10",
-            "wide_3_or_bmm_top10",
-            "similar_3_or_wand_top10",
-            "similar_3_or_bmm_top10",
-            "similar_5_or_wand_top10",
-            "similar_5_or_bmm_top10",
-            "similar_10_or_wand_top10",
-            "similar_10_or_bmm_top10",
-        ];
-        for bid in search_ids {
-            let _ = rss::write_rss_stats(group_name::SUPERFILE_FTS_SEARCH, bid, stats);
-        }
-
-        bench_superfile_fts_storage_tiers(c);
-
-        emit_search_markdown();
+fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
+    match mode {
+        BoolMode::Or => InfinoBoolMode::Or,
+        BoolMode::And => InfinoBoolMode::And,
     }
 }
 
-fn bench_superfile_fts_storage_tiers(c: &mut Criterion) {
-    let committed = superfile_object();
+/// WAND+BMW vs MaxScore+BMM p50 for one OR shape, via the infino
+/// internal per-algorithm hook.
+fn probe_algo_p50(reader: &SuperfileReader, terms: &[&str], algo: OrAlgo) -> Duration {
+    let fts = reader.fts().expect("FTS subsection");
+    // Warmup.
+    let _ = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
+        .expect("probe warmup");
+    let mut samples = Vec::with_capacity(HOT_ITERS);
+    for _ in 0..HOT_ITERS {
+        let t = Instant::now();
+        let hits = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
+            .expect("probe search");
+        samples.push(t.elapsed());
+        std::hint::black_box(hits);
+    }
+    p50(&mut samples)
+}
+
+/// Cold-tier p50 per query: fresh disk cache + full object-store cold
+/// open per iteration, reading through the production `DiskCacheStore`.
+fn measure_cold(committed: &tiers::SuperfileCommitted) -> HashMap<&'static str, Duration> {
     let uri = committed.uri;
-
-    for tier in [Tier::Cold] {
-        let mut g = c.benchmark_group(tiers::search_group_name(
-            "superfile_fts",
-            tier,
-            Some(committed.storage_label),
-        ));
-        g.sample_size(10);
-        // Cold rebuilds a fresh cache + full S3 cold open per sample; widen
-        // the cold group so criterion stops warning it can't fit 10
-        // samples in the 5s default.
-        if tier == Tier::Cold {
-            g.measurement_time(Duration::from_secs(30));
+    let mut out = HashMap::new();
+    for q in FTS_BATTERY {
+        let mode = to_infino_mode(q.mode);
+        let query = q.terms.join(" ");
+        let storage = Arc::clone(&committed.storage);
+        let mut samples = Vec::with_capacity(COLD_ITERS);
+        for _ in 0..COLD_ITERS {
+            let (cache_dir, cache) = tiers::fresh_superfile_cache(Arc::clone(&storage));
+            let t0 = Instant::now();
+            tiers::block_on(async {
+                let reader = cache.reader(&uri).await.expect("cold reader");
+                let _ = reader
+                    .bm25_search(FTS_COLUMN, &query, K, mode)
+                    .await
+                    .expect("cold bm25");
+            });
+            samples.push(t0.elapsed());
+            drop(cache);
+            drop(cache_dir);
         }
+        out.insert(q.name, p50(&mut samples));
+    }
+    out
+}
 
-        for (name, terms, mode) in TIER_QUERIES {
-            let mode = *mode;
-            let bench_id = format!("{name}_infino_top10");
-            let query = terms.join(" ");
-            match tier {
-                Tier::Cold => {
-                    let storage = Arc::clone(&committed.storage);
-                    g.bench_function(&bench_id, |b| {
-                        b.iter_custom(|iters| {
-                            let mut total = Duration::ZERO;
-                            for _ in 0..iters {
-                                let (cache_dir, cache) =
-                                    tiers::fresh_superfile_cache(Arc::clone(&storage));
-                                let t0 = Instant::now();
-                                tiers::block_on(async {
-                                    let reader = cache.reader(&uri).await.expect("reader");
-                                    let _ = reader
-                                        .bm25_search(FTS_COLUMN, &query, 10, mode)
-                                        .await
-                                        .expect("bm25");
-                                });
-                                total += t0.elapsed();
-                                drop(cache);
-                                drop(cache_dir);
-                            }
-                            total
-                        });
-                    });
+// ─── Entry point ──────────────────────────────────────────────────────
+
+struct Selection {
+    build: bool,
+    search: bool,
+}
+
+impl Selection {
+    /// Parse the optional `cargo bench -- <filter>` argument. With no
+    /// filter, run both phases.
+    fn from_args() -> Self {
+        let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
+        match filter.as_deref() {
+            None => Self {
+                build: true,
+                search: true,
+            },
+            Some(f) if f.contains("build") => Self {
+                build: true,
+                search: false,
+            },
+            Some(f) if f.contains("search") => Self {
+                build: false,
+                search: true,
+            },
+            // Any other filter (e.g. "superfile_fts") runs everything.
+            Some(_) => Self {
+                build: true,
+                search: true,
+            },
+        }
+    }
+}
+
+/// Bench entry point. Invoked by `benches/fts/main.rs`.
+pub fn run() {
+    let sel = Selection::from_args();
+    if !sel.build && !sel.search {
+        return;
+    }
+
+    let n_docs = corpus::superfile_docs();
+    eprintln!(
+        "[superfile_fts] generating {}-doc corpus...",
+        fmt_count(n_docs)
+    );
+    let corpus = MmapTextCorpus::generate(n_docs, 1);
+    let docs = corpus.rows();
+
+    // Comparable build + hot-search numbers, through the same harness
+    // retrievalbench drives. One build, then the full query battery.
+    eprintln!(
+        "[superfile_fts] run_fts: build + {HOT_ITERS}-iter hot search over {} docs...",
+        fmt_count(n_docs)
+    );
+    // One build at 1 writer (the queryable single superfile) plus a
+    // build-throughput probe at N writers — both through the same
+    // engine-generic driver the comparison uses.
+    let (result, index) = run_fts_with_index::<InfinoFtsEngine>(
+        FTS_COLUMN,
+        &docs,
+        FTS_BATTERY,
+        K,
+        HOT_ITERS,
+        corpus::parallel_writers(),
+    );
+
+    // Run-to-run deltas for every metric below, vs the previous run.
+    let mut report = Report::load("superfile_fts");
+
+    if sel.build {
+        emit_ingest(&mut report, n_docs, &corpus, &result);
+    }
+
+    if sel.search {
+        // Correctness gate on the exact 1-writer artifact measured
+        // above. Do not rebuild another copy for the oracle.
+        eprintln!("[superfile_fts] correctness: using measured 1-writer artifact...");
+        let reader = index.reader();
+        assert_superfile_self_consistent(reader, n_docs);
+        let n_bmw = assert_bmw_matches_brute_force(reader);
+        eprintln!(
+            "[superfile_fts] correctness OK: self-consistent + {n_bmw} queries BMW==brute-force"
+        );
+
+        // Infino-only: per-algorithm probe (WAND+BMW vs MaxScore+BMM).
+        let mut probes: Vec<(&'static str, Duration, Duration)> = Vec::new();
+        for (shape, terms) in PROBE_SHAPES {
+            let wand = probe_algo_p50(reader, terms, OrAlgo::WandBmw);
+            let bmm = probe_algo_p50(reader, terms, OrAlgo::Bmm);
+            probes.push((shape, wand, bmm));
+        }
+        // Cold tier: commit the same bytes to object storage, then read
+        // each query through the production cold path.
+        eprintln!(
+            "[superfile_fts] committing measured 1-writer artifact to object storage for the cold tier..."
+        );
+        let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
+            index.bytes(),
+        )));
+        let cold = measure_cold(&committed);
+
+        emit_search(&mut report, n_docs, &result, &cold, &probes);
+    }
+
+    report.save();
+}
+
+// ─── Result rendering (run-to-run deltas via report.rs) ───────────────
+
+fn headers(cols: &[&str]) -> Vec<String> {
+    cols.iter().map(|s| s.to_string()).collect()
+}
+
+fn ingest_row(
+    label: &str,
+    n_docs: usize,
+    wall: Duration,
+    stats: RssStats,
+    input_bytes: f64,
+) -> Vec<Cell> {
+    let secs = wall.as_secs_f64();
+    let ns = secs * 1e9;
+    let thr = n_docs as f64 / secs;
+    let bw = input_bytes / secs;
+    vec![
+        text(label),
+        metric(ns, fmt_time(ns), Better::Lower),
+        metric(thr, fmt_throughput(thr), Better::Higher),
+        metric(bw, fmt_bandwidth(bw), Better::Higher),
+        metric(
+            stats.peak_rss_bytes as f64,
+            rss::fmt_bytes(stats.peak_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            stats.median_rss_bytes as f64,
+            rss::fmt_bytes(stats.median_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            stats.p90_rss_bytes as f64,
+            rss::fmt_bytes(stats.p90_rss_bytes),
+            Better::Lower,
+        ),
+    ]
+}
+
+fn writer_label(writers: usize) -> String {
+    if writers == 1 {
+        "1 writer".to_string()
+    } else {
+        format!("{writers} writers")
+    }
+}
+
+fn emit_ingest(
+    report: &mut Report,
+    n_docs: usize,
+    corpus: &MmapTextCorpus,
+    result: &EngineFtsResult,
+) {
+    // Logical input payload: total corpus text bytes, identical across
+    // every writer count (the parallel build shards the same corpus).
+    let input_bytes = corpus.total_bytes() as f64;
+    let rows: Vec<Vec<Cell>> = result
+        .builds
+        .iter()
+        .map(|b| {
+            ingest_row(
+                &writer_label(b.writers),
+                n_docs,
+                b.phase.wall,
+                b.phase.rss,
+                input_bytes,
+            )
+        })
+        .collect();
+    let block = Block {
+        subtitle: String::new(),
+        headers: headers(&[
+            "Build",
+            "Time",
+            "Throughput",
+            "Bandwidth",
+            "Peak RSS",
+            "Median RSS",
+            "P90 RSS",
+        ]),
+        rows,
+    };
+    report.emit(&Section {
+        anchor: "bench/fts/superfile/ingest".into(),
+        title: format!(
+            "Superfile FTS — ingest, single-segment / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
+            fmt_count(n_docs)
+        ),
+        note: "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable \
+               commit), through the engine-generic `run_fts` driver the cross-engine comparison also \
+               uses. Rows are by writer count: `1 writer` is the single-threaded build (and the index \
+               queries run against); `N writers` is the sharded parallel build. Bandwidth is over the \
+               logical input text payload. Δ is vs the previous run."
+            .into(),
+        blocks: vec![block],
+    });
+}
+
+fn search_row(
+    name: &'static str,
+    by_name: &HashMap<&'static str, &QueryStats>,
+    cold: &HashMap<&'static str, Duration>,
+) -> Vec<Cell> {
+    let mut cells = vec![text(name)];
+    match by_name.get(&name) {
+        Some(q) => {
+            let hot_ns = q.p50.as_secs_f64() * 1e9;
+            cells.push(metric(hot_ns, fmt_time(hot_ns), Better::Lower));
+            match cold.get(&name) {
+                Some(d) => {
+                    let ns = d.as_secs_f64() * 1e9;
+                    cells.push(metric(ns, fmt_time(ns), Better::Lower));
                 }
-                Tier::Hot => {}
+                None => cells.push(text("—")),
+            }
+            cells.push(metric(
+                q.rss.peak_rss_bytes as f64,
+                rss::fmt_bytes(q.rss.peak_rss_bytes),
+                Better::Lower,
+            ));
+            cells.push(metric(
+                q.rss.median_rss_bytes as f64,
+                rss::fmt_bytes(q.rss.median_rss_bytes),
+                Better::Lower,
+            ));
+            cells.push(metric(
+                q.rss.p90_rss_bytes as f64,
+                rss::fmt_bytes(q.rss.p90_rss_bytes),
+                Better::Lower,
+            ));
+        }
+        None => {
+            for _ in 0..5 {
+                cells.push(text("—"));
             }
         }
-        g.finish();
     }
+    cells
 }
 
-// ─── Markdown summary emitters ────────────────────────────────────────
+fn emit_search(
+    report: &mut Report,
+    n_docs: usize,
+    result: &EngineFtsResult,
+    cold: &HashMap<&'static str, Duration>,
+    probes: &[(&'static str, Duration, Duration)],
+) {
+    let by_name: HashMap<&'static str, &QueryStats> =
+        result.queries.iter().map(|q| (q.name, q)).collect();
 
-mod group_name {
-    pub const SUPERFILE_FTS_BUILD: &str = "superfile_fts_build";
-    pub const SUPERFILE_FTS_SEARCH: &str = "superfile_fts_hot_search";
-}
-
-fn emit_ingest_markdown() {
-    use markdown::{MarkdownSection, fmt_bandwidth, fmt_throughput, fmt_time, read_mean_ns};
-
-    // Logical input payload: total corpus text bytes, identical across
-    // both variants (the rayon variant shards the same corpus).
-    let input_bytes = text_corpus().total_bytes() as f64;
-
-    let mut body = String::new();
-    body.push_str(&format!(
-        "### Superfile FTS — ingest ({N_DOCS} docs, Zipfian, 200 tokens/doc, 10K vocab)\n\n"
-    ));
-    body.push_str(
-        "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit). \
-         Bandwidth (MB/s) is over the logical input text payload.\n\n",
-    );
-    body.push_str(
-        "| Engine                       | Time       | Throughput | Bandwidth  | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
-    );
-    body.push_str(
-        "|------------------------------|------------|------------|------------|-----------|------------|-----------|------------|\n",
-    );
-
-    let group = group_name::SUPERFILE_FTS_BUILD;
-    let one_thread_id = format!("infino_1thread_{N_DOCS}docs");
-    let rayon_id = format!("infino_rayon_default_threads_{N_DOCS}docs");
-    let one_thread = read_mean_ns(group, &one_thread_id);
-    let rayon = read_mean_ns(group, &rayon_id);
-    let one_thread_rss = rss::read_peak_rss_bytes(group, &one_thread_id);
-    let rayon_rss = rss::read_peak_rss_bytes(group, &rayon_id);
-
-    let row = |label: &str, bench_id: &str, ns: Option<f64>, peak: Option<u64>| -> String {
-        let time = ns.map(fmt_time).unwrap_or_else(|| "—".into());
-        let thrpt = ns
-            .map(|n| fmt_throughput((N_DOCS as f64) / (n / 1e9)))
-            .unwrap_or_else(|| "—".into());
-        let bandwidth = ns
-            .map(|n| fmt_bandwidth(input_bytes / (n / 1e9)))
-            .unwrap_or_else(|| "—".into());
-        let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
-        let median_rss = rss::fmt_median_rss(group, bench_id);
-        let p90_rss = rss::fmt_p90_rss(group, bench_id);
-        let rss_delta = rss::fmt_peak_rss_delta(group, bench_id);
-        format!(
-            "| {label:28} | {time:10} | {thrpt:10} | {bandwidth:10} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n"
-        )
+    let search_headers = headers(&["Query", "hot", "cold", "Peak RSS", "Median RSS", "P90 RSS"]);
+    let or_block = Block {
+        subtitle: "OR queries".into(),
+        headers: search_headers.clone(),
+        rows: OR_QUERIES
+            .iter()
+            .map(|&n| search_row(n, &by_name, cold))
+            .collect(),
+    };
+    let and_block = Block {
+        subtitle: "AND queries".into(),
+        headers: search_headers,
+        rows: AND_QUERIES
+            .iter()
+            .map(|&n| search_row(n, &by_name, cold))
+            .collect(),
+    };
+    let probe_block = Block {
+        subtitle: "Per-algorithm probes (WAND+BMW vs MaxScore+BMM)".into(),
+        headers: headers(&["Shape", "WAND+BMW", "MaxScore+BMM"]),
+        rows: probes
+            .iter()
+            .map(|(shape, wand, bmm)| {
+                let w = wand.as_secs_f64() * 1e9;
+                let b = bmm.as_secs_f64() * 1e9;
+                vec![
+                    text(*shape),
+                    metric(w, fmt_time(w), Better::Lower),
+                    metric(b, fmt_time(b), Better::Lower),
+                ]
+            })
+            .collect(),
     };
 
-    body.push_str(&row(
-        "infino_1thread",
-        &one_thread_id,
-        one_thread,
-        one_thread_rss,
-    ));
-    body.push_str(&row(
-        "infino_rayon_default_threads",
-        &rayon_id,
-        rayon,
-        rayon_rss,
-    ));
-
-    markdown::emit(&MarkdownSection {
-        anchor_id: "bench/fts/superfile/ingest".into(),
-        body,
+    report.emit(&Section {
+        anchor: "bench/fts/superfile/search".into(),
+        title: format!(
+            "Superfile FTS — search, single-segment / in-memory ({} docs)",
+            fmt_count(n_docs)
+        ),
+        note: "Hot = `SuperfileReader::open` in memory (p50 via the engine-generic `run_fts` driver); \
+               cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` \
+               (production cold path). Δ is vs the previous run."
+            .into(),
+        blocks: vec![or_block, and_block, probe_block],
     });
 }
-
-fn emit_search_markdown() {
-    use markdown::{MarkdownSection, fmt_time, read_mean_ns};
-
-    let mut body = String::new();
-    body.push_str(&format!("### Superfile FTS — search ({N_DOCS} docs)\n\n"));
-    body.push_str(
-        "Hot = `SuperfileReader::open` in memory; cold = same `.parquet` on object storage via \
-         `DiskCacheStore::reader` → `bm25_search` (production cold path).\n\n",
-    );
-
-    let group = group_name::SUPERFILE_FTS_SEARCH;
-    let queries_or = [
-        "single_rare",
-        "single_df1",
-        "single_common",
-        "two_term_or",
-        "three_wide_or",
-        "three_similar_or",
-        "five_term_or",
-        "ten_term_or",
-    ];
-    let queries_and = [
-        "two_term_and",
-        "three_wide_and",
-        "three_similar_and",
-        "five_term_and",
-        "ten_term_and",
-    ];
-
-    body.push_str("**OR queries:**\n\n");
-    body.push_str(
-        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
-    );
-    body.push_str(
-        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
-    );
-    for q in queries_or {
-        let bid = format!("{q}_infino_top10");
-        let hot = read_mean_ns(group, &bid);
-        let cold = markdown::read_tier_mean_ns("superfile_fts", "cold", &bid);
-        let rss_cell = rss::read_peak_rss_bytes(group, &bid)
-            .map(rss::fmt_bytes)
-            .unwrap_or_else(|| "—".into());
-        let median_rss = rss::fmt_median_rss(group, &bid);
-        let p90_rss = rss::fmt_p90_rss(group, &bid);
-        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
-        body.push_str(&format!(
-            "| {q:14} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
-            hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-            cold.map(fmt_time).unwrap_or_else(|| "—".into()),
-        ));
-    }
-
-    body.push_str("\n**AND queries:**\n\n");
-    body.push_str(
-        "| Query          | hot        | cold       | Peak RSS  | Median RSS | P90 RSS   | Peak RSS Δ |\n",
-    );
-    body.push_str(
-        "|----------------|------------|------------|-----------|------------|-----------|------------|\n",
-    );
-    for q in queries_and {
-        let bid = format!("{q}_infino_top10");
-        let hot = read_mean_ns(group, &bid);
-        let cold = markdown::read_tier_mean_ns("superfile_fts", "cold", &bid);
-        let rss_cell = rss::read_peak_rss_bytes(group, &bid)
-            .map(rss::fmt_bytes)
-            .unwrap_or_else(|| "—".into());
-        let median_rss = rss::fmt_median_rss(group, &bid);
-        let p90_rss = rss::fmt_p90_rss(group, &bid);
-        let rss_delta = rss::fmt_peak_rss_delta(group, &bid);
-        body.push_str(&format!(
-            "| {q:14} | {} | {} | {rss_cell:9} | {median_rss:10} | {p90_rss:9} | {rss_delta:10} |\n",
-            hot.map(fmt_time).unwrap_or_else(|| "—".into()),
-            cold.map(fmt_time).unwrap_or_else(|| "—".into()),
-        ));
-    }
-
-    body.push('\n');
-    body.push_str("**Per-algorithm probes** (WAND+BMW vs MaxScore+BMM):\n\n");
-    body.push_str("| Shape         | WAND+BMW   | MaxScore+BMM |\n");
-    body.push_str("|---------------|------------|--------------|\n");
-    for shape in ["wide_3_or", "similar_3_or", "similar_5_or", "similar_10_or"] {
-        let wand = read_mean_ns(group, &format!("{shape}_wand_top10"));
-        let bmm = read_mean_ns(group, &format!("{shape}_bmm_top10"));
-        let wand_s = wand.map(fmt_time).unwrap_or_else(|| "—".into());
-        let bmm_s = bmm.map(fmt_time).unwrap_or_else(|| "—".into());
-        body.push_str(&format!("| {shape:13} | {wand_s:10} | {bmm_s:12} |\n"));
-    }
-
-    markdown::emit(&MarkdownSection {
-        anchor_id: "bench/fts/superfile/search".into(),
-        body,
-    });
-}
-
-criterion_group!(benches, bench);

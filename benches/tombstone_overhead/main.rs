@@ -24,35 +24,27 @@
 //!   `bitmap.is_empty()` short-circuit is NOT taken on the
 //!   read path. Stresses the full filter loop.
 //!
-//! ## Diff against a baseline
+//! Reports the per-state p50 for an FTS (BM25) query and a SQL
+//! `COUNT(*)` query through the custom report harness (terminal +,
+//! when `INFINO_BENCH_UPDATE_README=1`, the `bench/tombstone/overhead`
+//! README anchor), with run-to-run deltas. A `clean` regression points
+//! at lookup / TTL costs; a `one_percent` regression points at the
+//! filter-hook path; a `ten_percent_churned` regression points at filter
+//! cost on tombstone-heavy superfiles.
 //!
-//! Criterion saves runs to `target/criterion/`. To compare this
-//! branch's overhead to `main`:
+//! ## Invocation
 //!
 //! ```text
-//! git checkout main
 //! cargo bench --bench tombstone-overhead
-//! cp -r target/criterion target/criterion-main-baseline
-//! git checkout <this branch>
-//! cargo bench --bench tombstone-overhead
-//! # Compare `target/criterion-main-baseline/<group>` to
-//! # `target/criterion/<group>` per sub-bench (estimates.json
-//! # in each carries the p50 / p95 in ns).
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench tombstone-overhead
 //! ```
-//!
-//! Target per-sub-bench budget: `delta ≤ max(2 % × base_p50,
-//! 1 µs)`. Localize a regression by group: a `clean` regression
-//! points at lookup / TTL costs; a `one_percent` regression
-//! points at the filter-hook path; a `ten_percent_churned`
-//! regression points at filter cost on tombstone-heavy
-//! superfiles.
 
 use std::hint::black_box;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use chrono::Utc;
-use criterion::{Criterion, criterion_group, criterion_main};
 use infino::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::superfile::fts::reader::BoolMode;
 use infino::supertable::Supertable;
@@ -62,6 +54,9 @@ use infino::supertable::wal::state_doc::{
     OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
 };
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino_bench_utils::markdown::fmt_time;
+use infino_bench_utils::report::{Better, Block, Cell, Report, Section, metric, text};
+use infino_bench_utils::rss::{self, PeakSampler, RssStats};
 use tempfile::TempDir;
 
 // ─── Sizing ───────────────────────────────────────────────────────────
@@ -88,6 +83,10 @@ const TOP_K: usize = 10;
 /// superfiles in pruning (varies with the corpus); the cache
 /// hook fires once per touched superfile.
 const QUERY_TERM: &str = "alpha";
+
+/// Timed repetitions per query (after one warmup); report the p50.
+/// Matches the Criterion `sample_size(20)` the bench previously used.
+const ITERS: usize = 20;
 
 // ─── Fixtures ─────────────────────────────────────────────────────────
 
@@ -139,6 +138,16 @@ enum WorkloadState {
     Clean,
     OnePercent,
     TenPercentChurned,
+}
+
+impl WorkloadState {
+    fn label(self) -> &'static str {
+        match self {
+            WorkloadState::Clean => "clean",
+            WorkloadState::OnePercent => "one_percent",
+            WorkloadState::TenPercentChurned => "ten_percent_churned",
+        }
+    }
 }
 
 /// Tombstone the first `fraction` of each superfile's docs.
@@ -200,114 +209,124 @@ fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
     }
 }
 
-// Cached fixtures so each criterion sample reuses one set.
-fn fixture_clean() -> &'static Supertable {
-    static F: OnceLock<(TempDir, Supertable)> = OnceLock::new();
-    &F.get_or_init(|| build_supertable(WorkloadState::Clean)).1
+// ─── Measurement ──────────────────────────────────────────────────────
+
+fn p50(samples: &mut [Duration]) -> Duration {
+    samples.sort_unstable();
+    samples[(samples.len() - 1) / 2]
 }
 
-fn fixture_one_percent() -> &'static Supertable {
-    static F: OnceLock<(TempDir, Supertable)> = OnceLock::new();
-    &F.get_or_init(|| build_supertable(WorkloadState::OnePercent))
-        .1
+/// p50 of the BM25 query over `ITERS` timed runs (after one warmup).
+fn measure_fts(st: &Supertable) -> Duration {
+    let warm = st
+        .bm25_search("title", QUERY_TERM, TOP_K, BoolMode::Or)
+        .expect("fts");
+    black_box(warm);
+    let mut samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let t0 = Instant::now();
+        let hits = st
+            .bm25_search(
+                black_box("title"),
+                black_box(QUERY_TERM),
+                black_box(TOP_K),
+                BoolMode::Or,
+            )
+            .expect("fts");
+        samples.push(t0.elapsed());
+        black_box(hits);
+    }
+    p50(&mut samples)
 }
 
-fn fixture_ten_percent_churned() -> &'static Supertable {
-    static F: OnceLock<(TempDir, Supertable)> = OnceLock::new();
-    &F.get_or_init(|| build_supertable(WorkloadState::TenPercentChurned))
-        .1
+/// p50 of the SQL `COUNT(*)` query over `ITERS` timed runs (after one warmup).
+fn measure_sql(st: &Supertable) -> Duration {
+    let warm = st
+        .query_sql("SELECT COUNT(*) FROM supertable")
+        .expect("sql");
+    black_box(warm);
+    let mut samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let t0 = Instant::now();
+        let batches = st
+            .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
+            .expect("sql");
+        samples.push(t0.elapsed());
+        black_box(batches);
+    }
+    p50(&mut samples)
 }
 
-// ─── Benches ──────────────────────────────────────────────────────────
-
-fn bench_fts(c: &mut Criterion) {
-    let mut g = c.benchmark_group("tombstone_overhead_fts");
-    g.sample_size(20);
-
-    g.bench_function("clean", |b| {
-        let st = fixture_clean();
-        b.iter(|| {
-            let hits = st
-                .bm25_search(
-                    black_box("title"),
-                    black_box(QUERY_TERM),
-                    black_box(TOP_K),
-                    BoolMode::Or,
-                )
-                .expect("fts");
-            black_box(hits);
-        });
-    });
-
-    g.bench_function("one_percent", |b| {
-        let st = fixture_one_percent();
-        b.iter(|| {
-            let hits = st
-                .bm25_search(
-                    black_box("title"),
-                    black_box(QUERY_TERM),
-                    black_box(TOP_K),
-                    BoolMode::Or,
-                )
-                .expect("fts");
-            black_box(hits);
-        });
-    });
-
-    g.bench_function("ten_percent_churned", |b| {
-        let st = fixture_ten_percent_churned();
-        b.iter(|| {
-            let hits = st
-                .bm25_search(
-                    black_box("title"),
-                    black_box(QUERY_TERM),
-                    black_box(TOP_K),
-                    BoolMode::Or,
-                )
-                .expect("fts");
-            black_box(hits);
-        });
-    });
-
-    g.finish();
+fn rss_cells(stats: RssStats) -> Vec<Cell> {
+    vec![
+        metric(
+            stats.peak_rss_bytes as f64,
+            rss::fmt_bytes(stats.peak_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            stats.median_rss_bytes as f64,
+            rss::fmt_bytes(stats.median_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            stats.p90_rss_bytes as f64,
+            rss::fmt_bytes(stats.p90_rss_bytes),
+            Better::Lower,
+        ),
+    ]
 }
 
-fn bench_sql(c: &mut Criterion) {
-    let mut g = c.benchmark_group("tombstone_overhead_sql");
-    g.sample_size(20);
-
-    g.bench_function("clean", |b| {
-        let st = fixture_clean();
-        b.iter(|| {
-            let batches = st
-                .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
-                .expect("sql");
-            black_box(batches);
-        });
-    });
-
-    g.bench_function("one_percent", |b| {
-        let st = fixture_one_percent();
-        b.iter(|| {
-            let batches = st
-                .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
-                .expect("sql");
-            black_box(batches);
-        });
-    });
-
-    g.bench_function("ten_percent_churned", |b| {
-        let st = fixture_ten_percent_churned();
-        b.iter(|| {
-            let batches = st
-                .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
-                .expect("sql");
-            black_box(batches);
-        });
-    });
-
-    g.finish();
+fn state_row(state: WorkloadState) -> Vec<Cell> {
+    let (_dir, st) = build_supertable(state);
+    let sampler = PeakSampler::start_default();
+    let fts = measure_fts(&st).as_secs_f64() * 1e9;
+    let sql = measure_sql(&st).as_secs_f64() * 1e9;
+    let rss = sampler.stop_stats();
+    let mut cells = vec![
+        text(state.label()),
+        metric(fts, fmt_time(fts), Better::Lower),
+        metric(sql, fmt_time(sql), Better::Lower),
+    ];
+    cells.extend(rss_cells(rss));
+    cells
 }
 
-criterion_group!(benches, bench_fts, bench_sql);
-criterion_main!(benches);
+fn main() {
+    eprintln!(
+        "[tombstone-overhead] {N_DOCS} docs / {APPEND_CHUNKS} superfiles; measuring FTS + SQL p50 across clean / one_percent / ten_percent_churned..."
+    );
+    let rows = vec![
+        state_row(WorkloadState::Clean),
+        state_row(WorkloadState::OnePercent),
+        state_row(WorkloadState::TenPercentChurned),
+    ];
+
+    let mut report = Report::load("tombstone-overhead");
+    report.emit(&Section {
+        anchor: "bench/tombstone/overhead".into(),
+        title: format!(
+            "Tombstone overhead — reader-side filter hot path ({N_DOCS} docs, {APPEND_CHUNKS} superfiles)"
+        ),
+        note: "Per-query p50 across three tombstone states. `clean` is the empty-bitmap \
+               short-circuit floor; `one_percent` tombstones the first 1% of each superfile's \
+               docs (driven through the WAL `run_tombstone_phase` pipeline); `ten_percent_churned` \
+               tombstones 10% then re-tombstones the same rows to exercise the CAS-loss / \
+               bitmap-union path. FTS is a top-10 BM25 OR query for `alpha`; SQL is `COUNT(*)`. \
+               Δ is vs the previous run."
+            .into(),
+        blocks: vec![Block {
+            subtitle: String::new(),
+            headers: vec![
+                "State".into(),
+                "FTS p50".into(),
+                "SQL COUNT(*) p50".into(),
+                "Peak RSS".into(),
+                "Median RSS".into(),
+                "P90 RSS".into(),
+            ],
+            rows,
+        }],
+    });
+    report.save();
+}

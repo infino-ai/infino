@@ -32,7 +32,7 @@ pub fn ensure_ingest(reason: &str) -> &'static IngestResult {
     if INGEST.get().is_none() {
         eprintln!(
             "[supertable_all] ingesting {} docs ({} commits) to object storage for {reason}...",
-            supertable::N_DOCS,
+            supertable::n_docs(),
             supertable::N_COMMIT_CHUNKS
         );
     }
@@ -48,29 +48,8 @@ pub fn ensure_ingest(reason: &str) -> &'static IngestResult {
     })
 }
 
-/// Whether Criterion's substring filter selects this bench family.
-///
-/// Criterion calls every registered bench function even when its filter later
-/// skips all benchmarks inside that function. Use this at the top of expensive
-/// bench functions so build-only filters don't run search setup, correctness,
-/// or a 10M fixture build.
-pub fn criterion_filter_selects(aliases: &[&str], groups: &[&str]) -> bool {
-    let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
-    let Some(filter) = filter else {
-        return true;
-    };
-    aliases
-        .iter()
-        .any(|alias| *alias == filter || filter.contains(alias))
-        || groups
-            .iter()
-            .any(|group| group.contains(&filter) || filter.contains(group))
-}
-
 /// Search benches use the shared combined fixture. If an ingest group already
-/// ran in this Criterion process, reuse it; otherwise build it here. The
-/// expensive call sites are guarded by [`criterion_filter_selects`], so
-/// build-only filters do not accidentally trigger this path.
+/// ran in this process, reuse it; otherwise build it here.
 pub fn ensure_ingest_for_search(reason: &str) -> &'static IngestResult {
     if let Some(built) = INGEST.get() {
         return built;
@@ -93,7 +72,7 @@ pub fn ensure_fts_ingest(reason: &str) -> &'static IngestResult {
     if FTS_INGEST.get().is_none() {
         eprintln!(
             "[supertable_fts] ingesting {} docs (FTS-only) to object storage for {reason}...",
-            supertable::N_DOCS
+            supertable::n_docs()
         );
     }
     FTS_INGEST.get_or_init(|| {
@@ -122,7 +101,7 @@ pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
     if VEC_INGEST.get().is_none() {
         eprintln!(
             "[supertable_vec] ingesting {} docs (vector-only) to object storage for {reason}...",
-            supertable::N_DOCS
+            supertable::n_docs()
         );
     }
     VEC_INGEST.get_or_init(|| {

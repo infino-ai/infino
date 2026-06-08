@@ -213,7 +213,6 @@ infino = { path = ".", features = ["test-helpers"] }
 infino-bench-utils = { path = "benches/utils" }
 
 proptest = "1"
-criterion = "0.8"
 hdrhistogram = "7"
 # s3s + s3s-fs power the "real S3 wire protocol" smoke test.
 # s3s is the S3-compatible HTTP server library; s3s-fs is its
@@ -282,6 +281,11 @@ harness = false
 [[bench]]
 name = "superfile_vector"
 path = "benches/vector/main.rs"
+harness = false
+
+[[bench]]
+name = "sql"
+path = "benches/sql/main.rs"
 harness = false
 
 [[bench]]

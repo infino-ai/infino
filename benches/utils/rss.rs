@@ -30,13 +30,9 @@
 //! training + assignment plateaus are seconds long). Faster
 //! sampling adds noise without adding signal.
 //!
-//! [`write_rss_stats`] / [`read_peak_rss_bytes`] persist + read
-//! a per-bench `rss.json` next to criterion's `estimates.json`
-//! so the markdown emitters can pick memory stats up by the
-//! same `(group, bench)` lookup shape they use for timings.
+//! Run-to-run persistence lives in `report.rs`; this module only
+//! samples and formats RSS.
 
-use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -92,14 +88,6 @@ impl RssStats {
             peak_rss_bytes: *samples.last().expect("rss samples is non-empty"),
             median_rss_bytes: percentile_nearest_rank(&samples, 50),
             p90_rss_bytes: percentile_nearest_rank(&samples, 90),
-        }
-    }
-
-    fn peak_only(peak_rss_bytes: u64) -> Self {
-        Self {
-            peak_rss_bytes,
-            median_rss_bytes: peak_rss_bytes,
-            p90_rss_bytes: peak_rss_bytes,
         }
     }
 }
@@ -184,124 +172,6 @@ pub fn fmt_bytes(b: u64) -> String {
     } else {
         format!("{b} B")
     }
-}
-
-/// Persist a peak RSS sample next to criterion's artifacts:
-///
-/// `target/criterion/<group>/<bench>/new/rss.json`
-///
-/// Before writing, the previous `new/rss.json` is moved to
-/// `base/rss.json`, mirroring criterion's own `new`/`base`
-/// rotation for `estimates.json`. Keeping the artifact beside
-/// `estimates.json` makes the markdown emitters use the same
-/// `(group, bench)` lookup shape for both latency and memory.
-pub fn write_peak_rss(group: &str, bench: &str, peak_rss_bytes: u64) -> std::io::Result<()> {
-    write_rss_stats(group, bench, RssStats::peak_only(peak_rss_bytes))
-}
-
-pub fn write_rss_stats(group: &str, bench: &str, stats: RssStats) -> std::io::Result<()> {
-    let dir = criterion_bench_dir(group, bench);
-    let new_dir = dir.join("new");
-    let base_dir = dir.join("base");
-    std::fs::create_dir_all(&new_dir)?;
-    if let Ok(existing) = std::fs::read(new_dir.join("rss.json")) {
-        std::fs::create_dir_all(&base_dir)?;
-        std::fs::write(base_dir.join("rss.json"), existing)?;
-    }
-    let body = serde_json::json!({
-        "peak_rss_bytes": stats.peak_rss_bytes,
-        "median_rss_bytes": stats.median_rss_bytes,
-        "p90_rss_bytes": stats.p90_rss_bytes,
-    });
-    std::fs::write(
-        new_dir.join("rss.json"),
-        serde_json::to_vec_pretty(&body).expect("serialize rss json"),
-    )
-}
-
-/// Read a locally recorded peak RSS sample. `None` if the
-/// file doesn't exist (bench was filtered out or hasn't run
-/// yet) or the JSON can't be parsed.
-pub fn read_peak_rss_bytes(group: &str, bench: &str) -> Option<u64> {
-    read_rss_field(group, bench, "peak_rss_bytes")
-}
-
-pub fn read_median_rss_bytes(group: &str, bench: &str) -> Option<u64> {
-    read_rss_field(group, bench, "median_rss_bytes")
-}
-
-pub fn read_p90_rss_bytes(group: &str, bench: &str) -> Option<u64> {
-    read_rss_field(group, bench, "p90_rss_bytes")
-}
-
-pub fn fmt_median_rss(group: &str, bench: &str) -> String {
-    read_median_rss_bytes(group, bench)
-        .map(fmt_bytes)
-        .unwrap_or_else(|| "—".into())
-}
-
-pub fn fmt_p90_rss(group: &str, bench: &str) -> String {
-    read_p90_rss_bytes(group, bench)
-        .map(fmt_bytes)
-        .unwrap_or_else(|| "—".into())
-}
-
-fn read_rss_field(group: &str, bench: &str, field: &str) -> Option<u64> {
-    let dir = criterion_bench_dir(group, bench);
-    let path = dir.join("new").join("rss.json");
-    let text = std::fs::read_to_string(&path)
-        .or_else(|_| std::fs::read_to_string(dir.join("rss.json")))
-        .ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    v.get(field)
-        .and_then(Value::as_u64)
-        .or_else(|| v.get("peak_rss_bytes")?.as_u64())
-}
-
-/// Read the previous run's peak RSS sample (`base/rss.json`).
-pub fn read_base_peak_rss_bytes(group: &str, bench: &str) -> Option<u64> {
-    let path = criterion_bench_dir(group, bench)
-        .join("base")
-        .join("rss.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    v.get("peak_rss_bytes")?.as_u64()
-}
-
-/// Format the RSS delta for markdown tables. Uses a 5% noise band,
-/// matching criterion's default practical-significance threshold.
-pub fn fmt_peak_rss_delta(group: &str, bench: &str) -> String {
-    let Some(new) = read_peak_rss_bytes(group, bench) else {
-        return "—".into();
-    };
-    let Some(base) = read_base_peak_rss_bytes(group, bench) else {
-        return "—".into();
-    };
-    if base == 0 {
-        return "—".into();
-    }
-    let pct = ((new as f64 - base as f64) / base as f64) * 100.0;
-    let label = if pct <= -5.0 {
-        "improved"
-    } else if pct >= 5.0 {
-        "regressed"
-    } else {
-        "no change"
-    };
-    format!("{pct:+.1}% {label}")
-}
-
-/// `$CARGO_TARGET_DIR/criterion/<group>/<bench>` if `CARGO_TARGET_DIR`
-/// is set (criterion writes there when the env var is exported), else
-/// workspace-relative `target/criterion/<group>/<bench>`. Tracking
-/// criterion's own behavior keeps `rss.json` next to `estimates.json`
-/// on every host, including CI where the target dir is redirected
-/// outside the workspace.
-fn criterion_bench_dir(group: &str, bench: &str) -> PathBuf {
-    let base = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"));
-    base.join("criterion").join(group).join(bench)
 }
 
 #[cfg(test)]

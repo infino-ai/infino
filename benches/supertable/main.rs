@@ -1,19 +1,14 @@
-//! Supertable bench bundle (infino-only).
-//!
-//! Flow: `corpus` (synthetic stream) → `ingest` (object storage) →
-//! `bench/supertable` (ingest timing + FTS search + vector search).
+//! Supertable object-store bench bundle (infino-only entry point). Uses
+//! Infino's custom benchmark harness directly.
 //!
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench supertable_all                         # all supertable benches
-//! cargo bench --bench supertable_all -- supertable_vec       # vector groups
-//! cargo bench --bench supertable_all -- supertable_fts       # FTS groups
-//! cargo bench --bench supertable_all -- _build               # shared ingest group
-//! cargo bench --bench supertable_all -- _search              # search groups
+//! cargo bench --bench supertable_all
+//! INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
 //! ```
 
-use infino_bench_utils::bench::supertable;
-
-criterion::criterion_main!(supertable::benches);
+fn main() {
+    infino_bench_utils::supertable_bench::run();
+}

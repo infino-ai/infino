@@ -80,10 +80,10 @@ the suite and `make ci` before opening a pull request. See
 
 ## Performance
 
-Benchmarks live in the in-tree
-[criterion](https://github.com/bheisler/criterion.rs) harness under
-[`benches/`](benches/). Run `cargo bench` to reproduce them on your
-hardware.
+Benchmarks live under [`benches/`](benches/) and use Infino's custom
+benchmark harness so build, correctness, hot reads, cold object-store
+reads, RSS, and markdown output all share one measured lifecycle. Run
+`cargo bench` to reproduce them on your hardware.
 
 ## Tests
 

@@ -14,18 +14,31 @@
 //! Defaults are sized so the bench runs in seconds on a
 //! developer laptop. Larger sizes are gated behind env vars
 //! (e.g. `INFINO_BENCH_UPDATE_N_DOCS=10000000` for the
-//! 10M-doc scale-out shape).
+//! 10M-doc scale-out shape). Results render through the custom
+//! report harness (terminal +, when `INFINO_BENCH_UPDATE_README=1`,
+//! the `bench/supertable_update/*` README anchors) with run-to-run
+//! deltas.
+//!
+//! ## Invocation
+//!
+//! ```text
+//! cargo bench --bench supertable-update
+//! INFINO_BENCH_UPDATE_N_DOCS=10000000 cargo bench --bench supertable-update
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable-update
+//! ```
 
 use std::env;
 use std::hint::black_box;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use arrow_array::Array;
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::prelude::{col, lit};
 use infino::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino_bench_utils::markdown::{fmt_count, fmt_throughput, fmt_time};
+use infino_bench_utils::report::{Better, Block, Cell, Report, Section, metric, text};
+use infino_bench_utils::rss::{self, PeakSampler, RssStats};
 use tempfile::TempDir;
 
 /// Doc count for the baseline ingest. Override via
@@ -39,8 +52,7 @@ fn n_docs() -> usize {
 
 /// Number of single-row mutations to drive after ingest.
 /// Override via `INFINO_BENCH_UPDATE_N_MUTATIONS`. Default
-/// sized so the criterion timer can sample at least a handful
-/// of iterations.
+/// sized so the timer can sample a handful of iterations.
 fn n_mutations() -> usize {
     env::var("INFINO_BENCH_UPDATE_N_MUTATIONS")
         .ok()
@@ -66,6 +78,26 @@ fn build_supertable_with_ingest(n: usize) -> (TempDir, Supertable) {
     (dir, st)
 }
 
+fn rss_cells(stats: RssStats) -> Vec<Cell> {
+    vec![
+        metric(
+            stats.peak_rss_bytes as f64,
+            rss::fmt_bytes(stats.peak_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            stats.median_rss_bytes as f64,
+            rss::fmt_bytes(stats.median_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            stats.p90_rss_bytes as f64,
+            rss::fmt_bytes(stats.p90_rss_bytes),
+            Better::Lower,
+        ),
+    ]
+}
+
 /// Total live row count via SQL `COUNT(*)`.
 fn count_rows(st: &Supertable) -> i64 {
     let batches = st
@@ -79,76 +111,60 @@ fn count_rows(st: &Supertable) -> i64 {
         .value(0)
 }
 
-// ─── Bench: ingest ───────────────────────────────────────────────────
+// ─── Ingest ───────────────────────────────────────────────────────────
 
-fn bench_ingest(c: &mut Criterion) {
-    let n = n_docs();
-    let mut g = c.benchmark_group("supertable_update_ingest");
-    g.sample_size(10);
-    g.throughput(Throughput::Elements(n as u64));
-    g.bench_function("baseline_ingest", |b| {
-        b.iter_with_large_drop(|| build_supertable_with_ingest(black_box(n)));
-    });
-    g.finish();
+/// Time one baseline ingest of `n` rows; returns the wall time + RSS. The
+/// built supertable is dropped before returning (large-drop excluded
+/// from the timed span, matching the old `iter_with_large_drop`).
+fn measure_ingest(n: usize) -> (Duration, RssStats) {
+    let sampler = PeakSampler::start_default();
+    let t0 = Instant::now();
+    let built = build_supertable_with_ingest(black_box(n));
+    let wall = t0.elapsed();
+    let rss = sampler.stop_stats();
+    drop(built);
+    (wall, rss)
 }
 
-// ─── Bench: deletes ──────────────────────────────────────────────────
+// ─── Deletes ──────────────────────────────────────────────────────────
 
-fn bench_deletes(c: &mut Criterion) {
-    let n = n_docs();
-    let m = n_mutations();
+/// Drive `m` distinct single-row deletes against a fresh `n`-row table,
+/// one `commit()` per delete. Returns the wall time and asserts the
+/// exact end-state row count. Each delete targets a fresh, still-present
+/// row (`row{i:08}`); the counter runs monotonically.
+fn measure_deletes(n: usize, m: usize) -> (Duration, RssStats) {
     let (_dir, st) = build_supertable_with_ingest(n);
+    let sampler = PeakSampler::start_default();
+    let t0 = Instant::now();
+    for i in 0..m as u64 {
+        let mut w = st.writer().expect("writer");
+        let title = format!("row{i:08}");
+        let pending = w.delete(col("title").eq(lit(title))).expect("delete");
+        black_box(pending);
+        black_box(w.commit().expect("commit"));
+    }
+    let wall = t0.elapsed();
+    let rss = sampler.stop_stats();
 
-    let mut g = c.benchmark_group("supertable_update_delete");
-    g.sample_size(10);
-    g.throughput(Throughput::Elements(m as u64));
-    // `i` lives outside the bench closure on purpose: criterion calls
-    // that closure several times (estimate, warm-up, measurement), and
-    // the deletes mutate the one reused supertable. A counter reset to
-    // 0 on a later invocation would re-target already-tombstoned rows
-    // and silently no-op, so it must run monotonically across them.
-    let mut i: u64 = 0;
-    g.bench_function("single_row_predicate_deletes", |b| {
-        // Delete distinct rows by predicate, one `commit()` per delete,
-        // against a single reused supertable — no per-iteration
-        // rebuild. Each delete targets a fresh, still-present row
-        // (`row{i:08}`). Unlike the update chain a delete is terminal,
-        // so this consumes the corpus: the `n`-row pool bounds how many
-        // deletes a run can make before predicates start matching
-        // nothing (ample at the scale-out sizes).
-        b.iter(|| {
-            for _ in 0..m {
-                let mut w = st.writer().expect("writer");
-                let title = format!("row{i:08}");
-                let pending = w.delete(col("title").eq(lit(title))).expect("delete");
-                black_box(pending);
-                black_box(w.commit().expect("commit"));
-                i += 1;
-            }
-        });
-    });
-    g.finish();
-
-    // Exact end-state: each of the `i` delete attempts removed a
+    // Exact end-state: each of the `m` delete attempts removed a
     // distinct row while one was still present, so exactly
-    // `min(i, n)` rows are gone and `n - min(i, n)` remain. Asserting
-    // the exact count (not just `< n`) catches both under- and
-    // over-deletion — e.g. a predicate that silently matched nothing
-    // or matched more than one row.
-    let expected = (n as u64).saturating_sub(i) as i64;
+    // `min(m, n)` rows are gone and `n - min(m, n)` remain.
+    let expected = (n as u64).saturating_sub(m as u64) as i64;
     assert_eq!(
         count_rows(&st),
         expected,
-        "after {i} single-row deletes over an {n}-row table, \
+        "after {m} single-row deletes over an {n}-row table, \
          expected {expected} rows to remain"
     );
+    (wall, rss)
 }
 
-// ─── Bench: updates ──────────────────────────────────────────────────
+// ─── Updates ──────────────────────────────────────────────────────────
 
-fn bench_updates(c: &mut Criterion) {
-    let n = n_docs();
-    let m = n_mutations();
+/// Rewrite one row `m` times (`target-{i}` -> `target-{i+1}`) against a
+/// fresh `n`-row table, one `commit()` per update. Returns the wall time
+/// and asserts the row count is preserved (`n + 1`).
+fn measure_updates(n: usize, m: usize) -> (Duration, RssStats) {
     let (_dir, st) = build_supertable_with_ingest(n);
 
     // Seed the single row this bench rewrites, at generation 0. It
@@ -160,41 +176,21 @@ fn bench_updates(c: &mut Criterion) {
         w.commit().expect("commit");
     }
 
-    let mut g = c.benchmark_group("supertable_update_update");
-    g.sample_size(10);
-    g.throughput(Throughput::Elements(m as u64));
-    // `i` lives outside the bench closure on purpose: criterion calls
-    // that closure several times (estimate, warm-up, measurement), and
-    // the chain's state lives in the one reused supertable. A counter
-    // reset to 0 on a later invocation would look for `target-0` —
-    // long since rewritten to `target-{N}` — and fail the cardinality
-    // contract with `matched: 0`. It must run monotonically across all
-    // invocations.
-    let mut i: u64 = 0;
-    g.bench_function("single_row_predicate_updates", |b| {
-        // Rewrite one row over and over, advancing a generation suffix:
-        // `target-{i}` -> `target-{i+1}`. Each step must `commit()`
-        // before the next, because `update` resolves its predicate
-        // against the *committed* manifest snapshot — the previous
-        // rename has to be durable for the next predicate to match.
-        // The same supertable is reused throughout — no per-iteration
-        // rebuild.
-        b.iter(|| {
-            for _ in 0..m {
-                let mut w = st.writer().expect("writer");
-                let from = format!("target-{i}");
-                let to = format!("target-{}", i + 1);
-                let replacement = build_title_batch(&[&to]);
-                let pending = w
-                    .update(col("title").eq(lit(from)), replacement)
-                    .expect("update");
-                black_box(pending);
-                black_box(w.commit().expect("commit"));
-                i += 1;
-            }
-        });
-    });
-    g.finish();
+    let sampler = PeakSampler::start_default();
+    let t0 = Instant::now();
+    for i in 0..m as u64 {
+        let mut w = st.writer().expect("writer");
+        let from = format!("target-{i}");
+        let to = format!("target-{}", i + 1);
+        let replacement = build_title_batch(&[&to]);
+        let pending = w
+            .update(col("title").eq(lit(from)), replacement)
+            .expect("update");
+        black_box(pending);
+        black_box(w.commit().expect("commit"));
+    }
+    let wall = t0.elapsed();
+    let rss = sampler.stop_stats();
 
     // Update preserves the row count: the `n`-row corpus plus the
     // single rewritten target row.
@@ -204,7 +200,96 @@ fn bench_updates(c: &mut Criterion) {
         "update changed the row count; expected {}",
         n + 1
     );
+    (wall, rss)
 }
 
-criterion_group!(benches, bench_ingest, bench_deletes, bench_updates);
-criterion_main!(benches);
+// ─── Entry point ──────────────────────────────────────────────────────
+
+fn main() {
+    let n = n_docs();
+    let m = n_mutations();
+    eprintln!(
+        "[supertable-update] baseline {} docs, {} single-row mutations...",
+        fmt_count(n),
+        fmt_count(m)
+    );
+
+    let (ingest_wall, ingest_rss) = measure_ingest(n);
+    let (delete_wall, delete_rss) = measure_deletes(n, m);
+    let (update_wall, update_rss) = measure_updates(n, m);
+
+    let ingest_ns = ingest_wall.as_secs_f64() * 1e9;
+    let ingest_thr = n as f64 / ingest_wall.as_secs_f64();
+
+    let mutation_row = |label: &str, wall: Duration, rss: RssStats| -> Vec<Cell> {
+        let ns = wall.as_secs_f64() * 1e9;
+        let ops = m as f64 / wall.as_secs_f64();
+        let mut cells = vec![
+            text(label),
+            metric(ns, fmt_time(ns), Better::Lower),
+            metric(ops, format!("{ops:.0}/s"), Better::Higher),
+        ];
+        cells.extend(rss_cells(rss));
+        cells
+    };
+
+    let mut ingest_cells = vec![
+        text("baseline_ingest"),
+        metric(ingest_ns, fmt_time(ingest_ns), Better::Lower),
+        metric(ingest_thr, fmt_throughput(ingest_thr), Better::Higher),
+    ];
+    ingest_cells.extend(rss_cells(ingest_rss));
+
+    let mut report = Report::load("supertable-update");
+    report.emit(&Section {
+        anchor: "bench/supertable_update/ingest".into(),
+        title: format!(
+            "Supertable update — baseline ingest ({} docs)",
+            fmt_count(n)
+        ),
+        note: "Single-commit baseline load via `SupertableWriter::append` + `commit`. \
+               Throughput is rows/s. Δ is vs the previous run."
+            .into(),
+        blocks: vec![Block {
+            subtitle: String::new(),
+            headers: vec![
+                "Phase".into(),
+                "Time".into(),
+                "Throughput".into(),
+                "Peak RSS".into(),
+                "Median RSS".into(),
+                "P90 RSS".into(),
+            ],
+            rows: vec![ingest_cells],
+        }],
+    });
+    report.emit(&Section {
+        anchor: "bench/supertable_update/mutation".into(),
+        title: format!(
+            "Supertable update — mutation throughput ({} single-row ops over a {}-doc table)",
+            fmt_count(m),
+            fmt_count(n)
+        ),
+        note: "End-to-end single-row `update` / `delete`, one `commit()` each, through the full \
+               WAL pipeline (resolve + append + tombstone + state-doc CAS + cleanup). End-state \
+               row counts are asserted (deletes shrink the table, updates preserve it). Throughput \
+               is mutations/s. Δ is vs the previous run."
+            .into(),
+        blocks: vec![Block {
+            subtitle: String::new(),
+            headers: vec![
+                "Op".into(),
+                "Time".into(),
+                "Throughput".into(),
+                "Peak RSS".into(),
+                "Median RSS".into(),
+                "P90 RSS".into(),
+            ],
+            rows: vec![
+                mutation_row("single_row_predicate_deletes", delete_wall, delete_rss),
+                mutation_row("single_row_predicate_updates", update_wall, update_rss),
+            ],
+        }],
+    });
+    report.save();
+}

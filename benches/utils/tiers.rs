@@ -6,7 +6,6 @@
 //! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
 //! (or `INFINO_TEST_REAL_S3_BUCKET`) for AWS S3.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -25,7 +24,6 @@ const S3S_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const S3S_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 const S3S_REGION: &str = "us-east-1";
 
-const SUPERTABLE_S3S_BUCKET: &str = "infino-bench-supertable";
 const SUPERFILE_S3S_BUCKET: &str = "infino-bench-superfile";
 
 /// Storage tier exercised by a search bench row.
@@ -46,7 +44,7 @@ impl Tier {
     }
 }
 
-/// Criterion group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
+/// Stable report group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
 pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) -> String {
     match tier {
         Tier::Hot => format!("{family}_hot_search"),
@@ -62,12 +60,64 @@ pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
     pub real_s3: bool,
+    /// Real-S3 prefix to delete when the run finishes (`None` for the
+    /// auto-cleaned s3s-fs tempdir backend).
+    pub cleanup: Option<S3Cleanup>,
     _keepalive: StorageKeepalive,
 }
 
 enum StorageKeepalive {
     S3sFs { _fs_root: TempDir },
     RealS3,
+}
+
+/// A real-S3 prefix that a bench run created and must delete on exit so it
+/// accrues no storage cost. The supertable build writes many objects
+/// (segments, manifests, the pointer) under one unique prefix; cleanup
+/// lists every key beneath it and deletes them.
+#[derive(Clone)]
+pub struct S3Cleanup {
+    pub bucket: String,
+    pub prefix: String,
+}
+
+/// Delete every object under a real-S3 bench prefix. Uses a fresh, *un*-prefixed
+/// provider on purpose: `list_with_prefix` takes an absolute key prefix (it does
+/// not prepend a provider prefix) and `delete` targets the absolute keys it
+/// returns verbatim, so both sides agree on the same keyspace.
+pub fn cleanup_real_s3_prefix(cleanup: &S3Cleanup) {
+    let provider = match S3StorageProvider::new(&cleanup.bucket) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "[tiers] cleanup: cannot open bucket {} ({e}); prefix {} NOT deleted",
+                cleanup.bucket, cleanup.prefix
+            );
+            return;
+        }
+    };
+    let prefix = cleanup.prefix.clone();
+    let result: Result<usize, String> = block_on(async move {
+        let keys = provider
+            .list_with_prefix(&prefix)
+            .await
+            .map_err(|e| e.to_string())?;
+        let n = keys.len();
+        for key in &keys {
+            provider.delete(key).await.map_err(|e| e.to_string())?;
+        }
+        Ok(n)
+    });
+    match result {
+        Ok(n) => eprintln!(
+            "[tiers] cleanup real S3 prefix={}: deleted {n} objects",
+            cleanup.prefix
+        ),
+        Err(e) => eprintln!(
+            "[tiers] cleanup real S3 prefix={}: FAILED ({e}) — objects may remain",
+            cleanup.prefix
+        ),
+    }
 }
 
 /// A single superfile committed to object storage (1M tier benches).
@@ -82,6 +132,29 @@ pub struct SuperfileCommitted {
     pub real_s3: bool,
     pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
+}
+
+impl SuperfileCommitted {
+    /// Delete the uploaded object when the fixture points at real S3.
+    /// s3s-fs fixtures live under a tempdir and are cleaned up by dropping
+    /// `_keepalive`, so they do not need object-level deletion.
+    pub fn cleanup(&self) {
+        let Some(path) = self.cleanup_path.as_deref() else {
+            return;
+        };
+        let storage = Arc::clone(&self.storage);
+        let result = block_on(async move { storage.delete(path).await });
+        match result {
+            Ok(()) => eprintln!("[tiers] cleanup real S3 superfile path={path}: deleted"),
+            Err(e) => eprintln!("[tiers] cleanup real S3 superfile path={path}: {e}"),
+        }
+    }
+}
+
+impl Drop for SuperfileCommitted {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 /// One runtime for the whole bench process. `spawn_s3s_fs` binds its
@@ -164,6 +237,7 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
             storage,
             storage_label: "real_s3",
             real_s3: true,
+            cleanup: Some(S3Cleanup { bucket, prefix }),
             _keepalive: StorageKeepalive::RealS3,
         }
     } else {
@@ -193,14 +267,47 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
             storage,
             storage_label: "s3s_fs",
             real_s3: false,
+            cleanup: None,
             _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
         }
     }
 }
 
-/// Supertable-shaped backing store (10M warm/cold benches).
+/// Error string for the missing-bucket guard. Kept as a constant so the
+/// `run()` pre-flight check and this fixture report the same message.
+pub const SUPERTABLE_REQUIRES_REAL_S3: &str = "\
+the supertable object-store bench requires real AWS S3. Set INFINO_REAL_S3_BUCKET \
+(or INFINO_TEST_REAL_S3_BUCKET) to a writable bucket and provide AWS credentials. \
+The s3s-fs emulator is not usable here: it does not implement conditional If-Match \
+PUTs, which the supertable's multi-commit OCC requires, so every commit after the \
+first would lose the CAS. There is no local stand-in — a local filesystem backend \
+would not measure object-store ingest or cold-read behavior, which is the whole \
+point of this bench.";
+
+/// Supertable-shaped backing store (multi-segment, multi-commit benches).
+///
+/// **Real S3 only.** Unlike the single-`put_atomic` superfile cold tier, the
+/// supertable build commits many times, so its OCC pointer update rides on the
+/// conditional `If-Match` PUT (`put_if_match(Some(etag))`). The in-process
+/// `s3s-fs` emulator does not implement conditional `If-Match` PUTs (every
+/// commit after the first loses the CAS), and a local filesystem backend would
+/// not measure the object-store behavior this bench exists for. So this fixture
+/// requires `INFINO_REAL_S3_BUCKET` and panics with [`SUPERTABLE_REQUIRES_REAL_S3`]
+/// otherwise. The returned fixture carries an [`S3Cleanup`] so the caller can
+/// delete the unique prefix when the run finishes.
 pub async fn supertable_storage_fixture() -> StorageFixture {
-    backing_store(SUPERTABLE_S3S_BUCKET, "infino-supertable-bench").await
+    let bucket = real_s3_bucket_env().expect(SUPERTABLE_REQUIRES_REAL_S3);
+    let prefix = unique_bench_prefix(&real_s3_prefix_root("infino-supertable-bench"));
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 provider"));
+    eprintln!("[tiers] real S3: bucket={bucket} prefix={prefix}");
+    StorageFixture {
+        storage,
+        storage_label: "real_s3",
+        real_s3: true,
+        cleanup: Some(S3Cleanup { bucket, prefix }),
+        _keepalive: StorageKeepalive::RealS3,
+    }
 }
 
 /// Upload one superfile blob for superfile-shaped warm/cold benches (1M).
@@ -349,10 +456,4 @@ pub fn consumer_options(
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {
     Supertable::open(opts).expect("Supertable::open from object store")
-}
-
-#[allow(dead_code)]
-pub fn empty_pinned()
--> Arc<dyn Fn() -> HashSet<infino::supertable::manifest::SuperfileUri> + Send + Sync> {
-    Arc::new(HashSet::new)
 }

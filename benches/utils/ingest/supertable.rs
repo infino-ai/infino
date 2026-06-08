@@ -11,10 +11,15 @@ use infino::supertable::storage::StorageProvider;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
 
-use crate::corpus::{self, DIM, SUPERTABLE_DOCS, SequentialSyntheticCorpus};
+use crate::corpus::{self, DIM, SequentialSyntheticCorpus};
 use crate::tiers;
 
-pub const N_DOCS: usize = SUPERTABLE_DOCS;
+/// Supertable-shape document count — the supplied parameter. Default 10M
+/// ([`crate::corpus::supertable_docs`]); override with
+/// `INFINO_BENCH_SUPERTABLE_DOCS`.
+pub fn n_docs() -> usize {
+    corpus::supertable_docs()
+}
 /// Ingest commit chunks (not final superfile count).
 pub const N_COMMIT_CHUNKS: usize = 16;
 pub const TEXT_COLUMN: &str = "title";
@@ -29,6 +34,8 @@ pub struct IngestResult {
     pub storage_label: &'static str,
     pub n_superfiles: usize,
     pub total_index_bytes: u64,
+    /// Real-S3 prefix this build wrote under, to delete when the run ends.
+    pub cleanup: Option<tiers::S3Cleanup>,
 }
 
 /// Which index shapes a supertable build includes. Drives apples-to-apples
@@ -76,7 +83,7 @@ pub fn options_for(
     modality: Modality,
     storage: Option<Arc<dyn StorageProvider>>,
 ) -> SupertableOptions {
-    let n_cent_total = corpus::n_cent(N_DOCS);
+    let n_cent_total = corpus::n_cent(n_docs());
     let n_cent_per_segment = (n_cent_total / N_COMMIT_CHUNKS).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -124,9 +131,11 @@ pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> Supertable
 /// across modalities (same seeds), so each shape is directly comparable to its
 /// single-modality competitor.
 pub fn build_on_storage(modality: Modality) -> IngestResult {
+    let n_docs = n_docs();
     let storage_backend = tiers::block_on(tiers::supertable_storage_fixture());
+    let cleanup = storage_backend.cleanup.clone();
     let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));
-    let n_cent_total = corpus::n_cent(N_DOCS);
+    let n_cent_total = corpus::n_cent(n_docs);
     // Disk cache attached only to keep segment bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
@@ -136,14 +145,14 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
         .with_cache_prepopulation(false);
     let st = Supertable::create(opts).expect("create supertable");
     let mut w = st.writer().expect("writer");
-    let chunk_size = N_DOCS.div_ceil(N_COMMIT_CHUNKS);
+    let chunk_size = n_docs.div_ceil(N_COMMIT_CHUNKS);
     let mut synth =
         SequentialSyntheticCorpus::new(n_cent_total, CORPUS_VEC_SEED, CORPUS_TEXT_SEED, true);
     let schema = schema_for(modality);
     let mut titles = Vec::new();
     let mut flat = Vec::new();
-    for start in (0..N_DOCS).step_by(chunk_size) {
-        let end = (start + chunk_size).min(N_DOCS);
+    for start in (0..n_docs).step_by(chunk_size) {
+        let end = (start + chunk_size).min(n_docs);
         let len = end - start;
         // Generate only the columns this modality ingests so the bench
         // process never holds (and the RSS sampler never counts) a corpus
@@ -203,6 +212,7 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
         storage_label: storage_backend.storage_label,
         n_superfiles,
         total_index_bytes,
+        cleanup,
     }
 }
 
