@@ -16,7 +16,7 @@ on:
       vm_size:
         description: "Azure VM size."
         required: false
-        default: "Standard_D8s_v5"
+        default: "Standard_D8s_v7"
         type: string
       location:
         description: "VM region."
