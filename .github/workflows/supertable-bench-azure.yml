@@ -73,7 +73,10 @@ jobs:
           LOC="${{ github.event.inputs.location }}"
           SIZE="${{ github.event.inputs.vm_size }}"
 
-          az group create -n "$RG" -l "$LOC" -o none
+          # Tag the RG + VM so Cost Management attributes spend by
+          # purpose / run after the group is deleted.
+          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ github.event.inputs.ref }}")
+          az group create -n "$RG" -l "$LOC" --tags "${TAGS[@]}" -o none
 
           # No default inbound rule; the only SSH allow is the
           # runner-IP /32 added below.
@@ -86,6 +89,7 @@ jobs:
             --public-ip-sku Standard \
             --os-disk-size-gb 128 \
             --nsg-rule NONE \
+            --tags "${TAGS[@]}" \
             -o none
 
           RUNNER_IP="$(curl -s https://api.ipify.org)"
