@@ -198,7 +198,8 @@ const K: usize = 10;
 
 fn run_bm25(st: &Supertable) -> Vec<(String, u32)> {
     hit_key(
-        &st.bm25_search("title", "rust", K, BoolMode::Or)
+        &st.reader()
+            .bm25_search("title", "rust", K, BoolMode::Or)
             .expect("bm25"),
     )
 }
@@ -207,7 +208,8 @@ fn run_vector(st: &Supertable) -> Vec<(String, u32)> {
     let mut q = [0.0f32; DIM];
     q[0] = 1.0;
     hit_key(
-        &st.vector_search("emb", &q, K, VectorSearchOptions::new())
+        &st.reader()
+            .vector_search("emb", &q, K, VectorSearchOptions::new())
             .expect("vector"),
     )
 }

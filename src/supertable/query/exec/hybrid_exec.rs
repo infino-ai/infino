@@ -360,8 +360,8 @@ impl ExecutionPlan for HybridSearchExec {
             // each inherits its own manifest skip and returns hits
             // best-first.
             let (bm25_res, vector_res) = futures::future::join(
-                reader.bm25_search(&text_col, &q_text, k, mode),
-                reader.vector_search(&vec_col, &q_vec, k, options),
+                reader.bm25_search_async(&text_col, &q_text, k, mode),
+                reader.vector_search_async(&vec_col, &q_vec, k, options),
             )
             .await;
             let bm25_hits = bm25_res.map_err(|e| DataFusionError::Execution(e.to_string()))?;
