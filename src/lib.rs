@@ -37,15 +37,18 @@
 // Restructuring into a builder adds boilerplate without clarity.
 #![allow(clippy::too_many_arguments)]
 // In a normal (non-`test-helpers`) build the internal layers (`config`,
-// `storage`, the manifest + WAL + reader-cache stack) are `pub(crate)`,
-// and the curated public surface has no constructor yet — the catalog
-// API that exercises storage/config setup lands in a later milestone.
-// Until then large parts of those layers are legitimately unreferenced,
-// and their test-facing re-exports go unused. Allow that *only* in this
-// build mode: the `test-helpers` build — which CI compiles with
-// `-D warnings` and which runs every test/bench — still exercises those
-// paths, so genuinely dead code (dead even under `test-helpers`) is still
-// caught. Remove this once the public constructor wires the layers in.
+// `storage`, the manifest + WAL + reader-cache + query stack) are
+// `pub(crate)`. The curated public surface reaches a large part of them
+// (`Connection` builds storage + creates/opens tables; `append` commits;
+// the search methods query), but not all of it — the WAL lease/heartbeat
+// machinery, cold-fetch cache tiers, config-file loading, and assorted
+// deeper query/format helpers are only driven from paths the minimal
+// public API doesn't exercise yet, so they read as dead here, and some
+// test-facing re-exports go unused. Allow that *only* in this build mode:
+// the `test-helpers` build — which CI compiles with `-D warnings` and
+// which runs every test/bench — exercises those paths, so genuinely dead
+// code (dead even under `test-helpers`) is still caught. Narrow or drop
+// this as more of the surface (SQL, cache config) lands.
 #![cfg_attr(not(feature = "test-helpers"), allow(dead_code, unused_imports))]
 
 // `mimalloc` calls into a C runtime; miri can't execute foreign
@@ -110,20 +113,23 @@ pub mod supertable;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod supertable;
 
+// The catalog layer (`Connection` + `connect`). Internal module; its
+// public items are re-exported at the crate root below.
+mod catalog;
 mod error;
 mod runtime_bridge;
 
 // ---- Curated public surface ----
-//
-// The two-handle catalog API (`Connection`) arrives with the catalog
-// milestone; today the public surface is the single-table `Supertable`
-// handle plus the value types its public methods name.
 
+/// Catalog entry points and handle: open a `Connection`, then create /
+/// open / drop / list tables.
+pub use catalog::{ConnectOptions, Connection, IndexSpec, connect, connect_with};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
-/// Value types named by `Supertable`'s public method signatures.
+/// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
 pub use superfile::fts::reader::BoolMode;
+pub use superfile::vector::distance::Metric;
 /// Single-table handle: `append` / `update` / `delete` / `bm25_search`
 /// / `vector_search` / `schema`.
 pub use supertable::Supertable;

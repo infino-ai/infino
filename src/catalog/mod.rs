@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Catalog layer — [`Connection`] and the `connect` entry points.
+//!
+//! A `Connection` is rooted at a URI (local dir, object-store prefix, or
+//! `memory://`) and owns a `name → table` catalog. It is the entry point
+//! to the public API: open a connection, then create / open / drop / list
+//! tables, each of which is a [`Supertable`].
+//!
+//! The catalog is **validating** — `list_tables` reflects an
+//! authoritative `name → record` map (persisted on the root storage for
+//! durable backends, in-process for `memory://`), not a raw directory
+//! scan, so it never lists a table that can't be opened.
+
+mod index_spec;
+mod manifest;
+mod options;
+mod uri;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use arrow_schema::SchemaRef;
+
+pub use index_spec::IndexSpec;
+pub use options::ConnectOptions;
+
+use crate::InfinoError;
+use crate::runtime_bridge::bridge_sync_to_async;
+use crate::storage::StorageProvider;
+use crate::superfile::builder::FtsConfig;
+use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+use crate::superfile::vector::builder::VectorConfig;
+use crate::superfile::vector::distance::Metric;
+use crate::supertable::Supertable;
+use crate::supertable::options::SupertableOptions;
+use manifest::{
+    TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
+};
+use uri::{Backend, parse_uri};
+
+/// Open (or create) a catalog rooted at `uri`.
+///
+/// The storage backend is derived from the URI scheme: a bare path or
+/// `file://` → local filesystem, `s3://bucket/prefix` → S3,
+/// `az://container/prefix` → Azure, `memory://` → in-process
+/// (non-persistent). Equivalent to
+/// [`connect_with`]`(uri, ConnectOptions::default())`.
+pub fn connect(uri: impl AsRef<str>) -> Result<Connection, InfinoError> {
+    connect_with(uri, ConnectOptions::default())
+}
+
+/// Open (or create) a catalog rooted at `uri` with explicit storage
+/// configuration (credentials / region / endpoint the URI can't carry).
+pub fn connect_with(
+    uri: impl AsRef<str>,
+    options: ConnectOptions,
+) -> Result<Connection, InfinoError> {
+    let backend = parse_uri(uri.as_ref())?;
+    let store = match &backend {
+        Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
+        _ => {
+            let root = backend_to_provider(&backend, &options)?
+                .expect("non-memory backend yields a storage provider");
+            CatalogStore::Storage(root)
+        }
+    };
+    Ok(Connection {
+        inner: Arc::new(ConnectionInner {
+            backend,
+            options,
+            store,
+        }),
+    })
+}
+
+/// A catalog connection. Cheap to clone (one `Arc`); clones share the
+/// same catalog.
+#[derive(Clone)]
+pub struct Connection {
+    inner: Arc<ConnectionInner>,
+}
+
+struct ConnectionInner {
+    backend: Backend,
+    options: ConnectOptions,
+    store: CatalogStore,
+}
+
+/// Where the `name → table` map lives. Durable backends persist it on the
+/// root storage under optimistic concurrency; `memory://` keeps it (and
+/// the tables themselves) in-process.
+enum CatalogStore {
+    Memory(Mutex<HashMap<String, Supertable>>),
+    Storage(Arc<dyn StorageProvider>),
+}
+
+impl Connection {
+    /// Create a new table named `name` with the given Arrow `schema` and
+    /// search `indexes`. Fails with [`InfinoError::AlreadyExists`] if a
+    /// table of that name already exists. Returns the open handle.
+    pub fn create_table(
+        &self,
+        name: &str,
+        schema: SchemaRef,
+        indexes: IndexSpec,
+    ) -> Result<Supertable, InfinoError> {
+        validate_name(name)?;
+        let (fts_cfg, vec_cfg) = indexes.to_configs();
+        let tokenizer = table_tokenizer(&indexes);
+
+        match &self.inner.store {
+            CatalogStore::Memory(map) => {
+                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, None)?;
+                let handle = Supertable::create(opts)?;
+                let mut map = map.lock().expect("catalog mutex poisoned");
+                if map.contains_key(name) {
+                    return Err(InfinoError::AlreadyExists(name.to_string()));
+                }
+                map.insert(name.to_string(), handle.clone());
+                Ok(handle)
+            }
+            CatalogStore::Storage(root) => {
+                // Record what was actually used to build the table, so
+                // `open_table` reconstructs matching options (the
+                // supertable's options-hash check then validates them).
+                let vectors: Vec<VectorEntry> = vec_cfg
+                    .iter()
+                    .map(|vc| VectorEntry {
+                        column: vc.column.clone(),
+                        dim: vc.dim,
+                        n_cent: vc.n_cent,
+                        metric: metric_to_str(vc.metric),
+                    })
+                    .collect();
+                let entry = TableEntry {
+                    location: name.to_string(),
+                    schema_ipc: schema_to_ipc(&schema)?,
+                    fts: indexes.fts_columns().to_vec(),
+                    vectors,
+                    created_at_unix: now_unix(),
+                };
+
+                let table_storage =
+                    backend_to_provider(&self.inner.backend.join(name), &self.inner.options)?
+                        .expect("non-memory backend yields a storage provider");
+                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                // Create the physical table first; then register it. The
+                // location is deterministic (`<root>/<name>`), so a losing
+                // racer that also created it just re-opens the same bytes.
+                let handle = Supertable::create(opts)?;
+
+                let name = name.to_string();
+                bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
+                    if body.tables.contains_key(&name) {
+                        return Err(InfinoError::AlreadyExists(name.clone()));
+                    }
+                    body.tables.insert(name.clone(), entry.clone());
+                    Ok(())
+                }))?;
+                Ok(handle)
+            }
+        }
+    }
+
+    /// Open an existing table by name. Fails with
+    /// [`InfinoError::NotFound`] if no such table is registered.
+    pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
+        match &self.inner.store {
+            CatalogStore::Memory(map) => map
+                .lock()
+                .expect("catalog mutex poisoned")
+                .get(name)
+                .cloned()
+                .ok_or_else(|| InfinoError::NotFound(name.to_string())),
+            CatalogStore::Storage(root) => {
+                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
+                let entry = body
+                    .tables
+                    .get(name)
+                    .ok_or_else(|| InfinoError::NotFound(name.to_string()))?;
+
+                let schema = schema_from_ipc(&entry.schema_ipc)?;
+                // Rebuild the index spec from the recorded declarations and
+                // lower it through the *same* path `create_table` used, so
+                // the defaults it applies (rotation seed, rerank codec) are
+                // identical and the table's options-hash check passes.
+                let mut spec = IndexSpec::new();
+                for column in &entry.fts {
+                    spec = spec.fts(column.clone());
+                }
+                for v in &entry.vectors {
+                    spec = spec.vector(
+                        v.column.clone(),
+                        v.dim,
+                        v.n_cent,
+                        metric_from_str(&v.metric)?,
+                    );
+                }
+                let (fts_cfg, vec_cfg) = spec.to_configs();
+                let tokenizer = table_tokenizer(&spec);
+
+                let table_storage = backend_to_provider(
+                    &self.inner.backend.join(&entry.location),
+                    &self.inner.options,
+                )?
+                .expect("non-memory backend yields a storage provider");
+                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                Ok(Supertable::open(opts)?)
+            }
+        }
+    }
+
+    /// Remove a table from the catalog. Fails with
+    /// [`InfinoError::NotFound`] if it isn't registered.
+    ///
+    /// This unregisters the table; the underlying object-store data under
+    /// `<root>/<name>/` is left in place (physical reclamation is a
+    /// separate operation).
+    pub fn drop_table(&self, name: &str) -> Result<(), InfinoError> {
+        match &self.inner.store {
+            CatalogStore::Memory(map) => map
+                .lock()
+                .expect("catalog mutex poisoned")
+                .remove(name)
+                .map(|_| ())
+                .ok_or_else(|| InfinoError::NotFound(name.to_string())),
+            CatalogStore::Storage(root) => {
+                let name = name.to_string();
+                bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
+                    body.tables
+                        .remove(&name)
+                        .map(|_| ())
+                        .ok_or_else(|| InfinoError::NotFound(name.clone()))
+                }))
+            }
+        }
+    }
+
+    /// List the names of every table registered in this catalog,
+    /// alphabetically.
+    pub fn list_tables(&self) -> Result<Vec<String>, InfinoError> {
+        match &self.inner.store {
+            CatalogStore::Memory(map) => {
+                let mut names: Vec<String> = map
+                    .lock()
+                    .expect("catalog mutex poisoned")
+                    .keys()
+                    .cloned()
+                    .collect();
+                names.sort();
+                Ok(names)
+            }
+            CatalogStore::Storage(root) => {
+                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
+                Ok(body.tables.into_keys().collect())
+            }
+        }
+    }
+}
+
+/// Build `SupertableOptions` from a schema + lowered configs, attaching
+/// `storage` when present (absent → in-memory table).
+fn build_options(
+    schema: SchemaRef,
+    fts: Vec<FtsConfig>,
+    vectors: Vec<VectorConfig>,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    storage: Option<Arc<dyn StorageProvider>>,
+) -> Result<SupertableOptions, InfinoError> {
+    let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
+    if let Some(s) = storage {
+        opts = opts.with_storage(s);
+    }
+    Ok(opts)
+}
+
+/// The v1 default tokenizer, required iff the spec has FTS columns.
+fn table_tokenizer(indexes: &IndexSpec) -> Option<Arc<dyn Tokenizer>> {
+    if indexes.has_fts() {
+        Some(Arc::new(AsciiLowerTokenizer))
+    } else {
+        None
+    }
+}
+
+/// Construct the storage provider for `backend` (None for `memory://`).
+fn backend_to_provider(
+    backend: &Backend,
+    options: &ConnectOptions,
+) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
+    use crate::storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider};
+
+    let provider: Option<Arc<dyn StorageProvider>> = match backend {
+        Backend::Memory => None,
+        Backend::LocalFs { root } => Some(Arc::new(LocalFsStorageProvider::new(root.clone())?)),
+        Backend::S3 { bucket, prefix } => {
+            let p = match options.s3.as_ref() {
+                Some(s3) => S3StorageProvider::new_with_endpoint_and_prefix(
+                    &s3.endpoint,
+                    bucket,
+                    &s3.access_key,
+                    &s3.secret_key,
+                    &s3.region,
+                    prefix,
+                )?,
+                None => S3StorageProvider::new_with_prefix(bucket, prefix)?,
+            };
+            Some(Arc::new(p))
+        }
+        Backend::Azure { container, prefix } => Some(Arc::new(
+            AzureStorageProvider::new_with_prefix(container, prefix)?,
+        )),
+    };
+    Ok(provider)
+}
+
+/// Table names are flat, case-sensitive `[A-Za-z0-9_-]+` identifiers —
+/// they are SQL identifiers and object-store path segments.
+fn validate_name(name: &str) -> Result<(), InfinoError> {
+    let ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(InfinoError::Backend(format!(
+            "invalid table name {name:?}: use non-empty [A-Za-z0-9_-]"
+        )))
+    }
+}
+
+/// The metric's lowercased name (`"cosine"` / `"l2sq"` / `"negdot"`),
+/// matching the manifest's encoding.
+fn metric_to_str(m: Metric) -> String {
+    format!("{m:?}").to_lowercase()
+}
+
+/// Inverse of [`metric_to_str`].
+fn metric_from_str(s: &str) -> Result<Metric, InfinoError> {
+    match s {
+        "cosine" => Ok(Metric::Cosine),
+        "l2sq" => Ok(Metric::L2Sq),
+        "negdot" => Ok(Metric::NegDot),
+        other => Err(InfinoError::Backend(format!(
+            "unknown vector metric {other:?}"
+        ))),
+    }
+}
+
+/// Seconds since the Unix epoch (0 if the clock is before the epoch).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BoolMode;
+    use crate::test_helpers::{build_title_batch, schema_id_title};
+
+    const TOP_K: usize = 10;
+
+    #[test]
+    fn memory_create_open_search_drop() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        table
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
+
+        // Re-open by name and search.
+        let reopened = conn.open_table("docs").expect("open_table");
+        let hits = reopened
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or)
+            .expect("bm25_search");
+        assert_eq!(hits.len(), 1, "expected one hit for 'fox'");
+
+        conn.drop_table("docs").expect("drop_table");
+        assert!(conn.list_tables().expect("list").is_empty());
+        assert!(matches!(
+            conn.open_table("docs"),
+            Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_create_is_already_exists() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("first create");
+        let again = conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"));
+        assert!(matches!(again, Err(InfinoError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn open_missing_is_not_found() {
+        let conn = connect("memory://").expect("connect");
+        assert!(matches!(
+            conn.open_table("nope"),
+            Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_table_name_rejected() {
+        let conn = connect("memory://").expect("connect");
+        let bad = conn.create_table("has space", schema_id_title(), IndexSpec::new());
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn localfs_persists_across_reconnect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["a lazy sleeping fox"]))
+                .expect("append");
+        }
+
+        // A fresh connection to the same root sees the catalog + data.
+        let conn = connect(&uri).expect("reconnect");
+        assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
+        let table = conn.open_table("docs").expect("open_table");
+        let hits = table
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or)
+            .expect("bm25_search");
+        assert_eq!(hits.len(), 1, "expected the persisted doc to be searchable");
+    }
+}

@@ -173,6 +173,11 @@ impl SupertableInner {
 }
 
 impl Supertable {
+    // Interim options-based constructor — not on the curated public surface
+    // (the catalog `create_table` supersedes it). `pub` under `test-helpers`
+    // so tests/benches reach it directly; `pub(crate)` otherwise, where the
+    // catalog `Connection` calls it internally.
+    test_visible! {
     /// Create-or-open from validated options.
     ///
     /// Behaviour:
@@ -196,11 +201,7 @@ impl Supertable {
     /// `#[tokio::test]` contexts. In-memory creates avoid the
     /// open-time sweep bridge entirely because no WAL/GC I/O can
     /// exist without attached storage.
-    // Interim options-based constructor — not on the public surface (a
-    // catalog API will supersede it). Reachable from tests/benches/examples
-    // via `test-helpers`; absent from a normal build.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn create(options: SupertableOptions) -> Result<Self, OpenError> {
+    fn create(options: SupertableOptions) -> Result<Self, OpenError> {
         // Pointer-probe pass. When storage is attached AND a
         // pointer file already exists, we want open's load path
         // — never silently shadow committed state with an empty
@@ -260,7 +261,12 @@ impl Supertable {
         }
         Ok(st)
     }
+    }
 
+    // Interim options-based open — internal counterpart of `create`; the
+    // catalog `Connection` calls it internally, tests/benches reach it via
+    // `test-helpers`.
+    test_visible! {
     /// Open an existing persisted supertable.
     ///
     /// Reads the pointer file at
@@ -284,11 +290,9 @@ impl Supertable {
     /// Sync public API. Internally bridges to the async storage I/O
     /// via the same `Handle::try_current() + block_in_place` pattern
     /// as the rest of the supertable's sync surface.
-    // Interim options-based open — internal counterpart of `create`,
-    // off the public surface; reachable via `test-helpers`.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn open(options: SupertableOptions) -> Result<Self, OpenError> {
+    fn open(options: SupertableOptions) -> Result<Self, OpenError> {
         bridge_sync_to_async(Self::open_async(options))
+    }
     }
 
     /// Async open kernel. `pub(crate)` — the public surface is the

@@ -38,6 +38,76 @@ impl core::marker::Unpin for infino::InfinoError
 impl core::marker::UnsafeUnpin for infino::InfinoError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::InfinoError
 impl core::panic::unwind_safe::UnwindSafe for infino::InfinoError
+pub enum infino::Metric
+pub infino::Metric::Cosine
+pub infino::Metric::L2Sq
+pub infino::Metric::NegDot
+impl core::clone::Clone for infino::Metric
+pub fn infino::Metric::clone(&self) -> infino::Metric
+impl core::cmp::Eq for infino::Metric
+impl core::cmp::PartialEq for infino::Metric
+pub fn infino::Metric::eq(&self, &infino::Metric) -> bool
+impl core::fmt::Debug for infino::Metric
+pub fn infino::Metric::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Metric
+impl core::marker::StructuralPartialEq for infino::Metric
+impl core::marker::Freeze for infino::Metric
+impl core::marker::Send for infino::Metric
+impl core::marker::Sync for infino::Metric
+impl core::marker::Unpin for infino::Metric
+impl core::marker::UnsafeUnpin for infino::Metric
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Metric
+impl core::panic::unwind_safe::UnwindSafe for infino::Metric
+pub struct infino::ConnectOptions
+impl infino::ConnectOptions
+pub fn infino::ConnectOptions::new() -> Self
+pub fn infino::ConnectOptions::with_s3_endpoint(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for infino::ConnectOptions
+pub fn infino::ConnectOptions::clone(&self) -> infino::ConnectOptions
+impl core::default::Default for infino::ConnectOptions
+pub fn infino::ConnectOptions::default() -> infino::ConnectOptions
+impl core::fmt::Debug for infino::ConnectOptions
+pub fn infino::ConnectOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::ConnectOptions
+impl core::marker::Send for infino::ConnectOptions
+impl core::marker::Sync for infino::ConnectOptions
+impl core::marker::Unpin for infino::ConnectOptions
+impl core::marker::UnsafeUnpin for infino::ConnectOptions
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ConnectOptions
+impl core::panic::unwind_safe::UnwindSafe for infino::ConnectOptions
+pub struct infino::Connection
+impl infino::Connection
+pub fn infino::Connection::create_table(&self, &str, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> core::result::Result<infino::Supertable, infino::InfinoError>
+pub fn infino::Connection::drop_table(&self, &str) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Connection::list_tables(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
+pub fn infino::Connection::open_table(&self, &str) -> core::result::Result<infino::Supertable, infino::InfinoError>
+impl core::clone::Clone for infino::Connection
+pub fn infino::Connection::clone(&self) -> infino::Connection
+impl core::marker::Freeze for infino::Connection
+impl core::marker::Send for infino::Connection
+impl core::marker::Sync for infino::Connection
+impl core::marker::Unpin for infino::Connection
+impl core::marker::UnsafeUnpin for infino::Connection
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
+impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+pub struct infino::IndexSpec
+impl infino::IndexSpec
+pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::IndexSpec::new() -> Self
+pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, usize, infino::Metric) -> Self
+impl core::clone::Clone for infino::IndexSpec
+pub fn infino::IndexSpec::clone(&self) -> infino::IndexSpec
+impl core::default::Default for infino::IndexSpec
+pub fn infino::IndexSpec::default() -> infino::IndexSpec
+impl core::fmt::Debug for infino::IndexSpec
+pub fn infino::IndexSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::IndexSpec
+impl core::marker::Send for infino::IndexSpec
+impl core::marker::Sync for infino::IndexSpec
+impl core::marker::Unpin for infino::IndexSpec
+impl core::marker::UnsafeUnpin for infino::IndexSpec
+impl core::panic::unwind_safe::RefUnwindSafe for infino::IndexSpec
+impl core::panic::unwind_safe::UnwindSafe for infino::IndexSpec
 #[non_exhaustive] pub struct infino::MutationStats
 impl infino::MutationStats
 pub fn infino::MutationStats::matched(&self) -> usize
@@ -122,3 +192,5 @@ impl core::marker::UnsafeUnpin for infino::VectorSearchOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::VectorSearchOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::VectorSearchOptions
 pub const infino::BUILDER_ID: &str
+pub fn infino::connect(impl core::convert::AsRef<str>) -> core::result::Result<infino::Connection, infino::InfinoError>
+pub fn infino::connect_with(impl core::convert::AsRef<str>, infino::ConnectOptions) -> core::result::Result<infino::Connection, infino::InfinoError>
