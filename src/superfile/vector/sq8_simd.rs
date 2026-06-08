@@ -52,6 +52,8 @@ const F32X8_LANES: usize = 8;
 /// Lane count of an AVX-512 f32 register (512-bit / 32-bit). The
 /// AVX-512 kernels process this many f32s per iteration, with an
 /// 8-lane half-tail for `dim % AVX512_F32_LANES == F32X8_LANES`.
+// Referenced only by the x86-gated AVX-512 kernels; dead on other targets.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const AVX512_F32_LANES: usize = 16;
 
 /// Per-cluster Sq8 encode constants. Each cluster contributes one

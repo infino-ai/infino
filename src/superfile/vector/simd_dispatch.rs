@@ -39,6 +39,10 @@ use std::sync::OnceLock;
 /// hosts that *do* support AVX-512 — for A/B perf comparison or
 /// regression isolation without rebuilding. Reads the env var
 /// exactly once on the first call.
+// Every dispatch site that calls this is itself x86-gated, so on other
+// targets the function is unused in the library build (it stays defined
+// because the `cfg(test)` gate tests reference it on all targets).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 pub(crate) fn avx512_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -127,6 +131,10 @@ pub fn avx2_enabled() -> bool {
 /// or `true` (case-insensitive); everything else (including unset)
 /// is false. Pulled into its own helper so the parsing logic is
 /// shared across the gates above and exercised by unit tests.
+// Reached only through the x86-gated `avx512_enabled`, so it is unused
+// in a non-x86 library build (its sibling `disable_avx2_env_set` is
+// reached on all targets via the `pub` `avx2_enabled`, hence no allowance).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 fn disable_env_set() -> bool {
     std::env::var("INFINO_DISABLE_AVX512")

@@ -32,6 +32,8 @@ const F32X8_LANES: usize = 8;
 
 /// Lane count of an AVX-512 f32 vector register (512-bit / 32-bit).
 /// The AVX-512 kernels process this many f32s per FMA iteration.
+// Referenced only by the x86-gated AVX-512 kernels; dead on other targets.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const AVX512_F32_LANES: usize = 16;
 
 /// Byte width of one little-endian `f32`. A byte-backed vector of
