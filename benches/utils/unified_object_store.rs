@@ -11,6 +11,13 @@
 //! Exercises unified vector + FTS cold-open / cold-first-search
 //! / warm-search against an in-process S3 server (`s3s-fs`).
 //!
+//! Backend selection here is intentionally **S3-only and inference-based**
+//! (`s3s-fs`, or real S3 when `INFINO_REAL_S3_BUCKET` is set) — it does not
+//! use the `INFINO_BENCH_STORE` selector or the Azure backend that the
+//! canonical benches do. This is a diagnostics probe, not a headline bench,
+//! so it keeps its own minimal fixture rather than routing through
+//! `tiers::Backend`.
+//!
 //! Spawns `s3s-fs` on a random port, points an
 //! `S3StorageProvider` at it, uploads a real **unified**
 //! superfile (one Parquet file carrying both a vector
