@@ -511,12 +511,6 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
 
 // ─── Benches ─────────────────────────────────────────────────────────
 
-/// p50 (median) of a set of duration samples.
-fn p50(mut samples: Vec<Duration>) -> Duration {
-    samples.sort_unstable();
-    samples[samples.len() / 2]
-}
-
 /// Cold-row iteration count. Bounded for real S3 (each iter is a real
 /// network round trip + a fresh-cache cold open), more samples on s3s-fs
 /// for a stabler p50.
@@ -529,14 +523,8 @@ fn cold_iters(real_s3: bool) -> usize {
 }
 
 pub fn run() {
-    // Diagnostic path: short-circuit the normal rows and dump a
-    // raw-RTT + cold-fetch-range (and S3 latency-model / cost) breakdown
-    // to stderr to localize where the cold-open / cold-first-search wall
-    // time is going. Gated on env vars so the default path is unaffected.
-    if std::env::var("INFINO_DIAG_COLD_PATH").is_ok() {
-        diag::diagnose_s3s_fs_cold_path();
-        return;
-    }
+    // Deeper opt-in diagnostics (separate fixtures + breakdowns) stay
+    // gated. The cold-path stats themselves are always shown below.
     if std::env::var("INFINO_DIAG_REAL_S3").is_ok() {
         diag::diagnose_real_s3_cold_path();
         return;
@@ -571,73 +559,33 @@ pub fn run() {
     let real_s3 = fixture.real_s3;
     let iters = cold_iters(real_s3);
 
-    // ── Row 1: cold lazy open via S3. Fresh cache each iteration,
-    // `cache.reader(uri).await` timed; cache dropped before the next.
-    let (cold_open, open_rss) = {
+    // Each phase runs through a request-counting store: it prints the
+    // detailed per-iter `[diag]` line (modeled S3 latency + estimated cost
+    // for s3s-fs; true wall-clock + cost for real S3) and returns the p50
+    // latency + median cost for the summary table. The RSS sampler bounds
+    // the whole phase.
+    let measure = |name: &str, op: diag::ColdOp| {
         let sampler = crate::rss::PeakSampler::start_default();
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage));
-            let t0 = Instant::now();
-            let reader = rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
-            samples.push(t0.elapsed());
-            drop(reader);
-            drop(cache);
-            drop(cache_dir);
-        }
-        (p50(samples), sampler.stop_stats())
+        let phase = diag::measure_cold_phase(
+            &rt,
+            Arc::clone(&storage),
+            &uri,
+            &query,
+            nprobe,
+            real_s3,
+            name,
+            op,
+            iters,
+        );
+        (phase, sampler.stop_stats())
     };
 
-    // ── Row 2: cold first vector search after lazy open. Reader open is
-    // outside the timed region — this measures first-query range GETs.
-    let (cold_vec, vec_rss) = {
-        let sampler = crate::rss::PeakSampler::start_default();
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage));
-            let reader = rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
-            let t0 = Instant::now();
-            let hits = {
-                let vec = reader.vec().expect("vector reader present");
-                vec.search("v", &query, TOP_K, nprobe, DEFAULT_RERANK_MULT)
-                    .expect("cold vector_search")
-            };
-            samples.push(t0.elapsed());
-            std::hint::black_box(hits);
-            drop(cache);
-            drop(cache_dir);
-        }
-        (p50(samples), sampler.stop_stats())
-    };
-
-    // ── Row 3: cold first BM25 search after lazy open. Drives the FTS
-    // subsection through `FtsReader::open_lazy`; reader open excluded.
-    let (cold_bm25, bm25_rss) = {
-        let sampler = crate::rss::PeakSampler::start_default();
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage));
-            let reader = rt.block_on(async { cache.reader(&uri).await.expect("cold reader") });
-            let t0 = Instant::now();
-            let hits = rt
-                .block_on(reader.bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or))
-                .expect("cold bm25_search");
-            samples.push(t0.elapsed());
-            std::hint::black_box(hits);
-            drop(cache);
-            drop(cache_dir);
-        }
-        (p50(samples), sampler.stop_stats())
-    };
+    let open = measure("cold_open", diag::ColdOp::Open);
+    let vec = measure("cold_first_vector_search", diag::ColdOp::VectorSearch);
+    let bm25 = measure("cold_first_bm25_search", diag::ColdOp::Bm25Search);
 
     rt.block_on(fixture.cleanup());
-    emit_object_store(
-        storage_label,
-        n,
-        (cold_open, open_rss),
-        (cold_vec, vec_rss),
-        (cold_bm25, bm25_rss),
-    );
+    emit_object_store(storage_label, real_s3, n, open, vec, bm25);
 }
 
 // ─── Report emitter ──────────────────────────────────────────────────
@@ -645,13 +593,16 @@ pub fn run() {
 /// Emit the three measured cold rows through the custom report harness:
 /// terminal table + run-to-run deltas, plus (when
 /// `INFINO_BENCH_UPDATE_README=1`) the `bench/vector/object_store/cold`
-/// README anchor.
+/// README anchor. The `p50` column is the modeled S3 latency for s3s-fs
+/// (loopback removed, TTFB+throughput added back) or the true wall-clock
+/// for real S3; `Est S3 cost` is the modeled per-op request+data cost.
 fn emit_object_store(
     storage_label: &str,
+    real_s3: bool,
     n: usize,
-    cold_open: (Duration, crate::rss::RssStats),
-    cold_vec: (Duration, crate::rss::RssStats),
-    cold_bm25: (Duration, crate::rss::RssStats),
+    cold_open: (diag::ColdPhase, crate::rss::RssStats),
+    cold_vec: (diag::ColdPhase, crate::rss::RssStats),
+    cold_bm25: (diag::ColdPhase, crate::rss::RssStats),
 ) {
     use crate::markdown::fmt_time;
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
@@ -679,11 +630,29 @@ fn emit_object_store(
         ]
     };
 
-    let row = |label: &str, m: (Duration, crate::rss::RssStats)| -> Vec<Cell> {
-        let ns = m.0.as_secs_f64() * 1e9;
-        let mut cells = vec![text(label), metric(ns, fmt_time(ns), Better::Lower)];
+    let row = |label: &str, m: (diag::ColdPhase, crate::rss::RssStats)| -> Vec<Cell> {
+        let ns = m.0.p50.as_secs_f64() * 1e9;
+        let mut cells = vec![
+            text(label),
+            metric(ns, fmt_time(ns), Better::Lower),
+            metric(m.0.cost_usd, format!("${:.6}", m.0.cost_usd), Better::Lower),
+        ];
         cells.extend(rss_cells(m.1));
         cells
+    };
+
+    let latency_col = if real_s3 {
+        "p50 (real S3)"
+    } else {
+        "p50 (modeled S3)"
+    };
+    let backend_note = if real_s3 {
+        "Latency is the true real-S3 wall-clock; cost is the modeled per-op request + data cost."
+    } else {
+        "Latency is the modeled S3 wall-clock (the s3s-fs loopback blocking span is subtracted and \
+         a TTFB + throughput model added back per overlap-coalesced GET batch — the raw s3s-fs \
+         loopback time is environment-dependent and not representative); cost is the modeled per-op \
+         request + data cost. Set INFINO_REAL_S3_BUCKET to measure real S3 directly."
     };
 
     let mut report = Report::load("object-store");
@@ -692,24 +661,25 @@ fn emit_object_store(
         title: format!(
             "Superfile vector + FTS — object-store cold ({storage_label}, {n} docs × dim={dim}, ~{superfile_mib:.0} MiB unified superfile, Sq8 rerank + `title` FTS)"
         ),
-        note: "One unified superfile (vector subsection + FTS subsection in a single Parquet file) \
-               served through one `DiskCacheStore` in `LazyForegroundWithBackgroundFill` mode. \
-               In-process `s3s-fs` exercises the full SigV4 + HTTP/1.1 path-style range-GET path for \
-               request shape; loopback wall-clock is environment-dependent, so the `INFINO_DIAG_*` \
-               modes report an adjusted S3 latency-model breakdown and `INFINO_REAL_S3_BUCKET` \
-               measures real S3 directly. p50 over repeated fresh-cache runs. Δ is vs the previous run."
-            .into(),
+        note: format!(
+            "One unified superfile (vector subsection + FTS subsection in a single Parquet file) \
+             served through one `DiskCacheStore` in `LazyForegroundWithBackgroundFill` mode. \
+             In-process `s3s-fs` exercises the full SigV4 + HTTP/1.1 path-style range-GET path for \
+             request shape. {backend_note} The detailed per-range `[diag]` breakdown prints above \
+             this table. p50 over repeated fresh-cache runs. Δ is vs the previous run."
+        ),
         blocks: vec![Block {
             subtitle: String::new(),
             headers: vec![
                 "Phase".into(),
-                "p50".into(),
+                latency_col.into(),
+                "Est S3 cost".into(),
                 "Peak RSS".into(),
                 "Median RSS".into(),
                 "P90 RSS".into(),
             ],
             rows: vec![
-                row("cold open via s3s-fs (footer + per-subsection open-time region)", cold_open),
+                row("cold open (footer + per-subsection open-time region)", cold_open),
                 row(
                     &format!("cold first vector_search (nprobe+1 cluster GETs at nprobe={DEFAULT_NPROBE})"),
                     cold_vec,
@@ -1139,11 +1109,113 @@ pub(crate) mod diag {
         }
     }
 
+    /// One cold phase's aggregate for the default report table.
+    pub(super) struct ColdPhase {
+        /// p50 latency — the modeled S3 wall-clock for s3s-fs (loopback
+        /// blocking subtracted, TTFB+throughput model added back), or the
+        /// true wall-clock for real S3.
+        pub(super) p50: Duration,
+        /// Median estimated S3 cost (USD) of one cold operation.
+        pub(super) cost_usd: f64,
+    }
+
+    /// Which cold operation a phase drives.
+    pub(super) enum ColdOp {
+        Open,
+        VectorSearch,
+        Bm25Search,
+    }
+
+    /// Run `iters` fresh-cache cold operations through a request-counting
+    /// store. Prints the per-iter `[diag]` breakdown (modeled S3 latency +
+    /// estimated cost for s3s-fs; true wall-clock + cost for real S3) via
+    /// [`report`], and returns the p50 (modeled/real) latency + median
+    /// estimated cost for the summary table. `raw_storage` is the
+    /// un-instrumented backend.
+    pub(super) fn measure_cold_phase(
+        rt: &Runtime,
+        raw_storage: Arc<dyn StorageProvider>,
+        uri: &SuperfileUri,
+        query: &[f32],
+        nprobe: usize,
+        real_s3: bool,
+        name: &str,
+        op: ColdOp,
+        iters: usize,
+    ) -> ColdPhase {
+        let storage = Arc::new(CountingStorage::new(raw_storage));
+        let storage_dyn: Arc<dyn StorageProvider> =
+            Arc::clone(&storage) as Arc<dyn StorageProvider>;
+        let model = S3LatencyModel::from_env_or_default();
+        let cost_model = S3CostModel::from_env_or_default();
+        let mut latencies = Vec::with_capacity(iters);
+        let mut costs = Vec::with_capacity(iters);
+        for i in 0..iters {
+            let before = storage.snapshot();
+            let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
+            let t0 = Instant::now();
+            match op {
+                ColdOp::Open => {
+                    let r = rt.block_on(async { cache.reader(uri).await.expect("cold reader") });
+                    std::hint::black_box(r);
+                }
+                ColdOp::VectorSearch => {
+                    let h = rt.block_on(async {
+                        let reader = cache.reader(uri).await.expect("cold reader");
+                        let vec = reader.vec().expect("vector reader present");
+                        vec.search("v", query, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                            .expect("cold vector_search")
+                    });
+                    std::hint::black_box(h);
+                }
+                ColdOp::Bm25Search => {
+                    let h = rt.block_on(async {
+                        let reader = cache.reader(uri).await.expect("cold reader");
+                        reader
+                            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                            .await
+                            .expect("cold bm25_search")
+                    });
+                    std::hint::black_box(h);
+                }
+            }
+            let wall = t0.elapsed();
+            let snap = storage.snapshot().diff(&before);
+            report(&format!("{name}[{i}]"), &snap, wall, real_s3);
+            let latency = if real_s3 {
+                wall
+            } else {
+                let (raw_blocking, model_blocking, _) =
+                    request_blocking_spans(&snap.range_log, model);
+                wall.checked_sub(raw_blocking).unwrap_or(Duration::ZERO) + model_blocking
+            };
+            let cost = cost_model
+                .cost_for(snap.head_count, snap.range_count, snap.range_bytes())
+                .total_usd();
+            latencies.push(latency);
+            costs.push(cost);
+            // Let the previous iter's background fill stop touching the
+            // backend before the next cold timing starts.
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
+            drop(cache);
+            drop(cache_dir);
+        }
+        latencies.sort_unstable();
+        costs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ColdPhase {
+            p50: latencies[latencies.len() / 2],
+            cost_usd: costs[costs.len() / 2],
+        }
+    }
+
     /// Probe raw s3s-fs / `S3StorageProvider` round-trip latency
     /// for three range sizes (header-sized, MiB-sized, chunk-sized)
     /// then exercise the cold-open + cold-first-search paths with
     /// the counting wrapper installed so we can see exactly what
-    /// the cold-fetch coordinator issues against the wire.
+    /// the cold-fetch coordinator issues against the wire. The
+    /// unhinted-vs-hinted A/B + raw-RTT probes here go beyond the
+    /// always-on summary `run()` emits; kept as an opt-in deep dive.
+    #[allow(dead_code)]
     pub fn diagnose_s3s_fs_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
         let superfile = superfile_bytes();

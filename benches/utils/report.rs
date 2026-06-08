@@ -197,8 +197,10 @@ impl Report {
                     }),
                     Cell::Metric { raw, shown, better } => {
                         let header = block.headers.get(ci).map(String::as_str).unwrap_or("");
-                        let key = format!("{}|{}|{}|{}", section.anchor, block.subtitle, label, header);
-                        let (delta, color) = compute_delta(self.prev.get(&key).copied(), *raw, *better);
+                        let key =
+                            format!("{}|{}|{}|{}", section.anchor, block.subtitle, label, header);
+                        let (delta, color) =
+                            compute_delta(self.prev.get(&key).copied(), *raw, *better);
                         self.cur.insert(key, *raw);
                         rrow.push(Rendered {
                             value: shown.clone(),
@@ -224,7 +226,10 @@ impl Report {
             merged.insert(k.clone(), *v);
         }
         if let Err(e) = write_map(&store_path(&self.bench), &merged) {
-            eprintln!("[report] failed to persist baseline for {}: {e}", self.bench);
+            eprintln!(
+                "[report] failed to persist baseline for {}: {e}",
+                self.bench
+            );
         }
     }
 }

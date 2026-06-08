@@ -503,12 +503,6 @@ fn emit_query(
         headers: query_headers(),
         rows: to_rows(fts_pushdown),
     };
-    // SUM(rating) over the candidate set at three selectivities (1 row
-    // / 10% / all), the two access paths back-to-back: non-indexed
-    // column (DataFusion full scan, min/max can't prune) vs FTS-indexed
-    // column (WHERE → token_match positive candidate selection). Read
-    // the two blocks row-for-row to watch the index advantage shrink as
-    // the match set grows.
     // Aggregate shapes over the candidate set, the two access paths
     // back-to-back. The 1-row `key=?` rows are the win-case (unsorted
     // key → min/max defeated → index reads one page); the `bucket IN all`

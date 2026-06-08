@@ -134,28 +134,26 @@ fn measure_ingest(n: usize) -> (Duration, RssStats) {
 /// row (`row{i:08}`); the counter runs monotonically.
 fn measure_deletes(n: usize, m: usize) -> (Duration, RssStats) {
     let (_dir, st) = build_supertable_with_ingest(n);
-    let mut i: u64 = 0;
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
-    for _ in 0..m {
+    for i in 0..m as u64 {
         let mut w = st.writer().expect("writer");
         let title = format!("row{i:08}");
         let pending = w.delete(col("title").eq(lit(title))).expect("delete");
         black_box(pending);
         black_box(w.commit().expect("commit"));
-        i += 1;
     }
     let wall = t0.elapsed();
     let rss = sampler.stop_stats();
 
-    // Exact end-state: each of the `i` delete attempts removed a
+    // Exact end-state: each of the `m` delete attempts removed a
     // distinct row while one was still present, so exactly
-    // `min(i, n)` rows are gone and `n - min(i, n)` remain.
-    let expected = (n as u64).saturating_sub(i) as i64;
+    // `min(m, n)` rows are gone and `n - min(m, n)` remain.
+    let expected = (n as u64).saturating_sub(m as u64) as i64;
     assert_eq!(
         count_rows(&st),
         expected,
-        "after {i} single-row deletes over an {n}-row table, \
+        "after {m} single-row deletes over an {n}-row table, \
          expected {expected} rows to remain"
     );
     (wall, rss)
@@ -178,10 +176,9 @@ fn measure_updates(n: usize, m: usize) -> (Duration, RssStats) {
         w.commit().expect("commit");
     }
 
-    let mut i: u64 = 0;
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
-    for _ in 0..m {
+    for i in 0..m as u64 {
         let mut w = st.writer().expect("writer");
         let from = format!("target-{i}");
         let to = format!("target-{}", i + 1);
@@ -191,7 +188,6 @@ fn measure_updates(n: usize, m: usize) -> (Duration, RssStats) {
             .expect("update");
         black_box(pending);
         black_box(w.commit().expect("commit"));
-        i += 1;
     }
     let wall = t0.elapsed();
     let rss = sampler.stop_stats();

@@ -18,12 +18,12 @@ use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use rayon::prelude::*;
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
+use rayon::prelude::*;
 
 use super::{Capabilities, SqlEngine, SqlOutput, SqlRow};
 
@@ -64,7 +64,10 @@ pub const SQL_DIM: usize = 16;
 const ROT_SEED: u64 = 7;
 
 fn fixed_list_f32(dim: usize) -> DataType {
-    DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim as i32)
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+    )
 }
 
 /// High-cardinality lookup key for `doc_id`, deliberately **uncorrelated
@@ -317,10 +320,8 @@ mod tests {
         let total = InfinoSqlEngine::read(&idx, "SELECT * FROM supertable");
         assert_eq!(total.rows, 3, "all rows visible; got {}", total.rows);
 
-        let rust = InfinoSqlEngine::read(
-            &idx,
-            "SELECT title FROM supertable WHERE category = 'rust'",
-        );
+        let rust =
+            InfinoSqlEngine::read(&idx, "SELECT title FROM supertable WHERE category = 'rust'");
         assert_eq!(rust.rows, 2, "two rust rows; got {}", rust.rows);
     }
 
@@ -333,18 +334,30 @@ mod tests {
         // bm25_search, vector_search, and hybrid_search are all just SQL
         // options through the same query_sql read path.
         let bm25 = InfinoSqlEngine::read(&idx, "SELECT _id FROM bm25_search('title', 'rust', 10)");
-        assert!(bm25.rows >= 1, "bm25 should match 'rust'; got {}", bm25.rows);
+        assert!(
+            bm25.rows >= 1,
+            "bm25 should match 'rust'; got {}",
+            bm25.rows
+        );
 
         let vector = InfinoSqlEngine::read(
             &idx,
             &format!("SELECT _id FROM vector_search('emb', '{qv}', 3)"),
         );
-        assert!(vector.rows >= 1, "vector should return hits; got {}", vector.rows);
+        assert!(
+            vector.rows >= 1,
+            "vector should return hits; got {}",
+            vector.rows
+        );
 
         let hybrid = InfinoSqlEngine::read(
             &idx,
             &format!("SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{qv}', 3)"),
         );
-        assert!(hybrid.rows >= 1, "hybrid should fuse hits; got {}", hybrid.rows);
+        assert!(
+            hybrid.rows >= 1,
+            "hybrid should fuse hits; got {}",
+            hybrid.rows
+        );
     }
 }

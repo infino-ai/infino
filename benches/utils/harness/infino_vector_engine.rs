@@ -73,8 +73,7 @@ fn build_superfile(
             .collect::<Decimal128Array>()
             .with_precision_and_scale(38, 0)
             .expect("decimal128 precision/scale");
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).expect("RecordBatch");
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).expect("RecordBatch");
         builder
             .add_batch(&batch, &[&vectors[offset * dim..(offset + len) * dim]])
             .expect("add_batch");
@@ -190,12 +189,7 @@ impl VectorEngine for InfinoVectorEngine {
         std::hint::black_box(shards);
     }
 
-    fn read(
-        index: &Self::Index,
-        query: &[f32],
-        k: usize,
-        search: VectorSearch,
-    ) -> Vec<VectorHit> {
+    fn read(index: &Self::Index, query: &[f32], k: usize, search: VectorSearch) -> Vec<VectorHit> {
         let opts = VectorSearchOptions::new()
             .with_nprobe(search.nprobe)
             .with_rerank_mult(search.rerank_mult);

@@ -1769,7 +1769,24 @@ async fn try_commit_attempt(
     //    supertable → no pointer yet → None etag (initial
     //    commit).
     let prev_etag = match storage.head(POINTER_PATH).await {
-        Ok(meta) => meta.etag,
+        // Pointer exists with an etag: CAS against it.
+        Ok(meta) if meta.etag.is_some() => meta.etag,
+        // Pointer exists but HEAD returned no etag. Some
+        // S3-compatible stores (e.g. the `s3s-fs` test emulator)
+        // omit the ETag on HeadObject while still returning it on
+        // GetObject. Recover the etag via get() so the CAS uses
+        // `put_if_match` against the live pointer. Treating a
+        // missing etag as "no prior pointer" would downgrade to a
+        // create-only put that fails PreconditionFailed against
+        // the existing pointer on every retry, deadlocking the
+        // OCC loop.
+        Ok(_) => {
+            let (_, meta) = storage
+                .get(POINTER_PATH)
+                .await
+                .map_err(crate::supertable::CommitError::from)?;
+            meta.etag
+        }
         Err(StorageError::NotFound { .. }) => None,
         Err(e) => return Err(crate::supertable::CommitError::from(e)),
     };

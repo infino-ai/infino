@@ -287,7 +287,9 @@ impl MmapTextCorpus {
     /// feeds to every engine. `doc_id` is the dense row index, so it
     /// doubles as the cross-engine recall id.
     pub fn rows(&self) -> Vec<(u64, &str)> {
-        (0..self.n_docs()).map(|i| (i as u64, self.doc(i))).collect()
+        (0..self.n_docs())
+            .map(|i| (i as u64, self.doc(i)))
+            .collect()
     }
 }
 
