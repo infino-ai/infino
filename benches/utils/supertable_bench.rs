@@ -10,12 +10,12 @@
 //! single-modality peers: FTS-only, vector-only, and combined FTS +
 //! vector.
 //!
-//! **Real AWS S3 only.** The multi-commit build relies on conditional
-//! `If-Match` PUTs that the `s3s-fs` emulator does not implement, and a
-//! local filesystem backend would not measure object-store behavior, so
-//! this bench requires `INFINO_REAL_S3_BUCKET` (+ AWS creds) and exits with
-//! a message otherwise. Every object the run writes lands under one unique
-//! prefix per shape, all of which are deleted before the runner returns.
+//! **Real object store only** (`INFINO_BENCH_STORE=s3` or `azure`). The
+//! multi-commit build relies on conditional `If-Match` PUTs that the
+//! `s3s-fs` emulator does not implement, so this bench rejects `s3s_fs` (the
+//! default) and exits with a message otherwise. Every object the run writes
+//! lands under one unique prefix per shape, all deleted before the runner
+//! returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
 //!
 //! ## Per-shape process isolation
 //!
@@ -31,9 +31,10 @@
 //! ## Invocation
 //!
 //! ```text
-//! INFINO_REAL_S3_BUCKET=my-bench-bucket cargo bench --bench supertable_all
-//! INFINO_REAL_S3_BUCKET=my-bench-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
-//! INFINO_REAL_S3_BUCKET=my-bench-bucket INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench --bench supertable_all
+//! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
+//!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench --bench supertable_all
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
 //! ```
 
 use std::process::{Command, Stdio};

@@ -6,8 +6,9 @@
 //! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
-//! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
-//! (or `INFINO_TEST_REAL_S3_BUCKET`) for AWS S3.
+//! Backend is chosen explicitly by `INFINO_BENCH_STORE` (`s3s_fs` default |
+//! `s3` | `azure`) — never inferred from which credential is set. `s3` reads
+//! `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -81,7 +82,7 @@ pub struct StorageFixture {
     pub storage_label: &'static str,
     /// `true` for a real remote backend (S3 or Azure), `false` for the
     /// in-process s3s-fs emulator.
-    pub real_s3: bool,
+    pub remote: bool,
     /// Remote prefix to delete when the run finishes (`None` for the
     /// auto-cleaned s3s-fs tempdir, or when `INFINO_BENCH_KEEP_TABLE` is set).
     pub cleanup: Option<PrefixCleanup>,
@@ -143,24 +144,23 @@ pub struct SuperfileCommitted {
     pub object_path: String,
     pub object_size: u64,
     pub storage_label: &'static str,
-    pub real_s3: bool,
     pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
 }
 
 impl SuperfileCommitted {
-    /// Delete the uploaded object when the fixture points at real S3.
-    /// s3s-fs fixtures live under a tempdir and are cleaned up by dropping
-    /// `_keepalive`, so they do not need object-level deletion.
+    /// Delete the uploaded object on a real backend. s3s-fs fixtures live
+    /// under a tempdir and are cleaned up by dropping `_keepalive`, so they
+    /// carry no `cleanup_path` and this is a no-op.
     pub fn cleanup(&self) {
         let Some(path) = self.cleanup_path.as_deref() else {
             return;
         };
-        let storage = Arc::clone(&self.storage);
+        let (storage, label) = (Arc::clone(&self.storage), self.storage_label);
         let result = block_on(async move { storage.delete(path).await });
         match result {
-            Ok(()) => eprintln!("[tiers] cleanup real S3 superfile path={path}: deleted"),
-            Err(e) => eprintln!("[tiers] cleanup real S3 superfile path={path}: {e}"),
+            Ok(()) => eprintln!("[tiers] cleanup {label} superfile path={path}: deleted"),
+            Err(e) => eprintln!("[tiers] cleanup {label} superfile path={path}: {e}"),
         }
     }
 }
@@ -363,7 +363,7 @@ fn remote_fixture(backend: Backend, prefix_default: &str) -> StorageFixture {
     StorageFixture {
         storage,
         storage_label: label,
-        real_s3: true,
+        remote: true,
         cleanup,
         _keepalive: StorageKeepalive::Remote,
     }
@@ -399,7 +399,7 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     StorageFixture {
         storage,
         storage_label: "s3s_fs",
-        real_s3: false,
+        remote: false,
         cleanup: None,
         _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
     }
@@ -452,9 +452,8 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
         object_path: path.clone(),
         object_size: bytes.len() as u64,
         storage_label: fixture.storage_label,
-        real_s3: fixture.real_s3,
         // Delete the uploaded object on a real backend, unless asked to keep it.
-        cleanup_path: (fixture.real_s3 && !keep_table()).then_some(path),
+        cleanup_path: (fixture.remote && !keep_table()).then_some(path),
         _keepalive: fixture._keepalive,
     }
 }
