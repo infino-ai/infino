@@ -16,6 +16,7 @@
 mod index_spec;
 mod manifest;
 mod options;
+mod search_tvf;
 mod uri;
 
 use std::collections::{HashMap, HashSet};
@@ -300,6 +301,11 @@ impl Connection {
             }
         }
 
+        // Search TVFs resolve their leading table-name argument through
+        // the catalog at call time (so a table named only inside a TVF —
+        // not as a `FROM` relation — still resolves).
+        search_tvf::register_search_tvfs(&ctx, self.clone());
+
         let sql = sql.to_owned();
         let drive = async move {
             let df = ctx
@@ -514,6 +520,31 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3, "2 from docs + 1 from more");
+    }
+
+    #[test]
+    fn query_sql_bm25_search_tvf_resolves_table() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append");
+
+        // Leading table-name argument selects the catalog table.
+        let rows: usize = conn
+            .query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
+            .expect("bm25_search tvf")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "one doc matches 'fox'");
+
+        // An unknown table in the TVF is a clean planning error.
+        assert!(
+            conn.query_sql("SELECT _id FROM bm25_search('nope', 'title', 'fox', 10)")
+                .is_err()
+        );
     }
 
     #[test]
