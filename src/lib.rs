@@ -56,10 +56,14 @@ pub const BUILDER_ID: &str = concat!(
 );
 
 pub mod config;
+mod error;
 mod runtime_bridge;
 pub mod storage;
 pub mod superfile;
 pub mod supertable;
+
+/// The single public error type for the curated API.
+pub use error::Error;
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)
