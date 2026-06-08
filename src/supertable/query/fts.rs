@@ -701,8 +701,7 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits =
-            block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
 
@@ -737,9 +736,7 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader();
-        let hits = r
-            .bm25_search_prefix("title", "zzzz", 10)
-            .expect("query");
+        let hits = r.bm25_search_prefix("title", "zzzz", 10).expect("query");
         assert!(hits.is_empty());
     }
 
@@ -755,9 +752,7 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader();
-        let hits = r
-            .bm25_search_prefix("title", "RUST", 5)
-            .expect("query");
+        let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
         assert_eq!(hits.len(), 1);
     }
 
