@@ -67,6 +67,7 @@ use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resol
 use super::vector_exec::arg_to_query_vector;
 use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::reader::VectorSearchOptions;
+use crate::supertable::QueryError;
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
 use crate::supertable::query::SuperfileHit;
@@ -97,6 +98,55 @@ pub(crate) fn register_hybrid_search(
         HYBRID_SEARCH_UDTF,
         Arc::new(HybridSearchFunc::new(reader, scalar_schema)),
     );
+}
+
+impl SupertableReader {
+    /// Async kernel: run BM25 (`mode`) and vector kNN concurrently over
+    /// this reader's pinned snapshot and fuse the two rankings with
+    /// reciprocal-rank fusion, returning the top-`k` fused hits (each
+    /// carrying its RRF score; higher is better). The hits are
+    /// unresolved — the caller resolves `_id` / scalar columns.
+    /// `pub(crate)` kernel; the public surface is the sync
+    /// [`SupertableReader::hybrid_search`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hybrid_search_async(
+        &self,
+        text_col: &str,
+        q_text: &str,
+        mode: BoolMode,
+        vec_col: &str,
+        q_vec: &[f32],
+        options: VectorSearchOptions,
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        // Both retrievers run concurrently on the query runtime; each
+        // inherits its own manifest skip and returns hits best-first.
+        let (bm25_res, vector_res) = futures::future::join(
+            self.bm25_search_async(text_col, q_text, k, mode),
+            self.vector_search_async(vec_col, q_vec, k, options),
+        )
+        .await;
+        Ok(rrf_fuse(&bm25_res?, &vector_res?, k))
+    }
+
+    /// Hybrid BM25 + vector search fused with reciprocal-rank fusion
+    /// over this reader's pinned snapshot. Returns up to `k` fused hits
+    /// carrying the RRF score (higher is better). Sync wrapper over
+    /// [`SupertableReader::hybrid_search_async`] — the same fusion the
+    /// `hybrid_search` SQL table function runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        text_col: &str,
+        q_text: &str,
+        mode: BoolMode,
+        vec_col: &str,
+        q_vec: &[f32],
+        options: VectorSearchOptions,
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.block_on(self.hybrid_search_async(text_col, q_text, mode, vec_col, q_vec, options, k))
+    }
 }
 
 /// `TableFunctionImpl` for `hybrid_search`. Holds the query's pinned
@@ -356,19 +406,12 @@ impl ExecutionPlan for HybridSearchExec {
         let projected_schema = Arc::clone(&self.projected_schema);
 
         let fut = async move {
-            // Run both retrievers concurrently on the query runtime;
-            // each inherits its own manifest skip and returns hits
-            // best-first.
-            let (bm25_res, vector_res) = futures::future::join(
-                reader.bm25_search_async(&text_col, &q_text, k, mode),
-                reader.vector_search_async(&vec_col, &q_vec, k, options),
-            )
-            .await;
-            let bm25_hits = bm25_res.map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let vector_hits = vector_res.map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-            // Fuse on hit identity, then resolve the fused set once.
-            let fused = rrf_fuse(&bm25_hits, &vector_hits, k);
+            // Run both retrievers concurrently and fuse with RRF via the
+            // shared kernel, then resolve the fused set once.
+            let fused = reader
+                .hybrid_search_async(&text_col, &q_text, mode, &vec_col, &q_vec, options, k)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &fused,

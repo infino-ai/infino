@@ -263,8 +263,8 @@ impl SupertableReader {
     /// skip uses the same term-bloom prune as BM25.
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
-    /// [`Supertable::token_match`].
-    pub(crate) async fn token_match(
+    /// [`SupertableReader::token_match`].
+    pub(crate) async fn token_match_async(
         &self,
         column: &str,
         query: &str,
@@ -313,8 +313,8 @@ impl SupertableReader {
     /// for the per-segment two-pass (token-AND prune + raw verify).
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
-    /// [`Supertable::exact_match`].
-    pub(crate) async fn exact_match(
+    /// [`SupertableReader::exact_match`].
+    pub(crate) async fn exact_match_async(
         &self,
         column: &str,
         value: &str,
@@ -383,33 +383,29 @@ impl SupertableReader {
         self.block_on(self.bm25_search_prefix_async(column, prefix, k))
     }
 
-    /// Unranked token match over the current snapshot. Returns
+    /// Unranked token match over this reader's pinned snapshot. Returns
     /// every row whose `column` matches `query`'s tokens under `mode`
     /// (`Or` = any token, `And` = every token). The returned hits are
     /// **unranked** — `score` is `0.0` and order is unspecified — unlike
-    /// the ranked [`Supertable::bm25_search`]. Same sync→async bridge
-    /// and freshness policy as the other search methods.
+    /// the ranked [`SupertableReader::bm25_search`]. Drives the async
+    /// kernel via the sync→async bridge ([`SupertableReader::block_on`]).
     pub fn token_match(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.token_match(column, query, mode))
+        self.block_on(self.token_match_async(column, query, mode))
     }
 
     /// Unranked exact match of the raw string `value` against `column`
-    /// over the current snapshot — the two-pass index-pruned, text-
-    /// verified match (see
+    /// over this reader's pinned snapshot — the two-pass index-pruned,
+    /// text-verified match (see
     /// [`SuperfileReader::exact_match`](crate::superfile::SuperfileReader::exact_match)).
     /// Returns the rows whose stored value equals `value` exactly;
     /// hits are **unranked** (`score` is `0.0`).
     pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.exact_match(column, value))
+        self.block_on(self.exact_match_async(column, value))
     }
 }
 

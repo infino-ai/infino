@@ -338,9 +338,9 @@ impl ExecutionPlan for MatchExec {
         let fut = async move {
             let hits = match &query {
                 MatchQuery::Token { query, mode } => {
-                    reader.token_match(&column, query, *mode).await
+                    reader.token_match_async(&column, query, *mode).await
                 }
-                MatchQuery::Exact { value } => reader.exact_match(&column, value).await,
+                MatchQuery::Exact { value } => reader.exact_match_async(&column, value).await,
             }
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
@@ -492,7 +492,8 @@ mod tests {
     #[test]
     fn public_methods_agree_with_tvfs() {
         let st = demo();
-        let method = st
+        let reader = st.reader();
+        let method = reader
             .token_match(
                 "title",
                 "rust systems",
@@ -500,7 +501,9 @@ mod tests {
             )
             .expect("token_match");
         assert_eq!(method.len(), 1);
-        let exact = st.exact_match("title", "go routines").expect("exact_match");
+        let exact = reader
+            .exact_match("title", "go routines")
+            .expect("exact_match");
         assert_eq!(exact.len(), 1);
     }
 }
