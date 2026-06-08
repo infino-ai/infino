@@ -2284,7 +2284,6 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
- "infino",
  "infino-bench-utils",
  "memmap2",
  "memory-stats",

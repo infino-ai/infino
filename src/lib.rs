@@ -67,9 +67,10 @@ pub use error::InfinoError;
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)
-///   - Integration tests + benches (via the `test-helpers`
-///     feature, auto-enabled by the `dev-dependencies` self-
-///     reference in `Cargo.toml`)
+///   - Integration tests (via `cargo test --features test-helpers`,
+///     wired into the `Makefile`)
+///   - Benches (which pull `test-helpers` in transitively through
+///     the `infino-bench-utils` dev-dependency)
 ///
 /// NOT part of infino's stable API. Signatures may change.
 #[cfg(any(test, feature = "test-helpers"))]

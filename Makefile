@@ -4,17 +4,17 @@
 
 check:
 	cargo fmt --check
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --features test-helpers -- -D warnings
 
 test:
-	cargo test
+	cargo test --features test-helpers
 
 # Coverage (cargo-llvm-cov; install: cargo install cargo-llvm-cov)
 coverage:                      # CI gate: ≥90% overall + lcov.info for codecov upload
-	cargo llvm-cov --summary-only
+	cargo llvm-cov --summary-only --features test-helpers
 
 coverage-summary:              # quick terminal summary
-	cargo llvm-cov --summary-only
+	cargo llvm-cov --summary-only --features test-helpers
 
 # Note: an earlier `coverage-arena` gate was retired when the
 # custom MemoryArena it covered was deleted. The remaining
@@ -25,10 +25,10 @@ coverage-summary:              # quick terminal summary
 
 # Benchmarks
 bench:
-	cargo bench
+	cargo bench --features test-helpers
 
 bench-quick:
-	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench superfile_fts
+	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench superfile_fts --features test-helpers
 
 # Memory safety oracles for the FTS / format `unsafe` surface.
 # The remaining `unsafe` surface is one bumpalo lifetime
