@@ -66,7 +66,7 @@ use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
-use super::SuperfileHit;
+use super::{SearchHit, SuperfileHit};
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -260,11 +260,31 @@ impl SupertableReader {
 impl Supertable {
     /// Single-column BM25 search over the current snapshot.
     ///
-    /// Pins a reader at call entry, applies the read-consistency
-    /// policy, and drives the internal async kernel to completion
-    /// via the sync→async bridge ([`Supertable::block_on_query`]).
-    /// Returns up to `k` hits sorted by BM25 score *descending*.
+    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), best
+    /// score first. Pins a reader, applies the read-consistency policy,
+    /// drives the async kernel via the sync→async bridge, then resolves
+    /// each segment-local hit to its public `_id`.
     pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<SearchHit>, crate::Error> {
+        let hits = self.bm25_search_hits(column, query, k, mode)?;
+        let reader = self.reader();
+        let id_col = self.options().id_column.clone();
+        self.block_on_query(crate::supertable::query::exec::common::resolve_search_hits(
+            &reader, &hits, &id_col,
+        ))
+        .map_err(|e| crate::Error::Query(e.to_string()))
+    }
+
+    /// Segment-local BM25 hits ([`SuperfileHit`], carrying
+    /// `segment` + `local_doc_id`). Internal/positional — used by the
+    /// correctness oracles; the public surface is
+    /// [`Supertable::bm25_search`]. Up to `k`, BM25 score *descending*.
+    pub fn bm25_search_hits(
         &self,
         column: &str,
         query: &str,

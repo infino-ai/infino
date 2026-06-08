@@ -182,7 +182,7 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
     let before = store.snapshot();
 
     let hits = st
-        .bm25_search(
+        .bm25_search_hits(
             "title",
             "nimblefox",
             BM25_TOP_K,
@@ -277,7 +277,7 @@ fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
 
     let before = store.snapshot();
     let hits = st
-        .bm25_search(
+        .bm25_search_hits(
             "title",
             "definitelynotpresent",
             BM25_TOP_K,
@@ -320,7 +320,7 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
 
     let before = store.snapshot();
     let _hits = st
-        .bm25_search(
+        .bm25_search_hits(
             "title",
             "alpha beta",
             BM25_TOP_K,

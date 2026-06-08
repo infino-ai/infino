@@ -202,7 +202,7 @@ fn demo_supertable() {
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());
     for h in &hits {
-        println!("    local_doc_id={} score={:.4}", h.local_doc_id, h.score);
+        println!("    _id={} score={:.4}", h.id, h.score);
     }
 
     // SQL surfaces the real auto-injected `_id` alongside the payload.
