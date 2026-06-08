@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "infino"
+description = "Fast search on object storage — SQL, full-text, and vector search."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = ["pyarrow>=14"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest", "pyarrow>=14"]
+
+[tool.maturin]
+# The cdylib's lib name is `infino`, so the built module is `infino`.
+features = ["pyo3/extension-module"]

@@ -2,3 +2,10 @@
 lcov.info
 *.profraw
 .DS_Store
+
+# Python bindings (built standalone with maturin; not a workspace member).
+infino-python/target/
+infino-python/Cargo.lock
+infino-python/.venv/
+**/__pycache__/
+**/.pytest_cache/

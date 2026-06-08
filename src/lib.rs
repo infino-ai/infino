@@ -53,8 +53,11 @@
 
 // `mimalloc` calls into a C runtime; miri can't execute foreign
 // functions, so we fall back to the system allocator under miri.
-// Production builds and tests not under miri keep mimalloc.
-#[cfg(not(miri))]
+// Production builds and tests not under miri keep mimalloc. Gated on the
+// default-on `mimalloc` feature so an embedding loaded into a host
+// process with its own allocator (the Python extension) can opt out — a
+// second global allocator dlopened into a live process segfaults.
+#[cfg(all(not(miri), feature = "mimalloc"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

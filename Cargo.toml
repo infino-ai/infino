@@ -21,11 +21,23 @@ autobenches = false
 # can be checked/built/tested directly.
 [workspace]
 members = ["benches/utils"]
+# The Python bindings are built standalone with maturin, not as part of
+# this workspace — so the core Rust crate never requires a Python /
+# pyo3 toolchain to build. See `infino-python/README.md`.
+exclude = ["infino-python"]
 
 [lib]
 path = "src/lib.rs"
 
 [features]
+# `mimalloc` installs mimalloc as the `#[global_allocator]` (see
+# `lib.rs`). Default-on for the standalone library, binaries, and
+# benches. An embedding that is loaded into a host process with its own
+# allocator — notably the Python extension module — must turn it OFF
+# (`default-features = false`): a second global allocator dlopened into a
+# live process segfaults. Not part of the public API surface.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
 # Exposes `infino::test_helpers` — convenience builders for
 # Decimal128 id columns, default tokenizers, default vector
 # configs. Enabled explicitly by the Makefile test / bench / coverage
@@ -61,7 +73,7 @@ bytemuck = "1"
 
 # Allocator strategy: mimalloc as #[global_allocator], bumpalo for
 # per-query scratch, plus the custom MemoryArena in fts/arena.rs.
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 static_assertions = "1"
