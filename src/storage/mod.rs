@@ -38,6 +38,7 @@ use thiserror::Error;
 
 pub mod azure;
 pub mod local_fs;
+mod retry;
 pub mod s3;
 
 pub use azure::AzureStorageProvider;
