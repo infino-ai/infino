@@ -52,6 +52,35 @@ cargo bench --features bench-diagnostics --bench object-store
 cargo bench --features bench-diagnostics --bench scale -- vector_recall
 ```
 
+## Object-store backends
+
+The supertable benches (and the superfile cold tier) run against an object
+store, chosen **explicitly** by `INFINO_BENCH_STORE` — never inferred from
+which credentials happen to be set:
+
+| `INFINO_BENCH_STORE` | Backend | Extra env |
+|---|---|---|
+| _unset_ / `s3s_fs` | in-process s3s-fs emulator | — |
+| `s3` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
+| `azure` | real Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
+
+```sh
+# Superfile benches: any backend (s3s-fs is the zero-setup default).
+cargo bench --bench superfile_fts
+
+# Supertable bench: real object store only (s3 or azure). s3s-fs lacks the
+# multi-commit If-Match CAS the supertable commit needs, so it is rejected.
+INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket \
+  cargo bench --bench supertable_all
+INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
+  AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... \
+  cargo bench --bench supertable_all
+```
+
+A real-backend run writes under a unique prefix and deletes it on exit; set
+`INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
+emulator self-cleans and reproduces request/byte volume, not network latency.
+
 ## Migration Status
 
 Only migrated sections should be treated as current. Sections that still show a

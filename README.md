@@ -35,11 +35,13 @@ let mut writer = table.writer()?;
 writer.append(&batch)?;                        // columns: title (text) + embedding (vector)
 writer.commit()?;
 
-// Keyword search (BM25):
-let hits = table.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+// Reads run through a snapshot-pinned reader — synchronous, fans out
+// across segments for you. Keyword search (BM25):
+let hits = table.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
 
 // Vector search (k-NN):
-let knn = table.vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
+let query = vec![/* dim=384 f32s */];
+let knn = table.reader().vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
 
 // SQL (DataFusion under the hood; every segment is also valid Parquet):
 let rows = table.query_sql("SELECT _id, title FROM bm25_search('title', 'rust async', 10)")?;

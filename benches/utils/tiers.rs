@@ -6,15 +6,16 @@
 //! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
-//! Default backing store is in-process `s3s-fs`. Set `INFINO_REAL_S3_BUCKET`
-//! (or `INFINO_TEST_REAL_S3_BUCKET`) for AWS S3.
+//! Backend is chosen explicitly by `INFINO_BENCH_STORE` (`s3s_fs` default |
+//! `s3` | `azure`) — never inferred from which credential is set. `s3` reads
+//! `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{S3StorageProvider, StorageProvider};
+use infino::supertable::storage::{AzureStorageProvider, S3StorageProvider, StorageProvider};
 use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
@@ -79,63 +80,57 @@ pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) 
 pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
-    pub real_s3: bool,
-    /// Real-S3 prefix to delete when the run finishes (`None` for the
-    /// auto-cleaned s3s-fs tempdir backend).
-    pub cleanup: Option<S3Cleanup>,
+    /// `true` for a real remote backend (S3 or Azure), `false` for the
+    /// in-process s3s-fs emulator.
+    pub remote: bool,
+    /// Remote prefix to delete when the run finishes (`None` for the
+    /// auto-cleaned s3s-fs tempdir, or when `INFINO_BENCH_KEEP_TABLE` is set).
+    pub cleanup: Option<PrefixCleanup>,
     _keepalive: StorageKeepalive,
 }
 
 enum StorageKeepalive {
     S3sFs { _fs_root: TempDir },
-    RealS3,
+    Remote,
 }
 
-/// A real-S3 prefix that a bench run created and must delete on exit so it
+/// A real-backend prefix a bench run created and must delete on exit so it
 /// accrues no storage cost. The supertable build writes many objects
-/// (segments, manifests, the pointer) under one unique prefix; cleanup
-/// lists every key beneath it and deletes them.
+/// (segments, manifests, the pointer) under one unique prefix; cleanup lists
+/// every key beneath it and deletes them. `root` is an *un*-prefixed provider
+/// (bucket/container root): `list_with_prefix` takes an absolute key prefix
+/// and `delete` targets the absolute keys it returns verbatim, so both sides
+/// agree on the same keyspace.
 #[derive(Clone)]
-pub struct S3Cleanup {
-    pub bucket: String,
-    pub prefix: String,
+pub struct PrefixCleanup {
+    root: Arc<dyn StorageProvider>,
+    prefix: String,
+    label: &'static str,
 }
 
-/// Delete every object under a real-S3 bench prefix. Uses a fresh, *un*-prefixed
-/// provider on purpose: `list_with_prefix` takes an absolute key prefix (it does
-/// not prepend a provider prefix) and `delete` targets the absolute keys it
-/// returns verbatim, so both sides agree on the same keyspace.
-pub fn cleanup_real_s3_prefix(cleanup: &S3Cleanup) {
-    let provider = match S3StorageProvider::new(&cleanup.bucket) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "[tiers] cleanup: cannot open bucket {} ({e}); prefix {} NOT deleted",
-                cleanup.bucket, cleanup.prefix
-            );
-            return;
-        }
-    };
+/// Delete every object under a bench prefix on its (S3 or Azure) backend.
+pub fn cleanup_prefix(cleanup: &PrefixCleanup) {
+    let root = Arc::clone(&cleanup.root);
     let prefix = cleanup.prefix.clone();
     let result: Result<usize, String> = block_on(async move {
-        let keys = provider
+        let keys = root
             .list_with_prefix(&prefix)
             .await
             .map_err(|e| e.to_string())?;
         let n = keys.len();
         for key in &keys {
-            provider.delete(key).await.map_err(|e| e.to_string())?;
+            root.delete(key).await.map_err(|e| e.to_string())?;
         }
         Ok(n)
     });
     match result {
         Ok(n) => eprintln!(
-            "[tiers] cleanup real S3 prefix={}: deleted {n} objects",
-            cleanup.prefix
+            "[tiers] cleanup {} prefix={}: deleted {n} objects",
+            cleanup.label, cleanup.prefix
         ),
         Err(e) => eprintln!(
-            "[tiers] cleanup real S3 prefix={}: FAILED ({e}) — objects may remain",
-            cleanup.prefix
+            "[tiers] cleanup {} prefix={}: FAILED ({e}) — objects may remain",
+            cleanup.label, cleanup.prefix
         ),
     }
 }
@@ -149,24 +144,23 @@ pub struct SuperfileCommitted {
     pub object_path: String,
     pub object_size: u64,
     pub storage_label: &'static str,
-    pub real_s3: bool,
     pub cleanup_path: Option<String>,
     _keepalive: StorageKeepalive,
 }
 
 impl SuperfileCommitted {
-    /// Delete the uploaded object when the fixture points at real S3.
-    /// s3s-fs fixtures live under a tempdir and are cleaned up by dropping
-    /// `_keepalive`, so they do not need object-level deletion.
+    /// Delete the uploaded object on a real backend. s3s-fs fixtures live
+    /// under a tempdir and are cleaned up by dropping `_keepalive`, so they
+    /// carry no `cleanup_path` and this is a no-op.
     pub fn cleanup(&self) {
         let Some(path) = self.cleanup_path.as_deref() else {
             return;
         };
-        let storage = Arc::clone(&self.storage);
+        let (storage, label) = (Arc::clone(&self.storage), self.storage_label);
         let result = block_on(async move { storage.delete(path).await });
         match result {
-            Ok(()) => eprintln!("[tiers] cleanup real S3 superfile path={path}: deleted"),
-            Err(e) => eprintln!("[tiers] cleanup real S3 superfile path={path}: {e}"),
+            Ok(()) => eprintln!("[tiers] cleanup {label} superfile path={path}: deleted"),
+            Err(e) => eprintln!("[tiers] cleanup {label} superfile path={path}: {e}"),
         }
     }
 }
@@ -199,6 +193,106 @@ pub fn real_s3_bucket_env() -> Option<String> {
 
 pub fn real_s3_prefix_root(default: &str) -> String {
     std::env::var("INFINO_REAL_S3_PREFIX").unwrap_or_else(|_| default.to_string())
+}
+
+fn azure_container_env() -> Option<String> {
+    std::env::var("INFINO_REAL_AZURE_CONTAINER")
+        .or_else(|_| std::env::var("INFINO_TEST_REAL_AZURE_CONTAINER"))
+        .ok()
+}
+
+fn azure_prefix_root(default: &str) -> String {
+    std::env::var("INFINO_REAL_AZURE_PREFIX").unwrap_or_else(|_| default.to_string())
+}
+
+/// Whether to retain the run's unique prefix instead of deleting it.
+fn keep_table() -> bool {
+    std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some()
+}
+
+/// The object-store backend a run targets, chosen explicitly by
+/// `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure`) — never inferred
+/// from which credential happens to be set.
+#[derive(Debug, PartialEq, Eq)]
+enum Backend {
+    /// In-process s3s-fs emulator (no creds, no network).
+    S3sFs,
+    /// Real AWS S3.
+    S3 { bucket: String },
+    /// Real Azure Blob.
+    Azure { container: String },
+}
+
+impl Backend {
+    fn from_env() -> Result<Self, String> {
+        let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "s3s_fs".into());
+        Self::parse(&store, real_s3_bucket_env(), azure_container_env())
+    }
+
+    /// Pure resolution: real backends require their location env. Split out
+    /// so selection is unit-testable without mutating process env.
+    fn parse(
+        store: &str,
+        s3_bucket: Option<String>,
+        azure_container: Option<String>,
+    ) -> Result<Self, String> {
+        match store {
+            "s3s_fs" => Ok(Self::S3sFs),
+            "s3" => s3_bucket
+                .map(|bucket| Self::S3 { bucket })
+                .ok_or_else(|| "INFINO_BENCH_STORE=s3 requires INFINO_REAL_S3_BUCKET".to_string()),
+            "azure" => azure_container
+                .map(|container| Self::Azure { container })
+                .ok_or_else(|| {
+                    "INFINO_BENCH_STORE=azure requires INFINO_REAL_AZURE_CONTAINER".to_string()
+                }),
+            other => Err(format!(
+                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure)"
+            )),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::S3sFs => "s3s_fs",
+            Self::S3 { .. } => "s3",
+            Self::Azure { .. } => "azure",
+        }
+    }
+
+    /// Namespace root under the bucket/container for this run's objects.
+    fn prefix_root(&self, default: &str) -> String {
+        match self {
+            Self::S3sFs => default.to_string(),
+            Self::S3 { .. } => real_s3_prefix_root(default),
+            Self::Azure { .. } => azure_prefix_root(default),
+        }
+    }
+
+    /// Provider for a real backend, scoped to `prefix`. `None` for s3s-fs
+    /// (spawned separately). `prefix = ""` gives the bucket/container root.
+    fn provider(&self, prefix: &str) -> Option<Arc<dyn StorageProvider>> {
+        match self {
+            Self::S3sFs => None,
+            Self::S3 { bucket } => Some(Arc::new(
+                S3StorageProvider::new_with_prefix(bucket, prefix).expect("real S3 provider"),
+            )),
+            Self::Azure { container } => Some(Arc::new(
+                AzureStorageProvider::new_with_prefix(container, prefix)
+                    .expect("real Azure provider"),
+            )),
+        }
+    }
+}
+
+/// Pre-flight for the supertable bench: it needs a real object store (`s3`
+/// or `azure`) for the multi-commit OCC. `Ok` when one is selected + ready,
+/// `Err(reason)` otherwise (default s3s-fs, missing creds, unknown store).
+pub fn supertable_backend_check() -> Result<(), String> {
+    match Backend::from_env()? {
+        Backend::S3sFs => Err(SUPERTABLE_REQUIRES_REAL_OBJECT_STORE.to_string()),
+        _ => Ok(()),
+    }
 }
 
 fn unique_bench_prefix(root: &str) -> String {
@@ -246,87 +340,94 @@ async fn spawn_s3s_fs(s3s_bucket: &str) -> (SocketAddr, TempDir) {
     (addr, fs_root)
 }
 
-async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture {
-    if let Some(bucket) = real_s3_bucket_env() {
-        let prefix = unique_bench_prefix(&real_s3_prefix_root(prefix_default));
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 provider"),
-        );
-        eprintln!("[tiers] real S3: bucket={bucket} prefix={prefix}");
-        StorageFixture {
-            storage,
-            storage_label: "real_s3",
-            real_s3: true,
-            cleanup: Some(S3Cleanup { bucket, prefix }),
-            _keepalive: StorageKeepalive::RealS3,
-        }
-    } else {
-        let (addr, fs_root) = spawn_s3s_fs(s3s_bucket).await;
-        let endpoint = format!("http://{addr}");
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_endpoint(
-                &endpoint,
-                s3s_bucket,
-                S3S_ACCESS_KEY,
-                S3S_SECRET_KEY,
-                S3S_REGION,
-            )
-            .expect("s3s-fs S3StorageProvider"),
-        );
+/// Build the fixture for a real backend (S3 or Azure): a unique prefix, a
+/// prefix-scoped provider, and — unless `INFINO_BENCH_KEEP_TABLE` — a cleanup
+/// over that prefix on the bucket/container root.
+fn remote_fixture(backend: Backend, prefix_default: &str) -> StorageFixture {
+    let label = backend.label();
+    let prefix = unique_bench_prefix(&backend.prefix_root(prefix_default));
+    let storage = backend.provider(&prefix).expect("remote provider");
+    eprintln!("[tiers] {label} prefix={prefix}");
+    let cleanup = if keep_table() {
         eprintln!(
-            "\n\
-             ################################################################################\n\
-             ##  WARNING: benchmarking against the s3s-fs emulator, NOT real AWS S3.        ##\n\
-             ##  The emulator reproduces request count and byte volume, not network         ##\n\
-             ##  latency, so warm/cold timings here are not representative of S3.            ##\n\
-             ##  Set INFINO_REAL_S3_BUCKET (+ AWS creds) to benchmark against real S3.       ##\n\
-             ################################################################################\n\
-             [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT real S3)\n"
+            "[tiers] keeping {label} prefix={prefix} (INFINO_BENCH_KEEP_TABLE; cleanup skipped)"
         );
-        StorageFixture {
-            storage,
-            storage_label: "s3s_fs",
-            real_s3: false,
-            cleanup: None,
-            _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
-        }
+        None
+    } else {
+        Some(PrefixCleanup {
+            root: backend.provider("").expect("remote root provider"),
+            prefix,
+            label,
+        })
+    };
+    StorageFixture {
+        storage,
+        storage_label: label,
+        remote: true,
+        cleanup,
+        _keepalive: StorageKeepalive::Remote,
     }
 }
 
-/// Error string for the missing-bucket guard. Kept as a constant so the
-/// `run()` pre-flight check and this fixture report the same message.
-pub const SUPERTABLE_REQUIRES_REAL_S3: &str = "\
-the supertable object-store bench requires real AWS S3. Set INFINO_REAL_S3_BUCKET \
-(or INFINO_TEST_REAL_S3_BUCKET) to a writable bucket and provide AWS credentials. \
-The s3s-fs emulator is not usable here: it does not implement conditional If-Match \
-PUTs, which the supertable's multi-commit OCC requires, so every commit after the \
-first would lose the CAS. There is no local stand-in — a local filesystem backend \
-would not measure object-store ingest or cold-read behavior, which is the whole \
-point of this bench.";
+async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture {
+    let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let Backend::S3sFs = backend else {
+        return remote_fixture(backend, prefix_default);
+    };
+    let (addr, fs_root) = spawn_s3s_fs(s3s_bucket).await;
+    let endpoint = format!("http://{addr}");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        S3StorageProvider::new_with_endpoint(
+            &endpoint,
+            s3s_bucket,
+            S3S_ACCESS_KEY,
+            S3S_SECRET_KEY,
+            S3S_REGION,
+        )
+        .expect("s3s-fs S3StorageProvider"),
+    );
+    eprintln!(
+        "\n\
+         ################################################################################\n\
+         ##  WARNING: INFINO_BENCH_STORE=s3s_fs — in-process emulator, NOT a real store.##\n\
+         ##  It reproduces request count and byte volume, not network latency, so       ##\n\
+         ##  warm/cold timings here are not representative. Set INFINO_BENCH_STORE=s3    ##\n\
+         ##  (+ INFINO_REAL_S3_BUCKET) or =azure (+ INFINO_REAL_AZURE_CONTAINER) for real.##\n\
+         ################################################################################\n\
+         [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT a real store)\n"
+    );
+    StorageFixture {
+        storage,
+        storage_label: "s3s_fs",
+        remote: false,
+        cleanup: None,
+        _keepalive: StorageKeepalive::S3sFs { _fs_root: fs_root },
+    }
+}
+
+/// Error string for the supertable backend guard. A constant so the `run()`
+/// pre-flight ([`supertable_backend_check`]) and this fixture agree.
+pub const SUPERTABLE_REQUIRES_REAL_OBJECT_STORE: &str = "\
+the supertable object-store bench requires a real object store. Set \
+INFINO_BENCH_STORE=s3 (+ INFINO_REAL_S3_BUCKET + AWS creds) or =azure (+ \
+INFINO_REAL_AZURE_CONTAINER + AZURE_STORAGE_ACCOUNT_NAME/_KEY). The s3s-fs \
+emulator is not usable here: it does not implement conditional If-Match PUTs, \
+which the supertable's multi-commit OCC requires, so every commit after the \
+first would lose the CAS.";
 
 /// Supertable-shaped backing store (multi-segment, multi-commit benches).
 ///
-/// **Real S3 only.** Unlike the single-`put_atomic` superfile cold tier, the
-/// supertable build commits many times, so its OCC pointer update rides on the
-/// conditional `If-Match` PUT (`put_if_match(Some(etag))`). The in-process
-/// `s3s-fs` emulator does not implement conditional `If-Match` PUTs (every
-/// commit after the first loses the CAS), and a local filesystem backend would
-/// not measure the object-store behavior this bench exists for. So this fixture
-/// requires `INFINO_REAL_S3_BUCKET` and panics with [`SUPERTABLE_REQUIRES_REAL_S3`]
-/// otherwise. The returned fixture carries an [`S3Cleanup`] so the caller can
-/// delete the unique prefix when the run finishes.
+/// **Real object store only** (S3 or Azure). The supertable build commits
+/// many times, so its OCC pointer update rides on the conditional `If-Match`
+/// PUT. The in-process `s3s-fs` emulator does not implement those (every
+/// commit after the first loses the CAS), so this fixture rejects it and
+/// panics with [`SUPERTABLE_REQUIRES_REAL_OBJECT_STORE`]. The returned fixture
+/// carries a [`PrefixCleanup`] so the caller can delete the unique prefix when
+/// the run finishes.
 pub async fn supertable_storage_fixture() -> StorageFixture {
-    let bucket = real_s3_bucket_env().expect(SUPERTABLE_REQUIRES_REAL_S3);
-    let prefix = unique_bench_prefix(&real_s3_prefix_root("infino-supertable-bench"));
-    let storage: Arc<dyn StorageProvider> =
-        Arc::new(S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 provider"));
-    eprintln!("[tiers] real S3: bucket={bucket} prefix={prefix}");
-    StorageFixture {
-        storage,
-        storage_label: "real_s3",
-        real_s3: true,
-        cleanup: Some(S3Cleanup { bucket, prefix }),
-        _keepalive: StorageKeepalive::RealS3,
+    match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
+        Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
+        backend => remote_fixture(backend, "infino-supertable-bench"),
     }
 }
 
@@ -351,8 +452,8 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
         object_path: path.clone(),
         object_size: bytes.len() as u64,
         storage_label: fixture.storage_label,
-        real_s3: fixture.real_s3,
-        cleanup_path: if fixture.real_s3 { Some(path) } else { None },
+        // Delete the uploaded object on a real backend, unless asked to keep it.
+        cleanup_path: (fixture.remote && !keep_table()).then_some(path),
         _keepalive: fixture._keepalive,
     }
 }
@@ -482,4 +583,63 @@ pub fn consumer_options(
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {
     Supertable::open(opts).expect("Supertable::open from object store")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_defaults_to_s3s_fs() {
+        assert_eq!(Backend::parse("s3s_fs", None, None), Ok(Backend::S3sFs));
+    }
+
+    #[test]
+    fn parse_s3_needs_bucket() {
+        assert_eq!(
+            Backend::parse("s3", Some("bkt".into()), None),
+            Ok(Backend::S3 {
+                bucket: "bkt".into()
+            })
+        );
+        assert!(Backend::parse("s3", None, None).is_err());
+    }
+
+    #[test]
+    fn parse_azure_needs_container() {
+        assert_eq!(
+            Backend::parse("azure", None, Some("c".into())),
+            Ok(Backend::Azure {
+                container: "c".into()
+            })
+        );
+        assert!(Backend::parse("azure", None, None).is_err());
+    }
+
+    #[test]
+    fn parse_does_not_infer_from_creds() {
+        // Creds present but store=s3s_fs → still the emulator.
+        assert_eq!(
+            Backend::parse("s3s_fs", Some("bkt".into()), Some("c".into())),
+            Ok(Backend::S3sFs)
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_store() {
+        assert!(Backend::parse("gcs", None, None).is_err());
+    }
+
+    #[test]
+    fn labels_match_backend() {
+        assert_eq!(Backend::S3sFs.label(), "s3s_fs");
+        assert_eq!(Backend::S3 { bucket: "b".into() }.label(), "s3");
+        assert_eq!(
+            Backend::Azure {
+                container: "c".into()
+            }
+            .label(),
+            "azure"
+        );
+    }
 }

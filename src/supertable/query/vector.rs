@@ -8,7 +8,7 @@
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
 //! let hits: Vec<SuperfileHit> =
-//!     supertable.vector_search("emb", &query_vec, 10, opts)?;
+//!     supertable.reader().vector_search("emb", &query_vec, 10, opts)?;
 //! ```
 //!
 //! Returns [`SuperfileHit`]s sorted by distance *ascending* —
@@ -61,7 +61,7 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
+use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileEntry;
 
 use super::SuperfileHit;
@@ -90,9 +90,9 @@ impl SupertableReader {
     /// to an empty `Vec`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`Supertable::vector_search`], which drives this via the
-    /// sync→async bridge after applying the read-consistency policy.
-    pub(crate) async fn vector_search(
+    /// [`SupertableReader::vector_search`], which drives this via the
+    /// sync→async bridge.
+    pub(crate) async fn vector_search_async(
         &self,
         column: &str,
         query: &[f32],
@@ -231,13 +231,13 @@ impl SupertableReader {
     }
 }
 
-impl Supertable {
-    /// Single-column vector kNN search over the current snapshot.
+impl SupertableReader {
+    /// Single-column vector kNN search over this reader's pinned
+    /// snapshot.
     ///
-    /// Pins a reader at call entry, applies the read-consistency
-    /// policy, and drives the internal async kernel to completion
-    /// via the sync→async bridge ([`Supertable::block_on_query`]).
-    /// Returns up to `k` hits sorted by distance *ascending*.
+    /// Drives the internal async kernel to completion via the
+    /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
+    /// to `k` hits sorted by distance *ascending*.
     pub fn vector_search(
         &self,
         column: &str,
@@ -245,9 +245,7 @@ impl Supertable {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.vector_search(column, query, k, options))
+        self.block_on(self.vector_search_async(column, query, k, options))
     }
 }
 
@@ -309,6 +307,18 @@ mod tests {
     use super::VectorSearchOptions;
 
     use crate::test_helpers::default_tokenizer as tok;
+
+    /// Drive an async future to completion on a throwaway current-thread
+    /// runtime. Used only for the single-segment `SuperfileReader`
+    /// oracle, whose search surface is async-only; the supertable
+    /// reader's own search methods are sync and need no runtime here.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
 
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
@@ -444,20 +454,19 @@ mod tests {
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
     }
 
-    #[tokio::test]
-    async fn vector_search_empty_supertable_returns_empty() {
+    #[test]
+    fn vector_search_empty_supertable_returns_empty() {
         let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
             .vector_search("emb", &q, 5, VectorSearchOptions::new())
-            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn vector_search_k_zero_short_circuits() {
+    #[test]
+    fn vector_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
@@ -467,13 +476,12 @@ mod tests {
         let q = vec![0.1f32; 16];
         let hits = r
             .vector_search("emb", &q, 0, VectorSearchOptions::new())
-            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn vector_search_returns_ascending_distance_order() {
+    #[test]
+    fn vector_search_returns_ascending_distance_order() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
@@ -488,7 +496,6 @@ mod tests {
         }
         let hits = r
             .vector_search("emb", &q, 5, VectorSearchOptions::new())
-            .await
             .expect("query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -501,8 +508,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn vector_search_top_k_caps_at_k() {
+    #[test]
+    fn vector_search_top_k_caps_at_k() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
@@ -517,13 +524,12 @@ mod tests {
         let q = vec![0.1f32; dim];
         let hits = r
             .vector_search("emb", &q, 7, VectorSearchOptions::new())
-            .await
             .expect("query");
         assert_eq!(hits.len(), 7);
     }
 
-    #[tokio::test]
-    async fn vector_search_global_selection_recovers_neighbors_under_low_budget() {
+    #[test]
+    fn vector_search_global_selection_recovers_neighbors_under_low_budget() {
         // 10 segments × 16 one-hot docs. Query e_0's true neighbors are
         // the 10 docs with id % dim == 0 (one per segment) at cosine
         // distance 0; every other doc is orthogonal (distance 1). With
@@ -549,7 +555,6 @@ mod tests {
         let hits = st
             .reader()
             .vector_search("emb", &q, 10, opts)
-            .await
             .expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
@@ -560,8 +565,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn vector_search_carries_segment_uris_for_multi_segment_results() {
+    #[test]
+    fn vector_search_carries_segment_uris_for_multi_segment_results() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
@@ -575,7 +580,6 @@ mod tests {
         let q = vec![0.1f32; dim];
         let hits = r
             .vector_search("emb", &q, 24, VectorSearchOptions::new())
-            .await
             .expect("query");
         let segment_uris: std::collections::HashSet<_> = hits.iter().map(|h| h.segment).collect();
         // All three superfiles should contribute (high k pulls from
@@ -583,8 +587,8 @@ mod tests {
         assert_eq!(segment_uris.len(), 3);
     }
 
-    #[tokio::test]
-    async fn vector_search_oracle_top_k_set_matches_single_superfile() {
+    #[test]
+    fn vector_search_oracle_top_k_set_matches_single_superfile() {
         // Vector distances are segment-independent — cosine /
         // L2-sq are functions of the query + per-doc vector only.
         // So the per-segment-top-k → global-top-k pattern recovers
@@ -612,10 +616,10 @@ mod tests {
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
 
-        let oracle_hits = oracle
-            .vector_search("emb", &q, 2, opts)
-            .await
-            .expect("oracle query");
+        // The oracle is a single-segment `SuperfileReader` whose search
+        // is async-only; drive it on a throwaway runtime. The supertable
+        // reader below uses its sync public API.
+        let oracle_hits = block_on(oracle.vector_search("emb", &q, 2, opts)).expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());
@@ -623,7 +627,6 @@ mod tests {
         let st_reader = st.reader();
         let st_hits = st_reader
             .vector_search("emb", &q, 2, opts)
-            .await
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -641,8 +644,8 @@ mod tests {
         assert_eq!(st_globals, oracle_globals);
     }
 
-    #[tokio::test]
-    async fn vector_search_unknown_column_errors() {
+    #[test]
+    fn vector_search_unknown_column_errors() {
         let dim = 16;
         let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
@@ -653,7 +656,6 @@ mod tests {
         let q = vec![0.1f32; dim];
         let err = r
             .vector_search("nope", &q, 5, VectorSearchOptions::new())
-            .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }

@@ -600,10 +600,18 @@ impl Supertable {
     /// Pinned reader. Captures the current manifest at construction
     /// and holds it for its lifetime. New commits don't affect a
     /// live reader; closing + reopening picks up later commits.
+    ///
+    /// Applies the read-consistency policy ([`Supertable::ensure_fresh`])
+    /// before pinning, so the reader observes the freshest manifest
+    /// the configured
+    /// [`Consistency`](crate::supertable::options::Consistency) allows.
+    /// No-op for an in-memory supertable and under `Snapshot`.
     pub fn reader(&self) -> SupertableReader {
+        self.ensure_fresh();
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
+            inner: Arc::clone(&self.inner),
         }
     }
 
@@ -940,9 +948,12 @@ impl std::fmt::Debug for Supertable {
 
 /// Snapshot-pinned reader. Captures `Arc<Manifest>` at construction
 /// and holds it through query lifetime — new commits to the parent
-/// `Supertable` don't affect this reader's view. Query methods
-/// (`bm25_search`, `vector_search`, etc.) are added by the query
-/// modules on top of this handle.
+/// `Supertable` don't affect this reader's view. The public read
+/// methods (`bm25_search`, `bm25_search_prefix`, `vector_search`) live
+/// on this handle; each drives its async kernel to completion via the
+/// sync→async bridge ([`SupertableReader::block_on`]), mirroring the
+/// way [`SupertableWriter`](crate::supertable::SupertableWriter)
+/// drives `commit`.
 pub struct SupertableReader {
     manifest: Arc<Manifest>,
     /// Per-process tombstone-bitmap cache shared with the parent
@@ -950,6 +961,13 @@ pub struct SupertableReader {
     /// returning per-superfile hits so tombstoned rows never
     /// reach callers. `None` for in-memory-only supertables.
     pub(crate) tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+    /// Shared inner state, held only so the reader's sync read
+    /// methods can drive their async kernels on the supertable's
+    /// `query_runtime` — the same `Arc<SupertableInner>` the writer
+    /// holds. One `Arc::clone` per `reader()`; keeping it alive also
+    /// keeps the runtime alive for the reader's lifetime, so a reader
+    /// captured before its parent `Supertable` drops can still query.
+    inner: Arc<SupertableInner>,
 }
 
 impl SupertableReader {
@@ -957,6 +975,15 @@ impl SupertableReader {
     /// reader-vs-writer visibility ordering in tests.
     pub fn manifest_id(&self) -> u64 {
         self.manifest.manifest_id
+    }
+
+    /// Sync→async bridge for this reader's public query surface.
+    /// Reuses an ambient `multi_thread` runtime via `block_in_place`
+    /// when present, otherwise drives on the supertable's lazily-built
+    /// `query_runtime`. Same bridge [`Supertable::block_on_query`] and
+    /// the writer's `commit` use.
+    pub(crate) fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        bridge_on_runtime(fut, &self.inner.query_runtime())
     }
 
     /// Number of superfiles visible to this reader.

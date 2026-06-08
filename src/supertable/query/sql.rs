@@ -72,14 +72,12 @@ impl Supertable {
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
-        // Apply the read-consistency policy before pinning, so SQL
+        // Read-consistency is applied when the snapshot is pinned:
+        // `sql_session_context` pins via `self.reader()`, which runs
+        // [`Supertable::ensure_fresh`] before `load_full`. So SQL
         // honors the same freshness contract as the search APIs
-        // (`bm25_search` / `vector_search`): under `Strong` /
-        // `BoundedStaleness` this advances the in-memory snapshot to
-        // the latest published manifest; under `Snapshot` (and for
-        // in-memory tables) it is a no-op. See
-        // [`Supertable::ensure_fresh`].
-        self.ensure_fresh();
+        // (`reader().bm25_search` / `reader().vector_search`) without a
+        // separate call here.
 
         // Build (or reuse the cached) SessionContext for the pinned
         // snapshot — the pushdown-aware SupertableProvider plus the
@@ -202,10 +200,10 @@ impl Supertable {
     ) -> Result<Vec<i128>, QueryError> {
         // Resolve against the freshest snapshot the consistency
         // policy allows — the spec requires delete/update predicates
-        // to bind "against the current snapshot at call time", which
-        // means honoring `Strong` / `BoundedStaleness` just like the
-        // read APIs do. No-op under `Snapshot` / in-memory tables.
-        self.ensure_fresh();
+        // to bind "against the current snapshot at call time".
+        // `sql_session_context` pins via `self.reader()`, which applies
+        // [`Supertable::ensure_fresh`] before `load_full`, so this
+        // honors `Strong` / `BoundedStaleness` like the read APIs do.
         let ctx = self.sql_session_context()?;
         let id_column = self.options().id_column.clone();
 
