@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use arrow::compute::concat_batches;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -196,11 +197,26 @@ struct Table {
 
 #[pymethods]
 impl Table {
-    /// Append a pyarrow `RecordBatch`. Durable when this returns (one
-    /// `append` == one commit == one sealed segment).
-    fn append(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(data)?;
-        self.inner.append(&batch).map_err(py_err)
+    /// Append data. Accepts a pyarrow `RecordBatch` or `Table`, a pandas
+    /// `DataFrame`, or a `list[dict]` (coerced to Arrow with the table's
+    /// declared schema). Durable when this returns — one `append` == one
+    /// commit == one sealed segment, so batch rows per call.
+    fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let declared = self.inner.schema();
+        let py_schema = declared.as_ref().to_pyarrow(py)?;
+        match coerce_to_record_batch(py, data, &py_schema)? {
+            Some(batch) => {
+                // Python sources (pandas, list[dict]) are inherently
+                // nullable; re-wrap the (null-free) columns under the
+                // table's declared schema so the exact-schema append check
+                // accepts them. A genuine type or null mismatch still errors.
+                let aligned = RecordBatch::try_new(declared, batch.columns().to_vec())
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                self.inner.append(&aligned).map_err(py_err)
+            }
+            // Empty input — nothing to append (no empty commit).
+            None => Ok(()),
+        }
     }
 
     /// BM25 search over one FTS column. Returns `list[{"_id", "score"}]`,
@@ -271,6 +287,64 @@ fn hits_to_pylist<'py>(
         list.append(row)?;
     }
     Ok(list)
+}
+
+/// Coerce append input — a pyarrow `RecordBatch` / `Table`, a pandas
+/// `DataFrame`, or a `list[dict]` — into a single `RecordBatch`. `schema`
+/// is the table's declared pyarrow `Schema`, used to type the `list` /
+/// `DataFrame` conversions so column types match. Returns `None` for
+/// empty input (so an empty append is a no-op, not an empty commit).
+fn coerce_to_record_batch(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    schema: &Bound<'_, PyAny>,
+) -> PyResult<Option<RecordBatch>> {
+    let pa = py.import("pyarrow")?;
+    let table_cls = pa.getattr("Table")?;
+    let record_batch_cls = pa.getattr("RecordBatch")?;
+
+    // A single RecordBatch: convert directly.
+    if data.is_instance(&record_batch_cls)? {
+        return Ok(Some(RecordBatch::from_pyarrow_bound(data)?));
+    }
+
+    // Normalize a Table / list[dict] / DataFrame to a pyarrow Table,
+    // typed by the table's own schema so column types line up.
+    let table = if data.is_instance(&table_cls)? {
+        data.clone()
+    } else if data.is_instance_of::<PyList>() {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("schema", schema)?;
+        table_cls.call_method("from_pylist", (data,), Some(&kwargs))?
+    } else {
+        // Assume a pandas DataFrame (or anything `from_pandas` accepts).
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("schema", schema)?;
+        kwargs.set_item("preserve_index", false)?;
+        table_cls.call_method("from_pandas", (data,), Some(&kwargs))?
+    };
+
+    // Collapse the Table's chunks into a single RecordBatch — one append
+    // is one commit / one sealed segment.
+    let batches = table
+        .call_method0("combine_chunks")?
+        .call_method0("to_batches")?;
+    let batches = batches.downcast::<PyList>()?;
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    let mut rust_batches = Vec::with_capacity(batches.len());
+    for batch in batches.iter() {
+        rust_batches.push(RecordBatch::from_pyarrow_bound(&batch)?);
+    }
+    if rust_batches.len() == 1 {
+        Ok(rust_batches.into_iter().next())
+    } else {
+        let merged_schema = rust_batches[0].schema();
+        concat_batches(&merged_schema, &rust_batches)
+            .map(Some)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
 }
 
 // Named `infino_ext` (not `infino`) so the generated module item doesn't

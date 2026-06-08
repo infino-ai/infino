@@ -31,16 +31,18 @@ maturin develop          # compile the extension + install into the venv
 pytest tests/
 ```
 
-## Scope (M3a)
+## Scope
 
 - `connect(uri, *, endpoint, region, access_key, secret_key)` — backend
   from the URI scheme; S3-compatible static creds via kwargs.
 - `Connection`: `create_table(name, pyarrow.Schema, IndexSpec)`,
   `open_table`, `drop_table`, `list_tables`, `query_sql` → pyarrow Table.
-- `Table`: `append(pyarrow.RecordBatch)`, `bm25_search`,
-  `vector_search`, `schema`.
+- `Table`: `append(...)`, `bm25_search`, `vector_search`, `schema`.
+  `append` accepts a pyarrow `RecordBatch` or `Table`, a pandas
+  `DataFrame`, or a `list[dict]` — coerced to Arrow against the table's
+  declared schema (Python sources are nullable; null-free columns are
+  re-wrapped to match). One `append` is one commit.
 - `IndexSpec().fts(col).vector(col, dim, n_cent, metric)`.
 
-Next (M3b): `append` accepting a pyarrow `Table` / pandas `DataFrame` /
-`list[dict]`; `update`/`delete`; richer `ConnectOptions` (disk cache);
-abi3 wheels + CI.
+Next: `update` / `delete`; richer `ConnectOptions` (disk cache);
+abi3 wheels + CI for distribution.
