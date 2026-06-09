@@ -17,6 +17,25 @@ and as a search index by infino's reader.
   commit/publish path, pluggable storage, query fan-out with
   manifest-only skip pruning, and reader/writer concurrency.
 
+## Quick example in Python
+
+```python
+import infino
+import pyarrow as pa
+
+db = infino.connect("memory://")              # or "./data", "s3://bucket/prefix"
+schema = pa.schema([("title", pa.large_utf8())])
+docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
+
+docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
+
+hits = docs.bm25_search("title", "fox", 10)         # [{"_id": ..., "score": ...}]
+rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
+```
+
+The Python bindings (PyO3 + maturin) live in
+[`infino-python/`](infino-python/) — see its README to build and test.
+
 ## Quick example in Rust
 
 Open a connection, create a table with a full-text index, append rows,
@@ -112,25 +131,6 @@ assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 A search TVF (`bm25_search('posts', 'body', 'alice', 10)`) can stand in
 for either side of the join, so keyword/vector results compose with the
 rest of the catalog the same way.
-
-## Quick example in Python
-
-```python
-import infino
-import pyarrow as pa
-
-db = infino.connect("memory://")              # or "./data", "s3://bucket/prefix"
-schema = pa.schema([("title", pa.large_utf8())])
-docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
-
-docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
-
-hits = docs.bm25_search("title", "fox", 10)         # [{"_id": ..., "score": ...}]
-rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
-```
-
-The Python bindings (PyO3 + maturin) live in
-[`infino-python/`](infino-python/) — see its README to build and test.
 
 ## Stability
 
