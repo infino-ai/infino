@@ -237,7 +237,7 @@ fn p50(samples: &mut [Duration]) -> Duration {
 fn measure_fts(st: &Supertable) -> Duration {
     let warm = st
         .reader()
-        .bm25_search("title", QUERY_TERM, TOP_K, BoolMode::Or)
+        .bm25_hits("title", QUERY_TERM, TOP_K, BoolMode::Or)
         .expect("fts");
     black_box(warm);
     let mut samples = Vec::with_capacity(ITERS);
@@ -245,7 +245,7 @@ fn measure_fts(st: &Supertable) -> Duration {
         let t0 = Instant::now();
         let hits = st
             .reader()
-            .bm25_search(
+            .bm25_hits(
                 black_box("title"),
                 black_box(QUERY_TERM),
                 black_box(TOP_K),

@@ -197,7 +197,7 @@ fn supertable_to_global_ids(
 fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
     let hits = st
         .reader()
-        .bm25_search("title", query, k, BoolMode::Or)
+        .bm25_hits("title", query, k, BoolMode::Or)
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -210,7 +210,7 @@ fn supertable_search_and_global(
 ) -> Vec<u64> {
     let hits = st
         .reader()
-        .bm25_search("title", query, k, BoolMode::And)
+        .bm25_hits("title", query, k, BoolMode::And)
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
 }

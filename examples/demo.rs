@@ -199,7 +199,7 @@ fn demo_supertable() {
     // segment + local_doc_id + score.
     let hits = st
         .reader()
-        .bm25_search("title", "fox", SEARCH_TOP_K, BoolMode::Or)
+        .bm25_hits("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());
     for h in &hits {

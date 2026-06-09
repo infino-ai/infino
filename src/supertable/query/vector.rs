@@ -8,7 +8,7 @@
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
 //! let hits: Vec<SuperfileHit> =
-//!     supertable.reader().vector_search("emb", &query_vec, 10, opts)?;
+//!     supertable.reader().vector_hits("emb", &query_vec, 10, opts)?;
 //! ```
 //!
 //! Returns [`SuperfileHit`]s sorted by distance *ascending* —
@@ -57,6 +57,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::superfile::vector::distance::{Metric, distance};
@@ -64,6 +65,7 @@ use crate::supertable::error::QueryError;
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileEntry;
 
+use super::exec::common::{output_schema_with_score, resolve_hits};
 use super::SuperfileHit;
 
 /// How to probe one segment in the vector fan-out: the globally-selected
@@ -233,12 +235,37 @@ impl SupertableReader {
 
 impl SupertableReader {
     /// Single-column vector kNN search over this reader's pinned
-    /// snapshot.
+    /// snapshot, materialized as Arrow rows.
+    ///
+    /// This is the user-facing row-returning path. It runs the same
+    /// vector hit kernel the SQL TVF uses, then resolves those top-k hits
+    /// through the shared row materializer. Returned batches include
+    /// `_id`, every visible scalar column, and a trailing `score` column
+    /// containing the distance (smaller is better).
+    pub fn vector_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.block_on(async {
+            let hits = self.vector_search_async(column, query, k, options).await?;
+            let scalar_schema = self.options().scalar_schema();
+            let output_schema = output_schema_with_score(&scalar_schema);
+            let batch = resolve_hits(self, &hits, &scalar_schema, &output_schema, None)
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            Ok(vec![batch])
+        })
+    }
+
+    /// Low-level vector kNN search over this reader's pinned snapshot.
     ///
     /// Drives the internal async kernel to completion via the
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
     /// to `k` hits sorted by distance *ascending*.
-    pub fn vector_search(
+    pub fn vector_hits(
         &self,
         column: &str,
         query: &[f32],
@@ -460,7 +487,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -475,7 +502,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_search("emb", &q, 0, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 0, VectorSearchOptions::new())
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -495,7 +522,7 @@ mod tests {
             *x = (d as f32) / 100.0 + 0.001;
         }
         let hits = r
-            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
             .expect("query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -523,7 +550,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_search("emb", &q, 7, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 7, VectorSearchOptions::new())
             .expect("query");
         assert_eq!(hits.len(), 7);
     }
@@ -554,7 +581,7 @@ mod tests {
         let opts = VectorSearchOptions::new().with_nprobe(1);
         let hits = st
             .reader()
-            .vector_search("emb", &q, 10, opts)
+            .vector_hits("emb", &q, 10, opts)
             .expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
@@ -579,7 +606,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_search("emb", &q, 24, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 24, VectorSearchOptions::new())
             .expect("query");
         let segment_uris: std::collections::HashSet<_> = hits.iter().map(|h| h.segment).collect();
         // All three superfiles should contribute (high k pulls from
@@ -626,7 +653,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .vector_search("emb", &q, 2, opts)
+            .vector_hits("emb", &q, 2, opts)
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -655,7 +682,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let err = r
-            .vector_search("nope", &q, 5, VectorSearchOptions::new())
+            .vector_hits("nope", &q, 5, VectorSearchOptions::new())
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }

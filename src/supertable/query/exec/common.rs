@@ -26,6 +26,7 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 
+use crate::superfile::SuperfileReader;
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
 use crate::supertable::query::SuperfileHit;
@@ -196,6 +197,40 @@ async fn resolve_columns(
     }))
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    // `take_by_local_doc_ids` decodes projected Parquet rows and currently
+    // works over eager readers. Lazy readers are still the right first open
+    // for search/candidate work; when the caller projects scalar columns,
+    // fetch the full immutable segment bytes here and reopen eagerly for the
+    // targeted row materialization step.
+    let storage_for_eager = storage.cloned();
+    let opened = futures::future::try_join_all(
+        seg_order
+            .iter()
+            .zip(opened.into_iter())
+            .map(|(uri, reader)| {
+                let storage = storage_for_eager.clone();
+                async move {
+                    if reader.parquet_bytes().is_some() {
+                        return Ok::<Arc<SuperfileReader>, DataFusionError>(reader);
+                    }
+                    let storage = storage.ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "resolve_hits needs eager bytes for {uri:?}, but the reader was lazy and no storage backend is attached"
+                        ))
+                    })?;
+                    let path = uri.storage_path();
+                    let (bytes, _) = storage
+                        .get(&path)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(format!("fetch {path}: {e}")))?;
+                    let eager = SuperfileReader::open(bytes)
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    Ok::<Arc<SuperfileReader>, DataFusionError>(Arc::new(eager))
+                }
+            }),
+    )
+    .await?;
 
     // Owned inputs so the rayon closure is `'static`. `rayon`'s
     // ordered `collect` preserves segment order, so `per_segment[i]`

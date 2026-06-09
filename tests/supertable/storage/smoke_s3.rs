@@ -452,7 +452,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
 
         let bm25_hits = consumer
             .reader()
-            .bm25_search(
+            .bm25_hits(
                 "title",
                 "alpha",
                 10,

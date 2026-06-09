@@ -43,11 +43,11 @@ use std::time::{Duration, Instant};
 
 use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
 use infino::superfile::reader::VectorSearchOptions;
+use crate::harness::BoolMode;
 use infino::supertable::Supertable;
 use tempfile::TempDir;
 
 use crate::corpus::DIM;
-use crate::harness::BoolMode;
 use crate::ingest::supertable::{self, Modality};
 use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
@@ -509,10 +509,10 @@ pub mod fts {
                 let mut samples = Vec::with_capacity(HOT_ITERS);
                 for _ in 0..HOT_ITERS {
                     let t = Instant::now();
-                    let hits = reader
+                    let batches = reader
                         .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
                         .expect("hot bm25");
-                    std::hint::black_box(hits);
+                    std::hint::black_box(batches);
                     samples.push(t.elapsed());
                 }
                 (q.name, p50(&mut samples))
@@ -530,11 +530,11 @@ pub mod fts {
                 for _ in 0..COLD_ITERS {
                     let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
                     let t = Instant::now();
-                    let hits = consumer
+                    let batches = consumer
                         .reader()
                         .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
                         .expect("cold bm25");
-                    std::hint::black_box(hits);
+                    std::hint::black_box(batches);
                     samples.push(t.elapsed());
                     drop(consumer);
                     drop(cache_dir);

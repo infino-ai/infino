@@ -7,7 +7,7 @@
 //!
 //! ```ignore
 //! let hits: Vec<SuperfileHit> =
-//!     supertable.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
+//!     supertable.reader().bm25_hits("title", "rust async", 10, BoolMode::Or)?;
 //!
 //! let prefix_hits: Vec<SuperfileHit> =
 //!     supertable.reader().bm25_search_prefix("title", "rus", 10)?;
@@ -59,6 +59,7 @@
 
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
@@ -66,6 +67,7 @@ use crate::supertable::error::QueryError;
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
+use super::exec::common::{output_schema_with_score, resolve_hits};
 use super::SuperfileHit;
 
 impl SupertableReader {
@@ -357,12 +359,37 @@ impl SupertableReader {
 }
 
 impl SupertableReader {
-    /// Single-column BM25 search over this reader's pinned snapshot.
+    /// Single-column BM25 search over this reader's pinned snapshot,
+    /// materialized as Arrow rows.
+    ///
+    /// This is the user-facing row-returning path. It runs the same
+    /// BM25 hit kernel the SQL TVF uses, then resolves those top-k hits
+    /// through the shared row materializer. Returned batches include
+    /// `_id`, every visible scalar column, and a trailing `score` column.
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.block_on(async {
+            let hits = self.bm25_search_async(column, query, k, mode).await?;
+            let scalar_schema = self.options().scalar_schema();
+            let output_schema = output_schema_with_score(&scalar_schema);
+            let batch = resolve_hits(self, &hits, &scalar_schema, &output_schema, None)
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            Ok(vec![batch])
+        })
+    }
+
+    /// Low-level BM25 search over this reader's pinned snapshot.
     ///
     /// Drives the internal async kernel to completion via the
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
     /// to `k` hits sorted by BM25 score *descending*.
-    pub fn bm25_search(
+    pub fn bm25_hits(
         &self,
         column: &str,
         query: &str,
@@ -661,7 +688,7 @@ mod tests {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -674,7 +701,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 0, BoolMode::Or)
+            .bm25_hits("title", "rust", 0, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -696,7 +723,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 4, BoolMode::Or)
+            .bm25_hits("title", "rust", 4, BoolMode::Or)
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
         assert_eq!(hits.len(), 3);
@@ -718,7 +745,7 @@ mod tests {
         let r = st.reader();
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
         // Both segment URIs should appear.
@@ -782,7 +809,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .bm25_search("title", "nimblefox", 5, BoolMode::Or)
+            .bm25_hits("title", "nimblefox", 5, BoolMode::Or)
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
         // Resolve supertable hits to global doc-ids via segment
@@ -889,7 +916,7 @@ mod tests {
 
         let r = st.reader();
         let err = r
-            .bm25_search("missing_column", "rust", 5, BoolMode::Or)
+            .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
@@ -906,7 +933,7 @@ mod tests {
         }
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 2, BoolMode::Or)
+            .bm25_hits("title", "rust", 2, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
     }

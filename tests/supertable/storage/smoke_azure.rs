@@ -474,7 +474,7 @@ async fn supertable_real_azure_round_trip() {
 
         let bm25_hits = consumer
             .reader()
-            .bm25_search(
+            .bm25_hits(
                 "title",
                 "alpha",
                 10,

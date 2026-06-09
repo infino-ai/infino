@@ -37,7 +37,7 @@ writer.commit()?;
 
 // Reads run through a snapshot-pinned reader — synchronous, fans out
 // across segments for you. Keyword search (BM25):
-let hits = table.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
+let rows = table.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
 
 // Vector search (k-NN):
 let query = vec![/* dim=384 f32s */];

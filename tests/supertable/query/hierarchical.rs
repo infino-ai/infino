@@ -154,7 +154,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // query.
     let hits = consumer
         .reader()
-        .bm25_search("title", "echo", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits("title", "echo", BM25_TOP_K, BoolMode::Or)
         .expect("bm25");
     assert!(
         !hits.is_empty(),
@@ -204,7 +204,7 @@ fn bm25_term_in_no_part_loads_nothing() {
     // already rejected without needing the part bytes).
     let hits = consumer
         .reader()
-        .bm25_search("title", "zoo", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits("title", "zoo", BM25_TOP_K, BoolMode::Or)
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
     // up non-empty if any bloom collides on 'zoo' — but
@@ -389,7 +389,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
     // BM25 hits.
     let hits = consumer
         .reader()
-        .bm25_search("title", "alpha", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("bm25");
     assert!(!hits.is_empty());
 
