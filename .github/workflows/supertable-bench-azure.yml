@@ -45,6 +45,11 @@ on:
         required: false
         default: "30"
         type: string
+      update_baseline:
+        description: "Publish this run as the main baseline + history (main only)."
+        required: false
+        default: false
+        type: boolean
   # Callable from other workflows (e.g. the PR group in ci.yml). Same
   # inputs; `choice` isn't valid here so `bench` is a string.
   workflow_call:
@@ -59,6 +64,9 @@ on:
       # Discriminator appended to resource names so parallel callers
       # (e.g. matrix legs sharing one run_id) don't collide / cross-delete.
       name_suffix:     { type: string, required: false, default: "" }
+      # On main: publish the run as the baseline pointer + per-commit
+      # history. On a PR: false — restore main's baseline and diff against it.
+      update_baseline: { type: boolean, required: false, default: false }
 
 permissions:
   id-token: write   # Azure OIDC federated login
@@ -249,6 +257,43 @@ jobs:
           sccache --show-stats || true
           REMOTE
 
+      # Seed the report's baseline with main's metrics so the run renders
+      # deltas (vs main) instead of "(new)". Skipped on baseline runs, which
+      # want a clean baseline. Best-effort: no blob = first run = "(new)".
+      - name: Restore baseline (diff vs latest main)
+        if: ${{ !inputs.update_baseline }}
+        env:
+          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+          VM_SIZE: ${{ inputs.vm_size }}
+          DOCS: ${{ inputs.docs }}
+          TARGETS: ${{ steps.resolve.outputs.targets }}
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          # supertable_all's report is named "supertable"; others match.
+          jname() { case "$1" in supertable_all) echo supertable ;; *) echo "$1" ;; esac; }
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "mkdir -p infino-src/target/infino-bench"
+          for t in $TARGETS; do
+            j="$(jname "$t")"
+            blob="bench/${j}/baseline/${VM_SIZE}-${DOCS}.json"
+            if az storage blob download --account-name "$ACC" --account-key "$KEY" \
+                 -c "$CONTAINER" -n "$blob" -f "${j}.json" 2>/dev/null; then
+              # Best-effort: a transient scp flake must not fail the bench —
+              # the run just renders "(new)" without the baseline.
+              if scp -o StrictHostKeyChecking=no "${j}.json" \
+                   "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json"; then
+                echo "baseline restored: $j"
+              else
+                echo "::warning::scp failed for $j — running without baseline"
+              fi
+            else
+              echo "no baseline for $j — first run, all (new)"
+            fi
+          done
+
       - name: Run benchmark (on VM)
         run: |
           set -euo pipefail
@@ -281,6 +326,46 @@ jobs:
             unset INFINO_BENCH_SUPERTABLE_SHAPES
           done < "$HOME/bench-bins"
           REMOTE
+
+      # Main only: publish the metrics as the latest-main pointer (overwritten,
+      # what PRs diff against) and an immutable per-commit history blob (the
+      # trend). Runs only on a successful bench, so a broken run never
+      # poisons the baseline.
+      - name: Publish baseline + history (main only)
+        # success() is implicit, but explicit here: never publish from a
+        # failed/partial bench run.
+        if: ${{ inputs.update_baseline && success() }}
+        env:
+          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+          VM_SIZE: ${{ inputs.vm_size }}
+          DOCS: ${{ inputs.docs }}
+          TARGETS: ${{ steps.resolve.outputs.targets }}
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          jname() { case "$1" in supertable_all) echo supertable ;; *) echo "$1" ;; esac; }
+          # Commit identity from the VM checkout: sha keys the history blob,
+          # commit time (unix s) rides as metadata for chronological sorting.
+          meta="$(ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            'cd infino-src && git rev-parse --short HEAD && git show -s --format=%ct HEAD')"
+          SHA="$(echo "$meta" | sed -n 1p)"
+          TS="$(echo "$meta" | sed -n 2p)"
+          for t in $TARGETS; do
+            j="$(jname "$t")"
+            scp -o StrictHostKeyChecking=no \
+              "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "${j}.json" \
+              || { echo "::warning::no metrics for $j — skipping"; continue; }
+            az storage blob upload --overwrite --account-name "$ACC" --account-key "$KEY" \
+              -c "$CONTAINER" -n "bench/${j}/baseline/${VM_SIZE}-${DOCS}.json" -f "${j}.json"
+            # No --overwrite: a commit's record is immutable once written.
+            az storage blob upload --account-name "$ACC" --account-key "$KEY" \
+              -c "$CONTAINER" -n "bench/${j}/history/${VM_SIZE}-${DOCS}-${SHA}.json" \
+              -f "${j}.json" --metadata "sha=${SHA}" "ts=${TS}" "ref=main" \
+              || echo "::notice::history for ${SHA} already exists"
+            echo "published: $j ($SHA)"
+          done
 
       - name: Summarize results
         if: always()
