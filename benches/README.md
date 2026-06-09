@@ -38,8 +38,9 @@ cargo bench --bench superfile_fts
 cargo bench --bench superfile_vector
 cargo bench --bench supertable_all
 
-# Smaller local loop.
-INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench superfile_fts
+# Smaller local loop. Doc counts are plain integers (a `100K`/`1M`-style
+# suffix is not parsed and silently falls back to the default).
+INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench superfile_fts
 
 # Override the N-writers build row.
 INFINO_BENCH_WRITERS=4 cargo bench --bench superfile_fts
