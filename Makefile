@@ -28,7 +28,7 @@ bench:
 	cargo bench
 
 bench-quick:
-	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench superfile_fts
+	INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench superfile_fts
 
 # Memory safety oracles for the FTS / format `unsafe` surface.
 # The remaining `unsafe` surface is one bumpalo lifetime
