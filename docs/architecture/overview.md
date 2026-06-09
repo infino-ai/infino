@@ -65,7 +65,13 @@ To minimize latency and cost, infino tries to optimize data layout and data acce
    single byte of a segment.
 3. **Fetches only what it needs** — for surviving files it pulls just
   the relevant byte ranges from object storage (a posting list, a
-   handful of vector clusters), not the whole file.
+   handful of vector clusters), not the whole file. This holds for SQL
+   too: a keyword filter on an indexed text column is answered from the
+   index and decodes only the matching rows, rather than scanning the
+   whole column. The same index answers unranked retrieval directly —
+   boolean token matching and exact raw-value matching — so an
+   equality or `IN` predicate on an indexed column resolves to a small
+   candidate row set before any column data is read.
 4. **Merges** the per-file results into one ranked answer.
 
 The cost model that falls out of this is the headline: **you pay for
@@ -176,13 +182,7 @@ easy interop with existing data tooling.
 SQL, BM25, and IVF + RaBitQ vectors share one copy of the data and
 one consistency model, instead of syncing a DB + a search engine + a
 vector DB.
-- **Hybrid search is first-class, not glued on.** Because every modality
-shares that one copy and one query path, you fuse keyword (BM25) and
-vector relevance — with SQL filters — in a single query against a
-single snapshot, with no second system to keep in sync and no
-client-side result stitching. The same index machinery prunes segments
-across SQL, full-text, and vector together, so the hybrid query is also
-the well-pruned, cheap one.
+- **Hybrid search is a first-class citizen.** Because every modality shares that one copy and one query path, you fuse keyword (BM25) and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. The same index machinery prunes segments across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
 
 ### At a glance
 
@@ -190,12 +190,12 @@ Read these as **design center and typical tradeoff**, not hard limits —
 most systems are extending across the row over time.
 
 
-|                          | Built around                             | Modalities (today)                                           | Cold-data cost curve                         | Format              |
-| ------------------------ | ---------------------------------------- | ------------------------------------------------------------ | -------------------------------------------- | ------------------- |
-| **Traditional DB**       | Transactions, single node                | Scalar core; full-text + vectors added (e.g. pgvector)       | Rises with total data (coupled)              | Proprietary         |
-| **Search engine**        | Node/shard cluster                       | Full-text core; vectors maturing; object-storage tiers added | Lower with frozen tiers, but cluster-centric | Proprietary         |
-| **Vector DB**            | ANN over embeddings                      | Vector core; hybrid + filtering increasingly common          | Varies; RAM/SSD-heavy if latency-pinned      | Proprietary         |
-| **Object Store Engines** | Object storage + multi-modal, by default | Scalar + full-text + vector + hybrid as a baseline           | Low; pay for what you query                  | Infino: **Parquet** |
+|                          | Built around                             | Modalities (today)                                           | Cold-data cost curve                         | Format                                     |
+| ------------------------ | ---------------------------------------- | ------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------ |
+| **Traditional DB**       | Transactions, single node                | Scalar core; full-text + vectors added (e.g. pgvector)       | Rises with total data (coupled)              | Some prorietary, many support **Parquet**. |
+| **Search engine**        | Node/shard cluster                       | Full-text core; vectors maturing; object-storage tiers added | Lower with frozen tiers, but cluster-centric | Proprietary                                |
+| **Vector DB**            | ANN over embeddings                      | Vector core; hybrid + filtering increasingly common          | Varies; RAM/SSD-heavy if latency-pinned      | Proprietary                                |
+| **Object Store Engines** | Object storage + multi-modal, by default | Scalar + full-text + vector + hybrid as a baseline           | Low; pay for what you query                  | Infino: **Parquet**                        |
 
 
 ## What Infino optimizes for

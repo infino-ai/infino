@@ -236,6 +236,7 @@ fn p50(samples: &mut [Duration]) -> Duration {
 /// p50 of the BM25 query over `ITERS` timed runs (after one warmup).
 fn measure_fts(st: &Supertable) -> Duration {
     let warm = st
+        .reader()
         .bm25_search("title", QUERY_TERM, TOP_K, BoolMode::Or)
         .expect("fts");
     black_box(warm);
@@ -243,6 +244,7 @@ fn measure_fts(st: &Supertable) -> Duration {
     for _ in 0..ITERS {
         let t0 = Instant::now();
         let hits = st
+            .reader()
             .bm25_search(
                 black_box("title"),
                 black_box(QUERY_TERM),

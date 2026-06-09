@@ -2323,6 +2323,7 @@ dependencies = [
  "async-trait",
  "bytemuck",
  "bytes",
+ "datafusion",
  "futures",
  "hyper-util",
  "infino",

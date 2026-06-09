@@ -22,7 +22,7 @@ use object_store::{
     PutPayload, UpdateVersion,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider};
+use super::{ObjectMeta, StorageError, StorageProvider, retry};
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.
@@ -42,6 +42,7 @@ impl AzureStorageProvider {
         let store = MicrosoftAzureBuilder::from_env()
             .with_container_name(&container)
             .with_client_options(tuned_client_options())
+            .with_retry(retry::config())
             .build()
             .map_err(|e| StorageError::Permanent {
                 uri: format!("azure://{container}"),
@@ -131,31 +132,27 @@ fn normalize_prefix(prefix: impl Into<String>) -> String {
     prefix.into().trim_matches('/').to_string()
 }
 
-/// Warm idle connections kept per host, so a wide concurrent
-/// range-GET fan-out reuses established TLS sessions rather than
-/// re-handshaking on the cold tail.
+/// Warm idle connections per host, so a wide range-GET fan-out reuses
+/// TLS sessions instead of re-handshaking on the cold tail.
 const AZURE_POOL_MAX_IDLE_PER_HOST: usize = 1024;
 
-/// Client idle-connection timeout. Longer than the S3 backend's
-/// because Azure's server-side keep-alive window is more generous.
+/// Idle-connection keep-alive, below Azure's server-side close window.
 const AZURE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Connect-phase timeout. Bounds a single slow SYN/TLS so it can't
-/// dominate the fan-out's p99.
+/// Connect-phase timeout, so one slow SYN/TLS can't dominate the p99.
 const AZURE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Tuned HTTP client options for the object-store-native fan-out.
-///
-/// The supertable query path fans out one cold-open + cold-search
-/// batch per segment concurrently. A deep, long-lived idle pool lets
-/// the fan-out reuse warm connections instead of paying a TLS
-/// handshake RTT per range GET, which otherwise inflates the p99 tail
-/// under load.
+/// Whole-request timeout (incl. body). The 30s default is too tight for
+/// a multi-MB segment PUT on a modest uplink — it aborts mid-upload.
+const AZURE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// HTTP client options: deep warm idle pool + bounded connect/request.
 fn tuned_client_options() -> object_store::ClientOptions {
     object_store::ClientOptions::new()
         .with_pool_max_idle_per_host(AZURE_POOL_MAX_IDLE_PER_HOST)
         .with_pool_idle_timeout(AZURE_POOL_IDLE_TIMEOUT)
         .with_connect_timeout(AZURE_CONNECT_TIMEOUT)
+        .with_timeout(AZURE_REQUEST_TIMEOUT)
 }
 
 /// Translate an `object_store::Error` to our `StorageError`. Kept
@@ -195,24 +192,29 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
-        let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-        // `GetResult.meta` is the version whose bytes we're about to
-        // read — etag and bytes are atomically paired, so no follow-up
-        // HEAD is needed.
-        let meta = ObjectMeta {
-            size: result.meta.size as u64,
-            etag: result.meta.e_tag.clone(),
-        };
-        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-        Ok((bytes, meta))
+        // etag and bytes are atomically paired in the same response, so
+        // no follow-up HEAD is needed.
+        retry::with_reissue(|| async {
+            let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
+            let meta = ObjectMeta {
+                size: result.meta.size as u64,
+                etag: result.meta.e_tag.clone(),
+            };
+            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+            Ok((bytes, meta))
+        })
+        .await
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        self.store
-            .get_range(&path, range)
-            .await
-            .map_err(|e| translate(uri, e))
+        retry::complete_range(uri, range, |r| async {
+            self.store
+                .get_range(&path, r)
+                .await
+                .map_err(|e| translate(uri, e))
+        })
+        .await
     }
 
     /// Single-RTT tail fetch via Azure's native `Range: bytes=-len`
@@ -226,18 +228,21 @@ impl StorageProvider for AzureStorageProvider {
             return Ok((Bytes::new(), meta.size));
         }
         let path = self.path(uri)?;
-        let opts = GetOptions {
-            range: Some(GetRange::Suffix(len)),
-            ..Default::default()
-        };
-        let result = self
-            .store
-            .get_opts(&path, opts)
-            .await
-            .map_err(|e| translate(uri, e))?;
-        let size = result.meta.size as u64;
-        let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-        Ok((bytes, size))
+        retry::with_reissue(|| async {
+            let opts = GetOptions {
+                range: Some(GetRange::Suffix(len)),
+                ..Default::default()
+            };
+            let result = self
+                .store
+                .get_opts(&path, opts)
+                .await
+                .map_err(|e| translate(uri, e))?;
+            let size = result.meta.size as u64;
+            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+            Ok((bytes, size))
+        })
+        .await
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {

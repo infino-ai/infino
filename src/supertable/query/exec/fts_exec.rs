@@ -363,9 +363,11 @@ impl ExecutionPlan for Bm25Exec {
         let fut = async move {
             let hits = match &query {
                 Bm25Query::Terms { query, mode } => {
-                    reader.bm25_search(&column, query, k, *mode).await
+                    reader.bm25_search_async(&column, query, k, *mode).await
                 }
-                Bm25Query::Prefix { prefix } => reader.bm25_search_prefix(&column, prefix, k).await,
+                Bm25Query::Prefix { prefix } => {
+                    reader.bm25_search_prefix_async(&column, prefix, k).await
+                }
             }
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
@@ -387,7 +389,7 @@ impl ExecutionPlan for Bm25Exec {
 }
 
 /// Parse the optional `mode` argument: `'or'` (default) or `'and'`.
-fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
+pub(crate) fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
     let s = arg_to_string(expr, "bm25_search mode")?;
     match s.to_ascii_lowercase().as_str() {
         "or" => Ok(BoolMode::Or),

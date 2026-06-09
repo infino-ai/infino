@@ -11,6 +11,13 @@
 //! Exercises unified vector + FTS cold-open / cold-first-search
 //! / warm-search against an in-process S3 server (`s3s-fs`).
 //!
+//! Backend selection here is intentionally **S3-only and inference-based**
+//! (`s3s-fs`, or real S3 when `INFINO_REAL_S3_BUCKET` is set) — it does not
+//! use the `INFINO_BENCH_STORE` selector or the Azure backend that the
+//! canonical benches do. This is a diagnostics probe, not a headline bench,
+//! so it keeps its own minimal fixture rather than routing through
+//! `tiers::Backend`.
+//!
 //! Spawns `s3s-fs` on a random port, points an
 //! `S3StorageProvider` at it, uploads a real **unified**
 //! superfile (one Parquet file carrying both a vector
@@ -740,7 +747,7 @@ fn emit_object_store(
 // `bench()` runs the diagnostic and returns before any of the
 // criterion rows fire.
 
-mod diag {
+pub(crate) mod diag {
     use super::*;
     use async_trait::async_trait;
     use infino::storage::{ObjectMeta, StorageError};
@@ -1739,6 +1746,7 @@ mod diag {
             let query = query_vector().to_vec();
             let vec_t0 = Instant::now();
             let vec_hits = consumer
+                .reader()
                 .vector_search(
                     VEC_COLUMN,
                     &query,
@@ -1755,6 +1763,7 @@ mod diag {
 
             let bm25_t0 = Instant::now();
             let bm25_hits = consumer
+                .reader()
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
@@ -1768,6 +1777,7 @@ mod diag {
 
             let warm_vec_t0 = Instant::now();
             let warm_vec_hits = consumer
+                .reader()
                 .vector_search(
                     VEC_COLUMN,
                     &query,
@@ -1778,6 +1788,7 @@ mod diag {
             let warm_vec = warm_vec_t0.elapsed();
             let warm_bm25_t0 = Instant::now();
             let warm_bm25_hits = consumer
+                .reader()
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
@@ -2176,9 +2187,11 @@ mod diag {
         eprintln!("[diag-qsql-overhead] warming cache (cold pass + 2s mmap promotion sleep)");
         let q = query_vector().to_vec();
         let _ = consumer
+            .reader()
             .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
             .expect("warm-up bm25");
         let _ = consumer
+            .reader()
             .vector_search(
                 VEC_COLUMN,
                 &q,
@@ -2221,6 +2234,7 @@ mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
+                .reader()
                 .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("kernel bm25");
             kernel_bm25.push(t.elapsed());
@@ -2235,6 +2249,7 @@ mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
+                .reader()
                 .vector_search(VEC_COLUMN, &q, TOP_K, opts)
                 .expect("kernel vector");
             kernel_vec.push(t.elapsed());

@@ -102,6 +102,13 @@ A query runs in two stages:
    bounds to skip blocks that cannot improve the current top results,
    and rank the surviving documents with BM25.
 
+The same inverted index also answers **unranked token matching**:
+resolve the query tokens to their posting lists and intersect them (all
+tokens present) or union them (any token present) to get the matching
+document set, with no BM25 scoring. This is the boolean retrieval the
+table layer's SQL `WHERE` pushdown builds on; ranking and matching share
+one set of posting lists.
+
 Document identifiers in the index are local to the superfile.
 
 ## Vector index
@@ -181,5 +188,10 @@ first.
   table layer's responsibility (see [supertable](./supertable.md)).
 - A superfile is immutable and is queryable only once it is fully
   written.
-- Full-text search is bag-of-words BM25; phrase and positional queries
-  are not part of the format.
+- Full-text search is bag-of-words: BM25 ranking and unranked token
+  matching (AND/OR) both run over the same posting lists. The format
+  stores **no token positions**, so there is no positional/phrase index.
+  Exact-string matching is therefore done as a two-pass operation — a
+  token-AND prune on the index to gather candidate rows, then a
+  raw-value verification against the stored column — not by storing
+  positions.

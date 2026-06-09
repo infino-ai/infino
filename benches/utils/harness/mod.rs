@@ -32,7 +32,7 @@ pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
-pub use infino_sql_engine::{InfinoSqlEngine, InfinoSqlIndex, sample_query_csv};
+pub use infino_sql_engine::{InfinoSqlEngine, InfinoSqlIndex, sample_query_csv, scatter_key};
 pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
 pub use sql_driver::{
     EngineSqlResult, SqlBuildStat, SqlQuery, SqlQueryStats, SqlRunConfig, run_sql,

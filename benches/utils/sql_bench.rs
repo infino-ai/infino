@@ -27,7 +27,7 @@ use infino::supertable::Supertable;
 use crate::corpus::{self, MmapTextCorpus};
 use crate::harness::{
     EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery, SqlRow, SqlRunConfig,
-    run_sql_with_index, sample_query_csv,
+    run_sql_with_index, sample_query_csv, scatter_key,
 };
 use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
@@ -43,18 +43,27 @@ const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
 /// The SQL query battery. `SELECT *` scans the whole table; the filters
 /// exercise scalar pushdown on a text column and a numeric column; the
 /// aggregates exercise the grouped/counted paths.
+// Aggregations + count-based filters: each reads the column(s) but
+// collapses to a few rows, so the measurement is read + compute
+// throughput — not row materialization. (A bare `SELECT col` returning
+// every row would just measure output transfer, so it's deliberately
+// absent — analytical benchmarks like ClickBench / TPC-H don't include
+// one.)
 const SQL_BATTERY: &[SqlQuery] = &[
+    // Aggregation over the whole title column (decodes every value,
+    // returns one row).
     SqlQuery {
-        name: "scan_all",
-        sql: "SELECT title FROM supertable",
+        name: "agg_max_title",
+        sql: "SELECT MAX(title) AS m FROM supertable",
+    },
+    // Selective filters as match counts (process all rows, return one).
+    SqlQuery {
+        name: "filter_category_count",
+        sql: "SELECT COUNT(*) AS n FROM supertable WHERE category = 'rust'",
     },
     SqlQuery {
-        name: "filter_category",
-        sql: "SELECT title FROM supertable WHERE category = 'rust'",
-    },
-    SqlQuery {
-        name: "filter_rating",
-        sql: "SELECT title FROM supertable WHERE rating < 10",
+        name: "filter_rating_count",
+        sql: "SELECT COUNT(*) AS n FROM supertable WHERE rating < 10",
     },
     SqlQuery {
         name: "count_star",
@@ -175,11 +184,15 @@ pub fn run() {
     );
     eprintln!("[sql] correctness OK: COUNT(*) == {n_docs}, rust == {rust}");
 
-    // Infino-only SQL options: the bm25 / vector / hybrid table functions
+    // Infino-only SQL options: table functions on the same `query_sql`
     // resolve through the same `query_sql` read path against the indexed
     // table. Hybrid is just a SQL option, measured here as another query.
-    eprintln!("[sql] measuring search table-function queries (bm25 / vector / hybrid)...");
+    eprintln!(
+        "[sql] measuring search table-function queries (bm25 / vector / hybrid / token / exact)..."
+    );
     let qv = sample_query_csv();
+    let sample_title = corpus_rows[corpus_rows.len() / 2].1.replace('\'', "''");
+
     let tvf = vec![
         timed_tvf(
             &index,
@@ -196,11 +209,149 @@ pub fn run() {
             "hybrid_search",
             &format!("SELECT _id FROM hybrid_search('title', 'term00001', 'emb', '{qv}', 10)"),
         ),
+        // Degenerate: the two most-frequent Zipf terms (rank 1 & 2)
+        // occur in ~every doc, so this AND matches the whole table — a
+        // worst case dominated by materializing 1M result rows.
+        timed_tvf(
+            &index,
+            "token_match (all rows)",
+            "SELECT _id FROM token_match('title', 'term00001 term00002', 'and')",
+        ),
+        // Realistic: a doc-unique token (df=1) — the selective shape a
+        // WHERE predicate actually hits, returning a tiny result.
+        timed_tvf(
+            &index,
+            "token_match (selective)",
+            "SELECT _id FROM token_match('title', 'doc0500000', 'and')",
+        ),
+        timed_tvf(
+            &index,
+            "exact_match",
+            &format!("SELECT _id FROM exact_match('title', '{sample_title}')"),
+        ),
+    ];
+
+    // Selective equality (one matching row), no-index column vs
+    // FTS-indexed column — on TWO column shapes that expose when the
+    // index actually beats DataFusion's min/max page pruning:
+    //   * `title`  is sorted by ingest order (titles start with
+    //     `doc{id:07}`), so its page min/max ranges isolate the value —
+    //     DataFusion prunes well on its own and the scan stays cheap.
+    //   * `key`    is a high-cardinality hash uncorrelated with row
+    //     order, so every page's min/max spans the whole domain —
+    //     min/max can prune nothing and DataFusion must scan all pages,
+    //     while the FTS index resolves the single row's page directly.
+    // The unsorted `key` row is the honest win-case; the sorted `title`
+    // row shows the index adds little when min/max already works.
+    eprintln!("[sql] measuring no-index vs FTS-index equality (sorted title vs unsorted key)...");
+    let sample_key = scatter_key(corpus_rows[corpus_rows.len() / 2].0);
+    let plain_scan = vec![
+        timed_tvf(
+            &index,
+            "WHERE title = ?  (sorted col, min/max prunes)",
+            &format!("SELECT title FROM supertable WHERE title_noidx = '{sample_title}'"),
+        ),
+        timed_tvf(
+            &index,
+            "WHERE key   = ?  (unsorted col, min/max defeated)",
+            &format!("SELECT key FROM supertable WHERE key_noidx = '{sample_key}'"),
+        ),
+    ];
+    let fts_pushdown = vec![
+        timed_tvf(
+            &index,
+            "WHERE title = ?  (sorted col, min/max prunes)",
+            &format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
+        ),
+        timed_tvf(
+            &index,
+            "WHERE key   = ?  (unsorted col, min/max defeated)",
+            &format!("SELECT key FROM supertable WHERE key = '{sample_key}'"),
+        ),
+    ];
+
+    // Aggregate **shapes** (COUNT / SUM / MAX / AVG, plus a GROUP BY)
+    // over the surviving candidate rows of an FTS-resolvable predicate,
+    // run two ways: on a non-indexed column (DataFusion full scan) vs the
+    // FTS-indexed column (the WHERE resolves through `token_match`). The
+    // selective rows use the unsorted `key` (min/max defeated → the
+    // honest win-case); the final `SUM … bucket IN (all)` row is the
+    // many-matches case where matches saturate every page so no page can
+    // be skipped and the index can't win (it just adds overhead — this is
+    // the case a selectivity gate must catch ahead of time).
+    eprintln!(
+        "[sql] measuring aggregate shapes over a candidate set: DataFusion only vs token_match..."
+    );
+    const BUCKET_IN_ALL: &str = "('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9')";
+    let agg_scan = vec![
+        timed_tvf(
+            &index,
+            "COUNT(*)            key=? (1 row)",
+            &format!("SELECT COUNT(*) AS a FROM supertable WHERE key_noidx = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "SUM(rating)         key=? (1 row)",
+            &format!("SELECT SUM(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "MAX(rating)         key=? (1 row)",
+            &format!("SELECT MAX(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "AVG(rating)         key=? (1 row)",
+            &format!("SELECT AVG(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "SUM(rating) bucket IN all (1M rows)",
+            &format!(
+                "SELECT SUM(rating) AS a FROM supertable WHERE bucket_noidx IN {BUCKET_IN_ALL}"
+            ),
+        ),
+    ];
+    let agg_idx = vec![
+        timed_tvf(
+            &index,
+            "COUNT(*)            key=? (1 row)",
+            &format!("SELECT COUNT(*) AS a FROM supertable WHERE key = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "SUM(rating)         key=? (1 row)",
+            &format!("SELECT SUM(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "MAX(rating)         key=? (1 row)",
+            &format!("SELECT MAX(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "AVG(rating)         key=? (1 row)",
+            &format!("SELECT AVG(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+        ),
+        timed_tvf(
+            &index,
+            "SUM(rating) bucket IN all (1M rows)",
+            &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"),
+        ),
     ];
 
     let mut report = Report::load("sql");
     emit_build(&mut report, n_docs, &corpus, &result);
-    emit_query(&mut report, n_docs, &result, &tvf);
+    emit_query(
+        &mut report,
+        n_docs,
+        &result,
+        &tvf,
+        &plain_scan,
+        &fts_pushdown,
+        &agg_scan,
+        &agg_idx,
+    );
     report.save();
 }
 
@@ -308,9 +459,27 @@ fn query_headers() -> Vec<String> {
     ]
 }
 
-fn emit_query(report: &mut Report, n_docs: usize, result: &EngineSqlResult, tvf: &[TvfStat]) {
+#[allow(clippy::too_many_arguments)]
+fn emit_query(
+    report: &mut Report,
+    n_docs: usize,
+    result: &EngineSqlResult,
+    tvf: &[TvfStat],
+    plain_scan: &[TvfStat],
+    fts_pushdown: &[TvfStat],
+    agg_scan: &[TvfStat],
+    agg_idx: &[TvfStat],
+) {
+    let to_rows = |stats: &[TvfStat]| -> Vec<Vec<Cell>> {
+        stats
+            .iter()
+            .map(|t| query_row(t.name, t.p50, t.rows, t.rss))
+            .collect()
+    };
     let scalar = Block {
-        subtitle: "Scalar SQL".into(),
+        subtitle:
+            "Aggregations & count-filters (read + compute, return few rows — not the index A/B)"
+                .into(),
         headers: query_headers(),
         rows: result
             .queries
@@ -319,12 +488,43 @@ fn emit_query(report: &mut Report, n_docs: usize, result: &EngineSqlResult, tvf:
             .collect(),
     };
     let search = Block {
-        subtitle: "Search table functions (bm25 / vector / hybrid)".into(),
+        subtitle: "Search table functions (bm25 / vector / hybrid / token / exact)".into(),
         headers: query_headers(),
         rows: tvf
             .iter()
             .map(|t| query_row(t.name, t.p50, t.rows, t.rss))
             .collect(),
+    };
+    // The honest A/B: same selective equality (1 matching row), no index
+    // vs FTS index. Two blocks so the labels are unmistakable.
+    let plain = Block {
+        subtitle:
+            "Plain Scan (DataFusion only) — selective equality, 1 row (sorted vs unsorted col)"
+                .into(),
+        headers: query_headers(),
+        rows: to_rows(plain_scan),
+    };
+    let pushdown = Block {
+        subtitle:
+            "FTS-pushdown (DataFusion + Infino) — SAME equality, 1 row (sorted vs unsorted col)"
+                .into(),
+        headers: query_headers(),
+        rows: to_rows(fts_pushdown),
+    };
+    // Aggregate shapes over the candidate set, the two access paths
+    // back-to-back. The 1-row `key=?` rows are the win-case (unsorted
+    // key → min/max defeated → index reads one page); the `bucket IN all`
+    // row is the many-matches case where the index can't help.
+    let agg_scan_block = Block {
+        subtitle: "Aggregate over FTS candidates — Full Scan (DataFusion only)".into(),
+        headers: query_headers(),
+        rows: to_rows(agg_scan),
+    };
+    let agg_idx_block = Block {
+        subtitle: "Aggregate over FTS candidates — FTS-pushdown (DataFusion + Infino token_match)"
+            .into(),
+        headers: query_headers(),
+        rows: to_rows(agg_idx),
     };
     report.emit(&Section {
         anchor: "bench/sql/query".into(),
@@ -332,10 +532,26 @@ fn emit_query(report: &mut Report, n_docs: usize, result: &EngineSqlResult, tvf:
             "SQL — query, in-memory supertable ({} rows)",
             fmt_count(n_docs)
         ),
-        note: "Hot p50 over `Supertable::query_sql` against the canonical 1-writer table. The search \
-               table functions (`bm25_search`, `vector_search`, `hybrid_search`) are infino-only SQL \
-               options on the same read path. `Rows` is the result-set size. Δ is vs the previous run."
+        note: "Hot p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline \
+               comparison is the last two blocks: the *same* selective equality (one matching row) run \
+               against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the \
+               byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects \
+               the candidate row, DataFusion verifies). Same predicate, same 1-row result, so the gap \
+               is purely the index. The first block is aggregations & count-filters (read + compute, \
+               return few rows) — general engine context, not a like-for-like index comparison; there \
+               is no bare `SELECT col` row because that only measures row materialization. `Rows` is \
+               the result-set size. Δ is vs the previous run."
             .into(),
-        blocks: vec![scalar, search],
+        // Comparison blocks adjacent: the 1-row equality (Plain Scan vs
+        // FTS-pushdown), then the 10%-filter aggregate (Full Scan vs
+        // token_match candidate); the bm25 / vector / hybrid TVFs last.
+        blocks: vec![
+            scalar,
+            plain,
+            pushdown,
+            agg_scan_block,
+            agg_idx_block,
+            search,
+        ],
     });
 }

@@ -314,7 +314,7 @@ impl ExecutionPlan for VectorSearchExec {
 
         let fut = async move {
             let hits = reader
-                .vector_search(&column, &query, k, options)
+                .vector_search_async(&column, &query, k, options)
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(

@@ -99,6 +99,18 @@ const MEMORY_STORE_URL_PREFIX: &str = "memory://supertable-";
 /// Monotonic source of per-provider object-store authorities.
 static STORE_URL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Selectivity gate for the FTS `WHERE` pushdown: only push an index
+/// candidate set into the scan when the estimated match count is at
+/// most this fraction of the segment's rows. Above it, matches saturate
+/// the Parquet data pages so an index `RowSelection` can't skip any —
+/// a plain scan is cheaper than the posting walk + selection overhead.
+const PUSHDOWN_MAX_FRACTION: f64 = 0.01;
+
+/// Floor for the gate so the pushdown stays active on small segments
+/// (where `n_docs * fraction` rounds to ~0 but there's no page-skip
+/// tradeoff to lose anyway).
+const PUSHDOWN_MIN_ROWS: u64 = 4096;
+
 /// A [`TableProvider`] over a pinned supertable snapshot.
 ///
 /// Cheap to build (just `Arc` clones); all real work happens in
@@ -211,6 +223,18 @@ impl SupertableProvider {
             .map_err(|e| DataFusionError::Execution(e.to_string()))
     }
 
+    /// The set of FTS-indexed column names — used by the candidate
+    /// planner and by `supports_filters_pushdown` to decide which
+    /// filters the index can resolve.
+    fn fts_cols_set(&self) -> std::collections::HashSet<String> {
+        self.manifest
+            .options
+            .fts_columns
+            .iter()
+            .map(|c| c.column.clone())
+            .collect()
+    }
+
     /// Test hook: how many segments survive pruning for `filters` — the
     /// observable behind "did the index prune more than min/max?".
     #[cfg(test)]
@@ -248,9 +272,12 @@ impl TableProvider for SupertableProvider {
     /// Report every filter as `Inexact`: DataFusion hands us the
     /// predicates (for both pruning tiers) **and** keeps a
     /// `FilterExec` above the scan, so correctness never depends on
-    /// our conservative pruning. Returning `Unsupported` (the
-    /// default) would withhold the filters from [`scan`] entirely,
-    /// disabling segment + row-group skip.
+    /// our conservative pruning. The `FilterExec` also does the
+    /// candidate-superset verification in the same scan pass as the
+    /// projection (one decode), which a self-verifying `exact_match`
+    /// candidate would split into an extra pass — measured slower.
+    /// Returning `Unsupported` (the default) would withhold the filters
+    /// from [`scan`] entirely, disabling segment + row-group skip.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -304,6 +331,17 @@ impl TableProvider for SupertableProvider {
             cache.prefetch(&ids, now).await;
         }
 
+        // Pass 1 — build the index candidate plan once for this scan. It
+        // lowers the FTS-resolvable part of the `WHERE` clause to a
+        // boolean tree over `token_match`; evaluated per segment below
+        // it yields a candidate row-id superset (or `Unbounded` = scan
+        // the segment). See `crate::supertable::query::candidate`.
+        let candidate_plan = crate::supertable::query::candidate::CandidatePlan::from_filters(
+            filters,
+            &self.fts_cols_set(),
+            self.manifest.options.tokenizer.as_ref(),
+        );
+
         // In-memory object store exposing the surviving segment bytes
         // to DataFusion's Parquet source for the duration of this scan.
         let mem_store = Arc::new(InMemory::new());
@@ -332,24 +370,64 @@ impl TableProvider for SupertableProvider {
             let path = entry.uri.storage_path();
             let size = bytes.len() as u64;
 
-            // Lazy delete path: translate this segment's tombstone
-            // bitmap into a Parquet row selection so deleted rows are
-            // never decoded. Absent/empty overlay → full scan, zero
-            // overhead. The `local_doc_id` in the bitmap is the row's
-            // global position within the segment's Parquet body, which
-            // is exactly the coordinate `ParquetAccessPlan` selects on.
-            let access_plan = match self.tombstone_cache.as_ref() {
-                Some(cache) => {
-                    let bitmap = cache
-                        .bitmap_for(entry.superfile_id, now)
-                        .map_err(|e| DataFusionError::Execution(format!("tombstone cache: {e}")))?;
-                    if bitmap.is_empty() {
+            // Pass 1 (per segment): resolve candidate rows from the
+            // index. `None` ⇒ no usable bound, scan the segment.
+            //
+            // Selectivity gate: estimate the match count from per-term
+            // `df` first (cheap, header-only — no posting decode). If a
+            // predicate would match more than `PUSHDOWN_MAX_FRACTION` of
+            // this segment, skip the index path and let DataFusion scan:
+            // at that match density the rows saturate the data pages, so
+            // an index `RowSelection` can't skip any page and only adds
+            // the posting-walk + selection overhead. The floor keeps the
+            // pushdown active on small segments (where there's no page to
+            // skip-vs-scan tradeoff anyway).
+            let est = candidate_plan
+                .estimate(reader.as_ref())
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let gate =
+                ((reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64).max(PUSHDOWN_MIN_ROWS);
+            let candidates = if est > gate {
+                None
+            } else {
+                candidate_plan
+                    .evaluate(reader.as_ref())
+                    .await
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+            };
+
+            // This segment's tombstoned rows (empty when no overlay).
+            let tombstones = match self.tombstone_cache.as_ref() {
+                Some(cache) => cache
+                    .bitmap_for(entry.superfile_id, now)
+                    .map_err(|e| DataFusionError::Execution(format!("tombstone cache: {e}")))?,
+                None => Arc::new(RoaringBitmap::new()),
+            };
+
+            // Build the Parquet row selection. `local_doc_id`s are global
+            // row positions in the Parquet body — exactly the coordinate
+            // `ParquetAccessPlan` selects on.
+            let access_plan = match candidates {
+                // Index-driven row selection: decode only the candidate
+                // rows minus any tombstoned row. The term-AND candidate is
+                // a superset of the SQL predicate, so the `FilterExec`
+                // above still verifies it exactly — this never drops a
+                // true match, only avoids decoding non-candidates.
+                Some(mut keep) => {
+                    keep -= tombstones.as_ref();
+                    Some(selection_access_plan(&bytes, &keep)?)
+                }
+                // No index bound: lazy-delete-only path — translate the
+                // tombstone bitmap into a row selection so deleted rows
+                // are never decoded; absent/empty overlay → full scan.
+                None => {
+                    if tombstones.is_empty() {
                         None
                     } else {
-                        tombstone_access_plan(&bytes, &bitmap)?
+                        tombstone_access_plan(&bytes, &tombstones)?
                     }
                 }
-                None => None,
             };
 
             mem_store
@@ -368,13 +446,32 @@ impl TableProvider for SupertableProvider {
             .runtime_env()
             .register_object_store(url.as_ref(), mem_store);
 
-        // Tier 2 — DataFusion-owned row-group / page pruning. Hand
-        // the same predicate to ParquetSource as a physical expr;
-        // on any lowering failure we simply skip row-group pruning
-        // (FilterExec above still guarantees correctness).
+        // Tier 2 — DataFusion-owned row-group / page pruning + row-level
+        // filter pushdown, used **only when the index could not bound the
+        // rows** (`Unbounded` candidate plan). In that fallback the
+        // predicate becomes a Parquet `RowFilter` (`with_pushdown_filters`)
+        // so the predicate columns are decoded first and only surviving
+        // rows materialize — pull-up avoided.
+        //
+        // When the index *did* bound the rows, the per-segment access plan
+        // already selects exactly the candidate rows and the `FilterExec`
+        // above (filters are `Inexact`) verifies the exact predicate over
+        // that tiny set. Handing DataFusion the same predicate here would
+        // turn it into a `RowFilter` that decodes the whole predicate
+        // column to re-test it — scanning the very column the index just
+        // let us skip. So we attach the pushdown predicate only on the
+        // unbounded path.
+        let index_bounded = !matches!(
+            candidate_plan,
+            crate::supertable::query::candidate::CandidatePlan::Unbounded
+        );
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        if let Some(predicate) = row_group_predicate(state, filters, &self.schema) {
-            source = source.with_predicate(predicate);
+        if !index_bounded && let Some(predicate) = row_group_predicate(state, filters, &self.schema)
+        {
+            source = source
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .with_reorder_filters(true);
         }
 
         // Only push the LIMIT into the scan when there are no
@@ -473,6 +570,76 @@ fn tombstone_access_plan(
     }
 
     Ok(any.then_some(plan))
+}
+
+/// Build a [`ParquetAccessPlan`] that decodes **only** the rows in
+/// `keep`, skipping everything else — the inverse of
+/// [`tombstone_access_plan`]. Used for index-driven row selection: the
+/// candidate planner yields a small set of `local_doc_id`s (already
+/// minus tombstones), and we want the Parquet reader to materialize the
+/// payload columns for just those rows rather than scanning the segment.
+///
+/// `keep`'s ids are `local_doc_id`s — global row positions in the
+/// Parquet body — which partition contiguously across row groups laid
+/// out in append order. An empty `keep` produces an all-skip plan (zero
+/// rows decoded), the correct result for a segment with no candidate.
+fn selection_access_plan(
+    parquet_bytes: &Bytes,
+    keep: &RoaringBitmap,
+) -> DfResult<ParquetAccessPlan> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
+        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
+    let row_groups = builder.metadata().row_groups();
+    // Ascending — `RoaringBitmap::iter` yields sorted, so each row group
+    // binary-searches its contiguous slice of kept ids.
+    let kept: Vec<u32> = keep.iter().collect();
+
+    let mut plan = ParquetAccessPlan::new_all(row_groups.len());
+    let mut base: u32 = 0;
+    for (idx, rg) in row_groups.iter().enumerate() {
+        let n = rg.num_rows() as u32;
+        if n == 0 {
+            continue;
+        }
+        let lo = kept.partition_point(|&x| x < base);
+        let hi = kept.partition_point(|&x| x < base + n);
+        let rg_kept = &kept[lo..hi];
+        if rg_kept.is_empty() {
+            plan.skip(idx);
+            base += n;
+            continue;
+        }
+        if rg_kept.len() as u32 == n {
+            // Every row in this group is a candidate — leave it as Scan.
+            base += n;
+            continue;
+        }
+        // Emit alternating skip(gap) / select(run) selectors so only the
+        // kept rows are decoded.
+        let mut selectors: Vec<RowSelector> = Vec::new();
+        let mut cursor: u32 = 0; // next un-emitted position within the row group
+        let mut i = 0usize;
+        while i < rg_kept.len() {
+            let start_rel = rg_kept[i] - base;
+            if start_rel > cursor {
+                selectors.push(RowSelector::skip((start_rel - cursor) as usize));
+            }
+            let mut j = i;
+            while j + 1 < rg_kept.len() && rg_kept[j + 1] == rg_kept[j] + 1 {
+                j += 1;
+            }
+            let run = (rg_kept[j] - rg_kept[i] + 1) as usize;
+            selectors.push(RowSelector::select(run));
+            cursor = (rg_kept[j] - base) + 1;
+            i = j + 1;
+        }
+        if cursor < n {
+            selectors.push(RowSelector::skip((n - cursor) as usize));
+        }
+        plan.scan_selection(idx, RowSelection::from(selectors));
+        base += n;
+    }
+    Ok(plan)
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's

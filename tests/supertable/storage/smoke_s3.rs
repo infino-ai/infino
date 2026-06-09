@@ -451,6 +451,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         }
 
         let bm25_hits = consumer
+            .reader()
             .bm25_search(
                 "title",
                 "alpha",
@@ -465,6 +466,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         let mut query = vec![0.0f32; dim];
         query[0] = 1.0;
         let vector_hits = consumer
+            .reader()
             .vector_search(
                 "emb",
                 &query,
