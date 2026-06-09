@@ -261,14 +261,14 @@ fn measure_fts(st: &Supertable) -> Duration {
 /// p50 of the SQL `COUNT(*)` query over `ITERS` timed runs (after one warmup).
 fn measure_sql(st: &Supertable) -> Duration {
     let warm = st
-        .query_sql("SELECT COUNT(*) FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) FROM supertable")
         .expect("sql");
     black_box(warm);
     let mut samples = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         let t0 = Instant::now();
         let batches = st
-            .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
+            .reader().query_sql(black_box("SELECT COUNT(*) FROM supertable"))
             .expect("sql");
         samples.push(t0.elapsed());
         black_box(batches);

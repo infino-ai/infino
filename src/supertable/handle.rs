@@ -871,7 +871,7 @@ impl Supertable {
     pub fn __debug_cached_session(&self) -> SessionContext {
         // Reuses the same fast path as `query_sql` — see the
         // doc-comment on `sql_session_cache` for invalidation.
-        self.query_sql("SELECT 1 WHERE 1=0").ok();
+        self.reader().query_sql("SELECT 1 WHERE 1=0").ok();
         let guard = self
             .sql_session_cache()
             .lock()
@@ -954,6 +954,7 @@ impl std::fmt::Debug for Supertable {
 /// sync→async bridge ([`SupertableReader::block_on`]), mirroring the
 /// way [`SupertableWriter`](crate::supertable::SupertableWriter)
 /// drives `commit`.
+#[derive(Clone)]
 pub struct SupertableReader {
     manifest: Arc<Manifest>,
     /// Per-process tombstone-bitmap cache shared with the parent
@@ -1001,6 +1002,17 @@ impl SupertableReader {
     /// + summaries directly.
     pub fn manifest(&self) -> &Arc<Manifest> {
         &self.manifest
+    }
+
+    /// Per-supertable configuration for this reader's snapshot.
+    pub(crate) fn options(&self) -> &Arc<SupertableOptions> {
+        &self.inner.options
+    }
+
+    /// Cached `SessionContext` keyed on the manifest `Arc`, reused by
+    /// [`SupertableReader::query_sql`] across queries on this snapshot.
+    pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
+        &self.inner.sql_session_cache
     }
 }
 

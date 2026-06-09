@@ -13,5 +13,5 @@
 //! ```
 
 fn main() {
-    infino_bench_utils::supertable_bench::run();
+    infino_bench_utils::supertable::run();
 }

@@ -216,7 +216,7 @@ fn run_vector(st: &Supertable) -> Vec<(String, u32)> {
 
 fn run_hybrid(st: &Supertable) -> Vec<i128> {
     id_vec(
-        &st.query_sql(&format!(
+        &st.reader().query_sql(&format!(
             "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{}', {K})",
             csv_one_hot(0)
         ))
@@ -226,7 +226,7 @@ fn run_hybrid(st: &Supertable) -> Vec<i128> {
 
 fn run_count(st: &Supertable) -> i64 {
     let batches = st
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("count query_sql");
     batches[0]
         .column_by_name("n")

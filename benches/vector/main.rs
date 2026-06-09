@@ -13,8 +13,6 @@
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_vector
 //! ```
 
-use infino_bench_utils::vector_superfile;
-
 fn main() {
-    vector_superfile::run();
+    infino_bench_utils::superfile::vector::run();
 }

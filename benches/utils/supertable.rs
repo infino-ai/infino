@@ -7,7 +7,7 @@
 //! (`INFINO_BENCH_SUPERTABLE_DOCS`, default 10M), built through the
 //! production `SupertableWriter::append` + `commit` path. Three index
 //! shapes are measured for apples-to-apples comparison against
-//! single-modality peers: FTS-only, vector-only, and combined FTS +
+//! single-modality peers: FTS-only, vector-only, SQL, and combined FTS +
 //! vector.
 //!
 //! **Real object store only** (`INFINO_BENCH_STORE=s3` or `azure`). The
@@ -52,20 +52,27 @@ const SHAPE_ENV: &str = "INFINO_BENCH_SUPERTABLE_SHAPE";
 const RESULT_PREFIX: &str = "__SUPERTABLE_SHAPE_RESULT__ ";
 
 /// The three measured shapes: (display label, child-env key, modality).
-const SHAPES: [(&str, &str, Modality); 3] = [
+const SHAPES: [(&str, &str, Modality); 4] = [
     ("FTS-only", "fts", Modality::Fts),
     ("vector-only", "vector", Modality::Vector),
+    ("SQL", "sql", Modality::Sql),
     ("combined FTS + vector", "combined", Modality::Combined),
 ];
 
 /// Plain measured numbers for one shape, marshalled across the
 /// parent/child process boundary as a single `key=value` line.
-struct ShapeMetrics {
-    wall_ns: f64,
-    n_superfiles: usize,
-    peak_rss_bytes: u64,
-    median_rss_bytes: u64,
-    p90_rss_bytes: u64,
+pub struct ShapeMetrics {
+    pub wall_ns: f64,
+    pub n_superfiles: usize,
+    pub peak_rss_bytes: u64,
+    pub median_rss_bytes: u64,
+    pub p90_rss_bytes: u64,
+}
+
+pub struct SupertableShapeResult {
+    pub label: &'static str,
+    pub key: &'static str,
+    pub metrics: ShapeMetrics,
 }
 
 impl ShapeMetrics {
@@ -179,7 +186,31 @@ fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
     metrics
 }
 
-fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
+pub fn handle_shape_child_from_env() -> bool {
+    if let Ok(key) = std::env::var(SHAPE_ENV) {
+        run_child_shape(&key);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn run_ingest_shapes_isolated() -> Vec<SupertableShapeResult> {
+    let mut results = Vec::with_capacity(SHAPES.len());
+    for (label, key, _) in SHAPES {
+        eprintln!("[supertable] === shape {label} (isolated process) ===");
+        if let Some(metrics) = build_shape_isolated(key) {
+            results.push(SupertableShapeResult {
+                label,
+                key,
+                metrics,
+            });
+        }
+    }
+    results
+}
+
+pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     let secs = m.wall_ns / 1e9;
     let thr = if secs > 0.0 {
         n_docs as f64 / secs
@@ -220,8 +251,7 @@ pub fn run() {
     }
 
     // Child mode: build exactly one shape in this fresh process, then exit.
-    if let Ok(key) = std::env::var(SHAPE_ENV) {
-        run_child_shape(&key);
+    if handle_shape_child_from_env() {
         return;
     }
 
@@ -235,13 +265,11 @@ pub fn run() {
         supertable::N_COMMIT_CHUNKS
     );
 
-    let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(SHAPES.len());
-    for (label, key, _) in SHAPES {
-        eprintln!("[supertable] === shape {label} (isolated process) ===");
-        if let Some(metrics) = build_shape_isolated(key) {
-            rows.push(ingest_row(n_docs, label, &metrics));
-        }
-    }
+    let shape_results = run_ingest_shapes_isolated();
+    let rows: Vec<Vec<Cell>> = shape_results
+        .iter()
+        .map(|r| ingest_row(n_docs, r.label, &r.metrics))
+        .collect();
 
     if rows.is_empty() {
         eprintln!("[supertable] no shapes produced metrics — not emitting a report");

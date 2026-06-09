@@ -208,7 +208,7 @@ fn demo_supertable() {
 
     // SQL surfaces the real auto-injected `_id` alongside the payload.
     let batches = st
-        .query_sql("SELECT _id, title FROM supertable ORDER BY _id")
+        .reader().query_sql("SELECT _id, title FROM supertable ORDER BY _id")
         .expect("query_sql");
     let table = pretty_format_batches(&batches).expect("format");
     for line in table.to_string().lines() {

@@ -163,7 +163,7 @@ async fn sql_query_excludes_tombstoned_row() {
     // `SELECT COUNT(*)` should now report 2 (4 minus the two
     // tombstoned rows).
     let batches = st
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     assert_eq!(batches.len(), 1);
     let arr = batches[0]
@@ -175,7 +175,7 @@ async fn sql_query_excludes_tombstoned_row() {
 
     // `SELECT title` should return only the un-tombstoned rows.
     let batches = st
-        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .reader().query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<&str> = batches
         .iter()

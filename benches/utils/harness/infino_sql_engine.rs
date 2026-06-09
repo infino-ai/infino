@@ -272,7 +272,7 @@ impl SqlEngine for InfinoSqlEngine {
     }
 
     fn read(index: &Self::Index, sql: &str) -> SqlOutput {
-        let batches = index.table().query_sql(sql).expect("query_sql");
+        let batches = index.table().reader().query_sql(sql).expect("query_sql");
         SqlOutput {
             rows: batches.iter().map(RecordBatch::num_rows).sum(),
         }

@@ -8,7 +8,7 @@
 //! ```ignore
 //! let st: Supertable = ...;
 //! let batches: Vec<RecordBatch> =
-//!     st.query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
+//!     st.reader().query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
 //! ```
 //!
 //! Sync return type: callers don't need a tokio runtime.
@@ -53,11 +53,11 @@ use arrow_array::{Array, Decimal128Array};
 use datafusion::execution::context::SessionContext;
 
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::Supertable;
+use crate::supertable::handle::SupertableReader;
 use crate::supertable::query::provider::{SupertableProvider, TABLE_NAME};
 
-impl Supertable {
-    /// Run a SQL query against this supertable's pinned snapshot.
+impl SupertableReader {
+    /// Run a SQL query against this reader's pinned snapshot.
     ///
     /// The snapshot is captured at `query_sql` entry — concurrent
     /// commits don't affect the in-flight query. Returns the
@@ -98,8 +98,8 @@ impl Supertable {
         // Drive through the shared sync→async bridge: ambient
         // runtime → block_in_place on the ambient handle; otherwise
         // the lazily-built owned query_runtime. See
-        // [`Supertable::block_on_query`].
-        self.block_on_query(drive)
+        // [`SupertableReader::block_on`].
+        self.block_on(drive)
     }
 
     /// Build (or reuse the cached) [`SessionContext`] for the
@@ -119,9 +119,9 @@ impl Supertable {
     /// Callers apply their own freshness policy
     /// ([`ensure_fresh`](Self::ensure_fresh)) before calling.
     fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
-        // ArcSwap::load_full is a single atomic load + Arc clone, so
-        // pinning the snapshot is cheap even on the hot path.
-        let reader = Arc::new(self.reader());
+        // This reader already pins the snapshot; clone is a handful of
+        // Arc refcount bumps.
+        let reader = Arc::new(self.clone());
         let manifest = Arc::clone(reader.manifest());
 
         let mut guard = self
@@ -223,7 +223,7 @@ impl Supertable {
             extract_id_column(&batches)
         };
 
-        self.block_on_query(drive)
+        self.block_on(drive)
     }
 }
 
@@ -319,7 +319,7 @@ mod tests {
     /// Convenience: run a query and pull a single `Int64` aggregate
     /// value from cell (0,0).
     fn run_count(st: &Supertable, sql: &str) -> i64 {
-        let batches = st.query_sql(sql).expect("query_sql ok");
+        let batches = st.reader().query_sql(sql).expect("query_sql ok");
         assert!(!batches.is_empty(), "expected at least one result batch");
         let n = batches[0]
             .column(0)
@@ -384,7 +384,7 @@ mod tests {
         w.commit().expect("commit");
 
         let batches = st
-            .query_sql(
+            .reader().query_sql(
                 "SELECT category, COUNT(*) AS n FROM supertable \
                  GROUP BY category ORDER BY category",
             )
@@ -549,7 +549,7 @@ mod tests {
             1,
         );
         let batches = st
-            .query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
+            .reader().query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
             .expect("query");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
@@ -700,7 +700,7 @@ mod tests {
         w.commit().expect("c2");
 
         let batches = st
-            .query_sql("SELECT _id FROM supertable ORDER BY _id")
+            .reader().query_sql("SELECT _id FROM supertable ORDER BY _id")
             .expect("query");
         let ids: Vec<i128> = batches
             .iter()
@@ -730,7 +730,7 @@ mod tests {
         w.commit().expect("c");
 
         let batches = st
-            .query_sql("SELECT * FROM supertable LIMIT 1")
+            .reader().query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -761,7 +761,7 @@ mod tests {
     fn query_sql_invalid_sql_returns_plan_error() {
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let err = st
-            .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
+            .reader().query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
         assert!(
             matches!(err, crate::supertable::error::QueryError::Plan(_)),
@@ -848,7 +848,7 @@ mod tests {
         w.commit().expect("commit");
 
         let batches = st
-            .query_sql("SELECT * FROM supertable LIMIT 1")
+            .reader().query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -866,7 +866,7 @@ mod tests {
         w.commit().expect("commit");
 
         let err = st
-            .query_sql("SELECT emb FROM supertable")
+            .reader().query_sql("SELECT emb FROM supertable")
             .expect_err("vector column should not be in the SQL schema");
         assert!(
             matches!(err, crate::supertable::error::QueryError::Plan(_)),

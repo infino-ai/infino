@@ -113,7 +113,7 @@ fn rss_cells(stats: RssStats) -> Vec<Cell> {
 /// Total live row count via SQL `COUNT(*)`.
 fn count_rows(st: &Supertable) -> i64 {
     let batches = st
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     batches[0]
         .column(0)

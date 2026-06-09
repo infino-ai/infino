@@ -13,5 +13,5 @@
 //! ```
 
 fn main() {
-    infino_bench_utils::sql_bench::run();
+    infino_bench_utils::superfile::sql::run();
 }

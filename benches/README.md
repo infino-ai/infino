@@ -101,9 +101,9 @@ corpus/                     synthetic corpora + brute-force oracles
 harness/                    engine interfaces and generic drivers
 report.rs                   terminal + markdown rendering with deltas
 rss.rs                      per-phase RSS sampling
-fts_superfile.rs            superfile FTS runner
-vector_superfile.rs         superfile vector runner (migration pending)
-ingest/, fixture/, bench/   supertable object-store helpers (migration pending)
+superfile.rs                superfile runners by modality (fts / vector / sql)
+supertable.rs               supertable object-store ingest runner
+ingest/, fixture/, bench/   supertable object-store helpers
 ```
 
 ## Result Anchors

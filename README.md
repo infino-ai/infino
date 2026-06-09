@@ -57,7 +57,7 @@ let fused = table.reader().hybrid_search(
 
 // Every retriever is also a SQL table function (DataFusion under the hood;
 // each segment is valid Parquet), so you can filter, join, and fuse in SQL:
-let rows = table.query_sql(
+let rows = table.reader().query_sql(
     "SELECT _id, title, score \
      FROM hybrid_search('title', 'rust async', 'embedding', '<query vector>', 10)",
 )?;

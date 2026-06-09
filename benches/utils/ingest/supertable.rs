@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::tokenize::Tokenizer;
@@ -27,6 +27,8 @@ pub fn n_docs() -> usize {
 pub const N_COMMIT_CHUNKS: usize = 16;
 pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
+pub const SQL_CATEGORY_COLUMN: &str = "category";
+pub const SQL_RATING_COLUMN: &str = "rating";
 
 const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
@@ -55,22 +57,33 @@ pub struct IngestResult {
 pub enum Modality {
     Fts,
     Vector,
+    Sql,
     Combined,
 }
 
 impl Modality {
     pub fn has_text(self) -> bool {
+        matches!(self, Modality::Fts | Modality::Sql | Modality::Combined)
+    }
+    pub fn has_fts(self) -> bool {
         matches!(self, Modality::Fts | Modality::Combined)
     }
     pub fn has_vector(self) -> bool {
         matches!(self, Modality::Vector | Modality::Combined)
     }
+    pub fn has_sql(self) -> bool {
+        matches!(self, Modality::Sql)
+    }
 }
 
 fn schema_for(modality: Modality) -> Arc<Schema> {
-    let mut fields = Vec::with_capacity(2);
+    let mut fields = Vec::with_capacity(3);
     if modality.has_text() {
         fields.push(Field::new(TEXT_COLUMN, DataType::LargeUtf8, false));
+    }
+    if modality.has_sql() {
+        fields.push(Field::new(SQL_CATEGORY_COLUMN, DataType::LargeUtf8, false));
+        fields.push(Field::new(SQL_RATING_COLUMN, DataType::Int64, false));
     }
     if modality.has_vector() {
         fields.push(Field::new(
@@ -102,7 +115,7 @@ pub fn options_for(
             .expect("pool"),
     );
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let fts = if modality.has_text() {
+    let fts = if modality.has_fts() {
         vec![FtsConfig {
             column: TEXT_COLUMN.into(),
         }]
@@ -174,16 +187,25 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
             modality.has_text(),
             modality.has_vector(),
         );
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(2);
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(3);
         if modality.has_text() {
             let title_arr: Vec<&str> = titles.iter().map(String::as_str).collect();
             columns.push(Arc::new(LargeStringArray::from(title_arr)));
-            // The arrow array now owns the only copy of the text. Drop the
-            // Vec<String> heap before append/commit so the long index-build
-            // phase (where the RSS sampler dwells) measures the production
-            // working set — arrow batch + writer + index — not the in-process
-            // synthetic-corpus generator, which a real server never holds (it
-            // receives the batch over the API).
+        }
+        if modality.has_sql() {
+            let categories = (start..end)
+                .map(|doc_id| match doc_id % 4 {
+                    0 => "rust",
+                    1 => "python",
+                    2 => "go",
+                    _ => "sql",
+                })
+                .collect::<Vec<_>>();
+            columns.push(Arc::new(LargeStringArray::from(categories)));
+            let ratings = (start..end).map(|doc_id| (doc_id % 100) as i64).collect::<Vec<_>>();
+            columns.push(Arc::new(Int64Array::from(ratings)));
+        }
+        if modality.has_text() {
             titles.clear();
             titles.shrink_to_fit();
         }

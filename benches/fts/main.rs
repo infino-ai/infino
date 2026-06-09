@@ -21,5 +21,5 @@
 //! ```
 
 fn main() {
-    infino_bench_utils::fts_superfile::run();
+    infino_bench_utils::superfile::fts::run();
 }

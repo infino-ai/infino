@@ -96,7 +96,7 @@ async fn writer_delete_tombstones_matching_rows() {
 
     // Follow-up SQL query no longer returns the row.
     let batches = st
-        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .reader().query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
         .iter()
@@ -205,7 +205,7 @@ async fn writer_update_replaces_matching_rows() {
     drop(w);
 
     let batches = st
-        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .reader().query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
         .iter()

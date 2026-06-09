@@ -313,7 +313,7 @@ fn sql_loads_all_parts_returns_correct_count() {
 
     // 5 commits × 2 rows/commit = 10 rows total.
     let batches = consumer
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
     let arr = batches[0]
@@ -395,7 +395,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
 
     // SQL.
     let batches = consumer
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     assert_eq!(batches.len(), 1);
 }

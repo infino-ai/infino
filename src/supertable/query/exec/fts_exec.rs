@@ -511,7 +511,7 @@ mod tests {
     fn bm25_search_tvf_returns_matches_in_descending_score() {
         let st = demo_corpus();
         let batches = st
-            .query_sql("SELECT title, score FROM bm25_search('title', 'rust', 10)")
+            .reader().query_sql("SELECT title, score FROM bm25_search('title', 'rust', 10)")
             .expect("query_sql");
         let titles = titles_of(&batches);
         assert_eq!(titles.len(), 2, "only docs 0 + 4 contain 'rust'");
@@ -527,14 +527,14 @@ mod tests {
         let st = demo_corpus();
         // AND: only doc 4 has both `rust` and `systems`.
         let and_rows = st
-            .query_sql("SELECT title FROM bm25_search('title', 'rust systems', 10, 'and')")
+            .reader().query_sql("SELECT title FROM bm25_search('title', 'rust systems', 10, 'and')")
             .expect("query_sql");
         let and_titles = titles_of(&and_rows);
         assert_eq!(and_titles, vec!["rust systems programming".to_string()]);
 
         // OR (default): docs 0 + 4 (union of `rust` and `systems`).
         let or_rows = st
-            .query_sql("SELECT title FROM bm25_search('title', 'rust systems', 10)")
+            .reader().query_sql("SELECT title FROM bm25_search('title', 'rust systems', 10)")
             .expect("query_sql");
         assert_eq!(titles_of(&or_rows).len(), 2);
     }
@@ -544,7 +544,7 @@ mod tests {
         let st = demo_corpus();
         // `rus` expands to `rust` → docs 0 + 4.
         let batches = st
-            .query_sql("SELECT title FROM bm25_search_prefix('title', 'rus', 10)")
+            .reader().query_sql("SELECT title FROM bm25_search_prefix('title', 'rus', 10)")
             .expect("query_sql");
         let titles = titles_of(&batches);
         assert_eq!(titles.len(), 2);
@@ -555,7 +555,7 @@ mod tests {
     fn bm25_search_tvf_star_projection_appends_score_column() {
         let st = demo_corpus();
         let batches = st
-            .query_sql("SELECT * FROM bm25_search('title', 'rust', 10)")
+            .reader().query_sql("SELECT * FROM bm25_search('title', 'rust', 10)")
             .expect("query_sql");
         let b = &batches[0];
         // Scalar schema (_id, title) + score.
@@ -569,7 +569,7 @@ mod tests {
     fn bm25_search_tvf_empty_supertable_returns_no_rows() {
         let st = Supertable::create(options_title_fts()).expect("create");
         let batches = st
-            .query_sql("SELECT title, score FROM bm25_search('title', 'rust', 5)")
+            .reader().query_sql("SELECT title, score FROM bm25_search('title', 'rust', 5)")
             .expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
@@ -580,7 +580,7 @@ mod tests {
         let st = demo_corpus();
         // 2 args (missing k) → planning error, surfaced as QueryError::Plan.
         assert!(
-            st.query_sql("SELECT title FROM bm25_search('title', 'rust')")
+            st.reader().query_sql("SELECT title FROM bm25_search('title', 'rust')")
                 .is_err()
         );
     }

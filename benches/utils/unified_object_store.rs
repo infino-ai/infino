@@ -149,7 +149,7 @@ const ID_COLUMN: &str = "doc_id";
 /// blob, not the Parquet schema).
 const VEC_COLUMN: &str = "v";
 /// FTS column registered on the unified fixture. Single `title`
-/// column — same shape `benches/utils/fts_superfile.rs` builds.
+/// column — same shape `benches/utils/superfile.rs` (`fts`) builds.
 /// It stays in the Parquet body (SQL-visible) *and* is indexed
 /// into the FTS blob, which is the whole point of the unified
 /// layout.
@@ -2097,7 +2097,7 @@ pub(crate) mod diag {
     }
 
     /// Times warm `reader.bm25_search` / `reader.vector_search`
-    /// (kernel-direct) vs `consumer.query_sql("SELECT _id FROM
+    /// (kernel-direct) vs `consumer.reader().query_sql("SELECT _id FROM
     /// bm25_search(...)")` / `query_sql("... vector_search ...")`
     /// (DataFusion path) side-by-side on the same warm Supertable
     /// over an in-process `s3s-fs`. Prints min / p50 / p95 / mean
@@ -2221,10 +2221,10 @@ pub(crate) mod diag {
         let vec_score_sql =
             format!("SELECT score FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
         let _ = consumer
-            .query_sql(&bm25_sql)
+            .reader().query_sql(&bm25_sql)
             .expect("warm-up query_sql bm25");
         let _ = consumer
-            .query_sql(&vec_sql)
+            .reader().query_sql(&vec_sql)
             .expect("warm-up query_sql vector");
 
         // 7. Time both paths.
@@ -2242,7 +2242,7 @@ pub(crate) mod diag {
         let mut qsql_bm25: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = consumer.query_sql(&bm25_sql).expect("query_sql bm25");
+            let _ = consumer.reader().query_sql(&bm25_sql).expect("query_sql bm25");
             qsql_bm25.push(t.elapsed());
         }
         let mut kernel_vec: Vec<Duration> = Vec::with_capacity(iters);
@@ -2257,7 +2257,7 @@ pub(crate) mod diag {
         let mut qsql_vec: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = consumer.query_sql(&vec_sql).expect("query_sql vector");
+            let _ = consumer.reader().query_sql(&vec_sql).expect("query_sql vector");
             qsql_vec.push(t.elapsed());
         }
 
@@ -2295,7 +2295,7 @@ pub(crate) mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
-                .query_sql(&bm25_score_sql)
+                .reader().query_sql(&bm25_score_sql)
                 .expect("query_sql bm25 score");
             bm25_score_total.push(t.elapsed());
         }
@@ -2303,7 +2303,7 @@ pub(crate) mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
-                .query_sql(&vec_score_sql)
+                .reader().query_sql(&vec_score_sql)
                 .expect("query_sql vector score");
             vec_score_total.push(t.elapsed());
         }
