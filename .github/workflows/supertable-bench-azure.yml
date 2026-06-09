@@ -296,13 +296,16 @@ jobs:
           fi
 
           # The report banner ("══ … ══") and table are present only when
-          # at least one shape succeeded.
+          # at least one shape succeeded. Capture from the first banner to
+          # the end, then drop the inter-bench noise that falls between
+          # report tables: the run-step "===== …" markers and the benches'
+          # "[tag] …" progress lines. Report rows never start that way.
           if grep -q '══' "$LOG"; then
             REPORT_OK=1
             {
               echo "### Results"
               echo '```'
-              awk '/══/{f=1} f' "$LOG"
+              awk '/══/{f=1} f' "$LOG" | grep -vE '^=====|^\[[a-z][a-z_]*\]'
               echo '```'
             } >> "$SUMMARY"
           else
