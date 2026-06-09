@@ -46,7 +46,7 @@ cargo bench --bench superfile_vector
 - **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
 - **No code duplication.** Read the surrounding modules *before* writing new code — there is usually an existing helper that already does what you need. Refactor shared logic into one helper rather than copy-pasting; duplicated logic drifts out of sync and is a correctness hazard.
 - **No `unsafe` outside the documented surface.** `unsafe` in `src/` is concentrated in three areas: SIMD intrinsic kernels (`superfile/vector/distance.rs`, `vector/sq8_simd.rs`, `vector/quant.rs`, `superfile/fts/tokenize.rs`), memory-mapped / page-advise I/O (`supertable/reader_cache/disk.rs`, `config/`), and the one `bumpalo` lifetime extension in `FtsBuilder::add_doc`. (Note: `superfile/format/` is *safe* byte parsing — no `unsafe` there.) New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
-- **Visibility hygiene.** Items used only inside the crate are `pub(crate)`, not `pub`. Test-only methods go behind `#[cfg(test)]`, not `#[allow(dead_code)]`. The public API surface is what's re-exported from `superfile/mod.rs` and `supertable/mod.rs` — see the "Public API surface" section below.
+- **Visibility hygiene.** Items used only inside the crate are `pub(crate)`, not `pub`. Test-only methods go behind `#[cfg(test)]`, not `#[allow(dead_code)]`. The public API surface is what's re-exported at the crate root (`src/lib.rs`) — see the "Public API surface" section below.
 - **State rationale inline in comments.** Don't cite external documents or trackers a reader may not have access to; explain the reasoning directly.
 - **Use plain language in source, comments, and commit messages.** Avoid cryptic internal shorthand or tracking tags; describe the change directly.
 - **Performance numbers live in `benches/README.md`.** Keep benchmark results there rather than scattered through the codebase.
@@ -182,7 +182,7 @@ Rule of thumb for landing a change in the right place:
 
 ### ⚠️ Ask first (open an issue before writing code)
 
-- Changes to the public API surface (anything re-exported from `superfile/mod.rs` or `supertable/mod.rs`)
+- Changes to the public API surface (anything re-exported at the crate root / tracked in `public-api.txt`)
 - Adding a new top-level module under `src/`
 - Adding a new direct dependency to `Cargo.toml`
 - Changes to the on-disk format (`superfile/format/`, footer layout, blob layout, CRC discipline)
@@ -202,12 +202,31 @@ If you have a strong reason to revisit any 🚫 item, open an issue with new evi
 
 ## Public API surface
 
-The stability boundary is what's re-exported from these two module roots:
+The stability boundary is the set of items re-exported at the **crate
+root** (`src/lib.rs`) — everything a user reaches as `infino::*`. The
+surface is deliberately small: a connection-and-table API over the
+storage/superfile/supertable layers, which are themselves internal.
 
-- `**src/superfile/mod.rs`** — re-exports `SuperfileReader`, `OpenOptions`, `VectorSearchOptions`, `LazyByteSource` (+ `BytesLazyByteSource`, `LazyByteSourceError`), and the error types. `SuperfileBuilder` is reachable via `pub mod builder` (not re-exported at the root). BM25 and vector search are **methods on `SuperfileReader`** (`bm25_search` / `vector_search`), not free functions.
-- `**src/supertable/mod.rs**` — `Supertable`, `SupertableReader`, `SupertableWriter`, `SupertableOptions`, `Manifest`, `SuperfileEntry`, `SuperfileUri`, `FtsSummary`, `VectorSummary`, storage providers (`LocalFsStorageProvider`, `S3StorageProvider`, `AzureStorageProvider`, `StorageProvider` trait), and error types.
+- **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
+- **`Connection`** — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
+- **`Supertable`** (the table handle) — `append`, `update`, `delete`, `bm25_search`, `vector_search`, `schema`. BM25 and vector search return `Vec<SearchHit>`; the segment-local hit representation is internal and resolved to the public `_id` before it reaches the caller.
+- **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `SearchHit`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
 
-Anything not re-exported through one of those module roots is internal. Default new items to `pub(crate)`; if you add a `pub` item, justify why it needs to be reachable outside the crate.
+Everything else — `SupertableReader`/`SupertableWriter`, the manifest
+and summary types, the storage providers and `StorageProvider` trait,
+the whole `SuperfileReader`/builder/byte-source surface — is
+`pub(crate)` or test-only and **not** part of the public API. Default
+new items to `pub(crate)`; if you add a crate-root `pub` re-export,
+justify why it needs to be reachable outside the crate.
+
+The surface is **machine-guarded**: `public-api.txt` is a checked-in
+`cargo-public-api` snapshot. `make public-api` fails if the live
+surface drifts from it; run `make public-api-update` to regenerate the
+snapshot intentionally and review the diff in the PR. Test-only
+visibility is handled by the `test_visible!` macro (flips an item
+between `pub(crate)` and `pub` under the `test-helpers` feature) so
+integration tests can reach internals without widening the shipped
+surface.
 
 ## Sources of truth
 
