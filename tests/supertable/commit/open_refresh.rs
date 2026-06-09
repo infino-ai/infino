@@ -133,6 +133,7 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
     // A strongly-consistent query re-checks the pointer and serves
     // against the latest manifest — picking up the new commit.
     let hits = consumer
+        .reader()
         .bm25_search("title", "added", BM25_TOP_K, BoolMode::Or)
         .expect("query under strong consistency");
     assert!(!hits.is_empty(), "strong query must see the v2 row");
@@ -176,6 +177,7 @@ fn strong_consistency_query_is_stable_when_pointer_unchanged() {
     // No producer commits between open and query: the pointer hasn't
     // advanced, so the strongly-consistent query stays at v1.
     let _ = consumer
+        .reader()
         .bm25_search("title", "only", BM25_TOP_K, BoolMode::Or)
         .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
@@ -197,6 +199,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
     )
     .expect("create");
     let hits = st
+        .reader()
         .bm25_search("title", "anything", BM25_TOP_K, BoolMode::Or)
         .expect("query on uncommitted table");
     assert!(hits.is_empty());

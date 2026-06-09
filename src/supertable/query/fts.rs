@@ -7,10 +7,10 @@
 //!
 //! ```ignore
 //! let hits: Vec<SuperfileHit> =
-//!     supertable.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+//!     supertable.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
 //!
 //! let prefix_hits: Vec<SuperfileHit> =
-//!     supertable.bm25_search_prefix("title", "rus", 10)?;
+//!     supertable.reader().bm25_search_prefix("title", "rus", 10)?;
 //! ```
 //!
 //! Both methods return [`SuperfileHit`]s sorted by score *descending*
@@ -83,11 +83,11 @@ impl SupertableReader {
     /// without consulting the store.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`Supertable::bm25_search`], which drives this via the
-    /// sync→async bridge after applying the read-consistency policy.
+    /// [`SupertableReader::bm25_search`], which drives this via the
+    /// sync→async bridge.
     ///
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
-    pub(crate) async fn bm25_search(
+    pub(crate) async fn bm25_search_async(
         &self,
         column: &str,
         query: &str,
@@ -183,8 +183,8 @@ impl SupertableReader {
     /// to an empty `Vec`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`Supertable::bm25_search_prefix`].
-    pub(crate) async fn bm25_search_prefix(
+    /// [`SupertableReader::bm25_search_prefix`].
+    pub(crate) async fn bm25_search_prefix_async(
         &self,
         column: &str,
         prefix: &str,
@@ -255,62 +255,157 @@ impl SupertableReader {
 
         Ok(top_k_descending(per_unit, k))
     }
+
+    /// Unranked token match across the pinned snapshot. Returns
+    /// every row matching `query`'s tokens under `mode` (`Or` = any
+    /// token, `And` = every token) as [`SuperfileHit`]s — **no scoring**
+    /// (`score` is left `0.0`; these results are unordered). Segment
+    /// skip uses the same term-bloom prune as BM25.
+    ///
+    /// `pub(crate)` async kernel; the public surface is the sync
+    /// [`SupertableReader::token_match`].
+    pub(crate) async fn token_match_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
+        if term_strings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let kept = crate::supertable::query::prune::select_segments(
+            manifest.as_ref(),
+            &[crate::supertable::query::prune::PruneLeaf::TermPresence {
+                column: column.to_owned(),
+                terms: term_strings.clone(),
+                mode,
+            }],
+        )
+        .await?;
+        if kept.is_empty() {
+            return Ok(Vec::new());
+        }
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let column_arc = Arc::new(column.to_owned());
+        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+            let column_arc = Arc::clone(&column_arc);
+            let term_arc = Arc::clone(&term_arc);
+            async move {
+                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                let docs = r
+                    .token_match(&column_arc, &refs, mode)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+            }
+        };
+        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        Ok(per_unit.into_iter().flatten().collect())
+    }
+
+    /// Unranked two-pass exact match of the **raw string** `value`
+    /// against `column` across the pinned snapshot. Returns the rows
+    /// whose stored value equals `value` exactly as [`SuperfileHit`]s —
+    /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
+    /// for the per-segment two-pass (token-AND prune + raw verify).
+    ///
+    /// `pub(crate)` async kernel; the public surface is the sync
+    /// [`SupertableReader::exact_match`].
+    pub(crate) async fn exact_match_async(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        // Tokens prune segments via the term bloom (AND); a token-less
+        // value (e.g. punctuation only) can't prune, so keep all.
+        let leaves = if term_strings.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::supertable::query::prune::PruneLeaf::TermPresence {
+                column: column.to_owned(),
+                terms: term_strings,
+                mode: BoolMode::And,
+            }]
+        };
+        let kept =
+            crate::supertable::query::prune::select_segments(manifest.as_ref(), &leaves).await?;
+        if kept.is_empty() {
+            return Ok(Vec::new());
+        }
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let column_arc = Arc::new(column.to_owned());
+        let value_arc = Arc::new(value.to_owned());
+        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+            let column_arc = Arc::clone(&column_arc);
+            let value_arc = Arc::clone(&value_arc);
+            async move {
+                let docs = r
+                    .exact_match(&column_arc, &value_arc)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+            }
+        };
+        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        Ok(per_unit.into_iter().flatten().collect())
+    }
 }
 
-impl Supertable {
-    /// Single-column BM25 search over the current snapshot.
+impl SupertableReader {
+    /// Single-column BM25 search over this reader's pinned snapshot.
     ///
-    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), best
-    /// score first. Pins a reader, applies the read-consistency policy,
-    /// drives the async kernel via the sync→async bridge, then resolves
-    /// each segment-local hit to its public `_id`.
+    /// Drives the internal async kernel to completion via the
+    /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
+    /// to `k` hits sorted by BM25 score *descending*.
     pub fn bm25_search(
         &self,
         column: &str,
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
-        let hits = self.bm25_search_hits(column, query, k, mode)?;
-        let reader = self.reader();
-        let id_col = self.options().id_column.clone();
-        self.block_on_query(crate::supertable::query::exec::common::resolve_search_hits(
-            &reader, &hits, &id_col,
-        ))
-        .map_err(|e| crate::InfinoError::Query(e.to_string()))
-    }
-
-    test_visible! {
-    /// Segment-local BM25 hits ([`SuperfileHit`], carrying
-    /// `segment` + `local_doc_id`). Internal/positional — used by the
-    /// correctness oracles; the public surface is
-    /// [`Supertable::bm25_search`]. Up to `k`, BM25 score *descending*.
-    fn bm25_search_hits(
-        &self,
-        column: &str,
-        query: &str,
-        k: usize,
-        mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.bm25_search(column, query, k, mode))
-    }
+        self.block_on(self.bm25_search_async(column, query, k, mode))
     }
 
-    /// Prefix-expanded BM25 search — see [`Supertable::bm25_search`]
-    /// for the bridge semantics. Off the public surface (prefix search is
-    /// reached through SQL); used by tests/benches via `test-helpers`.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
+    /// for the bridge semantics.
     pub fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.ensure_fresh();
-        let reader = self.reader();
-        self.block_on_query(reader.bm25_search_prefix(column, prefix, k))
+        self.block_on(self.bm25_search_prefix_async(column, prefix, k))
+    }
+
+    /// Unranked token match over this reader's pinned snapshot. Returns
+    /// every row whose `column` matches `query`'s tokens under `mode`
+    /// (`Or` = any token, `And` = every token). The returned hits are
+    /// **unranked** — `score` is `0.0` and order is unspecified — unlike
+    /// the ranked [`SupertableReader::bm25_search`]. Drives the async
+    /// kernel via the sync→async bridge ([`SupertableReader::block_on`]).
+    pub fn token_match(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.block_on(self.token_match_async(column, query, mode))
+    }
+
+    /// Unranked exact match of the raw string `value` against `column`
+    /// over this reader's pinned snapshot — the two-pass index-pruned,
+    /// text-verified match (see
+    /// [`SuperfileReader::exact_match`](crate::superfile::SuperfileReader::exact_match)).
+    /// Returns the rows whose stored value equals `value` exactly;
+    /// hits are **unranked** (`score` is `0.0`).
+    pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.block_on(self.exact_match_async(column, value))
     }
 }
 
@@ -457,6 +552,46 @@ fn _manifest_doc_total(manifest: &Manifest) -> u64 {
     manifest.n_docs_total()
 }
 
+impl Supertable {
+    /// Single-column BM25 search over the current snapshot.
+    ///
+    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), best
+    /// score first. Pins a fresh reader, runs the BM25 fan-out, then
+    /// resolves each segment-local hit to its public `_id`.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, BoolMode, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or)?;
+    /// assert_eq!(hits.len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
+        let reader = self.reader();
+        let hits = reader
+            .bm25_search(column, query, k, mode)
+            .map_err(crate::InfinoError::from)?;
+        let id_col = self.options().id_column.clone();
+        self.block_on_query(super::exec::common::resolve_search_hits(
+            &reader, &hits, &id_col,
+        ))
+        .map_err(|e| crate::InfinoError::Query(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -472,6 +607,18 @@ mod tests {
     use super::BoolMode;
 
     use crate::test_helpers::default_tokenizer as tok;
+
+    /// Drive an async future to completion on a throwaway current-thread
+    /// runtime. Used only for the single-segment `SuperfileReader`
+    /// oracle, whose search surface is async-only; the supertable
+    /// reader's own search methods are sync and need no runtime here.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
 
     fn schema_id_title() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -549,19 +696,18 @@ mod tests {
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
     }
 
-    #[tokio::test]
-    async fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
+    #[test]
+    fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
-            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn bm25_search_k_zero_short_circuits() {
+    #[test]
+    fn bm25_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
@@ -569,13 +715,12 @@ mod tests {
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 0, BoolMode::Or)
-            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn bm25_search_returns_descending_score_order() {
+    #[test]
+    fn bm25_search_returns_descending_score_order() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(
@@ -592,7 +737,6 @@ mod tests {
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 4, BoolMode::Or)
-            .await
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
         assert_eq!(hits.len(), 3);
@@ -602,8 +746,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn bm25_search_carries_segment_uri_for_each_hit() {
+    #[test]
+    fn bm25_search_carries_segment_uri_for_each_hit() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust rust async"])).expect("a1");
@@ -615,7 +759,6 @@ mod tests {
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
-            .await
             .expect("query");
         assert_eq!(hits.len(), 2);
         // Both segment URIs should appear.
@@ -629,8 +772,8 @@ mod tests {
         assert_eq!(uris, expected);
     }
 
-    #[tokio::test]
-    async fn bm25_search_oracle_top_k_set_matches_single_superfile() {
+    #[test]
+    fn bm25_search_oracle_top_k_set_matches_single_superfile() {
         // Plant a corpus where the top-k under BM25 is unambiguous
         // regardless of per-segment-vs-global IDF variation: 3 docs
         // contain the rare term `nimblefox`, distributed across 3
@@ -666,10 +809,11 @@ mod tests {
         assert_eq!(st.reader().n_superfiles(), 3);
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = oracle
-            .bm25_search("title", "nimblefox", 5, BoolMode::Or)
-            .await
-            .expect("oracle");
+        // Single-segment `SuperfileReader` oracle: async-only search,
+        // driven on a throwaway runtime. The supertable reader below
+        // uses its sync public API.
+        let oracle_hits =
+            block_on(oracle.bm25_search("title", "nimblefox", 5, BoolMode::Or)).expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
         let oracle_set: std::collections::HashSet<u32> =
@@ -679,7 +823,6 @@ mod tests {
         let st_reader = st.reader();
         let st_hits = st_reader
             .bm25_search("title", "nimblefox", 5, BoolMode::Or)
-            .await
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
         // Resolve supertable hits to global doc-ids via segment
@@ -699,8 +842,8 @@ mod tests {
         assert_eq!(st_globals, oracle_set);
     }
 
-    #[tokio::test]
-    async fn bm25_search_prefix_oracle_top_k_set_matches_single_superfile() {
+    #[test]
+    fn bm25_search_prefix_oracle_top_k_set_matches_single_superfile() {
         let titles = vec![
             "rust async runtime",
             "rust embedded systems",
@@ -722,17 +865,13 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = oracle
-            .bm25_search_prefix("title", "rust", 5)
-            .await
-            .expect("oracle");
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
 
         let st_reader = st.reader();
         let st_hits = st_reader
             .bm25_search_prefix("title", "rust", 5)
-            .await
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -753,23 +892,20 @@ mod tests {
         assert!(st_hits.len() >= 4);
     }
 
-    #[tokio::test]
-    async fn bm25_search_prefix_unmatched_prefix_returns_empty() {
+    #[test]
+    fn bm25_search_prefix_unmatched_prefix_returns_empty() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
 
         let r = st.reader();
-        let hits = r
-            .bm25_search_prefix("title", "zzzz", 10)
-            .await
-            .expect("query");
+        let hits = r.bm25_search_prefix("title", "zzzz", 10).expect("query");
         assert!(hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn bm25_search_prefix_lowercases_input() {
+    #[test]
+    fn bm25_search_prefix_lowercases_input() {
         // Index stores tokenized terms (lowercased); user provides
         // mixed-case prefix; we lowercase before expansion so the
         // FST walk finds the matching subtree.
@@ -780,15 +916,12 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader();
-        let hits = r
-            .bm25_search_prefix("title", "RUST", 5)
-            .await
-            .expect("query");
+        let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
         assert_eq!(hits.len(), 1);
     }
 
-    #[tokio::test]
-    async fn bm25_search_unknown_column_errors() {
+    #[test]
+    fn bm25_search_unknown_column_errors() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust"])).expect("append");
@@ -797,13 +930,12 @@ mod tests {
         let r = st.reader();
         let err = r
             .bm25_search("missing_column", "rust", 5, BoolMode::Or)
-            .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
 
-    #[tokio::test]
-    async fn bm25_search_results_global_top_k_caps_at_k() {
+    #[test]
+    fn bm25_search_results_global_top_k_caps_at_k() {
         // 4 superfiles × 1 doc each = 4 hits; ask for k=2; expect 2.
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -815,7 +947,6 @@ mod tests {
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 2, BoolMode::Or)
-            .await
             .expect("query");
         assert_eq!(hits.len(), 2);
     }

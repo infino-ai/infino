@@ -181,8 +181,8 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
     // measure the delta over the query alone.
     let before = store.snapshot();
 
-    let hits = st
-        .bm25_search_hits(
+    let hits = r
+        .bm25_search(
             "title",
             "nimblefox",
             BM25_TOP_K,
@@ -240,7 +240,7 @@ fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     let quokka_uri = manifest.superfiles[1].uri;
 
     let before = store.snapshot();
-    let hits = st
+    let hits = r
         .bm25_search_prefix("title", "quokka", BM25_TOP_K)
         .expect("prefix query");
     assert_eq!(hits.len(), 2, "two docs in segment 1 begin with `quokka`");
@@ -277,7 +277,8 @@ fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
 
     let before = store.snapshot();
     let hits = st
-        .bm25_search_hits(
+        .reader()
+        .bm25_search(
             "title",
             "definitelynotpresent",
             BM25_TOP_K,
@@ -319,8 +320,8 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
     let kept_uri = manifest.superfiles[0].uri;
 
     let before = store.snapshot();
-    let _hits = st
-        .bm25_search_hits(
+    let _hits = r
+        .bm25_search(
             "title",
             "alpha beta",
             BM25_TOP_K,

@@ -1,0 +1,376 @@
+name: Benchmark (Azure)
+
+# Runs a selected benchmark (`bench` input) on a per-run ephemeral Azure
+# VM in the storage account's region (transfers ride the Azure backbone,
+# not the public internet). The VM builds with an sccache compile cache
+# in Azure Blob — shared across branches — runs the bench, and is torn
+# down.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: "What to run."
+        required: false
+        default: supertable_all
+        type: choice
+        options: [supertable_all, fts, vector, combined, sql, all]
+      docs:
+        description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
+        required: false
+        default: "1000000"
+        type: string
+      vm_size:
+        description: "Azure VM size."
+        required: false
+        default: "Standard_D8s_v7"
+        type: string
+      location:
+        description: "VM region."
+        required: false
+        default: "eastus"
+        type: string
+      ref:
+        description: "Git ref / SHA to benchmark."
+        required: false
+        default: "main"
+        type: string
+      keep_table:
+        description: "Keep the bench blob prefix after the run (debug)."
+        required: false
+        default: false
+        type: boolean
+      timeout_minutes:
+        description: "Hard auto-stop; VM is torn down when hit."
+        required: false
+        default: "30"
+        type: string
+
+permissions:
+  id-token: write   # Azure OIDC federated login
+  contents: read    # clone the repo on the VM via the job token
+
+# One benchmark at a time; queued, never cancelled mid-run.
+concurrency:
+  group: supertable-bench-azure
+  cancel-in-progress: false
+
+env:
+  # Pre-existing RG the bench service principal is scoped to (Contributor
+  # on this RG only). The workflow creates per-run resources inside it,
+  # never the RG itself.
+  RG: rg-infino-bench
+  VM: bench-vm-${{ github.run_id }}
+  ADMIN: azureuser
+  SCCACHE_VERSION: v0.8.2
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    # Run under the `ci` environment so the OIDC subject is
+    # repo:…:environment:ci — branch-independent, so one federated
+    # credential authorizes runs from any branch.
+    environment: ci
+    # Auto-stop ceiling on VM billing; teardown runs on timeout.
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_minutes) }}
+    steps:
+      - name: Resolve bench selection
+        id: resolve
+        run: |
+          set -euo pipefail
+          # Map the single `bench` input to the cargo target(s) to build
+          # and the supertable shape filter (empty = all three).
+          case "${{ github.event.inputs.bench }}" in
+            supertable_all)      targets="supertable_all";     shapes="" ;;
+            fts|vector|combined) targets="supertable_all";     shapes="${{ github.event.inputs.bench }}" ;;
+            sql)                 targets="sql";                shapes="" ;;
+            all)                 targets="supertable_all sql"; shapes="" ;;
+            *) echo "::error::unknown bench ${{ github.event.inputs.bench }}"; exit 1 ;;
+          esac
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "shapes=$shapes"   >> "$GITHUB_OUTPUT"
+          echo "targets=[$targets] shapes=[$shapes]"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision ephemeral VM
+        id: provision
+        run: |
+          set -euo pipefail
+          LOC="${{ github.event.inputs.location }}"
+          SIZE="${{ github.event.inputs.vm_size }}"
+
+          # Tag the VM so Cost Management attributes spend by purpose / run.
+          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ github.event.inputs.ref }}")
+
+          # Every resource is named with the unique per-run VM name so
+          # teardown can delete this run's resources by exact name (never
+          # a prefix that could match another run). No default inbound
+          # rule; the only SSH allow is the runner-IP /32 added below.
+          az vm create \
+            -g "$RG" -n "$VM" \
+            --image Ubuntu2204 \
+            --size "$SIZE" \
+            --admin-username "$ADMIN" \
+            --generate-ssh-keys \
+            --public-ip-sku Standard \
+            --os-disk-size-gb 128 \
+            --nsg-rule NONE \
+            --nsg "${VM}-nsg" \
+            --public-ip-address "${VM}-pip" \
+            --vnet-name "${VM}-vnet" \
+            --subnet "${VM}-subnet" \
+            --os-disk-name "${VM}-osdisk" \
+            --tags "${TAGS[@]}" \
+            -o none
+
+          RUNNER_IP="$(curl -s https://api.ipify.org)"
+          az network nsg rule create \
+            -g "$RG" --nsg-name "${VM}-nsg" -n allow-ssh-runner --priority 300 \
+            --access Allow --protocol Tcp --direction Inbound \
+            --destination-port-ranges 22 \
+            --source-address-prefixes "${RUNNER_IP}/32" -o none
+
+          VM_IP="$(az vm show -d -g "$RG" -n "$VM" --query publicIps -o tsv)"
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+          echo "Provisioned $VM ($SIZE) at $VM_IP in $LOC"
+
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 "${ADMIN}@${VM_IP}" true 2>/dev/null; then
+              echo "SSH up after ${i} tries"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSH never came up"; exit 1
+
+      - name: Clone repo + toolchain + sccache (on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          # Single-quoted heredoc: the body is literal; only the
+          # ssh-line assignments reach the VM as env.
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "GH_TOKEN='${{ github.token }}' \
+             REPO='${{ github.repository }}' \
+             REF='${{ github.event.inputs.ref }}' \
+             SCCACHE_VERSION='${{ env.SCCACHE_VERSION }}' \
+             bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkg-config cmake clang protobuf-compiler git
+
+          # Prebuilt sccache (static musl, glibc-agnostic).
+          if ! command -v sccache >/dev/null 2>&1; then
+            TARBALL="sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+            curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}.tar.gz" \
+              | tar -xz
+            sudo install "${TARBALL}/sccache" /usr/local/bin/sccache
+          fi
+
+          rm -rf "$HOME/infino-src"
+          git clone --filter=blob:none \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$HOME/infino-src"
+          cd "$HOME/infino-src"
+          git checkout "$REF" 2>/dev/null \
+            || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
+          echo "Checked out: $(git rev-parse --short HEAD)"
+          REMOTE
+
+      - name: Build (sccache, on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
+             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             BENCH_TARGETS='${{ steps.resolve.outputs.targets }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cd "$HOME/infino-src"
+
+          # Content-addressed compile cache in Azure Blob, shared across
+          # branches. CARGO_INCREMENTAL=0 is required (it conflicts with
+          # sccache). Reuses the bench container under a key prefix;
+          # connection string from the same account.
+          export RUSTC_WRAPPER=sccache
+          export CARGO_INCREMENTAL=0
+          export SCCACHE_AZURE_BLOB_CONTAINER="$INFINO_REAL_AZURE_CONTAINER"
+          export SCCACHE_AZURE_KEY_PREFIX=sccache
+          export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+          sccache --start-server || true
+
+          # Build each selected target and record "<target><TAB><binary>"
+          # so the run step execs each directly — no cargo at run time
+          # means no re-fingerprint / rebuild. Cargo underscores the
+          # artifact name, so a hyphenated target maps via ${t//-/_}.
+          : > "$HOME/bench-bins"
+          for t in $BENCH_TARGETS; do
+            cargo bench --bench "$t" --no-run
+            stem="${t//-/_}"
+            BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name "${stem}-*" \
+                     -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+            test -n "$BIN" && test -x "$BIN" || { echo "::error::binary for $t not found"; exit 1; }
+            printf '%s\t%s\n' "$t" "$BIN" >> "$HOME/bench-bins"
+            echo "built $t: $BIN"
+          done
+          sccache --show-stats || true
+          REMOTE
+
+      - name: Run benchmark (on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
+             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             INFINO_BENCH_DOC_COUNT='${{ github.event.inputs.docs }}' \
+             BENCH_SHAPES='${{ steps.resolve.outputs.shapes }}' \
+             KEEP='${{ github.event.inputs.keep_table }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
+          set -euo pipefail
+          cd "$HOME/infino-src"
+          export INFINO_BENCH_STORE=azure
+          [ "$KEEP" = "true" ] && export INFINO_BENCH_KEEP_TABLE=1
+          # The multi-commit build holds many segment files + object-store
+          # connections open at once; raise the fd soft limit to the hard
+          # max so commits don't hit EMFILE ("too many open files").
+          ulimit -n "$(ulimit -Hn)"
+          echo "fd limit: $(ulimit -n)"
+
+          # Exec each built target. The supertable target honours the
+          # shape filter; others ignore it.
+          while IFS=$'\t' read -r t BIN; do
+            [ "$t" = "supertable_all" ] && export INFINO_BENCH_SUPERTABLE_SHAPES="$BENCH_SHAPES"
+            echo "===== BENCH ${t} START ====="
+            "$BIN" 2>&1
+            echo "===== BENCH ${t} END ====="
+            unset INFINO_BENCH_SUPERTABLE_SHAPES
+          done < "$HOME/bench-bins"
+          REMOTE
+
+      - name: Summarize results
+        if: always()
+        run: |
+          # Best-effort parser: never abort early; exit codes are set
+          # explicitly below.
+          set +e -u -o pipefail
+          SUMMARY="$GITHUB_STEP_SUMMARY"
+          LOG=/tmp/bench.clean
+          {
+            echo "## Benchmark \`${{ github.event.inputs.bench }}\` — Azure (${{ github.event.inputs.location }})"
+            echo ""
+            echo "- docs: \`${{ github.event.inputs.docs }}\` · vm: \`${{ github.event.inputs.vm_size }}\` · ref: \`${{ github.event.inputs.ref }}\`"
+            echo ""
+          } >> "$SUMMARY"
+
+          # Combine build + run logs (build warnings live in build.log,
+          # the report + runtime panics in bench.log), ANSI-stripped.
+          : > "$LOG"
+          for f in /tmp/build.log /tmp/bench.log; do
+            [ -s "$f" ] && sed -r 's/\x1b\[[0-9;]*m//g' "$f" >> "$LOG"
+          done
+          if [ ! -s "$LOG" ]; then
+            echo "::error::No output produced — provisioning or SSH failed (see job logs)."
+            echo "_No output produced — provisioning or SSH failed._" >> "$SUMMARY"
+            exit 1
+          fi
+
+          # The report banner ("══ … ══") and table are present only when
+          # at least one shape succeeded.
+          if grep -q '══' "$LOG"; then
+            REPORT_OK=1
+            {
+              echo "### Results"
+              echo '```'
+              awk '/══/{f=1} f' "$LOG"
+              echo '```'
+            } >> "$SUMMARY"
+          else
+            REPORT_OK=0
+            echo "**❌ No report table — every shape failed.**" >> "$SUMMARY"
+          fi
+
+          # Panics, runtime errors, and compile errors (error[E…]); the
+          # panic line carries the full chain.
+          ERRORS="$(grep -nE 'panicked|error\[|HTTP error|storage error|transient error|AppendFlush|PointerParse|child exited|no shapes produced|skipped:|content-hash mismatch|short read' "$LOG" || true)"
+          if [ -n "$ERRORS" ]; then
+            {
+              echo "### 🛑 Errors & panics"
+              echo '```'
+              printf '%s\n' "$ERRORS"
+              echo '```'
+            } >> "$SUMMARY"
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::${line}"
+            done <<< "$(grep -E 'panicked at|AppendFlush|storage error|HTTP error' "$LOG" | head -n 8)"
+          fi
+
+          # Unique build/harness warnings.
+          WARNINGS="$(grep -E '^warning:|: warning:|\bwarning:' "$LOG" | sed 's/^[0-9]*://' | sort -u || true)"
+          if [ -n "$WARNINGS" ]; then
+            WCOUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
+            {
+              echo "### ⚠️ Warnings (${WCOUNT} unique)"
+              echo '```'
+              printf '%s\n' "$WARNINGS" | head -n 40
+              echo '```'
+            } >> "$SUMMARY"
+            echo "::warning::${WCOUNT} unique build/harness warnings — see step summary."
+          fi
+
+          echo "" >> "$SUMMARY"
+          echo "_Full output attached as the \`supertable-bench-log\` artifact._" >> "$SUMMARY"
+
+          if [ "$REPORT_OK" -ne 1 ]; then
+            echo "::error::Benchmark produced no results — every shape failed."
+            exit 1
+          fi
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supertable-bench-log
+          path: |
+            /tmp/build.log
+            /tmp/bench.log
+          if-no-files-found: warn
+
+      - name: Teardown (always)
+        if: always()
+        env:
+          # The auto-created NIC is the only resource az names for us:
+          # "<vm>VMNic".
+          NIC: ${{ env.VM }}VMNic
+        run: |
+          # Delete exactly this run's resources by name (VM is unique per
+          # run, so no name can collide with another run), keeping the
+          # shared RG. Ordered so dependencies release: VM frees the NIC
+          # and disk; the NIC frees the IP/NSG/subnet. Each is best-effort
+          # so a missing resource doesn't fail teardown.
+          az vm delete            -g "$RG" -n "$VM"          --yes        || true
+          az network nic delete   -g "$RG" -n "$NIC"                      || true
+          az disk delete          -g "$RG" -n "${VM}-osdisk" --yes        || true
+          az network public-ip delete -g "$RG" -n "${VM}-pip"             || true
+          az network nsg delete   -g "$RG" -n "${VM}-nsg"                 || true
+          az network vnet delete  -g "$RG" -n "${VM}-vnet"                || true

@@ -235,6 +235,22 @@ impl Supertable {
     /// Folds the buffered writer + commit into a single call: one
     /// `append` == one commit == one sealed segment, so callers batch
     /// rows per call rather than calling once per row.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// let batch = RecordBatch::try_new(
+    ///     schema,
+    ///     vec![Arc::new(LargeStringArray::from(vec!["hello world"]))],
+    /// )?;
+    /// posts.append(&batch)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn append(&self, batch: &RecordBatch) -> Result<(), crate::InfinoError> {
         let mut w = self.writer()?;
         w.append(batch)?;
@@ -245,6 +261,24 @@ impl Supertable {
     /// Replace every row matching `predicate` with `new_rows`, then
     /// commit. `new_rows.num_rows()` must equal the match count.
     /// Durable when this returns.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use datafusion::prelude::{col, lit};
+    /// # use infino::{connect, IndexSpec};
+    /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
+    /// # let db = connect(dir.path().to_str().expect("utf8 path"))?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # let row = |s: &str| RecordBatch::try_new(
+    /// #     schema.clone(), vec![Arc::new(LargeStringArray::from(vec![s]))]).expect("batch");
+    /// # posts.append(&row("draft"))?;
+    /// let stats = posts.update(col("body").eq(lit("draft")), &row("published"))?;
+    /// assert_eq!(stats.matched(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn update(
         &self,
         predicate: datafusion::prelude::Expr,
@@ -257,6 +291,23 @@ impl Supertable {
 
     /// Tombstone every row matching `predicate`, then commit. Durable
     /// when this returns.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use datafusion::prelude::{col, lit};
+    /// # use infino::{connect, IndexSpec};
+    /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
+    /// # let db = connect(dir.path().to_str().expect("utf8 path"))?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["spam"]))])?)?;
+    /// let stats = posts.delete(col("body").eq(lit("spam")))?;
+    /// assert_eq!(stats.n_tombstoned(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn delete(
         &self,
         predicate: datafusion::prelude::Expr,

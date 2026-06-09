@@ -75,14 +75,12 @@ impl Supertable {
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
-        // Apply the read-consistency policy before pinning, so SQL
+        // Read-consistency is applied when the snapshot is pinned:
+        // `sql_session_context` pins via `self.reader()`, which runs
+        // [`Supertable::ensure_fresh`] before `load_full`. So SQL
         // honors the same freshness contract as the search APIs
-        // (`bm25_search` / `vector_search`): under `Strong` /
-        // `BoundedStaleness` this advances the in-memory snapshot to
-        // the latest published manifest; under `Snapshot` (and for
-        // in-memory tables) it is a no-op. See
-        // [`Supertable::ensure_fresh`].
-        self.ensure_fresh();
+        // (`reader().bm25_search` / `reader().vector_search`) without a
+        // separate call here.
 
         // Build (or reuse the cached) SessionContext for the pinned
         // snapshot — the pushdown-aware SupertableProvider plus the
@@ -165,6 +163,12 @@ impl Supertable {
             Arc::clone(&reader),
             Arc::clone(&scalar_schema),
         );
+        // Unranked token / exact match TVFs (siblings of bm25_search).
+        crate::supertable::query::exec::match_exec::register_match(
+            &ctx,
+            Arc::clone(&reader),
+            Arc::clone(&scalar_schema),
+        );
         crate::supertable::query::exec::hybrid_exec::register_hybrid_search(
             &ctx,
             Arc::clone(&reader),
@@ -229,10 +233,10 @@ impl Supertable {
     ) -> Result<Vec<i128>, QueryError> {
         // Resolve against the freshest snapshot the consistency
         // policy allows — the spec requires delete/update predicates
-        // to bind "against the current snapshot at call time", which
-        // means honoring `Strong` / `BoundedStaleness` just like the
-        // read APIs do. No-op under `Snapshot` / in-memory tables.
-        self.ensure_fresh();
+        // to bind "against the current snapshot at call time".
+        // `sql_session_context` pins via `self.reader()`, which applies
+        // [`Supertable::ensure_fresh`] before `load_full`, so this
+        // honors `Strong` / `BoundedStaleness` like the read APIs do.
         let ctx = self.sql_session_context()?;
         let id_column = self.options().id_column.clone();
 
@@ -549,6 +553,165 @@ mod tests {
                 "SELECT COUNT(*) FROM supertable WHERE title = 'rust async'"
             ),
             0
+        );
+    }
+
+    #[test]
+    fn query_sql_fts_equality_superset_is_narrowed_to_exact_match() {
+        // Index-driven row selection: the candidate plan resolves
+        // `WHERE title = 'rust async'` to the term-AND posting set, which
+        // within one segment is a *superset* — both rows below contain
+        // {rust, async}. The FilterExec above the scan must narrow that
+        // candidate superset to the single exact-equality row, proving
+        // the row-level prune never over-returns.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(
+            0,
+            &["x", "y"],
+            &["rust async", "rust async runtime"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'rust async'",
+            ),
+            1,
+        );
+        let batches = st
+            .query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
+            .expect("query");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn query_sql_fts_or_and_in_are_exact() {
+        // OR of two FTS equalities, AND with a non-FTS conjunct, and IN —
+        // all index-bounded except where a branch is un-boundable, and
+        // all verified exact by FilterExec.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(
+            0,
+            &["rust", "python", "rust", "go"],
+            &["alpha", "beta", "gamma", "delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        // OR of two FTS equalities → union, exact.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'alpha' OR title = 'beta'",
+            ),
+            2,
+        );
+        // AND with a non-FTS conjunct: FTS branch bounds candidates, the
+        // category check is verified in pass 2.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE title = 'alpha' AND category = 'rust'",
+            ),
+            1,
+        );
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE title = 'alpha' AND category = 'python'",
+            ),
+            0,
+        );
+        // IN on the FTS column → OR of equalities.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title IN ('alpha', 'delta', 'zzz')",
+            ),
+            2,
+        );
+    }
+
+    #[test]
+    fn query_sql_not_predicates_are_exact() {
+        // NOT / != aren't index-prefiltered (Unbounded → scan), but must
+        // still be exact; and `= AND !=` prefilters on the `=` branch
+        // while FilterExec applies the negation.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(
+            0,
+            &["rust", "python", "rust", "go"],
+            &["alpha", "beta", "alpha", "delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        // Standalone NOT (scan fallback): 4 rows, 2 are 'alpha' → 2 left.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE NOT (title = 'alpha')",
+            ),
+            2,
+        );
+        // `!=` (NotEq) likewise.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title != 'alpha'"
+            ),
+            2,
+        );
+        // `= AND !=`: candidates from the `title='alpha'` branch (2 rows),
+        // then FilterExec drops category='rust' → 1 remains.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE title = 'alpha' AND category != 'rust'",
+            ),
+            0,
+        );
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE title = 'alpha' AND category != 'python'",
+            ),
+            2,
+        );
+    }
+
+    #[test]
+    fn query_sql_or_with_non_fts_branch_matches_full_scan() {
+        // `title = 'alpha' OR category = 'go'` is un-boundable (the
+        // category branch could match any row), so the planner falls back
+        // to a full scan + FilterExec — and must still be exact.
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(
+            0,
+            &["rust", "python", "go", "go"],
+            &["alpha", "beta", "gamma", "delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        // alpha (1 row) ∪ category=go (2 rows), disjoint → 3.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title = 'alpha' OR category = 'go'",
+            ),
+            3,
         );
     }
 

@@ -295,7 +295,7 @@ pub enum ManifestLoadError {
     #[error("part_id not in manifest list: {part_id}")]
     PartNotInList { part_id: part::PartId },
     /// Storage backend returned an error.
-    #[error("storage error during part load")]
+    #[error("storage error during part load: {0}")]
     Storage(#[source] crate::storage::StorageError),
     /// Computed blake3 of the loaded bytes didn't match the
     /// manifest list's recorded `content_hash`. The bad bytes

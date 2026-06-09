@@ -37,7 +37,7 @@
 //! See `docs/architecture/superfile.md` (Vector index algorithm
 //! subsection) for the full RaBitQ rationale and recall trade-offs.
 
-use wide::{CmpGt, f32x8};
+use wide::f32x8;
 
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::avx512_enabled;

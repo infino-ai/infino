@@ -195,8 +195,8 @@ fn demo_supertable() {
         w.commit().expect("commit");
     }
 
-    // BM25 across both segments. SuperfileHit carries the source
-    // segment + local_doc_id + score.
+    // BM25 across both segments. The public `bm25_search` returns
+    // `SearchHit`s carrying the auto-injected `_id` + score.
     let hits = st
         .bm25_search("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");

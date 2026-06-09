@@ -18,6 +18,28 @@ impl core::marker::Unpin for infino::BoolMode
 impl core::marker::UnsafeUnpin for infino::BoolMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::BoolMode
 impl core::panic::unwind_safe::UnwindSafe for infino::BoolMode
+pub enum infino::ColdFetchMode
+pub infino::ColdFetchMode::HybridWithPrefetch
+pub infino::ColdFetchMode::LazyForegroundWithBackgroundFill
+pub infino::ColdFetchMode::RangeOnly
+impl core::clone::Clone for infino::ColdFetchMode
+pub fn infino::ColdFetchMode::clone(&self) -> infino::ColdFetchMode
+impl core::cmp::Eq for infino::ColdFetchMode
+impl core::cmp::PartialEq for infino::ColdFetchMode
+pub fn infino::ColdFetchMode::eq(&self, &infino::ColdFetchMode) -> bool
+impl core::default::Default for infino::ColdFetchMode
+pub fn infino::ColdFetchMode::default() -> infino::ColdFetchMode
+impl core::fmt::Debug for infino::ColdFetchMode
+pub fn infino::ColdFetchMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::ColdFetchMode
+impl core::marker::StructuralPartialEq for infino::ColdFetchMode
+impl core::marker::Freeze for infino::ColdFetchMode
+impl core::marker::Send for infino::ColdFetchMode
+impl core::marker::Sync for infino::ColdFetchMode
+impl core::marker::Unpin for infino::ColdFetchMode
+impl core::marker::UnsafeUnpin for infino::ColdFetchMode
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
+impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
@@ -61,6 +83,9 @@ impl core::panic::unwind_safe::UnwindSafe for infino::Metric
 pub struct infino::ConnectOptions
 impl infino::ConnectOptions
 pub fn infino::ConnectOptions::new() -> Self
+pub fn infino::ConnectOptions::with_cache_budget_bytes(self, u64) -> Self
+pub fn infino::ConnectOptions::with_cache_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn infino::ConnectOptions::with_cold_fetch_mode(self, infino::ColdFetchMode) -> Self
 pub fn infino::ConnectOptions::with_s3_endpoint(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::clone::Clone for infino::ConnectOptions
 pub fn infino::ConnectOptions::clone(&self) -> infino::ConnectOptions
