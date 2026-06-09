@@ -60,6 +60,10 @@ env:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    # Run under the `ci` environment so the OIDC subject is
+    # repo:…:environment:ci — branch-independent, so one federated
+    # credential authorizes runs from any branch.
+    environment: ci
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_minutes) }}
     steps:
