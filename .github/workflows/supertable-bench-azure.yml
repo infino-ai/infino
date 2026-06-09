@@ -45,15 +45,24 @@ on:
         required: false
         default: "30"
         type: string
+  # Callable from other workflows (e.g. the PR group in ci.yml). Same
+  # inputs; `choice` isn't valid here so `bench` is a string.
+  workflow_call:
+    inputs:
+      bench:           { type: string, required: false, default: supertable_all }
+      docs:            { type: string, required: false, default: "1000000" }
+      vm_size:         { type: string, required: false, default: "Standard_D8s_v7" }
+      location:        { type: string, required: false, default: eastus }
+      ref:             { type: string, required: false, default: main }
+      keep_table:      { type: boolean, required: false, default: false }
+      timeout_minutes: { type: string, required: false, default: "30" }
 
 permissions:
   id-token: write   # Azure OIDC federated login
   contents: read    # clone the repo on the VM via the job token
 
-# One benchmark at a time; queued, never cancelled mid-run.
-concurrency:
-  group: supertable-bench-azure
-  cancel-in-progress: false
+# Concurrency is owned by the caller (per-PR cancel in ci.yml); a manual
+# dispatch needs none — runs are isolated by run_id and self-clean.
 
 env:
   # Pre-existing RG the bench service principal is scoped to (Contributor
@@ -72,7 +81,7 @@ jobs:
     # credential authorizes runs from any branch.
     environment: ci
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
-    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_minutes) }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
       - name: Resolve bench selection
         id: resolve
@@ -80,12 +89,12 @@ jobs:
           set -euo pipefail
           # Map the single `bench` input to the cargo target(s) to build
           # and the supertable shape filter (empty = all three).
-          case "${{ github.event.inputs.bench }}" in
+          case "${{ inputs.bench }}" in
             supertable_all)      targets="supertable_all";     shapes="" ;;
-            fts|vector|combined) targets="supertable_all";     shapes="${{ github.event.inputs.bench }}" ;;
+            fts|vector|combined) targets="supertable_all";     shapes="${{ inputs.bench }}" ;;
             sql)                 targets="sql";                shapes="" ;;
             all)                 targets="supertable_all sql"; shapes="" ;;
-            *) echo "::error::unknown bench ${{ github.event.inputs.bench }}"; exit 1 ;;
+            *) echo "::error::unknown bench ${{ inputs.bench }}"; exit 1 ;;
           esac
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
           echo "shapes=$shapes"   >> "$GITHUB_OUTPUT"
@@ -102,11 +111,11 @@ jobs:
         id: provision
         run: |
           set -euo pipefail
-          LOC="${{ github.event.inputs.location }}"
-          SIZE="${{ github.event.inputs.vm_size }}"
+          LOC="${{ inputs.location }}"
+          SIZE="${{ inputs.vm_size }}"
 
           # Tag the VM so Cost Management attributes spend by purpose / run.
-          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ github.event.inputs.ref }}")
+          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}")
 
           # Every resource is named with the unique per-run VM name so
           # teardown can delete this run's resources by exact name (never
@@ -162,7 +171,7 @@ jobs:
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             "GH_TOKEN='${{ github.token }}' \
              REPO='${{ github.repository }}' \
-             REF='${{ github.event.inputs.ref }}' \
+             REF='${{ inputs.ref }}' \
              SCCACHE_VERSION='${{ env.SCCACHE_VERSION }}' \
              bash -s" <<'REMOTE'
           set -euo pipefail
@@ -243,9 +252,9 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
-             INFINO_BENCH_DOC_COUNT='${{ github.event.inputs.docs }}' \
+             INFINO_BENCH_DOC_COUNT='${{ inputs.docs }}' \
              BENCH_SHAPES='${{ steps.resolve.outputs.shapes }}' \
-             KEEP='${{ github.event.inputs.keep_table }}' \
+             KEEP='${{ inputs.keep_table }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
           set -euo pipefail
           cd "$HOME/infino-src"
@@ -277,9 +286,9 @@ jobs:
           SUMMARY="$GITHUB_STEP_SUMMARY"
           LOG=/tmp/bench.clean
           {
-            echo "## Benchmark \`${{ github.event.inputs.bench }}\` — Azure (${{ github.event.inputs.location }})"
+            echo "## Benchmark \`${{ inputs.bench }}\` — Azure (${{ inputs.location }})"
             echo ""
-            echo "- docs: \`${{ github.event.inputs.docs }}\` · vm: \`${{ github.event.inputs.vm_size }}\` · ref: \`${{ github.event.inputs.ref }}\`"
+            echo "- docs: \`${{ inputs.docs }}\` · vm: \`${{ inputs.vm_size }}\` · ref: \`${{ inputs.ref }}\`"
             echo ""
           } >> "$SUMMARY"
 

@@ -45,3 +45,32 @@ jobs:
             cargo install cargo-llvm-cov --locked
           fi
       - run: make ci
+
+  # Informational benchmark on each PR push — supertable_all + sql, one
+  # in-region Azure VM each, in parallel. Never blocks merge. Same-repo
+  # only (fork PRs can't use the Azure OIDC secrets).
+  bench:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false   # one member failing must not cancel the other
+      matrix:
+        include:
+          - { bench: supertable_all, docs: "10000000" }
+          - { bench: sql, docs: "1000000" }
+    # A new push cancels this PR's in-flight run for that member.
+    concurrency:
+      group: bench-${{ github.event.pull_request.number }}-${{ matrix.bench }}
+      cancel-in-progress: true
+    permissions:
+      id-token: write
+      contents: read
+    # Informational: keep these checks out of branch-protection's required
+    # set so a red bench never blocks merge.
+    uses: ./.github/workflows/supertable-bench-azure.yml
+    with:
+      bench: ${{ matrix.bench }}
+      docs: ${{ matrix.docs }}
+      ref: ${{ github.event.pull_request.head.sha }}
+    secrets: inherit
