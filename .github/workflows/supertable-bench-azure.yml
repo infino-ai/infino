@@ -357,13 +357,25 @@ jobs:
             scp -o StrictHostKeyChecking=no \
               "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "${j}.json" \
               || { echo "::warning::no metrics for $j — skipping"; continue; }
+
+            # Informational: warn on a real az failure rather than failing the
+            # whole run (az already retries transient storage errors itself).
             az storage blob upload --overwrite --account-name "$ACC" --account-key "$KEY" \
-              -c "$CONTAINER" -n "bench/${j}/baseline/${VM_SIZE}-${DOCS}.json" -f "${j}.json"
-            # No --overwrite: a commit's record is immutable once written.
-            az storage blob upload --account-name "$ACC" --account-key "$KEY" \
-              -c "$CONTAINER" -n "bench/${j}/history/${VM_SIZE}-${DOCS}-${SHA}.json" \
-              -f "${j}.json" --metadata "sha=${SHA}" "ts=${TS}" "ref=main" \
-              || echo "::notice::history for ${SHA} already exists"
+              -c "$CONTAINER" -n "bench/${j}/baseline/${VM_SIZE}-${DOCS}.json" -f "${j}.json" \
+              || { echo "::warning::baseline upload failed for $j — skipping"; continue; }
+
+            # History is immutable per commit. Check existence explicitly so a
+            # genuine az error isn't silently mistaken for "already written".
+            hist="bench/${j}/history/${VM_SIZE}-${DOCS}-${SHA}.json"
+            if [ "$(az storage blob exists --account-name "$ACC" --account-key "$KEY" \
+                      -c "$CONTAINER" -n "$hist" --query exists -o tsv 2>/dev/null)" = "true" ]; then
+              echo "::notice::history for $j ($SHA) already exists — skipping"
+            else
+              az storage blob upload --account-name "$ACC" --account-key "$KEY" \
+                -c "$CONTAINER" -n "$hist" -f "${j}.json" \
+                --metadata "sha=${SHA}" "ts=${TS}" "ref=main" \
+                || echo "::warning::history upload failed for $j ($SHA)"
+            fi
             echo "published: $j ($SHA)"
           done
 
