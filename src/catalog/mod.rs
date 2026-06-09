@@ -28,7 +28,7 @@ use arrow_schema::SchemaRef;
 use datafusion::execution::context::SessionContext;
 
 pub use index_spec::IndexSpec;
-pub use options::ConnectOptions;
+pub use options::{ColdFetchMode, ConnectOptions};
 
 use crate::InfinoError;
 use crate::runtime_bridge::bridge_sync_to_async;
@@ -39,6 +39,7 @@ use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::vector::distance::Metric;
 use crate::supertable::Supertable;
 use crate::supertable::options::SupertableOptions;
+use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
@@ -175,7 +176,12 @@ impl Connection {
                 let table_storage =
                     backend_to_provider(&self.inner.backend.join(name), &self.inner.options)?
                         .expect("non-memory backend yields a storage provider");
-                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
+                let mut opts =
+                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                if let Some(cache) = disk_cache {
+                    opts = opts.with_disk_cache(cache);
+                }
                 // Create the physical table first; then register it. The
                 // location is deterministic (`<root>/<name>`), so a losing
                 // racer that also created it just re-opens the same bytes.
@@ -248,7 +254,13 @@ impl Connection {
                     &self.inner.options,
                 )?
                 .expect("non-memory backend yields a storage provider");
-                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let disk_cache =
+                    build_disk_cache(&self.inner.options, &table_storage, &entry.location)?;
+                let mut opts =
+                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                if let Some(cache) = disk_cache {
+                    opts = opts.with_disk_cache(cache);
+                }
                 Ok(Supertable::open(opts)?)
             }
         }
@@ -453,6 +465,30 @@ fn backend_to_provider(
     Ok(provider)
 }
 
+/// Build a per-table disk cache from the connection's options, or `None`
+/// when no cache directory is configured. Rooted at `<cache_dir>/<name>`
+/// so tables don't share cache files; the byte budget applies per table.
+fn build_disk_cache(
+    options: &ConnectOptions,
+    storage: &Arc<dyn StorageProvider>,
+    name: &str,
+) -> Result<Option<Arc<DiskCacheStore>>, InfinoError> {
+    let Some(cache_root) = options.cache_dir.as_ref() else {
+        return Ok(None);
+    };
+    let mut cfg = DiskCacheConfig {
+        cache_root: cache_root.join(name),
+        cold_fetch_mode: options.cold_fetch_mode.to_internal(),
+        ..Default::default()
+    };
+    if let Some(budget) = options.cache_budget_bytes {
+        cfg.disk_budget_bytes = budget;
+    }
+    let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg)
+        .map_err(|e| InfinoError::Io(e.to_string()))?;
+    Ok(Some(cache))
+}
+
 /// Table names are flat, case-sensitive `[A-Za-z0-9_-]+` identifiers —
 /// they are SQL identifiers and object-store path segments.
 fn validate_name(name: &str) -> Result<(), InfinoError> {
@@ -616,6 +652,29 @@ mod tests {
             conn.query_sql("SELECT _id FROM bm25_search('nope', 'title', 'fox', 10)")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn localfs_with_disk_cache() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let opts = ConnectOptions::new()
+            .with_cache_dir(cache.path())
+            .with_cold_fetch_mode(ColdFetchMode::HybridWithPrefetch)
+            .with_cache_budget_bytes(64 * 1024 * 1024);
+        let conn = connect_with(root.path().to_str().expect("utf8"), opts).expect("connect");
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        table
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let hits = table
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        // The disk cache got a per-table subdirectory.
+        assert!(cache.path().join("docs").exists());
     }
 
     #[test]

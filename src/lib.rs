@@ -123,7 +123,7 @@ mod runtime_bridge;
 
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
-pub use catalog::{ConnectOptions, Connection, IndexSpec, connect, connect_with};
+pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
