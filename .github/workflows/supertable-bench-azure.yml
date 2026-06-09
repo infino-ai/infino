@@ -56,6 +56,9 @@ on:
       ref:             { type: string, required: false, default: main }
       keep_table:      { type: boolean, required: false, default: false }
       timeout_minutes: { type: string, required: false, default: "30" }
+      # Discriminator appended to resource names so parallel callers
+      # (e.g. matrix legs sharing one run_id) don't collide / cross-delete.
+      name_suffix:     { type: string, required: false, default: "" }
 
 permissions:
   id-token: write   # Azure OIDC federated login
@@ -69,7 +72,9 @@ env:
   # on this RG only). The workflow creates per-run resources inside it,
   # never the RG itself.
   RG: rg-infino-bench
-  VM: bench-vm-${{ github.run_id }}
+  # Unique per run; `name_suffix` keeps parallel callers that share a
+  # run_id (matrix legs) from colliding on the same VM.
+  VM: bench-vm-${{ github.run_id }}${{ inputs.name_suffix }}
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
 
