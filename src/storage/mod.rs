@@ -31,6 +31,7 @@
 //! state, and retries the commit on top of it.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -229,5 +230,24 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// place; production providers (LocalFs, S3) override.
     async fn list_with_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
+    }
+
+    /// Expose the underlying `object_store` handle plus the object
+    /// key that `uri` maps to within it, when this provider is backed
+    /// by a store DataFusion can range-GET directly.
+    ///
+    /// Used by the SQL scan and search-hit row resolution to hand
+    /// DataFusion's `ParquetSource` the real object store so it issues
+    /// async footer / row-group / page range GETs against object
+    /// storage, instead of buffering whole segments into memory.
+    ///
+    /// `None` for providers without a native `object_store` handle
+    /// (mocks / in-memory test doubles); those callers fall back to the
+    /// whole-object read path.
+    fn object_store_handle(
+        &self,
+        _uri: &str,
+    ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+        None
     }
 }

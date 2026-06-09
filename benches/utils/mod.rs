@@ -21,5 +21,8 @@ pub mod tiers;
 pub mod superfile;
 pub mod supertable;
 
+pub mod scale;
 pub mod sql_diag;
+pub mod supertable_update;
+pub mod tombstone_overhead;
 pub mod unified_object_store;

@@ -5,7 +5,7 @@
 //!
 //! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;
 //! `INFINO_BENCH_FULL=1` → 1M). Canonical tiered benchmarks (superfile 1M /
-//! supertable 10M × hot/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
+//! supertable 10M × warm/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
 //! Use this bench to iterate on request shape and diagnostics, not headline SLA rows.
 //!
 //! Exercises unified vector + FTS cold-open / cold-first-search
@@ -56,7 +56,7 @@
 //!
 //! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
 //! ~1.5 GiB) — this is the superfile warm/cold tier and matches the
-//! superfile hot benches. There is no `INFINO_BENCH_FULL` knob. The
+//! superfile warm benches. There is no `INFINO_BENCH_FULL` knob. The
 //! Criterion rows run over the in-process `s3s-fs` server by default;
 //! setting `INFINO_REAL_S3_BUCKET` (or `INFINO_TEST_REAL_S3_BUCKET`)
 //! reruns the same rows against real AWS S3.

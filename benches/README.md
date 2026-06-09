@@ -10,14 +10,14 @@ harness owns the measured lifecycle directly:
 - generate the corpus once;
 - build the artifact once;
 - run correctness on that built artifact;
-- run hot reads on that artifact;
+- run warm reads on that artifact;
 - upload or commit that same artifact for object-store tiers;
 - run cold reads against the uploaded/committed artifact with fresh cache state;
 - sample RSS around the measured phase;
 - render terminal and markdown reports through `report.rs`.
 
 The invariant is simple: **the first measured build produces the artifact used by
-correctness, hot reads, and cold upload/commit.** The benchmark must not rebuild a
+correctness, warm reads, and cold upload/commit.** The benchmark must not rebuild a
 second copy just to run correctness or object-store reads.
 
 ## Bench Shapes
@@ -25,7 +25,7 @@ second copy just to run correctness or object-store reads.
 - **Superfile** — single-artifact, in-memory read path. Default scale: `1M`
   docs, controlled by `INFINO_BENCH_SUPERFILE_DOCS`.
 - **Supertable** — multi-artifact table committed to object storage and read
-  through hot/cold table paths. Default scale: `10M` docs, controlled by
+  through warm/cold table paths. Default scale: `10M` docs, controlled by
   `INFINO_BENCH_SUPERTABLE_DOCS`.
 - **Writer count** — build rows report `1 writer` and `N writers`. `N` defaults
   to the machine's logical core count and is controlled by
@@ -45,12 +45,12 @@ cargo bench --bench bench -- supertable_fts
 cargo bench --bench bench -- supertable_vector
 cargo bench --bench bench -- supertable_sql
 
-# Select phases. Valid phases are: build, hot, cold.
+# Select phases. Valid phases are: build, warm, cold.
 cargo bench --bench bench -- superfile_sql cold
-cargo bench --bench bench -- supertable_vector build hot
+cargo bench --bench bench -- supertable_vector build warm
 
 # Smaller local loop.
-INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench bench -- superfile_fts hot
+INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench bench -- superfile_fts warm
 
 # Override the N-writers build row.
 INFINO_BENCH_WRITERS=4 cargo bench --bench bench -- superfile_fts build
@@ -107,7 +107,7 @@ The main bench has six selectable tests:
 | `supertable_vector` | supertable | vector |
 | `supertable_sql` | supertable | SQL |
 
-Each selector supports `build`, `hot`, and `cold`. If no selector is supplied,
+Each selector supports `build`, `warm`, and `cold`. If no selector is supplied,
 all six tests run. If no phase is supplied, all three phases run.
 
 ## Code Layout (`infino-bench-utils`)
@@ -192,7 +192,7 @@ Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Hot p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline comparison is the last two blocks: the *same* selective equality (one matching row) run against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects the candidate row, DataFusion verifies). Same predicate, same 1-row result, so the gap is purely the index. The first block is aggregations & count-filters (read + compute, return few rows) — general engine context, not a like-for-like index comparison; there is no bare `SELECT col` row because that only measures row materialization. `Rows` is the result-set size. Δ is vs the previous run.
+Warm p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline comparison is the last two blocks: the *same* selective equality (one matching row) run against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects the candidate row, DataFusion verifies). Same predicate, same 1-row result, so the gap is purely the index. The first block is aggregations & count-filters (read + compute, return few rows) — general engine context, not a like-for-like index comparison; there is no bare `SELECT col` row because that only measures row materialization. `Rows` is the result-set size. Δ is vs the previous run.
 
 **Aggregations & count-filters (read + compute, return few rows — not the index A/B)**
 

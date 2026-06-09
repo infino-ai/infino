@@ -91,7 +91,7 @@ pub const DIM: usize = 384;
 pub type Hit = (u32, f32);
 
 /// Doc count for superfile-shape benches (one-segment scale). 1M ×
-/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the hot tier and
+/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the warm tier and
 /// is the single-superfile cold-open unit for the warm/cold tiers.
 pub const SUPERFILE_DOCS: usize = 1_000_000;
 

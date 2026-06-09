@@ -69,20 +69,20 @@ pub mod fts {
 
     /// Top-k for every search.
     pub const K: usize = 10;
-    /// Timed hot-search repetitions per query (after one warmup). `run_fts`
+    /// Timed warm-search repetitions per query (after one warmup). `run_fts`
     /// reports the p50 over these.
-    pub const HOT_ITERS: usize = 50;
+    pub const WARM_ITERS: usize = 50;
     /// Cold-tier repetitions per query — each pays a fresh cache + full S3
     /// cold open, so this is deliberately small.
     const COLD_ITERS: usize = 10;
     /// Nanoseconds per second, for throughput / bandwidth markdown.
     const NS_PER_SEC: f64 = 1e9;
 
-    // ─── Query battery (shared by hot search, cold tier, recall id grading) ─
+    // ─── Query battery (shared by warm search, cold tier, recall id grading) ─
 
-    /// The full FTS query battery. Drives the engine-generic hot search via
+    /// The full FTS query battery. Drives the engine-generic warm search via
     /// [`run_fts`]; the cold tier re-derives its query strings + modes from
-    /// the same list so hot and cold measure identical shapes.
+    /// the same list so warm and cold measure identical shapes.
     pub const FTS_BATTERY: &[FtsQuery] = &[
         FtsQuery {
             name: "single_rare",
@@ -374,8 +374,8 @@ pub mod fts {
         // Warmup.
         let _ = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
             .expect("probe warmup");
-        let mut samples = Vec::with_capacity(HOT_ITERS);
-        for _ in 0..HOT_ITERS {
+        let mut samples = Vec::with_capacity(WARM_ITERS);
+        for _ in 0..WARM_ITERS {
             let t = Instant::now();
             let hits = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
                 .expect("probe search");
@@ -391,6 +391,10 @@ pub mod fts {
         let uri = committed.uri;
         let mut out = HashMap::new();
         for q in FTS_BATTERY {
+            eprintln!(
+                "[superfile_fts] cold: query {} — {COLD_ITERS} fresh-cache iters...",
+                q.name,
+            );
             let mode = to_infino_mode(q.mode);
             let query = q.terms.join(" ");
             let storage = Arc::clone(&committed.storage);
@@ -419,7 +423,14 @@ pub mod fts {
     /// Bench entry point. Invoked by `benches/fts/main.rs`.
     pub fn run(phases: Phases) {
         let n_docs = corpus::superfile_docs();
-        let (corpus, result, index) = build_hot_artifact(n_docs);
+        eprintln!(
+            "[superfile_fts] starting {} docs (build={}, warm={}, cold={})",
+            fmt_count(n_docs),
+            phases.build,
+            phases.warm,
+            phases.cold,
+        );
+        let (corpus, result, index) = build_warm_artifact(n_docs, phases);
 
         // Run-to-run deltas for every metric below, vs the previous run.
         let mut report = Report::load("superfile_fts");
@@ -428,9 +439,9 @@ pub mod fts {
             emit_build(&mut report, n_docs, &corpus, &result);
         }
 
-        if phases.hot || phases.cold {
+        if phases.warm || phases.cold {
             assert_correct(&index, n_docs);
-            let probes = phases.hot.then(|| measure_hot_probes(&index));
+            let probes = phases.warm.then(|| measure_warm_probes(&index));
             let cold = phases.cold.then(|| measure_cold_queries(&index));
             emit_search(
                 &mut report,
@@ -438,7 +449,7 @@ pub mod fts {
                 &result,
                 cold.as_ref(),
                 probes.as_deref(),
-                phases.hot,
+                phases.warm,
                 phases.cold,
             );
         }
@@ -446,34 +457,48 @@ pub mod fts {
         report.save();
     }
 
-    /// Build the canonical one-writer superfile and run the hot query
+    /// Build the canonical one-writer superfile and run the warm query
     /// battery through the shared FTS driver. The returned index is the
     /// exact measured artifact used by correctness and cold reads.
-    fn build_hot_artifact(n_docs: usize) -> (MmapTextCorpus, EngineFtsResult, InfinoFtsIndex) {
+    fn build_warm_artifact(
+        n_docs: usize,
+        phases: Phases,
+    ) -> (MmapTextCorpus, EngineFtsResult, InfinoFtsIndex) {
         eprintln!(
-            "[superfile_fts] generating {}-doc corpus...",
+            "[superfile_fts] generating {}-doc Zipfian corpus...",
             fmt_count(n_docs)
         );
         let corpus = MmapTextCorpus::generate(n_docs, 1);
         let docs = corpus.rows();
 
-        eprintln!(
-            "[superfile_fts] run_fts: build + {HOT_ITERS}-iter hot search over {} docs...",
-            fmt_count(n_docs)
-        );
+        let run_warm_search = phases.warm;
+        if phases.build {
+            eprintln!(
+                "[superfile_fts] building 1-writer superfile over {} docs...",
+                fmt_count(n_docs)
+            );
+        }
+        if run_warm_search {
+            eprintln!(
+                "[superfile_fts] warm search battery: {} queries × {WARM_ITERS} timed iters...",
+                FTS_BATTERY.len(),
+            );
+        }
         let (result, index) = run_fts_with_index::<InfinoFtsEngine>(
             FTS_COLUMN,
             &docs,
-            FTS_BATTERY,
+            if run_warm_search { FTS_BATTERY } else { &[] },
             K,
-            HOT_ITERS,
+            WARM_ITERS,
             corpus::parallel_writers(),
         );
         (corpus, result, index)
     }
 
     fn assert_correct(index: &InfinoFtsIndex, n_docs: usize) {
-        eprintln!("[superfile_fts] correctness: using measured 1-writer artifact...");
+        eprintln!(
+            "[superfile_fts] correctness check: self-consistency + BMW==brute-force on measured artifact..."
+        );
         let reader = index.reader();
         assert_superfile_self_consistent(reader, n_docs);
         let n_bmw = assert_bmw_matches_brute_force(reader);
@@ -482,11 +507,16 @@ pub mod fts {
         );
     }
 
-    /// Infino-only hot probes on the measured in-memory artifact.
-    fn measure_hot_probes(index: &InfinoFtsIndex) -> Vec<(&'static str, Duration, Duration)> {
+    /// Infino-only warm probes on the measured in-memory artifact.
+    fn measure_warm_probes(index: &InfinoFtsIndex) -> Vec<(&'static str, Duration, Duration)> {
+        eprintln!(
+            "[superfile_fts] per-algorithm probes: {} OR shapes × {WARM_ITERS} iters (WAND+BMW vs MaxScore+BMM)...",
+            PROBE_SHAPES.len(),
+        );
         let reader = index.reader();
         let mut probes: Vec<(&'static str, Duration, Duration)> = Vec::new();
         for (shape, terms) in PROBE_SHAPES {
+            eprintln!("[superfile_fts] probe: {shape}...");
             let wand = probe_algo_p50(reader, terms, OrAlgo::WandBmw);
             let bmm = probe_algo_p50(reader, terms, OrAlgo::Bmm);
             probes.push((shape, wand, bmm));
@@ -498,11 +528,15 @@ pub mod fts {
     /// query through the production cold path.
     fn measure_cold_queries(index: &InfinoFtsIndex) -> HashMap<&'static str, Duration> {
         eprintln!(
-            "[superfile_fts] committing measured 1-writer artifact to object storage for the cold tier..."
+            "[superfile_fts] uploading measured 1-writer artifact to object storage for cold tier..."
         );
         let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
             index.bytes(),
         )));
+        eprintln!(
+            "[superfile_fts] cold search: {} queries × {COLD_ITERS} fresh-cache iters...",
+            FTS_BATTERY.len(),
+        );
         measure_cold(&committed)
     }
 
@@ -609,15 +643,15 @@ pub mod fts {
         name: &'static str,
         by_name: &HashMap<&'static str, &QueryStats>,
         cold: Option<&HashMap<&'static str, Duration>>,
-        include_hot: bool,
+        include_warm: bool,
         include_cold: bool,
     ) -> Vec<Cell> {
         let mut cells = vec![text(name)];
-        if include_hot {
+        if include_warm {
             match by_name.get(&name) {
                 Some(q) => {
-                    let hot_ns = q.p50.as_secs_f64() * NS_PER_SEC;
-                    cells.push(metric(hot_ns, fmt_time(hot_ns), Better::Lower));
+                    let warm_ns = q.p50.as_secs_f64() * NS_PER_SEC;
+                    cells.push(metric(warm_ns, fmt_time(warm_ns), Better::Lower));
                     cells.push(metric(
                         q.rss.peak_rss_bytes as f64,
                         rss::fmt_bytes(q.rss.peak_rss_bytes),
@@ -659,15 +693,15 @@ pub mod fts {
         result: &EngineFtsResult,
         cold: Option<&HashMap<&'static str, Duration>>,
         probes: Option<&[(&'static str, Duration, Duration)]>,
-        include_hot: bool,
+        include_warm: bool,
         include_cold: bool,
     ) {
         let by_name: HashMap<&'static str, &QueryStats> =
             result.queries.iter().map(|q| (q.name, q)).collect();
 
         let mut header_cols = vec!["Query"];
-        if include_hot {
-            header_cols.extend(["hot", "Peak RSS", "Median RSS", "P90 RSS"]);
+        if include_warm {
+            header_cols.extend(["warm", "Peak RSS", "Median RSS", "P90 RSS"]);
         }
         if include_cold {
             header_cols.push("cold");
@@ -678,7 +712,7 @@ pub mod fts {
             headers: search_headers.clone(),
             rows: OR_QUERIES
                 .iter()
-                .map(|&n| search_row(n, &by_name, cold, include_hot, include_cold))
+                .map(|&n| search_row(n, &by_name, cold, include_warm, include_cold))
                 .collect(),
         };
         let and_block = Block {
@@ -686,7 +720,7 @@ pub mod fts {
             headers: search_headers,
             rows: AND_QUERIES
                 .iter()
-                .map(|&n| search_row(n, &by_name, cold, include_hot, include_cold))
+                .map(|&n| search_row(n, &by_name, cold, include_warm, include_cold))
                 .collect(),
         };
         let mut blocks = vec![or_block, and_block];
@@ -715,7 +749,7 @@ pub mod fts {
                 "Superfile FTS — search, single-segment / in-memory ({} docs)",
                 fmt_count(n_docs)
             ),
-            note: "Hot = `SuperfileReader::open` in memory (p50 via the engine-generic `run_fts` driver); \
+            note: "Warm = `SuperfileReader::open` in memory (p50 via the engine-generic `run_fts` driver); \
                    cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` \
                    (production cold path). Δ is vs the previous run."
                 .into(),
@@ -733,7 +767,7 @@ pub mod vector {
     //! + correctness gate (`recall@10 ≥ 0.80` at high-recall config)
     //!
     //! Every phase uses the production path: [`SuperfileBuilder`] →
-    //! [`SuperfileReader`] → [`SuperfileReader::vector_search`]. Hot
+    //! [`SuperfileReader`] → [`SuperfileReader::vector_search`]. Warm
     //! opens the finished `.parquet` in memory; cold commits the same bytes
     //! to object storage and reads through [`DiskCacheStore::reader`].
     //!
@@ -923,6 +957,9 @@ pub mod vector {
         let gt = ground_truth_calibration();
         let mut out: [Option<Calibrated>; 3] = [None; 3];
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            eprintln!(
+                "[superfile_vec] calibrating recall@{target:.2}: grid search over probes/refines ({N_CALIBRATION_QUERIES} queries)..."
+            );
             out[i] = corpus::calibrate_superfile(
                 reader,
                 VEC_COLUMN,
@@ -938,7 +975,7 @@ pub mod vector {
         out
     }
 
-    fn timed_hot(index: &InfinoVectorIndex, query: &[f32], search: VectorSearch) -> Timed {
+    fn timed_warm(index: &InfinoVectorIndex, query: &[f32], search: VectorSearch) -> Timed {
         let sampler = rss::PeakSampler::start_default();
         let _ = InfinoVectorEngine::read(index, query, TOP_K, search);
         let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
@@ -1013,26 +1050,26 @@ pub mod vector {
     fn search_row(
         label: String,
         params: String,
-        hot: Option<Timed>,
+        warm: Option<Timed>,
         cold: Option<Duration>,
     ) -> Vec<Cell> {
         let mut cells = vec![text(label), text(params)];
-        if let Some(hot) = hot {
-            let hot_ns = hot.p50.as_secs_f64() * NS_PER_SEC;
-            cells.push(metric(hot_ns, fmt_time(hot_ns), Better::Lower));
+        if let Some(warm) = warm {
+            let warm_ns = warm.p50.as_secs_f64() * NS_PER_SEC;
+            cells.push(metric(warm_ns, fmt_time(warm_ns), Better::Lower));
             cells.push(metric(
-                hot.rss.peak_rss_bytes as f64,
-                rss::fmt_bytes(hot.rss.peak_rss_bytes),
+                warm.rss.peak_rss_bytes as f64,
+                rss::fmt_bytes(warm.rss.peak_rss_bytes),
                 Better::Lower,
             ));
             cells.push(metric(
-                hot.rss.median_rss_bytes as f64,
-                rss::fmt_bytes(hot.rss.median_rss_bytes),
+                warm.rss.median_rss_bytes as f64,
+                rss::fmt_bytes(warm.rss.median_rss_bytes),
                 Better::Lower,
             ));
             cells.push(metric(
-                hot.rss.p90_rss_bytes as f64,
-                rss::fmt_bytes(hot.rss.p90_rss_bytes),
+                warm.rss.p90_rss_bytes as f64,
+                rss::fmt_bytes(warm.rss.p90_rss_bytes),
                 Better::Lower,
             ));
         }
@@ -1045,7 +1082,14 @@ pub mod vector {
 
     pub fn run(phases: Phases) {
         let n_docs = n_docs();
-        let (build_result, index) = build_hot_artifact(n_docs);
+        eprintln!(
+            "[superfile_vec] starting {}×{DIM} (build={}, warm={}, cold={})",
+            fmt_count(n_docs),
+            phases.build,
+            phases.warm,
+            phases.cold,
+        );
+        let (build_result, index) = build_warm_artifact(n_docs);
 
         let build_rows = build_rows(n_docs, &build_result);
         let mut report = Report::load("superfile_vector");
@@ -1053,11 +1097,22 @@ pub mod vector {
             emit_build(&mut report, n_docs, build_rows);
         }
 
-        if phases.hot || phases.cold {
+        if phases.warm || phases.cold {
             assert_correct(&index);
+            eprintln!("[superfile_vec] calibrating recall targets {:?}...", RECALL_TARGETS);
             let cal = local_calibrations(index.reader());
             let q = &queries_calibration()[0];
             let committed = phases.cold.then(|| commit_cold_artifact(&index));
+            if phases.warm {
+                eprintln!(
+                    "[superfile_vec] warm search: recall targets + default config × {CALIBRATION_P50_ITERS} iters..."
+                );
+            }
+            if phases.cold {
+                eprintln!(
+                    "[superfile_vec] cold search: recall targets + default config × 3 fresh-cache iters..."
+                );
+            }
             let search_rows = search_rows(&index, committed.as_ref(), q, &cal, phases);
             emit_search(&mut report, n_docs, search_rows, phases);
         }
@@ -1066,14 +1121,18 @@ pub mod vector {
 
     /// Build the canonical one-writer vector superfile and the build-only
     /// parallel row. The returned index is the exact artifact used by
-    /// correctness, hot search, and cold upload.
-    fn build_hot_artifact(n_docs: usize) -> (EngineVectorResult, InfinoVectorIndex) {
+    /// correctness, warm search, and cold upload.
+    fn build_warm_artifact(n_docs: usize) -> (EngineVectorResult, InfinoVectorIndex) {
         eprintln!(
-            "[superfile_vec] generating {}×{DIM} vector corpus...",
+            "[superfile_vec] generating {}×{DIM} planted-cluster vector corpus...",
             fmt_count(n_docs)
         );
         let vectors = vectors();
 
+        eprintln!(
+            "[superfile_vec] building 1-writer vector superfile over {} docs...",
+            fmt_count(n_docs),
+        );
         let empty_queries: [crate::harness::VectorQuery<'_>; 0] = [];
         let (build_result, index) = run_vector_with_index::<InfinoVectorEngine>(
             VectorRunConfig {
@@ -1091,7 +1150,9 @@ pub mod vector {
     }
 
     fn assert_correct(index: &InfinoVectorIndex) {
-        eprintln!("[superfile_vec] correctness: using measured 1-writer artifact...");
+        eprintln!(
+            "[superfile_vec] correctness check: recall@{TOP_K} on {N_CORRECTNESS_QUERIES} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})..."
+        );
         let recall = assert_infino_self_consistent(index.reader());
         eprintln!(
             "[superfile_vec] correctness OK: recall@{TOP_K} = {recall:.3} (≥ {CORRECTNESS_RECALL_FLOOR:.2})"
@@ -1100,7 +1161,9 @@ pub mod vector {
 
     /// Upload the exact measured one-writer artifact for cold reads.
     fn commit_cold_artifact(index: &InfinoVectorIndex) -> tiers::SuperfileCommitted {
-        eprintln!("[superfile_vec] committing measured 1-writer artifact to object storage...");
+        eprintln!(
+            "[superfile_vec] uploading measured 1-writer artifact to object storage for cold tier..."
+        );
         tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
             index.bytes(),
         )))
@@ -1114,7 +1177,7 @@ pub mod vector {
         rows
     }
 
-    /// Measure hot and cold search rows for calibrated recall targets plus
+    /// Measure warm and cold search rows for calibrated recall targets plus
     /// the default user-facing search config.
     fn search_rows(
         index: &InfinoVectorIndex,
@@ -1130,12 +1193,12 @@ pub mod vector {
                     nprobe: c.probe,
                     rerank_mult: c.refine,
                 };
-                let hot = phases.hot.then(|| timed_hot(index, q, search));
+                let warm = phases.warm.then(|| timed_warm(index, q, search));
                 let cold = committed.map(|c| timed_cold(c, q, search));
                 rows.push(search_row(
                     format!("{target:.2}"),
                     format!("p={}, r={}", c.probe, c.refine),
-                    hot,
+                    warm,
                     cold,
                 ));
             }
@@ -1144,12 +1207,12 @@ pub mod vector {
             nprobe: DEFAULT_NPROBE,
             rerank_mult: DEFAULT_RERANK_MULT,
         };
-        let default_hot = phases.hot.then(|| timed_hot(index, q, default_search));
+        let default_warm = phases.warm.then(|| timed_warm(index, q, default_search));
         let default_cold = committed.map(|c| timed_cold(c, q, default_search));
         rows.push(search_row(
             "default".into(),
             format!("p={DEFAULT_NPROBE}, r={DEFAULT_RERANK_MULT}"),
-            default_hot,
+            default_warm,
             default_cold,
         ));
         rows
@@ -1181,9 +1244,9 @@ pub mod vector {
 
     fn emit_search(report: &mut Report, n_docs: usize, search_rows: Vec<Vec<Cell>>, phases: Phases) {
         let mut headers = vec!["Recall target".into(), "(p, r)".into()];
-        if phases.hot {
+        if phases.warm {
             headers.extend([
-                "hot".into(),
+                "warm".into(),
                 "Peak RSS".into(),
                 "Median RSS".into(),
                 "P90 RSS".into(),
@@ -1198,7 +1261,7 @@ pub mod vector {
                 "Superfile vector — search, single-segment / in-memory ({} docs × dim={DIM})",
                 fmt_count(n_docs)
             ),
-            note: "Correctness, hot search, and cold upload reuse the measured 1-writer artifact. Recall rows use the lowest-p50 calibrated point meeting each target; `default` is the user-facing option baseline. Δ is vs the previous run.".into(),
+            note: "Correctness, warm search, and cold upload reuse the measured 1-writer artifact. Recall rows use the lowest-p50 calibrated point meeting each target; `default` is the user-facing option baseline. Δ is vs the previous run.".into(),
             blocks: vec![Block {
                 subtitle: String::new(),
                 headers,
@@ -1217,7 +1280,7 @@ pub mod sql {
     //! Build + query numbers are measured through the engine-generic SQL
     //! harness (`run_sql::<InfinoSqlEngine>`) — the same path the cross-engine
     //! comparison uses. The canonical 1-writer build produces the queryable
-    //! in-memory `Supertable`; correctness and hot queries run against that
+    //! in-memory `Supertable`; correctness and warm queries run against that
     //! exact artifact. A separate `N writers` build row measures parallel
     //! ingest throughput.
     //!
@@ -1361,13 +1424,20 @@ pub mod sql {
 
     pub fn run(phases: Phases) {
         let n_docs = corpus::superfile_docs();
-        let (corpus, query_inputs, result, index) = build_hot_artifact(n_docs);
+        eprintln!(
+            "[superfile_sql] starting {} rows (build={}, warm={}, cold={})",
+            fmt_count(n_docs),
+            phases.build,
+            phases.warm,
+            phases.cold,
+        );
+        let (corpus, query_inputs, result, index) = build_warm_artifact(n_docs, phases);
 
         let mut report = Report::load("sql");
         if phases.build {
             emit_build(&mut report, n_docs, &corpus, &result);
         }
-        if phases.hot {
+        if phases.warm {
             assert_correct(&index, n_docs);
             let query_sets = measure_query_sets(&index, &query_inputs);
             emit_query(
@@ -1390,17 +1460,21 @@ pub mod sql {
         report.save();
     }
 
-    /// Build the canonical one-writer SQL table and run the hot scalar SQL
+    /// Build the canonical one-writer SQL table and run the warm scalar SQL
     /// battery through the shared SQL driver.
-    fn build_hot_artifact(
+    fn build_warm_artifact(
         n_docs: usize,
+        phases: Phases,
     ) -> (
         MmapTextCorpus,
         QueryInputs,
         EngineSqlResult,
         InfinoSqlIndex,
     ) {
-        eprintln!("[sql] generating {}-row corpus...", fmt_count(n_docs));
+        eprintln!(
+            "[superfile_sql] generating {}-row Zipfian corpus...",
+            fmt_count(n_docs)
+        );
         let corpus = MmapTextCorpus::generate(n_docs, 1);
         let corpus_rows = corpus.rows();
         let mid = corpus_rows.len() / 2;
@@ -1411,24 +1485,33 @@ pub mod sql {
         };
         let rows = sql_rows(&corpus_rows);
 
-        eprintln!(
-            "[sql] run_sql: build + {ITERS}-iter query battery over {} rows...",
-            fmt_count(n_docs)
-        );
+        if phases.build {
+            eprintln!(
+                "[superfile_sql] building 1-writer supertable over {} rows...",
+                fmt_count(n_docs),
+            );
+        }
+        if phases.warm {
+            eprintln!(
+                "[superfile_sql] scalar SQL battery: {} queries × {ITERS} timed iters...",
+                SQL_BATTERY.len(),
+            );
+        }
         let (result, index) = run_sql_with_index::<InfinoSqlEngine>(
             SqlRunConfig {
                 iters: ITERS,
                 parallel: corpus::parallel_writers(),
             },
             &rows,
-            SQL_BATTERY,
+            if phases.warm { SQL_BATTERY } else { &[] },
         );
         (corpus, query_inputs, result, index)
     }
 
     fn assert_correct(index: &InfinoSqlIndex, n_docs: usize) {
-        // Correctness gate on the exact 1-writer artifact measured above.
-        eprintln!("[sql] correctness: using measured 1-writer artifact...");
+        eprintln!(
+            "[superfile_sql] correctness check: COUNT(*) and planted category distribution..."
+        );
         let table = index.table();
         let total = count_value(table, "SELECT COUNT(*) AS n FROM supertable");
         assert_eq!(
@@ -1444,7 +1527,7 @@ pub mod sql {
             expected_rust(n_docs),
             "rust-category COUNT(*) must match the planted distribution; got {rust}"
         );
-        eprintln!("[sql] correctness OK: COUNT(*) == {n_docs}, rust == {rust}");
+        eprintln!("[superfile_sql] correctness OK: COUNT(*) == {n_docs}, rust == {rust}");
     }
 
     struct QuerySets {
@@ -1468,7 +1551,7 @@ pub mod sql {
         // resolve through the same `query_sql` read path against the indexed
         // table. Hybrid is just a SQL option, measured here as another query.
         eprintln!(
-            "[sql] measuring search table-function queries (bm25 / vector / hybrid / token / exact)..."
+            "[superfile_sql] measuring search table-function queries (bm25 / vector / hybrid / token / exact)..."
         );
         let qv = inputs.qv.as_str();
         let sample_title = inputs.sample_title.as_str();
@@ -1523,7 +1606,9 @@ pub mod sql {
         //     while the FTS index resolves the single row's page directly.
         // The unsorted `key` row is the honest win-case; the sorted `title`
         // row shows the index adds little when min/max already works.
-        eprintln!("[sql] measuring no-index vs FTS-index equality (sorted title vs unsorted key)...");
+        eprintln!(
+            "[superfile_sql] measuring no-index vs FTS-index equality (sorted title vs unsorted key)..."
+        );
         let sample_key = inputs.sample_key.as_str();
         let plain_scan = vec![
             timed_tvf(
@@ -1560,7 +1645,7 @@ pub mod sql {
         // be skipped and the index can't win (it just adds overhead — this is
         // the case a selectivity gate must catch ahead of time).
         eprintln!(
-            "[sql] measuring aggregate shapes over a candidate set: DataFusion only vs token_match..."
+            "[superfile_sql] measuring aggregate shapes over a candidate set: DataFusion only vs token_match..."
         );
         const BUCKET_IN_ALL: &str = "('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9')";
         let agg_scan = vec![
@@ -1640,7 +1725,7 @@ pub mod sql {
     ///
     /// The write is a single commit at superfile scale; this keeps the
     /// default `s3s_fs` fixture usable while still writing the same parquet
-    /// superfile format that hot SQL reads.
+    /// superfile format that warm SQL reads.
     fn build_cold_artifact(rows: &[SqlRow<'_>]) -> ColdSqlArtifact {
         eprintln!(
             "[superfile_sql] building object-store SQL artifact for cold reads over {} rows...",
@@ -1686,9 +1771,17 @@ pub mod sql {
     fn measure_cold_queries(rows: &[SqlRow<'_>]) -> Vec<(&'static str, Duration)> {
         const COLD_ITERS: usize = 5;
         let artifact = build_cold_artifact(rows);
+        eprintln!(
+            "[superfile_sql] cold queries: {} queries × {COLD_ITERS} fresh-cache iters...",
+            SQL_BATTERY.len(),
+        );
         let out = SQL_BATTERY
             .iter()
             .map(|q| {
+                eprintln!(
+                    "[superfile_sql] cold: query {} — {COLD_ITERS} fresh-cache iters...",
+                    q.name,
+                );
                 let mut samples = Vec::with_capacity(COLD_ITERS);
                 for _ in 0..COLD_ITERS {
                     let (cache_dir, table) = open_cold_consumer(&artifact);
@@ -1913,7 +2006,7 @@ pub mod sql {
                 "SQL — query, in-memory supertable ({} rows)",
                 fmt_count(n_docs)
             ),
-            note: "Hot p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline \
+            note: "Warm p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline \
                    comparison is the last two blocks: the *same* selective equality (one matching row) run \
                    against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the \
                    byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects \

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Hot-path overhead of the reader-side tombstone filter.
+//! Warm-path overhead of the reader-side tombstone filter.
 //!
 //! Measures per-query latency across three supertable states so a
-//! regression in the cache + filter hot path is localized to one
+//! regression in the cache + filter warm path is localized to one
 //! of: DashMap lookup cost, TTL-check cost, filter-hook cost, or
 //! the cache-miss path.
 //!
@@ -35,12 +35,7 @@
 //! filter-hook path; a `ten_percent_churned` regression points at filter
 //! cost on tombstone-heavy superfiles.
 //!
-//! ## Invocation
-//!
-//! ```text
-//! cargo bench --bench tombstone-overhead
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench tombstone-overhead
-//! ```
+//! Invoked as `cargo bench -- tombstone`.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -57,10 +52,11 @@ use infino::supertable::wal::state_doc::{
     OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
 };
 use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino_bench_utils::markdown::fmt_time;
-use infino_bench_utils::report::{Better, Block, Cell, Report, Section, metric, text};
-use infino_bench_utils::rss::{self, PeakSampler, RssStats};
 use tempfile::TempDir;
+
+use crate::markdown::fmt_time;
+use crate::report::{Better, Block, Cell, Report, Section, metric, text};
+use crate::rss::{self, PeakSampler, RssStats};
 
 // ─── Sizing ───────────────────────────────────────────────────────────
 
@@ -237,7 +233,7 @@ fn p50(samples: &mut [Duration]) -> Duration {
 fn measure_fts(st: &Supertable) -> Duration {
     let warm = st
         .reader()
-        .bm25_hits("title", QUERY_TERM, TOP_K, BoolMode::Or)
+        .bm25_search("title", QUERY_TERM, TOP_K, BoolMode::Or)
         .expect("fts");
     black_box(warm);
     let mut samples = Vec::with_capacity(ITERS);
@@ -245,7 +241,7 @@ fn measure_fts(st: &Supertable) -> Duration {
         let t0 = Instant::now();
         let hits = st
             .reader()
-            .bm25_hits(
+            .bm25_search(
                 black_box("title"),
                 black_box(QUERY_TERM),
                 black_box(TOP_K),
@@ -311,7 +307,7 @@ fn state_row(state: WorkloadState) -> Vec<Cell> {
     cells
 }
 
-fn main() {
+pub fn run() {
     eprintln!(
         "[tombstone-overhead] {N_DOCS} docs / {APPEND_CHUNKS} superfiles; measuring FTS + SQL p50 across clean / one_percent / ten_percent_churned..."
     );
@@ -325,7 +321,7 @@ fn main() {
     report.emit(&Section {
         anchor: "bench/tombstone/overhead".into(),
         title: format!(
-            "Tombstone overhead — reader-side filter hot path ({N_DOCS} docs, {APPEND_CHUNKS} superfiles)"
+            "Tombstone overhead — reader-side filter warm path ({N_DOCS} docs, {APPEND_CHUNKS} superfiles)"
         ),
         note: "Per-query p50 across three tombstone states. `clean` is the empty-bitmap \
                short-circuit floor; `one_percent` tombstones the first 1% of each superfile's \

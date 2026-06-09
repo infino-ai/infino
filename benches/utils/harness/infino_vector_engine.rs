@@ -6,7 +6,7 @@
 //! The canonical `write` builds one unified superfile through
 //! `SuperfileBuilder`, opens a `SuperfileReader`, and retains both the
 //! bytes and the reader. In-tree benches use those retained bytes for
-//! cold upload and the retained reader for correctness/hot search.
+//! cold upload and the retained reader for correctness/warm search.
 
 use std::sync::Arc;
 

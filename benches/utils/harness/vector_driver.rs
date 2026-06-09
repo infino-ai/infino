@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::{VectorEngine, VectorHit};
 use crate::corpus;
+use crate::markdown::fmt_count;
 use crate::rss::{PeakSampler, RssStats};
 
 /// Metric requested by the benchmark harness.
@@ -90,6 +91,12 @@ pub fn run_vector_with_index<E: VectorEngine>(
     let n_docs = vectors.len() / cfg.dim;
     let n_cent = corpus::n_cent(n_docs);
 
+    eprintln!(
+        "[harness/vector] {}: building 1-writer index over {} docs × dim={}...",
+        E::name(),
+        fmt_count(n_docs),
+        cfg.dim,
+    );
     let mut index = E::open(cfg.column, cfg.dim, cfg.metric, n_cent);
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
@@ -103,6 +110,11 @@ pub fn run_vector_with_index<E: VectorEngine>(
     }];
 
     if cfg.parallel > 1 {
+        eprintln!(
+            "[harness/vector] {}: parallel build probe ({} writers)...",
+            E::name(),
+            cfg.parallel,
+        );
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
         E::parallel_write(cfg.column, vectors, cfg.dim, cfg.metric, cfg.parallel);
@@ -117,6 +129,12 @@ pub fn run_vector_with_index<E: VectorEngine>(
 
     let mut queries_out = Vec::with_capacity(queries.len());
     for q in queries {
+        eprintln!(
+            "[harness/vector] {}: warm search query {} ({} timed iters)...",
+            E::name(),
+            q.name,
+            cfg.iters,
+        );
         let sampler = PeakSampler::start_default();
         let warm = E::read(&index, q.vector, cfg.k, q.search);
         let hit_ids: Vec<u64> = warm.iter().map(|h: &VectorHit| h.doc_id).collect();

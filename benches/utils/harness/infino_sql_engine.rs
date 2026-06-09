@@ -98,7 +98,7 @@ fn schema() -> Arc<Schema> {
 /// reproducible and cheap. Used both to populate the `emb` column and
 /// (via [`sample_query_csv`]) to form a query vector for the
 /// `vector_search` / `hybrid_search` TVFs.
-fn emb_for(doc_id: u64) -> [f32; SQL_DIM] {
+pub fn emb_for(doc_id: u64) -> [f32; SQL_DIM] {
     let mut v = [0f32; SQL_DIM];
     for (d, slot) in v.iter_mut().enumerate() {
         *slot = ((doc_id.wrapping_mul(31).wrapping_add(d as u64 * 7) % 97) as f32) + 1.0;

@@ -81,6 +81,15 @@ pub struct SuperfileReader {
     /// bytes). Carries the page index when present so `RowSelection`
     /// can skip whole pages.
     arrow_meta: Option<ArrowReaderMetadata>,
+    /// The lazy byte source the reader was opened over, retained only
+    /// on the [`open_lazy`] path. `None` on the eager [`open`] path
+    /// (resident bytes already cover every range). Lets
+    /// [`byte_source`](Self::byte_source) hand callers one uniform
+    /// whole-segment byte source regardless of how the reader opened.
+    ///
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    /// [`open`]: SuperfileReader::open
+    source: Option<Arc<dyn crate::superfile::LazyByteSource>>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -272,6 +281,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: None,
             arrow_meta: None,
+            source: Some(source),
             schema,
             id_column,
             n_docs,
@@ -376,6 +386,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: Some(bytes),
             arrow_meta: Some(arrow_meta),
+            source: None,
             schema,
             id_column,
             n_docs,
@@ -439,6 +450,33 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
+    }
+
+    /// A [`LazyByteSource`] over the **entire** segment, regardless of
+    /// how the reader was opened. The single byte-access handle the
+    /// SQL/DataFusion path reads through -- callers never branch on
+    /// storage mode:
+    ///
+    /// - resident-bytes readers (eager [`open`], disk-cache mmap) wrap
+    ///   their bytes in a [`BytesLazyByteSource`]; every `range` is a
+    ///   zero-copy `Bytes::slice` (a refcount bump, no copy).
+    /// - lazy readers ([`open_lazy`]) return the source they were
+    ///   opened over, so ranges stream straight from object storage.
+    ///
+    /// [`LazyByteSource`]: crate::superfile::LazyByteSource
+    /// [`BytesLazyByteSource`]: crate::superfile::BytesLazyByteSource
+    /// [`open`]: SuperfileReader::open
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    pub fn byte_source(&self) -> Arc<dyn crate::superfile::LazyByteSource> {
+        match (&self.bytes, &self.source) {
+            (Some(bytes), _) => {
+                Arc::new(crate::superfile::BytesLazyByteSource::new(bytes.clone()))
+            }
+            (None, Some(src)) => Arc::clone(src),
+            (None, None) => {
+                unreachable!("a SuperfileReader has either resident bytes or a lazy source")
+            }
+        }
     }
 
     /// Resolve in-segment row offsets to their durable identity.

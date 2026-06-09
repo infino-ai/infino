@@ -5,7 +5,7 @@
 //!
 //! Builds ONE supertable-segment-sized superfile (default 2.5M docs,
 //! `n_cent = 1024`, dim 384, Sq8 / Cosine — i.e. one of the four
-//! 10M-supertable segments) and times the hot in-memory
+//! 10M-supertable segments) and times the warm in-memory
 //! `SuperfileReader::search` across an `(nprobe, rerank_mult)` grid,
 //! reporting per-config latency and recall@10.
 //!
