@@ -677,6 +677,17 @@ impl Supertable {
 
     /// The user-facing Arrow schema — the columns the caller supplied.
     /// The auto-injected `_id` is not part of this schema.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// assert_eq!(posts.schema().field(0).name(), "body");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn schema(&self) -> arrow_schema::SchemaRef {
         self.inner.options.user_schema()
     }

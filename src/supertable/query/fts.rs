@@ -264,6 +264,21 @@ impl Supertable {
     /// score first. Pins a reader, applies the read-consistency policy,
     /// drives the async kernel via the sync→async bridge, then resolves
     /// each segment-local hit to its public `_id`.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, BoolMode, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or)?;
+    /// assert_eq!(hits.len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn bm25_search(
         &self,
         column: &str,

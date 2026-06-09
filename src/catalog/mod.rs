@@ -51,12 +51,25 @@ use uri::{Backend, parse_uri};
 /// `az://container/prefix` → Azure, `memory://` → in-process
 /// (non-persistent). Equivalent to
 /// [`connect_with`]`(uri, ConnectOptions::default())`.
+///
+/// ```
+/// let db = infino::connect("memory://")?;
+/// assert!(db.list_tables()?.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn connect(uri: impl AsRef<str>) -> Result<Connection, InfinoError> {
     connect_with(uri, ConnectOptions::default())
 }
 
 /// Open (or create) a catalog rooted at `uri` with explicit storage
 /// configuration (credentials / region / endpoint the URI can't carry).
+///
+/// ```
+/// use infino::{connect_with, ConnectOptions};
+/// let db = connect_with("memory://", ConnectOptions::new())?;
+/// # let _ = db;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn connect_with(
     uri: impl AsRef<str>,
     options: ConnectOptions,
@@ -104,6 +117,19 @@ impl Connection {
     /// Create a new table named `name` with the given Arrow `schema` and
     /// search `indexes`. Fails with [`InfinoError::AlreadyExists`] if a
     /// table of that name already exists. Returns the open handle.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// use infino::{connect, IndexSpec};
+    ///
+    /// let db = connect("memory://")?;
+    /// let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// let posts = db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// assert_eq!(db.list_tables()?, ["posts"]);
+    /// # let _ = posts;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn create_table(
         &self,
         name: &str,
@@ -170,6 +196,18 @@ impl Connection {
 
     /// Open an existing table by name. Fails with
     /// [`InfinoError::NotFound`] if no such table is registered.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// let posts = db.open_table("posts")?;
+    /// # let _ = posts;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
         match &self.inner.store {
             CatalogStore::Memory(map) => map
@@ -222,6 +260,18 @@ impl Connection {
     /// This unregisters the table; the underlying object-store data under
     /// `<root>/<name>/` is left in place (physical reclamation is a
     /// separate operation).
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// db.drop_table("posts")?;
+    /// assert!(db.list_tables()?.is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn drop_table(&self, name: &str) -> Result<(), InfinoError> {
         match &self.inner.store {
             CatalogStore::Memory(map) => map
@@ -244,6 +294,13 @@ impl Connection {
 
     /// List the names of every table registered in this catalog,
     /// alphabetically.
+    ///
+    /// ```
+    /// # let db = infino::connect("memory://")?;
+    /// let names: Vec<String> = db.list_tables()?;
+    /// # let _ = names;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn list_tables(&self) -> Result<Vec<String>, InfinoError> {
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -267,6 +324,20 @@ impl Connection {
     /// names is resolved through the catalog and registered into one
     /// DataFusion session, so cross-table joins and aggregations work.
     /// Returns the collected result batches.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(schema, vec![Arc::new(LargeStringArray::from(vec!["hello"]))])?)?;
+    /// let rows = db.query_sql("SELECT _id, body FROM posts")?;
+    /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         let ctx = SessionContext::new();
 

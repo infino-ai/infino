@@ -30,10 +30,12 @@ struct VectorIndex {
 /// Arrow schema. Columns with no index are still stored and queryable
 /// via SQL — they just have no BM25 / vector index.
 ///
-/// ```ignore
+/// ```
+/// use infino::{IndexSpec, Metric};
 /// let spec = IndexSpec::new()
 ///     .fts("body")
 ///     .vector("embedding", 384, 256, Metric::Cosine);
+/// # let _ = spec;
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct IndexSpec {

@@ -58,6 +58,61 @@ and call `vector_search`. SQL-native search — the `bm25_search` /
 `vector_search` / `hybrid_search` table functions — composes with joins
 and aggregations across catalog tables.
 
+## SQL joins across tables
+
+`query_sql` resolves every table the query names through the catalog and
+registers them into one engine, so a join across two tables — or a join
+of a search result against a table — is just SQL:
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, IndexSpec};
+
+let db = connect("memory://")?;
+
+// Two tables sharing an `author_id`.
+let authors_schema = Arc::new(Schema::new(vec![
+    Field::new("author_id", DataType::Int64, false),
+    Field::new("name", DataType::LargeUtf8, false),
+]));
+let authors = db.create_table("authors", authors_schema.clone(), IndexSpec::new())?;
+authors.append(&RecordBatch::try_new(
+    authors_schema,
+    vec![
+        Arc::new(Int64Array::from(vec![1])),
+        Arc::new(LargeStringArray::from(vec!["alice"])),
+    ],
+)?)?;
+
+let posts_schema = Arc::new(Schema::new(vec![
+    Field::new("author_id", DataType::Int64, false),
+    Field::new("body", DataType::LargeUtf8, false),
+]));
+let posts = db.create_table("posts", posts_schema.clone(), IndexSpec::new().fts("body"))?;
+posts.append(&RecordBatch::try_new(
+    posts_schema,
+    vec![
+        Arc::new(Int64Array::from(vec![1])),
+        Arc::new(LargeStringArray::from(vec!["hello from alice"])),
+    ],
+)?)?;
+
+// Join both tables in one query.
+let rows = db.query_sql(
+    "SELECT a.name, p.body \
+     FROM posts p JOIN authors a ON p.author_id = a.author_id",
+)?;
+assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A search TVF (`bm25_search('posts', 'body', 'alice', 10)`) can stand in
+for either side of the join, so keyword/vector results compose with the
+rest of the catalog the same way.
+
 ## Quick example in Python
 
 ```python
