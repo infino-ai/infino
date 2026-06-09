@@ -38,12 +38,21 @@
 //! ```
 
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
+use infino::superfile::reader::VectorSearchOptions;
+use infino::supertable::Supertable;
+use tempfile::TempDir;
+
+use crate::corpus::DIM;
+use crate::harness::BoolMode;
 use crate::ingest::supertable::{self, Modality};
 use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 use crate::rss::{self, PeakSampler};
+use crate::tiers;
 
 /// Env var the parent sets to make a child build exactly one shape and
 /// print its metrics instead of emitting the report.
@@ -307,4 +316,508 @@ pub fn run() {
         }],
     });
     report.save();
+}
+
+// ─── Per-modality query runners ───────────────────────────────────────────
+
+const HOT_ITERS: usize = 20;
+const COLD_ITERS: usize = 5;
+const TOP_K: usize = 10;
+const VECTOR_NPROBE: usize = 8;
+const VECTOR_RERANK_MULT: usize = 20;
+
+/// Selected phases for a per-modality supertable runner.
+///
+/// Read phases (`hot`, `cold`) still build the object-store table because
+/// they need the committed artifact; `build` controls whether the ingest
+/// section is emitted.
+#[derive(Clone, Copy)]
+pub struct Phases {
+    pub build: bool,
+    pub hot: bool,
+    pub cold: bool,
+}
+
+impl Phases {
+    pub const ALL: Phases = Phases {
+        build: true,
+        hot: true,
+        cold: true,
+    };
+}
+
+fn p50(samples: &mut [Duration]) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    samples.sort_unstable();
+    samples[(samples.len() - 1) / 2]
+}
+
+fn open_consumer(
+    modality: Modality,
+    built: &supertable::IngestResult,
+) -> (TempDir, Supertable) {
+    let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+        Arc::clone(&built.storage),
+        Some(built.total_index_bytes),
+    );
+    let opts = tiers::consumer_options(
+        supertable::options_for(modality, None),
+        Arc::clone(&built.storage),
+        cache,
+    );
+    (cache_dir, tiers::open_consumer(opts))
+}
+
+fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
+    match mode {
+        BoolMode::Or => InfinoBoolMode::Or,
+        BoolMode::And => InfinoBoolMode::And,
+    }
+}
+
+fn emit_query_rows(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    note: &str,
+    col: &str,
+    rows: Vec<(&'static str, Duration)>,
+) {
+    report.emit(&Section {
+        anchor: anchor.into(),
+        title,
+        note: note.into(),
+        blocks: vec![Block {
+            subtitle: String::new(),
+            headers: vec!["Query".into(), col.into()],
+            rows: rows
+                .into_iter()
+                .map(|(name, d)| {
+                    let ns = d.as_secs_f64() * 1e9;
+                    vec![text(name), metric(ns, fmt_time(ns), Better::Lower)]
+                })
+                .collect(),
+        }],
+    });
+}
+
+pub mod fts {
+    use super::*;
+
+    /// Build an FTS-only supertable, then measure hot and cold BM25 reads.
+    ///
+    /// This is not wired to a Cargo selector yet; it is the per-modality
+    /// runner that the eventual one-binary dispatcher will call.
+    pub fn run(phases: Phases) {
+        if let Err(reason) = tiers::supertable_backend_check() {
+            eprintln!("[supertable_fts] skipped: {reason}");
+            return;
+        }
+
+        let n_docs = supertable::n_docs();
+        let sampler = PeakSampler::start_default();
+        let t0 = Instant::now();
+        let built = supertable::build_on_storage(Modality::Fts);
+        let wall = t0.elapsed();
+        let rss = sampler.stop_stats();
+
+        let mut report = Report::load("supertable_fts");
+        let metrics = ShapeMetrics {
+            wall_ns: wall.as_secs_f64() * 1e9,
+            n_superfiles: built.n_superfiles,
+            peak_rss_bytes: rss.peak_rss_bytes,
+            median_rss_bytes: rss.median_rss_bytes,
+            p90_rss_bytes: rss.p90_rss_bytes,
+        };
+        if phases.build {
+            report.emit(&Section {
+            anchor: "bench/fts/supertable/ingest".into(),
+            title: format!(
+                "Supertable FTS — ingest, multi-segment / object-store ({} docs, {} commits)",
+                fmt_count(n_docs),
+                supertable::N_COMMIT_CHUNKS
+            ),
+            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+            blocks: vec![Block {
+                subtitle: String::new(),
+                headers: vec![
+                    "Shape".into(),
+                    "Time".into(),
+                    "Throughput".into(),
+                    "Superfiles".into(),
+                    "Peak RSS".into(),
+                    "Median RSS".into(),
+                    "P90 RSS".into(),
+                ],
+                rows: vec![ingest_row(n_docs, "FTS-only", &metrics)],
+            }],
+            });
+        }
+
+        if phases.hot {
+            let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
+            let hot = measure_hot(&consumer);
+            drop(consumer);
+            drop(cache_dir);
+            emit_query_rows(
+                &mut report,
+                "bench/fts/supertable/hot",
+                format!(
+                    "Supertable FTS — hot search, warm cache / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                "Hot = committed table reopened with a disk cache sized to the index; p50 over repeated BM25 reads. Δ is vs the previous run.",
+                "hot",
+                hot,
+            );
+        }
+
+        if phases.cold {
+            let cold = measure_cold(&built);
+            emit_query_rows(
+                &mut report,
+                "bench/fts/supertable/cold",
+                format!(
+                    "Supertable FTS — cold search, fresh cache / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                "Cold = fresh disk cache + fresh consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.",
+                "cold",
+                cold,
+            );
+        }
+
+        report.save();
+
+        if let Some(cleanup) = &built.cleanup {
+            tiers::cleanup_prefix(cleanup);
+        }
+    }
+
+    fn measure_hot(consumer: &Supertable) -> Vec<(&'static str, Duration)> {
+        crate::superfile::fts::FTS_BATTERY
+            .iter()
+            .map(|q| {
+                let query = q.terms.join(" ");
+                let mode = to_infino_mode(q.mode);
+                let reader = consumer.reader();
+                let _ = reader
+                    .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
+                    .expect("warmup bm25");
+                let mut samples = Vec::with_capacity(HOT_ITERS);
+                for _ in 0..HOT_ITERS {
+                    let t = Instant::now();
+                    let hits = reader
+                        .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
+                        .expect("hot bm25");
+                    std::hint::black_box(hits);
+                    samples.push(t.elapsed());
+                }
+                (q.name, p50(&mut samples))
+            })
+            .collect()
+    }
+
+    fn measure_cold(built: &supertable::IngestResult) -> Vec<(&'static str, Duration)> {
+        crate::superfile::fts::FTS_BATTERY
+            .iter()
+            .map(|q| {
+                let query = q.terms.join(" ");
+                let mode = to_infino_mode(q.mode);
+                let mut samples = Vec::with_capacity(COLD_ITERS);
+                for _ in 0..COLD_ITERS {
+                    let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+                    let t = Instant::now();
+                    let hits = consumer
+                        .reader()
+                        .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
+                        .expect("cold bm25");
+                    std::hint::black_box(hits);
+                    samples.push(t.elapsed());
+                    drop(consumer);
+                    drop(cache_dir);
+                }
+                (q.name, p50(&mut samples))
+            })
+            .collect()
+    }
+}
+
+pub mod vector {
+    use super::*;
+
+    /// Build a vector-only supertable, then measure hot and cold kNN reads.
+    ///
+    /// This is not wired to a Cargo selector yet; it is the per-modality
+    /// runner that the eventual one-binary dispatcher will call.
+    pub fn run(phases: Phases) {
+        if let Err(reason) = tiers::supertable_backend_check() {
+            eprintln!("[supertable_vector] skipped: {reason}");
+            return;
+        }
+
+        let n_docs = supertable::n_docs();
+        let sampler = PeakSampler::start_default();
+        let t0 = Instant::now();
+        let built = supertable::build_on_storage(Modality::Vector);
+        let wall = t0.elapsed();
+        let rss = sampler.stop_stats();
+
+        let mut report = Report::load("supertable_vector");
+        let metrics = ShapeMetrics {
+            wall_ns: wall.as_secs_f64() * 1e9,
+            n_superfiles: built.n_superfiles,
+            peak_rss_bytes: rss.peak_rss_bytes,
+            median_rss_bytes: rss.median_rss_bytes,
+            p90_rss_bytes: rss.p90_rss_bytes,
+        };
+        if phases.build {
+            report.emit(&Section {
+                anchor: "bench/vector/supertable/ingest".into(),
+                title: format!(
+                    "Supertable vector — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
+                    fmt_count(n_docs),
+                    DIM,
+                    supertable::N_COMMIT_CHUNKS
+                ),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+                blocks: vec![Block {
+                    subtitle: String::new(),
+                    headers: vec![
+                        "Shape".into(),
+                        "Time".into(),
+                        "Throughput".into(),
+                        "Superfiles".into(),
+                        "Peak RSS".into(),
+                        "Median RSS".into(),
+                        "P90 RSS".into(),
+                    ],
+                    rows: vec![ingest_row(n_docs, "vector-only", &metrics)],
+                }],
+            });
+        }
+
+        let query = query_vector();
+        if phases.hot {
+            let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
+            let hot = measure_hot(&consumer, &query);
+            drop(consumer);
+            drop(cache_dir);
+            emit_query_rows(
+                &mut report,
+                "bench/vector/supertable/hot",
+                format!(
+                    "Supertable vector — hot search, warm cache / object-store ({} docs × dim={})",
+                    fmt_count(n_docs),
+                    DIM
+                ),
+                "Hot = committed table reopened with a disk cache sized to the index; p50 over repeated vector reads. Δ is vs the previous run.",
+                "hot",
+                hot,
+            );
+        }
+
+        if phases.cold {
+            let cold = measure_cold(&built, &query);
+            emit_query_rows(
+                &mut report,
+                "bench/vector/supertable/cold",
+                format!(
+                    "Supertable vector — cold search, fresh cache / object-store ({} docs × dim={})",
+                    fmt_count(n_docs),
+                    DIM
+                ),
+                "Cold = fresh disk cache + fresh consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.",
+                "cold",
+                cold,
+            );
+        }
+
+        report.save();
+
+        if let Some(cleanup) = &built.cleanup {
+            tiers::cleanup_prefix(cleanup);
+        }
+    }
+
+    fn query_vector() -> Vec<f32> {
+        vec![1.0 / (DIM as f32).sqrt(); DIM]
+    }
+
+    fn search_options() -> VectorSearchOptions {
+        VectorSearchOptions::new()
+            .with_nprobe(VECTOR_NPROBE)
+            .with_rerank_mult(VECTOR_RERANK_MULT)
+    }
+
+    fn measure_hot(consumer: &Supertable, query: &[f32]) -> Vec<(&'static str, Duration)> {
+        let reader = consumer.reader();
+        let _ = reader
+            .vector_search(supertable::VEC_COLUMN, query, TOP_K, search_options())
+            .expect("warmup vector_search");
+        let mut samples = Vec::with_capacity(HOT_ITERS);
+        for _ in 0..HOT_ITERS {
+            let t = Instant::now();
+            let hits = reader
+                .vector_search(supertable::VEC_COLUMN, query, TOP_K, search_options())
+                .expect("hot vector_search");
+            std::hint::black_box(hits);
+            samples.push(t.elapsed());
+        }
+        vec![("knn_default", p50(&mut samples))]
+    }
+
+    fn measure_cold(
+        built: &supertable::IngestResult,
+        query: &[f32],
+    ) -> Vec<(&'static str, Duration)> {
+        let mut samples = Vec::with_capacity(COLD_ITERS);
+        for _ in 0..COLD_ITERS {
+            let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
+            let t = Instant::now();
+            let hits = consumer
+                .reader()
+                .vector_search(supertable::VEC_COLUMN, query, TOP_K, search_options())
+                .expect("cold vector_search");
+            std::hint::black_box(hits);
+            samples.push(t.elapsed());
+            drop(consumer);
+            drop(cache_dir);
+        }
+        vec![("knn_default", p50(&mut samples))]
+    }
+}
+
+pub mod sql {
+    use super::*;
+
+    /// Build a SQL-only supertable, then measure hot and cold `query_sql`
+    /// reads over the scalar SQL battery.
+    ///
+    /// This is not wired to a Cargo selector yet; it is the per-modality
+    /// runner that the eventual one-binary dispatcher will call.
+    pub fn run(phases: Phases) {
+        if let Err(reason) = tiers::supertable_backend_check() {
+            eprintln!("[supertable_sql] skipped: {reason}");
+            return;
+        }
+
+        let n_docs = supertable::n_docs();
+        let sampler = PeakSampler::start_default();
+        let t0 = Instant::now();
+        let built = supertable::build_on_storage(Modality::Sql);
+        let wall = t0.elapsed();
+        let rss = sampler.stop_stats();
+
+        let mut report = Report::load("supertable_sql");
+        let metrics = ShapeMetrics {
+            wall_ns: wall.as_secs_f64() * 1e9,
+            n_superfiles: built.n_superfiles,
+            peak_rss_bytes: rss.peak_rss_bytes,
+            median_rss_bytes: rss.median_rss_bytes,
+            p90_rss_bytes: rss.p90_rss_bytes,
+        };
+        if phases.build {
+            report.emit(&Section {
+                anchor: "bench/sql/supertable/ingest".into(),
+                title: format!(
+                    "Supertable SQL — ingest, multi-segment / object-store ({} rows, {} commits)",
+                    fmt_count(n_docs),
+                    supertable::N_COMMIT_CHUNKS
+                ),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+                blocks: vec![Block {
+                    subtitle: String::new(),
+                    headers: vec![
+                        "Shape".into(),
+                        "Time".into(),
+                        "Throughput".into(),
+                        "Superfiles".into(),
+                        "Peak RSS".into(),
+                        "Median RSS".into(),
+                        "P90 RSS".into(),
+                    ],
+                    rows: vec![ingest_row(n_docs, "SQL", &metrics)],
+                }],
+            });
+        }
+
+        if phases.hot {
+            let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
+            let hot = measure_hot(&consumer);
+            drop(consumer);
+            drop(cache_dir);
+            emit_query_rows(
+                &mut report,
+                "bench/sql/supertable/hot",
+                format!(
+                    "Supertable SQL — hot queries, warm cache / object-store ({} rows)",
+                    fmt_count(n_docs)
+                ),
+                "Hot = committed table reopened with a disk cache sized to the index; p50 over repeated `reader().query_sql(...)` calls. Δ is vs the previous run.",
+                "hot",
+                hot,
+            );
+        }
+
+        if phases.cold {
+            let cold = measure_cold(&built);
+            emit_query_rows(
+                &mut report,
+                "bench/sql/supertable/cold",
+                format!(
+                    "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
+                    fmt_count(n_docs)
+                ),
+                "Cold = fresh disk cache + fresh consumer per iteration, so each query pays the object-store cold open. Δ is vs the previous run.",
+                "cold",
+                cold,
+            );
+        }
+
+        report.save();
+
+        if let Some(cleanup) = &built.cleanup {
+            tiers::cleanup_prefix(cleanup);
+        }
+    }
+
+    fn measure_hot(consumer: &Supertable) -> Vec<(&'static str, Duration)> {
+        crate::superfile::sql::SQL_BATTERY
+            .iter()
+            .map(|q| {
+                let reader = consumer.reader();
+                let _ = reader.query_sql(q.sql).expect("warmup query_sql");
+                let mut samples = Vec::with_capacity(HOT_ITERS);
+                for _ in 0..HOT_ITERS {
+                    let t = Instant::now();
+                    let batches = reader.query_sql(q.sql).expect("hot query_sql");
+                    std::hint::black_box(batches);
+                    samples.push(t.elapsed());
+                }
+                (q.name, p50(&mut samples))
+            })
+            .collect()
+    }
+
+    fn measure_cold(built: &supertable::IngestResult) -> Vec<(&'static str, Duration)> {
+        crate::superfile::sql::SQL_BATTERY
+            .iter()
+            .map(|q| {
+                let mut samples = Vec::with_capacity(COLD_ITERS);
+                for _ in 0..COLD_ITERS {
+                    let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
+                    let t = Instant::now();
+                    let batches = consumer.reader().query_sql(q.sql).expect("cold query_sql");
+                    std::hint::black_box(batches);
+                    samples.push(t.elapsed());
+                    drop(consumer);
+                    drop(cache_dir);
+                }
+                (q.name, p50(&mut samples))
+            })
+            .collect()
+    }
 }

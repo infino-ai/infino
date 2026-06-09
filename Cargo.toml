@@ -270,33 +270,17 @@ path = "tests/superfile/main.rs"
 name = "supertable"
 path = "tests/supertable/main.rs"
 
-# Bench bundles. Superfile-scale FTS/vector benches stay split by
-# topic because their 1M builds are cheap enough to sample independently.
-# Supertable-scale FTS/vector benches share one combined 10M table in the
-# `supertable` bench so the expensive table is built once and reused.
+# Main benchmark bundle. Select tier×modality tests and phases with
+# `cargo bench --bench bench -- <test> <phase>`, e.g.
+# `cargo bench --bench bench -- superfile_fts hot`.
 [[bench]]
-name = "superfile_fts"
-path = "benches/fts/main.rs"
-harness = false
-
-[[bench]]
-name = "superfile_vector"
-path = "benches/vector/main.rs"
-harness = false
-
-[[bench]]
-name = "sql"
-path = "benches/sql/main.rs"
+name = "bench"
+path = "benches/bench/main.rs"
 harness = false
 
 [[bench]]
 name = "sql-diag"
 path = "benches/sql_diag/main.rs"
-harness = false
-
-[[bench]]
-name = "supertable_all"
-path = "benches/supertable/main.rs"
 harness = false
 
 [[bench]]

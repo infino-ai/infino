@@ -34,22 +34,35 @@ second copy just to run correctness or object-store reads.
 ## Invocation
 
 ```sh
-cargo bench --bench superfile_fts
-cargo bench --bench superfile_vector
-cargo bench --bench supertable_all
+# Run every tier × modality test, all phases.
+cargo bench --bench bench
+
+# Run one test, all phases.
+cargo bench --bench bench -- superfile_fts
+cargo bench --bench bench -- superfile_vector
+cargo bench --bench bench -- superfile_sql
+cargo bench --bench bench -- supertable_fts
+cargo bench --bench bench -- supertable_vector
+cargo bench --bench bench -- supertable_sql
+
+# Select phases. Valid phases are: build, hot, cold.
+cargo bench --bench bench -- superfile_sql cold
+cargo bench --bench bench -- supertable_vector build hot
 
 # Smaller local loop.
-INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench superfile_fts
+INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench bench -- superfile_fts hot
 
 # Override the N-writers build row.
-INFINO_BENCH_WRITERS=4 cargo bench --bench superfile_fts
+INFINO_BENCH_WRITERS=4 cargo bench --bench bench -- superfile_fts build
 
 # Refresh the markdown sections in this file.
-INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts
+INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile_fts
 
 # Diagnostics (not part of the default bench loop).
 cargo bench --features bench-diagnostics --bench object-store
 cargo bench --features bench-diagnostics --bench scale -- vector_recall
+cargo bench --bench tombstone-overhead
+cargo bench --bench supertable-update
 ```
 
 ## Object-store backends
@@ -65,34 +78,37 @@ which credentials happen to be set:
 | `azure` | real Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
 
 ```sh
-# Superfile benches: any backend (s3s-fs is the zero-setup default).
-cargo bench --bench superfile_fts
+# Superfile cold tiers: any backend (s3s-fs is the zero-setup default).
+cargo bench --bench bench -- superfile_fts cold
 
-# Supertable bench: real object store only (s3 or azure). s3s-fs lacks the
+# Supertable tests: real object store only (s3 or azure). s3s-fs lacks the
 # multi-commit If-Match CAS the supertable commit needs, so it is rejected.
 INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket \
-  cargo bench --bench supertable_all
+  cargo bench --bench bench -- supertable_fts
 INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... \
-  cargo bench --bench supertable_all
+  cargo bench --bench bench -- supertable_sql cold
 ```
 
 A real-backend run writes under a unique prefix and deletes it on exit; set
 `INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
 emulator self-cleans and reproduces request/byte volume, not network latency.
 
-## Migration Status
+## Test Matrix
 
-Only migrated sections should be treated as current. Sections that still show a
-placeholder are waiting for their custom-harness migration.
+The main bench has six selectable tests:
 
-- FTS superfile: custom harness, artifact reuse fixed.
-- Vector superfile: pending `VectorEngine` migration.
-- SQL: pending `SqlEngine` migration.
-- Supertable object-store: pending custom harness migration.
+| Selector | Tier | Modality |
+|---|---|---|
+| `superfile_fts` | superfile | FTS |
+| `superfile_vector` | superfile | vector |
+| `superfile_sql` | superfile | SQL |
+| `supertable_fts` | supertable | FTS |
+| `supertable_vector` | supertable | vector |
+| `supertable_sql` | supertable | SQL |
 
-See `bench-harness-migration-plan.md` in this worktree for the uncommitted
-working plan.
+Each selector supports `build`, `hot`, and `cold`. If no selector is supplied,
+all six tests run. If no phase is supplied, all three phases run.
 
 ## Code Layout (`infino-bench-utils`)
 

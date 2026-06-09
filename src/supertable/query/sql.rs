@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `Supertable::query_sql` — DataFusion SQL over the supertable.
+//! `SupertableReader::query_sql` — DataFusion SQL over a pinned supertable snapshot.
 //!
 //! ## Public API
 //!
 //! ```ignore
-//! let st: Supertable = ...;
+//! let reader = supertable.reader();
 //! let batches: Vec<RecordBatch> =
-//!     st.reader().query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
+//!     reader.query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
 //! ```
 //!
 //! Sync return type: callers don't need a tokio runtime.
-//! Internally we `block_on` against a single multi-worker Runtime
-//! cached on `SupertableInner` (lazy — first SQL query allocates).
+//! Internally the reader drives the async DataFusion plan through the same
+//! sync→async bridge used by BM25 and vector search.
 //!
 //! ## Strategy
 //!
 //! At `query_sql` time we:
 //!
-//!   1. Pin the manifest (`self.reader()` → `Arc<Manifest>`).
+//!   1. Use the reader's already-pinned `Arc<Manifest>`.
 //!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
 //!   3. `ctx.sql(sql).await.collect().await`.
@@ -72,16 +72,13 @@ impl SupertableReader {
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
-        // Read-consistency is applied when the snapshot is pinned:
-        // `sql_session_context` pins via `self.reader()`, which runs
-        // [`Supertable::ensure_fresh`] before `load_full`. So SQL
-        // honors the same freshness contract as the search APIs
-        // (`reader().bm25_search` / `reader().vector_search`) without a
-        // separate call here.
+        // Read-consistency was applied when `Supertable::reader()` created
+        // this pinned reader. SQL therefore observes the same snapshot as
+        // `bm25_search` and `vector_search` on this handle.
 
         // Build (or reuse the cached) SessionContext for the pinned
         // snapshot — the pushdown-aware SupertableProvider plus the
-        // search TVFs. See [`Supertable::sql_session_context`].
+        // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
 
         let sql = sql.to_owned();
@@ -116,8 +113,8 @@ impl SupertableReader {
     /// segment-skip + row-group/page pruning + lazy tombstone
     /// filtering the read path uses.
     ///
-    /// Callers apply their own freshness policy
-    /// ([`ensure_fresh`](Self::ensure_fresh)) before calling.
+    /// Freshness policy is applied when the reader is created by
+    /// [`Supertable::reader`](crate::supertable::handle::Supertable::reader).
     fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
         // This reader already pins the snapshot; clone is a handful of
         // Arc refcount bumps.
@@ -198,12 +195,9 @@ impl SupertableReader {
         &self,
         expr: datafusion::prelude::Expr,
     ) -> Result<Vec<i128>, QueryError> {
-        // Resolve against the freshest snapshot the consistency
-        // policy allows — the spec requires delete/update predicates
-        // to bind "against the current snapshot at call time".
-        // `sql_session_context` pins via `self.reader()`, which applies
-        // [`Supertable::ensure_fresh`] before `load_full`, so this
-        // honors `Strong` / `BoundedStaleness` like the read APIs do.
+        // Resolve against this reader's pinned snapshot. Callers that need
+        // current-state semantics create a fresh reader immediately before
+        // invoking this helper.
         let ctx = self.sql_session_context()?;
         let id_column = self.options().id_column.clone();
 

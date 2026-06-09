@@ -458,6 +458,14 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     }
 }
 
+/// Backing object store for superfile-shaped warm/cold benches (1M).
+///
+/// Unlike [`supertable_storage_fixture`], this allows the default `s3s_fs`
+/// emulator because superfile-shaped benches do not rely on multi-commit OCC.
+pub async fn superfile_storage_fixture() -> StorageFixture {
+    backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await
+}
+
 fn env_gib(name: &str, default_gib: u64) -> u64 {
     std::env::var(name)
         .ok()

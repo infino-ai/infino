@@ -339,18 +339,23 @@ impl TableProvider for SupertableProvider {
             )
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let bytes = reader
-                .parquet_bytes()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "SQL scan requires eager-opened superfile bytes; reader for {:?} \
-                         was opened via the lazy path which does not materialize the \
-                         full segment",
-                        entry.uri
-                    ))
-                })?
-                .clone();
             let path = entry.uri.storage_path();
+            let bytes = match reader.parquet_bytes() {
+                Some(bytes) => bytes.clone(),
+                None => {
+                    let storage = self.manifest.options.storage.as_ref().ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "SQL scan needs segment bytes for {:?}, but the reader was lazy and no storage backend is attached",
+                            entry.uri
+                        ))
+                    })?;
+                    storage
+                        .get(&path)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(format!("fetch {path}: {e}")))?
+                        .0
+                }
+            };
             let size = bytes.len() as u64;
 
             // Pass 1 (per segment): resolve candidate rows from the
