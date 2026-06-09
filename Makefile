@@ -1,7 +1,8 @@
 .PHONY: check test doctest \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
-        public-api public-api-update
+        public-api public-api-update \
+        python-test python-wheel
 
 check:
 	cargo fmt --check
@@ -93,6 +94,26 @@ asan:
 # exercises the same curated public API a downstream user sees.
 doctest:
 	cargo test --doc
+
+# Python bindings (PyO3 + maturin). Built standalone — `infino-python` is
+# excluded from the cargo workspace, so the core crate never needs a
+# Python toolchain. These targets are self-contained: they create a
+# throwaway venv under `infino-python/.venv` with the build + test deps.
+
+# Build the extension into the venv and run the smoke tests.
+python-test:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip
+	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas
+	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop -m infino-python/Cargo.toml
+	infino-python/.venv/bin/python -m pytest infino-python/tests/ -v
+
+# Build a release abi3 wheel for the current platform into
+# `infino-python/dist/` (one wheel covers CPython >= 3.9).
+python-wheel:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip maturin
+	infino-python/.venv/bin/maturin build --release --out infino-python/dist -m infino-python/Cargo.toml
 
 # Local "pre-PR" check — same gates CI runs
 ci: check doctest coverage

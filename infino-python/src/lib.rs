@@ -329,7 +329,7 @@ fn coerce_to_record_batch(
     let batches = table
         .call_method0("combine_chunks")?
         .call_method0("to_batches")?;
-    let batches = batches.downcast::<PyList>()?;
+    let batches = batches.cast::<PyList>()?;
     if batches.is_empty() {
         return Ok(None);
     }

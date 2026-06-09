@@ -25,4 +25,7 @@ infino = { path = "..", default-features = false }
 arrow = { version = "58", features = ["pyarrow"] }
 arrow-array = "58"
 arrow-schema = "58"
-pyo3 = { version = "0.28", features = ["extension-module"] }
+# `abi3-py39` builds a single wheel compatible with CPython >= 3.9 (the
+# stable ABI), so distribution needs one wheel per platform rather than
+# one per Python version.
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
