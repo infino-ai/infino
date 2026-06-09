@@ -4,11 +4,12 @@
 //! Supertable object-store bench (infino-only entry point).
 //!
 //! Multi-segment ingest to object storage at the supertable scale
-//! (`INFINO_BENCH_SUPERTABLE_DOCS`, default 10M), built through the
-//! production `SupertableWriter::append` + `commit` path. Three index
-//! shapes are measured for apples-to-apples comparison against
-//! single-modality peers: FTS-only, vector-only, and combined FTS +
-//! vector.
+//! (`INFINO_BENCH_DOC_COUNT`, default 10M), built through the production
+//! `SupertableWriter::append` + `commit` path. Three index shapes are
+//! measured for apples-to-apples comparison against single-modality
+//! peers: FTS-only, vector-only, and combined FTS + vector. Pick a
+//! subset with `INFINO_BENCH_SUPERTABLE_SHAPES` (e.g. `fts,vector`);
+//! unset builds all three.
 //!
 //! **Real object store only** (`INFINO_BENCH_STORE=s3` or `azure`). The
 //! multi-commit build relies on conditional `If-Match` PUTs that the
@@ -34,7 +35,8 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench --bench supertable_all
 //! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
 //!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench --bench supertable_all
-//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench supertable_all
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_SHAPES=vector cargo bench --bench supertable_all
 //! ```
 
 use std::process::{Command, Stdio};
@@ -116,6 +118,37 @@ fn modality_for_key(key: &str) -> Option<Modality> {
         .iter()
         .find(|(_, k, _)| *k == key)
         .map(|(_, _, m)| *m)
+}
+
+/// `(label, key)` of the shapes to build, in `SHAPES` order. Reads
+/// `INFINO_BENCH_SUPERTABLE_SHAPES` (e.g. `fts,vector`); unset selects
+/// all. An unknown key exits — silently running the wrong subset would
+/// waste a full run.
+fn selected_shapes() -> Vec<(&'static str, &'static str)> {
+    let requested = match std::env::var("INFINO_BENCH_SUPERTABLE_SHAPES") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return SHAPES.iter().map(|(l, k, _)| (*l, *k)).collect(),
+    };
+    let keys: Vec<&str> = requested
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    for key in &keys {
+        if !SHAPES.iter().any(|(_, k, _)| k == key) {
+            let valid: Vec<&str> = SHAPES.iter().map(|(_, k, _)| *k).collect();
+            eprintln!(
+                "[supertable] unknown shape {key:?}; valid: {}",
+                valid.join(", ")
+            );
+            std::process::exit(2);
+        }
+    }
+    SHAPES
+        .iter()
+        .filter(|(_, k, _)| keys.contains(k))
+        .map(|(l, k, _)| (*l, *k))
+        .collect()
 }
 
 /// Child entry point: build exactly one shape, sample its RSS in this
@@ -225,18 +258,21 @@ pub fn run() {
         return;
     }
 
-    // Parent mode: build each shape in its own isolated subprocess so the
-    // per-shape RSS numbers are independent (see the module docs).
+    // Parent mode: build each selected shape in its own isolated
+    // subprocess so the per-shape RSS numbers are independent (see the
+    // module docs).
+    let shapes = selected_shapes();
     let n_docs = supertable::n_docs();
     eprintln!(
         "[supertable] ingesting {} docs ({} commits) per shape to object storage, \
-         one isolated process per shape...",
+         one isolated process per shape ({} shape(s) selected)...",
         fmt_count(n_docs),
-        supertable::N_COMMIT_CHUNKS
+        supertable::N_COMMIT_CHUNKS,
+        shapes.len()
     );
 
-    let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(SHAPES.len());
-    for (label, key, _) in SHAPES {
+    let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(shapes.len());
+    for (label, key) in shapes {
         eprintln!("[supertable] === shape {label} (isolated process) ===");
         if let Some(metrics) = build_shape_isolated(key) {
             rows.push(ingest_row(n_docs, label, &metrics));

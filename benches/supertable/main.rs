@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! cargo bench --bench supertable_all
-//! INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
+//! INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench supertable_all
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all
 //! ```
 
