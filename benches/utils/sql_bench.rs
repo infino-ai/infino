@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! cargo bench --bench sql
-//! INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench sql
+//! INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench sql
 //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench sql
 //! ```
 

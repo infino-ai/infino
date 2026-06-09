@@ -41,7 +41,7 @@
 //!
 //! ```text
 //! cargo bench --bench sql-diag
-//! INFINO_BENCH_SUPERFILE_DOCS=1000000 cargo bench --bench sql-diag
+//! INFINO_BENCH_DOC_COUNT=1000000 cargo bench --bench sql-diag
 //! INFINO_SQL_DIAG_ITERS=20 cargo bench --bench sql-diag
 //! # delegate to the kernel-vs-query_sql TVF dispatch-tax diagnostic:
 //! INFINO_SQL_DIAG=tvf cargo bench --bench sql-diag
@@ -263,7 +263,7 @@ pub fn run() {
         .unwrap_or(15);
     eprintln!(
         "[sql-diag] scalar scan decomposition: n_docs={} iters={iters} \
-         (knobs: INFINO_BENCH_SUPERFILE_DOCS, INFINO_SQL_DIAG_ITERS)",
+         (knobs: INFINO_BENCH_DOC_COUNT, INFINO_SQL_DIAG_ITERS)",
         fmt_count(n)
     );
 

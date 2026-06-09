@@ -1,13 +1,20 @@
-name: Supertable Benchmark (Azure)
+name: Benchmark (Azure)
 
-# Supertable ingest benchmark on a per-run ephemeral Azure VM in the
-# storage account's region (transfers ride the Azure backbone, not the
-# public internet). The VM builds with an sccache compile cache in Azure
-# Blob — shared across branches — runs the bench, and is torn down.
+# Runs a selected benchmark (`bench` input) on a per-run ephemeral Azure
+# VM in the storage account's region (transfers ride the Azure backbone,
+# not the public internet). The VM builds with an sccache compile cache
+# in Azure Blob — shared across branches — runs the bench, and is torn
+# down.
 
 on:
   workflow_dispatch:
     inputs:
+      bench:
+        description: "What to run."
+        required: false
+        default: supertable_all
+        type: choice
+        options: [supertable_all, fts, vector, combined, sql, all]
       docs:
         description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
         required: false
@@ -67,6 +74,23 @@ jobs:
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_minutes) }}
     steps:
+      - name: Resolve bench selection
+        id: resolve
+        run: |
+          set -euo pipefail
+          # Map the single `bench` input to the cargo target(s) to build
+          # and the supertable shape filter (empty = all three).
+          case "${{ github.event.inputs.bench }}" in
+            supertable_all)      targets="supertable_all";     shapes="" ;;
+            fts|vector|combined) targets="supertable_all";     shapes="${{ github.event.inputs.bench }}" ;;
+            sql)                 targets="sql";                shapes="" ;;
+            all)                 targets="supertable_all sql"; shapes="" ;;
+            *) echo "::error::unknown bench ${{ github.event.inputs.bench }}"; exit 1 ;;
+          esac
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "shapes=$shapes"   >> "$GITHUB_OUTPUT"
+          echo "targets=[$targets] shapes=[$shapes]"
+
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
@@ -177,6 +201,7 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             BENCH_TARGETS='${{ steps.resolve.outputs.targets }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -193,16 +218,21 @@ jobs:
           export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
           sccache --start-server || true
 
-          cargo bench --bench supertable_all --no-run
+          # Build each selected target and record "<target><TAB><binary>"
+          # so the run step execs each directly — no cargo at run time
+          # means no re-fingerprint / rebuild. Cargo underscores the
+          # artifact name, so a hyphenated target maps via ${t//-/_}.
+          : > "$HOME/bench-bins"
+          for t in $BENCH_TARGETS; do
+            cargo bench --bench "$t" --no-run
+            stem="${t//-/_}"
+            BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name "${stem}-*" \
+                     -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+            test -n "$BIN" && test -x "$BIN" || { echo "::error::binary for $t not found"; exit 1; }
+            printf '%s\t%s\n' "$t" "$BIN" >> "$HOME/bench-bins"
+            echo "built $t: $BIN"
+          done
           sccache --show-stats || true
-
-          # Record the built binary so the run step execs it directly —
-          # no cargo in the run step means no re-fingerprint / rebuild.
-          BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name 'supertable_all-*' \
-                   -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
-          test -n "$BIN" && test -x "$BIN" || { echo "::error::bench binary not found"; exit 1; }
-          echo "$BIN" > "$HOME/bench-bin"
-          echo "bench binary: $BIN"
           REMOTE
 
       - name: Run benchmark (on VM)
@@ -213,7 +243,8 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
-             INFINO_BENCH_SUPERTABLE_DOCS='${{ github.event.inputs.docs }}' \
+             INFINO_BENCH_DOC_COUNT='${{ github.event.inputs.docs }}' \
+             BENCH_SHAPES='${{ steps.resolve.outputs.shapes }}' \
              KEEP='${{ github.event.inputs.keep_table }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
           set -euo pipefail
@@ -225,10 +256,16 @@ jobs:
           # max so commits don't hit EMFILE ("too many open files").
           ulimit -n "$(ulimit -Hn)"
           echo "fd limit: $(ulimit -n)"
-          BIN="$(cat "$HOME/bench-bin")"
-          echo "===== SUPERTABLE BENCHMARK START ====="
-          "$BIN" 2>&1
-          echo "===== SUPERTABLE BENCHMARK END ====="
+
+          # Exec each built target. The supertable target honours the
+          # shape filter; others ignore it.
+          while IFS=$'\t' read -r t BIN; do
+            [ "$t" = "supertable_all" ] && export INFINO_BENCH_SUPERTABLE_SHAPES="$BENCH_SHAPES"
+            echo "===== BENCH ${t} START ====="
+            "$BIN" 2>&1
+            echo "===== BENCH ${t} END ====="
+            unset INFINO_BENCH_SUPERTABLE_SHAPES
+          done < "$HOME/bench-bins"
           REMOTE
 
       - name: Summarize results
@@ -240,7 +277,7 @@ jobs:
           SUMMARY="$GITHUB_STEP_SUMMARY"
           LOG=/tmp/bench.clean
           {
-            echo "## Supertable benchmark — Azure (${{ github.event.inputs.location }})"
+            echo "## Benchmark \`${{ github.event.inputs.bench }}\` — Azure (${{ github.event.inputs.location }})"
             echo ""
             echo "- docs: \`${{ github.event.inputs.docs }}\` · vm: \`${{ github.event.inputs.vm_size }}\` · ref: \`${{ github.event.inputs.ref }}\`"
             echo ""

@@ -101,20 +101,16 @@ pub const SUPERFILE_DOCS: usize = 1_000_000;
 /// over the object store.
 pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
-/// Document count for the **superfile** test — a single-segment index
-/// built and queried entirely **in memory**. Defaults to
-/// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
-/// for a quicker local loop or a larger stress run.
+/// Superfile doc count — single-segment, in-memory. Default 1M; override
+/// with `INFINO_BENCH_DOC_COUNT`.
 pub fn superfile_docs() -> usize {
-    docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
+    docs_from_env("INFINO_BENCH_DOC_COUNT", SUPERFILE_DOCS)
 }
 
-/// Document count for the **supertable** test — a multi-segment table
-/// committed to and queried from **object storage**. Defaults to
-/// [`SUPERTABLE_DOCS`] (10M); override with
-/// `INFINO_BENCH_SUPERTABLE_DOCS`.
+/// Supertable doc count — multi-segment, object storage. Default 10M;
+/// override with `INFINO_BENCH_DOC_COUNT`.
 pub fn supertable_docs() -> usize {
-    docs_from_env("INFINO_BENCH_SUPERTABLE_DOCS", SUPERTABLE_DOCS)
+    docs_from_env("INFINO_BENCH_DOC_COUNT", SUPERTABLE_DOCS)
 }
 
 /// Parse a positive doc-count override from `var`, falling back to

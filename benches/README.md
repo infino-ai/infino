@@ -23,10 +23,10 @@ second copy just to run correctness or object-store reads.
 ## Bench Shapes
 
 - **Superfile** — single-artifact, in-memory read path. Default scale: `1M`
-  docs, controlled by `INFINO_BENCH_SUPERFILE_DOCS`.
+  docs, controlled by `INFINO_BENCH_DOC_COUNT`.
 - **Supertable** — multi-artifact table committed to object storage and read
   through hot/cold table paths. Default scale: `10M` docs, controlled by
-  `INFINO_BENCH_SUPERTABLE_DOCS`.
+  `INFINO_BENCH_DOC_COUNT`.
 - **Writer count** — build rows report `1 writer` and `N writers`. `N` defaults
   to the machine's logical core count and is controlled by
   `INFINO_BENCH_WRITERS`.
@@ -40,7 +40,7 @@ cargo bench --bench supertable_all
 
 # Smaller local loop. Doc counts are plain integers (a `100K`/`1M`-style
 # suffix is not parsed and silently falls back to the default).
-INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench superfile_fts
+INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench superfile_fts
 
 # Override the N-writers build row.
 INFINO_BENCH_WRITERS=4 cargo bench --bench superfile_fts
