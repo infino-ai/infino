@@ -260,7 +260,7 @@ jobs:
       # Seed the report's baseline with main's metrics so the run renders
       # deltas (vs main) instead of "(new)". Skipped on baseline runs, which
       # want a clean baseline. Best-effort: no blob = first run = "(new)".
-      - name: Restore baseline (diff vs latest main)
+      - name: Restore main baseline
         if: ${{ !inputs.update_baseline }}
         env:
           ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
@@ -327,11 +327,10 @@ jobs:
           done < "$HOME/bench-bins"
           REMOTE
 
-      # Main only: publish the metrics as the latest-main pointer (overwritten,
-      # what PRs diff against) and an immutable per-commit history blob (the
-      # trend). Runs only on a successful bench, so a broken run never
-      # poisons the baseline.
-      - name: Publish baseline + history (main only)
+      # Publish the metrics as the latest-main pointer (overwritten, what PRs
+      # diff against) and an immutable per-commit history blob (the trend).
+      # Runs only on a successful bench, so a broken run never poisons it.
+      - name: Publish baseline + history
         # success() is implicit, but explicit here: never publish from a
         # failed/partial bench run.
         if: ${{ inputs.update_baseline && success() }}
@@ -381,7 +380,7 @@ jobs:
 
       # Plot P90 RSS over the last (≤10) main commits as Mermaid line charts in
       # the run summary. Informational: a fetch hiccup drops a point, never fails.
-      - name: Trend (main only)
+      - name: Render P90 RSS trend chart
         if: ${{ inputs.update_baseline && success() }}
         env:
           ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
@@ -403,7 +402,9 @@ jobs:
           built=""; for t in $TARGETS; do built="$built $(jname "$t")"; done
           echo "## Trend — P90 RSS (last 10 main commits)" >> "$SUMMARY"
 
-          while IFS=$'\t' read -r jb key title; do
+          # Loops read on dedicated FDs (3, 4) so the az calls in the body —
+          # which read stdin — can't consume the loop input.
+          while IFS=$'\t' read -r -u 3 jb key title; do
             jb="${jb#"${jb%%[![:space:]]*}"}"   # strip leading indent from heredoc
             case " $built " in *" $jb "*) ;; *) continue ;; esac
 
@@ -413,7 +414,7 @@ jobs:
                     | sort -k2 -n | tail -10)"
 
             labels=(); values=(); n=0
-            while IFS=$'\t' read -r name ts sha; do
+            while IFS=$'\t' read -r -u 4 name ts sha; do
               [ -n "$name" ] || continue
               az storage blob download -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
                 -n "$name" -f /tmp/h.json -o none 2>/dev/null || continue
@@ -422,7 +423,7 @@ jobs:
               labels+=("${sha:0:7}")
               values+=("$(awk -v b="$v" 'BEGIN{printf "%.0f", b/1048576}')")
               n=$((n+1))
-            done <<< "$rows"
+            done 4<<< "$rows"
 
             if [ "$n" -lt 2 ]; then
               echo "_${title}: ${n} data point(s) — need ≥2 to chart._" >> "$SUMMARY"
@@ -437,7 +438,7 @@ jobs:
               printf '    line [%s]\n' "$(IFS=,; echo "${values[*]}")"
               echo '```'
             } >> "$SUMMARY"
-          done <<< "$SERIES"
+          done 3<<< "$SERIES"
 
       - name: Summarize results
         if: always()
