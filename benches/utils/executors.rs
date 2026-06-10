@@ -24,6 +24,44 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() - 1) / 2]
 }
 
+/// Cold timings for one query, split at the open/search boundary:
+/// `open` is the fresh-consumer open (consumer + manifest + every
+/// segment reader), `search` is the first query over the opened but
+/// data-cold table. Timed separately so cold search latency never
+/// bills the one-time open bookkeeping — the same cold-open vs
+/// cold-first-search split the quick-iter object-store harness uses.
+#[derive(Clone, Copy)]
+pub struct ColdTiming {
+    pub open: Duration,
+    pub search: Duration,
+}
+
+/// Force-open every segment reader on the consumer's pinned snapshot —
+/// the "cold open" phase of a cold iteration. Runs the same per-segment
+/// open the query fan-out would lazily trigger (in-memory tier → disk
+/// cache admit → lazy range-GET fallback), concurrently like the query
+/// path, so the subsequent timed search pays only the search work.
+pub fn open_all_segments(consumer: &infino::supertable::Supertable) {
+    let reader = consumer.reader();
+    let manifest = reader.manifest();
+    let store = &manifest.options.store;
+    let disk_cache = manifest.options.disk_cache.as_ref();
+    let storage = manifest.options.storage.as_ref();
+    crate::tiers::block_on(async {
+        futures::future::try_join_all(manifest.superfiles.iter().map(|e| {
+            infino::supertable::query::superfile_reader::superfile_reader(
+                store,
+                disk_cache,
+                storage,
+                &e.uri,
+                e.subsection_offsets.as_ref(),
+            )
+        }))
+        .await
+        .expect("cold open: open segment readers");
+    });
+}
+
 pub mod fts {
     use super::*;
     use std::collections::HashMap;
@@ -263,9 +301,11 @@ pub mod fts {
     }
 
     /// Measure the cold battery: for each query, `iters` fresh-reader
-    /// opens, timing one search each. `open_fresh` returns a guard that
-    /// both implements [`FtsRead`] and owns the cache/consumer resources
-    /// it must drop after the timed read.
+    /// opens, timing the open and one search **separately** (see
+    /// [`ColdTiming`]). `open_fresh` returns a guard that both
+    /// implements [`FtsRead`] and owns the cache/consumer resources it
+    /// must drop after the timed read; the guard's constructor performs
+    /// the full open (consumer + segment readers).
     pub fn measure_cold<G: FtsRead>(
         open_fresh: impl Fn() -> G,
         battery: &[FtsQuery],
@@ -273,7 +313,7 @@ pub mod fts {
         k: usize,
         iters: usize,
         log_prefix: &str,
-    ) -> HashMap<&'static str, Duration> {
+    ) -> HashMap<&'static str, ColdTiming> {
         let mut out = HashMap::new();
         for q in battery {
             eprintln!(
@@ -282,16 +322,25 @@ pub mod fts {
             );
             let query = q.terms.join(" ");
             let mode = to_infino_mode(q.mode);
-            let mut samples = Vec::with_capacity(iters);
+            let mut open_samples = Vec::with_capacity(iters);
+            let mut search_samples = Vec::with_capacity(iters);
             for _ in 0..iters {
+                let t_open = Instant::now();
                 let guard = open_fresh();
+                open_samples.push(t_open.elapsed());
                 let t = Instant::now();
                 let rows = guard.bm25_rows(column, &query, k, mode);
-                samples.push(t.elapsed());
+                search_samples.push(t.elapsed());
                 std::hint::black_box(rows);
                 drop(guard);
             }
-            out.insert(q.name, p50(&mut samples));
+            out.insert(
+                q.name,
+                ColdTiming {
+                    open: p50(&mut open_samples),
+                    search: p50(&mut search_samples),
+                },
+            );
         }
         out
     }
@@ -326,7 +375,7 @@ pub mod fts {
     fn search_row(
         name: &'static str,
         warm: Option<&HashMap<&'static str, FtsQueryStat>>,
-        cold: Option<&HashMap<&'static str, Duration>>,
+        cold: Option<&HashMap<&'static str, ColdTiming>>,
     ) -> Vec<Cell> {
         let mut cells = vec![text(name)];
         if let Some(warm) = warm {
@@ -334,11 +383,16 @@ pub mod fts {
         }
         if let Some(cold) = cold {
             match cold.get(&name) {
-                Some(d) => {
-                    let ns = d.as_secs_f64() * NS_PER_SEC;
-                    cells.push(metric(ns, fmt_time(ns), Better::Lower));
+                Some(t) => {
+                    let open_ns = t.open.as_secs_f64() * NS_PER_SEC;
+                    let search_ns = t.search.as_secs_f64() * NS_PER_SEC;
+                    cells.push(metric(open_ns, fmt_time(open_ns), Better::Lower));
+                    cells.push(metric(search_ns, fmt_time(search_ns), Better::Lower));
                 }
-                None => cells.push(text("—")),
+                None => {
+                    cells.push(text("—"));
+                    cells.push(text("—"));
+                }
             }
         }
         cells
@@ -355,7 +409,7 @@ pub mod fts {
         title: String,
         note: &str,
         warm: Option<&[FtsQueryStat]>,
-        cold: Option<&HashMap<&'static str, Duration>>,
+        cold: Option<&HashMap<&'static str, ColdTiming>>,
         probes: Option<&[(&'static str, Duration, Duration)]>,
     ) {
         let warm_map: Option<HashMap<&'static str, FtsQueryStat>> =
@@ -370,7 +424,8 @@ pub mod fts {
             );
         }
         if cold.is_some() {
-            header_cols.push("cold".to_string());
+            header_cols.push("cold open".to_string());
+            header_cols.push("cold search".to_string());
         }
 
         let or_block = Block {
@@ -622,7 +677,8 @@ pub mod vector {
         }
     }
 
-    /// Cold p50 (ns): `iters` fresh-reader opens, timing one search each.
+    /// Cold p50s: `iters` fresh-reader opens, timing the open and one
+    /// search separately (see [`ColdTiming`]).
     pub fn measure_cold<G: VectorRead>(
         open_fresh: &impl Fn() -> G,
         column: &str,
@@ -631,17 +687,23 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
         iters: usize,
-    ) -> f64 {
-        let mut samples = Vec::with_capacity(iters);
+    ) -> ColdTiming {
+        let mut open_samples = Vec::with_capacity(iters);
+        let mut search_samples = Vec::with_capacity(iters);
         for _ in 0..iters {
+            let t_open = Instant::now();
             let guard = open_fresh();
+            open_samples.push(t_open.elapsed());
             let t0 = Instant::now();
             let hits = guard.topk_global(column, query, k, nprobe, rerank);
-            samples.push(t0.elapsed());
+            search_samples.push(t0.elapsed());
             black_box(hits);
             drop(guard);
         }
-        p50(&mut samples).as_secs_f64() * NS_PER_SEC
+        ColdTiming {
+            open: p50(&mut open_samples),
+            search: p50(&mut search_samples),
+        }
     }
 
     /// One rendered recall-table row.
@@ -650,7 +712,7 @@ pub mod vector {
         pub params: String,
         pub recall: String,
         pub warm: Option<VecTiming>,
-        pub cold_ns: Option<f64>,
+        pub cold: Option<ColdTiming>,
     }
 
     fn time_cell(ns: f64) -> Cell {
@@ -705,7 +767,8 @@ pub mod vector {
             );
         }
         if include_cold {
-            headers.push("cold".to_string());
+            headers.push("cold open".to_string());
+            headers.push("cold search".to_string());
         }
         let body: Vec<Vec<Cell>> = rows
             .iter()
@@ -721,10 +784,16 @@ pub mod vector {
                     }
                 }
                 if include_cold {
-                    cells.push(match r.cold_ns {
-                        Some(ns) => time_cell(ns),
-                        None => text("—"),
-                    });
+                    match r.cold {
+                        Some(t) => {
+                            cells.push(time_cell(t.open.as_secs_f64() * NS_PER_SEC));
+                            cells.push(time_cell(t.search.as_secs_f64() * NS_PER_SEC));
+                        }
+                        None => {
+                            cells.push(text("—"));
+                            cells.push(text("—"));
+                        }
+                    }
                 }
                 cells
             })
@@ -806,7 +875,7 @@ pub mod vector {
                     recall: format!("{:.3}", c.recall),
                     warm: include_warm
                         .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
-                    cold_ns: include_cold.then(|| {
+                    cold: include_cold.then(|| {
                         measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
                     }),
                 }),
@@ -815,7 +884,7 @@ pub mod vector {
                     params: "—".into(),
                     recall: "—".into(),
                     warm: None,
-                    cold_ns: None,
+                    cold: None,
                 }),
             }
         }
@@ -825,7 +894,7 @@ pub mod vector {
             recall: "—".into(),
             warm: include_warm
                 .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
-            cold_ns: include_cold.then(|| {
+            cold: include_cold.then(|| {
                 measure_cold(
                     &open_cold,
                     column,
@@ -1259,28 +1328,38 @@ pub mod sql {
         });
     }
 
-    /// Cold scalar-battery p50: `iters` fresh-reader opens per query.
+    /// Cold scalar-battery p50s: `iters` fresh-reader opens per query,
+    /// timing the open and the query separately (see [`ColdTiming`]).
     pub fn measure_cold<G: SqlRead>(
         open_fresh: impl Fn() -> G,
         iters: usize,
         log_prefix: &str,
-    ) -> HashMap<&'static str, Duration> {
+    ) -> HashMap<&'static str, ColdTiming> {
         let mut out = HashMap::new();
         for q in SQL_BATTERY {
             eprintln!(
                 "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
                 q.name
             );
-            let mut samples = Vec::with_capacity(iters);
+            let mut open_samples = Vec::with_capacity(iters);
+            let mut search_samples = Vec::with_capacity(iters);
             for _ in 0..iters {
+                let t_open = Instant::now();
                 let guard = open_fresh();
+                open_samples.push(t_open.elapsed());
                 let t0 = Instant::now();
                 let rows = guard.query_rows(q.sql);
-                samples.push(t0.elapsed());
+                search_samples.push(t0.elapsed());
                 black_box(rows);
                 drop(guard);
             }
-            out.insert(q.name, p50(&mut samples));
+            out.insert(
+                q.name,
+                ColdTiming {
+                    open: p50(&mut open_samples),
+                    search: p50(&mut search_samples),
+                },
+            );
         }
         out
     }
@@ -1290,28 +1369,30 @@ pub mod sql {
         anchor: &str,
         title: String,
         note: &str,
-        cold: &HashMap<&'static str, Duration>,
+        cold: &HashMap<&'static str, ColdTiming>,
     ) {
+        let time_cell = |ns: f64| {
+            if ns.is_finite() {
+                metric(ns, fmt_time(ns), Better::Lower)
+            } else {
+                text("—")
+            }
+        };
         report.emit(&Section {
             anchor: anchor.into(),
             title,
             note: note.into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec!["Query".into(), "cold".into()],
+                headers: vec!["Query".into(), "cold open".into(), "cold search".into()],
                 rows: SQL_BATTERY
                     .iter()
                     .map(|q| {
-                        let ns = cold
+                        let (open_ns, search_ns) = cold
                             .get(&q.name)
-                            .map(|d| d.as_secs_f64() * 1e9)
-                            .unwrap_or(f64::NAN);
-                        let cell = if ns.is_finite() {
-                            metric(ns, fmt_time(ns), Better::Lower)
-                        } else {
-                            text("—")
-                        };
-                        vec![text(q.name), cell]
+                            .map(|t| (t.open.as_secs_f64() * 1e9, t.search.as_secs_f64() * 1e9))
+                            .unwrap_or((f64::NAN, f64::NAN));
+                        vec![text(q.name), time_cell(open_ns), time_cell(search_ns)]
                     })
                     .collect(),
             }],

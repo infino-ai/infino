@@ -50,6 +50,7 @@ pub mod fts {
     use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
 
     use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
+    use crate::executors::ColdTiming;
     use crate::executors::fts as exec_fts;
     use crate::executors::fts::{FTS_BATTERY, FtsRead};
     use crate::harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index};
@@ -379,7 +380,7 @@ pub mod fts {
 
     /// Cold tier: commit the same bytes to object storage, then read each
     /// query through the production cold path.
-    fn measure_cold_queries(index: &InfinoFtsIndex) -> HashMap<&'static str, Duration> {
+    fn measure_cold_queries(index: &InfinoFtsIndex) -> HashMap<&'static str, ColdTiming> {
         eprintln!(
             "[superfile_fts] uploading measured 1-writer artifact to object storage for cold tier..."
         );
@@ -402,14 +403,13 @@ pub mod fts {
         )
     }
 
-    /// Cold-tier guard: a fresh disk cache per open. The timed
-    /// `bm25_rows` pays the full object-store cold open + read through
-    /// the production `DiskCacheStore` path (matches the prior superfile
-    /// cold semantics: open is inside the timed region).
+    /// Cold-tier guard: a fresh disk cache per open. The constructor
+    /// performs the cold reader open (footer + section admit through
+    /// the production `DiskCacheStore` path), so the timed `bm25_rows`
+    /// pays only the cold search — open and search report separately.
     struct SuperfileColdGuard {
         _cache_dir: tempfile::TempDir,
-        cache: Arc<infino::supertable::reader_cache::DiskCacheStore>,
-        uri: infino::supertable::manifest::SuperfileUri,
+        reader: Arc<infino::superfile::SuperfileReader>,
     }
 
     impl SuperfileColdGuard {
@@ -418,10 +418,10 @@ pub mod fts {
             uri: infino::supertable::manifest::SuperfileUri,
         ) -> Self {
             let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
+            let reader = tiers::block_on(async { cache.reader(&uri).await.expect("cold reader") });
             Self {
                 _cache_dir: cache_dir,
-                cache,
-                uri,
+                reader,
             }
         }
     }
@@ -429,8 +429,7 @@ pub mod fts {
     impl FtsRead for SuperfileColdGuard {
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize {
             tiers::block_on(async {
-                let reader = self.cache.reader(&self.uri).await.expect("cold reader");
-                reader
+                self.reader
                     .bm25_hits_async(column, query, k, mode)
                     .await
                     .expect("cold bm25")
@@ -889,8 +888,6 @@ pub mod sql {
     //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile sql
     //! ```
 
-    use std::time::Duration;
-
     use crate::executors::sql as exec_sql;
     use crate::executors::sql::SqlRead;
     use infino::supertable::Supertable;
@@ -1078,7 +1075,7 @@ pub mod sql {
 
     fn measure_cold_queries(
         rows: &[SqlRow<'_>],
-    ) -> std::collections::HashMap<&'static str, Duration> {
+    ) -> std::collections::HashMap<&'static str, crate::executors::ColdTiming> {
         const COLD_ITERS: usize = 5;
         let artifact = build_cold_artifact(rows);
         eprintln!(
@@ -1088,6 +1085,7 @@ pub mod sql {
         let cold = exec_sql::measure_cold(
             || {
                 let (cache_dir, table) = open_cold_consumer(&artifact);
+                crate::executors::open_all_segments(&table);
                 SqlColdGuard {
                     _cache_dir: cache_dir,
                     table,

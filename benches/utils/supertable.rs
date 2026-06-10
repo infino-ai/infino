@@ -149,9 +149,12 @@ fn run_child_shape(key: &str) {
         modality_label(modality),
         fmt_count(supertable::n_docs()),
     );
+    // Corpus is generated to disk + mmapped BEFORE the sampler so the
+    // measured window covers the engine only.
+    let corpus = supertable::prepare_corpus(modality);
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
-    let built = supertable::build_on_storage(modality);
+    let built = supertable::build_on_storage(modality, &corpus);
     let wall = t0.elapsed();
     let rss = sampler.stop_stats();
 
@@ -405,9 +408,11 @@ pub mod fts {
                 fmt_count(n_docs),
             );
         }
+        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
+        let corpus = supertable::prepare_corpus(Modality::Fts);
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Fts);
+        let built = supertable::build_on_storage(Modality::Fts, &corpus);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
         let metrics = ShapeMetrics {
@@ -520,7 +525,7 @@ pub mod fts {
 
     fn measure_cold(
         built: &supertable::IngestResult,
-    ) -> std::collections::HashMap<&'static str, Duration> {
+    ) -> std::collections::HashMap<&'static str, crate::executors::ColdTiming> {
         exec_fts::measure_cold(
             || SupertableColdGuard::open(built),
             FTS_BATTERY,
@@ -531,8 +536,10 @@ pub mod fts {
         )
     }
 
-    /// Cold-tier guard: a fresh disk cache + consumer per open; the timed
-    /// `bm25_rows` pays the object-store cold open on the empty cache.
+    /// Cold-tier guard: a fresh disk cache + consumer per open. The
+    /// constructor performs the full cold open (consumer + manifest +
+    /// every segment reader), so the timed `bm25_rows` pays only the
+    /// cold search work — open and search are reported separately.
     struct SupertableColdGuard {
         _cache_dir: TempDir,
         consumer: Supertable,
@@ -541,6 +548,7 @@ pub mod fts {
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+            crate::executors::open_all_segments(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -569,7 +577,7 @@ pub mod fts {
 
 pub mod vector {
     use super::*;
-    use crate::corpus::{self, MmapVectorCorpus};
+    use crate::corpus;
     use crate::executors::vector as exec_vec;
     use crate::executors::vector::VectorRead;
 
@@ -579,10 +587,6 @@ pub mod vector {
     const N_CALIBRATION_QUERIES: usize = 100;
     const DEFAULT_NPROBE: usize = VECTOR_NPROBE;
     const DEFAULT_RERANK_MULT: usize = VECTOR_RERANK_MULT;
-    /// Vector-corpus seed. Must match `ingest::supertable`'s `CORPUS_VEC_SEED`
-    /// so the regenerated ground-truth vectors are bit-identical to the rows
-    /// that were ingested (asserted by `stream_matches_mmap_vector_corpus`).
-    const CORPUS_VEC_SEED: u64 = 1;
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
@@ -609,9 +613,13 @@ pub mod vector {
                 fmt_count(n_docs),
             );
         }
+        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
+        // Kept alive for the search phase: the same mmap backs the
+        // ground-truth recall measurement instead of a regeneration.
+        let corpus = supertable::prepare_corpus(Modality::Vector);
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Vector);
+        let built = supertable::build_on_storage(Modality::Vector, &corpus);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
 
@@ -650,15 +658,16 @@ pub mod vector {
         }
 
         if phases.warm || phases.cold {
-            // Regenerate the ingested vectors (same seed → bit-identical to
-            // what was committed) to compute brute-force ground truth.
+            // The ingested vectors are still mmapped from the prepared
+            // corpus — reuse them for brute-force ground truth instead
+            // of regenerating 10M×384 floats.
             eprintln!(
-                "[supertable_vector] regenerating {}×{DIM} corpus + brute-force ground truth...",
-                fmt_count(n_docs),
+                "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
             );
-            let vectors =
-                MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true);
-            let vslice = vectors.as_slice();
+            let vslice = corpus
+                .vectors()
+                .expect("vector modality prepared a vector corpus")
+                .as_slice();
             let q_correct = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -748,6 +757,7 @@ pub mod vector {
     impl SupertableVecColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
+            crate::executors::open_all_segments(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -795,9 +805,11 @@ pub mod sql {
                 fmt_count(n_docs),
             );
         }
+        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
+        let corpus = supertable::prepare_corpus(Modality::Sql);
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Sql);
+        let built = supertable::build_on_storage(Modality::Sql, &corpus);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
 
@@ -914,6 +926,7 @@ pub mod sql {
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
+            crate::executors::open_all_segments(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,

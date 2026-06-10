@@ -83,8 +83,10 @@ pub fn ensure_fts_ingest(reason: &str) -> &'static IngestResult {
         );
     }
     FTS_INGEST.get_or_init(|| {
+        // Corpus generated before the timed window — engine-only timing.
+        let corpus = supertable::prepare_corpus(Modality::Fts);
         let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Fts);
+        let built = supertable::build_on_storage(Modality::Fts, &corpus);
         let _ = FTS_BUILD_NS.set(t0.elapsed().as_secs_f64() * SEC_TO_NANOS);
         eprintln!(
             "[supertable_fts] ingest OK: {} superfiles ({})",
@@ -112,8 +114,10 @@ pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
         );
     }
     VEC_INGEST.get_or_init(|| {
+        // Corpus generated before the timed window — engine-only timing.
+        let corpus = supertable::prepare_corpus(Modality::Vector);
         let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Vector);
+        let built = supertable::build_on_storage(Modality::Vector, &corpus);
         let _ = VEC_BUILD_NS.set(t0.elapsed().as_secs_f64() * SEC_TO_NANOS);
         eprintln!(
             "[supertable_vec] ingest OK: {} superfiles ({})",
