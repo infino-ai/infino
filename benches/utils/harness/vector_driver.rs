@@ -127,14 +127,18 @@ pub fn run_vector_with_index<E: VectorEngine>(
         });
     }
 
-    let mut queries_out = Vec::with_capacity(queries.len());
-    for q in queries {
+    // One battery-level progress line; per-query results land in the
+    // report table, so per-query progress lines are just noise.
+    if !queries.is_empty() {
         eprintln!(
-            "[harness/vector] {}: warm search query {} ({} timed iters)...",
+            "[harness/vector] {}: warm search battery ({} queries × {} timed iters)...",
             E::name(),
-            q.name,
+            queries.len(),
             cfg.iters,
         );
+    }
+    let mut queries_out = Vec::with_capacity(queries.len());
+    for q in queries {
         let sampler = PeakSampler::start_default();
         let warm = E::read(&index, q.vector, cfg.k, q.search);
         let hit_ids: Vec<u64> = warm.iter().map(|h: &VectorHit| h.doc_id).collect();

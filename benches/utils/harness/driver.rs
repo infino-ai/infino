@@ -130,14 +130,18 @@ pub fn run_fts_with_index<E: FtsEngine>(
     }
 
     // ── read: per-query warmup + timed iters ─────────────────────────
-    let mut queries_out = Vec::with_capacity(queries.len());
-    for q in queries {
+    // One battery-level progress line; per-query results land in the
+    // report table, so per-query progress lines are just noise.
+    if !queries.is_empty() {
         eprintln!(
-            "[harness/fts] {}: warm search query {} ({} timed iters)...",
+            "[harness/fts] {}: warm search battery ({} queries × {} timed iters)...",
             E::name(),
-            q.name,
+            queries.len(),
             iters,
         );
+    }
+    let mut queries_out = Vec::with_capacity(queries.len());
+    for q in queries {
         let sampler = PeakSampler::start_default();
         // Warmup (fault pages, prime caches) — not timed.
         let warm = E::read(&index, q.terms, k, q.mode);

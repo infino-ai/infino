@@ -100,14 +100,18 @@ pub fn run_sql_with_index<E: SqlEngine>(
         });
     }
 
-    let mut queries_out = Vec::with_capacity(queries.len());
-    for q in queries {
+    // One battery-level progress line; per-query results land in the
+    // report table, so per-query progress lines are just noise.
+    if !queries.is_empty() {
         eprintln!(
-            "[harness/sql] {}: warm query {} ({} timed iters)...",
+            "[harness/sql] {}: warm query battery ({} queries × {} timed iters)...",
             E::name(),
-            q.name,
+            queries.len(),
             cfg.iters,
         );
+    }
+    let mut queries_out = Vec::with_capacity(queries.len());
+    for q in queries {
         let sampler = PeakSampler::start_default();
         let warm = E::read(&index, q.sql);
         let mut samples = Vec::with_capacity(cfg.iters.max(1));
