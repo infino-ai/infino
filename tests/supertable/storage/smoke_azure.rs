@@ -479,6 +479,7 @@ async fn supertable_real_azure_round_trip() {
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
+                None,
             )
             .map_err(|e| format!("cold BM25 over real Azure: {e}"))?;
         if bm25_hits.is_empty() {

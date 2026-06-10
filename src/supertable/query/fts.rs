@@ -372,14 +372,34 @@ impl SupertableReader {
         query: &str,
         k: usize,
         mode: BoolMode,
+        projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
             let scalar_schema = self.options().scalar_schema();
             let output_schema = output_schema_with_score(&scalar_schema);
-            let batch = resolve_hits(self, &hits, &scalar_schema, &output_schema, None)
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            // `projection` selects columns by name (any of `_id`, the
+            // visible scalar columns, or the trailing `score`); `None`
+            // returns the whole row. Names are resolved to `output_schema`
+            // indices and forwarded to the shared `resolve_hits`, which
+            // decodes only the projected columns.
+            let indices: Option<Vec<usize>> = match projection {
+                Some(names) => Some(
+                    names
+                        .iter()
+                        .map(|name| {
+                            output_schema.index_of(name).map_err(|_| {
+                                QueryError::Execute(format!("bm25_search: unknown column {name:?}"))
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                None => None,
+            };
+            let batch =
+                resolve_hits(self, &hits, &scalar_schema, &output_schema, indices.as_deref())
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
             Ok(vec![batch])
         })
     }
@@ -800,7 +820,7 @@ mod tests {
         // driven on a throwaway runtime. The supertable reader below
         // uses its sync public API.
         let oracle_hits =
-            block_on(oracle.bm25_search("title", "nimblefox", 5, BoolMode::Or)).expect("oracle");
+            block_on(oracle.bm25_hits_async("title", "nimblefox", 5, BoolMode::Or)).expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
         let oracle_set: std::collections::HashSet<u32> =

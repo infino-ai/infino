@@ -2287,7 +2287,7 @@ mod tests {
         let store = &st.options().store;
         let sf_reader = store.reader(&segment.uri).expect("reader");
         let hits = sf_reader
-            .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .bm25_hits_async("title", "alpha", 10, BoolMode::Or)
             .await
             .expect("bm25");
         // All 4 docs contain "alpha"; should all be returned.

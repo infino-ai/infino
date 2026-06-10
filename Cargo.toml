@@ -24,6 +24,9 @@ members = ["benches/utils"]
 
 [lib]
 path = "src/lib.rs"
+# Don't run the lib's `#[test]` harness under `cargo bench` (it would just
+# enumerate every unit test as "ignored"). Unit tests still run via `cargo test`.
+bench = false
 
 [features]
 # Exposes `infino::test_helpers` — convenience builders for
@@ -265,10 +268,12 @@ debug = 1
 [[test]]
 name = "superfile"
 path = "tests/superfile/main.rs"
+bench = false
 
 [[test]]
 name = "supertable"
 path = "tests/supertable/main.rs"
+bench = false
 
 # The one and only benchmark binary. Everything — the tier × modality
 # matrix and the standalone diagnostics (scale / tombstone / update /

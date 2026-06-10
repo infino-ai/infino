@@ -640,7 +640,7 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(reader.vector_search(column, q, k, opts)).expect("vector_search");
+        let hits = block_on_inmem(reader.vector_hits_async(column, q, k, opts)).expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -755,7 +755,7 @@ pub fn calibrate_superfile(
                 .with_rerank_mult(refine);
             let p50 = p50_micros(
                 || {
-                    let _ = block_on_inmem(reader.vector_search(column, q, k, opts))
+                    let _ = block_on_inmem(reader.vector_hits_async(column, q, k, opts))
                         .expect("vector_search");
                 },
                 p50_iter,

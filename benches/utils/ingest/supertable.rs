@@ -16,7 +16,7 @@ use infino::test_helpers::default_tokenizer;
 
 use crate::corpus::{self, DIM, MmapTextCorpus, SequentialSyntheticCorpus};
 use crate::markdown::fmt_count;
-use crate::harness::{emb_for, scatter_key, sql_options};
+use crate::harness::{emb_for, scatter_key, sql_options, sql_schema};
 use crate::tiers;
 
 /// Supertable-shape document count — the supplied parameter. Default 10M
@@ -119,6 +119,17 @@ pub fn options_for(
     modality: Modality,
     storage: Option<Arc<dyn StorageProvider>>,
 ) -> SupertableOptions {
+    // SQL uses the rich SQL bench schema (built by `build_sql_on_storage`
+    // via `sql_options`). The consumer MUST open with the byte-identical
+    // options, or `Supertable::open` rejects the table on an options-hash
+    // mismatch. Route SQL here so ingest and read share one definition.
+    if modality == Modality::Sql {
+        let mut opts = sql_options(n_docs());
+        if let Some(s) = storage {
+            opts = opts.with_storage(s);
+        }
+        return opts;
+    }
     let n_cent_total = corpus::n_cent(n_docs());
     let n_cent_per_segment = (n_cent_total / N_COMMIT_CHUNKS).max(1);
     let pool = Arc::new(
@@ -290,14 +301,14 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
 
 
 fn build_sql_on_storage(
-    storage_backend: tiers::StorageBackend,
+    storage_backend: tiers::StorageFixture,
     cache_dir: tempfile::TempDir,
     cache: Arc<infino::supertable::reader_cache::DiskCacheStore>,
 ) -> IngestResult {
     let n_docs = n_docs();
     let corpus = MmapTextCorpus::generate(n_docs, CORPUS_TEXT_SEED);
     let mid = n_docs / 2;
-    let sample_title = corpus.doc(mid).replace(''', "''");
+    let sample_title = corpus.doc(mid).replace('\'', "''");
     let sample_key = scatter_key(mid as u64);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -314,7 +325,7 @@ fn build_sql_on_storage(
         .with_reader_pool(Arc::clone(&pool))
         .with_writer_pool(pool);
     let st = Supertable::create(opts).expect("create sql supertable");
-    let schema = st.options().user_schema.clone();
+    let schema = sql_schema();
     let mut w = st.writer().expect("writer");
     let chunk_size = n_docs.div_ceil(N_COMMIT_CHUNKS);
     let dim = emb_for(0).len();

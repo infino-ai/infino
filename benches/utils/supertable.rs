@@ -39,11 +39,9 @@
 
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
 use std::time::{Duration, Instant};
 
-use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
-use infino::superfile::reader::VectorSearchOptions;
-use crate::harness::BoolMode;
 use infino::supertable::Supertable;
 use tempfile::TempDir;
 
@@ -353,14 +351,6 @@ impl Phases {
     };
 }
 
-fn p50(samples: &mut [Duration]) -> Duration {
-    if samples.is_empty() {
-        return Duration::ZERO;
-    }
-    samples.sort_unstable();
-    samples[(samples.len() - 1) / 2]
-}
-
 fn open_consumer(
     modality: Modality,
     built: &supertable::IngestResult,
@@ -377,46 +367,13 @@ fn open_consumer(
     (cache_dir, tiers::open_consumer(opts))
 }
 
-fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
-    match mode {
-        BoolMode::Or => InfinoBoolMode::Or,
-        BoolMode::And => InfinoBoolMode::And,
-    }
-}
-
-fn emit_query_rows(
-    report: &mut Report,
-    anchor: &str,
-    title: String,
-    note: &str,
-    col: &str,
-    rows: Vec<(&'static str, Duration)>,
-) {
-    report.emit(&Section {
-        anchor: anchor.into(),
-        title,
-        note: note.into(),
-        blocks: vec![Block {
-            subtitle: String::new(),
-            headers: vec!["Query".into(), col.into()],
-            rows: rows
-                .into_iter()
-                .map(|(name, d)| {
-                    let ns = d.as_secs_f64() * 1e9;
-                    vec![text(name), metric(ns, fmt_time(ns), Better::Lower)]
-                })
-                .collect(),
-        }],
-    });
-}
-
 pub mod fts {
     use super::*;
+    use crate::executors::fts as exec_fts;
+    use crate::executors::fts::{FtsRead, FTS_BATTERY};
 
-    /// Build an FTS-only supertable, then measure warm and cold BM25 reads.
-    ///
-    /// This is not wired to a Cargo selector yet; it is the per-modality
-    /// runner that the eventual one-binary dispatcher will call.
+    /// Build an FTS-only supertable, then measure warm and cold BM25
+    /// reads through the shared FTS executor (same code superfile runs).
     pub fn run(phases: Phases) {
         if let Err(reason) = tiers::supertable_backend_check() {
             eprintln!("[supertable_fts] skipped: {reason}");
@@ -426,36 +383,15 @@ pub mod fts {
         let n_docs = supertable::n_docs();
         let mut report = Report::load("supertable_fts");
 
-        // Build-only matches main `supertable_all`: one isolated subprocess with
-        // a clean RSS sample. Warm/cold need the committed artifact in-process.
+        // Build-only matches main `supertable_all`: one isolated subprocess
+        // with a clean RSS sample. Warm/cold need the artifact in-process.
         if phases.build && !phases.warm && !phases.cold {
             eprintln!(
                 "[supertable_fts] build-only: isolated ingest of {} docs to object storage...",
                 fmt_count(n_docs),
             );
             if let Some(metrics) = build_shape_isolated("fts") {
-                report.emit(&Section {
-                    anchor: "bench/fts/supertable/ingest".into(),
-                    title: format!(
-                        "Supertable FTS — ingest, multi-segment / object-store ({} docs, {} commits)",
-                        fmt_count(n_docs),
-                        supertable::N_COMMIT_CHUNKS
-                    ),
-                    note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
-                    blocks: vec![Block {
-                        subtitle: String::new(),
-                        headers: vec![
-                            "Shape".into(),
-                            "Time".into(),
-                            "Throughput".into(),
-                            "Superfiles".into(),
-                            "Peak RSS".into(),
-                            "Median RSS".into(),
-                            "P90 RSS".into(),
-                        ],
-                        rows: vec![ingest_row(n_docs, "FTS-only", &metrics)],
-                    }],
-                });
+                emit_ingest(&mut report, n_docs, &metrics);
                 report.save();
             }
             return;
@@ -485,7 +421,46 @@ pub mod fts {
             p90_rss_bytes: rss.p90_rss_bytes,
         };
         if phases.build {
-            report.emit(&Section {
+            emit_ingest(&mut report, n_docs, &metrics);
+        }
+
+        if phases.warm || phases.cold {
+            let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
+            let reader = consumer.reader();
+            exec_fts::assert_correct(&reader, supertable::TEXT_COLUMN, n_docs, "supertable_fts");
+            drop(consumer);
+            drop(cache_dir);
+        }
+
+        let warm = phases.warm.then(|| measure_warm(&built));
+        let cold = phases.cold.then(|| measure_cold(&built));
+        if phases.warm || phases.cold {
+            exec_fts::emit_search(
+                &mut report,
+                "bench/fts/supertable/search",
+                format!(
+                    "Supertable FTS — search, multi-segment / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                "Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query \
+                 p50 over repeated bm25_search). Cold = fresh disk cache + consumer per iteration, so \
+                 each read pays the object-store cold open. Δ is vs the previous run.",
+                warm.as_deref(),
+                cold.as_ref(),
+                None,
+            );
+        }
+
+        report.save();
+
+        if let Some(cleanup) = &built.cleanup {
+            eprintln!("[supertable_fts] cleaning up object-store prefix...");
+            tiers::cleanup_prefix(cleanup);
+        }
+    }
+
+    fn emit_ingest(report: &mut Report, n_docs: usize, metrics: &ShapeMetrics) {
+        report.emit(&Section {
             anchor: "bench/fts/supertable/ingest".into(),
             title: format!(
                 "Supertable FTS — ingest, multi-segment / object-store ({} docs, {} commits)",
@@ -504,153 +479,106 @@ pub mod fts {
                     "Median RSS".into(),
                     "P90 RSS".into(),
                 ],
-                rows: vec![ingest_row(n_docs, "FTS-only", &metrics)],
+                rows: vec![ingest_row(n_docs, "FTS-only", metrics)],
             }],
-            });
-        }
-
-        if phases.warm {
-            eprintln!(
-                "[supertable_fts] warm search: {} queries × {WARM_ITERS} timed iters (shared consumer, bm25_search)...",
-                crate::superfile::fts::FTS_BATTERY.len(),
-            );
-            let warm = measure_warm(&built);
-            emit_query_rows(
-                &mut report,
-                "bench/fts/supertable/warm",
-                format!(
-                    "Supertable FTS — warm search, warm cache / object-store ({} docs)",
-                    fmt_count(n_docs)
-                ),
-                "Warm = one shared consumer + disk cache: untimed prewarm bm25_search, wait_until_warm once, then per-query prewarm + p50 over repeated bm25_search (full row materialization). Δ is vs the previous run.",
-                "warm",
-                warm,
-            );
-        }
-
-        if phases.cold {
-            eprintln!(
-                "[supertable_fts] cold search: {} queries × {COLD_ITERS} fresh-cache iters...",
-                crate::superfile::fts::FTS_BATTERY.len(),
-            );
-            let cold = measure_cold(&built);
-            emit_query_rows(
-                &mut report,
-                "bench/fts/supertable/cold",
-                format!(
-                    "Supertable FTS — cold search, fresh cache / object-store ({} docs)",
-                    fmt_count(n_docs)
-                ),
-                "Cold = fresh disk cache + fresh consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.",
-                "cold",
-                cold,
-            );
-        }
-
-        report.save();
-
-        if let Some(cleanup) = &built.cleanup {
-            eprintln!("[supertable_fts] cleaning up object-store prefix...");
-            tiers::cleanup_prefix(cleanup);
-        }
+        });
     }
 
-    fn measure_warm(built: &supertable::IngestResult) -> Vec<(&'static str, Duration)> {
+    fn measure_warm(built: &supertable::IngestResult) -> Vec<exec_fts::FtsQueryStat> {
         eprintln!(
             "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
         );
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
-        let first = &crate::superfile::fts::FTS_BATTERY[0];
+        let first = &FTS_BATTERY[0];
         let first_query = first.terms.join(" ");
-        let first_mode = to_infino_mode(first.mode);
         let _ = reader
-            .bm25_search(supertable::TEXT_COLUMN, &first_query, TOP_K, first_mode)
+            .bm25_search(
+                supertable::TEXT_COLUMN,
+                &first_query,
+                TOP_K,
+                exec_fts::to_infino_mode(first.mode),
+                None,
+            )
             .expect("warm prewarm bm25_search");
         consumer
             .wait_until_warm(Duration::from_secs(600))
             .expect("supertable warm promotion");
         eprintln!(
             "[supertable_fts] warm: cache hot — timing {} queries × {WARM_ITERS} iters via bm25_search...",
-            crate::superfile::fts::FTS_BATTERY.len(),
+            FTS_BATTERY.len(),
         );
-        let results = crate::superfile::fts::FTS_BATTERY
-            .iter()
-            .map(|q| {
-                eprintln!("[supertable_fts] warm: query {}...", q.name);
-                let query = q.terms.join(" ");
-                let mode = to_infino_mode(q.mode);
-                let _ = reader
-                    .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
-                    .expect("warm prewarm bm25_search");
-                let mut samples = Vec::with_capacity(WARM_ITERS);
-                for _ in 0..WARM_ITERS {
-                    let t = Instant::now();
-                    let batches = reader
-                        .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
-                        .expect("warm bm25_search");
-                    std::hint::black_box(batches);
-                    samples.push(t.elapsed());
-                }
-                (q.name, p50(&mut samples))
-            })
-            .collect();
+        let out = exec_fts::measure_warm(
+            &reader,
+            FTS_BATTERY,
+            supertable::TEXT_COLUMN,
+            TOP_K,
+            WARM_ITERS,
+            "supertable_fts",
+        );
         drop(consumer);
         drop(cache_dir);
-        results
+        out
     }
 
-    fn measure_cold(built: &supertable::IngestResult) -> Vec<(&'static str, Duration)> {
-        crate::superfile::fts::FTS_BATTERY
-            .iter()
-            .map(|q| {
-                eprintln!(
-                    "[supertable_fts] cold: query {} — {COLD_ITERS} fresh-cache iters...",
-                    q.name,
-                );
-                let query = q.terms.join(" ");
-                let mode = to_infino_mode(q.mode);
-                let mut samples = Vec::with_capacity(COLD_ITERS);
-                for _ in 0..COLD_ITERS {
-                    let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-                    let t = Instant::now();
-                    let batches = consumer
-                        .reader()
-                        .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode)
-                        .expect("cold bm25_search");
-                    std::hint::black_box(batches);
-                    samples.push(t.elapsed());
-                    drop(consumer);
-                    drop(cache_dir);
-                }
-                (q.name, p50(&mut samples))
-            })
-            .collect()
+    fn measure_cold(
+        built: &supertable::IngestResult,
+    ) -> std::collections::HashMap<&'static str, Duration> {
+        exec_fts::measure_cold(
+            || SupertableColdGuard::open(built),
+            FTS_BATTERY,
+            supertable::TEXT_COLUMN,
+            TOP_K,
+            COLD_ITERS,
+            "supertable_fts",
+        )
+    }
+
+    /// Cold-tier guard: a fresh disk cache + consumer per open; the timed
+    /// `bm25_rows` pays the object-store cold open on the empty cache.
+    struct SupertableColdGuard {
+        _cache_dir: TempDir,
+        consumer: Supertable,
+    }
+
+    impl SupertableColdGuard {
+        fn open(built: &supertable::IngestResult) -> Self {
+            let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+            Self { _cache_dir: cache_dir, consumer }
+        }
+    }
+
+    impl FtsRead for SupertableColdGuard {
+        fn bm25_rows(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> usize {
+            self.consumer
+                .reader()
+                .bm25_search(column, query, k, mode, None)
+                .expect("cold bm25_search")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
+        }
     }
 }
 
 pub mod vector {
     use super::*;
-    use crate::corpus::{self, Calibrated, MmapVectorCorpus};
+    use crate::corpus::{self, MmapVectorCorpus};
+    use crate::executors::vector as exec_vec;
+    use crate::executors::vector::VectorRead;
 
-    /// Correctness gate: recall@TOP_K must clear this at the high-recall
-    /// probe/rerank config or the bench fails.
-    const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
-    const CORRECTNESS_NPROBE: usize = 64;
-    const CORRECTNESS_RERANK_MULT: usize = 256;
+    // Correctness gate, recall targets, calibration grid, and p50 iters
+    // live in `crate::executors::vector` (shared by both tiers).
     const N_CORRECTNESS_QUERIES: usize = 20;
-    /// Calibration query battery + p50 repetitions per timed point.
     const N_CALIBRATION_QUERIES: usize = 100;
-    const CALIBRATION_P50_ITERS: usize = 7;
-    /// Recall targets the calibrated rows report (lowest-p50 point clearing
-    /// each), plus the user-facing `default` config.
-    const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
     const DEFAULT_NPROBE: usize = VECTOR_NPROBE;
     const DEFAULT_RERANK_MULT: usize = VECTOR_RERANK_MULT;
-    /// (probe, refine) calibration grid — same shape as the superfile
-    /// vector runner so the two are directly comparable.
-    const PROBES: &[usize] = &[1, 5, 10, 25, 50, 100, 200, 400, 800];
-    const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
     /// Vector-corpus seed. Must match `ingest::supertable`'s `CORPUS_VEC_SEED`
     /// so the regenerated ground-truth vectors are bit-identical to the rows
     /// that were ingested (asserted by `stream_matches_mmap_vector_corpus`).
@@ -658,7 +586,6 @@ pub mod vector {
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
-    const NS_PER_US: f64 = 1e3;
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
     /// at calibrated recall targets (and a default config), with a
@@ -756,90 +683,39 @@ pub mod vector {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
             let _ = consumer
                 .reader()
-                .vector_search(supertable::VEC_COLUMN, &q_cal[0], TOP_K, search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT))
+                .vector_search(supertable::VEC_COLUMN, &q_cal[0], TOP_K, exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT))
                 .expect("warm prewarm vector_search");
             consumer
                 .wait_until_warm(Duration::from_secs(600))
                 .expect("supertable warm promotion");
 
-            // Correctness gate on the hot consumer.
-            eprintln!(
-                "[supertable_vector] correctness: recall@{TOP_K} on {N_CORRECTNESS_QUERIES} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})..."
+            let title = format!(
+                "Supertable vector — search, multi-segment / object-store ({} docs × dim={})",
+                fmt_count(n_docs),
+                DIM
             );
-            let recall = mean_recall(
+            exec_vec::run_search(
+                &mut report,
                 &consumer,
+                || SupertableVecColdGuard::open(&built),
+                supertable::VEC_COLUMN,
+                TOP_K,
+                DEFAULT_NPROBE,
+                DEFAULT_RERANK_MULT,
                 &q_correct,
                 &gt_correct,
-                CORRECTNESS_NPROBE,
-                CORRECTNESS_RERANK_MULT,
+                &q_cal,
+                &gt_cal,
+                phases.warm,
+                phases.cold,
+                COLD_ITERS,
+                "supertable_vector",
+                "bench/vector/supertable/search",
+                title,
+                "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.",
             );
-            assert!(
-                recall >= CORRECTNESS_RECALL_FLOOR,
-                "supertable vector recall@{TOP_K} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
-            );
-            eprintln!("[supertable_vector] correctness OK: recall@{TOP_K} = {recall:.3}");
-
-            // Calibrate each recall target on the hot consumer (warm p50 is
-            // measured here, on the same hot cache).
-            let cal: Vec<Option<Calibrated>> = RECALL_TARGETS
-                .iter()
-                .map(|&target| {
-                    eprintln!(
-                        "[supertable_vector] calibrating recall@{target:.2}: grid over probes/refines ({N_CALIBRATION_QUERIES} queries)..."
-                    );
-                    calibrate(&consumer, &q_cal, &gt_cal, target)
-                })
-                .collect();
-
-            let q0 = &q_cal[0];
-
-            // Warm default-config p50 on the hot consumer.
-            let warm_default = phases.warm.then(|| {
-                warm_p50_ns(&consumer, q0, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
-            });
             drop(consumer);
             drop(cache_dir);
-
-            // Cold: fresh consumer per iteration per config.
-            let cold = |nprobe: usize, rerank: usize| {
-                phases.cold.then(|| cold_p50_ns(&built, q0, nprobe, rerank))
-            };
-
-            let mut rows: Vec<Vec<Cell>> = Vec::new();
-            for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-                match cal[i] {
-                    Some(c) => {
-                        let warm = phases.warm.then_some(c.p50_micros as f64 * NS_PER_US);
-                        let cold = cold(c.probe, c.refine);
-                        rows.push(recall_row(
-                            format!("{target:.2}"),
-                            format!("p={}, r={}", c.probe, c.refine),
-                            format!("{:.3}", c.recall),
-                            warm,
-                            cold,
-                            phases,
-                        ));
-                    }
-                    None => rows.push(recall_row(
-                        format!("{target:.2}"),
-                        "—".into(),
-                        "—".into(),
-                        phases.warm.then_some(f64::NAN),
-                        None,
-                        phases,
-                    )),
-                }
-            }
-            rows.push(recall_row(
-                "default".into(),
-                format!("p={DEFAULT_NPROBE}, r={DEFAULT_RERANK_MULT}"),
-                "—".into(),
-                warm_default,
-                cold(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
-                phases,
-            ));
-
-            emit_recall_table(&mut report, n_docs, rows, phases);
         }
 
         report.save();
@@ -850,201 +726,40 @@ pub mod vector {
         }
     }
 
-    fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
-        VectorSearchOptions::new()
-            .with_nprobe(nprobe)
-            .with_rerank_mult(rerank_mult)
+    struct SupertableVecColdGuard {
+        _cache_dir: TempDir,
+        consumer: Supertable,
     }
 
-    /// Global-id top-k hits (segment prefix-offset + local id, carrying
-    /// score) for recall comparison against brute-force ground truth.
-    fn global_hits(
-        consumer: &Supertable,
-        query: &[f32],
-        nprobe: usize,
-        rerank: usize,
-    ) -> Vec<(u32, f32)> {
-        let hits = consumer
-            .reader()
-            .vector_hits(supertable::VEC_COLUMN, query, TOP_K, search_opts(nprobe, rerank))
-            .expect("vector_hits");
-        let reader = consumer.reader();
-        let manifest = reader.manifest();
-        let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
-        let mut acc: u32 = 0;
-        for entry in manifest.superfiles.iter() {
-            offsets.push(acc);
-            acc = acc.saturating_add(entry.n_docs as u32);
-        }
-        hits.into_iter()
-            .map(|h| {
-                let seg_idx = manifest
-                    .superfiles
-                    .iter()
-                    .position(|e| e.uri == h.segment)
-                    .expect("superfile in manifest");
-                (offsets[seg_idx] + h.local_doc_id, h.score)
-            })
-            .collect()
-    }
-
-    fn mean_recall(
-        consumer: &Supertable,
-        queries: &[Vec<f32>],
-        truths: &[Vec<u32>],
-        nprobe: usize,
-        rerank: usize,
-    ) -> f32 {
-        let mut sum = 0f32;
-        for (q, t) in queries.iter().zip(truths) {
-            let hits = global_hits(consumer, q, nprobe, rerank);
-            sum += corpus::recall_at_k(&hits, t);
-        }
-        sum / queries.len() as f32
-    }
-
-    /// Lowest-p50 (probe, refine) point clearing `target_recall`; warm p50
-    /// is timed on the (hot) consumer. `None` if no grid point reaches it.
-    fn calibrate(
-        consumer: &Supertable,
-        queries: &[Vec<f32>],
-        truths: &[Vec<u32>],
-        target_recall: f32,
-    ) -> Option<Calibrated> {
-        let mut best: Option<Calibrated> = None;
-        let mut peak = 0f32;
-        for &probe in PROBES {
-            for &refine in REFINES {
-                let recall = mean_recall(consumer, queries, truths, probe, refine);
-                peak = peak.max(recall);
-                if recall < target_recall {
-                    continue;
-                }
-                let q0 = &queries[0];
-                let p50 = corpus::p50_micros(
-                    || {
-                        let _ = consumer
-                            .reader()
-                            .vector_search(supertable::VEC_COLUMN, q0, TOP_K, search_opts(probe, refine))
-                            .expect("vector_search");
-                    },
-                    CALIBRATION_P50_ITERS,
-                );
-                let cand = Calibrated {
-                    probe,
-                    refine,
-                    recall,
-                    p50_micros: p50,
-                };
-                best = match best {
-                    None => Some(cand),
-                    Some(b) if cand.p50_micros < b.p50_micros => Some(cand),
-                    Some(b) => Some(b),
-                };
-            }
-        }
-        if best.is_none() {
-            eprintln!(
-                "    [supertable_vector] no point hit recall ≥ {target_recall:.2}; peak = {peak:.3}"
-            );
-        }
-        best
-    }
-
-    fn warm_p50_ns(consumer: &Supertable, query: &[f32], nprobe: usize, rerank: usize) -> f64 {
-        corpus::p50_micros(
-            || {
-                let _ = consumer
-                    .reader()
-                    .vector_search(supertable::VEC_COLUMN, query, TOP_K, search_opts(nprobe, rerank))
-                    .expect("warm vector_search");
-            },
-            CALIBRATION_P50_ITERS,
-        ) as f64
-            * NS_PER_US
-    }
-
-    fn cold_p50_ns(
-        built: &supertable::IngestResult,
-        query: &[f32],
-        nprobe: usize,
-        rerank: usize,
-    ) -> f64 {
-        let mut samples = Vec::with_capacity(COLD_ITERS);
-        for _ in 0..COLD_ITERS {
+    impl SupertableVecColdGuard {
+        fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
-            let t = Instant::now();
-            let hits = consumer
-                .reader()
-                .vector_search(supertable::VEC_COLUMN, query, TOP_K, search_opts(nprobe, rerank))
-                .expect("cold vector_search");
-            std::hint::black_box(hits);
-            samples.push(t.elapsed());
-            drop(consumer);
-            drop(cache_dir);
-        }
-        p50(&mut samples).as_secs_f64() * 1e9
-    }
-
-    fn time_cell(ns: Option<f64>) -> Cell {
-        match ns {
-            Some(v) if v.is_finite() => metric(v, fmt_time(v), Better::Lower),
-            _ => text("—"),
+            Self { _cache_dir: cache_dir, consumer }
         }
     }
 
-    fn recall_row(
-        target: String,
-        params: String,
-        recall: String,
-        warm_ns: Option<f64>,
-        cold_ns: Option<f64>,
-        phases: Phases,
-    ) -> Vec<Cell> {
-        let mut cells = vec![text(&target), text(&params), text(&recall)];
-        if phases.warm {
-            cells.push(time_cell(warm_ns));
+    impl VectorRead for SupertableVecColdGuard {
+        fn topk_global(
+            &self,
+            column: &str,
+            query: &[f32],
+            k: usize,
+            nprobe: usize,
+            rerank: usize,
+        ) -> Vec<(u32, f32)> {
+            self.consumer.topk_global(column, query, k, nprobe, rerank)
         }
-        if phases.cold {
-            cells.push(time_cell(cold_ns));
-        }
-        cells
-    }
-
-    fn emit_recall_table(report: &mut Report, n_docs: usize, rows: Vec<Vec<Cell>>, phases: Phases) {
-        let mut headers = vec!["Recall target".into(), "(p, r)".into(), "recall".into()];
-        if phases.warm {
-            headers.push("warm".into());
-        }
-        if phases.cold {
-            headers.push("cold".into());
-        }
-        report.emit(&Section {
-            anchor: "bench/vector/supertable/search".into(),
-            title: format!(
-                "Supertable vector — search, multi-segment / object-store ({} docs × dim={})",
-                fmt_count(n_docs),
-                DIM
-            ),
-            note: "Recall rows use the lowest-p50 calibrated `(p, r)` clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run."
-                .into(),
-            blocks: vec![Block {
-                subtitle: String::new(),
-                headers,
-                rows,
-            }],
-        });
     }
 }
 
 pub mod sql {
     use super::*;
+    use crate::executors::sql as exec_sql;
+    use crate::executors::sql::SqlRead;
+    use crate::harness::sample_query_csv;
 
-    /// Build a SQL-only supertable, then measure warm and cold `query_sql`
-    /// reads over the scalar SQL battery.
-    ///
-    /// This is not wired to a Cargo selector yet; it is the per-modality
-    /// runner that the eventual one-binary dispatcher will call.
+    /// Build a SQL supertable, then measure warm + cold `query_sql` through
+    /// the shared SQL executor (same code + same query shapes as superfile).
     pub fn run(phases: Phases) {
         if let Err(reason) = tiers::supertable_backend_check() {
             eprintln!("[supertable_sql] skipped: {reason}");
@@ -1053,10 +768,7 @@ pub mod sql {
 
         let n_docs = supertable::n_docs();
         if phases.build {
-            eprintln!(
-                "[supertable_sql] ingesting {} rows to object storage...",
-                fmt_count(n_docs),
-            );
+            eprintln!("[supertable_sql] ingesting {} rows to object storage...", fmt_count(n_docs));
         } else {
             eprintln!(
                 "[supertable_sql] building query artifact ({} rows) for warm/cold phases...",
@@ -1102,56 +814,57 @@ pub mod sql {
             });
         }
 
-        if phases.warm {
-            eprintln!(
-                "[supertable_sql] warm queries: {} queries × {WARM_ITERS} timed iters...",
-                crate::superfile::sql::SQL_BATTERY.len(),
-            );
+        let inputs = exec_sql::QueryInputs {
+            qv: sample_query_csv(),
+            sample_title: built.sql_sample_title.clone().expect("sql ingest sets sample_title"),
+            sample_key: built.sql_sample_key.clone().expect("sql ingest sets sample_key"),
+        };
+
+        if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
-            // Promote segments to the disk cache (mmap) before timing, so
-            // warm reads hit local cached bytes instead of re-fetching from
-            // object storage on every query — same warm contract as the
-            // FTS/vector runners.
-            eprintln!("[supertable_sql] warm: prewarm + wait_until_warm...");
+            exec_sql::assert_correct(&consumer, n_docs, "supertable_sql");
+            drop(consumer);
+            drop(cache_dir);
+        }
+
+        if phases.warm {
+            eprintln!("[supertable_sql] warm: opening consumer, prewarm + wait_until_warm...");
+            let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
             let _ = consumer
                 .reader()
-                .query_sql(crate::superfile::sql::SQL_BATTERY[0].sql)
+                .query_sql("SELECT COUNT(*) AS n FROM supertable")
                 .expect("warm prewarm query_sql");
             consumer
                 .wait_until_warm(Duration::from_secs(600))
                 .expect("supertable warm promotion");
-            let warm = measure_warm(&consumer);
+            let sets =
+                exec_sql::measure_query_sets(&consumer, &inputs, exec_sql::ITERS, "supertable_sql");
             drop(consumer);
             drop(cache_dir);
-            emit_query_rows(
+            exec_sql::emit_query(
                 &mut report,
                 "bench/sql/supertable/warm",
                 format!(
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `reader().query_sql(...)` calls. Δ is vs the previous run.",
-                "warm",
-                warm,
+                "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls. The headline comparison is Plain Scan vs FTS-pushdown (same selective equality). Δ is vs the previous run.",
+                &sets,
             );
         }
 
         if phases.cold {
-            eprintln!(
-                "[supertable_sql] cold queries: {} queries × {COLD_ITERS} fresh-cache iters...",
-                crate::superfile::sql::SQL_BATTERY.len(),
-            );
-            let cold = measure_cold(&built);
-            emit_query_rows(
+            let cold =
+                exec_sql::measure_cold(|| SupertableSqlColdGuard::open(&built), COLD_ITERS, "supertable_sql");
+            exec_sql::emit_cold(
                 &mut report,
                 "bench/sql/supertable/cold",
                 format!(
                     "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Cold = fresh disk cache + fresh consumer per iteration, so each query pays the object-store cold open. Δ is vs the previous run.",
-                "cold",
-                cold,
+                "Cold = fresh disk cache + consumer per iteration, so each query pays the object-store cold open. Δ is vs the previous run.",
+                &cold,
             );
         }
 
@@ -1163,48 +876,24 @@ pub mod sql {
         }
     }
 
-    fn measure_warm(consumer: &Supertable) -> Vec<(&'static str, Duration)> {
-        crate::superfile::sql::SQL_BATTERY
-            .iter()
-            .map(|q| {
-                eprintln!(
-                    "[supertable_sql] warm: query {} — prewarm + {WARM_ITERS} timed iters...",
-                    q.name,
-                );
-                let reader = consumer.reader();
-                let _ = reader.query_sql(q.sql).expect("warmup query_sql");
-                let mut samples = Vec::with_capacity(WARM_ITERS);
-                for _ in 0..WARM_ITERS {
-                    let t = Instant::now();
-                    let batches = reader.query_sql(q.sql).expect("warm query_sql");
-                    std::hint::black_box(batches);
-                    samples.push(t.elapsed());
-                }
-                (q.name, p50(&mut samples))
-            })
-            .collect()
+    /// Cold-tier guard: fresh disk cache + consumer per open; the timed
+    /// `query_rows` pays the object-store cold open on the empty cache.
+    struct SupertableSqlColdGuard {
+        _cache_dir: TempDir,
+        consumer: Supertable,
     }
-
-    fn measure_cold(built: &supertable::IngestResult) -> Vec<(&'static str, Duration)> {
-        crate::superfile::sql::SQL_BATTERY
-            .iter()
-            .map(|q| {
-                eprintln!(
-                    "[supertable_sql] cold: query {} — {COLD_ITERS} fresh-cache iters...",
-                    q.name,
-                );
-                let mut samples = Vec::with_capacity(COLD_ITERS);
-                for _ in 0..COLD_ITERS {
-                    let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
-                    let t = Instant::now();
-                    let batches = consumer.reader().query_sql(q.sql).expect("cold query_sql");
-                    std::hint::black_box(batches);
-                    samples.push(t.elapsed());
-                    drop(consumer);
-                    drop(cache_dir);
-                }
-                (q.name, p50(&mut samples))
-            })
-            .collect()
+    impl SupertableSqlColdGuard {
+        fn open(built: &supertable::IngestResult) -> Self {
+            let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
+            Self { _cache_dir: cache_dir, consumer }
+        }
+    }
+    impl SqlRead for SupertableSqlColdGuard {
+        fn query_rows(&self, sql: &str) -> usize {
+            self.consumer.query_rows(sql)
+        }
+        fn query_count(&self, sql: &str) -> i64 {
+            self.consumer.query_count(sql)
+        }
     }
 }

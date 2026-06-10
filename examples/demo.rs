@@ -122,7 +122,7 @@ fn demo_superfile() -> Bytes {
         // BM25 over the embedded FTS blob. Hits are (local_doc_id, score).
         for q in ["brown", "fox", "missing"] {
             let hits = reader
-                .bm25_search("title", q, SEARCH_TOP_K, BoolMode::Or)
+                .bm25_hits_async("title", q, SEARCH_TOP_K, BoolMode::Or)
                 .await
                 .expect("bm25_search");
             println!("  bm25 {q:>8?} -> {} hit(s): {hits:?}", hits.len());
@@ -131,7 +131,7 @@ fn demo_superfile() -> Bytes {
         // kNN over the embedded vector blob. Query with the doc's own
         // embedding -> distance ~0 under cosine.
         let knn = reader
-            .vector_search("emb", &emb, SEARCH_TOP_K, VectorSearchOptions::default())
+            .vector_hits_async("emb", &emb, SEARCH_TOP_K, VectorSearchOptions::default())
             .await
             .expect("vector_search");
         println!("  knn  self-query -> {} hit(s): {knn:?}", knn.len());

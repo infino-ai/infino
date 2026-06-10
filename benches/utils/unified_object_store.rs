@@ -1206,7 +1206,7 @@ pub(crate) mod diag {
                     let h = rt.block_on(async {
                         let reader = cache.reader(uri).await.expect("cold reader");
                         reader
-                            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                            .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                             .await
                             .expect("cold bm25_search")
                     });
@@ -1403,7 +1403,7 @@ pub(crate) mod diag {
             let _hits = rt.block_on(async {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 reader
-                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                     .await
                     .expect("cold bm25_search")
             });
@@ -1433,7 +1433,7 @@ pub(crate) mod diag {
                     .await
                     .expect("cold reader");
                 reader
-                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                     .await
                     .expect("cold bm25_search")
             });
@@ -1460,7 +1460,7 @@ pub(crate) mod diag {
                     .await
                     .expect("cold reader");
                 reader
-                    .bm25_search(FTS_COLUMN, FTS_MULTI_QUERY, TOP_K, BoolMode::Or)
+                    .bm25_hits_async(FTS_COLUMN, FTS_MULTI_QUERY, TOP_K, BoolMode::Or)
                     .await
                     .expect("cold multi-term bm25_search")
             });
@@ -1626,7 +1626,7 @@ pub(crate) mod diag {
                         .await
                         .expect("real S3 cold reader");
                     reader
-                        .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                        .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                         .await
                         .expect("real S3 cold bm25_search")
                 });

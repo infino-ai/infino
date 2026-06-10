@@ -710,8 +710,9 @@ impl SuperfileReader {
     ///
     /// `query` is tokenized by the same v1 tokenizer used at build
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
-    /// ordered by descending score.
-    pub async fn bm25_search(
+    /// hits ordered by descending score — this is the hit kernel, not a
+    /// row-returning search; row materialization is `take_by_local_doc_ids`.
+    pub async fn bm25_hits_async(
         &self,
         column: &str,
         query: &str,
@@ -979,7 +980,7 @@ impl SuperfileReader {
     /// only a cold `Source::Lazy` miss actually `await`s an
     /// object-store GET. The CPU steps (centroid + 1-bit code scoring,
     /// rerank) parallelize on the global rayon pool.
-    pub async fn vector_search(
+    pub async fn vector_hits_async(
         &self,
         column: &str,
         query: &[f32],
@@ -1303,7 +1304,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits_async("title", "rust", 5, BoolMode::Or)
             .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
@@ -1326,7 +1327,7 @@ mod tests {
         let bytes = Bytes::from(b.finish().expect("finish builder"));
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
-            .bm25_search("nope", "x", 1, BoolMode::Or)
+            .bm25_hits_async("nope", "x", 1, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
@@ -1421,7 +1422,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search("emb", &q, 1, VectorSearchOptions::default())
+            .vector_hits_async("emb", &q, 1, VectorSearchOptions::default())
             .await
             .expect("vector search");
         assert!(!hits.is_empty());
@@ -1437,7 +1438,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
+            .vector_hits_async("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
             .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
@@ -1465,7 +1466,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
-            .bm25_search("nonexistent", "rust", 5, BoolMode::Or)
+            .bm25_hits_async("nonexistent", "rust", 5, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::Fts(_)));

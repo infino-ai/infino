@@ -7,10 +7,12 @@ publish = false
 
 [lib]
 path = "mod.rs"
+bench = false
 
 [[bin]]
 name = "profile_segment"
 path = "bin/profile_segment.rs"
+bench = false
 
 
 [dependencies]

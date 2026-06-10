@@ -222,7 +222,7 @@ impl SupertableReader {
                             .vector_search_clusters(&column, &query, k, &ids, options)
                             .await
                     }
-                    Probe::Nprobe => reader.vector_search(&column, &query, k, options).await,
+                    Probe::Nprobe => reader.vector_hits_async(&column, &query, k, options).await,
                 };
                 res.map_err(|e| QueryError::Parquet(e.to_string()))
             }
@@ -646,7 +646,7 @@ mod tests {
         // The oracle is a single-segment `SuperfileReader` whose search
         // is async-only; drive it on a throwaway runtime. The supertable
         // reader below uses its sync public API.
-        let oracle_hits = block_on(oracle.vector_search("emb", &q, 2, opts)).expect("oracle query");
+        let oracle_hits = block_on(oracle.vector_hits_async("emb", &q, 2, opts)).expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());

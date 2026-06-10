@@ -82,7 +82,7 @@ fn search_blocking(
     k: usize,
     opts: VectorSearchOptions,
 ) -> Vec<(u32, f32)> {
-    crate::corpus::block_on_inmem(reader.vector_search("emb", query, k, opts))
+    crate::corpus::block_on_inmem(reader.vector_hits_async("emb", query, k, opts))
         .expect("vector_search")
 }
 

@@ -80,6 +80,10 @@ pub fn scatter_key(doc_id: u64) -> String {
     format!("k{:08}", doc_id.wrapping_mul(2_654_435_761) % 100_000_000)
 }
 
+pub fn sql_schema() -> Arc<Schema> {
+    schema()
+}
+
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new(TITLE_COLUMN, DataType::LargeUtf8, false),
