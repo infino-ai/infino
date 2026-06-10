@@ -636,19 +636,47 @@ impl FtsReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        self.search_with_floor(column, terms, k, mode, f32::NEG_INFINITY)
+            .await
+    }
+
+    /// [`Self::search`] with an externally-supplied **score floor**:
+    /// docs scoring **strictly below** `floor` can never appear in the
+    /// caller's final result (e.g. a cross-segment top-k already holds
+    /// k hits at or above it), so every pruning structure — BMW block
+    /// skips, the MaxScore essential boundary, heap admission — starts
+    /// from the floor instead of from empty. Docs scoring **equal to**
+    /// `floor` are still returned (tie candidates survive), which keeps
+    /// the caller's merged result identical to an unfloored run.
+    /// `f32::NEG_INFINITY` disables the floor.
+    pub async fn search_with_floor(
+        &self,
+        column: &str,
+        terms: &[&str],
+        k: usize,
+        mode: BoolMode,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
 
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
+        // Every kernel prunes with `<= threshold` / `> threshold`
+        // comparisons; seeding them with the largest f32 strictly
+        // below `floor` makes those comparisons exactly "strictly
+        // below floor is dead, equal-to-floor survives".
+        let floor_eff = floor.next_down();
 
         // Single-term fast path: BlockMaxWAND-driven block skipping.
         // Walks blocks in order, populating a top-k min-heap. Once the
         // heap is full, blocks whose skip-table-recorded `max_bm25`
-        // can't beat the heap's worst score are skipped without
-        // decoding.
+        // can't beat the kth-best (or the seeded floor) are skipped
+        // without decoding.
         if terms.len() == 1 {
-            return self.search_single_term_bmw(column_id, terms[0], k).await;
+            return self
+                .search_single_term_bmw(column_id, terms[0], k, floor_eff)
+                .await;
         }
 
         // Multi-term routing:
@@ -661,7 +689,10 @@ impl FtsReader {
         //         with the OR path so neither pays for cursor work
         //         twice when the bench harness compares them.
         match mode {
-            BoolMode::Or => self.dispatch_multi_term_or(column_id, terms, k).await,
+            BoolMode::Or => {
+                self.dispatch_multi_term_or(column_id, terms, k, floor_eff)
+                    .await
+            }
             BoolMode::And => {
                 // Build cursors; if any term is missing, the
                 // intersection is empty.
@@ -669,7 +700,7 @@ impl FtsReader {
                 if cursors.len() != terms.len() {
                     return Ok(Vec::new());
                 }
-                self.run_and_intersect(column_id, cursors, k)
+                self.run_and_intersect(column_id, cursors, k, floor_eff)
             }
         }
     }
@@ -771,6 +802,28 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        self.search_or_range_pretokenized_with_floor(
+            column,
+            terms,
+            k,
+            doc_id_start,
+            doc_id_end,
+            f32::NEG_INFINITY,
+        )
+        .await
+    }
+
+    /// [`Self::search_or_range_pretokenized`] with a score floor — see
+    /// [`Self::search_with_floor`] for the floor contract.
+    pub async fn search_or_range_pretokenized_with_floor(
+        &self,
+        column: &str,
+        terms: &[&str],
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if terms.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
@@ -779,7 +832,14 @@ impl FtsReader {
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.run_max_score_bmm_range(column_id, cursors, k, doc_id_start, doc_id_end)
+        self.run_max_score_bmm_range(
+            column_id,
+            cursors,
+            k,
+            doc_id_start,
+            doc_id_end,
+            floor.next_down(),
+        )
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -830,6 +890,7 @@ impl FtsReader {
         column_id: u32,
         term: &str,
         k: usize,
+        floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -846,12 +907,16 @@ impl FtsReader {
             FstValue::Inline { doc_id, tf } => {
                 // df=1 inline path: no postings-region read, no
                 // skip-table, no PFOR decode. The single doc's score
-                // is the entire result for any k ≥ 1.
+                // is the entire result for any k ≥ 1 (unless it sits
+                // strictly below the caller's floor).
                 let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
                 let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
                 let score =
                     crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+                if score <= floor_eff {
+                    return Ok(Vec::new());
+                }
                 return Ok(vec![(doc_id, score)]);
             }
             FstValue::Pfor {
@@ -890,6 +955,11 @@ impl FtsReader {
             // AND-merge seeks, which single-term never does.
             let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
 
+            // Floor skip: nothing in this block can reach the caller's
+            // floor — dead regardless of local heap state.
+            if block_max_bm25 <= floor_eff {
+                continue;
+            }
             // BMW skip: heap full AND this block can't beat the kth-best.
             if heap.len() >= k
                 && let Some(TopKEntry(min_score, _)) = heap.peek()
@@ -914,6 +984,12 @@ impl FtsReader {
                     tf,
                     dl_norm_k1[doc_id as usize],
                 );
+                // Floor gate: strictly-below-floor docs are dead to the
+                // caller; keeping them out also keeps the heap's min
+                // (the BMW skip bar) honest.
+                if score <= floor_eff {
+                    continue;
+                }
                 if heap.len() < k {
                     heap.push(TopKEntry(score, doc_id));
                 } else if let Some(TopKEntry(min_score, _)) = heap.peek()
@@ -1251,7 +1327,7 @@ impl FtsReader {
         cursors: Vec<TermCursor>,
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX)
+        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX, f32::NEG_INFINITY)
     }
 
     /// Multi-term AND via leapfrog intersection over the skip table.
@@ -1278,6 +1354,7 @@ impl FtsReader {
         column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
+        floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         if cursors.is_empty() {
             return Ok(Vec::new());
@@ -1303,9 +1380,9 @@ impl FtsReader {
         // straightforwardly generalize and the per-doc leapfrog still
         // amortizes well with the block-max pruning below.
         if cursors.len() == 2 {
-            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, k, &mut heap);
+            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, k, &mut heap, floor_eff);
         } else {
-            self.run_and_intersect_general(&mut cursors, dl_norm_k1, k, &mut heap);
+            self.run_and_intersect_general(&mut cursors, dl_norm_k1, k, &mut heap, floor_eff);
         }
 
         Ok(drain_top_k_desc(heap))
@@ -1326,20 +1403,26 @@ impl FtsReader {
         dl_norm_k1: &[f32],
         k: usize,
         heap: &mut BinaryHeap<TopKEntry>,
+        floor_eff: f32,
     ) {
         'outer: loop {
             if cursors[0].is_exhausted() {
                 break;
             }
 
-            // Block-max-AND pruning. After the heap fills, the kth-best
-            // score gates further inserts. If the leader's current block
-            // can't possibly produce a top-K beating-score, skip the
-            // whole block — the safest UB sums leader's block_max with
-            // each other cursor's max block_max across all blocks that
+            // Block-max-AND pruning. The bar is the kth-best once the
+            // heap fills, or the caller's seeded floor before that —
+            // whichever is higher. If the leader's current block can't
+            // possibly produce a bar-beating score, skip the whole
+            // block — the safest UB sums leader's block_max with each
+            // other cursor's max block_max across all blocks that
             // overlap the leader's block doc-id range.
-            if heap.len() >= k {
-                let heap_min = heap.peek().expect("heap len == k").0;
+            let bar = if heap.len() >= k {
+                heap.peek().expect("heap len == k").0.max(floor_eff)
+            } else {
+                floor_eff
+            };
+            if bar > f32::NEG_INFINITY {
                 let range_start = cursors[0].current_doc_id();
                 let range_end = cursors[0].current_block_last_doc_id();
                 let leader_block_max = cursors[0].current_block_max_bm25();
@@ -1347,7 +1430,7 @@ impl FtsReader {
                 for c in cursors[1..].iter_mut() {
                     other_ub += c.block_max_in_range(range_start, range_end);
                 }
-                if leader_block_max + other_ub <= heap_min {
+                if leader_block_max + other_ub <= bar {
                     cursors[0].skip_to(range_end.saturating_add(1));
                     continue;
                 }
@@ -1435,7 +1518,11 @@ impl FtsReader {
                             norm,
                         );
                     }
-                    and_heap_push(heap, k, score, a);
+                    // Floor gate: strictly-below-floor docs are dead to
+                    // the caller.
+                    if score > floor_eff {
+                        and_heap_push(heap, k, score, a);
+                    }
                     i += 1;
                     for o in others.iter_mut() {
                         o.pos += 1;
@@ -1473,6 +1560,7 @@ impl FtsReader {
         dl_norm_k1: &[f32],
         k: usize,
         heap: &mut BinaryHeap<TopKEntry>,
+        floor_eff: f32,
     ) {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
@@ -1487,14 +1575,20 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning at the leader's current block.
-            if heap.len() >= k {
-                let heap_min = heap.peek().expect("heap len == k").0;
+            // Block-max-AND pruning at the leader's current block. The
+            // bar is the kth-best once the heap fills, or the caller's
+            // seeded floor before that — whichever is higher.
+            let bar = if heap.len() >= k {
+                heap.peek().expect("heap len == k").0.max(floor_eff)
+            } else {
+                floor_eff
+            };
+            if bar > f32::NEG_INFINITY {
                 let range_start = c0.current_doc_id();
                 let range_end = c0.current_block_last_doc_id();
                 let ub =
                     c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
-                if ub <= heap_min {
+                if ub <= bar {
                     c0.skip_to(range_end.saturating_add(1));
                     continue;
                 }
@@ -1551,7 +1645,11 @@ impl FtsReader {
                         c1.block_tfs[j],
                         norm,
                     );
-                    and_heap_push(heap, k, score, a);
+                    // Floor gate: strictly-below-floor docs are dead to
+                    // the caller.
+                    if score > floor_eff {
+                        and_heap_push(heap, k, score, a);
+                    }
                     i += 1;
                     j += 1;
                 }
@@ -1598,6 +1696,7 @@ impl FtsReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
+        floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
@@ -1634,15 +1733,17 @@ impl FtsReader {
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        let mut threshold: f32 = 0.0;
+        // Seed the pruning threshold with the caller's floor: docs
+        // strictly below it can never matter, so the MaxScore
+        // machinery (essential boundary, block skips, heap admission)
+        // starts from the floor instead of from zero. BM25 scores are
+        // positive, so an unfloored run keeps the original 0.0 seed.
+        let mut threshold: f32 = floor_eff.max(0.0);
 
-        // Essential boundary: smallest f such that partial_max[f] ≤ threshold.
-        // Initially threshold=0; only partial_max[n]=0 satisfies, so f=n
-        // (all terms essential). f shrinks as threshold rises.
-        let mut f_essential: usize = n;
         let recompute_f = |partial_max: &[f32], threshold: f32| -> usize {
-            // Linear scan from the front until partial_max[i] ≤ threshold.
-            // For typical N ≤ 8 query terms this is cheaper than a
+            // Essential boundary: smallest f such that
+            // partial_max[f] ≤ threshold. Linear scan from the front —
+            // for typical N ≤ 8 query terms this is cheaper than a
             // binary search's branch-and-bound overhead.
             let mut f = 0;
             while f < partial_max.len() - 1 && partial_max[f] > threshold {
@@ -1650,6 +1751,10 @@ impl FtsReader {
             }
             f
         };
+        // With a zero threshold only partial_max[n]=0 satisfies, so
+        // f=n (all terms essential); a seeded floor can already shrink
+        // the essential set before the first doc is scored.
+        let mut f_essential: usize = recompute_f(&partial_max, threshold);
 
         // Total term-level UB. Used for the block-skip bound on
         // essential cursors below.
@@ -1735,7 +1840,9 @@ impl FtsReader {
                     if heap.len() < k {
                         heap.push(TopKEntry(score, candidate));
                         if heap.len() == k {
-                            threshold = heap.peek().expect("non-empty").0;
+                            // max(): a seeded floor must never be
+                            // lowered by a weaker local kth-best.
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
                             let new_f = recompute_f(&partial_max, threshold);
                             if new_f != f_essential {
                                 f_essential = new_f;
@@ -1745,7 +1852,7 @@ impl FtsReader {
                     } else if score > threshold {
                         heap.pop();
                         heap.push(TopKEntry(score, candidate));
-                        threshold = heap.peek().expect("non-empty").0;
+                        threshold = heap.peek().expect("non-empty").0.max(threshold);
                         let new_f = recompute_f(&partial_max, threshold);
                         if new_f != f_essential {
                             f_essential = new_f;
@@ -1892,16 +1999,18 @@ impl FtsReader {
             // heap.peek().0 every time we mutate the heap, so we can
             // gate the replace-or-skip decision against the local
             // f32 instead of paying for a heap.peek() per iter.
+            // (max(): a seeded floor must never be lowered by a
+            // weaker local kth-best.)
             if heap.len() < k {
                 heap.push(TopKEntry(score, candidate));
                 if heap.len() == k {
-                    threshold = heap.peek().expect("non-empty").0;
+                    threshold = heap.peek().expect("non-empty").0.max(threshold);
                     f_essential = recompute_f(&partial_max, threshold);
                 }
             } else if score > threshold {
                 heap.pop();
                 heap.push(TopKEntry(score, candidate));
-                threshold = heap.peek().expect("non-empty").0;
+                threshold = heap.peek().expect("non-empty").0.max(threshold);
                 f_essential = recompute_f(&partial_max, threshold);
             }
 
@@ -2079,12 +2188,13 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         k: usize,
+        floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let cursors = self.build_term_cursors(column_id, terms).await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.run_max_score_bmm(column_id, cursors, k)
+        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX, floor_eff)
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
@@ -2387,10 +2497,18 @@ impl TermMeta {
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
+        // +1 quantization step: files written before the builder
+        // switched to round-up encoding truncated the fixed-point
+        // value, so the stored field can sit one step BELOW the true
+        // block max — not an upper bound. Compensating here makes the
+        // recovered value a true upper bound for old and new files
+        // alike; the cost is at most one needless block decode per
+        // 1e-3 of score slack.
         (
             last_doc_id,
             block_offset,
-            (max_bm25_x1000 as f32) / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            (max_bm25_x1000.saturating_add(1) as f32)
+                / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
         )
     }
 

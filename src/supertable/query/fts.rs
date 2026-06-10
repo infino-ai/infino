@@ -80,6 +80,92 @@ use arrow::record_batch::RecordBatch;
 use super::SuperfileHit;
 use super::exec::common::resolve_hits_named;
 
+/// Cross-segment top-k score sharing for the BM25 fan-out.
+///
+/// Every segment kernel runs an independent top-k; without
+/// coordination, segment N knows nothing about the k hits segments
+/// 1..N-1 already produced, so it scores blocks the global result can
+/// never use. This shares the running **global kth-best score** as a
+/// floor: each kernel reads it at start and seeds its pruning
+/// structures (BMW block skips, the MaxScore essential boundary, AND
+/// block-max bars) from it; each finishing kernel merges its surviving
+/// scores back, monotonically raising the floor for the segments still
+/// running.
+///
+/// Correctness: the floor only ever prunes docs scoring **strictly
+/// below** the published kth-best (kernels apply it via
+/// `floor.next_down()` comparisons), and the published floor is always
+/// ≤ the final global kth-best, so every doc that could appear in the
+/// merged top-k survives in some segment's result — the merged output
+/// is identical to an uncoordinated run, including score ties. Only
+/// the amount of *skipped work* depends on segment completion order.
+struct SharedTopK {
+    k: usize,
+    /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
+    heap: std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<OrdScore>>>,
+    /// f32 bits of the current floor; `NEG_INFINITY` until `k` scores
+    /// have been seen. Monotonically non-decreasing.
+    floor_bits: std::sync::atomic::AtomicU32,
+}
+
+/// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
+/// are finite, but `f32` still needs an `Ord` shim).
+#[derive(PartialEq)]
+struct OrdScore(f32);
+impl Eq for OrdScore {}
+impl PartialOrd for OrdScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrdScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl SharedTopK {
+    fn new(k: usize) -> Arc<Self> {
+        Arc::new(Self {
+            k,
+            heap: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
+            floor_bits: std::sync::atomic::AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+        })
+    }
+
+    /// The current global floor — `NEG_INFINITY` until k scores merged.
+    fn floor(&self) -> f32 {
+        f32::from_bits(
+            self.floor_bits
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Merge one finished segment's (tombstone-surviving) scores and
+    /// publish the new kth-best as the floor once k scores are known.
+    fn merge(&self, scores: impl IntoIterator<Item = f32>) {
+        let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
+        for s in scores {
+            if heap.len() < self.k {
+                heap.push(std::cmp::Reverse(OrdScore(s)));
+            } else if let Some(std::cmp::Reverse(OrdScore(min))) = heap.peek()
+                && s > *min
+            {
+                heap.pop();
+                heap.push(std::cmp::Reverse(OrdScore(s)));
+            }
+        }
+        if heap.len() == self.k
+            && let Some(std::cmp::Reverse(OrdScore(min))) = heap.peek()
+        {
+            // The heap min only rises, so a plain store stays monotone
+            // under the lock.
+            self.floor_bits
+                .store(min.to_bits(), std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
     /// superfiles. Returns up to `k` highest-scoring hits, sorted
@@ -148,34 +234,80 @@ impl SupertableReader {
         // Single-term OR and AND stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         let work_units = build_or_work_units(&kept_refs, mode, term_refs.len(), pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
-            work_units.into_iter().map(|u| (u.entry, u.range)).collect();
+        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, uuid::Uuid))> = work_units
+            .into_iter()
+            .map(|u| {
+                let suid = u.entry.superfile_id;
+                (u.entry, (u.range, suid))
+            })
+            .collect();
 
         let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
         let column_arc = Arc::new(column_owned);
+
+        // Cross-segment threshold sharing: each unit reads the global
+        // kth-best floor before searching and merges its surviving
+        // scores back after — late units skip every block that can't
+        // beat what earlier units already found. Tombstoned hits are
+        // excluded from the merge so deleted rows never raise the bar.
+        let shared = SharedTopK::new(k);
+        let tombstones = self.tombstone_cache.clone();
+        let now = std::time::Instant::now();
 
         // One shared fan-out (`query::dispatch::fanout`) — the same
         // orchestrator the vector path uses. It warms the tombstone
         // sidecars in one batch, opens each segment reader and runs the
         // kernel under `tokio::spawn` so cold GETs overlap, then tags +
         // tombstone-filters each unit's hits. The per-unit `params` is
-        // the optional doc-id sub-range; `None` searches the whole
-        // segment.
-        let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
+        // the optional doc-id sub-range (`None` searches the whole
+        // segment) plus the segment id for the tombstone-aware merge.
+        let kernel = move |r: Arc<SuperfileReader>,
+                           (range, suid): (Option<(u32, u32)>, uuid::Uuid)| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
+            let shared = Arc::clone(&shared);
+            let tombstones = tombstones.clone();
             async move {
                 let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                match range {
+                let floor = shared.floor();
+                let hits = match range {
                     Some((start, end)) => r
-                        .bm25_search_or_range_pretokenized(&column_arc, &term_refs, k, start, end)
+                        .bm25_search_or_range_pretokenized_with_floor(
+                            &column_arc,
+                            &term_refs,
+                            k,
+                            start,
+                            end,
+                            floor,
+                        )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     None => r
-                        .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
+                        .bm25_search_pretokenized_with_floor(
+                            &column_arc,
+                            &term_refs,
+                            k,
+                            mode,
+                            floor,
+                        )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                };
+                // Raise the global floor with this unit's surviving
+                // scores. Sidecars were prefetched by the dispatcher,
+                // so the bitmap lookup is an in-memory hit; on a cache
+                // miss/error we simply don't merge (a lower floor is
+                // always safe).
+                match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                    Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                        hits.iter()
+                            .filter(|(d, _)| !bitmap.contains(*d))
+                            .map(|(_, s)| *s),
+                    ),
+                    Some(Err(_)) => {}
+                    _ => shared.merge(hits.iter().map(|(_, s)| *s)),
                 }
+                Ok(hits)
             }
         };
         let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;

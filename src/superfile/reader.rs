@@ -764,10 +764,28 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.bm25_search_pretokenized_with_floor(column, terms, k, mode, f32::NEG_INFINITY)
+            .await
+    }
+
+    /// [`Self::bm25_search_pretokenized`] with a score floor: docs
+    /// scoring strictly below `floor` are pruned inside the kernels
+    /// (BMW / MaxScore / AND block skips all start from the floor);
+    /// docs scoring exactly `floor` are still returned. Used by the
+    /// supertable fan-out to share the global kth-best score across
+    /// segments. See [`FtsReader::search_with_floor`].
+    pub async fn bm25_search_pretokenized_with_floor(
+        &self,
+        column: &str,
+        terms: &[&str],
+        k: usize,
+        mode: BoolMode,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search(column, terms, k, mode).await?)
+        Ok(fts.search_with_floor(column, terms, k, mode, floor).await?)
     }
 
     /// Unranked token match: the `local_doc_id`s matching the
@@ -915,11 +933,40 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.bm25_search_or_range_pretokenized_with_floor(
+            column,
+            terms,
+            k,
+            doc_id_start,
+            doc_id_end,
+            f32::NEG_INFINITY,
+        )
+        .await
+    }
+
+    /// [`Self::bm25_search_or_range_pretokenized`] with a score floor —
+    /// same contract as [`Self::bm25_search_pretokenized_with_floor`].
+    pub async fn bm25_search_or_range_pretokenized_with_floor(
+        &self,
+        column: &str,
+        terms: &[&str],
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .search_or_range_pretokenized(column, terms, k, doc_id_start, doc_id_end)
+            .search_or_range_pretokenized_with_floor(
+                column,
+                terms,
+                k,
+                doc_id_start,
+                doc_id_end,
+                floor,
+            )
             .await?)
     }
 
