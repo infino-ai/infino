@@ -49,9 +49,9 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench bench -- object-store
-//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --bench bench -- object-store
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- object-store
+//! cargo bench -- object-store
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench -- object-store
+//! INFINO_BENCH_UPDATE_README=1 cargo bench -- object-store
 //! ```
 //!
 //! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
@@ -739,7 +739,7 @@ fn emit_object_store(
 //
 // Invocation:
 //
-//   INFINO_DIAG_COLD_PATH=1 cargo bench --bench bench -- object-store
+//   INFINO_DIAG_COLD_PATH=1 cargo bench -- object-store
 //
 // to localize where cold-path time is going (raw s3s-fs RTT vs.
 // our cold-fetch path's range count). When the env var is set,
@@ -1491,7 +1491,7 @@ pub(crate) mod diag {
     /// INFINO_DIAG_REAL_S3=1 \
     /// INFINO_REAL_S3_BUCKET=cold-test-381491836522 \
     /// AWS_REGION=us-east-1 \
-    /// cargo bench --bench bench -- object-store
+    /// cargo bench -- object-store
     /// ```
     pub fn diagnose_real_s3_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
@@ -2223,10 +2223,12 @@ pub(crate) mod diag {
         let vec_score_sql =
             format!("SELECT score FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
         let _ = consumer
-            .reader().query_sql(&bm25_sql)
+            .reader()
+            .query_sql(&bm25_sql)
             .expect("warm-up query_sql bm25");
         let _ = consumer
-            .reader().query_sql(&vec_sql)
+            .reader()
+            .query_sql(&vec_sql)
             .expect("warm-up query_sql vector");
 
         // 7. Time both paths.
@@ -2244,7 +2246,10 @@ pub(crate) mod diag {
         let mut qsql_bm25: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = consumer.reader().query_sql(&bm25_sql).expect("query_sql bm25");
+            let _ = consumer
+                .reader()
+                .query_sql(&bm25_sql)
+                .expect("query_sql bm25");
             qsql_bm25.push(t.elapsed());
         }
         let mut kernel_vec: Vec<Duration> = Vec::with_capacity(iters);
@@ -2259,7 +2264,10 @@ pub(crate) mod diag {
         let mut qsql_vec: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = consumer.reader().query_sql(&vec_sql).expect("query_sql vector");
+            let _ = consumer
+                .reader()
+                .query_sql(&vec_sql)
+                .expect("query_sql vector");
             qsql_vec.push(t.elapsed());
         }
 
@@ -2297,7 +2305,8 @@ pub(crate) mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
-                .reader().query_sql(&bm25_score_sql)
+                .reader()
+                .query_sql(&bm25_score_sql)
                 .expect("query_sql bm25 score");
             bm25_score_total.push(t.elapsed());
         }
@@ -2305,7 +2314,8 @@ pub(crate) mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
-                .reader().query_sql(&vec_score_sql)
+                .reader()
+                .query_sql(&vec_score_sql)
                 .expect("query_sql vector score");
             vec_score_total.push(t.elapsed());
         }

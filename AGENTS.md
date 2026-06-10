@@ -36,11 +36,11 @@ cargo test --lib superfile::vector::
 
 # All benches share one `bench` target; select cells with positional
 # tokens after `--`: [tier] [modality] [phase ...] (space-separated)
-cargo bench --bench bench -- superfile fts
-cargo bench --bench bench -- supertable vector build warm
+cargo bench -- superfile fts
+cargo bench -- supertable vector build warm
 # Diagnostics are tokens on the same binary:
 #   scale | tombstone | update | sql-diag | object-store
-cargo bench --bench bench -- tombstone
+cargo bench -- tombstone
 ```
 
 ## Code style beyond CONTRIBUTING.md
@@ -70,7 +70,7 @@ Performance *and* cost are first-class acceptance criteria for every change. A P
 
 ### What `benches/` covers
 
-One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench --bench bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
+One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
 
 - **`superfile` tier** — single-segment, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
 - **`supertable` tier** — multi-segment table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.

@@ -35,10 +35,10 @@ pub mod fts {
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench --bench bench -- superfile fts                 # build + search
-    //! cargo bench --bench bench -- superfile fts build           # ingest only
-    //! cargo bench --bench bench -- superfile fts search          # search only
-    //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile fts
+    //! cargo bench -- superfile fts                 # build + search
+    //! cargo bench -- superfile fts build           # ingest only
+    //! cargo bench -- superfile fts search          # search only
+    //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
     //! ```
 
     use std::collections::HashMap;
@@ -50,14 +50,14 @@ pub mod fts {
     use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
 
     use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
+    use crate::executors::fts as exec_fts;
+    use crate::executors::fts::{FTS_BATTERY, FtsRead};
     use crate::harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index};
     use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
     use crate::rss::{self, RssStats};
-    use crate::tiers;
     use crate::supertable::Phases;
-    use crate::executors::fts as exec_fts;
-    use crate::executors::fts::{FTS_BATTERY, FtsRead};
+    use crate::tiers;
 
     // ─── Constants ────────────────────────────────────────────────────────
 
@@ -79,7 +79,7 @@ pub mod fts {
 
     // ─── Query battery (shared by warm search, cold tier, recall id grading) ─
 
-// FTS query battery + OR/AND name lists live in `crate::executors::fts`.
+    // FTS query battery + OR/AND name lists live in `crate::executors::fts`.
 
     /// Per-algorithm probe shapes (OR-only; WAND+BMW vs MaxScore+BMM). This
     /// is an infino-internal hook with no cross-engine analogue.
@@ -118,16 +118,18 @@ pub mod fts {
     fn assert_superfile_self_consistent(reader: &SuperfileReader, n_docs: usize) {
         let probe_doc_id = n_docs / 2;
         let probe_token = format!("doc{probe_doc_id:07}");
-        let hits = block_on_inmem(reader.bm25_hits_async(FTS_COLUMN, &probe_token, K, InfinoBoolMode::Or))
-            .expect("search df=1");
+        let hits =
+            block_on_inmem(reader.bm25_hits_async(FTS_COLUMN, &probe_token, K, InfinoBoolMode::Or))
+                .expect("search df=1");
         assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
         assert_eq!(
             hits[0].0 as usize, probe_doc_id,
             "{probe_token} should match doc_id {probe_doc_id}"
         );
 
-        let hits = block_on_inmem(reader.bm25_hits_async(FTS_COLUMN, "term00001", K, InfinoBoolMode::Or))
-            .expect("search common");
+        let hits =
+            block_on_inmem(reader.bm25_hits_async(FTS_COLUMN, "term00001", K, InfinoBoolMode::Or))
+                .expect("search common");
         assert_eq!(hits.len(), K, "common term should fill top-k");
         for w in hits.windows(2) {
             assert!(
@@ -253,7 +255,6 @@ pub mod fts {
         }
         p50(&mut samples)
     }
-
 
     // ─── Entry point ──────────────────────────────────────────────────────
 
@@ -418,7 +419,11 @@ pub mod fts {
             uri: infino::supertable::manifest::SuperfileUri,
         ) -> Self {
             let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
-            Self { _cache_dir: cache_dir, cache, uri }
+            Self {
+                _cache_dir: cache_dir,
+                cache,
+                uri,
+            }
         }
     }
 
@@ -534,7 +539,7 @@ pub mod fts {
         });
     }
 
-// `search_row` / `emit_search` now live in `crate::executors::fts::emit_search`.
+    // `search_row` / `emit_search` now live in `crate::executors::fts::emit_search`.
 }
 
 pub mod vector {
@@ -556,8 +561,8 @@ pub mod vector {
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench --bench bench -- superfile vector build              # ingest only
-    //! cargo bench --bench bench -- superfile vector search             # search only
+    //! cargo bench -- superfile vector build              # ingest only
+    //! cargo bench -- superfile vector search             # search only
     //! ```
 
     use std::sync::{Arc, OnceLock};
@@ -754,7 +759,11 @@ pub mod vector {
                     uri: infino::supertable::manifest::SuperfileUri,
                 ) -> Self {
                     let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
-                    Self { _cache_dir: cache_dir, cache, uri }
+                    Self {
+                        _cache_dir: cache_dir,
+                        cache,
+                        uri,
+                    }
                 }
             }
             impl VectorRead for SuperfileVecColdGuard {
@@ -769,7 +778,12 @@ pub mod vector {
                     tiers::block_on(async {
                         let reader = self.cache.reader(&self.uri).await.expect("cold reader");
                         reader
-                            .vector_hits_async(column, query, k, exec_vec::search_opts(nprobe, rerank))
+                            .vector_hits_async(
+                                column,
+                                query,
+                                k,
+                                exec_vec::search_opts(nprobe, rerank),
+                            )
                             .await
                             .expect("cold vector_search")
                     })
@@ -850,7 +864,6 @@ pub mod vector {
             }],
         });
     }
-
 }
 
 pub mod sql {
@@ -869,9 +882,9 @@ pub mod sql {
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench --bench bench -- superfile sql
-    //! INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench bench -- superfile sql
-    //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile sql
+    //! cargo bench -- superfile sql
+    //! INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench -- superfile sql
+    //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile sql
     //! ```
 
     use std::time::Duration;
@@ -930,12 +943,19 @@ pub mod sql {
         }
         if phases.warm {
             exec_sql::assert_correct(&index, n_docs, "superfile_sql");
-            let sets =
-                exec_sql::measure_query_sets(&index, &query_inputs, exec_sql::ITERS, "superfile_sql");
+            let sets = exec_sql::measure_query_sets(
+                &index,
+                &query_inputs,
+                exec_sql::ITERS,
+                "superfile_sql",
+            );
             exec_sql::emit_query(
                 &mut report,
                 "bench/sql/query",
-                format!("Superfile SQL — query, single superfile / in-memory ({} rows)", fmt_count(n_docs)),
+                format!(
+                    "Superfile SQL — query, single superfile / in-memory ({} rows)",
+                    fmt_count(n_docs)
+                ),
                 "Warm p50 over `query_sql` against the canonical 1-writer table. The headline comparison is Plain Scan vs FTS-pushdown (same selective equality, 1 row, sorted vs unsorted column). The first block is aggregations & count-filters. `Rows` is the result-set size. Δ is vs the previous run.",
                 &sets,
             );
@@ -947,7 +967,10 @@ pub mod sql {
             exec_sql::emit_cold(
                 &mut report,
                 "bench/sql/superfile/cold",
-                format!("Superfile SQL — cold query, object-store ({} rows)", fmt_count(n_docs)),
+                format!(
+                    "Superfile SQL — cold query, object-store ({} rows)",
+                    fmt_count(n_docs)
+                ),
                 "Cold p50 over `reader().query_sql` after reopening the same SQL table shape from object storage with a fresh disk cache per iteration. Δ is vs the previous run.",
                 &cold,
             );
@@ -1063,7 +1086,10 @@ pub mod sql {
         let cold = exec_sql::measure_cold(
             || {
                 let (cache_dir, table) = open_cold_consumer(&artifact);
-                SqlColdGuard { _cache_dir: cache_dir, table }
+                SqlColdGuard {
+                    _cache_dir: cache_dir,
+                    table,
+                }
             },
             COLD_ITERS,
             "superfile_sql",

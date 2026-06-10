@@ -31,10 +31,10 @@
 //! ## Invocation
 //!
 //! ```text
-//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench --bench bench -- supertable
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench -- supertable
 //! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
-//!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench --bench bench -- supertable
-//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench bench -- supertable
+//!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench -- supertable
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
 use std::process::{Command, Stdio};
@@ -351,10 +351,7 @@ impl Phases {
     };
 }
 
-fn open_consumer(
-    modality: Modality,
-    built: &supertable::IngestResult,
-) -> (TempDir, Supertable) {
+fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         Arc::clone(&built.storage),
         Some(built.total_index_bytes),
@@ -370,7 +367,7 @@ fn open_consumer(
 pub mod fts {
     use super::*;
     use crate::executors::fts as exec_fts;
-    use crate::executors::fts::{FtsRead, FTS_BATTERY};
+    use crate::executors::fts::{FTS_BATTERY, FtsRead};
 
     /// Build an FTS-only supertable, then measure warm and cold BM25
     /// reads through the shared FTS executor (same code superfile runs).
@@ -544,7 +541,10 @@ pub mod fts {
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-            Self { _cache_dir: cache_dir, consumer }
+            Self {
+                _cache_dir: cache_dir,
+                consumer,
+            }
         }
     }
 
@@ -683,7 +683,13 @@ pub mod vector {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
             let _ = consumer
                 .reader()
-                .vector_search(supertable::VEC_COLUMN, &q_cal[0], TOP_K, exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT), None)
+                .vector_search(
+                    supertable::VEC_COLUMN,
+                    &q_cal[0],
+                    TOP_K,
+                    exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
+                    None,
+                )
                 .expect("warm prewarm vector_search");
             consumer
                 .wait_until_warm(Duration::from_secs(600))
@@ -734,7 +740,10 @@ pub mod vector {
     impl SupertableVecColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
-            Self { _cache_dir: cache_dir, consumer }
+            Self {
+                _cache_dir: cache_dir,
+                consumer,
+            }
         }
     }
 
@@ -768,7 +777,10 @@ pub mod sql {
 
         let n_docs = supertable::n_docs();
         if phases.build {
-            eprintln!("[supertable_sql] ingesting {} rows to object storage...", fmt_count(n_docs));
+            eprintln!(
+                "[supertable_sql] ingesting {} rows to object storage...",
+                fmt_count(n_docs)
+            );
         } else {
             eprintln!(
                 "[supertable_sql] building query artifact ({} rows) for warm/cold phases...",
@@ -816,8 +828,14 @@ pub mod sql {
 
         let inputs = exec_sql::QueryInputs {
             qv: sample_query_csv(),
-            sample_title: built.sql_sample_title.clone().expect("sql ingest sets sample_title"),
-            sample_key: built.sql_sample_key.clone().expect("sql ingest sets sample_key"),
+            sample_title: built
+                .sql_sample_title
+                .clone()
+                .expect("sql ingest sets sample_title"),
+            sample_key: built
+                .sql_sample_key
+                .clone()
+                .expect("sql ingest sets sample_key"),
         };
 
         if phases.warm || phases.cold {
@@ -854,8 +872,11 @@ pub mod sql {
         }
 
         if phases.cold {
-            let cold =
-                exec_sql::measure_cold(|| SupertableSqlColdGuard::open(&built), COLD_ITERS, "supertable_sql");
+            let cold = exec_sql::measure_cold(
+                || SupertableSqlColdGuard::open(&built),
+                COLD_ITERS,
+                "supertable_sql",
+            );
             exec_sql::emit_cold(
                 &mut report,
                 "bench/sql/supertable/cold",
@@ -885,7 +906,10 @@ pub mod sql {
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
-            Self { _cache_dir: cache_dir, consumer }
+            Self {
+                _cache_dir: cache_dir,
+                consumer,
+            }
         }
     }
     impl SqlRead for SupertableSqlColdGuard {
