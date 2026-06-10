@@ -138,7 +138,13 @@ fn time_p50(mut f: impl FnMut()) -> Duration {
 fn fanout_floor_decomposition() {
     let st = build_supertable();
     let reader = st.reader();
-    assert_eq!(reader.n_superfiles(), SEGMENTS, "one segment per commit");
+    // The writer row-shards each commit (cpus/2 shards), so the real
+    // segment count is a multiple of the commit count — report it.
+    let n_segments = reader.n_superfiles();
+    assert!(
+        n_segments >= SEGMENTS,
+        "expected at least one segment per commit, got {n_segments}"
+    );
 
     // (label, query term, expected to hit?)
     let shapes: &[(&str, &str, bool)] = &[
@@ -148,7 +154,7 @@ fn fanout_floor_decomposition() {
     ];
 
     println!(
-        "\n### Warm fan-out floor — {SEGMENTS} segments × {} docs, k={K}, p50 of {ITERS}\n",
+        "\n### Warm fan-out floor — {n_segments} segments ({SEGMENTS} commits × {} docs), k={K}, p50 of {ITERS}\n",
         DOCS_PER_SEGMENT
     );
     println!("| shape | bm25_hits | bm25_search (_id, score) |");
