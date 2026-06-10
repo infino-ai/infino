@@ -92,3 +92,23 @@ storage:
   cold_fetch_chunk_bytes: 4194304
   mmap_cold_threshold_secs: 300
   mmap_sweep_interval_secs: 75
+
+# Compaction merges the small segments produced by individual
+# commits into one target-sized segment, cutting query fan-out.
+# Sizes are in mb (1 MiB = 1024 × 1024 bytes).
+#
+# Env overrides (note the double underscore for nesting):
+#   INFINO_COMPACTION__TARGET_SEGMENT_SIZE_MB=2048
+#   INFINO_COMPACTION__MIN_FILL_PERCENT=80
+#   INFINO_COMPACTION__MAX_MEMORY_MB=3072
+compaction:
+  # Size a compacted output aims for.
+  target_segment_size_mb: 1024
+
+  # Minimum estimated live bytes to trigger a merge,
+  # as a percentage of `target_segment_size_mb`.
+  # E.g. at 80% with a 1 GiB target, two 200 MiB segments (400 MiB) do not compact.
+  min_fill_percent: 80
+
+  # Maximum memory budget for materializing inputs during a single merge, in MiB.
+  max_memory_mb: 3072
