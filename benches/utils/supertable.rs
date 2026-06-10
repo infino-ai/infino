@@ -678,22 +678,28 @@ pub mod vector {
             );
             let gt_cal = corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K);
 
-            // One hot consumer drives correctness + warm calibration.
-            eprintln!("[supertable_vector] opening warm consumer, prewarm + wait_until_warm...");
+            // One consumer drives correctness + calibration. Full cache
+            // promotion (prewarm + wait_until_warm) only matters for the
+            // warm timing rows — a cold-only run skips it (fts/sql gate
+            // the same way) so it doesn't pull every segment into the
+            // cache just to throw it away.
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
-            let _ = consumer
-                .reader()
-                .vector_search(
-                    supertable::VEC_COLUMN,
-                    &q_cal[0],
-                    TOP_K,
-                    exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
-                    None,
-                )
-                .expect("warm prewarm vector_search");
-            consumer
-                .wait_until_warm(Duration::from_secs(600))
-                .expect("supertable warm promotion");
+            if phases.warm {
+                eprintln!("[supertable_vector] opening warm consumer, prewarm + wait_until_warm...");
+                let _ = consumer
+                    .reader()
+                    .vector_search(
+                        supertable::VEC_COLUMN,
+                        &q_cal[0],
+                        TOP_K,
+                        exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
+                        None,
+                    )
+                    .expect("warm prewarm vector_search");
+                consumer
+                    .wait_until_warm(Duration::from_secs(600))
+                    .expect("supertable warm promotion");
+            }
 
             let title = format!(
                 "Supertable vector — search, multi-segment / object-store ({} docs × dim={})",
