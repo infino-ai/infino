@@ -4,7 +4,7 @@
 //! Supertable object-store bench (infino-only entry point).
 //!
 //! Multi-segment ingest to object storage at the supertable scale
-//! (`INFINO_BENCH_SUPERTABLE_DOCS`, default 10M), built through the
+//! (`INFINO_BENCH_DOC_COUNT`, default 10M), built through the
 //! production `SupertableWriter::append` + `commit` path. Three index
 //! shapes are measured for apples-to-apples comparison against
 //! single-modality peers: FTS-only, vector-only, SQL, and combined FTS +
@@ -31,10 +31,10 @@
 //! ## Invocation
 //!
 //! ```text
-//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench --bench supertable_all
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench --bench bench -- supertable
 //! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
-//!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench --bench supertable_all
-//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench --bench supertable_all
+//!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench --bench bench -- supertable
+//! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench bench -- supertable
 //! ```
 
 use std::process::{Command, Stdio};

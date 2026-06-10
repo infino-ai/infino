@@ -4,7 +4,7 @@
 //! SQL scan-path diagnostic — localizes where `Supertable::query_sql`
 //! scalar-scan latency actually goes.
 //!
-//! The headline SQL bench (`cargo bench --bench sql`) reports scalar
+//! The headline SQL bench (`cargo bench --bench bench -- superfile sql`) reports scalar
 //! scans (`scan_all`, `filter_category`, `filter_rating`) at ~300ms
 //! while `count_star` / `group_by_category` land at single-digit ms.
 //! This diagnostic decomposes that gap by timing infino's full
@@ -40,11 +40,11 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench sql-diag
-//! INFINO_BENCH_DOC_COUNT=1000000 cargo bench --bench sql-diag
-//! INFINO_SQL_DIAG_ITERS=20 cargo bench --bench sql-diag
+//! cargo bench --bench bench -- sql-diag
+//! INFINO_BENCH_DOC_COUNT=1000000 cargo bench --bench bench -- sql-diag
+//! INFINO_SQL_DIAG_ITERS=20 cargo bench --bench bench -- sql-diag
 //! # delegate to the kernel-vs-query_sql TVF dispatch-tax diagnostic:
-//! INFINO_SQL_DIAG=tvf cargo bench --bench sql-diag
+//! INFINO_SQL_DIAG=tvf cargo bench --bench bench -- sql-diag
 //! ```
 
 use std::sync::Arc;

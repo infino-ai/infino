@@ -35,10 +35,10 @@ pub mod fts {
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench --bench superfile_fts                          # build + search
-    //! cargo bench --bench superfile_fts -- superfile_fts_build   # ingest only
-    //! cargo bench --bench superfile_fts -- superfile_fts_search  # search only
-    //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts
+    //! cargo bench --bench bench -- superfile fts                 # build + search
+    //! cargo bench --bench bench -- superfile fts build           # ingest only
+    //! cargo bench --bench bench -- superfile fts search          # search only
+    //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile fts
     //! ```
 
     use std::collections::HashMap;
@@ -556,8 +556,8 @@ pub mod vector {
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench --bench superfile_vector -- superfile_vec_build      # ingest only
-    //! cargo bench --bench superfile_vector -- superfile_vec_search     # search only
+    //! cargo bench --bench bench -- superfile vector build              # ingest only
+    //! cargo bench --bench bench -- superfile vector search             # search only
     //! ```
 
     use std::sync::{Arc, OnceLock};
@@ -869,9 +869,9 @@ pub mod sql {
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench --bench sql
-    //! INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --bench sql
-    //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench sql
+    //! cargo bench --bench bench -- superfile sql
+    //! INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench bench -- superfile sql
+    //! INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile sql
     //! ```
 
     use std::time::Duration;

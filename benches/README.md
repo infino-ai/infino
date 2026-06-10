@@ -23,46 +23,51 @@ second copy just to run correctness or object-store reads.
 ## Bench Shapes
 
 - **Superfile** — single-artifact, in-memory read path. Default scale: `1M`
-  docs, controlled by `INFINO_BENCH_DOC_COUNT`.
+  docs.
 - **Supertable** — multi-artifact table committed to object storage and read
-  through warm/cold table paths. Default scale: `10M` docs, controlled by
-  `INFINO_BENCH_SUPERTABLE_DOCS`.
+  through warm/cold table paths. Default scale: `10M` docs.
+- Both scales are overridden by `INFINO_BENCH_DOC_COUNT` (one knob for both
+  tiers; a plain integer — `100K`/`1M` suffixes do not parse).
 - **Writer count** — build rows report `1 writer` and `N writers`. `N` defaults
   to the machine's logical core count and is controlled by
   `INFINO_BENCH_WRITERS`.
 
 ## Invocation
 
+Selection is positional tokens after `--`: `[tier] [modality] [phase ...]`,
+space-separated (there are no `superfile_fts`-style combined tokens).
+
 ```sh
 # Run every tier × modality test, all phases.
 cargo bench --bench bench
 
-# Run one test, all phases.
-cargo bench --bench bench -- superfile_fts
-cargo bench --bench bench -- superfile_vector
-cargo bench --bench bench -- superfile_sql
-cargo bench --bench bench -- supertable_fts
-cargo bench --bench bench -- supertable_vector
-cargo bench --bench bench -- supertable_sql
+# Run one cell, all phases.
+cargo bench --bench bench -- superfile fts
+cargo bench --bench bench -- supertable vector
 
-# Select phases. Valid phases are: build, warm, cold.
-cargo bench --bench bench -- superfile_sql cold
-cargo bench --bench bench -- supertable_vector build warm
+# One tier, all three modalities.
+cargo bench --bench bench -- supertable
 
-# Smaller local loop.
-INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench bench -- superfile_fts warm
+# Select phases. Valid phases: build, warm, cold (search = warm+cold).
+cargo bench --bench bench -- superfile sql cold
+cargo bench --bench bench -- supertable vector build warm
+
+# Smaller local loop (plain integer; K/M suffixes do not parse).
+INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench bench -- superfile fts warm
 
 # Override the N-writers build row.
-INFINO_BENCH_WRITERS=4 cargo bench --bench bench -- superfile_fts build
+INFINO_BENCH_WRITERS=4 cargo bench --bench bench -- superfile fts build
 
 # Refresh the markdown sections in this file.
-INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile_fts
+INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile fts
 
-# Diagnostics (not part of the default bench loop).
-cargo bench --features bench-diagnostics --bench object-store
-cargo bench --features bench-diagnostics --bench scale -- vector_recall
-cargo bench --bench tombstone-overhead
-cargo bench --bench supertable-update
+# Diagnostics (standalone programs in the same binary; not part of the
+# default loop).
+cargo bench --bench bench -- scale
+cargo bench --bench bench -- tombstone
+cargo bench --bench bench -- update
+cargo bench --bench bench -- sql-diag
+cargo bench --bench bench -- object-store
 ```
 
 ## Object-store backends
@@ -137,11 +142,11 @@ are produced directly by the custom harness.
 ### FTS — superfile (single-segment, 1M docs)
 
 <!-- BEGIN: bench/fts/superfile/ingest -->
-_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts` to populate._
+_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile fts` to populate._
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
-_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts` to populate._
+_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile fts` to populate._
 <!-- END: bench/fts/superfile/search -->
 
 ### FTS — supertable (multi-segment, 10M docs)
@@ -163,7 +168,7 @@ _Pending `VectorEngine` migration._
 ### Supertable — ingest (multi-segment, object store)
 
 <!-- BEGIN: bench/supertable/ingest -->
-_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable_all` to populate._
+_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- supertable` to populate._
 <!-- END: bench/supertable/ingest -->
 
 ### Vector — supertable (multi-segment, 10M × 384)

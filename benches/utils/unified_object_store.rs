@@ -49,9 +49,9 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --features bench-diagnostics --bench object-store
-//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --features bench-diagnostics --bench object-store
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --features bench-diagnostics --bench object-store
+//! cargo bench --bench bench -- object-store
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --bench bench -- object-store
+//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- object-store
 //! ```
 //!
 //! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
@@ -739,8 +739,7 @@ fn emit_object_store(
 //
 // Invocation:
 //
-//   INFINO_DIAG_COLD_PATH=1 cargo bench --no-default-features \
-//     --features bench-diagnostics --bench object-store --warm-up-time 1
+//   INFINO_DIAG_COLD_PATH=1 cargo bench --bench bench -- object-store
 //
 // to localize where cold-path time is going (raw s3s-fs RTT vs.
 // our cold-fetch path's range count). When the env var is set,
@@ -1492,7 +1491,7 @@ pub(crate) mod diag {
     /// INFINO_DIAG_REAL_S3=1 \
     /// INFINO_REAL_S3_BUCKET=cold-test-381491836522 \
     /// AWS_REGION=us-east-1 \
-    /// cargo bench --no-default-features --features bench-diagnostics --bench object-store -- --warm-up-time 1
+    /// cargo bench --bench bench -- object-store
     /// ```
     pub fn diagnose_real_s3_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");

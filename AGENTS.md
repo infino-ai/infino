@@ -23,7 +23,7 @@ When guidance disagrees, resolve in this order (closest wins):
 
 ## Running a focused test subset
 
-Test binaries are bundled by layer in `Cargo.toml` (`[[test]]` stanzas) to keep link time down — `--test <binary>` picks the layer, the filter narrows within it. Same applies to benches (`[[bench]]` stanzas).
+Test binaries are bundled by layer in `Cargo.toml` (`[[test]]` stanzas) to keep link time down — `--test <binary>` picks the layer, the filter narrows within it. Benches are one further step consolidated: a single `[[bench]]` target named `bench`, selected by positional tokens.
 
 ```sh
 # Run one integration test crate (each binary covers a top-level layer)
@@ -34,11 +34,13 @@ cargo test --test superfile format::crc_corruption
 # Run unit tests in one module
 cargo test --lib superfile::vector::
 
-# Single bench (target names are the [[bench]] `name` fields, not the dir)
-cargo bench --bench superfile_fts
-cargo bench --bench superfile_vector
-# Other bench targets: supertable_all, object-store, scale,
-# tombstone-overhead, supertable-update
+# All benches share one `bench` target; select cells with positional
+# tokens after `--`: [tier] [modality] [phase ...] (space-separated)
+cargo bench --bench bench -- superfile fts
+cargo bench --bench bench -- supertable vector build warm
+# Diagnostics are tokens on the same binary:
+#   scale | tombstone | update | sql-diag | object-store
+cargo bench --bench bench -- tombstone
 ```
 
 ## Code style beyond CONTRIBUTING.md
@@ -56,7 +58,7 @@ cargo bench --bench superfile_vector
 Three lanes beyond `cargo test`:
 
 - **Brute-force oracles** under `tests/` — BM25 top-K is compared against the textbook BM25 formula on planted corpora; full-nprobe IVF is compared against brute-force exact-nearest for L2Sq / Cosine / NegDot. These are the correctness gates; if you touch scoring math or vector distance kernels, the oracles run first.
-- **Recall measurement — the acceptance bar is recall@10 ≥ 0.99, full stop.** No change is accepted that drops vector recall@10 below 0.99 on the standard vector bench (10M-row supertable, default config); demonstrate it and report the number in the PR body. The lower floors currently hard-coded in the bench suite (recall@10 ≥ 0.90 / 0.95 in `benches/scale/vector_recall.rs`, and the 0.80 / 0.85 correctness floors) are loose regression tripwires only — **passing them is necessary but not sufficient.** The bar is 0.99.
+- **Recall measurement — the acceptance bar is recall@10 ≥ 0.99, full stop.** No change is accepted that drops vector recall@10 below 0.99 on the standard vector bench (10M-row supertable, default config); demonstrate it and report the number in the PR body. The lower floors currently hard-coded in the bench suite (recall@10 ≥ 0.90 / 0.95 in `benches/utils/scale.rs`, and the 0.80 / 0.85 correctness floors) are loose regression tripwires only — **passing them is necessary but not sufficient.** The bar is 0.99.
 - `**make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`), not just when you touch `unsafe` directly. Cost: miri ~100-1000× slower than native; asan 2-3×.
 - **Property tests** — `proptest` is in dev-deps; used for round-trip invariants like PFOR encode/decode.
 
@@ -64,28 +66,22 @@ Test deletions require explicit justification.
 
 ## Performance
 
-**The north star of this repo is speed-per-dollar.** Performance *and* cost are first-class acceptance criteria for every change. A PR that regresses query latency, ingest throughput, or the cost profile (bytes fetched, object-store request count, memory / cache footprint) is rejected unless it buys a correctness fix or a deliberate, documented trade-off. The golden rule still holds — correctness and simplicity come first — but among otherwise-acceptable changes, the one that preserves or improves speed-per-dollar wins.
+Performance *and* cost are first-class acceptance criteria for every change. A PR that regresses query latency, ingest throughput, or the cost profile (bytes fetched, object-store request count, memory / cache footprint) is rejected unless it buys a correctness fix or a deliberate, documented trade-off. The golden rule still holds — correctness and simplicity come first — but among otherwise-acceptable changes, the one that preserves or improves speed-per-dollar wins.
 
 ### What `benches/` covers
 
-Benchmarks, bundled by topic in `[[bench]]` stanzas (`harness = false`). See `benches/README.md` for the full invocation guide and the recorded result tables. The default suite (`cargo bench`) runs:
+One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench --bench bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
 
-- `**superfile_fts`** — BM25 ingest + search over one 1M-doc superfile.
-- `**superfile_vector**` — IVF + RaBitQ ingest + search over one 1M × 384 superfile.
-- `**supertable_all**` — a combined 10M-row supertable (FTS + vector) built once and reused for ingest + FTS-search + vector-search timing; the BM25 oracle / vector-recall floor run before timing.
-- `**tombstone-overhead**` — query overhead of the delete / tombstone path.
-- `**supertable-update**` — the update / delete pipeline.
+- **`superfile` tier** — single-segment, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
+- **`supertable` tier** — multi-segment table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
 
-Diagnostic benches are opt-in behind `--features bench-diagnostics` and are *not* run by plain `cargo bench`:
+Diagnostics are standalone programs sharing the same binary (tokens, not separate targets): `scale` (release-profile recall gates), `tombstone`, `update`, `sql-diag`, `object-store`. Scale knobs: `INFINO_BENCH_DOC_COUNT` (plain integer, one knob for both tiers) and `INFINO_BENCH_WRITERS`.
 
-- `**object-store*`* — S3-compatible cold lazy-fetch path (request count + bytes fetched) over a unified 1M superfile.
-- `**scale**` — release-profile recall gates (e.g. `vector_recall`).
-
-Recorded numbers live in `benches/README.md`; the structured source of truth is criterion's `target/criterion/<group>/<bench>/new/estimates.json`.
+Recorded numbers live in `benches/README.md`; the structured source of truth is `target/infino-bench/<bench>.json`, written by the report layer after each run (the previous run's file is the delta baseline).
 
 ### Running the suite
 
-- **Before any material change to the codebase, run the full bench suite** (`make bench`, i.e. `cargo bench`) and keep the baseline. After your change, re-run and diff against `main` — confirm there is no latency, throughput, *or* cost (bytes / requests / memory) regression. `make bench-quick` (`cargo bench -- --quick`) is for fast inner-loop iteration only, never for the final gate.
+- **Before any material change to the codebase, run the full bench suite** (`make bench`, i.e. `cargo bench`) and keep the baseline. After your change, re-run and diff against `main` — confirm there is no latency, throughput, *or* cost (bytes / requests / memory) regression. `make bench-quick` (a 100K-doc `superfile fts warm` run) is for fast inner-loop iteration only, never for the final gate.
 - This is the same bar the PR checklist enforces: the comparison against `main`, and any intentional trade-off, goes in the PR body.
 - Treat a bench run as mandatory — not optional — when you touch scoring math, distance / SIMD kernels, the quantization codecs, the commit / manifest path, or the reader cache.
 
@@ -116,12 +112,14 @@ Recorded numbers live in `benches/README.md`; the structured source of truth is 
 
 ## Repository layout
 
-Three core layers (`storage`, `superfile`, `supertable`) plus a few
-small support modules:
+Three core layers (`storage`, `superfile`, `supertable`), the public
+`catalog` layer on top, plus a few small support modules:
 
 ```
 src/
-├── lib.rs                 ← crate root (small; declares modules)
+├── lib.rs                 ← crate root (small; declares modules + curated re-exports)
+├── catalog/               ← public entry point (connect → Connection → tables, search TVFs)
+├── error.rs               ← the single public InfinoError (coarse, #[non_exhaustive])
 ├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure)
 ├── superfile/             ← single-file format (immutable segments)
 │   ├── builder.rs         ← write path
@@ -147,7 +145,8 @@ tests/                     ← integration tests; the two main binaries
                              in [[test]] stanzas, plus a few standalone
                              top-level test files (e.g. the crash /
                              concurrent-process tests)
-benches/                   ← custom harness benches, bundled by topic in [[bench]] stanzas
+benches/                   ← one custom-harness [[bench]] target (`bench`); all
+                             measurement logic in benches/utils (infino-bench-utils)
 docs/architecture/         ← canonical design references
 examples/                  ← runnable examples (start with `cargo run --example demo`)
 ```
@@ -168,6 +167,8 @@ Rule of thumb for landing a change in the right place:
 | Tombstones (delete-path / query-filter)     | `src/supertable/{wal,tombstones}/`                                    |
 | New storage backend                         | `src/storage/`                                                        |
 | File-format byte layout                     | `src/superfile/format/`                                               |
+| Catalog / `connect` / `Connection`          | `src/catalog/`                                                        |
+| Public error mapping                        | `src/error.rs`                                                        |
 
 
 ## Boundaries
