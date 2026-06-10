@@ -25,7 +25,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
+use rayon::prelude::*;
 
+use crate::superfile::SuperfileReader;
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
 use crate::supertable::query::{SearchHit, SuperfileHit};
@@ -202,20 +204,10 @@ async fn resolve_columns(
         placement.push((seg_idx, row));
     }
 
-    // Per-segment column-projected reads, split by concern:
-    //   1. **Open** every distinct segment reader **concurrently** on
-    //      the tokio runtime — these are async I/O (in-memory cache
-    //      lookups / disk-cache cold fetches), so overlapping them is
-    //      the right model and they cost ~microseconds when warm.
-    //   2. **Decode** every segment **in parallel** on
-    //      `options.reader_pool` (rayon). `take_by_local_doc_ids` is a
-    //      CPU-bound Parquet page decode over already-resident bytes;
-    //      the SQL tokio runtime is single-worker by design (it drives
-    //      the I/O state machine, not CPU), so CPU fan-out belongs on
-    //      the reader pool — the same pool the search kernels and the
-    //      writer's shard builds use. The work is bridged back to the
-    //      async caller via a oneshot so the tokio worker is never
-    //      blocked.
+    // Open every distinct segment reader concurrently on the tokio
+    // runtime — these are async I/O (in-memory cache lookups /
+    // disk-cache cold fetches), so overlapping them is the right
+    // model and they cost ~microseconds when warm.
     let manifest = reader.manifest();
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
@@ -229,60 +221,109 @@ async fn resolve_columns(
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-    // Materialize each segment's projected hit rows. Reads stay lazy:
-    // a reader holding resident bytes (in-memory tier / freshly written)
-    // decodes locally via `take_by_local_doc_ids`; a lazy object-store
-    // reader streams ONLY the projected hit rows through parquet's async
-    // `ParquetObjectReader` (footer + projected column pages via range
-    // GETs), so a cold read never materializes the whole segment.
+    // Materialize each segment's projected hit rows, split by tier:
     //
-    // Segment count here is bounded by the global top-k (one entry per
-    // distinct hit-bearing segment), so the per-segment fan-out is small
-    // and the concurrent range-GET reads overlap on the query runtime.
-    let per_segment: Vec<RecordBatch> = futures::future::try_join_all(
-        seg_order
-            .iter()
-            .zip(opened.iter())
-            .zip(seg_locals.iter())
-            .map(|((uri, reader), locals)| {
-                let storage = storage.cloned();
-                let file_size = manifest
-                    .superfiles
-                    .iter()
-                    .find(|e| e.uri == *uri)
-                    .and_then(|e| e.subsection_offsets.as_ref())
-                    .map(|o| o.total_size);
-                async move {
-                    if reader.parquet_bytes().is_some() {
-                        return reader
-                            .take_by_local_doc_ids(locals, names)
-                            .map_err(|e| DataFusionError::Execution(e.to_string()));
-                    }
-                    let storage = storage.ok_or_else(|| {
+    //   - **Resident readers** (in-memory tier / freshly written):
+    //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode
+    //     over already-resident bytes, so the whole wave runs on
+    //     `options.reader_pool` (rayon) — the same pool the search
+    //     kernels and the writer's shard builds use — bridged back via
+    //     a oneshot so no tokio worker blocks under the compute.
+    //   - **Lazy readers** stream ONLY the projected hit rows through
+    //     parquet's async `ParquetObjectReader` (footer + projected
+    //     column pages via range GETs) — async I/O that belongs on the
+    //     query runtime; a cold read never materializes the segment.
+    //
+    // Both waves run concurrently and stitch back in `seg_order`
+    // order. Segment count here is bounded by the global top-k (one
+    // entry per distinct hit-bearing segment), so the fan-out is small.
+    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
+    let mut cold_units: Vec<(usize, &SuperfileUri, &Arc<SuperfileReader>, &[u32])> = Vec::new();
+    for (i, ((uri, rd), locals)) in seg_order
+        .iter()
+        .zip(opened.iter())
+        .zip(seg_locals.iter())
+        .enumerate()
+    {
+        if rd.parquet_bytes().is_some() {
+            warm_inputs.push((i, Arc::clone(rd), locals.clone()));
+        } else {
+            cold_units.push((i, uri, rd, locals.as_slice()));
+        }
+    }
+
+    let warm_wave = async {
+        if warm_inputs.is_empty() {
+            return Ok::<Vec<(usize, RecordBatch)>, DataFusionError>(Vec::new());
+        }
+        // Owned inputs so the rayon closure is `'static`.
+        let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+        let pool = Arc::clone(&manifest.options.reader_pool);
+        let inputs = warm_inputs;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pool.spawn(move || {
+            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+            let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
+                .into_par_iter()
+                .map(|(i, sf, locals)| {
+                    sf.take_by_local_doc_ids(&locals, &name_refs)
+                        .map(|batch| (i, batch))
+                })
+                .collect();
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| {
+                DataFusionError::Execution("resolve decode: reader pool dropped result".into())
+            })?
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
+    };
+
+    let cold_wave = futures::future::try_join_all(cold_units.into_iter().map(
+        |(i, uri, reader, locals)| {
+            let storage = storage.cloned();
+            let file_size = manifest
+                .superfiles
+                .iter()
+                .find(|e| e.uri == *uri)
+                .and_then(|e| e.subsection_offsets.as_ref())
+                .map(|o| o.total_size);
+            async move {
+                let storage = storage.ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "resolve_hits needs row bytes for {uri:?}, but the reader was lazy and no storage backend is attached"
+                    ))
+                })?;
+                let (store, path) =
+                    storage.object_store_handle(&uri.storage_path()).ok_or_else(|| {
                         DataFusionError::Execution(format!(
-                            "resolve_hits needs row bytes for {uri:?}, but the reader was lazy and no storage backend is attached"
+                            "resolve_hits: storage backend exposes no object_store handle for {uri:?}"
                         ))
                     })?;
-                    let (store, path) =
-                        storage.object_store_handle(&uri.storage_path()).ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "resolve_hits: storage backend exposes no object_store handle for {uri:?}"
-                            ))
-                        })?;
-                    take_rows_object_store(
-                        store,
-                        path,
-                        file_size,
-                        reader.schema(),
-                        reader.n_docs(),
-                        locals,
-                        names,
-                    )
-                    .await
-                }
-            }),
-    )
-    .await?;
+                take_rows_object_store(
+                    store,
+                    path,
+                    file_size,
+                    reader.schema(),
+                    reader.n_docs(),
+                    locals,
+                    names,
+                )
+                .await
+                .map(|batch| (i, batch))
+            }
+        },
+    ));
+
+    let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
+    let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
+    for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
+        slots[i] = Some(batch);
+    }
+    let per_segment: Vec<RecordBatch> = slots
+        .into_iter()
+        .map(|s| s.expect("invariant: every segment resolved by exactly one wave"))
+        .collect();
     // Concatenate, then reorder rows into global rank order.
     let cat_schema = per_segment[0].schema();
     let combined = concat_batches(&cat_schema, &per_segment)
