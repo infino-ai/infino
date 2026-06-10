@@ -63,13 +63,12 @@ INFINO_BENCH_WRITERS=4 cargo bench -- superfile fts build
 # Refresh the markdown sections in this file.
 INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
 
-# Diagnostics (standalone programs in the same binary; not part of the
-# default loop).
-cargo bench -- scale
-cargo bench -- tombstone
-cargo bench -- update
-cargo bench -- sql-diag
-cargo bench -- object-store
+# Diagnostics (standalone programs in the same binary; never implied by
+# `all` or a bare `cargo bench`).
+cargo bench -- diagnostic                  # all five
+cargo bench -- diagnostic scale tombstone  # a subset, grouped
+cargo bench -- tombstone                   # bare names also work
+# Names: scale | tombstone | update | sql-diag | object-store
 ```
 
 ## Object-store backends

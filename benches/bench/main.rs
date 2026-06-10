@@ -16,11 +16,9 @@
 //! cargo bench -- supertable vector build cold
 //!
 //! # Diagnostics (standalone programs, same binary):
-//! cargo bench -- scale
-//! cargo bench -- tombstone
-//! cargo bench -- update
-//! cargo bench -- sql-diag
-//! cargo bench -- object-store
+//! cargo bench -- diagnostic              # all five
+//! cargo bench -- diagnostic scale        # a subset, grouped
+//! cargo bench -- tombstone               # bare names also work
 //! ```
 //!
 //! Token vocabulary:
@@ -30,8 +28,11 @@
 //!                 (omitted => all three phases)
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
-//!                 by a bare `cargo bench`; run them by name.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `object-store`
+//!                 by a bare `cargo bench`.
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `object-store`,
+//!                 by name, or grouped under the `diagnostic` keyword —
+//!                 `cargo bench -- diagnostic` runs all five,
+//!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
 //!
@@ -115,8 +116,10 @@ fn print_usage_and_exit(code: i32) -> ! {
          Tier      : superfile | supertable        (omitted => both)\n\
          Modality  : fts | vector | sql            (omitted => all three)\n\
          Phase     : build | warm | cold | search  (search = warm+cold; omitted => all)\n\
-         all       : every tier x modality (the default for a bare `cargo bench`)\n\
-         Diagnostic: scale | tombstone | update | sql-diag | object-store\n\
+         all       : every tier x modality x phase (the default for a bare\n\
+         \x20           `cargo bench`); matrix only — never implies diagnostics\n\
+         Diagnostic: scale | tombstone | update | sql-diag | object-store,\n\
+         \x20           or `diagnostic` for all five / `diagnostic <names>` for a subset\n\
          \n\
          Examples:\n\
          \x20 cargo bench\n\
@@ -160,6 +163,7 @@ fn parse_args() -> Selection {
     let mut warm = false;
     let mut cold = false;
     let mut want_all = false;
+    let mut want_diagnostics = false;
     let mut unknown: Vec<String> = Vec::new();
 
     let push_tier = |t: Tier, tiers: &mut Vec<Tier>| {
@@ -200,6 +204,7 @@ fn parse_args() -> Selection {
             "update" | "supertable-update" => diagnostics.push(Diagnostic::Update),
             "sql-diag" | "sql_diag" => diagnostics.push(Diagnostic::SqlDiag),
             "object-store" | "object_store" => diagnostics.push(Diagnostic::ObjectStore),
+            "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => unknown.push(other.to_string()),
         }
     }
@@ -207,6 +212,20 @@ fn parse_args() -> Selection {
     if !unknown.is_empty() {
         eprintln!("[bench] unknown selector(s): {}", unknown.join(", "));
         print_usage_and_exit(2);
+    }
+
+    // Bare `diagnostic` (no names) selects every diagnostic; with names it
+    // is a plain grouping word (`diagnostic scale tombstone`). Keeps the
+    // matrix vocabulary (`all`, tiers, modalities) disjoint from the
+    // diagnostics namespace.
+    if want_diagnostics && diagnostics.is_empty() {
+        diagnostics = vec![
+            Diagnostic::Scale,
+            Diagnostic::Tombstone,
+            Diagnostic::Update,
+            Diagnostic::SqlDiag,
+            Diagnostic::ObjectStore,
+        ];
     }
 
     let phase_selected = build || warm || cold;
