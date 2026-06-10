@@ -153,7 +153,7 @@ jobs:
         # `suffix` makes each leg's Azure resources unique — both legs
         # share one run_id, so without it they'd collide / cross-delete.
         include:
-          - { bench: supertable_all, docs: "10000000", suffix: st }
+          - { bench: supertable_all, docs: "1000000", suffix: st }
           - { bench: sql, docs: "1000000", suffix: sql }
     # PR: a new push cancels the in-flight run. main: serialize per bench so
     # concurrent merges don't race the baseline blob (never cancel).
