@@ -277,6 +277,15 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         let batch = chunk_batch(modality, corpus, &schema, start, end, len);
         w.append(&batch).expect("append");
         w.commit().expect("commit");
+        // The chunk is committed; drop its corpus pages from RSS so the
+        // build sampler measures the engine, not the streamed harness
+        // pages (clean file-backed pages — they'd re-fault if touched).
+        if let Some(text) = &corpus.text {
+            text.advise_consumed(start, len);
+        }
+        if let Some(vectors) = &corpus.vectors {
+            vectors.advise_consumed(start, len);
+        }
     }
     drop(w);
     let reader = st.reader();

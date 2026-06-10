@@ -322,6 +322,31 @@ impl MmapTextCorpus {
         (start..end).map(|idx| self.doc(idx)).collect()
     }
 
+    /// Drop the resident pages backing docs `[start, start + len)`
+    /// from this process's RSS (`MADV_DONTNEED`, best-effort). The
+    /// streamed build loop calls this after committing each chunk so
+    /// the whole-process RSS sampler measures the engine, not the
+    /// harness's already-consumed corpus pages. Page-rounding may also
+    /// drop a neighbouring chunk's boundary page — harmless; clean
+    /// file-backed pages transparently re-fault from the file.
+    pub fn advise_consumed(&self, start: usize, len: usize) {
+        let end = (start + len).min(self.n_docs());
+        if start >= end {
+            return;
+        }
+        let lo = page_floor(self.offsets[start] as usize);
+        let hi = self.offsets[end] as usize;
+        // SAFETY: read-only shared file mapping — `MADV_DONTNEED` can
+        // only discard clean pages, which re-fault from the backing
+        // file on the next touch; no data is mutated or lost. The
+        // byte range lies within the map by construction of `offsets`.
+        unsafe {
+            let _ =
+                self.map
+                    .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo);
+        }
+    }
+
     /// Materialize the whole corpus as `(doc_id, text)` rows borrowing
     /// from the mmap — the input shape the engine-generic FTS driver
     /// feeds to every engine. `doc_id` is the dense row index, so it
@@ -331,6 +356,17 @@ impl MmapTextCorpus {
             .map(|i| (i as u64, self.doc(i)))
             .collect()
     }
+}
+
+/// Page size assumed for `madvise` range alignment. 4 KiB on every
+/// Linux bench host; a larger real page size only makes the floor
+/// coarser, which is still correct (more bytes advised away).
+const PAGE_BYTES: usize = 4096;
+
+/// Round a byte offset down to the containing page boundary —
+/// `madvise` requires a page-aligned start address.
+fn page_floor(off: usize) -> usize {
+    off & !(PAGE_BYTES - 1)
 }
 
 pub mod combined;
@@ -468,6 +504,27 @@ impl MmapVectorCorpus {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Drop the resident pages backing rows `[start, start + len)`
+    /// from this process's RSS — same contract and safety argument as
+    /// [`MmapTextCorpus::advise_consumed`].
+    pub fn advise_consumed(&self, start: usize, len: usize) {
+        let end = (start + len).min(self.n_docs);
+        if start >= end {
+            return;
+        }
+        let row_bytes = self.dim * std::mem::size_of::<f32>();
+        let lo = page_floor(start * row_bytes);
+        let hi = end * row_bytes;
+        // SAFETY: read-only shared file mapping — `MADV_DONTNEED` only
+        // discards clean pages, which re-fault from the backing file;
+        // the range lies within the map (`end <= n_docs`).
+        unsafe {
+            let _ =
+                self.map
+                    .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo);
+        }
     }
 }
 

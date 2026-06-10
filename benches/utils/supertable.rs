@@ -415,6 +415,9 @@ pub mod fts {
         let built = supertable::build_on_storage(Modality::Fts, &corpus);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
+        // Ingest consumed the corpus; free its pages + temp file before
+        // the warm/cold phases so their samplers see the engine only.
+        drop(corpus);
         let metrics = ShapeMetrics {
             wall_ns: wall.as_secs_f64() * 1e9,
             n_superfiles: built.n_superfiles,
@@ -686,6 +689,9 @@ pub mod vector {
                 QUERY_SIGMA,
             );
             let gt_cal = corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K);
+            // Ground truth extracted; free the corpus pages + temp file
+            // so the warm/cold samplers measure the engine only.
+            drop(corpus);
 
             // One consumer drives correctness + calibration. Full cache
             // promotion (prewarm + wait_until_warm) only matters for the
@@ -812,6 +818,9 @@ pub mod sql {
         let built = supertable::build_on_storage(Modality::Sql, &corpus);
         let wall = t0.elapsed();
         let rss = sampler.stop_stats();
+        // The query predicates were sampled into `built` during the
+        // build; the corpus itself is done — free pages + temp file.
+        drop(corpus);
 
         let mut report = Report::load("supertable_sql");
         let metrics = ShapeMetrics {
