@@ -154,7 +154,7 @@ impl core::marker::Unpin for infino::MutationStats
 impl core::marker::UnsafeUnpin for infino::MutationStats
 impl core::panic::unwind_safe::RefUnwindSafe for infino::MutationStats
 impl core::panic::unwind_safe::UnwindSafe for infino::MutationStats
-pub struct infino::SearchHit
+#[non_exhaustive] pub struct infino::SearchHit
 pub infino::SearchHit::id: i128
 pub infino::SearchHit::score: f32
 impl core::clone::Clone for infino::SearchHit

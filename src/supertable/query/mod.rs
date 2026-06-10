@@ -73,6 +73,10 @@ pub struct SuperfileHit {
 /// `Supertable::bm25_search` / `Supertable::vector_search`,
 /// best-scoring first. Score direction is method-dependent: BM25 is
 /// higher-is-better; vector distance is smaller-is-better.
+///
+/// `#[non_exhaustive]`: constructed only by the engine, so fields can be
+/// added later without breaking downstream `match`/struct-literal code.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchHit {
     /// The row's public `_id`.

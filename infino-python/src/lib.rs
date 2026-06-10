@@ -61,27 +61,30 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
 #[pyfunction]
 #[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None))]
 fn connect(
+    py: Python<'_>,
     uri: &str,
     endpoint: Option<String>,
     region: Option<String>,
     access_key: Option<String>,
     secret_key: Option<String>,
 ) -> PyResult<Connection> {
-    let inner = match endpoint {
-        Some(endpoint) => {
-            let region =
-                region.ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
-            let access_key = access_key
-                .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
-            let secret_key = secret_key
-                .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
-            let opts =
-                ConnectOptions::new().with_s3_endpoint(endpoint, region, access_key, secret_key);
-            infino::connect_with(uri, opts)
-        }
-        None => infino::connect(uri),
-    }
-    .map_err(py_err)?;
+    // Opening a connection can touch object storage; release the GIL so
+    // other Python threads run during the (blocking) I/O.
+    let inner = py
+        .detach(|| match endpoint {
+            Some(endpoint) => {
+                let region = region
+                    .ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
+                let access_key = access_key
+                    .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
+                let secret_key = secret_key
+                    .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
+                let opts = ConnectOptions::new()
+                    .with_s3_endpoint(endpoint, region, access_key, secret_key);
+                infino::connect_with(uri, opts).map_err(py_err)
+            }
+            None => infino::connect(uri).map_err(py_err),
+        })?;
     Ok(Connection { inner })
 }
 
@@ -145,40 +148,46 @@ impl Connection {
     /// Create a table from a pyarrow `Schema` and an `IndexSpec`.
     fn create_table(
         &self,
+        py: Python<'_>,
         name: &str,
         schema: &Bound<'_, PyAny>,
         indexes: &IndexSpec,
     ) -> PyResult<Table> {
-        let schema = Schema::from_pyarrow_bound(schema)?;
+        // pyarrow conversions touch Python (hold the GIL); the table
+        // build commits to storage, so drop the GIL for that part.
+        let schema = Arc::new(Schema::from_pyarrow_bound(schema)?);
         let spec = indexes.to_rust()?;
-        let inner = self
-            .inner
-            .create_table(name, Arc::new(schema), spec)
+        let inner = py
+            .detach(|| self.inner.create_table(name, schema, spec))
             .map_err(py_err)?;
         Ok(Table { inner })
     }
 
     /// Open an existing table by name.
-    fn open_table(&self, name: &str) -> PyResult<Table> {
-        let inner = self.inner.open_table(name).map_err(py_err)?;
+    fn open_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
+        let inner = py
+            .detach(|| self.inner.open_table(name))
+            .map_err(py_err)?;
         Ok(Table { inner })
     }
 
     /// Drop (unregister) a table.
-    fn drop_table(&self, name: &str) -> PyResult<()> {
-        self.inner.drop_table(name).map_err(py_err)
+    fn drop_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        py.detach(|| self.inner.drop_table(name)).map_err(py_err)
     }
 
     /// List the catalog's table names.
-    fn list_tables(&self) -> PyResult<Vec<String>> {
-        self.inner.list_tables().map_err(py_err)
+    fn list_tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| self.inner.list_tables()).map_err(py_err)
     }
 
     /// Run SQL across the catalog's tables; returns a pyarrow `Table`.
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
-        let batches = self.inner.query_sql(sql).map_err(py_err)?;
+        let batches = py
+            .detach(|| self.inner.query_sql(sql))
+            .map_err(py_err)?;
         // `Vec<RecordBatch>` converts to a Python *list* of pyarrow
         // RecordBatches; assemble them into a single pyarrow `Table`.
         let py_batches = batches.to_pyarrow(py)?;
@@ -212,7 +221,8 @@ impl Table {
                 // accepts them. A genuine type or null mismatch still errors.
                 let aligned = RecordBatch::try_new(declared, batch.columns().to_vec())
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                self.inner.append(&aligned).map_err(py_err)
+                // Append commits a segment to storage — release the GIL.
+                py.detach(|| self.inner.append(&aligned)).map_err(py_err)
             }
             // Empty input — nothing to append (no empty commit).
             None => Ok(()),
@@ -239,9 +249,8 @@ impl Table {
                 )));
             }
         };
-        let hits = self
-            .inner
-            .bm25_search(column, query, k, mode)
+        let hits = py
+            .detach(|| self.inner.bm25_search(column, query, k, mode))
             .map_err(py_err)?;
         hits_to_pylist(py, &hits)
     }
@@ -261,9 +270,8 @@ impl Table {
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
-        let hits = self
-            .inner
-            .vector_search(column, &query, k, opts)
+        let hits = py
+            .detach(|| self.inner.vector_search(column, &query, k, opts))
             .map_err(py_err)?;
         hits_to_pylist(py, &hits)
     }
