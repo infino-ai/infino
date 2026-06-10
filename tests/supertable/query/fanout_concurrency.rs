@@ -248,6 +248,22 @@ fn golden(st: &Supertable) -> Golden {
     }
 }
 
+/// Single-threaded determinism gate for the floored fan-out: the
+/// cross-segment threshold (`SharedTopK`) evolves with unit completion
+/// order, which varies run to run — the *result* must not. This pins
+/// the regression where a truncated fixed-point block-max let the
+/// floor skip blocks holding score-tied hits, making the top-k depend
+/// on completion order.
+#[test]
+fn repeated_bm25_is_deterministic_under_threshold_sharing() {
+    let st = Arc::new(build_supertable());
+    let golden = run_bm25(&st);
+    for it in 0..200 {
+        let got = run_bm25(&st);
+        assert_eq!(got, golden, "bm25 result diverged on iteration {it}");
+    }
+}
+
 #[test]
 fn fanout_under_concurrency_is_live_and_deterministic() {
     let st = Arc::new(build_supertable());
@@ -282,8 +298,12 @@ fn fanout_under_concurrency_is_live_and_deterministic() {
                         // threads — maximizes runtime/pool contention.
                         match (t + it) % QUERY_KIND_COUNT {
                             0 => {
-                                if run_bm25(&st) != gold.bm25 {
-                                    return Err(format!("bm25 mismatch t={t} it={it}"));
+                                let got = run_bm25(&st);
+                                if got != gold.bm25 {
+                                    return Err(format!(
+                                        "bm25 mismatch t={t} it={it}\n  gold: {:?}\n  got:  {:?}",
+                                        gold.bm25, got
+                                    ));
                                 }
                             }
                             1 => {

@@ -2612,7 +2612,14 @@ fn encode_and_emit_term<W: Write>(
                 min_dl_per_block[i],
                 avgdl,
             );
+            // ceil(): the stored fixed-point value must stay a true
+            // UPPER bound after quantization — truncation would round
+            // it below the real block max and let BMW / floor skips
+            // drop blocks that still hold qualifying docs. (The reader
+            // additionally adds one step on decode to cover files
+            // written before this rounding fix.)
             let max_bm25_x1000 = (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
+                .ceil()
                 .max(0.0)
                 .min(u32::MAX as f32) as u32;
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
