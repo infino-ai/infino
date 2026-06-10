@@ -257,3 +257,44 @@ async fn writer_update_cardinality_mismatch_is_rejected() {
         }
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_emitted_segment_carries_subsection_offsets() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create");
+
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+        .expect("append");
+    w.commit().expect("commit");
+    w.update(
+        col("title").eq(lit("bravo")),
+        build_title_batch(&["bravo-prime"]),
+    )
+    .expect("update");
+    w.commit().expect("commit update");
+    drop(w);
+
+    let reader = st.reader();
+    let manifest = reader.manifest();
+    let emitted = manifest
+        .superfile_list
+        .superfiles
+        .iter()
+        .find(|e| e.n_docs == 1)
+        .expect("update-emitted single-row segment present");
+    let offsets = emitted
+        .subsection_offsets
+        .as_ref()
+        .expect("update-emitted segment carries subsection_offsets");
+    assert!(offsets.total_size > 0, "total_size is stamped");
+}

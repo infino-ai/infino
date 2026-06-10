@@ -1054,7 +1054,7 @@ fn build_one_shard(
 /// can carry it forward as a [`SubsectionOffsets`]. Returns `None`
 /// if the bytes don't parse — that path falls back to the
 /// 2-RTT cold open shape rather than failing the publish.
-fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
+pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
     use crate::superfile::format::{footer::read_kv_metadata, kv};
     let kvs = read_kv_metadata(bytes).ok()?;
     let get = |k: &str| -> Option<u64> { kvs.get(k).and_then(|s| s.parse::<u64>().ok()) };
