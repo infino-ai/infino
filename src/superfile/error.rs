@@ -18,11 +18,17 @@ pub enum BuildError {
     #[error("id_column {0:?} must be Decimal128(38, 0); found {1:?}")]
     IdColumnWrongType(String, String),
 
+    #[error("id column mismatch: self={0:?} other={1:?}")]
+    IdColumnMismatch(String, String),
+
     #[error("FTS column {column:?} must be LargeUtf8; found {actual:?}")]
     FtsColumnMustBeLargeUtf8 { column: String, actual: String },
 
     #[error("FTS column {column:?} has invalid type {actual:?}")]
     FtsColumnTypeInvalid { column: String, actual: String },
+
+    #[error("fts schema mismatch {0:?}")]
+    FTSSchemaMismatch(String),
 
     #[error("duplicate column name {0:?}")]
     DuplicateColumnName(String),
@@ -32,6 +38,9 @@ pub enum BuildError {
 
     #[error("user column name {0:?} contains reserved \\x1F separator")]
     ReservedSeparatorInColumnName(String),
+
+    #[error("schema mismatch: self={mine:?} other={other:?}")]
+    SchemaMismatch { mine: String, other: String },
 
     #[error("user column name {0:?} starts with reserved prefix 'inf.'")]
     ReservedPrefixInColumnName(String),
@@ -58,6 +67,12 @@ pub enum BuildError {
         actual: usize,
     },
 
+    #[error("vector schema mismatch {0:?}")]
+    VectorSchemaMismatch(String),
+
+    #[error("vectors could not be read")]
+    VectorReadError,
+
     #[error("vectors slice has {actual} entries but {expected} vector columns are declared")]
     VectorCountMismatch { expected: usize, actual: usize },
 
@@ -66,6 +81,9 @@ pub enum BuildError {
 
     #[error("RecordBatch schema does not match builder schema")]
     BatchSchemaMismatch,
+
+    #[error("RecordBatch could not be read")]
+    BatchReadError,
 
     #[error("FTS column {0:?} not found in schema")]
     FtsColumnMissing(String),

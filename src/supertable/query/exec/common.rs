@@ -20,7 +20,9 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use arrow::compute::{concat_batches, take};
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow_array::{
+    ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::Expr;
@@ -28,7 +30,38 @@ use datafusion::scalar::ScalarValue;
 
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::query::SuperfileHit;
+use crate::supertable::query::{SearchHit, SuperfileHit};
+
+/// Resolve segment-local hits to public [`SearchHit`]s: read the `_id`
+/// column (named `id_col`) for each `(segment, local_doc_id)` and pair
+/// it with the hit's score, preserving the kernel's rank order. Backs
+/// the public `Supertable::bm25_search` / `vector_search`, which expose
+/// `_id` + score rather than the internal segment-local position.
+pub(crate) async fn resolve_search_hits(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+    id_col: &str,
+) -> DfResult<Vec<SearchHit>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rb = resolve_columns(reader, hits, &[id_col]).await?;
+    let ids = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("id column {id_col:?} is not Decimal128"))
+        })?;
+    Ok(hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| SearchHit {
+            id: ids.value(i),
+            score: h.score,
+        })
+        .collect())
+}
 
 /// Output column carrying the per-hit score (vector distance or BM25
 /// relevance — direction is the originating TVF's contract).

@@ -195,15 +195,14 @@ fn demo_supertable() {
         w.commit().expect("commit");
     }
 
-    // BM25 across both segments. SuperfileHit carries the source
-    // segment + local_doc_id + score.
+    // BM25 across both segments. The public `bm25_search` returns
+    // `SearchHit`s carrying the auto-injected `_id` + score.
     let hits = st
-        .reader()
         .bm25_search("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());
     for h in &hits {
-        println!("    local_doc_id={} score={:.4}", h.local_doc_id, h.score);
+        println!("    _id={} score={:.4}", h.id, h.score);
     }
 
     // SQL surfaces the real auto-injected `_id` alongside the payload.

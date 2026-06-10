@@ -173,6 +173,11 @@ impl SupertableInner {
 }
 
 impl Supertable {
+    // Interim options-based constructor — not on the curated public surface
+    // (the catalog `create_table` supersedes it). `pub` under `test-helpers`
+    // so tests/benches reach it directly; `pub(crate)` otherwise, where the
+    // catalog `Connection` calls it internally.
+    test_visible! {
     /// Create-or-open from validated options.
     ///
     /// Behaviour:
@@ -196,7 +201,7 @@ impl Supertable {
     /// `#[tokio::test]` contexts. In-memory creates avoid the
     /// open-time sweep bridge entirely because no WAL/GC I/O can
     /// exist without attached storage.
-    pub fn create(options: SupertableOptions) -> Result<Self, OpenError> {
+    fn create(options: SupertableOptions) -> Result<Self, OpenError> {
         // Pointer-probe pass. When storage is attached AND a
         // pointer file already exists, we want open's load path
         // — never silently shadow committed state with an empty
@@ -256,7 +261,12 @@ impl Supertable {
         }
         Ok(st)
     }
+    }
 
+    // Interim options-based open — internal counterpart of `create`; the
+    // catalog `Connection` calls it internally, tests/benches reach it via
+    // `test-helpers`.
+    test_visible! {
     /// Open an existing persisted supertable.
     ///
     /// Reads the pointer file at
@@ -280,8 +290,9 @@ impl Supertable {
     /// Sync public API. Internally bridges to the async storage I/O
     /// via the same `Handle::try_current() + block_in_place` pattern
     /// as the rest of the supertable's sync surface.
-    pub fn open(options: SupertableOptions) -> Result<Self, OpenError> {
+    fn open(options: SupertableOptions) -> Result<Self, OpenError> {
         bridge_sync_to_async(Self::open_async(options))
+    }
     }
 
     /// Async open kernel. `pub(crate)` — the public surface is the
@@ -593,10 +604,12 @@ impl Supertable {
     /// Current manifest's id, without pinning a reader. Useful for
     /// observability + tests that want to assert "a commit
     /// happened" without holding a snapshot.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn manifest_id(&self) -> u64 {
         self.inner.manifest.load().manifest_id
     }
 
+    test_visible! {
     /// Pinned reader. Captures the current manifest at construction
     /// and holds it for its lifetime. New commits don't affect a
     /// live reader; closing + reopening picks up later commits.
@@ -606,13 +619,14 @@ impl Supertable {
     /// the configured
     /// [`Consistency`](crate::supertable::options::Consistency) allows.
     /// No-op for an in-memory supertable and under `Snapshot`.
-    pub fn reader(&self) -> SupertableReader {
+    fn reader(&self) -> SupertableReader {
         self.ensure_fresh();
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
             inner: Arc::clone(&self.inner),
         }
+    }
     }
 
     /// Engine-driven read-path freshness. Applies
@@ -661,10 +675,29 @@ impl Supertable {
         }
     }
 
+    test_visible! {
     /// Per-supertable configuration (schema, FTS / vector columns,
     /// tokenizer). Immutable for the supertable's lifetime.
-    pub fn options(&self) -> &Arc<SupertableOptions> {
+    fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+    }
+
+    /// The user-facing Arrow schema — the columns the caller supplied.
+    /// The auto-injected `_id` is not part of this schema.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// assert_eq!(posts.schema().field(0).name(), "body");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn schema(&self) -> arrow_schema::SchemaRef {
+        self.inner.options.user_schema()
     }
 
     /// Sync→async bridge for the public query surface. Mirrors the
@@ -701,6 +734,7 @@ impl Supertable {
     /// foreground lazy readers under steady query load. Warming purely
     /// by replaying queries does not register that waiter, so the
     /// segments can stay lazy/S3-backed indefinitely.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn wait_until_warm(
         &self,
         timeout: std::time::Duration,
@@ -813,6 +847,7 @@ impl Supertable {
     /// Cheap to call: one RSS syscall + an `ArcSwap::load` + a couple of
     /// length reads on the in-memory manifest. See
     /// [`crate::supertable::SupertableStats`] for the field-level contract.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn stats(&self) -> crate::supertable::SupertableStats {
         let manifest = self.inner.manifest.load();
         let n_manifest_parts = manifest.list.as_ref().map(|l| l.parts.len());
@@ -868,6 +903,7 @@ impl Supertable {
     /// vs `DataFrame::collect()` (execute) to find where the
     /// remaining dispatch time goes after the cache hit.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn __debug_cached_session(&self) -> SessionContext {
         // Reuses the same fast path as `query_sql` — see the
         // doc-comment on `sql_session_cache` for invalidation.

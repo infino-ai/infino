@@ -102,7 +102,7 @@ pub(crate) struct Bm25SearchFunc {
 }
 
 impl Bm25SearchFunc {
-    fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
+    pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
             reader,
@@ -148,7 +148,7 @@ pub(crate) struct Bm25PrefixFunc {
 }
 
 impl Bm25PrefixFunc {
-    fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
+    pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
             reader,

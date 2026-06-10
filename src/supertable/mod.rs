@@ -44,7 +44,14 @@ pub mod writer;
 /// by `superfile` (and any other crate-level module)
 /// without inverting the layering — the alias preserves
 /// existing call-site paths.
+// `supertable::storage` alias. `pub` under `test-helpers` (tests reach
+// `infino::supertable::storage::*`); `pub(crate)` otherwise so internal
+// `supertable::storage::…` paths still resolve without re-exporting a
+// crate-private module onto the public surface (which would be E0365).
+#[cfg(feature = "test-helpers")]
 pub use crate::storage;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) use crate::storage;
 
 pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
@@ -57,7 +64,9 @@ pub use manifest::{
     FtsSummary, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsTable, SuperfileEntry,
     SuperfileList, SuperfileUri, VectorSummary,
 };
+pub use mutations::MutationStats;
 pub use options::SupertableOptions;
+pub use query::SearchHit;
 pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
 pub use stats::SupertableStats;
 pub use writer::SupertableWriter;

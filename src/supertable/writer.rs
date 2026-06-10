@@ -68,7 +68,7 @@ use super::manifest::{
     FtsSummary, ScalarStatsTable, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use super::mutations::{
-    CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
+    CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
     PendingDelete, PendingUpdate,
 };
 use super::options::SupertableOptions;
@@ -220,7 +220,104 @@ fn split_buffer_into_row_shards(
     shards
 }
 
+/// The public folded `update` / `delete` buffer exactly one mutation
+/// before committing, so `CommitResult.outcomes` carries exactly one
+/// entry; surface it (or a backend error if, impossibly, none landed).
+fn single_outcome(res: CommitResult) -> Result<MutationStats, crate::InfinoError> {
+    res.outcomes.into_iter().next().ok_or_else(|| {
+        crate::InfinoError::Backend("commit produced no mutation outcome".to_string())
+    })
+}
+
 impl Supertable {
+    /// Append one batch of rows and commit — durable when this returns.
+    ///
+    /// Folds the buffered writer + commit into a single call: one
+    /// `append` == one commit == one sealed segment, so callers batch
+    /// rows per call rather than calling once per row.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// let batch = RecordBatch::try_new(
+    ///     schema,
+    ///     vec![Arc::new(LargeStringArray::from(vec!["hello world"]))],
+    /// )?;
+    /// posts.append(&batch)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), crate::InfinoError> {
+        let mut w = self.writer()?;
+        w.append(batch)?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Replace every row matching `predicate` with `new_rows`, then
+    /// commit. `new_rows.num_rows()` must equal the match count.
+    /// Durable when this returns.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use datafusion::prelude::{col, lit};
+    /// # use infino::{connect, IndexSpec};
+    /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
+    /// # let db = connect(dir.path().to_str().expect("utf8 path"))?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # let row = |s: &str| RecordBatch::try_new(
+    /// #     schema.clone(), vec![Arc::new(LargeStringArray::from(vec![s]))]).expect("batch");
+    /// # posts.append(&row("draft"))?;
+    /// let stats = posts.update(col("body").eq(lit("draft")), &row("published"))?;
+    /// assert_eq!(stats.matched(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn update(
+        &self,
+        predicate: datafusion::prelude::Expr,
+        new_rows: &RecordBatch,
+    ) -> Result<MutationStats, crate::InfinoError> {
+        let mut w = self.writer()?;
+        w.update(predicate, new_rows.clone())?;
+        single_outcome(w.commit()?)
+    }
+
+    /// Tombstone every row matching `predicate`, then commit. Durable
+    /// when this returns.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use datafusion::prelude::{col, lit};
+    /// # use infino::{connect, IndexSpec};
+    /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
+    /// # let db = connect(dir.path().to_str().expect("utf8 path"))?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["spam"]))])?)?;
+    /// let stats = posts.delete(col("body").eq(lit("spam")))?;
+    /// assert_eq!(stats.n_tombstoned(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn delete(
+        &self,
+        predicate: datafusion::prelude::Expr,
+    ) -> Result<MutationStats, crate::InfinoError> {
+        let mut w = self.writer()?;
+        w.delete(predicate)?;
+        single_outcome(w.commit()?)
+    }
+
+    test_visible! {
     /// Acquire the single writer for this supertable.
     ///
     /// Returns [`BuildError::SupertableInUse`] if another
@@ -229,7 +326,7 @@ impl Supertable {
     /// active writer slot at a time, enforced atomically; when
     /// the writer is dropped, the slot is released and a
     /// subsequent `writer()` call succeeds.
-    pub fn writer(&self) -> Result<SupertableWriter, BuildError> {
+    fn writer(&self) -> Result<SupertableWriter, BuildError> {
         match self.inner().writer_outstanding.compare_exchange(
             false,
             true,
@@ -245,6 +342,7 @@ impl Supertable {
             }),
             Err(_) => Err(BuildError::SupertableInUse),
         }
+    }
     }
 }
 
@@ -552,7 +650,7 @@ impl SupertableWriter {
     ///    pipeline (tombstone phase only).
     ///
     /// On success returns a [`CommitResult`] with one
-    /// [`OperationOutcome`] per buffered mutation (in buffer
+    /// [`MutationStats`] per buffered mutation (in buffer
     /// order). On a mid-flush mutation failure surfaces
     /// [`CommitError::PartialCommit`] listing the WALs that DID
     /// land durably; the remaining buffered ops stay on the
@@ -561,7 +659,7 @@ impl SupertableWriter {
     /// process dies before retrying.
     ///
     /// [`CommitResult`]: crate::supertable::mutations::CommitResult
-    /// [`OperationOutcome`]: crate::supertable::mutations::OperationOutcome
+    /// [`MutationStats`]: crate::supertable::mutations::MutationStats
     /// [`CommitError::PartialCommit`]: crate::supertable::mutations::CommitError::PartialCommit
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
         // Step 1: flush appends. A failure here is atomic —
@@ -575,7 +673,7 @@ impl SupertableWriter {
         let total_mutations = self.pending_updates.len() + self.pending_deletes.len();
         let mut committed_wal_ids: Vec<crate::supertable::wal::state_doc::WalId> =
             Vec::with_capacity(total_mutations);
-        let mut outcomes: Vec<OperationOutcome> = Vec::with_capacity(total_mutations);
+        let mut outcomes: Vec<MutationStats> = Vec::with_capacity(total_mutations);
 
         // Step 2: drive pending updates in buffer order. On
         // mid-loop failure, the failed entry is dropped (its
@@ -645,10 +743,7 @@ impl SupertableWriter {
 
     /// Drive one pending update entry through its full WAL
     /// pipeline. Returns the per-op outcome on success.
-    fn drive_one_update(
-        &self,
-        entry: &PendingUpdateEntry,
-    ) -> Result<OperationOutcome, MutationError> {
+    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
         let storage = self
             .inner
             .options
@@ -722,7 +817,7 @@ impl SupertableWriter {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
             Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
-        Ok(OperationOutcome {
+        Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
             n_tombstoned,
@@ -732,10 +827,7 @@ impl SupertableWriter {
 
     /// Drive one pending delete entry through its tombstone
     /// phase. Returns the per-op outcome on success.
-    fn drive_one_delete(
-        &self,
-        entry: &PendingDeleteEntry,
-    ) -> Result<OperationOutcome, MutationError> {
+    fn drive_one_delete(&self, entry: &PendingDeleteEntry) -> Result<MutationStats, MutationError> {
         let storage = self
             .inner
             .options
@@ -795,7 +887,7 @@ impl SupertableWriter {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
             Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
-        Ok(OperationOutcome {
+        Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
             n_tombstoned,

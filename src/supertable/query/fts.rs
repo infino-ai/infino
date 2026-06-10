@@ -63,10 +63,10 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
-use super::SuperfileHit;
+use super::{SearchHit, SuperfileHit};
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -587,6 +587,46 @@ fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superf
 #[allow(dead_code)]
 fn _manifest_doc_total(manifest: &Manifest) -> u64 {
     manifest.n_docs_total()
+}
+
+impl Supertable {
+    /// Single-column BM25 search over the current snapshot.
+    ///
+    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), best
+    /// score first. Pins a fresh reader, runs the BM25 fan-out, then
+    /// resolves each segment-local hit to its public `_id`.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, BoolMode, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or)?;
+    /// assert_eq!(hits.len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
+        let reader = self.reader();
+        let hits = reader
+            .bm25_search(column, query, k, mode)
+            .map_err(crate::InfinoError::from)?;
+        let id_col = self.options().id_column.clone();
+        self.block_on_query(super::exec::common::resolve_search_hits(
+            &reader, &hits, &id_col,
+        ))
+        .map_err(|e| crate::InfinoError::Query(e.to_string()))
+    }
 }
 
 #[cfg(test)]

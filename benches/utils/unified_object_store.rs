@@ -96,7 +96,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::config::{
-    Config, StorageBackend, StorageColdFetchMode, StorageSettings, SupertableSettings,
+    CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+    SupertableSettings,
 };
 use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
 use infino::superfile::fts::reader::BoolMode;
@@ -1843,6 +1844,7 @@ pub(crate) mod diag {
                 mmap_sweep_interval_secs: 0,
                 ..StorageSettings::default()
             },
+            compaction: CompactionSettings::default(),
         }
     }
 

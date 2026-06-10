@@ -89,9 +89,9 @@ async fn writer_delete_tombstones_matching_rows() {
     let result = w.commit().expect("commit delete");
     assert_eq!(result.outcomes.len(), 1);
     let outcome = &result.outcomes[0];
-    assert_eq!(outcome.matched, 1);
-    assert_eq!(outcome.n_tombstoned, 1);
-    assert_eq!(outcome.n_not_found, 0);
+    assert_eq!(outcome.matched(), 1);
+    assert_eq!(outcome.n_tombstoned(), 1);
+    assert_eq!(outcome.n_not_found(), 0);
     drop(w);
 
     // Follow-up SQL query no longer returns the row.
@@ -151,9 +151,9 @@ async fn writer_delete_on_predicate_with_no_matches_returns_zero_outcome() {
     let result = w.commit().expect("commit zero-match");
     assert_eq!(result.outcomes.len(), 1);
     let outcome = &result.outcomes[0];
-    assert_eq!(outcome.matched, 0);
-    assert_eq!(outcome.n_tombstoned, 0);
-    assert_eq!(outcome.n_not_found, 0);
+    assert_eq!(outcome.matched(), 0);
+    assert_eq!(outcome.n_tombstoned(), 0);
+    assert_eq!(outcome.n_not_found(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -199,9 +199,9 @@ async fn writer_update_replaces_matching_rows() {
     let result = w.commit().expect("commit update");
     assert_eq!(result.outcomes.len(), 1);
     let outcome = &result.outcomes[0];
-    assert_eq!(outcome.matched, 1);
-    assert_eq!(outcome.n_tombstoned, 1);
-    assert_eq!(outcome.n_not_found, 0);
+    assert_eq!(outcome.matched(), 1);
+    assert_eq!(outcome.n_tombstoned(), 1);
+    assert_eq!(outcome.n_not_found(), 0);
     drop(w);
 
     let batches = st

@@ -46,12 +46,106 @@ jobs:
           fi
       - run: make ci
 
-  # Informational benchmark on each PR push — supertable_all + sql, one
-  # in-region Azure VM each, in parallel. Never blocks merge. Same-repo
-  # only (fork PRs can't use the Azure OIDC secrets).
+  public-api:
+    name: Public API surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-public-api builds rustdoc JSON, which requires nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cargo/bin
+      - name: Install cargo-public-api
+        run: |
+          if ! command -v cargo-public-api &> /dev/null; then
+            cargo install cargo-public-api --locked
+          fi
+      # Fails if the curated public surface drifts from the committed
+      # `public-api.txt` snapshot. The snapshot is taken without
+      # `test-helpers`, so internal modules stay off the contract.
+      - run: make public-api
+
+  python:
+    name: Python bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The bindings build `infino` as a normal dependency; don't fail the
+    # build on a transitive-dependency deprecation warning. infino's own
+    # warnings are gated by the `check` job (against infino's lockfile).
+    env:
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-python
+      # Builds the extension + runs the smoke tests (self-contained venv).
+      - run: make python-test
+
+  python-wheels:
+    name: Wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      # Native runner per platform — `make python-wheel` builds for the
+      # host, so no cross-compilation. One abi3 wheel each (CPython >= 3.9).
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-13]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-python
+      - run: make python-wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: infino-python/dist
+
+  # Informational benchmark — supertable_all + sql, one in-region Azure VM
+  # each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
+  # On merge to main: publish the run as that baseline + a per-commit history
+  # point. Same-repo only (fork PRs can't use the Azure OIDC secrets).
   bench:
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false   # one member failing must not cancel the other
@@ -61,10 +155,11 @@ jobs:
         include:
           - { bench: supertable_all, docs: "10000000", suffix: st }
           - { bench: sql, docs: "1000000", suffix: sql }
-    # A new push cancels this PR's in-flight run for that member.
+    # PR: a new push cancels the in-flight run. main: serialize per bench so
+    # concurrent merges don't race the baseline blob (never cancel).
     concurrency:
-      group: bench-${{ github.event.pull_request.number }}-${{ matrix.bench }}
-      cancel-in-progress: true
+      group: bench-${{ github.event_name == 'push' && 'main' || github.event.pull_request.number }}-${{ matrix.bench }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       id-token: write
       contents: read
@@ -74,6 +169,7 @@ jobs:
     with:
       bench: ${{ matrix.bench }}
       docs: ${{ matrix.docs }}
-      ref: ${{ github.event.pull_request.head.sha }}
+      ref: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
       name_suffix: -${{ matrix.suffix }}
+      update_baseline: ${{ github.event_name == 'push' }}
     secrets: inherit

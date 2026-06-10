@@ -160,7 +160,7 @@ pub(crate) struct HybridSearchFunc {
 }
 
 impl HybridSearchFunc {
-    fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
+    pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
             reader,

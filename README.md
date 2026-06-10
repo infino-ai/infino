@@ -17,56 +17,144 @@ and as a search index by infino's reader.
   commit/publish path, pluggable storage, query fan-out with
   manifest-only skip pruning, and reader/writer concurrency.
 
-## Quick example
+## Quick example in Python
 
-A table has a full-text column (`title`) and a vector column
-(`embedding`). You append Arrow record batches, commit to seal a
-segment, then query it four ways — keyword, vector, SQL, or hybrid:
+```python
+import infino
+import pyarrow as pa
 
-```rust
-use infino::supertable::Supertable;
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::VectorSearchOptions;
+db = infino.connect("memory://")              # or "./data", "s3://bucket/prefix"
+schema = pa.schema([("title", pa.large_utf8())])
+docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
 
-let table = Supertable::create(options)?;     // schema + options: see examples/demo.rs
+docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
 
-// Ingest: append record batches, commit to publish an immutable segment.
-let mut writer = table.writer()?;
-writer.append(&batch)?;                        // columns: title (text) + embedding (vector)
-writer.commit()?;
-
-// Reads run through a snapshot-pinned reader — synchronous, fans out
-// across segments for you. Keyword search (BM25):
-let hits = table.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
-
-// Vector search (k-NN):
-let query = vec![/* dim=384 f32s */];
-let knn = table.reader().vector_search("embedding", &query, 10, VectorSearchOptions::default())?;
-
-// Unranked retrieval — boolean token match and exact raw-value match
-// (candidate sets, no scoring); the same primitives the SQL WHERE
-// pushdown uses to answer FTS-column filters from the index:
-let any_token = table.reader().token_match("title", "rust async", BoolMode::Or)?;
-let exact = table.reader().exact_match("title", "rust async")?;
-
-// Hybrid — keyword + vector fused with reciprocal-rank fusion. As a method:
-let fused = table.reader().hybrid_search(
-    "title", "rust async", BoolMode::Or,
-    "embedding", &query, VectorSearchOptions::default(), 10,
-)?;
-
-// Every retriever is also a SQL table function (DataFusion under the hood;
-// each segment is valid Parquet), so you can filter, join, and fuse in SQL:
-let rows = table.query_sql(
-    "SELECT _id, title, score \
-     FROM hybrid_search('title', 'rust async', 'embedding', '<query vector>', 10)",
-)?;
+hits = docs.bm25_search("title", "fox", 10)         # [{"_id": ..., "score": ...}]
+rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
 ```
 
-A complete, runnable version (schema, options, building a vector
-`RecordBatch`, reading segments back as plain Parquet) is in
-[`examples/demo.rs`](examples/demo.rs) — run it with
-`cargo run --example demo`.
+The Python bindings (PyO3 + maturin) live in
+[`infino-python/`](infino-python/) — see its README to build and test.
+
+## Quick example in Rust
+
+Open a connection, create a table with a full-text index, append rows,
+then search — by keyword or with SQL across the catalog. The backend is
+chosen by the URI scheme (`memory://`, a local path, `s3://…`, `az://…`).
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, BoolMode, IndexSpec};
+
+let db = connect("memory://")?; // or "./data", "s3://bucket/prefix"
+
+let schema = Arc::new(Schema::new(vec![Field::new("title", DataType::LargeUtf8, false)]));
+let docs = db.create_table("docs", schema.clone(), IndexSpec::new().fts("title"))?;
+
+// One `append` == one commit == one sealed, immutable segment.
+let batch = RecordBatch::try_new(
+    schema,
+    vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))],
+)?;
+docs.append(&batch)?;
+
+// Keyword search (BM25): hits carry the auto-injected `_id` + score.
+let hits = docs.bm25_search("title", "fox", 10, BoolMode::Or)?;
+assert_eq!(hits.len(), 1);
+
+// SQL across the catalog — every segment is also a valid Parquet file.
+let rows = db.query_sql("SELECT _id, title FROM docs")?;
+assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Vector search is the same shape: declare a vector column with
+`IndexSpec::new().vector("embedding", 384, 256, infino::Metric::Cosine)`
+and call `vector_search`. SQL-native search — the `bm25_search` /
+`vector_search` / `hybrid_search` table functions — composes with joins
+and aggregations across catalog tables.
+
+## SQL joins across tables
+
+`query_sql` resolves every table the query names through the catalog and
+registers them into one engine, so a join across two tables — or a join
+of a search result against a table — is just SQL:
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use infino::{connect, IndexSpec};
+
+let db = connect("memory://")?;
+
+// Two tables sharing an `author_id`.
+let authors_schema = Arc::new(Schema::new(vec![
+    Field::new("author_id", DataType::Int64, false),
+    Field::new("name", DataType::LargeUtf8, false),
+]));
+let authors = db.create_table("authors", authors_schema.clone(), IndexSpec::new())?;
+authors.append(&RecordBatch::try_new(
+    authors_schema,
+    vec![
+        Arc::new(Int64Array::from(vec![1])),
+        Arc::new(LargeStringArray::from(vec!["alice"])),
+    ],
+)?)?;
+
+let posts_schema = Arc::new(Schema::new(vec![
+    Field::new("author_id", DataType::Int64, false),
+    Field::new("body", DataType::LargeUtf8, false),
+]));
+let posts = db.create_table("posts", posts_schema.clone(), IndexSpec::new().fts("body"))?;
+posts.append(&RecordBatch::try_new(
+    posts_schema,
+    vec![
+        Arc::new(Int64Array::from(vec![1])),
+        Arc::new(LargeStringArray::from(vec!["hello from alice"])),
+    ],
+)?)?;
+
+// Join both tables in one query.
+let rows = db.query_sql(
+    "SELECT a.name, p.body \
+     FROM posts p JOIN authors a ON p.author_id = a.author_id",
+)?;
+assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A search TVF (`bm25_search('posts', 'body', 'alice', 10)`) can stand in
+for either side of the join, so keyword/vector results compose with the
+rest of the catalog the same way.
+
+## Stability
+
+The public API is what's re-exported from the crate root — `connect` /
+`connect_with`, `Connection`, `Supertable`, `IndexSpec`, `InfinoError`,
+and the value types their signatures name. It is pinned by a
+`cargo-public-api` snapshot (`public-api.txt`); any change to it is
+reviewed as a contract change in the same pull request.
+
+- **Versioning.** 0.x while the surface soaks; 1.0 once it has shipped
+  without churn for a release or two. Pre-1.0 may break, but every break
+  shows in the snapshot diff and is called out in the release notes.
+- **`#[non_exhaustive]`** on growable public enums/structs (e.g.
+  `InfinoError`, `MutationStats`), so adding a variant or field is not a
+  breaking change.
+- **Arrow / DataFusion are part of the contract.** The API is
+  Arrow-native (`RecordBatch`, `SchemaRef`, `Expr`); a major bump of
+  arrow / datafusion that changes an exposed type is a breaking change to
+  infino. The supported version range is documented and CI-tested.
+- **MSRV.** Raising the minimum Rust version is a minor bump, never a
+  patch.
+- **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
+  least one minor release first.
+- **Python.** The wheel tracks the crate version 1:1.
 
 ## Development
 
@@ -79,8 +167,13 @@ cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read 
 
 The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
 the right stable Rust on first build. Run `cargo test --workspace` for
-the suite and `make ci` before opening a pull request. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
+the suite and `make ci` before opening a pull request.
+
+For an enhanced local development experience, install and configure
+[pre-commit](https://pre-commit.com/#install) hooks with `pre-commit install`
+to catch formatting and lint issues before committing.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
 
 ## Performance
 

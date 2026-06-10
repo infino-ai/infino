@@ -21,18 +21,33 @@ autobenches = false
 # can be checked/built/tested directly.
 [workspace]
 members = ["benches/utils"]
+# The Python bindings are built standalone with maturin, not as part of
+# this workspace — so the core Rust crate never requires a Python /
+# pyo3 toolchain to build. See `infino-python/README.md`.
+exclude = ["infino-python"]
 
 [lib]
 path = "src/lib.rs"
 
 [features]
+# `mimalloc` installs mimalloc as the `#[global_allocator]` (see
+# `lib.rs`). Default-on for the standalone library, binaries, and
+# benches. An embedding that is loaded into a host process with its own
+# allocator — notably the Python extension module — must turn it OFF
+# (`default-features = false`): a second global allocator dlopened into a
+# live process segfaults. Not part of the public API surface.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
 # Exposes `infino::test_helpers` — convenience builders for
 # Decimal128 id columns, default tokenizers, default vector
-# configs. Used by integration tests, benches, and (via
-# `cfg(test)`) unit tests so all three contexts share one
-# source of truth for boilerplate-heavy fixtures. The
-# `dev-dependencies` self-reference below auto-enables this for
-# test + bench builds.
+# configs. Enabled explicitly by the Makefile test / bench / coverage
+# lanes (`--features test-helpers`), transitively by benches via the
+# `infino-bench-utils` dev-dependency, and by lib unit tests via
+# `cfg(test)`. The curated public surface is guarded by a
+# `cargo-public-api` snapshot, NOT by feature-gated example builds:
+# within this package the `infino-bench-utils` dev-dependency forces
+# `test-helpers` across the whole dev-target graph (tests, benches,
+# AND examples), so no in-package example can build with it off.
 test-helpers = []
 # Opt-in diagnostic benches that are useful for storage/request-shape
 # work or release-profile recall gates, but should not run as part of a
@@ -58,7 +73,7 @@ bytemuck = "1"
 
 # Allocator strategy: mimalloc as #[global_allocator], bumpalo for
 # per-query scratch, plus the custom MemoryArena in fts/arena.rs.
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 static_assertions = "1"
@@ -206,11 +221,17 @@ tempfile = "3"
 hashbrown = "0.17.1"
 
 [dev-dependencies]
-# Self-reference with the `test-helpers` feature enabled so
-# integration tests + benches see `infino::test_helpers`.
-# Unit tests (inside src/) reach the module via `crate::
-# test_helpers` under `cfg(test)`, independent of this dep.
-infino = { path = ".", features = ["test-helpers"] }
+# No `infino = { path=".", features=["test-helpers"] }` self-reference:
+# it is redundant. `infino-bench-utils` below already depends on
+# `infino` with `features=["test-helpers"]`, and dev-dependency
+# features unify across the whole dev-target graph — so `test-helpers`
+# is on for every test, bench, AND example build regardless. Integration
+# tests / benches / coverage also pass `--features test-helpers`
+# explicitly (see the Makefile) so the dependency is documented at the
+# call site rather than relied on implicitly. Genuinely public,
+# surface-only examples will live in a separate workspace crate (which
+# depends on `infino` WITHOUT `test-helpers`) when the catalog API
+# lands; the public surface itself is guarded by `cargo-public-api`.
 infino-bench-utils = { path = "benches/utils" }
 
 proptest = "1"
@@ -242,6 +263,18 @@ base64 = "0.22"
 httpdate = "1"
 
 [profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# Benches must measure true release performance. Cargo's built-in
+# `bench` profile defaults to opt-level 3 but does NOT inherit the
+# release tuning above — it leaves `lto` off and `codegen-units = 16`,
+# which under-optimizes the lib relative to a real release build and
+# would make `cargo bench` report slower-than-production numbers.
+# Mirror `[profile.release]` so the bench lane is representative.
+[profile.bench]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
@@ -320,4 +353,18 @@ harness = false
 name = "supertable-update"
 path = "benches/supertable_update/main.rs"
 harness = false
+
+# Both current examples exercise the format-layer internals (superfile
+# builder / reader, `test_helpers` fixtures), so they declare the
+# `test-helpers` feature they semantically need. (In practice that
+# feature is already forced on across the dev graph by the
+# `infino-bench-utils` dev-dependency — see its note above — so this is
+# documentation of intent, not an independent gate.)
+[[example]]
+name = "demo"
+required-features = ["test-helpers"]
+
+[[example]]
+name = "profile_fts_build"
+required-features = ["test-helpers"]
 

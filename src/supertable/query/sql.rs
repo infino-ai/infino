@@ -71,6 +71,9 @@ impl Supertable {
     /// Sync API. The first call allocates a tokio Runtime
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
+    // Single-table SQL — off the public surface; catalog-level SQL is the
+    // public entry point. Reachable from tests/benches via `test-helpers`.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         // Read-consistency is applied when the snapshot is pinned:
         // `sql_session_context` pins via `self.reader()`, which runs
@@ -173,6 +176,36 @@ impl Supertable {
         );
         *guard = Some((Arc::clone(&manifest), ctx.clone()));
         Ok(ctx)
+    }
+
+    /// Register this supertable's pushdown-aware provider into `ctx`
+    /// under `name`, applying the read-consistency policy first. The
+    /// catalog's multi-table [`Connection::query_sql`] calls this once
+    /// per referenced table. Returns the pinned reader so the caller can
+    /// later wire the same snapshot into search TVFs.
+    ///
+    /// [`Connection::query_sql`]: crate::Connection::query_sql
+    pub(crate) fn register_into(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+    ) -> Result<Arc<crate::supertable::handle::SupertableReader>, QueryError> {
+        self.ensure_fresh();
+        let reader = Arc::new(self.reader());
+        let manifest = Arc::clone(reader.manifest());
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let provider = SupertableProvider::new(
+            scalar_schema,
+            manifest,
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
+        ctx.register_table(name, Arc::new(provider))
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        Ok(reader)
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by

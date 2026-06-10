@@ -61,10 +61,10 @@ use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
 
-use super::SuperfileHit;
+use super::{SearchHit, SuperfileHit};
 
 /// How to probe one segment in the vector fan-out: the globally-selected
 /// cluster ids for that segment, or — for a segment whose manifest
@@ -288,6 +288,55 @@ fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superfi
     let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
     result.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
     result
+}
+
+impl Supertable {
+    /// Single-column vector kNN search over the current snapshot.
+    ///
+    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), nearest
+    /// first. Pins a fresh reader, runs the IVF fan-out, then resolves
+    /// each segment-local hit to its public `_id`.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
+    /// # let db = connect("memory://")?;
+    /// # let dim = 16;
+    /// # let field = Field::new("emb", DataType::FixedSizeList(
+    /// #     Arc::new(Field::new("item", DataType::Float32, true)), dim), false);
+    /// # let schema = Arc::new(Schema::new(vec![field]));
+    /// # let spec = IndexSpec::new().vector("emb", dim as usize, 1, Metric::Cosine);
+    /// # let vecs = db.create_table("vecs", schema.clone(), spec)?;
+    /// # let mut vals = vec![0.0f32; dim as usize]; vals[0] = 1.0;
+    /// # let values = Float32Array::from(vals);
+    /// # let col = FixedSizeListArray::new(
+    /// #     Arc::new(Field::new("item", DataType::Float32, true)), dim, Arc::new(values), None);
+    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
+    /// let mut query = vec![0.0f32; 16];
+    /// query[0] = 1.0;
+    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new())?;
+    /// assert!(!hits.is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn vector_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
+        let reader = self.reader();
+        let hits = reader
+            .vector_search(column, query, k, options)
+            .map_err(crate::InfinoError::from)?;
+        let id_col = self.options().id_column.clone();
+        self.block_on_query(super::exec::common::resolve_search_hits(
+            &reader, &hits, &id_col,
+        ))
+        .map_err(|e| crate::InfinoError::Query(e.to_string()))
+    }
 }
 
 #[cfg(test)]

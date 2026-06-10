@@ -37,7 +37,7 @@
 //! See `docs/architecture/superfile.md` (Vector index algorithm
 //! subsection) for the full RaBitQ rationale and recall trade-offs.
 
-use wide::{CmpGt, f32x8};
+use wide::f32x8;
 
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::avx512_enabled;
@@ -62,10 +62,13 @@ const RABITQ_NEGATIVE_SIGN: f32 = -1.0;
 /// Coefficient on `pos_sum` in the RaBitQ dot identity
 /// `dot = RABITQ_DOT_POS_COEFF·pos_sum − q_total`, where
 /// `pos_sum = Σ_{bit_d = 1} q_rot[d]`.
+// Referenced only by the x86-gated AVX-512 estimator; dead on other targets.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const RABITQ_DOT_POS_COEFF: f32 = 2.0;
 
 /// Lane count of an AVX-512 f32 register (512-bit / 32-bit), the
 /// dims-per-iteration of the masked-add estimator.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const AVX512_F32_LANES: usize = 16;
 
 /// 1-bit quantizer + estimator for vectors of fixed dimension `dim`.

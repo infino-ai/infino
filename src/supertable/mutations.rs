@@ -25,10 +25,10 @@
 //!
 //! - [`PendingUpdate`] / [`PendingDelete`] — values returned from
 //!   the corresponding writer entry points. Carry `matched` so the
-//!   caller can decide whether to proceed; the actual `OperationOutcome`
+//!   caller can decide whether to proceed; the actual `MutationStats`
 //!   surfaces on the next `commit()` call.
 //! - [`CommitResult`] — aggregate returned from a successful
-//!   `commit()`. Contains one [`OperationOutcome`] per buffered
+//!   `commit()`. Contains one [`MutationStats`] per buffered
 //!   mutation, in buffer order.
 //! - [`CommitError`] — typed failures from `commit()`, including
 //!   `PartialCommit { committed_wal_ids, cause }` for the
@@ -47,29 +47,55 @@ use crate::supertable::wal::persistence::WalStoreError;
 use crate::supertable::wal::pipeline::{AppendPhaseError, TombstonePhaseError};
 use crate::supertable::wal::state_doc::WalId;
 
-/// Per-call outcome from one `delete` / `update`. Same field
-/// shape the eventual `CommitResult.outcomes` will carry, so
-/// callers writing against this API don't need to change when
-/// the buffer + commit flush lands.
+/// Per-call outcome from one `delete` / `update`. Returned by the
+/// public `Supertable::update` / `Supertable::delete` (which fold
+/// writer + commit) and carried, one per buffered mutation, in
+/// `CommitResult.outcomes`.
+///
+/// The public surface is the three count accessors (`matched`,
+/// `n_tombstoned`, `n_not_found`); the recovery-only `wal_id` stays
+/// `pub(crate)`, so it never enters the public API.
+/// `#[non_exhaustive]` keeps the type open to growth.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperationOutcome {
+pub struct MutationStats {
     /// `wal_id` of the WAL that drove this mutation. The WAL is
     /// the recovery boundary: any partial-commit scenario surfaces
     /// the same id in the recovery sweep's report.
-    pub wal_id: WalId,
+    pub(crate) wal_id: WalId,
     /// Rows the predicate resolved to at call time. For a
     /// delete this is the number of rows whose tombstone the
     /// engine will try to land; for an update, the count of
     /// rows that must equal `new_rows.num_rows()`.
-    pub matched: usize,
+    pub(crate) matched: usize,
     /// Rows whose tombstone bit landed in a per-superfile
     /// sidecar.
-    pub n_tombstoned: usize,
+    pub(crate) n_tombstoned: usize,
     /// Rows the engine couldn't find at commit time — either a
     /// peer beat us to the tombstone, or compaction removed the
     /// row's superfile between resolve and tombstone. Not an
     /// error; surfaced for observability.
-    pub n_not_found: usize,
+    pub(crate) n_not_found: usize,
+}
+
+impl MutationStats {
+    /// Rows the predicate resolved to at call time.
+    pub fn matched(&self) -> usize {
+        self.matched
+    }
+
+    /// Rows whose tombstone bit landed (a delete, or an update's
+    /// tombstone phase).
+    pub fn n_tombstoned(&self) -> usize {
+        self.n_tombstoned
+    }
+
+    /// Rows the predicate resolved but that no superfile claimed at
+    /// commit time (a peer or compaction tombstoned them first). Not an
+    /// error; surfaced for observability.
+    pub fn n_not_found(&self) -> usize {
+        self.n_not_found
+    }
 }
 
 /// Cap on the number of rows one mutation call can target.
@@ -158,12 +184,12 @@ pub struct PendingDelete {
     /// Rows the predicate resolved to at call time. The
     /// commit-time pipeline will try to tombstone each of these;
     /// rows that no superfile claims at commit time are reported
-    /// as `n_not_found` in the corresponding [`OperationOutcome`].
+    /// as `n_not_found` in the corresponding [`MutationStats`].
     pub matched: usize,
 }
 
 /// Aggregate result of a successful [`SupertableWriter::commit`].
-/// One [`OperationOutcome`] per buffered update / delete, in
+/// One [`MutationStats`] per buffered update / delete, in
 /// buffer order. Pending appends don't appear as outcome entries
 /// — they're a separate concern from the WAL-driven mutation
 /// path and surface only through the manifest swap.
@@ -177,7 +203,7 @@ pub struct CommitResult {
     /// complete" without scanning the outcome list.
     pub wal_ids: Vec<WalId>,
     /// Per-operation outcomes, in buffer order.
-    pub outcomes: Vec<OperationOutcome>,
+    pub outcomes: Vec<MutationStats>,
 }
 
 /// Typed failures from [`SupertableWriter::commit`]. The buffered
