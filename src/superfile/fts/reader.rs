@@ -491,6 +491,10 @@ impl FtsReader {
         self.columns.iter().map(|c| c.name.as_str())
     }
 
+    pub fn fts_columns_config(&self) -> impl Iterator<Item = &ColumnMeta> {
+        self.columns.iter()
+    }
+
     fn dict_bytes(&self) -> Result<Bytes, FtsError> {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
     }
