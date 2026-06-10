@@ -24,6 +24,7 @@
 //!   `SupertableReader` (snapshot-pinned reader).
 
 pub(crate) mod build;
+pub(crate) mod compaction;
 pub mod error;
 pub mod handle;
 pub mod lazy_source;
