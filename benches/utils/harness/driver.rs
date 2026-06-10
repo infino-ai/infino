@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use super::{BoolMode, FtsEngine, Hit};
+use crate::markdown::fmt_count;
 use crate::rss::{PeakSampler, RssStats};
 
 /// One named query in the battery.
@@ -81,7 +82,7 @@ pub fn run_fts<E: FtsEngine>(
 
 /// Same as [`run_fts`], but returns the queryable 1-writer index as
 /// well. Infino's in-tree superfile bench uses this to run correctness,
-/// hot probes, and cold upload against the exact artifact that was just
+/// warm probes, and cold upload against the exact artifact that was just
 /// measured, instead of rebuilding a second copy.
 pub fn run_fts_with_index<E: FtsEngine>(
     column: &str,
@@ -92,6 +93,11 @@ pub fn run_fts_with_index<E: FtsEngine>(
     parallel: usize,
 ) -> (EngineFtsResult, E::Index) {
     // ── write: 1-writer canonical build (also the queryable index) ───
+    eprintln!(
+        "[harness/fts] {}: building 1-writer index over {} docs...",
+        E::name(),
+        fmt_count(docs.len()),
+    );
     let mut index = E::open(column);
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
@@ -108,6 +114,10 @@ pub fn run_fts_with_index<E: FtsEngine>(
 
     // ── build-only throughput probe at N writers (no query index) ────
     if parallel > 1 {
+        eprintln!(
+            "[harness/fts] {}: parallel build probe ({parallel} writers)...",
+            E::name(),
+        );
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
         E::parallel_write(column, docs, parallel);
@@ -120,6 +130,16 @@ pub fn run_fts_with_index<E: FtsEngine>(
     }
 
     // ── read: per-query warmup + timed iters ─────────────────────────
+    // One battery-level progress line; per-query results land in the
+    // report table, so per-query progress lines are just noise.
+    if !queries.is_empty() {
+        eprintln!(
+            "[harness/fts] {}: warm search battery ({} queries × {} timed iters)...",
+            E::name(),
+            queries.len(),
+            iters,
+        );
+    }
     let mut queries_out = Vec::with_capacity(queries.len());
     for q in queries {
         let sampler = PeakSampler::start_default();

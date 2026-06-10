@@ -355,6 +355,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
     let batches = consumer
+        .reader()
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query_sql via S3");
     assert_eq!(batches.len(), 1);
@@ -459,6 +460,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
+                None,
             )
             .map_err(|e| format!("cold BM25 over real S3: {e}"))?;
         if bm25_hits.is_empty() {
@@ -474,6 +476,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 &query,
                 VECTOR_SEARCH_K,
                 VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
             )
             .map_err(|e| format!("cold vector search over real S3: {e}"))?;
         if vector_hits.is_empty() {
@@ -624,6 +627,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     //    in exactly two titles ("alpha vector one", "alpha
     //    vector two"), so the TVF must return >= 2 rows.
     let bm25 = consumer
+        .reader()
         .query_sql(&format!(
             "SELECT _id FROM bm25_search('title', 'alpha', {BM25_TOP_K})"
         ))
@@ -637,6 +641,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     // 2. vector_search through query_sql. k=3.
     let vec_sql = format!("SELECT _id FROM vector_search('emb', '{q_csv}', 3)");
     let vector = consumer
+        .reader()
         .query_sql(&vec_sql)
         .expect("vector_search via query_sql over S3");
     assert!(
@@ -649,6 +654,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
     let hybrid_sql =
         format!("SELECT _id FROM hybrid_search('title', 'alpha', 'emb', '{q_csv}', 5)");
     let hybrid = consumer
+        .reader()
         .query_sql(&hybrid_sql)
         .expect("hybrid_search via query_sql over S3");
     let hyb_rows = count_rows(&hybrid);

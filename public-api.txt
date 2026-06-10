@@ -103,7 +103,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ConnectOptions
 pub struct infino::Connection
 impl infino::Connection
 pub fn infino::Connection::create_table(&self, &str, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> core::result::Result<infino::Supertable, infino::InfinoError>
-pub fn infino::Connection::drop_table(&self, &str) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Connection::drop_table(&self, &str, bool) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Connection::list_tables(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Connection::open_table(&self, &str) -> core::result::Result<infino::Supertable, infino::InfinoError>
 pub fn infino::Connection::query_sql(&self, &str) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
@@ -154,35 +154,19 @@ impl core::marker::Unpin for infino::MutationStats
 impl core::marker::UnsafeUnpin for infino::MutationStats
 impl core::panic::unwind_safe::RefUnwindSafe for infino::MutationStats
 impl core::panic::unwind_safe::UnwindSafe for infino::MutationStats
-pub struct infino::SearchHit
-pub infino::SearchHit::id: i128
-pub infino::SearchHit::score: f32
-impl core::clone::Clone for infino::SearchHit
-pub fn infino::SearchHit::clone(&self) -> infino::SearchHit
-impl core::cmp::PartialEq for infino::SearchHit
-pub fn infino::SearchHit::eq(&self, &infino::SearchHit) -> bool
-impl core::fmt::Debug for infino::SearchHit
-pub fn infino::SearchHit::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for infino::SearchHit
-impl core::marker::StructuralPartialEq for infino::SearchHit
-impl core::marker::Freeze for infino::SearchHit
-impl core::marker::Send for infino::SearchHit
-impl core::marker::Sync for infino::SearchHit
-impl core::marker::Unpin for infino::SearchHit
-impl core::marker::UnsafeUnpin for infino::SearchHit
-impl core::panic::unwind_safe::RefUnwindSafe for infino::SearchHit
-impl core::panic::unwind_safe::UnwindSafe for infino::SearchHit
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 impl infino::Supertable
-pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::BoolMode) -> core::result::Result<alloc::vec::Vec<infino::SearchHit>, infino::InfinoError>
+pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 impl infino::Supertable
-pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions) -> core::result::Result<alloc::vec::Vec<infino::SearchHit>, infino::InfinoError>
+pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> infino::Supertable
 impl core::fmt::Debug for infino::Supertable

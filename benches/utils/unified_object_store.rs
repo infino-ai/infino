@@ -5,7 +5,7 @@
 //!
 //! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;
 //! `INFINO_BENCH_FULL=1` → 1M). Canonical tiered benchmarks (superfile 1M /
-//! supertable 10M × hot/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
+//! supertable 10M × warm/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
 //! Use this bench to iterate on request shape and diagnostics, not headline SLA rows.
 //!
 //! Exercises unified vector + FTS cold-open / cold-first-search
@@ -49,14 +49,14 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --features bench-diagnostics --bench object-store
-//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench --features bench-diagnostics --bench object-store
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --features bench-diagnostics --bench object-store
+//! cargo bench -- object-store
+//! INFINO_REAL_S3_BUCKET=<bucket> cargo bench -- object-store
+//! INFINO_BENCH_UPDATE_README=1 cargo bench -- object-store
 //! ```
 //!
 //! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
 //! ~1.5 GiB) — this is the superfile warm/cold tier and matches the
-//! superfile hot benches. There is no `INFINO_BENCH_FULL` knob. The
+//! superfile warm benches. There is no `INFINO_BENCH_FULL` knob. The
 //! Criterion rows run over the in-process `s3s-fs` server by default;
 //! setting `INFINO_REAL_S3_BUCKET` (or `INFINO_TEST_REAL_S3_BUCKET`)
 //! reruns the same rows against real AWS S3.
@@ -150,7 +150,7 @@ const ID_COLUMN: &str = "doc_id";
 /// blob, not the Parquet schema).
 const VEC_COLUMN: &str = "v";
 /// FTS column registered on the unified fixture. Single `title`
-/// column — same shape `benches/utils/fts_superfile.rs` builds.
+/// column — same shape `benches/utils/superfile.rs` (`fts`) builds.
 /// It stays in the Parquet body (SQL-visible) *and* is indexed
 /// into the FTS blob, which is the whole point of the unified
 /// layout.
@@ -740,8 +740,7 @@ fn emit_object_store(
 //
 // Invocation:
 //
-//   INFINO_DIAG_COLD_PATH=1 cargo bench --no-default-features \
-//     --features bench-diagnostics --bench object-store --warm-up-time 1
+//   INFINO_DIAG_COLD_PATH=1 cargo bench -- object-store
 //
 // to localize where cold-path time is going (raw s3s-fs RTT vs.
 // our cold-fetch path's range count). When the env var is set,
@@ -1207,7 +1206,7 @@ pub(crate) mod diag {
                     let h = rt.block_on(async {
                         let reader = cache.reader(uri).await.expect("cold reader");
                         reader
-                            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                            .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                             .await
                             .expect("cold bm25_search")
                     });
@@ -1404,7 +1403,7 @@ pub(crate) mod diag {
             let _hits = rt.block_on(async {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 reader
-                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                     .await
                     .expect("cold bm25_search")
             });
@@ -1434,7 +1433,7 @@ pub(crate) mod diag {
                     .await
                     .expect("cold reader");
                 reader
-                    .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                    .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                     .await
                     .expect("cold bm25_search")
             });
@@ -1461,7 +1460,7 @@ pub(crate) mod diag {
                     .await
                     .expect("cold reader");
                 reader
-                    .bm25_search(FTS_COLUMN, FTS_MULTI_QUERY, TOP_K, BoolMode::Or)
+                    .bm25_hits_async(FTS_COLUMN, FTS_MULTI_QUERY, TOP_K, BoolMode::Or)
                     .await
                     .expect("cold multi-term bm25_search")
             });
@@ -1493,7 +1492,7 @@ pub(crate) mod diag {
     /// INFINO_DIAG_REAL_S3=1 \
     /// INFINO_REAL_S3_BUCKET=cold-test-381491836522 \
     /// AWS_REGION=us-east-1 \
-    /// cargo bench --no-default-features --features bench-diagnostics --bench object-store -- --warm-up-time 1
+    /// cargo bench -- object-store
     /// ```
     pub fn diagnose_real_s3_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
@@ -1627,7 +1626,7 @@ pub(crate) mod diag {
                         .await
                         .expect("real S3 cold reader");
                     reader
-                        .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                        .bm25_hits_async(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                         .await
                         .expect("real S3 cold bm25_search")
                 });
@@ -1753,6 +1752,7 @@ pub(crate) mod diag {
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
+                    None,
                 )
                 .expect("cold vector search over real S3 supertable");
             let cold_vec = vec_t0.elapsed();
@@ -1765,7 +1765,7 @@ pub(crate) mod diag {
             let bm25_t0 = Instant::now();
             let bm25_hits = consumer
                 .reader()
-                .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
             eprintln!(
@@ -1784,13 +1784,14 @@ pub(crate) mod diag {
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
+                    None,
                 )
                 .expect("warm vector search over real S3 supertable");
             let warm_vec = warm_vec_t0.elapsed();
             let warm_bm25_t0 = Instant::now();
             let warm_bm25_hits = consumer
                 .reader()
-                .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
             let cache_stats = consumer
@@ -2099,7 +2100,7 @@ pub(crate) mod diag {
     }
 
     /// Times warm `reader.bm25_search` / `reader.vector_search`
-    /// (kernel-direct) vs `consumer.query_sql("SELECT _id FROM
+    /// (kernel-direct) vs `consumer.reader().query_sql("SELECT _id FROM
     /// bm25_search(...)")` / `query_sql("... vector_search ...")`
     /// (DataFusion path) side-by-side on the same warm Supertable
     /// over an in-process `s3s-fs`. Prints min / p50 / p95 / mean
@@ -2190,7 +2191,7 @@ pub(crate) mod diag {
         let q = query_vector().to_vec();
         let _ = consumer
             .reader()
-            .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+            .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
             .expect("warm-up bm25");
         let _ = consumer
             .reader()
@@ -2199,6 +2200,7 @@ pub(crate) mod diag {
                 &q,
                 TOP_K,
                 VectorSearchOptions::new().with_nprobe(BENCH_NPROBE),
+                None,
             )
             .expect("warm-up vector");
         rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
@@ -2223,9 +2225,11 @@ pub(crate) mod diag {
         let vec_score_sql =
             format!("SELECT score FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
         let _ = consumer
+            .reader()
             .query_sql(&bm25_sql)
             .expect("warm-up query_sql bm25");
         let _ = consumer
+            .reader()
             .query_sql(&vec_sql)
             .expect("warm-up query_sql vector");
 
@@ -2237,14 +2241,17 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
-                .bm25_search(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("kernel bm25");
             kernel_bm25.push(t.elapsed());
         }
         let mut qsql_bm25: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = consumer.query_sql(&bm25_sql).expect("query_sql bm25");
+            let _ = consumer
+                .reader()
+                .query_sql(&bm25_sql)
+                .expect("query_sql bm25");
             qsql_bm25.push(t.elapsed());
         }
         let mut kernel_vec: Vec<Duration> = Vec::with_capacity(iters);
@@ -2252,14 +2259,17 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
-                .vector_search(VEC_COLUMN, &q, TOP_K, opts)
+                .vector_search(VEC_COLUMN, &q, TOP_K, opts, None)
                 .expect("kernel vector");
             kernel_vec.push(t.elapsed());
         }
         let mut qsql_vec: Vec<Duration> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let _ = consumer.query_sql(&vec_sql).expect("query_sql vector");
+            let _ = consumer
+                .reader()
+                .query_sql(&vec_sql)
+                .expect("query_sql vector");
             qsql_vec.push(t.elapsed());
         }
 
@@ -2297,6 +2307,7 @@ pub(crate) mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
+                .reader()
                 .query_sql(&bm25_score_sql)
                 .expect("query_sql bm25 score");
             bm25_score_total.push(t.elapsed());
@@ -2305,6 +2316,7 @@ pub(crate) mod diag {
         for _ in 0..iters {
             let t = Instant::now();
             let _ = consumer
+                .reader()
                 .query_sql(&vec_score_sql)
                 .expect("query_sql vector score");
             vec_score_total.push(t.elapsed());

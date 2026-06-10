@@ -278,6 +278,13 @@ impl StorageProvider for LocalFsStorageProvider {
         }
         Ok(out)
     }
+
+    fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
+        // The prefix (root) is baked into the LocalFileSystem store, so
+        // the object key is the bare uri.
+        let path = Self::path(uri).ok()?;
+        Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))
+    }
 }
 
 #[cfg(test)]

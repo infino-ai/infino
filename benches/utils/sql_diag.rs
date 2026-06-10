@@ -4,7 +4,7 @@
 //! SQL scan-path diagnostic — localizes where `Supertable::query_sql`
 //! scalar-scan latency actually goes.
 //!
-//! The headline SQL bench (`cargo bench --bench sql`) reports scalar
+//! The headline SQL bench (`cargo bench -- superfile sql`) reports scalar
 //! scans (`scan_all`, `filter_category`, `filter_rating`) at ~300ms
 //! while `count_star` / `group_by_category` land at single-digit ms.
 //! This diagnostic decomposes that gap by timing infino's full
@@ -40,11 +40,11 @@
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench sql-diag
-//! INFINO_BENCH_DOC_COUNT=1000000 cargo bench --bench sql-diag
-//! INFINO_SQL_DIAG_ITERS=20 cargo bench --bench sql-diag
+//! cargo bench -- sql-diag
+//! INFINO_BENCH_SUPERFILE_DOCS=1000000 cargo bench -- sql-diag
+//! INFINO_SQL_DIAG_ITERS=20 cargo bench -- sql-diag
 //! # delegate to the kernel-vs-query_sql TVF dispatch-tax diagnostic:
-//! INFINO_SQL_DIAG=tvf cargo bench --bench sql-diag
+//! INFINO_SQL_DIAG=tvf cargo bench -- sql-diag
 //! ```
 
 use std::sync::Arc;
@@ -71,7 +71,7 @@ use crate::markdown::fmt_count;
 /// segment count matches the headline SQL bench.
 const WRITE_CHUNK: usize = 65_536;
 
-/// Round-robin category labels (matches `sql_bench::CATEGORIES`).
+/// Round-robin category labels (matches `superfile::sql::CATEGORIES`).
 const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
 
 const TABLE: &str = "supertable";
@@ -263,7 +263,7 @@ pub fn run() {
         .unwrap_or(15);
     eprintln!(
         "[sql-diag] scalar scan decomposition: n_docs={} iters={iters} \
-         (knobs: INFINO_BENCH_DOC_COUNT, INFINO_SQL_DIAG_ITERS)",
+         (knobs: INFINO_BENCH_SUPERFILE_DOCS, INFINO_SQL_DIAG_ITERS)",
         fmt_count(n)
     );
 
@@ -321,6 +321,7 @@ pub fn run() {
         // 1. infino query_sql (full path).
         let (full_p50, full_mean, full_rows) = time_path(iters, || {
             table
+                .reader()
                 .query_sql(shape.sql)
                 .map(|b| count_rows(&b))
                 .expect("query_sql")

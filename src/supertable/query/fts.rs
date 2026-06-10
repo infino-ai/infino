@@ -5,18 +5,28 @@
 //!
 //! ## Public API
 //!
-//! ```ignore
-//! let hits: Vec<SuperfileHit> =
-//!     supertable.reader().bm25_search("title", "rust async", 10, BoolMode::Or)?;
+//! The sync, user-facing entry points live on
+//! [`Supertable`](super::super::Supertable):
 //!
-//! let prefix_hits: Vec<SuperfileHit> =
-//!     supertable.reader().bm25_search_prefix("title", "rus", 10)?;
+//! ```ignore
+//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
+//! let rows: Vec<RecordBatch> =
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None)?;
+//!
+//! // Just `_id` + `score` (no scalar decode): project them explicitly.
+//! let ids: Vec<RecordBatch> =
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "score"]))?;
+//!
+//! // Unranked candidate sets (Arrow rows, score == 0.0).
+//! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
+//! let exact = table.exact_match("title", "rust async", None)?;
 //! ```
 //!
-//! Both methods return [`SuperfileHit`]s sorted by score *descending*
-//! — higher BM25 score is more relevant. `local_doc_id` is the row
-//! offset within `segment`; doc-id space is local to a segment in
-//! v1.
+//! Internally these drive the async kernel on the snapshot-pinned
+//! [`SupertableReader`], whose `bm25_search` (rows) / `bm25_hits`
+//! ([`SuperfileHit`], segment-local) / `bm25_search_prefix` methods are
+//! the engine-facing surface. Ranked results are sorted by score
+//! *descending* — higher BM25 score is more relevant.
 //!
 //! ## Strategy
 //!
@@ -65,8 +75,10 @@ use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
+use arrow::record_batch::RecordBatch;
 
-use super::{SearchHit, SuperfileHit};
+use super::SuperfileHit;
+use super::exec::common::resolve_hits_named;
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -373,7 +385,35 @@ impl SupertableReader {
 }
 
 impl SupertableReader {
-    /// Single-column BM25 search over this reader's pinned snapshot.
+    /// Single-column BM25 search over this reader's pinned snapshot,
+    /// materialized as Arrow rows.
+    ///
+    /// This is the user-facing row-returning path. It runs the same
+    /// BM25 hit kernel the SQL TVF uses, then resolves those top-k hits
+    /// through the shared row materializer. Returned batches include
+    /// `_id`, every visible scalar column, and a trailing `score` column.
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.block_on(async {
+            let hits = self.bm25_search_async(column, query, k, mode).await?;
+            // `projection` selects columns by name (any of `_id`, the
+            // visible scalar columns, or the trailing `score`); `None`
+            // returns the whole row. The shared resolver decodes only
+            // the projected columns.
+            let batch = resolve_hits_named(self, &hits, projection, "bm25_search")
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            Ok(vec![batch])
+        })
+    }
+
+    /// Low-level BM25 search over this reader's pinned snapshot.
     ///
     /// Drives the internal async kernel to completion via the
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
@@ -385,7 +425,7 @@ impl SupertableReader {
     /// regardless of score; `mode` applies to the positive terms only.
     /// `"rust -python"` scores docs with `rust`, dropping any that also
     /// contain `python`. A query with only negated terms is an error.
-    pub fn bm25_search(
+    pub fn bm25_hits(
         &self,
         column: &str,
         query: &str,
@@ -590,11 +630,16 @@ fn _manifest_doc_total(manifest: &Manifest) -> u64 {
 }
 
 impl Supertable {
-    /// Single-column BM25 search over the current snapshot.
+    /// Single-column BM25 search over the current snapshot, returning
+    /// Arrow rows best-score-first (BM25 relevance, higher is better).
     ///
-    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), best
-    /// score first. Pins a fresh reader, runs the BM25 fan-out, then
-    /// resolves each segment-local hit to its public `_id`.
+    /// Pins a fresh reader (applying the read-consistency policy), runs
+    /// the BM25 fan-out, and resolves the top-`k` hits to Arrow rows.
+    ///
+    /// `projection` selects output columns by name (any of `_id`, the
+    /// visible scalar columns, or the trailing `score`); `None` returns
+    /// the whole row. Only the projected scalar columns are decoded, so
+    /// `Some(&["_id", "score"])` is the cheap "just the hits" path.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -606,8 +651,12 @@ impl Supertable {
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
-    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or)?;
-    /// assert_eq!(hits.len(), 1);
+    /// // `None` projection returns full rows:
+    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
+    /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    /// // Project just `_id` + `score` → no scalar decode at all:
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "score"]))?;
+    /// assert_eq!(hits[0].num_columns(), 2);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn bm25_search(
@@ -616,16 +665,65 @@ impl Supertable {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+        self.reader()
+            .bm25_search(column, query, k, mode, projection)
+            .map_err(crate::InfinoError::from)
+    }
+
+    /// Unranked token match over one FTS column: every row whose
+    /// `column` matches `query`'s tokens under `mode` (`Or` = any token,
+    /// `And` = every token). Returns Arrow rows like
+    /// [`Supertable::bm25_search`], but the `score` column is `0.0` and
+    /// row order is unspecified — a candidate set, not a ranking.
+    /// `projection` follows the same rules as `bm25_search`.
+    pub fn token_match(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
         let reader = self.reader();
         let hits = reader
-            .bm25_search(column, query, k, mode)
+            .token_match(column, query, mode)
             .map_err(crate::InfinoError::from)?;
-        let id_col = self.options().id_column.clone();
-        self.block_on_query(super::exec::common::resolve_search_hits(
-            &reader, &hits, &id_col,
-        ))
-        .map_err(|e| crate::InfinoError::Query(e.to_string()))
+        let batch = self
+            .block_on_query(resolve_hits_named(
+                &reader,
+                &hits,
+                projection,
+                "token_match",
+            ))
+            .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
+        Ok(vec![batch])
+    }
+
+    /// Unranked exact match: rows whose `column` value equals `value`
+    /// exactly (index-pruned, then text-verified). Returns Arrow rows
+    /// like [`Supertable::bm25_search`], with `score` fixed at `0.0` and
+    /// unspecified row order. `projection` follows the same rules as
+    /// `bm25_search`.
+    pub fn exact_match(
+        &self,
+        column: &str,
+        value: &str,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+        let reader = self.reader();
+        let hits = reader
+            .exact_match(column, value)
+            .map_err(crate::InfinoError::from)?;
+        let batch = self
+            .block_on_query(resolve_hits_named(
+                &reader,
+                &hits,
+                projection,
+                "exact_match",
+            ))
+            .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
+        Ok(vec![batch])
     }
 }
 
@@ -749,13 +847,13 @@ mod tests {
 
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "alpha -beta", 10, BoolMode::Or)
+            .bm25_hits("title", "alpha -beta", 10, BoolMode::Or)
             .expect("negation search");
         assert_eq!(hits.len(), 2, "alpha minus beta: {hits:?}");
 
         // Positive-only stays untouched: all three alpha docs.
         let hits = r
-            .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .bm25_hits("title", "alpha", 10, BoolMode::Or)
             .expect("positive search");
         assert_eq!(hits.len(), 3);
     }
@@ -778,7 +876,7 @@ mod tests {
 
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "alpha -delta", 10, BoolMode::And)
+            .bm25_hits("title", "alpha -delta", 10, BoolMode::And)
             .expect("negation search");
         assert_eq!(hits.len(), 2, "alpha minus delta: {hits:?}");
     }
@@ -791,7 +889,7 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader();
-        let res = r.bm25_search("title", "-alpha", 10, BoolMode::Or);
+        let res = r.bm25_hits("title", "-alpha", 10, BoolMode::Or);
         assert!(res.is_err(), "negation-only must error; got {res:?}");
     }
 
@@ -800,7 +898,7 @@ mod tests {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -813,7 +911,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 0, BoolMode::Or)
+            .bm25_hits("title", "rust", 0, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -835,7 +933,7 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 4, BoolMode::Or)
+            .bm25_hits("title", "rust", 4, BoolMode::Or)
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
         assert_eq!(hits.len(), 3);
@@ -857,7 +955,7 @@ mod tests {
         let r = st.reader();
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
         // Both segment URIs should appear.
@@ -911,8 +1009,8 @@ mod tests {
         // Single-segment `SuperfileReader` oracle: async-only search,
         // driven on a throwaway runtime. The supertable reader below
         // uses its sync public API.
-        let oracle_hits =
-            block_on(oracle.bm25_search("title", "nimblefox", 5, BoolMode::Or)).expect("oracle");
+        let oracle_hits = block_on(oracle.bm25_hits_async("title", "nimblefox", 5, BoolMode::Or))
+            .expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
         let oracle_set: std::collections::HashSet<u32> =
@@ -921,7 +1019,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .bm25_search("title", "nimblefox", 5, BoolMode::Or)
+            .bm25_hits("title", "nimblefox", 5, BoolMode::Or)
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
         // Resolve supertable hits to global doc-ids via segment
@@ -1028,7 +1126,7 @@ mod tests {
 
         let r = st.reader();
         let err = r
-            .bm25_search("missing_column", "rust", 5, BoolMode::Or)
+            .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
@@ -1045,7 +1143,7 @@ mod tests {
         }
         let r = st.reader();
         let hits = r
-            .bm25_search("title", "rust", 2, BoolMode::Or)
+            .bm25_hits("title", "rust", 2, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
     }

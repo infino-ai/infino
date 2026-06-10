@@ -100,18 +100,23 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          # Map the single `bench` input to the cargo target(s) to build
-          # and the supertable shape filter (empty = all three).
+          # All benches live in the single `bench` cargo target; cells are
+          # selected with positional tokens (`<tier> <modality> [phase]`).
+          # Map the legacy `bench` input vocabulary to (a) the binary's
+          # args and (b) the report JSONs (target/infino-bench/<name>.json)
+          # used for baseline restore / publish.
           case "${{ inputs.bench }}" in
-            supertable_all)      targets="supertable_all";     shapes="" ;;
-            fts|vector|combined) targets="supertable_all";     shapes="${{ inputs.bench }}" ;;
-            sql)                 targets="sql";                shapes="" ;;
-            all)                 targets="supertable_all sql"; shapes="" ;;
+            supertable_all) args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
+            fts)            args="supertable fts";        reports="supertable supertable_fts" ;;
+            vector)         args="supertable vector";     reports="supertable supertable_vector" ;;
+            combined)       args="supertable fts vector"; reports="supertable supertable_fts supertable_vector" ;;
+            sql)            args="superfile sql";         reports="sql" ;;
+            all)            args="all";                   reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
             *) echo "::error::unknown bench ${{ inputs.bench }}"; exit 1 ;;
           esac
-          echo "targets=$targets" >> "$GITHUB_OUTPUT"
-          echo "shapes=$shapes"   >> "$GITHUB_OUTPUT"
-          echo "targets=[$targets] shapes=[$shapes]"
+          echo "args=$args"       >> "$GITHUB_OUTPUT"
+          echo "reports=$reports" >> "$GITHUB_OUTPUT"
+          echo "args=[$args] reports=[$reports]"
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -223,7 +228,6 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
-             BENCH_TARGETS='${{ steps.resolve.outputs.targets }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -240,20 +244,15 @@ jobs:
           export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
           sccache --start-server || true
 
-          # Build each selected target and record "<target><TAB><binary>"
-          # so the run step execs each directly — no cargo at run time
-          # means no re-fingerprint / rebuild. Cargo underscores the
-          # artifact name, so a hyphenated target maps via ${t//-/_}.
-          : > "$HOME/bench-bins"
-          for t in $BENCH_TARGETS; do
-            cargo bench --bench "$t" --no-run
-            stem="${t//-/_}"
-            BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name "${stem}-*" \
-                     -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
-            test -n "$BIN" && test -x "$BIN" || { echo "::error::binary for $t not found"; exit 1; }
-            printf '%s\t%s\n' "$t" "$BIN" >> "$HOME/bench-bins"
-            echo "built $t: $BIN"
-          done
+          # Build the single unified bench target and record its binary so
+          # the run step execs it directly — no cargo at run time means no
+          # re-fingerprint / rebuild.
+          cargo bench --no-run
+          BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name 'bench-*' \
+                   -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+          test -n "$BIN" && test -x "$BIN" || { echo "::error::bench binary not found"; exit 1; }
+          printf '%s\n' "$BIN" > "$HOME/bench-bin"
+          echo "built bench: $BIN"
           sccache --show-stats || true
           REMOTE
 
@@ -268,16 +267,13 @@ jobs:
           CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
           VM_SIZE: ${{ inputs.vm_size }}
           DOCS: ${{ inputs.docs }}
-          TARGETS: ${{ steps.resolve.outputs.targets }}
+          REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          # supertable_all's report is named "supertable"; others match.
-          jname() { case "$1" in supertable_all) echo supertable ;; *) echo "$1" ;; esac; }
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             "mkdir -p infino-src/target/infino-bench"
-          for t in $TARGETS; do
-            j="$(jname "$t")"
+          for j in $REPORTS; do
             blob="bench/${j}/baseline/${VM_SIZE}-${DOCS}.json"
             if az storage blob download --account-name "$ACC" --account-key "$KEY" \
                  -c "$CONTAINER" -n "$blob" -f "${j}.json" 2>/dev/null; then
@@ -302,8 +298,9 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
-             INFINO_BENCH_DOC_COUNT='${{ inputs.docs }}' \
-             BENCH_SHAPES='${{ steps.resolve.outputs.shapes }}' \
+             INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              KEEP='${{ inputs.keep_table }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
           set -euo pipefail
@@ -316,15 +313,13 @@ jobs:
           ulimit -n "$(ulimit -Hn)"
           echo "fd limit: $(ulimit -n)"
 
-          # Exec each built target. The supertable target honours the
-          # shape filter; others ignore it.
-          while IFS=$'\t' read -r t BIN; do
-            [ "$t" = "supertable_all" ] && export INFINO_BENCH_SUPERTABLE_SHAPES="$BENCH_SHAPES"
-            echo "===== BENCH ${t} START ====="
-            "$BIN" 2>&1
-            echo "===== BENCH ${t} END ====="
-            unset INFINO_BENCH_SUPERTABLE_SHAPES
-          done < "$HOME/bench-bins"
+          # Exec the unified bench binary with the resolved positional
+          # selection (tier / modality tokens). Intentionally unquoted:
+          # $BENCH_ARGS is a token list.
+          BIN="$(cat "$HOME/bench-bin")"
+          echo "===== BENCH ${BENCH_ARGS} START ====="
+          "$BIN" $BENCH_ARGS 2>&1
+          echo "===== BENCH ${BENCH_ARGS} END ====="
           REMOTE
 
       # Publish the metrics as the latest-main pointer (overwritten, what PRs
@@ -340,19 +335,17 @@ jobs:
           CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
           VM_SIZE: ${{ inputs.vm_size }}
           DOCS: ${{ inputs.docs }}
-          TARGETS: ${{ steps.resolve.outputs.targets }}
+          REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          jname() { case "$1" in supertable_all) echo supertable ;; *) echo "$1" ;; esac; }
           # Commit identity from the VM checkout: sha keys the history blob,
           # commit time (unix s) rides as metadata for chronological sorting.
           meta="$(ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             'cd infino-src && git rev-parse --short HEAD && git show -s --format=%ct HEAD')"
           SHA="$(echo "$meta" | sed -n 1p)"
           TS="$(echo "$meta" | sed -n 2p)"
-          for t in $TARGETS; do
-            j="$(jname "$t")"
+          for j in $REPORTS; do
             scp -o StrictHostKeyChecking=no \
               "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "${j}.json" \
               || { echo "::warning::no metrics for $j — skipping"; continue; }

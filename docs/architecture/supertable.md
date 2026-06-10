@@ -25,12 +25,20 @@ and object storage.
 
 ## Public API
 
-A supertable is the handle an application holds. Its operations are
-grouped behind typed accessors so call sites read clearly: a **reader**
-for queries against a pinned snapshot, a **writer** for staged changes
-published by commit, and a **stats** view for introspection. The
-manifest and segment internals behind these accessors are never part of
-the surface.
+A supertable is the table handle an application holds. It is obtained
+from a **`Connection`** — the catalog of tables opened with
+`connect(uri)`, which creates / opens / lists / drops tables and runs
+SQL across them. The handle's public operations are **synchronous
+methods on the supertable itself**: `append`, `update`, `delete`, the
+search methods (`bm25_search` / `vector_search`, returning Arrow rows;
+the unranked `token_match` / `exact_match`), and `schema`.
+
+Internally those methods drive a **reader** (a pinned, consistent
+snapshot) for queries and a single **writer** (staged changes published
+by commit) for mutations, with a **stats** view for introspection. The
+reader / writer / stats accessors, the manifest, and the segment
+internals behind them are implementation details, never part of the
+public surface.
 
 Operations fall into two groups: **Read** and **Write**.
 
@@ -40,12 +48,21 @@ Reads run through a **reader** — a snapshot pinned at the moment it is
 taken, so a sequence of queries observes one consistent view of the
 table regardless of concurrent writes.
 
-Every read returns the same shape: a list of hits. A hit references a
-single row by its segment and the row's offset within that segment,
-plus a score when the query ranks results. BM25 fills the score with
-relevance (higher is better); vector search fills it with distance
+Every read returns the same shape internally: a list of hits. A hit
+references a single row by its segment and the row's offset within that
+segment, plus a score when the query ranks results. BM25 fills the score
+with relevance (higher is better); vector search fills it with distance
 under the column's metric (smaller is closer); a SQL filter leaves it
 unset.
+
+Those segment-local hits are the reader's internal representation. The
+public `Supertable` search methods resolve each hit to the table's
+stable `_id` and return Arrow `RecordBatch` rows. All four (`bm25_search`,
+`vector_search`, and the unranked `token_match` / `exact_match`) take a
+column `projection`: `None` returns the whole row, and only the
+projected scalar columns are decoded — projecting just `_id` + `score`
+skips scalar decode entirely (the cheap shape for a retrieval step
+feeding a follow-up fetch).
 
 - **Vector search.** k-nearest-neighbor over a vector column for a
 query vector, returning the `k` closest rows ordered by ascending

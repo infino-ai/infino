@@ -17,50 +17,60 @@
 
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use arrow::compute::{concat_batches, take};
-use arrow_array::{
-    ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
-};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
+use futures::TryStreamExt;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use rayon::prelude::*;
 
+use crate::superfile::SuperfileReader;
+use crate::superfile::reader::{rank_back_indices, row_selection_for_ids};
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::query::{SearchHit, SuperfileHit};
+use crate::supertable::query::SuperfileHit;
 
-/// Resolve segment-local hits to public [`SearchHit`]s: read the `_id`
-/// column (named `id_col`) for each `(segment, local_doc_id)` and pair
-/// it with the hit's score, preserving the kernel's rank order. Backs
-/// the public `Supertable::bm25_search` / `vector_search`, which expose
-/// `_id` + score rather than the internal segment-local position.
-pub(crate) async fn resolve_search_hits(
+/// Resolve `hits` to one `RecordBatch`, with `projection` naming the
+/// output columns (any of `_id`, the visible scalar columns, or the
+/// trailing `score`); `None` returns the whole row. Names are resolved
+/// to output-schema indices and forwarded to [`resolve_hits`], which
+/// decodes only the projected columns. Shared by every public
+/// row-returning search method (`bm25_search`, `vector_search`,
+/// `token_match`, `exact_match`); `what` labels error messages with
+/// the calling method.
+pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
-    id_col: &str,
-) -> DfResult<Vec<SearchHit>> {
-    if hits.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rb = resolve_columns(reader, hits, &[id_col]).await?;
-    let ids = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!("id column {id_col:?} is not Decimal128"))
-        })?;
-    Ok(hits
-        .iter()
-        .enumerate()
-        .map(|(i, h)| SearchHit {
-            id: ids.value(i),
-            score: h.score,
-        })
-        .collect())
+    projection: Option<&[&str]>,
+    what: &str,
+) -> DfResult<RecordBatch> {
+    let scalar_schema = reader.options().scalar_schema();
+    let output_schema = output_schema_with_score(&scalar_schema);
+    let indices: Option<Vec<usize>> = match projection {
+        Some(names) => Some(
+            names
+                .iter()
+                .map(|name| {
+                    output_schema.index_of(name).map_err(|_| {
+                        DataFusionError::Execution(format!("{what}: unknown column {name:?}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        None => None,
+    };
+    resolve_hits(
+        reader,
+        hits,
+        &scalar_schema,
+        &output_schema,
+        indices.as_deref(),
+    )
+    .await
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -203,20 +213,10 @@ async fn resolve_columns(
         placement.push((seg_idx, row));
     }
 
-    // Per-segment column-projected reads, split by concern:
-    //   1. **Open** every distinct segment reader **concurrently** on
-    //      the tokio runtime — these are async I/O (in-memory cache
-    //      lookups / disk-cache cold fetches), so overlapping them is
-    //      the right model and they cost ~microseconds when warm.
-    //   2. **Decode** every segment **in parallel** on
-    //      `options.reader_pool` (rayon). `take_by_local_doc_ids` is a
-    //      CPU-bound Parquet page decode over already-resident bytes;
-    //      the SQL tokio runtime is single-worker by design (it drives
-    //      the I/O state machine, not CPU), so CPU fan-out belongs on
-    //      the reader pool — the same pool the search kernels and the
-    //      writer's shard builds use. The work is bridged back to the
-    //      async caller via a oneshot so the tokio worker is never
-    //      blocked.
+    // Open every distinct segment reader concurrently on the tokio
+    // runtime — these are async I/O (in-memory cache lookups /
+    // disk-cache cold fetches), so overlapping them is the right
+    // model and they cost ~microseconds when warm.
     let manifest = reader.manifest();
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
@@ -230,30 +230,109 @@ async fn resolve_columns(
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-    // Owned inputs so the rayon closure is `'static`. `rayon`'s
-    // ordered `collect` preserves segment order, so `per_segment[i]`
-    // still lines up with `seg_order[i]` for the `offsets`/`placement`
-    // reorder below.
-    let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
-    let inputs: Vec<(Arc<crate::superfile::SuperfileReader>, Vec<u32>)> =
-        opened.into_iter().zip(seg_locals).collect();
-    let pool = Arc::clone(&manifest.options.reader_pool);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    pool.spawn(move || {
-        let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-        let result: Result<Vec<RecordBatch>, _> = inputs
-            .into_par_iter()
-            .map(|(sf, locals)| sf.take_by_local_doc_ids(&locals, &name_refs))
-            .collect();
-        let _ = tx.send(result);
-    });
-    let per_segment: Vec<RecordBatch> = rx
-        .await
-        .map_err(|_| {
-            DataFusionError::Execution("resolve decode: reader pool dropped result".into())
-        })?
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    // Materialize each segment's projected hit rows, split by tier:
+    //
+    //   - **Resident readers** (in-memory tier / freshly written):
+    //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode
+    //     over already-resident bytes, so the whole wave runs on
+    //     `options.reader_pool` (rayon) — the same pool the search
+    //     kernels and the writer's shard builds use — bridged back via
+    //     a oneshot so no tokio worker blocks under the compute.
+    //   - **Lazy readers** stream ONLY the projected hit rows through
+    //     parquet's async `ParquetObjectReader` (footer + projected
+    //     column pages via range GETs) — async I/O that belongs on the
+    //     query runtime; a cold read never materializes the segment.
+    //
+    // Both waves run concurrently and stitch back in `seg_order`
+    // order. Segment count here is bounded by the global top-k (one
+    // entry per distinct hit-bearing segment), so the fan-out is small.
+    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
+    let mut cold_units: Vec<(usize, &SuperfileUri, &Arc<SuperfileReader>, &[u32])> = Vec::new();
+    for (i, ((uri, rd), locals)) in seg_order
+        .iter()
+        .zip(opened.iter())
+        .zip(seg_locals.iter())
+        .enumerate()
+    {
+        if rd.parquet_bytes().is_some() {
+            warm_inputs.push((i, Arc::clone(rd), locals.clone()));
+        } else {
+            cold_units.push((i, uri, rd, locals.as_slice()));
+        }
+    }
 
+    let warm_wave = async {
+        if warm_inputs.is_empty() {
+            return Ok::<Vec<(usize, RecordBatch)>, DataFusionError>(Vec::new());
+        }
+        // Owned inputs so the rayon closure is `'static`.
+        let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+        let pool = Arc::clone(&manifest.options.reader_pool);
+        let inputs = warm_inputs;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pool.spawn(move || {
+            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+            let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
+                .into_par_iter()
+                .map(|(i, sf, locals)| {
+                    sf.take_by_local_doc_ids(&locals, &name_refs)
+                        .map(|batch| (i, batch))
+                })
+                .collect();
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| {
+                DataFusionError::Execution("resolve decode: reader pool dropped result".into())
+            })?
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
+    };
+
+    let cold_wave = futures::future::try_join_all(cold_units.into_iter().map(
+        |(i, uri, reader, locals)| {
+            let storage = storage.cloned();
+            let file_size = manifest
+                .superfiles
+                .iter()
+                .find(|e| e.uri == *uri)
+                .and_then(|e| e.subsection_offsets.as_ref())
+                .map(|o| o.total_size);
+            async move {
+                let storage = storage.ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "resolve_hits needs row bytes for {uri:?}, but the reader was lazy and no storage backend is attached"
+                    ))
+                })?;
+                let (store, path) =
+                    storage.object_store_handle(&uri.storage_path()).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "resolve_hits: storage backend exposes no object_store handle for {uri:?}"
+                        ))
+                    })?;
+                take_rows_object_store(
+                    store,
+                    path,
+                    file_size,
+                    reader.schema(),
+                    reader.n_docs(),
+                    locals,
+                    names,
+                )
+                .await
+                .map(|batch| (i, batch))
+            }
+        },
+    ));
+
+    let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
+    let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
+    for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
+        slots[i] = Some(batch);
+    }
+    let per_segment: Vec<RecordBatch> = slots
+        .into_iter()
+        .map(|s| s.expect("invariant: every segment resolved by exactly one wave"))
+        .collect();
     // Concatenate, then reorder rows into global rank order.
     let cat_schema = per_segment[0].schema();
     let combined = concat_batches(&cat_schema, &per_segment)
@@ -276,6 +355,95 @@ async fn resolve_columns(
     }
     RecordBatch::try_new(combined.schema(), columns)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Stream the projected `names` columns at `local_doc_ids` from a lazy
+/// object-store segment via parquet's async `ParquetObjectReader`
+/// (footer + projected column pages fetched as range GETs). Mirrors
+/// [`SuperfileReader::take_by_local_doc_ids`]'s row-selection + rank-back,
+/// but never materializes the whole segment — this is the cold/object-
+/// store row-resolution path.
+///
+/// [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
+async fn take_rows_object_store(
+    store: Arc<dyn object_store::ObjectStore>,
+    path: object_store::path::Path,
+    file_size: Option<u64>,
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    // Projected column indices (file order) + output fields (caller order).
+    let mut col_indices = Vec::with_capacity(names.len());
+    let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
+    for &name in names {
+        let idx = file_schema
+            .index_of(name)
+            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
+        col_indices.push(idx);
+        out_fields.push(file_schema.field(idx).clone());
+    }
+    let out_schema = Arc::new(Schema::new(out_fields));
+
+    if local_doc_ids.is_empty() {
+        return Ok(RecordBatch::new_empty(out_schema));
+    }
+    for &d in local_doc_ids {
+        if u64::from(d) >= n_docs {
+            return Err(DataFusionError::Execution(format!(
+                "doc id {d} out of range (n_docs={n_docs})"
+            )));
+        }
+    }
+
+    // Distinct, sorted ids → monotonic skip/select runs (decode only the
+    // rows the hits land on, not the whole column). Same selection
+    // contract as `take_by_local_doc_ids` — shared helpers, different
+    // I/O model (async range GETs here vs resident-bytes decode there).
+    let (sorted, selection) = row_selection_for_ids(local_doc_ids);
+
+    let mut object_reader = ParquetObjectReader::new(store, path);
+    if let Some(size) = file_size.filter(|&s| s > 0) {
+        // Skip the size-discovery HEAD when the manifest already knows it.
+        object_reader = object_reader.with_file_size(size);
+    }
+    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
+    let stream = builder
+        .with_projection(mask)
+        .with_row_selection(selection)
+        .build()
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(out_schema));
+    }
+    let read_schema = batches[0].schema();
+    let selected = concat_batches(&read_schema, &batches)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    // Rank back into the caller's (possibly duplicated) order.
+    let indices = rank_back_indices(local_doc_ids, &sorted);
+
+    // Gather columns in caller projection order (parquet returns file order).
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(names.len());
+    for &name in names {
+        let idx = selected
+            .schema()
+            .index_of(name)
+            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
+        columns.push(
+            take(selected.column(idx), &indices, None)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+        );
+    }
+    RecordBatch::try_new(out_schema, columns).map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 /// Extract a string literal argument (a column name, query text, ...).

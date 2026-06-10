@@ -29,7 +29,7 @@ docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
 
 docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
 
-hits = docs.bm25_search("title", "fox", 10)         # [{"_id": ..., "score": ...}]
+hits = docs.bm25_search("title", "fox", 10)         # pyarrow.Table (_id, title, score)
 rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
 ```
 
@@ -61,9 +61,12 @@ let batch = RecordBatch::try_new(
 )?;
 docs.append(&batch)?;
 
-// Keyword search (BM25): hits carry the auto-injected `_id` + score.
-let hits = docs.bm25_search("title", "fox", 10, BoolMode::Or)?;
-assert_eq!(hits.len(), 1);
+// Keyword search (BM25): Arrow rows carrying the auto-injected `_id`,
+// the projected columns, and a trailing `score`. Only the projected
+// scalar columns are decoded; project just `_id` + `score` (or pass
+// `None` for the whole row) to control the decode cost.
+let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
+assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
 // SQL across the catalog — every segment is also a valid Parquet file.
 let rows = db.query_sql("SELECT _id, title FROM docs")?;
@@ -131,6 +134,51 @@ assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 A search TVF (`bm25_search('posts', 'body', 'alice', 10)`) can stand in
 for either side of the join, so keyword/vector results compose with the
 rest of the catalog the same way.
+
+## Search is an access path, not just an API
+
+In most engines, search ends at top-k: run BM25, run ANN, fuse, return.
+Infino also wires the same indexes into SQL execution as **physical
+access paths**:
+
+```sql
+-- The text predicate is answered from the FTS index — inverted index →
+-- candidate rows → decode only those rows — never a full column scan.
+SELECT category, AVG(rating)
+FROM reviews
+WHERE title = 'battery life'
+GROUP BY category;
+```
+
+Equality, `IN`, and boolean combinations on an indexed text column
+resolve through the index to an exact candidate row set before any
+column data is read. Segments that can't match are never opened at all:
+term blooms, value ranges, and vector centroids live side by side in the
+manifest, so scalar, keyword, and vector signals prune through one
+shared layer.
+
+Retrieval composes the same way. The ranked `bm25_search` /
+`vector_search` / `hybrid_search` and the unranked `token_match` /
+`exact_match` are table functions — relations, not endpoints — so a
+candidate set is the *first stage of a plan* rather than its result:
+
+```sql
+-- Rank first; join and aggregate over just the candidates.
+SELECT a.name, COUNT(*) AS hits
+FROM bm25_search('posts', 'body', 'rust async', 100) p
+JOIN authors a ON a.author_id = p.author_id
+GROUP BY a.name
+ORDER BY hits DESC;
+
+-- Set algebra over index-bounded candidate sets: "rust but not compiler".
+SELECT _id FROM token_match('posts', 'body', 'rust')
+EXCEPT
+SELECT _id FROM token_match('posts', 'body', 'compiler');
+```
+
+One snapshot, one copy of the data: sparse (BM25), dense (vector), and
+structured (scalar) predicates compose inside the engine — no second
+system to sync, no client-side result stitching.
 
 ## Stability
 

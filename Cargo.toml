@@ -28,6 +28,9 @@ exclude = ["infino-python"]
 
 [lib]
 path = "src/lib.rs"
+# Don't run the lib's `#[test]` harness under `cargo bench` (it would just
+# enumerate every unit test as "ignored"). Unit tests still run via `cargo test`.
+bench = false
 
 [features]
 # `mimalloc` installs mimalloc as the `#[global_allocator]` (see
@@ -62,7 +65,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 arrow = "58"
 arrow-array = "58"
 arrow-schema = "58"
-parquet = "58"
+parquet = { version = "58", features = ["async", "object_store"] }
 
 # SIMD primitives
 bitpacking = "0.9"
@@ -298,60 +301,27 @@ debug = 1
 [[test]]
 name = "superfile"
 path = "tests/superfile/main.rs"
+bench = false
 
 [[test]]
 name = "supertable"
 path = "tests/supertable/main.rs"
+bench = false
 
-# Bench bundles. Superfile-scale FTS/vector benches stay split by
-# topic because their 1M builds are cheap enough to sample independently.
-# Supertable-scale FTS/vector benches share one combined 10M table in the
-# `supertable` bench so the expensive table is built once and reused.
+# The one and only benchmark binary. Everything — the tier × modality
+# matrix and the standalone diagnostics (scale / tombstone / update /
+# sql-diag / object-store) — is selected by positional tokens at runtime,
+# e.g.
+#   cargo bench                       # == cargo bench -- all
+#   cargo bench -- supertable
+#   cargo bench -- superfile fts
+#   cargo bench -- supertable sql warm
+#   cargo bench -- tombstone
+# All bench logic lives in the `infino-bench-utils` library; this target is
+# just the dispatching `main`. Benches don't build on a normal `cargo build`.
 [[bench]]
-name = "superfile_fts"
-path = "benches/fts/main.rs"
-harness = false
-
-[[bench]]
-name = "superfile_vector"
-path = "benches/vector/main.rs"
-harness = false
-
-[[bench]]
-name = "sql"
-path = "benches/sql/main.rs"
-harness = false
-
-[[bench]]
-name = "sql-diag"
-path = "benches/sql_diag/main.rs"
-harness = false
-
-[[bench]]
-name = "supertable_all"
-path = "benches/supertable/main.rs"
-harness = false
-
-[[bench]]
-name = "object-store"
-path = "benches/object_store/main.rs"
-harness = false
-required-features = ["bench-diagnostics"]
-
-[[bench]]
-name = "scale"
-path = "benches/scale/main.rs"
-harness = false
-required-features = ["bench-diagnostics"]
-
-[[bench]]
-name = "tombstone-overhead"
-path = "benches/tombstone_overhead/main.rs"
-harness = false
-
-[[bench]]
-name = "supertable-update"
-path = "benches/supertable_update/main.rs"
+name = "bench"
+path = "benches/bench/main.rs"
 harness = false
 
 # Both current examples exercise the format-layer internals (superfile

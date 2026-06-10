@@ -35,8 +35,8 @@ def test_memory_roundtrip():
     # Re-open by name and search.
     reopened = db.open_table("docs")
     hits = reopened.bm25_search("title", "fox", 10)
-    assert len(hits) == 1
-    assert "_id" in hits[0] and "score" in hits[0]
+    assert hits.num_rows == 1
+    assert "_id" in hits.column_names and "score" in hits.column_names
 
     db.drop_table("docs")
     assert db.list_tables() == []
@@ -102,7 +102,7 @@ def test_append_accepts_list_of_dicts():
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     t.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
     assert _count(db, "docs") == 2
-    assert len(t.bm25_search("title", "fox", 10)) == 1
+    assert t.bm25_search("title", "fox", 10).num_rows == 1
 
 
 def test_append_accepts_pandas_dataframe():
@@ -128,5 +128,5 @@ def test_vector_search_end_to_end():
     t.append(pa.record_batch([pa.array(vecs, type=pa.list_(pa.float32(), dim))], schema=schema))
 
     hits = t.vector_search("emb", onehot(0), 10)
-    assert len(hits) >= 1
-    assert "_id" in hits[0] and "score" in hits[0]
+    assert hits.num_rows >= 1
+    assert "_id" in hits.column_names and "score" in hits.column_names

@@ -24,18 +24,21 @@
 //! in debug. Results render through the custom report harness (terminal
 //! +, when `INFINO_BENCH_UPDATE_README=1`, the `bench/scale/vector_recall`
 //! README anchor) with run-to-run deltas.
+//!
+//! Invoked as `cargo bench -- scale`.
 
 use std::collections::HashSet;
 
 use infino::superfile::VectorSearchOptions;
 use infino::superfile::reader::SuperfileReader;
 use infino::superfile::vector::distance::Metric;
-use infino_bench_utils::corpus::{
+
+use crate::corpus::{
     brute_force_topk, build_superfile_with_metric, generate_realistic_queries,
     generate_vector_corpus, open_superfile,
 };
-use infino_bench_utils::report::{Better, Block, Cell, Report, Section, metric, text};
-use infino_bench_utils::rss::{self, PeakSampler, RssStats};
+use crate::report::{Better, Block, Cell, Report, Section, metric, text};
+use crate::rss::{self, PeakSampler, RssStats};
 
 const N_DOCS: usize = 10_000;
 const N_CENT: usize = 64;
@@ -79,7 +82,7 @@ fn search_blocking(
     k: usize,
     opts: VectorSearchOptions,
 ) -> Vec<(u32, f32)> {
-    infino_bench_utils::corpus::block_on_inmem(reader.vector_search("emb", query, k, opts))
+    crate::corpus::block_on_inmem(reader.vector_hits_async("emb", query, k, opts))
         .expect("vector_search")
 }
 

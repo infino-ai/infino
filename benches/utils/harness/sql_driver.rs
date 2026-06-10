@@ -6,12 +6,13 @@
 //! Builds one canonical 1-writer queryable artifact, optionally measures
 //! an N-writer build-throughput row, and times SQL queries against the
 //! canonical artifact. `run_sql_with_index` returns the artifact so
-//! in-tree benches can run additional correctness/hot/cold checks before
+//! in-tree benches can run additional correctness/warm/cold checks before
 //! calling `close`/`delete`.
 
 use std::time::{Duration, Instant};
 
 use super::{SqlEngine, SqlRow};
+use crate::markdown::fmt_count;
 use crate::rss::{PeakSampler, RssStats};
 
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +65,11 @@ pub fn run_sql_with_index<E: SqlEngine>(
     rows: &[SqlRow<'_>],
     queries: &[SqlQuery],
 ) -> (EngineSqlResult, E::Index) {
+    eprintln!(
+        "[harness/sql] {}: building 1-writer table over {} rows...",
+        E::name(),
+        fmt_count(rows.len()),
+    );
     let mut index = E::open();
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
@@ -77,6 +83,11 @@ pub fn run_sql_with_index<E: SqlEngine>(
     }];
 
     if cfg.parallel > 1 {
+        eprintln!(
+            "[harness/sql] {}: parallel build probe ({} writers)...",
+            E::name(),
+            cfg.parallel,
+        );
         let sampler = PeakSampler::start_default();
         let t0 = Instant::now();
         E::parallel_write(rows, cfg.parallel);
@@ -89,6 +100,16 @@ pub fn run_sql_with_index<E: SqlEngine>(
         });
     }
 
+    // One battery-level progress line; per-query results land in the
+    // report table, so per-query progress lines are just noise.
+    if !queries.is_empty() {
+        eprintln!(
+            "[harness/sql] {}: warm query battery ({} queries × {} timed iters)...",
+            E::name(),
+            queries.len(),
+            cfg.iters,
+        );
+    }
     let mut queries_out = Vec::with_capacity(queries.len());
     for q in queries {
         let sampler = PeakSampler::start_default();

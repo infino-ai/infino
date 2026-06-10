@@ -96,6 +96,7 @@ async fn writer_delete_tombstones_matching_rows() {
 
     // Follow-up SQL query no longer returns the row.
     let batches = st
+        .reader()
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -115,12 +116,14 @@ async fn writer_delete_tombstones_matching_rows() {
     );
 
     // Follow-up FTS query against the deleted token returns no
-    // hits.
+    // hits. The row-returning search yields one (possibly empty)
+    // batch, so assert on the row count, not the batch count.
     let hits = st
         .reader()
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or)
+        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
         .expect("fts");
-    assert!(hits.is_empty(), "expected zero hits for tombstoned token");
+    let n_rows: usize = hits.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(n_rows, 0, "expected zero hits for tombstoned token");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -205,6 +208,7 @@ async fn writer_update_replaces_matching_rows() {
     drop(w);
 
     let batches = st
+        .reader()
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -256,4 +260,45 @@ async fn writer_update_cardinality_mismatch_is_rejected() {
             new_rows: 2
         }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_emitted_segment_carries_subsection_offsets() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create");
+
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+        .expect("append");
+    w.commit().expect("commit");
+    w.update(
+        col("title").eq(lit("bravo")),
+        build_title_batch(&["bravo-prime"]),
+    )
+    .expect("update");
+    w.commit().expect("commit update");
+    drop(w);
+
+    let reader = st.reader();
+    let manifest = reader.manifest();
+    let emitted = manifest
+        .superfile_list
+        .superfiles
+        .iter()
+        .find(|e| e.n_docs == 1)
+        .expect("update-emitted single-row segment present");
+    let offsets = emitted
+        .subsection_offsets
+        .as_ref()
+        .expect("update-emitted segment carries subsection_offsets");
+    assert!(offsets.total_size > 0, "total_size is stamped");
 }

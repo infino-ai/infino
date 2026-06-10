@@ -22,13 +22,7 @@
 //! the `bench/supertable_update/*` README anchors) with run-to-run
 //! deltas.
 //!
-//! ## Invocation
-//!
-//! ```text
-//! cargo bench --bench supertable-update
-//! INFINO_BENCH_UPDATE_N_DOCS=10000000 cargo bench --bench supertable-update
-//! INFINO_BENCH_UPDATE_README=1 cargo bench --bench supertable-update
-//! ```
+//! Invoked as `cargo bench -- update`.
 
 use std::env;
 use std::hint::black_box;
@@ -39,10 +33,11 @@ use datafusion::prelude::{col, lit};
 use infino::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::supertable::Supertable;
 use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino_bench_utils::markdown::{fmt_count, fmt_throughput, fmt_time};
-use infino_bench_utils::report::{Better, Block, Cell, Report, Section, metric, text};
-use infino_bench_utils::rss::{self, PeakSampler, RssStats};
 use tempfile::TempDir;
+
+use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
+use crate::report::{Better, Block, Cell, Report, Section, metric, text};
+use crate::rss::{self, PeakSampler, RssStats};
 
 /// Default baseline ingest doc count (sized to run in <1s) when
 /// `INFINO_BENCH_UPDATE_N_DOCS` is unset.
@@ -113,6 +108,7 @@ fn rss_cells(stats: RssStats) -> Vec<Cell> {
 /// Total live row count via SQL `COUNT(*)`.
 fn count_rows(st: &Supertable) -> i64 {
     let batches = st
+        .reader()
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     batches[0]
@@ -217,7 +213,7 @@ fn measure_updates(n: usize, m: usize) -> (Duration, RssStats) {
 
 // ─── Entry point ──────────────────────────────────────────────────────
 
-fn main() {
+pub fn run() {
     let n = n_docs();
     let m = n_mutations();
     eprintln!(

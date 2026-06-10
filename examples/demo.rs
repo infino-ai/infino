@@ -122,7 +122,7 @@ fn demo_superfile() -> Bytes {
         // BM25 over the embedded FTS blob. Hits are (local_doc_id, score).
         for q in ["brown", "fox", "missing"] {
             let hits = reader
-                .bm25_search("title", q, SEARCH_TOP_K, BoolMode::Or)
+                .bm25_hits_async("title", q, SEARCH_TOP_K, BoolMode::Or)
                 .await
                 .expect("bm25_search");
             println!("  bm25 {q:>8?} -> {} hit(s): {hits:?}", hits.len());
@@ -131,7 +131,7 @@ fn demo_superfile() -> Bytes {
         // kNN over the embedded vector blob. Query with the doc's own
         // embedding -> distance ~0 under cosine.
         let knn = reader
-            .vector_search("emb", &emb, SEARCH_TOP_K, VectorSearchOptions::default())
+            .vector_hits_async("emb", &emb, SEARCH_TOP_K, VectorSearchOptions::default())
             .await
             .expect("vector_search");
         println!("  knn  self-query -> {} hit(s): {knn:?}", knn.len());
@@ -195,18 +195,21 @@ fn demo_supertable() {
         w.commit().expect("commit");
     }
 
-    // BM25 across both segments. The public `bm25_search` returns
-    // `SearchHit`s carrying the auto-injected `_id` + score.
+    // BM25 across both segments. The low-level reader `bm25_hits` returns
+    // `SuperfileHit`s carrying the source segment + local_doc_id + score;
+    // the public, row-returning path is `Supertable::bm25_search`.
     let hits = st
-        .bm25_search("title", "fox", SEARCH_TOP_K, BoolMode::Or)
+        .reader()
+        .bm25_hits("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());
     for h in &hits {
-        println!("    _id={} score={:.4}", h.id, h.score);
+        println!("    local_doc_id={} score={:.4}", h.local_doc_id, h.score);
     }
 
     // SQL surfaces the real auto-injected `_id` alongside the payload.
     let batches = st
+        .reader()
         .query_sql("SELECT _id, title FROM supertable ORDER BY _id")
         .expect("query_sql");
     let table = pretty_format_batches(&batches).expect("format");

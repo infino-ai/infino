@@ -21,11 +21,11 @@
 //!      `vector_centroid_skip`.
 //!   2. **Row-group / page skip (DataFusion).** The surviving
 //!      segments' Parquet bytes are exposed to a DataFusion
-//!      `ParquetSource` (via an in-memory object store), and the
-//!      same predicate is handed to it as a physical expression so
-//!      DataFusion's own `PruningPredicate` prunes row groups and
-//!      pages, then projects + limits. We deliberately do **not**
-//!      reimplement this commodity layer.
+//!      `ParquetSource` via an in-memory object store. The same
+//!      predicate is handed to DataFusion as a physical expression
+//!      so `PruningPredicate` prunes row groups and pages, then
+//!      projects + limits. We deliberately do **not** reimplement
+//!      this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
 //! is reported [`TableProviderFilterPushDown::Inexact`], so
@@ -36,17 +36,15 @@
 //!
 //! ## Why an in-memory object store
 //!
-//! The reader cache already holds each segment's Parquet bytes
-//! (`SuperfileReader::parquet_bytes`, an `Arc`-backed `Bytes` —
-//! cloning is a refcount bump, not a copy). Registering those
-//! bytes into a [`InMemory`] object store lets us reuse
-//! DataFusion's full `ParquetSource` (lazy row-group decode,
-//! projection/limit pushdown, row-group pruning) without
-//! reimplementing any Parquet machinery. This replaces the v1
-//! `MemTable` path, which eagerly decoded every row group of every
-//! segment regardless of the query.
+//! The reader cache already holds warm segments as resident Parquet bytes
+//! (`SuperfileReader::parquet_bytes`, an `Arc`-backed `Bytes` — cloning is
+//! a refcount bump, not a copy). Registering those bytes into a DataFusion
+//! [`InMemory`] object store lets us reuse DataFusion's full `ParquetSource`
+//! (lazy row-group decode, projection/limit pushdown, row-group pruning)
+//! without adding another object-store implementation.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -60,20 +58,22 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
-use datafusion::object_store::memory::InMemory;
 use datafusion::object_store::path::Path as ObjPath;
-use datafusion::object_store::{ObjectStoreExt, PutPayload};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use object_store::ObjectStore as OsObjectStore;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use roaring::RoaringBitmap;
 
+use crate::superfile::LazyByteSource;
 use crate::superfile::fts::reader::BoolMode;
 use crate::supertable::SuperfileEntry;
 use crate::supertable::manifest::Manifest;
+use crate::supertable::query::df_object_store::SuperfileObjectStore;
 use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
 use crate::supertable::tombstones::SidecarCache;
@@ -85,16 +85,16 @@ use datafusion::scalar::ScalarValue;
 /// resolving filter columns to a physical pruning predicate.
 pub(crate) const TABLE_NAME: &str = "supertable";
 
-/// Object-store URL *prefix* the surviving segments are registered
-/// under for a scan. The authority is arbitrary — only a key into the
-/// session's object-store registry — but it must be **unique per
-/// provider**: a multi-table catalog query registers several providers
-/// into one session, and a shared key would let one table's store
-/// overwrite another's (a segment would then read "not found"). A
-/// process-global counter makes each provider's URL distinct while
-/// keeping it stable across that provider's own scans, so the
-/// single-table cached session re-registers the same key (no growth).
-const MEMORY_STORE_URL_PREFIX: &str = "memory://supertable-";
+/// Object-store URL *prefix* the surviving segments are registered under
+/// for a scan. The authority is arbitrary — only a key into the session's
+/// object-store registry — but it must be **unique per provider**: a
+/// multi-table catalog query (`Connection::query_sql`) registers several
+/// providers into one DataFusion session, and a shared key would let one
+/// table's store overwrite another's, so the shadowed table's segments
+/// would read "not found". A process-global counter makes each provider's
+/// URL distinct while staying stable across that provider's own scans (so
+/// the cached single-table session re-registers the same key, no growth).
+const SUPERFILE_STORE_URL_PREFIX: &str = "superfile://supertable-";
 
 /// Monotonic source of per-provider object-store authorities.
 static STORE_URL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -136,7 +136,7 @@ pub(crate) struct SupertableProvider {
     /// pushdown intact while still honoring deletes.
     tombstone_cache: Option<Arc<SidecarCache>>,
     /// Per-provider object-store registry key (see
-    /// [`MEMORY_STORE_URL_PREFIX`]). Unique across providers so a
+    /// [`SUPERFILE_STORE_URL_PREFIX`]). Unique across providers so a
     /// multi-table query's registrations don't collide.
     store_url: ObjectStoreUrl,
 }
@@ -166,8 +166,8 @@ impl SupertableProvider {
         tombstone_cache: Option<Arc<SidecarCache>>,
     ) -> Self {
         let seq = STORE_URL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let store_url = ObjectStoreUrl::parse(format!("{MEMORY_STORE_URL_PREFIX}{seq}/"))
-            .expect("invariant: a counter-derived memory store URL is always valid");
+        let store_url = ObjectStoreUrl::parse(format!("{SUPERFILE_STORE_URL_PREFIX}{seq}/"))
+            .expect("invariant: a counter-derived store URL is always valid");
         Self {
             schema,
             manifest,
@@ -313,10 +313,6 @@ impl TableProvider for SupertableProvider {
             return Ok(Arc::new(EmptyExec::new(projected)));
         }
 
-        // Expose the surviving segments' bytes to DataFusion via an
-        // in-memory object store. `parquet_bytes()` is Arc-backed,
-        // so `clone()` / `PutPayload::from` are refcount bumps.
-        //
         // One `Instant::now()` for the whole scan so every per-segment
         // tombstone lookup shares the same `SidecarCache` TTL
         // reference.
@@ -342,10 +338,26 @@ impl TableProvider for SupertableProvider {
             self.manifest.options.tokenizer.as_ref(),
         );
 
-        // In-memory object store exposing the surviving segment bytes
-        // to DataFusion's Parquet source for the duration of this scan.
-        let mem_store = Arc::new(InMemory::new());
-        let mut files: Vec<PartitionedFile> = Vec::with_capacity(survivors.len());
+        // Every surviving segment is read through the one byte path the
+        // FTS/vector resolve path uses: `superfile_reader(...)` ->
+        // `SuperfileReader::byte_source()`. Warm / mmap segments slice
+        // their resident bytes zero-copy; cold segments range-fetch from
+        // object storage through the same source. The provider never
+        // branches on which — that distinction lives entirely inside the
+        // byte source.
+        let mut sources: HashMap<ObjPath, Arc<dyn LazyByteSource>> = HashMap::new();
+
+        // Per-segment scan inputs, resolved into PartitionedFiles once the
+        // store is built (row-group counts are read from each segment's
+        // footer through the same byte source).
+        struct SegmentScan {
+            path: ObjPath,
+            size: u64,
+            candidates: Option<RoaringBitmap>,
+            tombstones: Arc<RoaringBitmap>,
+        }
+        let mut segments: Vec<SegmentScan> = Vec::with_capacity(survivors.len());
+
         for entry in &survivors {
             let reader = crate::supertable::query::superfile_reader::superfile_reader(
                 &self.store,
@@ -356,32 +368,18 @@ impl TableProvider for SupertableProvider {
             )
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let bytes = reader
-                .parquet_bytes()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "SQL scan requires eager-opened superfile bytes; reader for {:?} \
-                         was opened via the lazy path which does not materialize the \
-                         full segment",
-                        entry.uri
-                    ))
-                })?
-                .clone();
-            let path = entry.uri.storage_path();
-            let size = bytes.len() as u64;
 
             // Pass 1 (per segment): resolve candidate rows from the
-            // index. `None` ⇒ no usable bound, scan the segment.
+            // index. `None` => no usable bound, scan the segment.
             //
             // Selectivity gate: estimate the match count from per-term
-            // `df` first (cheap, header-only — no posting decode). If a
-            // predicate would match more than `PUSHDOWN_MAX_FRACTION` of
-            // this segment, skip the index path and let DataFusion scan:
-            // at that match density the rows saturate the data pages, so
-            // an index `RowSelection` can't skip any page and only adds
-            // the posting-walk + selection overhead. The floor keeps the
-            // pushdown active on small segments (where there's no page to
-            // skip-vs-scan tradeoff anyway).
+            // `df` first (cheap, header-only). If a predicate would match
+            // more than `PUSHDOWN_MAX_FRACTION` of this segment, skip the
+            // index path and let DataFusion scan: at that match density
+            // the rows saturate the data pages, so an index `RowSelection`
+            // can't skip any page and only adds posting-walk + selection
+            // overhead. The floor keeps the pushdown active on small
+            // segments.
             let est = candidate_plan
                 .estimate(reader.as_ref())
                 .await
@@ -405,82 +403,78 @@ impl TableProvider for SupertableProvider {
                 None => Arc::new(RoaringBitmap::new()),
             };
 
-            // Build the Parquet row selection. `local_doc_id`s are global
-            // row positions in the Parquet body — exactly the coordinate
-            // `ParquetAccessPlan` selects on.
-            let access_plan = match candidates {
-                // Index-driven row selection: decode only the candidate
-                // rows minus any tombstoned row. The term-AND candidate is
-                // a superset of the SQL predicate, so the `FilterExec`
-                // above still verifies it exactly — this never drops a
-                // true match, only avoids decoding non-candidates.
-                Some(mut keep) => {
-                    keep -= tombstones.as_ref();
-                    Some(selection_access_plan(&bytes, &keep)?)
-                }
-                // No index bound: lazy-delete-only path — translate the
-                // tombstone bitmap into a row selection so deleted rows
-                // are never decoded; absent/empty overlay → full scan.
-                None => {
-                    if tombstones.is_empty() {
-                        None
-                    } else {
-                        tombstone_access_plan(&bytes, &tombstones)?
-                    }
-                }
-            };
+            let source = reader.byte_source();
+            let size = source.size();
+            let path = ObjPath::from(entry.uri.storage_path());
+            sources.insert(path.clone(), source);
+            segments.push(SegmentScan {
+                path,
+                size,
+                candidates,
+                tombstones,
+            });
+        }
 
-            mem_store
-                .put(&ObjPath::from(path.clone()), PutPayload::from(bytes))
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let mut file = PartitionedFile::new(path, size);
+        // The single object store DataFusion reads every survivor through.
+        let store: Arc<dyn OsObjectStore> = Arc::new(SuperfileObjectStore::from_sources(sources));
+
+        // Build each segment's PartitionedFile + access plan. Row-group
+        // counts come from the footer read through the same store: a
+        // zero-copy footer slice on warm/mmap segments, a small range GET
+        // on cold ones.
+        let mut files: Vec<PartitionedFile> = Vec::with_capacity(segments.len());
+        for seg in &segments {
+            let row_counts =
+                row_group_rows_object_store(Arc::clone(&store), seg.path.clone(), Some(seg.size))
+                    .await?;
+            let access_plan = build_access_plan(&row_counts, &seg.candidates, &seg.tombstones);
+            let mut file = PartitionedFile::new(seg.path.to_string(), seg.size);
             if let Some(plan) = access_plan {
                 file = file.with_extensions(Arc::new(plan));
             }
             files.push(file);
         }
 
-        let url = self.store_url.clone();
-        state
-            .runtime_env()
-            .register_object_store(url.as_ref(), mem_store);
-
-        // Tier 2 — DataFusion-owned row-group / page pruning + row-level
+        // Tier 2 - DataFusion-owned row-group / page pruning + row-level
         // filter pushdown, used **only when the index could not bound the
         // rows** (`Unbounded` candidate plan). In that fallback the
         // predicate becomes a Parquet `RowFilter` (`with_pushdown_filters`)
         // so the predicate columns are decoded first and only surviving
-        // rows materialize — pull-up avoided.
+        // rows materialize.
         //
         // When the index *did* bound the rows, the per-segment access plan
         // already selects exactly the candidate rows and the `FilterExec`
         // above (filters are `Inexact`) verifies the exact predicate over
-        // that tiny set. Handing DataFusion the same predicate here would
-        // turn it into a `RowFilter` that decodes the whole predicate
-        // column to re-test it — scanning the very column the index just
-        // let us skip. So we attach the pushdown predicate only on the
+        // that tiny set. So we attach the pushdown predicate only on the
         // unbounded path.
         let index_bounded = !matches!(
             candidate_plan,
             crate::supertable::query::candidate::CandidatePlan::Unbounded
         );
+        let predicate = if !index_bounded {
+            row_group_predicate(state, filters, &self.schema)
+        } else {
+            None
+        };
+
+        // Only push the LIMIT into the scan when there are no filters:
+        // with an `Inexact` filter re-applied above, a scan-level limit
+        // could stop before enough matching rows are produced. With no
+        // filters, DataFusion's own limit and a scan-level limit agree.
+        let effective_limit = if filters.is_empty() { limit } else { None };
+
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        if !index_bounded && let Some(predicate) = row_group_predicate(state, filters, &self.schema)
-        {
+        if let Some(predicate) = predicate.as_ref() {
             source = source
-                .with_predicate(predicate)
+                .with_predicate(Arc::clone(predicate))
                 .with_pushdown_filters(true)
                 .with_reorder_filters(true);
         }
 
-        // Only push the LIMIT into the scan when there are no
-        // filters: with an `Inexact` filter re-applied above, a
-        // scan-level limit could stop before enough matching rows
-        // are produced. With no filters, DataFusion's own limit and
-        // a scan-level limit agree.
-        let effective_limit = if filters.is_empty() { limit } else { None };
-
+        let url = self.store_url.clone();
+        state
+            .runtime_env()
+            .register_object_store(url.as_ref(), store);
         let mut builder = FileScanConfigBuilder::new(url, Arc::new(source));
         for file in files {
             builder = builder.with_file(file);
@@ -489,9 +483,7 @@ impl TableProvider for SupertableProvider {
             .with_projection_indices(projection.cloned())?
             .with_limit(effective_limit)
             .build();
-
-        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
-        Ok(plan)
+        Ok(DataSourceExec::from_data_source(config))
     }
 }
 
@@ -511,22 +503,37 @@ impl TableProvider for SupertableProvider {
 /// Parsing the footer via [`ParquetRecordBatchReaderBuilder`] only
 /// touches metadata, not column data, and only happens when the
 /// segment actually has tombstones — clean tables pay nothing.
-pub fn tombstone_access_plan(
+/// Byte-sourced wrapper over [`tombstone_access_plan_from_counts`]. The
+/// scan paths call the counts core directly via [`build_access_plan`];
+/// this wrapper serves callers that hold the raw Parquet bytes — the
+/// superfile reader's deleted-docs batching
+/// ([`SuperfileReader`](crate::superfile::SuperfileReader)) and the
+/// resident-bytes unit tests. In-crate callers only, so `pub(crate)`.
+pub(crate) fn tombstone_access_plan(
     parquet_bytes: &Bytes,
     bitmap: &RoaringBitmap,
 ) -> DfResult<Option<ParquetAccessPlan>> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
-        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
-    let row_groups = builder.metadata().row_groups();
+    Ok(tombstone_access_plan_from_counts(
+        &row_group_rows_from_bytes(parquet_bytes)?,
+        bitmap,
+    ))
+}
+
+/// Counts-based core of [`tombstone_access_plan`]: `row_counts[i]` is the
+/// row count of row group `i`. Lets the object-store scan path build the
+/// plan from a lazily-fetched footer (no whole-segment bytes).
+fn tombstone_access_plan_from_counts(
+    row_counts: &[u32],
+    bitmap: &RoaringBitmap,
+) -> Option<ParquetAccessPlan> {
     // Sorted ascending — `RoaringBitmap::iter` yields in order, which
     // lets each row group binary-search its slice of deleted ids.
     let deleted: Vec<u32> = bitmap.iter().collect();
 
-    let mut plan = ParquetAccessPlan::new_all(row_groups.len());
+    let mut plan = ParquetAccessPlan::new_all(row_counts.len());
     let mut base: u32 = 0;
     let mut any = false;
-    for (idx, rg) in row_groups.iter().enumerate() {
-        let n = rg.num_rows() as u32;
+    for (idx, &n) in row_counts.iter().enumerate() {
         if n == 0 {
             continue;
         }
@@ -569,35 +576,98 @@ pub fn tombstone_access_plan(
         base += n;
     }
 
-    Ok(any.then_some(plan))
+    any.then_some(plan)
+}
+
+/// Row counts per row group, parsed from a resident parquet footer.
+/// Test-only: the scan path reads row-group counts through the unified
+/// [`SuperfileObjectStore`] via [`row_group_rows_object_store`]; this
+/// byte-sourced variant backs [`tombstone_access_plan`] — the superfile
+/// reader's deleted-docs batching and the resident-bytes unit tests.
+fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
+        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
+    Ok(builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows() as u32)
+        .collect())
+}
+
+/// Row counts per row group, parsed lazily via parquet's async object-store
+/// reader (footer metadata only, no whole-object materialization).
+async fn row_group_rows_object_store(
+    store: Arc<dyn OsObjectStore>,
+    path: ObjPath,
+    file_size: Option<u64>,
+) -> DfResult<Vec<u32>> {
+    use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+
+    let mut object_reader = ParquetObjectReader::new(store, path);
+    if let Some(size) = file_size.filter(|&s| s > 0) {
+        // Skip an extra HEAD when the manifest already knows segment size.
+        object_reader = object_reader.with_file_size(size);
+    }
+    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
+    Ok(builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows() as u32)
+        .collect())
+}
+
+/// Assemble the per-segment [`ParquetAccessPlan`] from row-group counts:
+/// index candidates (minus tombstones) drive a selection plan; otherwise
+/// tombstones alone drive a delete-skip plan; a clean full scan is `None`.
+fn build_access_plan(
+    row_counts: &[u32],
+    candidates: &Option<RoaringBitmap>,
+    tombstones: &RoaringBitmap,
+) -> Option<ParquetAccessPlan> {
+    match candidates {
+        Some(keep) => {
+            let mut keep = keep.clone();
+            keep -= tombstones;
+            Some(selection_access_plan_from_counts(row_counts, &keep))
+        }
+        None => {
+            if tombstones.is_empty() {
+                None
+            } else {
+                tombstone_access_plan_from_counts(row_counts, tombstones)
+            }
+        }
+    }
 }
 
 /// Build a [`ParquetAccessPlan`] that decodes **only** the rows in
-/// `keep`, skipping everything else — the inverse of
-/// [`tombstone_access_plan`]. Used for index-driven row selection: the
-/// candidate planner yields a small set of `local_doc_id`s (already
-/// minus tombstones), and we want the Parquet reader to materialize the
-/// payload columns for just those rows rather than scanning the segment.
+/// `keep`, skipping everything else - the inverse of the tombstone
+/// plan. Used for index-driven row selection: the candidate planner
+/// yields a small set of `local_doc_id`s (already minus tombstones),
+/// and we want the Parquet reader to materialize the payload columns
+/// for just those rows rather than scanning the segment.
 ///
-/// `keep`'s ids are `local_doc_id`s — global row positions in the
-/// Parquet body — which partition contiguously across row groups laid
+/// `keep`'s ids are `local_doc_id`s - global row positions in the
+/// Parquet body - which partition contiguously across row groups laid
 /// out in append order. An empty `keep` produces an all-skip plan (zero
 /// rows decoded), the correct result for a segment with no candidate.
-fn selection_access_plan(
-    parquet_bytes: &Bytes,
+/// `row_counts[i]` is the row count of row group `i`, read from the
+/// segment footer through the unified store via [`build_access_plan`].
+fn selection_access_plan_from_counts(
+    row_counts: &[u32],
     keep: &RoaringBitmap,
-) -> DfResult<ParquetAccessPlan> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
-        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
-    let row_groups = builder.metadata().row_groups();
+) -> ParquetAccessPlan {
     // Ascending — `RoaringBitmap::iter` yields sorted, so each row group
     // binary-searches its contiguous slice of kept ids.
     let kept: Vec<u32> = keep.iter().collect();
 
-    let mut plan = ParquetAccessPlan::new_all(row_groups.len());
+    let mut plan = ParquetAccessPlan::new_all(row_counts.len());
     let mut base: u32 = 0;
-    for (idx, rg) in row_groups.iter().enumerate() {
-        let n = rg.num_rows() as u32;
+    for (idx, &n) in row_counts.iter().enumerate() {
         if n == 0 {
             continue;
         }
@@ -639,7 +709,7 @@ fn selection_access_plan(
         plan.scan_selection(idx, RowSelection::from(selectors));
         base += n;
     }
-    Ok(plan)
+    plan
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's

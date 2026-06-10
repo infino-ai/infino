@@ -318,6 +318,11 @@ impl StorageProvider for AzureStorageProvider {
         }
         Ok(out)
     }
+
+    fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
+        let path = self.path(uri).ok()?;
+        Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))
+    }
 }
 
 #[cfg(test)]

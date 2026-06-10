@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::tokenize::Tokenizer;
@@ -14,12 +16,14 @@ use infino::supertable::storage::StorageProvider;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
 
-use crate::corpus::{self, DIM, SequentialSyntheticCorpus};
+use crate::corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus};
+use crate::harness::{emb_for, scatter_key, sql_options, sql_schema};
+use crate::markdown::fmt_count;
 use crate::tiers;
 
 /// Supertable-shape document count — the supplied parameter. Default 10M
 /// ([`crate::corpus::supertable_docs`]); override with
-/// `INFINO_BENCH_DOC_COUNT`.
+/// `INFINO_BENCH_SUPERTABLE_DOCS`.
 pub fn n_docs() -> usize {
     corpus::supertable_docs()
 }
@@ -27,6 +31,8 @@ pub fn n_docs() -> usize {
 pub const N_COMMIT_CHUNKS: usize = 16;
 pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
+pub const SQL_CATEGORY_COLUMN: &str = "category";
+pub const SQL_RATING_COLUMN: &str = "rating";
 
 const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
@@ -46,6 +52,8 @@ pub struct IngestResult {
     pub total_index_bytes: u64,
     /// Remote prefix this build wrote under, to delete when the run ends.
     pub cleanup: Option<tiers::PrefixCleanup>,
+    pub sql_sample_title: Option<String>,
+    pub sql_sample_key: Option<String>,
 }
 
 /// Which index shapes a supertable build includes. Drives apples-to-apples
@@ -55,22 +63,42 @@ pub struct IngestResult {
 pub enum Modality {
     Fts,
     Vector,
+    Sql,
     Combined,
+}
+
+pub fn modality_label(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Fts => "FTS-only",
+        Modality::Vector => "vector-only",
+        Modality::Sql => "SQL",
+        Modality::Combined => "combined FTS + vector",
+    }
 }
 
 impl Modality {
     pub fn has_text(self) -> bool {
+        matches!(self, Modality::Fts | Modality::Sql | Modality::Combined)
+    }
+    pub fn has_fts(self) -> bool {
         matches!(self, Modality::Fts | Modality::Combined)
     }
     pub fn has_vector(self) -> bool {
         matches!(self, Modality::Vector | Modality::Combined)
     }
+    pub fn has_sql(self) -> bool {
+        matches!(self, Modality::Sql)
+    }
 }
 
 fn schema_for(modality: Modality) -> Arc<Schema> {
-    let mut fields = Vec::with_capacity(2);
+    let mut fields = Vec::with_capacity(3);
     if modality.has_text() {
         fields.push(Field::new(TEXT_COLUMN, DataType::LargeUtf8, false));
+    }
+    if modality.has_sql() {
+        fields.push(Field::new(SQL_CATEGORY_COLUMN, DataType::LargeUtf8, false));
+        fields.push(Field::new(SQL_RATING_COLUMN, DataType::Int64, false));
     }
     if modality.has_vector() {
         fields.push(Field::new(
@@ -93,6 +121,27 @@ pub fn options_for(
     modality: Modality,
     storage: Option<Arc<dyn StorageProvider>>,
 ) -> SupertableOptions {
+    // SQL uses the rich SQL bench schema (via `sql_options`). The
+    // consumer MUST open with the byte-identical options, or
+    // `Supertable::open` rejects the table on an options-hash mismatch.
+    // Route SQL here so ingest and read share one definition; the same
+    // pool / commit-threshold tuning as the other modalities applies.
+    if modality == Modality::Sql {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_cpus::get().max(1))
+                .build()
+                .expect("pool"),
+        );
+        let mut opts = sql_options(n_docs())
+            .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
+            .with_reader_pool(Arc::clone(&pool))
+            .with_writer_pool(pool);
+        if let Some(s) = storage {
+            opts = opts.with_storage(s);
+        }
+        return opts;
+    }
     let n_cent_total = corpus::n_cent(n_docs());
     let n_cent_per_segment = (n_cent_total / N_COMMIT_CHUNKS).max(1);
     let pool = Arc::new(
@@ -102,7 +151,7 @@ pub fn options_for(
             .expect("pool"),
     );
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let fts = if modality.has_text() {
+    let fts = if modality.has_fts() {
         vec![FtsConfig {
             column: TEXT_COLUMN.into(),
         }]
@@ -136,19 +185,70 @@ pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> Supertable
     options_for(Modality::Combined, storage)
 }
 
-/// Stream synthetic corpus → append → commit → object storage, building only
-/// the index shapes named by `modality`. The text/vector corpus is identical
-/// across modalities (same seeds), so each shape is directly comparable to its
-/// single-modality competitor.
-pub fn build_on_storage(modality: Modality) -> IngestResult {
+/// Corpus artifacts for one supertable build, generated to disk and
+/// mmapped **before** the measured build window. Callers create this
+/// outside the RSS sampler so corpus generation is never billed to the
+/// engine; the build loop then streams chunks straight off the mmap
+/// (the harness never holds more than one chunk's Arrow batch on the
+/// heap). Same shape for every modality: text for FTS/SQL/combined,
+/// vectors for vector/combined.
+pub struct PreparedCorpus {
+    text: Option<MmapTextCorpus>,
+    vectors: Option<MmapVectorCorpus>,
+}
+
+impl PreparedCorpus {
+    /// The mmap-backed vector corpus (vector / combined builds) — also
+    /// reusable for ground-truth recall measurement, so the search
+    /// phase doesn't regenerate 10M×384 floats.
+    pub fn vectors(&self) -> Option<&MmapVectorCorpus> {
+        self.vectors.as_ref()
+    }
+}
+
+/// Generate (to disk) and mmap the corpus columns `modality` ingests.
+/// Call this BEFORE starting the build RSS sampler.
+pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     let n_docs = n_docs();
+    let text = modality.has_text().then(|| {
+        eprintln!(
+            "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
+            fmt_count(n_docs)
+        );
+        MmapTextCorpus::generate(n_docs, CORPUS_TEXT_SEED)
+    });
+    let vectors = modality.has_vector().then(|| {
+        eprintln!(
+            "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
+            fmt_count(n_docs)
+        );
+        MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+    });
+    PreparedCorpus { text, vectors }
+}
+
+/// Stream the prepared on-disk corpus → append → commit → object
+/// storage, building only the index shapes named by `modality`. One
+/// loop for every modality — the corpus chunks are borrowed straight
+/// off the mmap, and SQL's extra columns are derived inline from
+/// `doc_id`. The text/vector corpus is identical across modalities
+/// (same seeds), so each shape is directly comparable to its
+/// single-modality competitor.
+pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestResult {
+    let n_docs = n_docs();
+    eprintln!(
+        "[supertable_ingest] ingesting {} docs ({}) in {} commits to object storage...",
+        fmt_count(n_docs),
+        modality_label(modality),
+        N_COMMIT_CHUNKS,
+    );
     let storage_backend = tiers::block_on(tiers::supertable_storage_fixture());
     let cleanup = storage_backend.cleanup.clone();
-    let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));
-    let n_cent_total = corpus::n_cent(n_docs);
     // Disk cache attached only to keep segment bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
+    let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));
+
     let opts = options_for(modality, Some(storage_backend.storage.clone()))
         .with_disk_cache(cache.clone())
         .with_memory_budget(WRITER_MEMORY_BUDGET_BYTES)
@@ -156,50 +256,25 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
     let st = Supertable::create(opts).expect("create supertable");
     let mut w = st.writer().expect("writer");
     let chunk_size = n_docs.div_ceil(N_COMMIT_CHUNKS);
-    let mut synth =
-        SequentialSyntheticCorpus::new(n_cent_total, CORPUS_VEC_SEED, CORPUS_TEXT_SEED, true);
-    let schema = schema_for(modality);
-    let mut titles = Vec::new();
-    let mut flat = Vec::new();
+    let schema = if modality.has_sql() {
+        sql_schema()
+    } else {
+        schema_for(modality)
+    };
+    let mut commit_idx = 0usize;
     for start in (0..n_docs).step_by(chunk_size) {
+        commit_idx += 1;
         let end = (start + chunk_size).min(n_docs);
         let len = end - start;
-        // Generate only the columns this modality ingests so the bench
-        // process never holds (and the RSS sampler never counts) a corpus
-        // column the build doesn't consume.
-        synth.fill_chunk_modality(
-            len,
-            &mut titles,
-            &mut flat,
-            modality.has_text(),
-            modality.has_vector(),
-        );
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(2);
-        if modality.has_text() {
-            let title_arr: Vec<&str> = titles.iter().map(String::as_str).collect();
-            columns.push(Arc::new(LargeStringArray::from(title_arr)));
-            // The arrow array now owns the only copy of the text. Drop the
-            // Vec<String> heap before append/commit so the long index-build
-            // phase (where the RSS sampler dwells) measures the production
-            // working set — arrow batch + writer + index — not the in-process
-            // synthetic-corpus generator, which a real server never holds (it
-            // receives the batch over the API).
-            titles.clear();
-            titles.shrink_to_fit();
+        // Progress every ~4 commits (plus first + last) to keep the log
+        // readable instead of one line per commit.
+        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx.is_multiple_of(4) {
+            eprintln!(
+                "[supertable_ingest] commit {commit_idx}/{N_COMMIT_CHUNKS} (docs {start}..{})...",
+                end.saturating_sub(1),
+            );
         }
-        if modality.has_vector() {
-            let item_field = Arc::new(Field::new("item", DataType::Float32, true));
-            let values = Float32Array::from(std::mem::take(&mut flat));
-            let fsl = FixedSizeListArray::try_new(
-                item_field,
-                DIM as i32,
-                Arc::new(values) as Arc<dyn Array>,
-                None,
-            )
-            .expect("FSL");
-            columns.push(Arc::new(fsl));
-        }
-        let batch = RecordBatch::try_new(schema.clone(), columns).expect("batch");
+        let batch = chunk_batch(modality, corpus, &schema, start, end, len);
         w.append(&batch).expect("append");
         w.commit().expect("commit");
     }
@@ -217,16 +292,126 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
     drop(st);
     drop(cache);
     drop(cache_dir);
+    eprintln!(
+        "[supertable_ingest] ingest complete: {n_superfiles} superfiles, {:.2} GiB index bytes on {}",
+        total_index_bytes as f64 / (1u64 << 30) as f64,
+        storage_backend.storage_label,
+    );
+    // SQL query predicates sample the mid-corpus row (one mmap page
+    // touch — not a corpus materialization).
+    let mid = n_docs / 2;
+    let (sql_sample_title, sql_sample_key) = if modality.has_sql() {
+        let text = corpus.text.as_ref().expect("sql modality has text");
+        (
+            Some(text.doc(mid).replace('\'', "''")),
+            Some(scatter_key(mid as u64)),
+        )
+    } else {
+        (None, None)
+    };
     IngestResult {
         storage: storage_backend.storage,
         storage_label: storage_backend.storage_label,
         n_superfiles,
         total_index_bytes,
         cleanup,
+        sql_sample_title,
+        sql_sample_key,
     }
 }
 
+/// One commit chunk's `RecordBatch` for `modality`, borrowing the text
+/// / vector payload straight off the prepared corpus mmaps. SQL's
+/// derived columns (buckets, keys, category, rating, small `emb`) are
+/// pure functions of `doc_id`.
+fn chunk_batch(
+    modality: Modality,
+    corpus: &PreparedCorpus,
+    schema: &Arc<Schema>,
+    start: usize,
+    end: usize,
+    len: usize,
+) -> RecordBatch {
+    let titles: Option<Vec<&str>> = corpus
+        .text
+        .as_ref()
+        .filter(|_| modality.has_text())
+        .map(|c| c.chunk_strs(start, len));
+
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+    if let Some(titles) = &titles {
+        columns.push(Arc::new(LargeStringArray::from(titles.clone())));
+    }
+    if modality.has_sql() {
+        let titles = titles.as_ref().expect("sql modality has text");
+        // title_noidx — same payload, unindexed twin column.
+        columns.push(Arc::new(LargeStringArray::from(titles.clone())));
+        let bucket_vals: Vec<String> = (start..end)
+            .map(|doc_id| format!("b{}", doc_id % 10))
+            .collect();
+        let key_vals: Vec<String> = (start..end)
+            .map(|doc_id| scatter_key(doc_id as u64))
+            .collect();
+        for vals in [&bucket_vals, &bucket_vals, &key_vals, &key_vals] {
+            columns.push(Arc::new(LargeStringArray::from(
+                vals.iter().map(String::as_str).collect::<Vec<_>>(),
+            )));
+        }
+        let categories = (start..end)
+            .map(|doc_id| match doc_id % 4 {
+                0 => "rust",
+                1 => "python",
+                2 => "go",
+                _ => "sql",
+            })
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(LargeStringArray::from(categories)));
+        let ratings = (start..end)
+            .map(|doc_id| (doc_id % 100) as i64)
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(Int64Array::from(ratings)));
+        // Small deterministic embedding column (SQL_DIM, not the
+        // planted-cluster corpus) — kept for the vector/hybrid TVFs.
+        let dim = emb_for(0).len();
+        let mut flat = Vec::with_capacity(len * dim);
+        for doc_id in start..end {
+            flat.extend_from_slice(&emb_for(doc_id as u64));
+        }
+        columns.push(Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+                Arc::new(Float32Array::from(flat)) as Arc<dyn Array>,
+                None,
+            )
+            .expect("sql emb FixedSizeList"),
+        ));
+    }
+    if modality.has_vector() {
+        let all = corpus
+            .vectors
+            .as_ref()
+            .expect("vector modality has a vector corpus")
+            .as_slice();
+        let flat = &all[start * DIM..end * DIM];
+        columns.push(Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+                Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
+                None,
+            )
+            .expect("FSL"),
+        ));
+    }
+    RecordBatch::try_new(schema.clone(), columns).expect("batch")
+}
+
 /// Combined FTS + vector build (search consumer + combined ingest row).
+/// Prepares the corpus inline — callers that need the corpus generated
+/// outside a measurement window use `prepare_corpus` + `build_on_storage`
+/// directly.
 pub fn build_combined_on_storage() -> IngestResult {
-    build_on_storage(Modality::Combined)
+    let corpus = prepare_corpus(Modality::Combined);
+    build_on_storage(Modality::Combined, &corpus)
 }

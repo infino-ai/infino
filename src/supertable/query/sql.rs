@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `Supertable::query_sql` — DataFusion SQL over the supertable.
+//! `SupertableReader::query_sql` — DataFusion SQL over a pinned supertable snapshot.
 //!
 //! ## Public API
 //!
 //! ```ignore
-//! let st: Supertable = ...;
+//! let reader = supertable.reader();
 //! let batches: Vec<RecordBatch> =
-//!     st.query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
+//!     reader.query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
 //! ```
 //!
 //! Sync return type: callers don't need a tokio runtime.
-//! Internally we `block_on` against a single multi-worker Runtime
-//! cached on `SupertableInner` (lazy — first SQL query allocates).
+//! Internally the reader drives the async DataFusion plan through the same
+//! sync→async bridge used by BM25 and vector search.
 //!
 //! ## Strategy
 //!
 //! At `query_sql` time we:
 //!
-//!   1. Pin the manifest (`self.reader()` → `Arc<Manifest>`).
+//!   1. Use the reader's already-pinned `Arc<Manifest>`.
 //!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
 //!   3. `ctx.sql(sql).await.collect().await`.
@@ -53,11 +53,11 @@ use arrow_array::{Array, Decimal128Array};
 use datafusion::execution::context::SessionContext;
 
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::Supertable;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::query::provider::{SupertableProvider, TABLE_NAME};
 
-impl Supertable {
-    /// Run a SQL query against this supertable's pinned snapshot.
+impl SupertableReader {
+    /// Run a SQL query against this reader's pinned snapshot.
     ///
     /// The snapshot is captured at `query_sql` entry — concurrent
     /// commits don't affect the in-flight query. Returns the
@@ -75,16 +75,13 @@ impl Supertable {
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
-        // Read-consistency is applied when the snapshot is pinned:
-        // `sql_session_context` pins via `self.reader()`, which runs
-        // [`Supertable::ensure_fresh`] before `load_full`. So SQL
-        // honors the same freshness contract as the search APIs
-        // (`reader().bm25_search` / `reader().vector_search`) without a
-        // separate call here.
+        // Read-consistency was applied when `Supertable::reader()` created
+        // this pinned reader. SQL therefore observes the same snapshot as
+        // `bm25_search` and `vector_search` on this handle.
 
         // Build (or reuse the cached) SessionContext for the pinned
         // snapshot — the pushdown-aware SupertableProvider plus the
-        // search TVFs. See [`Supertable::sql_session_context`].
+        // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
 
         let sql = sql.to_owned();
@@ -101,8 +98,8 @@ impl Supertable {
         // Drive through the shared sync→async bridge: ambient
         // runtime → block_in_place on the ambient handle; otherwise
         // the lazily-built owned query_runtime. See
-        // [`Supertable::block_on_query`].
-        self.block_on_query(drive)
+        // [`SupertableReader::block_on`].
+        self.block_on(drive)
     }
 
     /// Build (or reuse the cached) [`SessionContext`] for the
@@ -119,12 +116,12 @@ impl Supertable {
     /// segment-skip + row-group/page pruning + lazy tombstone
     /// filtering the read path uses.
     ///
-    /// Callers apply their own freshness policy
-    /// ([`ensure_fresh`](Self::ensure_fresh)) before calling.
+    /// Freshness policy is applied when the reader is created by
+    /// [`Supertable::reader`](crate::supertable::handle::Supertable::reader).
     fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
-        // ArcSwap::load_full is a single atomic load + Arc clone, so
-        // pinning the snapshot is cheap even on the hot path.
-        let reader = Arc::new(self.reader());
+        // This reader already pins the snapshot; clone is a handful of
+        // Arc refcount bumps.
+        let reader = Arc::new(self.clone());
         let manifest = Arc::clone(reader.manifest());
 
         let mut guard = self
@@ -178,36 +175,6 @@ impl Supertable {
         Ok(ctx)
     }
 
-    /// Register this supertable's pushdown-aware provider into `ctx`
-    /// under `name`, applying the read-consistency policy first. The
-    /// catalog's multi-table [`Connection::query_sql`] calls this once
-    /// per referenced table. Returns the pinned reader so the caller can
-    /// later wire the same snapshot into search TVFs.
-    ///
-    /// [`Connection::query_sql`]: crate::Connection::query_sql
-    pub(crate) fn register_into(
-        &self,
-        ctx: &SessionContext,
-        name: &str,
-    ) -> Result<Arc<crate::supertable::handle::SupertableReader>, QueryError> {
-        self.ensure_fresh();
-        let reader = Arc::new(self.reader());
-        let manifest = Arc::clone(reader.manifest());
-        let store = Arc::clone(&self.options().store);
-        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-        let scalar_schema = self.options().scalar_schema();
-        let provider = SupertableProvider::new(
-            scalar_schema,
-            manifest,
-            store,
-            disk_cache,
-            reader.tombstone_cache.clone(),
-        );
-        ctx.register_table(name, Arc::new(provider))
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
-        Ok(reader)
-    }
-
     /// Resolve a predicate to the matching `_id` values. Used by
     /// the writer's `delete()` / `update()` entry points to
     /// capture the target-id set at call time (step 0a in the
@@ -231,12 +198,9 @@ impl Supertable {
         &self,
         expr: datafusion::prelude::Expr,
     ) -> Result<Vec<i128>, QueryError> {
-        // Resolve against the freshest snapshot the consistency
-        // policy allows — the spec requires delete/update predicates
-        // to bind "against the current snapshot at call time".
-        // `sql_session_context` pins via `self.reader()`, which applies
-        // [`Supertable::ensure_fresh`] before `load_full`, so this
-        // honors `Strong` / `BoundedStaleness` like the read APIs do.
+        // Resolve against this reader's pinned snapshot. Callers that need
+        // current-state semantics create a fresh reader immediately before
+        // invoking this helper.
         let ctx = self.sql_session_context()?;
         let id_column = self.options().id_column.clone();
 
@@ -256,7 +220,39 @@ impl Supertable {
             extract_id_column(&batches)
         };
 
-        self.block_on_query(drive)
+        self.block_on(drive)
+    }
+}
+
+impl Supertable {
+    /// Register this supertable's pushdown-aware provider into `ctx`
+    /// under `name`, applying the read-consistency policy first. The
+    /// catalog's multi-table [`Connection::query_sql`] calls this once
+    /// per referenced table. Returns the pinned reader so the caller can
+    /// later wire the same snapshot into search TVFs.
+    ///
+    /// [`Connection::query_sql`]: crate::Connection::query_sql
+    pub(crate) fn register_into(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+    ) -> Result<Arc<SupertableReader>, QueryError> {
+        self.ensure_fresh();
+        let reader = Arc::new(self.reader());
+        let manifest = Arc::clone(reader.manifest());
+        let store = Arc::clone(&self.options().store);
+        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let scalar_schema = self.options().scalar_schema();
+        let provider = SupertableProvider::new(
+            scalar_schema,
+            manifest,
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
+        ctx.register_table(name, Arc::new(provider))
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        Ok(reader)
     }
 }
 
@@ -352,7 +348,7 @@ mod tests {
     /// Convenience: run a query and pull a single `Int64` aggregate
     /// value from cell (0,0).
     fn run_count(st: &Supertable, sql: &str) -> i64 {
-        let batches = st.query_sql(sql).expect("query_sql ok");
+        let batches = st.reader().query_sql(sql).expect("query_sql ok");
         assert!(!batches.is_empty(), "expected at least one result batch");
         let n = batches[0]
             .column(0)
@@ -417,6 +413,7 @@ mod tests {
         w.commit().expect("commit");
 
         let batches = st
+            .reader()
             .query_sql(
                 "SELECT category, COUNT(*) AS n FROM supertable \
                  GROUP BY category ORDER BY category",
@@ -582,6 +579,7 @@ mod tests {
             1,
         );
         let batches = st
+            .reader()
             .query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
             .expect("query");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -733,6 +731,7 @@ mod tests {
         w.commit().expect("c2");
 
         let batches = st
+            .reader()
             .query_sql("SELECT _id FROM supertable ORDER BY _id")
             .expect("query");
         let ids: Vec<i128> = batches
@@ -763,6 +762,7 @@ mod tests {
         w.commit().expect("c");
 
         let batches = st
+            .reader()
             .query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
@@ -794,6 +794,7 @@ mod tests {
     fn query_sql_invalid_sql_returns_plan_error() {
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let err = st
+            .reader()
             .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
         assert!(
@@ -881,6 +882,7 @@ mod tests {
         w.commit().expect("commit");
 
         let batches = st
+            .reader()
             .query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
@@ -899,6 +901,7 @@ mod tests {
         w.commit().expect("commit");
 
         let err = st
+            .reader()
             .query_sql("SELECT emb FROM supertable")
             .expect_err("vector column should not be in the SQL schema");
         assert!(

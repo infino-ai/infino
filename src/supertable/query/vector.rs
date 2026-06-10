@@ -5,16 +5,23 @@
 //!
 //! ## Public API
 //!
+//! The sync, user-facing entry points live on
+//! [`Supertable`](super::super::Supertable):
+//!
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
-//! let hits: Vec<SuperfileHit> =
-//!     supertable.reader().vector_search("emb", &query_vec, 10, opts)?;
+//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
+//! let rows: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None)?;
+//! // Just `_id` + `score` (no scalar decode): project them explicitly.
+//! let ids: Vec<RecordBatch> =
+//!     table.vector_search("emb", &query_vec, 10, opts, Some(&["_id", "score"]))?;
 //! ```
 //!
-//! Returns [`SuperfileHit`]s sorted by distance *ascending* —
-//! smaller distance is closer (cosine: `1 - dot`, L2-sq: squared
-//! distance). `local_doc_id` is the row offset within `segment`;
-//! doc-id space is local to a segment in v1.
+//! Internally these drive the async kernel on the snapshot-pinned
+//! [`SupertableReader`], whose `vector_search` (rows) / `vector_hits`
+//! ([`SuperfileHit`], segment-local) methods are the engine-facing
+//! surface. Results are sorted by distance *ascending* — smaller is
+//! closer (cosine: `1 - dot`, L2-sq: squared distance).
 //!
 //! ## Strategy
 //!
@@ -63,8 +70,10 @@ use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
+use arrow::record_batch::RecordBatch;
 
-use super::{SearchHit, SuperfileHit};
+use super::SuperfileHit;
+use super::exec::common::resolve_hits_named;
 
 /// How to probe one segment in the vector fan-out: the globally-selected
 /// cluster ids for that segment, or — for a segment whose manifest
@@ -220,7 +229,7 @@ impl SupertableReader {
                             .vector_search_clusters(&column, &query, k, &ids, options)
                             .await
                     }
-                    Probe::Nprobe => reader.vector_search(&column, &query, k, options).await,
+                    Probe::Nprobe => reader.vector_hits_async(&column, &query, k, options).await,
                 };
                 res.map_err(|e| QueryError::Parquet(e.to_string()))
             }
@@ -233,12 +242,40 @@ impl SupertableReader {
 
 impl SupertableReader {
     /// Single-column vector kNN search over this reader's pinned
-    /// snapshot.
+    /// snapshot, materialized as Arrow rows.
+    ///
+    /// This is the user-facing row-returning path. It runs the same
+    /// vector hit kernel the SQL TVF uses, then resolves those top-k hits
+    /// through the shared row materializer. Returned batches include
+    /// `_id`, every visible scalar column, and a trailing `score` column
+    /// containing the distance (smaller is better).
+    pub fn vector_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.block_on(async {
+            let hits = self.vector_search_async(column, query, k, options).await?;
+            // `projection` selects output columns by name (`_id`, the
+            // visible scalar columns, or the trailing `score`); `None`
+            // returns the whole row. The shared resolver decodes only
+            // the projected columns.
+            let batch = resolve_hits_named(self, &hits, projection, "vector_search")
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            Ok(vec![batch])
+        })
+    }
+
+    /// Low-level vector kNN search over this reader's pinned snapshot.
     ///
     /// Drives the internal async kernel to completion via the
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
     /// to `k` hits sorted by distance *ascending*.
-    pub fn vector_search(
+    pub fn vector_hits(
         &self,
         column: &str,
         query: &[f32],
@@ -291,33 +328,44 @@ fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superfi
 }
 
 impl Supertable {
-    /// Single-column vector kNN search over the current snapshot.
+    /// Single-column vector kNN search over the current snapshot,
+    /// returning Arrow rows nearest-first (distance score, smaller is
+    /// nearer).
     ///
-    /// Returns up to `k` public [`SearchHit`]s (`_id` + score), nearest
-    /// first. Pins a fresh reader, runs the IVF fan-out, then resolves
-    /// each segment-local hit to its public `_id`.
+    /// Pins a fresh reader (applying the read-consistency policy), runs
+    /// the IVF fan-out, and resolves the top-`k` nearest hits to Arrow
+    /// rows.
+    ///
+    /// `projection` selects output columns by name (any of `_id`, the
+    /// visible scalar columns, or the trailing `score`); `None` returns
+    /// the whole row. Only the projected scalar columns are decoded —
+    /// kNN is usually a retrieval step, so `Some(&["_id", "score"])` is
+    /// the cheap path when full rows are fetched in a follow-up only
+    /// for the hits you keep.
     ///
     /// ```
     /// # use std::sync::Arc;
     /// # use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    /// # use arrow_array::types::Float32Type;
     /// # use arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
     /// # let db = connect("memory://")?;
-    /// # let dim = 16;
-    /// # let field = Field::new("emb", DataType::FixedSizeList(
-    /// #     Arc::new(Field::new("item", DataType::Float32, true)), dim), false);
-    /// # let schema = Arc::new(Schema::new(vec![field]));
-    /// # let spec = IndexSpec::new().vector("emb", dim as usize, 1, Metric::Cosine);
-    /// # let vecs = db.create_table("vecs", schema.clone(), spec)?;
-    /// # let mut vals = vec![0.0f32; dim as usize]; vals[0] = 1.0;
-    /// # let values = Float32Array::from(vals);
-    /// # let col = FixedSizeListArray::new(
-    /// #     Arc::new(Field::new("item", DataType::Float32, true)), dim, Arc::new(values), None);
+    /// # let schema = Arc::new(Schema::new(vec![Field::new(
+    /// #     "emb",
+    /// #     DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
+    /// #     false,
+    /// # )]));
+    /// # let vecs = db.create_table("vecs", schema.clone(), IndexSpec::new().vector("emb", 16, 1, Metric::Cosine))?;
+    /// # let mut data = vec![0.0f32; 16]; data[0] = 1.0;
+    /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
     /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
-    /// let mut query = vec![0.0f32; 16];
-    /// query[0] = 1.0;
-    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new())?;
-    /// assert!(!hits.is_empty());
+    /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
+    /// // Project just `_id` + `score` → no scalar decode at all:
+    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), Some(&["_id", "score"]))?;
+    /// assert_eq!(hits[0].num_columns(), 2);
+    /// // `None` projection returns full rows:
+    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None)?;
+    /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn vector_search(
@@ -326,16 +374,11 @@ impl Supertable {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
-    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
-        let reader = self.reader();
-        let hits = reader
-            .vector_search(column, query, k, options)
-            .map_err(crate::InfinoError::from)?;
-        let id_col = self.options().id_column.clone();
-        self.block_on_query(super::exec::common::resolve_search_hits(
-            &reader, &hits, &id_col,
-        ))
-        .map_err(|e| crate::InfinoError::Query(e.to_string()))
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+        self.reader()
+            .vector_search(column, query, k, options, projection)
+            .map_err(crate::InfinoError::from)
     }
 }
 
@@ -509,7 +552,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -524,7 +567,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_search("emb", &q, 0, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 0, VectorSearchOptions::new())
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -544,7 +587,7 @@ mod tests {
             *x = (d as f32) / 100.0 + 0.001;
         }
         let hits = r
-            .vector_search("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
             .expect("query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -572,7 +615,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_search("emb", &q, 7, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 7, VectorSearchOptions::new())
             .expect("query");
         assert_eq!(hits.len(), 7);
     }
@@ -601,10 +644,7 @@ mod tests {
         let mut q = vec![0f32; dim];
         q[0] = 1.0;
         let opts = VectorSearchOptions::new().with_nprobe(1);
-        let hits = st
-            .reader()
-            .vector_search("emb", &q, 10, opts)
-            .expect("query");
+        let hits = st.reader().vector_hits("emb", &q, 10, opts).expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
         assert!(
@@ -628,7 +668,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_search("emb", &q, 24, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 24, VectorSearchOptions::new())
             .expect("query");
         let segment_uris: std::collections::HashSet<_> = hits.iter().map(|h| h.segment).collect();
         // All three superfiles should contribute (high k pulls from
@@ -668,14 +708,15 @@ mod tests {
         // The oracle is a single-segment `SuperfileReader` whose search
         // is async-only; drive it on a throwaway runtime. The supertable
         // reader below uses its sync public API.
-        let oracle_hits = block_on(oracle.vector_search("emb", &q, 2, opts)).expect("oracle query");
+        let oracle_hits =
+            block_on(oracle.vector_hits_async("emb", &q, 2, opts)).expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .vector_search("emb", &q, 2, opts)
+            .vector_hits("emb", &q, 2, opts)
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -704,7 +745,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let err = r
-            .vector_search("nope", &q, 5, VectorSearchOptions::new())
+            .vector_hits("nope", &q, 5, VectorSearchOptions::new())
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }

@@ -127,7 +127,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     // against the same handle excludes the row.
     let hits = st
         .reader()
-        .bm25_search(
+        .bm25_hits(
             "title",
             "alpha",
             10,
@@ -182,6 +182,7 @@ fn create_with_existing_pointer_delegates_to_open() {
         "create against existing pointer must load the committed manifest"
     );
     let batches = st
+        .reader()
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     let total = batches[0]
@@ -274,7 +275,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     // FTS query no longer returns the tombstoned row.
     let hits = st
         .reader()
-        .bm25_search(
+        .bm25_hits(
             "title",
             "foo",
             10,

@@ -61,7 +61,7 @@ async fn search_set(
     mode: BoolMode,
 ) -> HashSet<u64> {
     reader
-        .bm25_search("title", query, k, mode)
+        .bm25_hits_async("title", query, k, mode)
         .await
         .expect("bm25_search")
         .into_iter()
@@ -265,7 +265,9 @@ async fn negation_only_query_is_error() {
     // not a silent OR of "rust"). M1 introduces FtsError::NegationOnly.
     let corp = corpus();
     let r = build_infino_superfile(&corp);
-    let res = r.bm25_search("title", "-rust", K_ALL, BoolMode::Or).await;
+    let res = r
+        .bm25_hits_async("title", "-rust", K_ALL, BoolMode::Or)
+        .await;
     assert!(res.is_err(), "negation-only query must error; got {res:?}");
 }
 
@@ -280,7 +282,7 @@ async fn negation_with_multi_block_negated_list() {
     let corp = build_multi_block_corpus();
     let r = build_multi_block_reader(&corp);
     let got: HashSet<u64> = r
-        .bm25_search("title", "alpha -beta", 400, BoolMode::Or)
+        .bm25_hits_async("title", "alpha -beta", 400, BoolMode::Or)
         .await
         .expect("multi-block negation")
         .into_iter()

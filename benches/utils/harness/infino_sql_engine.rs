@@ -80,6 +80,10 @@ pub fn scatter_key(doc_id: u64) -> String {
     format!("k{:08}", doc_id.wrapping_mul(2_654_435_761) % 100_000_000)
 }
 
+pub fn sql_schema() -> Arc<Schema> {
+    schema()
+}
+
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new(TITLE_COLUMN, DataType::LargeUtf8, false),
@@ -98,7 +102,7 @@ fn schema() -> Arc<Schema> {
 /// reproducible and cheap. Used both to populate the `emb` column and
 /// (via [`sample_query_csv`]) to form a query vector for the
 /// `vector_search` / `hybrid_search` TVFs.
-fn emb_for(doc_id: u64) -> [f32; SQL_DIM] {
+pub fn emb_for(doc_id: u64) -> [f32; SQL_DIM] {
     let mut v = [0f32; SQL_DIM];
     for (d, slot) in v.iter_mut().enumerate() {
         *slot = ((doc_id.wrapping_mul(31).wrapping_add(d as u64 * 7) % 97) as f32) + 1.0;
@@ -128,7 +132,8 @@ fn n_cent_for(n_rows: usize) -> usize {
     crate::corpus::n_cent(n_rows).min(n_rows.max(1))
 }
 
-fn options(n_rows: usize) -> SupertableOptions {
+/// Options for the SQL benchmark table shape.
+pub fn sql_options(n_rows: usize) -> SupertableOptions {
     SupertableOptions::new(
         schema(),
         vec![
@@ -157,10 +162,21 @@ fn options(n_rows: usize) -> SupertableOptions {
 
 /// Build one in-memory supertable from `rows` via the public writer API.
 fn build_supertable(rows: &[SqlRow<'_>]) -> Supertable {
+    build_supertable_with_options(rows, sql_options(rows.len()), WRITE_CHUNK)
+}
+
+/// Build one supertable from `rows` via the public writer API with caller
+/// supplied options and chunking. Bench cold tiers use this to build the
+/// same SQL shape on object storage, then reopen it through a fresh cache.
+pub fn build_supertable_with_options(
+    rows: &[SqlRow<'_>],
+    opts: SupertableOptions,
+    write_chunk: usize,
+) -> Supertable {
     let schema = schema();
-    let st = Supertable::create(options(rows.len())).expect("create supertable");
+    let st = Supertable::create(opts).expect("create supertable");
     let mut writer = st.writer().expect("writer");
-    for chunk in rows.chunks(WRITE_CHUNK) {
+    for chunk in rows.chunks(write_chunk.max(1)) {
         let titles = LargeStringArray::from(chunk.iter().map(|r| r.title).collect::<Vec<_>>());
         // Identical values to `title`, but this column has no FTS index.
         let titles_noidx =
@@ -272,7 +288,7 @@ impl SqlEngine for InfinoSqlEngine {
     }
 
     fn read(index: &Self::Index, sql: &str) -> SqlOutput {
-        let batches = index.table().query_sql(sql).expect("query_sql");
+        let batches = index.table().reader().query_sql(sql).expect("query_sql");
         SqlOutput {
             rows: batches.iter().map(RecordBatch::num_rows).sum(),
         }

@@ -7,7 +7,7 @@
 //! `.parquet` superfile through [`SuperfileBuilder`], then query the
 //! embedded BM25 index through [`SuperfileReader`]. No internal hooks —
 //! the same public surface any downstream user calls, and the same
-//! builder/tokenizer the in-tree `fts_superfile` bench uses.
+//! builder/tokenizer the in-tree `superfile::fts` bench uses.
 
 use std::sync::Arc;
 

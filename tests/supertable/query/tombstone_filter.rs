@@ -112,7 +112,7 @@ async fn fts_query_excludes_tombstoned_row() {
     // middle row.
     let hits = st
         .reader()
-        .bm25_search("title", "alpha", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("fts");
     assert_eq!(hits.len(), 2, "tombstoned row must be excluded");
     for hit in &hits {
@@ -163,6 +163,7 @@ async fn sql_query_excludes_tombstoned_row() {
     // `SELECT COUNT(*)` should now report 2 (4 minus the two
     // tombstoned rows).
     let batches = st
+        .reader()
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     assert_eq!(batches.len(), 1);
@@ -175,6 +176,7 @@ async fn sql_query_excludes_tombstoned_row() {
 
     // `SELECT title` should return only the un-tombstoned rows.
     let batches = st
+        .reader()
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<&str> = batches
@@ -316,7 +318,7 @@ async fn vector_query_excludes_tombstoned_row() {
     let q = [0.0f32; DIM];
     let hits = st
         .reader()
-        .vector_search("embedding", &q, VECTOR_SEARCH_K, VectorSearchOptions::new())
+        .vector_hits("embedding", &q, VECTOR_SEARCH_K, VectorSearchOptions::new())
         .expect("vector");
     assert!(!hits.is_empty(), "expected at least one un-tombstoned hit");
     for hit in &hits {

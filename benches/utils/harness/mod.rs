@@ -32,7 +32,10 @@ pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
 pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
-pub use infino_sql_engine::{InfinoSqlEngine, InfinoSqlIndex, sample_query_csv, scatter_key};
+pub use infino_sql_engine::{
+    InfinoSqlEngine, InfinoSqlIndex, build_supertable_with_options, emb_for, sample_query_csv,
+    scatter_key, sql_options, sql_schema,
+};
 pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
 pub use sql_driver::{
     EngineSqlResult, SqlBuildStat, SqlQuery, SqlQueryStats, SqlRunConfig, run_sql,
@@ -143,7 +146,7 @@ pub struct VectorHit {
 ///
 /// `create` → `write` → `read` → `close` → `delete` is the full vector
 /// lifecycle. `write` builds the canonical 1-writer queryable artifact
-/// and must retain any bytes/handles needed by later correctness, hot
+/// and must retain any bytes/handles needed by later correctness, warm
 /// search, and cold upload. `parallel_write` is the build-throughput-only axis
 /// for `N writers`.
 pub trait VectorEngine {

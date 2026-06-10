@@ -695,22 +695,25 @@ mod tests {
         let k = 8;
 
         let hybrid = id_set(
-            &st.query_sql(&format!(
-                "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
-            ))
-            .expect("hybrid query_sql"),
+            &st.reader()
+                .query_sql(&format!(
+                    "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
+                ))
+                .expect("hybrid query_sql"),
         );
         let bm25 = id_set(
-            &st.query_sql(&format!(
-                "SELECT _id FROM bm25_search('title', 'rust', {k})"
-            ))
-            .expect("bm25 query_sql"),
+            &st.reader()
+                .query_sql(&format!(
+                    "SELECT _id FROM bm25_search('title', 'rust', {k})"
+                ))
+                .expect("bm25 query_sql"),
         );
         let vector = id_set(
-            &st.query_sql(&format!(
-                "SELECT _id FROM vector_search('emb', '{qv}', {k})"
-            ))
-            .expect("vector query_sql"),
+            &st.reader()
+                .query_sql(&format!(
+                    "SELECT _id FROM vector_search('emb', '{qv}', {k})"
+                ))
+                .expect("vector query_sql"),
         );
 
         let expected: HashSet<i128> = bm25.union(&vector).copied().collect();
@@ -725,6 +728,7 @@ mod tests {
         let dim = 16;
         let st = demo(dim);
         let res = st
+            .reader()
             .query_sql(&format!(
                 "SELECT title, score FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
                 csv_one_hot(dim, 0)
@@ -747,6 +751,7 @@ mod tests {
         let dim = 16;
         let st = demo(dim);
         let res = st
+            .reader()
             .query_sql(&format!(
                 "SELECT title FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
                 csv_one_hot(dim, 7)
@@ -772,6 +777,7 @@ mod tests {
         let dim = 16;
         let st = demo(dim);
         let batches = st
+            .reader()
             .query_sql(&format!(
                 "SELECT * FROM hybrid_search('title', 'rust', 'emb', '{}', 3)",
                 csv_one_hot(dim, 0)
@@ -790,6 +796,7 @@ mod tests {
         let dim = 16;
         let st = Supertable::create(options_title_emb(dim)).expect("create");
         let batches = st
+            .reader()
             .query_sql(&format!(
                 "SELECT _id, score FROM hybrid_search('title', 'rust', 'emb', '{}', 5)",
                 csv_one_hot(dim, 0)
@@ -805,7 +812,8 @@ mod tests {
         let st = demo(dim);
         // 4 args (missing k) → planning error.
         assert!(
-            st.query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', '1,0')")
+            st.reader()
+                .query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', '1,0')")
                 .is_err()
         );
     }
@@ -943,15 +951,18 @@ mod tests {
 
         // The three single-retriever result sets — the oracle inputs.
         let fts = id_set(
-            &st.query_sql("SELECT _id FROM bm25_search('title', 'rust', 8)")
+            &st.reader()
+                .query_sql("SELECT _id FROM bm25_search('title', 'rust', 8)")
                 .expect("bm25 query_sql"),
         );
         let vector = id_set(
-            &st.query_sql(&format!("SELECT _id FROM vector_search('emb', '{qv}', 5)"))
+            &st.reader()
+                .query_sql(&format!("SELECT _id FROM vector_search('emb', '{qv}', 5)"))
                 .expect("vector query_sql"),
         );
         let scalar = id_set(
-            &st.query_sql("SELECT _id FROM supertable WHERE category = 'systems'")
+            &st.reader()
+                .query_sql("SELECT _id FROM supertable WHERE category = 'systems'")
                 .expect("scalar query_sql"),
         );
         // Guard against corpus drift: the witnesses below only hold for
@@ -964,6 +975,7 @@ mod tests {
         // scalar SQL predicate — sql + vector + fts in one statement,
         // spanning two segments.
         let combined_batches = st
+            .reader()
             .query_sql(&format!(
                 "SELECT b._id, b.title AS title, b.category AS category, b.score AS score \
                  FROM bm25_search('title', 'rust', 8) AS b \
