@@ -685,7 +685,9 @@ pub mod vector {
             // cache just to throw it away.
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
             if phases.warm {
-                eprintln!("[supertable_vector] opening warm consumer, prewarm + wait_until_warm...");
+                eprintln!(
+                    "[supertable_vector] opening warm consumer, prewarm + wait_until_warm..."
+                );
                 let _ = consumer
                     .reader()
                     .vector_search(
