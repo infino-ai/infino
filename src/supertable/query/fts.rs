@@ -135,10 +135,7 @@ impl SharedTopK {
 
     /// The current global floor — `NEG_INFINITY` until k scores merged.
     fn floor(&self) -> f32 {
-        f32::from_bits(
-            self.floor_bits
-                .load(std::sync::atomic::Ordering::Acquire),
-        )
+        f32::from_bits(self.floor_bits.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Merge one finished segment's (tombstone-surviving) scores and
