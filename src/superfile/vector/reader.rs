@@ -165,7 +165,6 @@ impl ColumnReader {
     /// (`cluster_rerank_row_range`), so this whole-block range is
     /// retained for the layout-invariant test that pins the on-disk
     /// shape.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn cluster_block_range(
         &self,
         cluster_doc_off: u32,
@@ -1082,6 +1081,9 @@ impl VectorReader {
     pub fn vector_columns(&self) -> impl Iterator<Item = &str> {
         self.columns.iter().map(|c| c.name.as_str())
     }
+    pub fn vector_columns_config(&self) -> impl Iterator<Item = &ColumnReader> {
+        self.columns.iter()
+    }
 
     pub(crate) fn public_rerank_mult(&self, _column: &str, base: usize) -> usize {
         base
@@ -1569,6 +1571,127 @@ impl VectorReader {
     /// `Ok((col, true))` = real search to follow; `Ok((col, false))`
     /// = empty-result short circuit, caller returns `Ok(Vec::new())`.
     #[inline]
+    /// Retrieve original vectors in their insertion order for fp32-encoded columns.
+    /// Returns an error if the column uses a different encoding (Sq8Residual or RabitqOnly).
+    pub fn get_vectors_fp32(&self, column: &str) -> Result<Vec<Vec<f32>>, VectorError> {
+        let cid = *self
+            .column_id_by_name
+            .get(column)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        let col = &self.columns[cid as usize];
+
+        if col.rerank_codec != RerankCodec::Fp32 {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "column '{}' uses rerank codec {} instead of Fp32",
+                col.name,
+                col.rerank_codec.name()
+            ))));
+        }
+
+        if col.n_docs == 0 {
+            return Ok(Vec::new());
+        }
+
+        let sub_start = col.subsection_range.start;
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let cluster_idx = self
+            .source
+            .get_range(idx_start..idx_end)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        let cb = col.quant.code_bytes();
+        let per_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
+
+        // Collect all cluster ranges needed for fetching
+        let mut cluster_ranges: Vec<Range<usize>> = Vec::new();
+        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::new();
+
+        for c in 0..col.n_cent as usize {
+            let (off, cnt) = read_cluster_entry(&cluster_idx, c);
+            if cnt == 0 {
+                continue;
+            }
+            cluster_ranges.push(col.cluster_block_range(off, cnt));
+            cluster_meta.push((c, off, cnt));
+        }
+
+        if cluster_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fetch all cluster blocks
+        let cluster_blocks = self
+            .source
+            .get_ranges_parallel(&cluster_ranges)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        // Allocate output vector with doc_id -> vector mapping
+        let mut result: Vec<Option<Vec<f32>>> = vec![None; col.n_docs as usize];
+
+        // Process each cluster block
+        for (bi, block) in cluster_blocks.iter().enumerate() {
+            let (_, _off, cnt) = cluster_meta[bi];
+            let cnt_usize = cnt as usize;
+
+            // Layout within the block: [codes_chunk][doc_ids_chunk][full_chunk]
+            let codes_len = cnt_usize * cb;
+            let doc_ids_len = cnt_usize * 4;
+            let full_start = codes_len + doc_ids_len;
+
+            // Extract doc_ids from the block
+            let doc_ids_slice = block.slice(codes_len..codes_len + doc_ids_len);
+
+            // Extract and reconstruct vectors
+            for i in 0..cnt_usize {
+                let doc_id = u32::from_le_bytes([
+                    doc_ids_slice[i * 4],
+                    doc_ids_slice[i * 4 + 1],
+                    doc_ids_slice[i * 4 + 2],
+                    doc_ids_slice[i * 4 + 3],
+                ]) as usize;
+
+                let vec_start = full_start + i * per_vec_bytes;
+                let vec_end = vec_start + per_vec_bytes;
+                let vec_bytes = block.slice(vec_start..vec_end);
+
+                // Convert bytes to f32 vector
+                // For Fp32 codec, per_vec_bytes = dim * 4, so we expect dim f32s
+                let vec_f32: Vec<f32> = vec_bytes
+                    .as_ref()
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+
+                if vec_f32.len() != col.dim {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "vector size mismatch: got {}, expected {}",
+                        vec_f32.len(),
+                        col.dim
+                    ))));
+                }
+
+                if doc_id < col.n_docs as usize {
+                    result[doc_id] = Some(vec_f32);
+                }
+            }
+        }
+
+        // Convert to final result, checking all vectors were found
+        result
+            .into_iter()
+            .enumerate()
+            .map(|(idx, vec_opt)| {
+                vec_opt.ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "missing vector for doc_id {}",
+                        idx
+                    )))
+                })
+            })
+            .collect()
+    }
+
     fn resolve_column(
         &self,
         column: &str,
@@ -5358,5 +5481,132 @@ mod tests {
             matches!(meta_lazy, Sq8ColumnMeta::Lazy { .. }),
             "lazy open should defer Sq8 metadata to search"
         );
+    }
+
+    #[test]
+    fn get_vectors_fp32_returns_vectors_in_original_order() {
+        let n_docs = 64u32;
+        let dim = 16;
+        let n_cent = 4;
+
+        // Build a blob with Fp32 encoding
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "embedding".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
+        })
+        .expect("register column");
+
+        // Create deterministic vectors
+        let mut input_vectors = Vec::new();
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim)
+                .map(|j| ((i.wrapping_mul(31) + j as u32) % 100) as f32 * 0.01)
+                .collect();
+            input_vectors.push(v.clone());
+            b.add(0, &v).expect("add to vector builder");
+        }
+
+        let bytes = b.finish().expect("finish vector builder");
+        let json = format!(
+            r#"[{{"column":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
+        );
+        let reader = VectorReader::open(Bytes::from(bytes), &json).expect("open should succeed");
+
+        // Retrieve vectors via the new function
+        let retrieved = reader
+            .get_vectors_fp32("embedding")
+            .expect("get_vectors_fp32 should succeed");
+
+        // Verify all vectors are returned
+        assert_eq!(retrieved.len(), n_docs as usize);
+
+        // Verify vectors match original vectors (within floating point precision)
+        for (i, retrieved_vec) in retrieved.iter().enumerate() {
+            assert_eq!(retrieved_vec.len(), dim);
+            for (j, &val) in retrieved_vec.iter().enumerate() {
+                let expected = input_vectors[i][j];
+                assert!(
+                    (val - expected).abs() < 1e-6,
+                    "vector {} dimension {} mismatch: got {}, expected {}",
+                    i,
+                    j,
+                    val,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_vectors_fp32_rejects_non_fp32_codec() {
+        // blob was built with Sq8Residual by default, not Fp32
+        let mut builder = VectorBuilder::new();
+        builder
+            .register_column(VectorConfig {
+                column: "embedding".into(),
+                dim: 16,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Sq8Residual,
+            })
+            .expect("register column");
+        for i in 0u32..32 {
+            let v: Vec<f32> = (0..16)
+                .map(|j| ((i.wrapping_mul(31) + j as u32) % 100) as f32 * 0.01)
+                .collect();
+            builder.add(0, &v).expect("add");
+        }
+        let sq8_bytes = builder.finish().expect("finish");
+        let sq8_json =
+            r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+                .to_string();
+        let reader = VectorReader::open(Bytes::from(sq8_bytes), &sq8_json).expect("open");
+
+        // Should error because codec is Sq8Residual, not Fp32
+        let result = reader.get_vectors_fp32("embedding");
+        assert!(result.is_err());
+        if let Err(VectorError::Read(ReadError::MalformedVersion(msg))) = result {
+            assert!(msg.contains("Fp32"));
+        } else {
+            panic!("expected MalformedVersion error, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn get_vectors_fp32_rejects_unknown_column() {
+        let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let reader = VectorReader::open(blob, &json).expect("open should succeed");
+
+        let result = reader.get_vectors_fp32("nonexistent");
+        assert!(matches!(result, Err(VectorError::UnknownColumn(_))));
+    }
+
+    #[test]
+    fn get_vectors_fp32_returns_empty_for_no_docs() {
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "embedding".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
+        })
+        .expect("register column");
+        let bytes = b.finish().expect("finish vector builder");
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+            .to_string();
+        let reader = VectorReader::open(Bytes::from(bytes), &json).expect("open should succeed");
+
+        let retrieved = reader
+            .get_vectors_fp32("embedding")
+            .expect("get_vectors_fp32 should succeed");
+        assert!(retrieved.is_empty());
     }
 }

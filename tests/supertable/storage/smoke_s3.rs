@@ -60,7 +60,8 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::config::{
-    Config, StorageBackend, StorageColdFetchMode, StorageSettings, SupertableSettings,
+    CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+    SupertableSettings,
 };
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::supertable::Supertable;
@@ -213,6 +214,7 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
             mmap_sweep_interval_secs: 0,
             ..StorageSettings::default()
         },
+        compaction: CompactionSettings::default(),
     }
 }
 

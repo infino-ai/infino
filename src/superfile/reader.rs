@@ -25,6 +25,7 @@ use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
 use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::vector::reader::VectorReader;
+use crate::supertable::query::provider::tombstone_access_plan;
 use arrow::compute::{concat_batches, take};
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::{Field, Schema};
@@ -35,6 +36,7 @@ use parquet::arrow::arrow_reader::{
     RowSelector,
 };
 use parquet::file::metadata::PageIndexPolicy;
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -450,6 +452,52 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
+    }
+    /// Returns a record batch containing all documents with all columns
+    pub fn get_record_batch(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<RecordBatch, ReadError> {
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?;
+        let arrow_meta = self
+            .arrow_meta
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+        let plan = if let Some(deleted_docs_bitmap) = deleted_docs_bitmap {
+            tombstone_access_plan(bytes, deleted_docs_bitmap.as_ref())
+                .map_err(|e| ReadError::Columnar(e.to_string()))?
+        } else {
+            None
+        };
+
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), arrow_meta);
+        if let Some(plan) = plan {
+            let row_groups = plan.row_group_indexes();
+            let selection = plan
+                .into_overall_row_selection(builder.metadata().row_groups())
+                .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+            builder = builder.with_row_groups(row_groups);
+            if let Some(selection) = selection {
+                builder = builder.with_row_selection(selection);
+            }
+        }
+        let reader = builder
+            .build()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let record_batch = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+        Ok(record_batch)
     }
 
     /// A [`LazyByteSource`] over the **entire** segment, regardless of

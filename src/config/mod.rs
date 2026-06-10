@@ -73,6 +73,9 @@ pub struct Config {
     /// `backend: s3` plus a bucket/prefix.
     #[serde(default)]
     pub storage: StorageSettings,
+    /// Compaction settings.
+    #[serde(default)]
+    pub compaction: CompactionSettings,
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -125,6 +128,34 @@ impl Default for SupertableSettings {
 
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
+
+// Compaction defaults
+const DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB: u64 = 1024;
+const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
+const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB + 2048;
+
+/// Compaction subsection of [`Config`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CompactionSettings {
+    /// Target size of a compacted segment, in MiB.
+    pub target_segment_size_mb: u64,
+    /// Minimum estimated live bytes to trigger a merge,
+    /// as a percentage of `target_segment_size_mb`.
+    pub min_fill_percent: u8,
+    /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    pub max_memory_mb: u64,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            target_segment_size_mb: DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB,
+            min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
+            max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+        }
+    }
+}
 
 /// Persistent storage backend selected by [`StorageSettings`].
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -655,5 +686,95 @@ supertable:
             PathBuf::from("/tmp/home-test/.config/infino/config.yaml")
         );
         unsafe { std::env::remove_var("HOME") };
+    }
+
+    #[test]
+    fn embedded_default_compaction_matches_spec() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        let c = &cfg.compaction;
+        assert_eq!(
+            c.target_segment_size_mb,
+            DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB
+        );
+        assert_eq!(c.min_fill_percent, DEFAULT_COMPACTION_MIN_FILL_PERCENT);
+        assert_eq!(
+            c.max_memory_mb, DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            "target + 2048"
+        );
+    }
+
+    #[test]
+    fn compaction_struct_default_equals_embedded_yaml() {
+        // The Rust `Default` and the shipped YAML must not drift.
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.compaction, CompactionSettings::default());
+    }
+
+    #[test]
+    fn compaction_yaml_layer_overrides_defaults() {
+        let yaml = r#"
+               compaction:
+                    target_segment_size_mb: 2048
+                    min_fill_percent: 50
+           "#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("layered yaml");
+        assert_eq!(cfg.compaction.target_segment_size_mb, 2048);
+        assert_eq!(cfg.compaction.min_fill_percent, 50);
+        assert_eq!(cfg.compaction.max_memory_mb, 3072);
+    }
+
+    #[test]
+    fn compaction_nested_env_var_overrides_field() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        unsafe {
+            std::env::set_var("INFINO_COMPACTION__TARGET_SEGMENT_SIZE_MB", "4096");
+            std::env::set_var("INFINO_COMPACTION__MIN_FILL_PERCENT", "60");
+        }
+        let cfg = Config::load().expect("load with compaction env override");
+        assert_eq!(cfg.compaction.target_segment_size_mb, 4096);
+        assert_eq!(cfg.compaction.min_fill_percent, 60);
+        unsafe {
+            std::env::remove_var("INFINO_COMPACTION__TARGET_SEGMENT_SIZE_MB");
+            std::env::remove_var("INFINO_COMPACTION__MIN_FILL_PERCENT");
+        }
+    }
+
+    #[test]
+    fn compaction_invalid_value_type_errors_clearly() {
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(
+                "compaction:\n  target_segment_size_mb: \"not-a-number\"\n",
+            ));
+        let err = Config::from_figment(fig).expect_err("expected error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target_segment_size_mb")
+                || msg.contains("invalid type")
+                || msg.contains("expected"),
+            "expected a typed-error message; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_min_fill_percent_rejects_out_of_u8_range() {
+        // 256 overflows u8 — figment surfaces a typed error rather
+        // than silently truncating.
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string("compaction:\n  min_fill_percent: 256\n"));
+        let err = Config::from_figment(fig).expect_err("expected error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("min_fill_percent")
+                || msg.contains("256")
+                || msg.contains("u8")
+                || msg.contains("out of range")
+                || msg.contains("invalid value"),
+            "expected an out-of-range message; got {msg:?}"
+        );
     }
 }

@@ -63,10 +63,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 
-#[cfg(test)]
 use bytes::Bytes;
 use object_store::ObjectStore as OsObjectStore;
-#[cfg(test)]
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use roaring::RoaringBitmap;
@@ -505,11 +503,13 @@ impl TableProvider for SupertableProvider {
 /// Parsing the footer via [`ParquetRecordBatchReaderBuilder`] only
 /// touches metadata, not column data, and only happens when the
 /// segment actually has tombstones — clean tables pay nothing.
-/// Byte-sourced wrapper over [`tombstone_access_plan_from_counts`], kept
-/// for the resident-bytes unit tests; the scan paths call the counts core
-/// directly via [`build_access_plan`].
-#[cfg(test)]
-fn tombstone_access_plan(
+/// Byte-sourced wrapper over [`tombstone_access_plan_from_counts`]. The
+/// scan paths call the counts core directly via [`build_access_plan`];
+/// this wrapper serves callers that hold the raw Parquet bytes — the
+/// superfile reader's deleted-docs batching
+/// ([`SuperfileReader`](crate::superfile::SuperfileReader)) and the
+/// resident-bytes unit tests. In-crate callers only, so `pub(crate)`.
+pub(crate) fn tombstone_access_plan(
     parquet_bytes: &Bytes,
     bitmap: &RoaringBitmap,
 ) -> DfResult<Option<ParquetAccessPlan>> {
@@ -582,8 +582,8 @@ fn tombstone_access_plan_from_counts(
 /// Row counts per row group, parsed from a resident parquet footer.
 /// Test-only: the scan path reads row-group counts through the unified
 /// [`SuperfileObjectStore`] via [`row_group_rows_object_store`]; this
-/// byte-sourced variant backs the resident-bytes access-plan unit tests.
-#[cfg(test)]
+/// byte-sourced variant backs [`tombstone_access_plan`] — the superfile
+/// reader's deleted-docs batching and the resident-bytes unit tests.
 fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
         .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
