@@ -636,7 +636,10 @@ pub mod vector {
         })
     }
 
-    fn queries_calibration() -> &'static [Vec<f32>] {
+    // Calibration fixtures are `pub` so the cross-engine comparison
+    // harness (retrievalbench) can run the identical recall-calibrated
+    // protocol against the same queries and ground truth.
+    pub fn queries_calibration() -> &'static [Vec<f32>] {
         QUERIES_CALIBRATION.get_or_init(|| {
             corpus::generate_realistic_queries(
                 vectors(),
@@ -649,12 +652,12 @@ pub mod vector {
         })
     }
 
-    fn ground_truth_correctness() -> &'static [Vec<u32>] {
+    pub fn ground_truth_correctness() -> &'static [Vec<u32>] {
         GROUND_TRUTH_CORRECTNESS
             .get_or_init(|| corpus::ground_truth(vectors(), n_docs(), queries_correctness(), TOP_K))
     }
 
-    fn ground_truth_calibration() -> &'static [Vec<u32>] {
+    pub fn ground_truth_calibration() -> &'static [Vec<u32>] {
         GROUND_TRUTH_CALIBRATION
             .get_or_init(|| corpus::ground_truth(vectors(), n_docs(), queries_calibration(), TOP_K))
     }
