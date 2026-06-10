@@ -48,12 +48,30 @@ use infino::superfile::fts::reader::BoolMode;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
 
-/// Segment count — enough for the fan-out cost to dominate any single
+/// Commits — enough for the fan-out cost to dominate any single
 /// kernel, while keeping the fixture build in the low seconds.
+/// Override segment shape via `FLOOR_COMMITS` / `FLOOR_DOCS` to probe
+/// fat-segment behavior (e.g. `FLOOR_COMMITS=2 FLOOR_DOCS=200000`
+/// approximates production segment sizes, isolating kernel-init and
+/// resolve costs that scale with segment size rather than count).
 const SEGMENTS: usize = 64;
-/// Docs per segment — small enough that per-segment scoring is cheap,
+/// Docs per commit — small enough that per-segment scoring is cheap,
 /// so the orchestration layers stand out in the deltas.
 const DOCS_PER_SEGMENT: usize = 2048;
+
+fn commits() -> usize {
+    std::env::var("FLOOR_COMMITS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SEGMENTS)
+}
+
+fn docs_per_commit() -> usize {
+    std::env::var("FLOOR_DOCS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DOCS_PER_SEGMENT)
+}
 /// Timed iterations per shape (p50 reported).
 const ITERS: usize = 100;
 /// Rayon pool width for the fixture's reader/writer pools.
@@ -86,16 +104,17 @@ fn options_title_only() -> SupertableOptions {
     .with_reader_pool(pool)
 }
 
-/// Segment `seg` gets `DOCS_PER_SEGMENT` docs: every title contains
-/// the all-segment term `common`; doc 0 of segment 0 additionally
+/// Commit `seg` gets `docs_per_commit()` docs: every title contains
+/// the all-commit term `common`; doc 0 of commit 0 additionally
 /// carries the planted `uniqueterm`.
 fn build_batch(seg: usize, schema: Arc<Schema>) -> RecordBatch {
-    let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
+    let n = docs_per_commit();
+    let titles: Vec<String> = (0..n)
         .map(|i| {
             if seg == 0 && i == 0 {
                 "common uniqueterm topic".to_string()
             } else {
-                format!("common topic {} variant", seg * DOCS_PER_SEGMENT + i)
+                format!("common topic {} variant", seg * n + i)
             }
         })
         .collect();
@@ -107,7 +126,7 @@ fn build_supertable() -> Supertable {
     let st = Supertable::create(options_title_only()).expect("create");
     let schema = st.options().schema.clone();
     let mut w = st.writer().expect("writer");
-    for seg in 0..SEGMENTS {
+    for seg in 0..commits() {
         w.append(&build_batch(seg, schema.clone())).expect("append");
         w.commit().expect("commit");
     }
@@ -142,7 +161,7 @@ fn fanout_floor_decomposition() {
     // segment count is a multiple of the commit count — report it.
     let n_segments = reader.n_superfiles();
     assert!(
-        n_segments >= SEGMENTS,
+        n_segments >= commits(),
         "expected at least one segment per commit, got {n_segments}"
     );
 
@@ -154,11 +173,12 @@ fn fanout_floor_decomposition() {
     ];
 
     println!(
-        "\n### Warm fan-out floor — {n_segments} segments ({SEGMENTS} commits × {} docs), k={K}, p50 of {ITERS}\n",
-        DOCS_PER_SEGMENT
+        "\n### Warm fan-out floor — {n_segments} segments ({} commits × {} docs), k={K}, p50 of {ITERS}\n",
+        commits(),
+        docs_per_commit()
     );
-    println!("| shape | bm25_hits | bm25_search (_id, score) |");
-    println!("|-------|----------:|-------------------------:|");
+    println!("| shape | bm25_hits | search [_id, score] | search full row |");
+    println!("|-------|----------:|--------------------:|----------------:|");
 
     for &(label, term, expect_hits) in shapes {
         let hits = reader
@@ -176,16 +196,27 @@ fn fanout_floor_decomposition() {
                 .expect("bm25_hits");
             std::hint::black_box(h);
         });
-        let search_p50 = time_p50(|| {
+        let ids_p50 = time_p50(|| {
             let b = reader
                 .bm25_search("title", term, K, BoolMode::Or, Some(&["_id", "score"]))
                 .expect("bm25_search");
             std::hint::black_box(b);
         });
+        // `None` = every column — what the supertable warm battery
+        // (and any "give me the rows" caller) actually pays. The
+        // delta vs the ids-only column is the scalar decode cost,
+        // which scales with segment/page size, not segment count.
+        let full_p50 = time_p50(|| {
+            let b = reader
+                .bm25_search("title", term, K, BoolMode::Or, None)
+                .expect("bm25_search");
+            std::hint::black_box(b);
+        });
         println!(
-            "| {label} | {:.1} µs | {:.1} µs |",
+            "| {label} | {:.1} µs | {:.1} µs | {:.1} µs |",
             hits_p50.as_secs_f64() * 1e6,
-            search_p50.as_secs_f64() * 1e6,
+            ids_p50.as_secs_f64() * 1e6,
+            full_p50.as_secs_f64() * 1e6,
         );
     }
 }

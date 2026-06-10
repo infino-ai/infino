@@ -41,6 +41,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+/// Force the global allocator (mimalloc, default-on in the crate) to
+/// return freed-but-retained arenas to the OS. Every sampler start
+/// calls this so a phase's reported RSS is the engine's working set,
+/// not heap history from earlier bench phases — e.g. ingest scratch
+/// and brute-force ground-truth buffers were inflating the vector
+/// warm-search rows by the (freed) corpus-scale residual mimalloc had
+/// kept around (measured: ~1 GiB at 1M docs, ~10 GiB at 10M).
+pub fn purge_allocator() {
+    // SAFETY: `mi_collect` is documented safe to call from any thread
+    // at any time; `true` forces a synchronous collection that
+    // releases deferred pages back to the OS.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bytes per kibibyte — `/proc/self/status` reports `VmRSS` in kB
@@ -122,6 +136,9 @@ impl PeakSampler {
     /// who stop the sampler before any background sample
     /// lands still see at least the start-time RSS.
     pub fn start(interval: Duration) -> Self {
+        // Drop allocator-retained pages first so the measurement
+        // window opens on the process's true working set.
+        purge_allocator();
         let stop = Arc::new(AtomicBool::new(false));
         let initial = current_rss_bytes().unwrap_or(0);
 
