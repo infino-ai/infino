@@ -440,6 +440,31 @@ impl SuperfileReader {
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
     }
+    /// Returns a record batch containing all documents with all columns
+    pub fn get_record_batch(&self) -> Result<RecordBatch, ReadError> {
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+        let arrow_meta = self
+            .arrow_meta
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
+        let reader = builder
+            .build()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let record_batch = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+        Ok(record_batch)
+    }
 
     /// Resolve in-segment row offsets to their durable identity.
     ///

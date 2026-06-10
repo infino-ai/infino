@@ -358,3 +358,426 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
     assert!(doc_ids.contains(&2));
     assert!(doc_ids.contains(&4));
 }
+
+#[test]
+fn add_batch_from_reader_mergeability_compatible_superfiles() {
+    // Both superfiles have identical configurations; merge succeeds.
+    let bytes1 = build_pipeline_superfile();
+    let r1 = SuperfileReader::open(bytes1).expect("open superfile 1");
+
+    let bytes2 = build_pipeline_superfile();
+    let r2 = SuperfileReader::open(bytes2).expect("open superfile 2");
+
+    let opts = BuilderOptions::new(
+        r1.schema().clone(),
+        r1.id_column(),
+        vec![
+            FtsConfig {
+                column: "title".into(),
+            },
+            FtsConfig {
+                column: "body".into(),
+            },
+        ],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 17,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    // Should not error on compatible configuration
+    b.add_batch_from_reader(&r1)
+        .expect("add_batch_from_reader succeeds for compatible superfiles");
+    b.add_batch_from_reader(&r2)
+        .expect("add_batch_from_reader succeeds for compatible superfiles");
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_id_column_mismatch() {
+    // Build superfile with "different_id" as id column
+    let schema_with_alt_id = Arc::new(Schema::new(vec![
+        Field::new("different_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("body", DataType::LargeUtf8, false),
+        Field::new("score", DataType::Float32, true),
+    ]));
+    let opts = BuilderOptions::new(
+        schema_with_alt_id.clone(),
+        "different_id",
+        vec![],
+        vec![],
+        None,
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema_with_alt_id,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Build a builder with "doc_id" as id column using a matching schema
+    // Map the reader's schema: rename "different_id" to "doc_id" for the builder
+    let builder_schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("body", DataType::LargeUtf8, false),
+        Field::new("score", DataType::Float32, true),
+    ]));
+    let orig_opts = BuilderOptions::new(builder_schema, "doc_id", vec![], vec![], None);
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for id column mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_schema_mismatch() {
+    // Build superfile with schema missing a column
+    let schema_short = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+        // missing "body" column compared to pipeline_schema
+        Field::new("score", DataType::Float32, true),
+    ]));
+    let opts = BuilderOptions::new(schema_short.clone(), "doc_id", vec![], vec![], None);
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema_short,
+        vec![Arc::new(ids), Arc::new(titles), Arc::new(scores)],
+    )
+    .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Try to merge into builder with full pipeline schema
+    let orig_schema = pipeline_schema();
+    let orig_opts = BuilderOptions::new(orig_schema, "doc_id", vec![], vec![], None);
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for schema mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_fts_column_count_mismatch() {
+    // Build superfile with FTS on only one column
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Try to merge into builder with FTS on two columns
+    let orig_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![
+            FtsConfig {
+                column: "title".into(),
+            },
+            FtsConfig {
+                column: "body".into(),
+            },
+        ],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for FTS column count mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
+    // Build superfile with FTS on "body"
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "body".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Try to merge into builder with FTS on "title"
+    let orig_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for FTS column name mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
+    // Build superfile with one vector column
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 17,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    let mut emb = vec![0.0f32; 16];
+    emb[0] = 1.0;
+    normalize(&mut emb);
+    b.add_batch(&batch, &[emb.as_slice()]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Try to merge into builder with no vector columns
+    let orig_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for vector column count mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
+    // Build superfile with vector column "emb"
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 17,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    let mut emb = vec![0.0f32; 16];
+    emb[0] = 1.0;
+    normalize(&mut emb);
+    b.add_batch(&batch, &[emb.as_slice()]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Try to merge into builder with different vector column name
+    let orig_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "other_vec".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 17,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for vector column name mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
+    // Build superfile with vector dim=16
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 17,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    let mut emb = vec![0.0f32; 16];
+    emb[0] = 1.0;
+    normalize(&mut emb);
+    b.add_batch(&batch, &[emb.as_slice()]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Try to merge into builder with different dimension
+    let orig_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: 32, // different dimension
+            n_cent: 4,
+            rot_seed: 17,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
+
+    let err = orig_builder.add_batch_from_reader(&reader);
+    assert!(
+        err.is_err(),
+        "expected mergeability error for vector dimension mismatch"
+    );
+}

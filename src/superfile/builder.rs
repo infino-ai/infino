@@ -79,13 +79,13 @@
 //! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
 //! each entry (currently always `"ascii_lower"`), so the on-disk
 //! format is forward-compatible without a file rewrite.
-
-use crate::superfile::BuildError;
 use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
 use crate::superfile::format::{self, kv};
 use crate::superfile::fts::builder::FtsBuilder;
 use crate::superfile::fts::tokenize::Tokenizer;
 use crate::superfile::vector::builder::VectorBuilder;
+use crate::superfile::vector::reader::ColumnReader;
+use crate::superfile::{BuildError, SuperfileReader};
 // `VectorConfig` lives in `vector::builder` and is re-exported below
 // (single source of truth post-collapse — see the `pub use` line).
 pub use crate::superfile::vector::builder::VectorConfig;
@@ -109,6 +109,7 @@ pub struct FtsConfig {
 // wrapper struct.
 
 /// All knobs needed to build a superfile.
+#[derive(Clone)]
 pub struct BuilderOptions {
     /// Arrow schema. Must contain `id_column` (typed
     /// `Decimal128(38, 0)`) and every FTS column listed in
@@ -228,6 +229,79 @@ impl BuilderOptions {
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
         }
+    }
+
+    fn check_mergeability(
+        &self,
+        remote_id_col: &str,
+        remote_schema: &Arc<Schema>,
+        remote_fts_columns: Option<Vec<&str>>,
+        remote_vector_columns: Option<Vec<&ColumnReader>>,
+    ) -> Result<bool, BuildError> {
+        if self.id_column != *remote_id_col {
+            return Err(BuildError::IdColumnMismatch(
+                self.id_column.clone(),
+                remote_id_col.to_string(),
+            ));
+        }
+
+        if self.schema.fields() != remote_schema.fields() {
+            return Err(BuildError::SchemaMismatch {
+                mine: self.schema.to_string(),
+                other: remote_schema.to_string(),
+            });
+        }
+
+        if let Some(remote_fts_columns) = remote_fts_columns {
+            let self_fts_columns = &self.fts_columns;
+            if self_fts_columns.len() != remote_fts_columns.len() {
+                return Err(BuildError::FTSSchemaMismatch(format!(
+                    "mismatched column len. self {} vs other {}",
+                    self_fts_columns.len(),
+                    remote_fts_columns.len()
+                )));
+            }
+            for (self_fts_column, remote_fts_column) in
+                self_fts_columns.iter().zip(remote_fts_columns.iter())
+            {
+                if self_fts_column.column != *remote_fts_column {
+                    return Err(BuildError::FTSSchemaMismatch(format!(
+                        "mismatched column name. self {} vs other {}",
+                        self_fts_column.column, remote_fts_column
+                    )));
+                }
+            }
+        }
+
+        if let Some(remote_vector_columns) = remote_vector_columns {
+            let self_vec_columns = &self.vector_columns;
+            if self_vec_columns.len() != remote_vector_columns.len() {
+                return Err(BuildError::VectorSchemaMismatch(format!(
+                    "mismatched column len. self {} vs other {}",
+                    self_vec_columns.len(),
+                    remote_vector_columns.len()
+                )));
+            }
+
+            for (self_vec_column, remote_vector_column) in
+                self_vec_columns.iter().zip(remote_vector_columns.iter())
+            {
+                if self_vec_column.column != remote_vector_column.name {
+                    return Err(BuildError::VectorSchemaMismatch(format!(
+                        "mismatched column name. self {} vs other {}",
+                        self_vec_column.column, remote_vector_column.name
+                    )));
+                }
+                if self_vec_column.dim != remote_vector_column.dim {
+                    return Err(BuildError::VectorSchemaMismatch(format!(
+                        "mismatched column dim. self {} vs other {}",
+                        self_vec_column.dim, remote_vector_column.dim
+                    )));
+                }
+            }
+        }
+
+        Ok(true)
     }
 }
 
@@ -444,6 +518,87 @@ impl SuperfileBuilder {
 
         self.next_local_doc_id += n_rows;
         self.batches.push(batch.clone());
+        Ok(())
+    }
+
+    /// Add all data (Parquet + fts + vectors) from another [`SuperfileReader`] to this builder.
+    ///
+    /// Extracts the record batch and vectors from the reader and adds them via
+    /// [`Self::add_batch`]. This is useful for merging superfiles or copying data
+    /// between builders.
+    ///
+    /// **Requirements:**
+    /// - The reader's vector columns must use the **Fp32 codec**. Other codecs
+    ///   (Sq8Residual, RabitqOnly) will fail with `BuildError::VectorReadError`.
+    /// - Vector column names and dimensions in the reader must match those in
+    ///   `self.opts.vector_columns` in the exact same order. Mismatches will
+    ///   return `BuildError::VectorDimMismatch` error.
+    ///
+    /// **Memory:** Loads the reader's entire vector dataset into memory at once.
+    /// For very large superfiles, consider the memory overhead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BuildError::BatchReadError` if reading the record batch fails.
+    ///
+    /// Returns `BuildError::VectorReadError` if reading vectors fails
+    /// (e.g., codec is not Fp32).
+    ///
+    /// Returns `BuildError::VectorDimMismatch` if vector column names or
+    /// dimensions don't match the builder's configuration.
+    pub fn add_batch_from_reader(&mut self, reader: &SuperfileReader) -> Result<(), BuildError> {
+        self.opts.check_mergeability(
+            reader.id_column(),
+            reader.schema(),
+            reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+            reader
+                .vec()
+                .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+        )?;
+        let record_batch = reader
+            .get_record_batch()
+            .map_err(|_| BuildError::BatchReadError)?;
+
+        let num_rows = record_batch.num_rows();
+        let mut vectors: Vec<Vec<f32>> = Vec::new();
+        if let Some(v) = reader.vec() {
+            let reader_columns: Vec<_> = v.vector_columns_config().collect();
+
+            // Validate that reader's vector columns match builder's configuration
+            if reader_columns.len() != self.opts.vector_columns.len() {
+                return Err(BuildError::VectorDimMismatch {
+                    column: format!(
+                        "vector column count mismatch: expected {}, got {}",
+                        self.opts.vector_columns.len(),
+                        reader_columns.len()
+                    ),
+                    expected: self.opts.vector_columns.len(),
+                    actual: reader_columns.len(),
+                });
+            }
+
+            for (reader_col, builder_col) in reader_columns.iter().zip(&self.opts.vector_columns) {
+                if reader_col.name != builder_col.column || reader_col.dim != builder_col.dim {
+                    return Err(BuildError::VectorDimMismatch {
+                        column: reader_col.name.clone(),
+                        expected: builder_col.dim,
+                        actual: reader_col.dim,
+                    });
+                }
+
+                let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
+                let result = v
+                    .get_vectors_fp32(&reader_col.name)
+                    .map_err(|_| BuildError::VectorReadError)?;
+                for single_row in result {
+                    this_col_vectors.extend_from_slice(single_row.as_slice());
+                }
+                vectors.push(this_col_vectors);
+            }
+        }
+
+        let slices: Vec<&[f32]> = vectors.iter().map(|row| row.as_slice()).collect();
+        self.add_batch(&record_batch, &slices)?;
         Ok(())
     }
 
@@ -668,6 +823,7 @@ mod tests {
     use crate::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
     use arrow_array::LargeStringArray;
     use arrow_schema::Field;
+    use bytes::Bytes;
 
     fn schema_with_fts() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1017,5 +1173,417 @@ mod tests {
         assert_eq!(escape_json("a\\b"), "a\\\\b");
         assert_eq!(escape_json("a\nb"), "a\\nb");
         assert_eq!(escape_json("a\x01b"), "a\\u0001b");
+    }
+
+    #[test]
+    fn add_batch_from_reader_on_empty_builder_produces_identical_superfile() {
+        // Build original superfile with FTS and vectors
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![default_vector_config("emb", 7)],
+            Some(default_tokenizer()),
+        );
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b1.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let original_bytes = b1.finish().expect("finish builder");
+
+        // Read the superfile
+        let reader = SuperfileReader::open(Bytes::from(original_bytes.clone()))
+            .expect("open superfile reader");
+
+        // Create a new builder and add from reader
+        let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        b2.add_batch_from_reader(&reader)
+            .expect("add_batch_from_reader");
+        let merged_bytes = b2.finish().expect("finish builder");
+
+        // The two superfiles should be identical
+        assert_eq!(
+            original_bytes, merged_bytes,
+            "superfile created from reader should be identical to original"
+        );
+    }
+
+    #[test]
+    fn add_batch_from_reader_adds_parquet_data_correctly() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b1.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b1.finish().expect("finish builder");
+
+        // Read and verify parquet data
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open superfile reader");
+        let reader_batch = reader
+            .get_record_batch()
+            .expect("get_record_batch from reader");
+
+        // Should have 2 rows
+        assert_eq!(reader_batch.num_rows(), 2);
+
+        // Now add to a new builder
+        let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        b2.add_batch_from_reader(&reader)
+            .expect("add_batch_from_reader");
+        let merged_bytes = b2.finish().expect("finish builder");
+
+        // Read back and verify parquet data is correct
+        let reader2 =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged superfile reader");
+        let merged_batch = reader2
+            .get_record_batch()
+            .expect("get_record_batch from merged reader");
+        assert_eq!(merged_batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn add_batch_from_reader_adds_vectors_correctly() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+            None,
+        );
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b1.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let bytes = b1.finish().expect("finish builder");
+
+        // Read vectors from original superfile
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open superfile reader");
+        let vectors_before = reader
+            .vec()
+            .expect("get vector reader")
+            .get_vectors_fp32("emb")
+            .expect("get vectors fp32");
+
+        let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        b2.add_batch_from_reader(&reader)
+            .expect("add_batch_from_reader");
+        let merged_bytes = b2.finish().expect("finish builder");
+
+        // Read vectors from merged superfile
+        let reader2 =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged superfile reader");
+        let vectors_after = reader2
+            .vec()
+            .expect("get vector reader")
+            .get_vectors_fp32("emb")
+            .expect("get vectors fp32");
+
+        // Vectors should match
+        assert_eq!(vectors_before.len(), vectors_after.len());
+        for (v1, v2) in vectors_before.iter().zip(vectors_after.iter()) {
+            for (val1, val2) in v1.iter().zip(v2.iter()) {
+                assert!((val1 - val2).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn add_batch_from_reader_adds_fts_correctly() {
+        use crate::superfile::fts::reader::BoolMode;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b1.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b1.finish().expect("finish builder");
+
+        // Read FTS data from original
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open superfile reader");
+        let fts_reader = reader.fts().expect("get fts reader");
+        let results = fts_reader
+            .search("title", &["hello"], 10, BoolMode::Or)
+            .await
+            .expect("search fts");
+        assert_eq!(results.len(), 1);
+
+        // Add to new builder
+        let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        b2.add_batch_from_reader(&reader)
+            .expect("add_batch_from_reader");
+        let merged_bytes = b2.finish().expect("finish builder");
+
+        // Verify FTS still works after merge
+        let reader2 =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged superfile reader");
+        let fts_reader2 = reader2.fts().expect("get fts reader");
+        let results2 = fts_reader2
+            .search("title", &["hello"], 10, BoolMode::Or)
+            .await
+            .expect("search fts in merged");
+        assert_eq!(results2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_batch_from_reader_to_non_empty_builder_includes_both_datasets() {
+        use crate::superfile::fts::reader::BoolMode;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![default_vector_config("emb", 7)],
+            Some(default_tokenizer()),
+        );
+
+        // Create first superfile
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch1 = batch_two_rows(&schema);
+        let mut v1: Vec<f32> = vec![0.0; 32];
+        v1[0] = 1.0;
+        v1[16 + 1] = 1.0;
+        b1.add_batch(&batch1, &[v1.as_slice()]).expect("add_batch");
+        let bytes1 = b1.finish().expect("finish builder");
+
+        // Create second superfile
+        let mut b2 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let ids2 = decimal128_ids(vec![20u64, 21]);
+        let title2 = LargeStringArray::from(vec!["foo bar", "baz qux"]);
+        let body2 = LargeStringArray::from(vec!["quux corge", "grault garply"]);
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids2), Arc::new(title2), Arc::new(body2)],
+        )
+        .expect("build RecordBatch");
+        let mut v2: Vec<f32> = vec![0.0; 32];
+        v2[1] = 1.0;
+        v2[16] = 1.0;
+        b2.add_batch(&batch2, &[v2.as_slice()]).expect("add_batch");
+        let _bytes2 = b2.finish().expect("finish builder");
+
+        // Read first superfile
+        let reader1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader1");
+
+        // Create merged builder - add existing data + reader data
+        let mut merged = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        merged
+            .add_batch(&batch2, &[v2.as_slice()])
+            .expect("add_batch");
+        merged
+            .add_batch_from_reader(&reader1)
+            .expect("add_batch_from_reader");
+        let merged_bytes = merged.finish().expect("finish builder");
+
+        // Verify merged result
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+
+        // Should have 4 docs total (2 from batch2 + 2 from reader1)
+        let merged_batch = merged_reader.get_record_batch().expect("get_record_batch");
+        assert_eq!(merged_batch.num_rows(), 4);
+
+        // Verify vectors are correct
+        let merged_vectors = merged_reader
+            .vec()
+            .expect("get vector reader")
+            .get_vectors_fp32("emb")
+            .expect("get vectors");
+        assert_eq!(merged_vectors.len(), 4);
+
+        // Verify FTS works and finds both datasets
+        let fts_reader = merged_reader.fts().expect("get fts reader");
+        let hello_results = fts_reader
+            .search("title", &["hello"], 10, BoolMode::Or)
+            .await
+            .expect("search for hello");
+        assert!(
+            !hello_results.is_empty(),
+            "should find 'hello' from first dataset"
+        );
+
+        let foo_results = fts_reader
+            .search("title", &["foo"], 10, BoolMode::Or)
+            .await
+            .expect("search for foo");
+        assert!(
+            !foo_results.is_empty(),
+            "should find 'foo' from second dataset"
+        );
+    }
+
+    #[test]
+    fn add_vector_fp32_returns_correct_vectors() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+            None,
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0;
+        v[16] = 1.0;
+        v[17] = 1.0;
+        v[31] = 1.0;
+        b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open superfile reader");
+        let vectors = reader
+            .vec()
+            .expect("get vector reader")
+            .get_vectors_fp32("emb")
+            .expect("get vectors fp32");
+
+        // Verify structure
+        assert_eq!(vectors.len(), 2, "should have 2 vectors");
+        assert_eq!(
+            vectors[0].len(),
+            16,
+            "first vector should have 16 dimensions"
+        );
+        assert_eq!(
+            vectors[1].len(),
+            16,
+            "second vector should have 16 dimensions"
+        );
+
+        // Verify values
+        assert!((vectors[0][0] - 1.0).abs() < 1e-6);
+        assert!((vectors[0][1] - 0.0).abs() < 1e-6);
+        assert!((vectors[1][0] - 1.0).abs() < 1e-6);
+        assert!((vectors[1][1] - 1.0).abs() < 1e-6);
+        assert!((vectors[1][15] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn add_vector_fp32_rejects_non_fp32_codec() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![crate::superfile::vector::builder::VectorConfig {
+                column: "emb".into(),
+                dim: 16,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+            }],
+            None,
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let v: Vec<f32> = vec![0.0; 32];
+        b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open superfile reader");
+        let result = reader
+            .vec()
+            .expect("get vector reader")
+            .get_vectors_fp32("emb");
+
+        assert!(result.is_err(), "should reject Sq8Residual codec");
+    }
+
+    #[tokio::test]
+    async fn add_batch_from_reader_queries_work_correctly() {
+        use crate::superfile::fts::reader::BoolMode;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![default_vector_config("emb", 7)],
+            Some(default_tokenizer()),
+        );
+
+        // Create original superfile
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b1.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let bytes1 = b1.finish().expect("finish builder");
+
+        // Read original superfile
+        let reader1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader1");
+
+        // Create merged superfile with data from reader
+        let mut b_merged = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        b_merged
+            .add_batch_from_reader(&reader1)
+            .expect("add_batch_from_reader");
+        let merged_bytes = b_merged.finish().expect("finish builder");
+
+        // Read merged superfile
+        let reader_merged =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+
+        // Verify vector search works
+        let vec_reader = reader_merged.vec().expect("get vector reader");
+        let search_results = vec_reader
+            .search(
+                "emb",
+                &[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+                10,
+                4,
+                100,
+            )
+            .expect("vector search");
+        assert!(
+            !search_results.is_empty(),
+            "vector search should return results"
+        );
+
+        // Verify FTS search works
+        let fts_reader = reader_merged.fts().expect("get fts reader");
+        let fts_results = fts_reader
+            .search("title", &["hello"], 10, BoolMode::Or)
+            .await
+            .expect("fts search");
+        assert!(!fts_results.is_empty(), "fts search should return results");
+
+        // Verify parquet query works
+        let batch = reader_merged.get_record_batch().expect("get_record_batch");
+        assert_eq!(batch.num_rows(), 2);
     }
 }
