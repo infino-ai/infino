@@ -33,9 +33,9 @@ use crate::supertable::query::{SearchHit, SuperfileHit};
 /// Resolve segment-local hits to public [`SearchHit`]s: read the `_id`
 /// column (named `id_col`) for each `(segment, local_doc_id)` and pair
 /// it with the hit's score, preserving the kernel's rank order. Backs
-/// the lightweight public `Supertable::bm25_hits` / `vector_hits` /
-/// `token_match` / `exact_match`, which expose `_id` + score rather
-/// than the internal segment-local position.
+/// the lightweight public `Supertable::token_match` / `exact_match`,
+/// which expose `_id` + score rather than the internal segment-local
+/// position.
 pub(crate) async fn resolve_search_hits(
     reader: &SupertableReader,
     hits: &[SuperfileHit],

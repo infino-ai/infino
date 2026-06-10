@@ -33,8 +33,9 @@
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
 //!
-//! Scale (`INFINO_BENCH_DOC_COUNT`, a plain integer applied to whichever
-//! tier runs) and object-store backend (`INFINO_BENCH_STORE`) are env knobs.
+//! Scale (`INFINO_BENCH_SUPERFILE_DOCS`, `INFINO_BENCH_SUPERTABLE_DOCS` —
+//! plain integers) and object-store backend (`INFINO_BENCH_STORE`) are env
+//! knobs.
 
 use infino_bench_utils::supertable::Phases;
 

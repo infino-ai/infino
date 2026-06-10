@@ -298,7 +298,8 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
-             INFINO_BENCH_DOC_COUNT='${{ inputs.docs }}' \
+             INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              KEEP='${{ inputs.keep_table }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log

@@ -21,7 +21,7 @@ use crate::tiers;
 
 /// Supertable-shape document count — the supplied parameter. Default 10M
 /// ([`crate::corpus::supertable_docs`]); override with
-/// `INFINO_BENCH_DOC_COUNT`.
+/// `INFINO_BENCH_SUPERTABLE_DOCS`.
 pub fn n_docs() -> usize {
     corpus::supertable_docs()
 }
