@@ -44,6 +44,13 @@ use object_store::{
 
 use crate::superfile::LazyByteSource;
 
+/// Fixed `last_modified` reported for every registered segment.
+/// Superfiles are immutable once committed, so a wall-clock timestamp
+/// carries no signal here — and a value that changed on every call
+/// would defeat any downstream cache keyed on `(path, last_modified)`
+/// and make responses non-deterministic.
+const SEGMENT_LAST_MODIFIED: chrono::DateTime<chrono::Utc> = chrono::DateTime::UNIX_EPOCH;
+
 /// Read-only [`ObjectStore`] backed by per-segment [`LazyByteSource`]s.
 ///
 /// Construct via [`from_sources`](Self::from_sources) with the byte
@@ -111,7 +118,7 @@ impl ObjectStore for SuperfileObjectStore {
         let size = source.size();
         let meta = ObjectMeta {
             location: location.clone(),
-            last_modified: chrono::Utc::now(),
+            last_modified: SEGMENT_LAST_MODIFIED,
             size,
             e_tag: None,
             version: None,
@@ -230,6 +237,40 @@ mod tests {
 
         let head = store.head(&p).await.expect("head");
         assert_eq!(head.size, 10);
+    }
+
+    #[tokio::test]
+    async fn offset_and_suffix_ranges_resolve_and_clamp() {
+        let (store, p) = store_with("seg-a.parquet", b"0123456789");
+
+        // Offset: from `start` to the end; a past-the-end start clamps
+        // to an empty read instead of erroring.
+        let tail = get_with_range(&store, &p, GetRange::Offset(7)).await;
+        assert_eq!(&tail[..], b"789");
+        let empty = get_with_range(&store, &p, GetRange::Offset(99)).await;
+        assert!(empty.is_empty());
+
+        // Suffix: the last `n` bytes; an oversized suffix clamps to the
+        // whole object.
+        let suffix = get_with_range(&store, &p, GetRange::Suffix(4)).await;
+        assert_eq!(&suffix[..], b"6789");
+        let all = get_with_range(&store, &p, GetRange::Suffix(99)).await;
+        assert_eq!(&all[..], b"0123456789");
+    }
+
+    /// `get_opts` with an explicit [`GetRange`], collected to bytes.
+    async fn get_with_range(store: &SuperfileObjectStore, p: &ObjPath, range: GetRange) -> Bytes {
+        let options = GetOptions {
+            range: Some(range),
+            ..Default::default()
+        };
+        store
+            .get_opts(p, options)
+            .await
+            .expect("get_opts")
+            .bytes()
+            .await
+            .expect("bytes")
     }
 
     #[tokio::test]
