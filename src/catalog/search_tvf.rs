@@ -4,10 +4,11 @@
 //! Catalog-level search table-valued functions.
 //!
 //! The single-table search TVFs (`bm25_search` / `bm25_search_prefix` /
-//! `vector_search` / `hybrid_search`) capture one supertable reader and
-//! take column-first arguments — they bind to the lone `FROM supertable`
-//! provider. Under the catalog, several tables share one session, so the
-//! TVF can't know which table it targets from a bare column.
+//! `vector_search` / `hybrid_search` / `token_match` / `exact_match`)
+//! capture one supertable reader and take column-first arguments — they
+//! bind to the lone `FROM supertable` provider. Under the catalog,
+//! several tables share one session, so the TVF can't know which table
+//! it targets from a bare column.
 //!
 //! These adapters add a **leading table-name argument**
 //! (`bm25_search('users', 'body', 'q', 10)`): each resolves that table's
@@ -33,6 +34,9 @@ use crate::supertable::query::exec::fts_exec::{
     BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc,
 };
 use crate::supertable::query::exec::hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc};
+use crate::supertable::query::exec::match_exec::{
+    EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc,
+};
 use crate::supertable::query::exec::vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc};
 
 /// A resolved table's pinned snapshot: the reader the search kernels run
@@ -132,6 +136,18 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
         }),
     );
     ctx.register_udtf(
+        TOKEN_MATCH_UDTF,
+        Arc::new(TokenMatchCatalogFunc {
+            resolver: Arc::clone(&resolver),
+        }),
+    );
+    ctx.register_udtf(
+        EXACT_MATCH_UDTF,
+        Arc::new(ExactMatchCatalogFunc {
+            resolver: Arc::clone(&resolver),
+        }),
+    );
+    ctx.register_udtf(
         HYBRID_SEARCH_UDTF,
         Arc::new(HybridSearchCatalogFunc { resolver }),
     );
@@ -178,5 +194,27 @@ impl TableFunctionImpl for HybridSearchCatalogFunc {
     fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
         let (t, rest) = self.resolver.split_leading(args, "hybrid_search")?;
         HybridSearchFunc::new(t.reader, t.scalar_schema).call(rest)
+    }
+}
+
+#[derive(Debug)]
+struct TokenMatchCatalogFunc {
+    resolver: Arc<TableResolver>,
+}
+impl TableFunctionImpl for TokenMatchCatalogFunc {
+    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args, "token_match")?;
+        TokenMatchFunc::new(t.reader, t.scalar_schema).call(rest)
+    }
+}
+
+#[derive(Debug)]
+struct ExactMatchCatalogFunc {
+    resolver: Arc<TableResolver>,
+}
+impl TableFunctionImpl for ExactMatchCatalogFunc {
+    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args, "exact_match")?;
+        ExactMatchFunc::new(t.reader, t.scalar_schema).call(rest)
     }
 }

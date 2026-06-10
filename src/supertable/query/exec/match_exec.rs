@@ -92,7 +92,7 @@ pub(crate) struct TokenMatchFunc {
 }
 
 impl TokenMatchFunc {
-    fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
+    pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
             reader,
@@ -135,7 +135,7 @@ pub(crate) struct ExactMatchFunc {
 }
 
 impl ExactMatchFunc {
-    fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
+    pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
             reader,

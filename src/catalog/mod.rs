@@ -760,6 +760,51 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_match_tvfs_resolve_table() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&[
+            "the quick brown fox",
+            "a lazy dog",
+            "quick thinking",
+        ]))
+        .expect("append");
+
+        // Unranked token match: rows containing the token, any order.
+        let rows: usize = conn
+            .query_sql("SELECT _id FROM token_match('docs', 'title', 'quick')")
+            .expect("token_match tvf")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "two docs contain 'quick'");
+
+        // Set algebra over index-bounded candidate sets.
+        let rows: usize = conn
+            .query_sql(
+                "SELECT _id FROM token_match('docs', 'title', 'quick') \
+                 EXCEPT \
+                 SELECT _id FROM token_match('docs', 'title', 'fox')",
+            )
+            .expect("EXCEPT over token_match")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "'quick thinking' has quick but not fox");
+
+        // Exact raw-string match.
+        let rows: usize = conn
+            .query_sql("SELECT _id FROM exact_match('docs', 'title', 'a lazy dog')")
+            .expect("exact_match tvf")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "one doc equals the raw string exactly");
+    }
+
+    #[test]
     fn localfs_with_disk_cache() {
         let root = tempfile::tempdir().expect("tempdir");
         let cache = tempfile::tempdir().expect("cache tempdir");
