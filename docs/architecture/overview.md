@@ -55,8 +55,14 @@ Think of three ideas:
 
 ## Opening Infino
 
-There is no server to run. You open a **connection** to a root location
-on storage and work with tables through it:
+Infino is an **embedded engine, not a server** — it runs inside your
+process, the way SQLite or DuckDB do. You install it as a library (the
+Rust crate via `cargo add infino`, or the Python wheel via
+`pip install infino`) and open a **connection** to a root location on
+storage from your own code; the engine, including its SQL (DataFusion
+under the hood), executes in-process. There is no wire protocol yet, so
+external SQL clients can't attach — SQL is reached through the
+connection's `query_sql`. From that connection you work with tables:
 
 - `connect("s3://bucket/prefix")` (or a local path, or `memory://`)
   returns a **`Connection`** — a *catalog of tables* persisted at that

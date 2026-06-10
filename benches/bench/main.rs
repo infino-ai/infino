@@ -28,7 +28,9 @@
 //!   modality    : `fts` | `vector` | `sql`          (omitted => all three)
 //!   phase       : `build` | `warm` | `cold` | `search` (= warm+cold)
 //!                 (omitted => all three phases)
-//!   `all`       : explicit "every tier × modality" (the default)
+//!   `all`       : explicit "every tier × modality × phase" (the default).
+//!                 Matrix only — diagnostics are NEVER implied by `all` or
+//!                 by a bare `cargo bench`; run them by name.
 //!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `object-store`
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
