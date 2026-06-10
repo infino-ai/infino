@@ -23,7 +23,6 @@
 use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
-use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::vector::reader::VectorReader;
 use arrow::compute::{concat_batches, take};
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
@@ -673,6 +672,14 @@ impl SuperfileReader {
     /// `query` is tokenized by the same v1 tokenizer used at build
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
     /// ordered by descending score.
+    ///
+    /// ## Negation (`-term`)
+    ///
+    /// A `-`-prefixed term excludes every doc containing it, regardless
+    /// of score; `mode` applies to the positive terms only. Example:
+    /// `"rust -python"` scores docs with `rust`, dropping any that also
+    /// contain `python`. A query with only negated terms is rejected
+    /// (`FtsError::NegationOnly`).
     pub async fn bm25_search(
         &self,
         column: &str,
@@ -681,9 +688,11 @@ impl SuperfileReader {
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        let term_strings: Vec<String> = tok.tokenize(query).collect();
-        let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
-        self.bm25_search_pretokenized(column, &term_refs, k, mode)
+        // Lift the `-` sigil before tokenizing — the tokenizer splits on `-`.
+        let parsed = crate::superfile::fts::parser::parse(query, &tok);
+        let positives: Vec<&str> = parsed.positives.iter().map(|s| s.as_str()).collect();
+        let negatives: Vec<&str> = parsed.negatives.iter().map(|s| s.as_str()).collect();
+        self.bm25_search_pretokenized_excluding(column, &positives, &negatives, k, mode)
             .await
     }
 
@@ -796,6 +805,26 @@ impl SuperfileReader {
             }
         }
         Ok(out)
+    }
+
+    /// Pre-tokenized BM25 search with negated terms excluded — the
+    /// negation sibling of [`Self::bm25_search_pretokenized`]. The
+    /// supertable fan-out parses the `-` sigil once at the orchestrator
+    /// and hands every segment the split lists through here.
+    pub(crate) async fn bm25_search_pretokenized_excluding(
+        &self,
+        column: &str,
+        positives: &[&str],
+        negatives: &[&str],
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .search_excluding(column, positives, negatives, k, mode)
+            .await?)
     }
 
     /// Prefix-expanded BM25 search.

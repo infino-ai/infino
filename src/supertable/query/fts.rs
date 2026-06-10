@@ -101,26 +101,28 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
-        // Tokenize ONCE at the orchestrator. The pre-tokenized
-        // term slice is reused both for the list-level + per-
-        // segment bloom-skip masks AND for each per-segment
-        // search via SuperfileReader::bm25_search_pretokenized —
-        // eliminating the (N+1)·T redundant tokenizations a
-        // per-segment bm25_search would incur for N superfiles +
-        // a T-token query.
-        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
-        let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
+        // Parse + tokenize ONCE at the orchestrator (the `-` sigil
+        // splits negated terms out). The split lists are reused for the
+        // bloom-skip masks and for every per-segment search, instead of
+        // re-parsing per segment.
+        let parsed = crate::superfile::fts::parser::parse(query, &AsciiLowerTokenizer);
+        let positives = parsed.positives;
+        let negatives = parsed.negatives;
 
         // Segment selection via the shared two-tier prune
         // (`query::prune::select_segments`): part-level bloom-union
         // skip → lazy-load surviving parts → per-segment bloom skip.
         // FTS exact search is the single-`TermPresence`-leaf case of
         // the same path SQL scalar filtering uses.
+        // Only POSITIVE terms prune. A negated term must never drop a
+        // segment: a segment without it is the best case (none of its
+        // docs can be excluded), and under `And` it would even prune
+        // every segment that lacks the negated term.
         let kept = crate::supertable::query::prune::select_segments(
             manifest.as_ref(),
             &[crate::supertable::query::prune::PruneLeaf::TermPresence {
                 column: column_owned.clone(),
-                terms: term_strings.clone(),
+                terms: positives.clone(),
                 mode,
             }],
         )
@@ -135,11 +137,13 @@ impl SupertableReader {
         // sub-ranges so the fan-out can saturate every pool thread.
         // Single-term OR and AND stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        let work_units = build_or_work_units(&kept_refs, mode, term_refs.len(), pool_threads);
+        let fanout = fanout_for(mode, positives.len(), !negatives.is_empty());
+        let work_units = build_work_units(&kept_refs, fanout, pool_threads);
         let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
             work_units.into_iter().map(|u| (u.entry, u.range)).collect();
 
-        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let term_arc: Arc<Vec<String>> = Arc::new(positives);
+        let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let column_arc = Arc::new(column_owned);
 
         // One shared fan-out (`query::dispatch::fanout`) — the same
@@ -152,17 +156,32 @@ impl SupertableReader {
         let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
+            let neg_arc = Arc::clone(&neg_arc);
             async move {
                 let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 match range {
+                    // Ranged units exist only for negation-free queries
+                    // (`build_or_work_units` never slices otherwise).
                     Some((start, end)) => r
                         .bm25_search_or_range_pretokenized(&column_arc, &term_refs, k, start, end)
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string())),
-                    None => r
+                    None if neg_arc.is_empty() => r
                         .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string())),
+                    None => {
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        r.bm25_search_pretokenized_excluding(
+                            &column_arc,
+                            &term_refs,
+                            &neg_refs,
+                            k,
+                            mode,
+                        )
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))
+                    }
                 }
             }
         };
@@ -220,13 +239,10 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Same sub-range fan-out logic as `bm25_search`. `n_terms=2`
-        // stands in for "multi-term OR enabled" — the prefix path
-        // always runs BoolMode::Or and expansion typically yields ≥2
-        // terms at the scales we care about.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        let work_units =
-            build_or_work_units(&kept_refs, BoolMode::Or, OR_FANOUT_MIN_TERMS, pool_threads);
+        // Prefix expansion is always multi-term OR with no negation, so
+        // it is directly sub-range eligible.
+        let work_units = build_work_units(&kept_refs, FanOut::SubRanges, pool_threads);
         let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
             work_units.into_iter().map(|u| (u.entry, u.range)).collect();
 
@@ -362,6 +378,13 @@ impl SupertableReader {
     /// Drives the internal async kernel to completion via the
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
     /// to `k` hits sorted by BM25 score *descending*.
+    ///
+    /// ## Negation (`-term`)
+    ///
+    /// A `-`-prefixed query term excludes every doc containing it,
+    /// regardless of score; `mode` applies to the positive terms only.
+    /// `"rust -python"` scores docs with `rust`, dropping any that also
+    /// contain `python`. A query with only negated terms is an error.
     pub fn bm25_search(
         &self,
         column: &str,
@@ -429,35 +452,49 @@ const SUBRANGE_MIN_DOCS: u32 = 50_000;
 
 /// Minimum query term count that makes OR sub-range fan-out eligible.
 /// The range-aware Block-Max MaxScore path is only wired up for
-/// multi-term OR, so single-term queries stay whole-segment. The
-/// prefix path passes this value to stand in for "multi-term OR
-/// enabled" since prefix expansion is always OR-scored.
+/// multi-term OR, so single-term queries stay whole-segment.
 const OR_FANOUT_MIN_TERMS: usize = 2;
 
-/// Decide how to slice the kept superfiles into parallel work units.
-/// Returns one [`WorkUnit`] per (segment, doc_id sub-range) tuple.
+/// How a query fans out over the kept segments.
+enum FanOut {
+    /// One un-ranged unit per segment.
+    PerSegment,
+    /// Additionally slice big segments into doc-id sub-ranges when the
+    /// reader pool has spare threads.
+    SubRanges,
+}
+
+/// Pick the fan-out for a term query: only multi-term OR has a
+/// range-aware kernel, and negation has no ranged kernel (v1), so
+/// everything else stays one un-ranged unit per segment.
+fn fanout_for(mode: BoolMode, n_positives: usize, has_negatives: bool) -> FanOut {
+    if mode == BoolMode::Or && n_positives >= OR_FANOUT_MIN_TERMS && !has_negatives {
+        FanOut::SubRanges
+    } else {
+        FanOut::PerSegment
+    }
+}
+
+/// Slice the kept superfiles into parallel work units — one
+/// [`WorkUnit`] per (segment, doc_id sub-range) tuple.
 ///
-/// Fan-out happens only when:
-///   1. The query is `BoolMode::Or` with two or more terms — the
-///      only shape the range-aware BMM is wired up for.
-///   2. The reader pool has more threads than kept superfiles —
+/// `FanOut::SubRanges` slices only when:
+///   1. The reader pool has more threads than kept superfiles —
 ///      otherwise every thread is already saturated by one segment
 ///      and splitting just adds overhead.
-///   3. The candidate sub-range width is at least
+///   2. The candidate sub-range width is at least
 ///      `SUBRANGE_MIN_DOCS` — below that, BMM bookkeeping +
 ///      cross-sub-range top-K merge dominate the parallel win.
 ///
 /// Otherwise each kept segment becomes a single un-ranged work unit
 /// — identical to the original `par_iter` over superfiles shape.
-fn build_or_work_units(
+fn build_work_units(
     kept: &[&Arc<SuperfileEntry>],
-    mode: BoolMode,
-    n_terms: usize,
+    fanout: FanOut,
     pool_threads: usize,
 ) -> Vec<WorkUnit> {
-    let fanout_eligible = mode == BoolMode::Or && n_terms >= OR_FANOUT_MIN_TERMS;
     let want_subranges = pool_threads.div_ceil(kept.len().max(1)).max(1);
-    if !fanout_eligible || want_subranges <= 1 {
+    if matches!(fanout, FanOut::PerSegment) || want_subranges <= 1 {
         return kept
             .iter()
             .map(|e| WorkUnit {
@@ -654,6 +691,68 @@ mod tests {
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = bytes::Bytes::from(b.finish().expect("finish"));
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
+    }
+
+    #[test]
+    fn negation_excludes_across_segments() {
+        // 3 commits → 3 segments. "alpha -beta" must drop the one doc
+        // containing beta and keep the other two alpha docs.
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["alpha delta"])).expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(3, &["beta gamma"])).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let hits = r
+            .bm25_search("title", "alpha -beta", 10, BoolMode::Or)
+            .expect("negation search");
+        assert_eq!(hits.len(), 2, "alpha minus beta: {hits:?}");
+
+        // Positive-only stays untouched: all three alpha docs.
+        let hits = r
+            .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .expect("positive search");
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn negated_term_does_not_prune_segments() {
+        // "delta" exists only in segment 2. Under And, if the negated
+        // term leaked into the bloom prune, segments 1 and 3 (no delta)
+        // would be wrongly dropped and the result would be empty; the
+        // correct answer is segment 1's two alpha docs.
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha one", "alpha two"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["alpha delta"])).expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(3, &["gamma three"])).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let hits = r
+            .bm25_search("title", "alpha -delta", 10, BoolMode::And)
+            .expect("negation search");
+        assert_eq!(hits.len(), 2, "alpha minus delta: {hits:?}");
+    }
+
+    #[test]
+    fn negation_only_query_errors() {
+        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta"])).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let res = r.bm25_search("title", "-alpha", 10, BoolMode::Or);
+        assert!(res.is_err(), "negation-only must error; got {res:?}");
     }
 
     #[test]

@@ -230,6 +230,25 @@ const PROBE_SHAPES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Negation (`-term`) queries, timed through the string `bm25_search`
+/// path — the engine-generic battery is pretokenized and can't carry
+/// the sigil. Mid-frequency positives so scores differentiate; the
+/// negated term is common (long excluded list) or rare.
+const NEGATION_QUERIES: &[(&str, &str, BoolMode)] = &[
+    ("mid_pos_common_neg", "term00050 -term00005", BoolMode::Or),
+    ("mid_pos_rare_neg", "term00050 -term09000", BoolMode::Or),
+    (
+        "two_mid_or_common_neg",
+        "term00050 term00100 -term00005",
+        BoolMode::Or,
+    ),
+    (
+        "two_mid_and_common_neg",
+        "term00050 term00100 -term00005",
+        BoolMode::And,
+    ),
+];
+
 // ─── Correctness (infino-only oracle) ─────────────────────────────────
 
 fn assert_superfile_self_consistent(reader: &SuperfileReader, n_docs: usize) {
@@ -341,6 +360,29 @@ fn assert_bmw_matches_brute_force(reader: &SuperfileReader) -> usize {
     battery.len()
 }
 
+/// Negation correctness gate: each query must return hits, and no hit's
+/// doc may contain a negated term (checked against the corpus text).
+fn assert_negation_excludes(reader: &SuperfileReader, docs: &[(u64, &str)]) {
+    for (name, query, mode) in NEGATION_QUERIES {
+        let negated: Vec<&str> = query
+            .split_whitespace()
+            .filter_map(|r| r.strip_prefix('-'))
+            .collect();
+        let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, query, K, to_infino_mode(*mode)))
+            .expect("negation oracle search");
+        assert!(!hits.is_empty(), "{name}: no hits");
+        for (doc_id, _) in &hits {
+            let text = docs[*doc_id as usize].1;
+            for neg in &negated {
+                assert!(
+                    !text.split_whitespace().any(|w| w == *neg),
+                    "{name}: doc {doc_id} contains negated term {neg:?}"
+                );
+            }
+        }
+    }
+}
+
 // ─── Manual timing helpers (infino-only extras) ───────────────────────
 
 /// Nearest-rank p50 of a duration set (sorts in place).
@@ -359,18 +401,41 @@ fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
     }
 }
 
+/// One warmup call, then `HOT_ITERS` timed calls of `run`; returns the
+/// p50. Shared scaffold for every manual hot-timing path.
+fn hot_p50<T>(mut run: impl FnMut() -> T) -> Duration {
+    std::hint::black_box(run());
+    let mut samples = Vec::with_capacity(HOT_ITERS);
+    for _ in 0..HOT_ITERS {
+        let t = Instant::now();
+        let out = run();
+        samples.push(t.elapsed());
+        std::hint::black_box(out);
+    }
+    p50(&mut samples)
+}
+
 /// WAND+BMW vs MaxScore+BMM p50 for one OR shape, via the infino
 /// internal per-algorithm hook.
 fn probe_algo_p50(reader: &SuperfileReader, terms: &[&str], algo: OrAlgo) -> Duration {
     let fts = reader.fts().expect("FTS subsection");
+    hot_p50(|| {
+        block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
+            .expect("probe search")
+    })
+}
+
+/// Hot p50 for one negation query, through the string `bm25_search`
+/// path (which parses the `-` sigil).
+fn negation_p50(reader: &SuperfileReader, query: &str, mode: InfinoBoolMode) -> Duration {
     // Warmup.
-    let _ = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
-        .expect("probe warmup");
+    let _ =
+        block_on_inmem(reader.bm25_search(FTS_COLUMN, query, K, mode)).expect("negation warmup");
     let mut samples = Vec::with_capacity(HOT_ITERS);
     for _ in 0..HOT_ITERS {
         let t = Instant::now();
-        let hits = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
-            .expect("probe search");
+        let hits = block_on_inmem(reader.bm25_search(FTS_COLUMN, query, K, mode))
+            .expect("negation search");
         samples.push(t.elapsed());
         std::hint::black_box(hits);
     }
@@ -498,6 +563,15 @@ pub fn run() {
             let bmm = probe_algo_p50(reader, terms, OrAlgo::Bmm);
             probes.push((shape, wand, bmm));
         }
+        // Infino-only: negation (`-term`) family — correctness gate,
+        // then hot p50 through the string path.
+        eprintln!("[superfile_fts] negation: correctness + hot p50...");
+        assert_negation_excludes(reader, &docs);
+        let negations: Vec<(&'static str, Duration)> = NEGATION_QUERIES
+            .iter()
+            .map(|(name, query, mode)| (*name, negation_p50(reader, query, to_infino_mode(*mode))))
+            .collect();
+
         // Cold tier: commit the same bytes to object storage, then read
         // each query through the production cold path.
         eprintln!(
@@ -508,7 +582,7 @@ pub fn run() {
         )));
         let cold = measure_cold(&committed);
 
-        emit_search(&mut report, n_docs, &result, &cold, &probes);
+        emit_search(&mut report, n_docs, &result, &cold, &probes, &negations);
     }
 
     report.save();
@@ -661,6 +735,7 @@ fn emit_search(
     result: &EngineFtsResult,
     cold: &HashMap<&'static str, Duration>,
     probes: &[(&'static str, Duration, Duration)],
+    negations: &[(&'static str, Duration)],
 ) {
     let by_name: HashMap<&'static str, &QueryStats> =
         result.queries.iter().map(|q| (q.name, q)).collect();
@@ -680,6 +755,17 @@ fn emit_search(
         rows: AND_QUERIES
             .iter()
             .map(|&n| search_row(n, &by_name, cold))
+            .collect(),
+    };
+    let negation_block = Block {
+        subtitle: "Negation (`-term`) queries, hot only".into(),
+        headers: headers(&["Query", "hot"]),
+        rows: negations
+            .iter()
+            .map(|(name, d)| {
+                let ns = d.as_secs_f64() * NS_PER_SEC;
+                vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+            })
             .collect(),
     };
     let probe_block = Block {
@@ -709,6 +795,6 @@ fn emit_search(
                cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` \
                (production cold path). Δ is vs the previous run."
             .into(),
-        blocks: vec![or_block, and_block, probe_block],
+        blocks: vec![or_block, and_block, negation_block, probe_block],
     });
 }

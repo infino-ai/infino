@@ -126,7 +126,52 @@ _Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts` to populat
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
-_Run `INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts` to populate._
+### Superfile FTS — search, single-segment / in-memory (1M docs)
+
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Hot = `SuperfileReader::open` in memory (p50 via the engine-generic `run_fts` driver); cold = same `.parquet` on object storage via `DiskCacheStore::reader` → `bm25_search` (production cold path). Δ is vs the previous run.
+
+**OR queries**
+
+| Query | hot | cold | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- |
+| single_rare | 833 ns (new) | 6.51 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| single_df1 | 375 ns (new) | 4.89 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| single_common | 17.96 µs (new) | 6.51 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| two_term_or | 242.46 µs (new) | 6.57 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| three_wide_or | 2.87 ms (new) | 6.53 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| three_similar_or | 11.41 ms (new) | 6.56 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| five_term_or | 19.66 ms (new) | 6.68 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| ten_term_or | 62.91 ms (new) | 6.74 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+
+**AND queries**
+
+| Query | hot | cold | Peak RSS | Median RSS | P90 RSS |
+| --- | --- | --- | --- | --- | --- |
+| two_term_and | 268.58 µs (new) | 6.71 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| three_wide_and | 4.20 ms (new) | 6.67 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| three_similar_and | 6.85 ms (new) | 6.70 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| five_term_and | 8.12 ms (new) | 6.71 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| ten_term_and | 9.74 ms (new) | 6.71 s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+
+**Negation (`-term`) queries, hot only**
+
+| Query | hot |
+| --- | --- |
+| mid_pos_common_neg | 1.47 ms (new) |
+| mid_pos_rare_neg | 26.79 µs (new) |
+| two_mid_or_common_neg | 4.58 ms (new) |
+| two_mid_and_common_neg | 4.97 ms (new) |
+
+**Per-algorithm probes (WAND+BMW vs MaxScore+BMM)**
+
+| Shape | WAND+BMW | MaxScore+BMM |
+| --- | --- | --- |
+| wide_3_or | 9.21 ms (new) | 2.95 ms (new) |
+| similar_3_or | 17.27 ms (new) | 11.40 ms (new) |
+| similar_5_or | 48.73 ms (new) | 20.03 ms (new) |
+| similar_10_or | 399.90 ms (new) | 62.94 ms (new) |
 <!-- END: bench/fts/superfile/search -->
 
 ### FTS — supertable (multi-segment, 10M docs)

@@ -633,31 +633,75 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
+        self.search_positive(column_id, terms, k, mode, None).await
+    }
 
-        // Single-term fast path: BlockMaxWAND-driven block skipping.
-        // Walks blocks in order, populating a top-k min-heap. Once the
-        // heap is full, blocks whose skip-table-recorded `max_bm25`
-        // can't beat the heap's worst score are skipped without
-        // decoding.
-        if terms.len() == 1 {
-            return self.search_single_term_bmw(column_id, terms[0], k).await;
+    /// BM25 search with negated (`-term`) terms excluded.
+    ///
+    /// `positives` are scored under `mode` as in [`Self::search`];
+    /// `negatives` filter out any doc containing one of them, regardless
+    /// of score. Both lists are already tokenized.
+    ///
+    /// No positives → [`FtsError::NegationOnly`] (nothing to rank).
+    /// Empty positives *and* negatives → empty result.
+    pub async fn search_excluding(
+        &self,
+        column: &str,
+        positives: &[&str],
+        negatives: &[&str],
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if k == 0 {
+            return Ok(Vec::new());
         }
+        if positives.is_empty() {
+            if negatives.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(FtsError::NegationOnly);
+        }
+        // Negated cursors are built separately from the positives: a
+        // term missing from the dictionary yields no cursor (excludes
+        // nothing) and must not trip the positive AND's cursor-count
+        // check. No negatives → `None`; positive-only queries skip all
+        // of this.
+        if negatives.is_empty() {
+            self.search_positive(column_id, positives, k, mode, None)
+                .await
+        } else {
+            let mut filter =
+                ExcludeFilter::new(self.build_term_cursors(column_id, negatives).await?);
+            self.search_positive(column_id, positives, k, mode, Some(&mut filter))
+                .await
+        }
+    }
 
-        // Multi-term routing:
-        //   OR  → MaxScore+BMM via `dispatch_multi_term_or`. WAND+BMW
-        //         remains in-tree for `search_with_algo_for_bench` but
-        //         is not on the production path; see the routing-
-        //         decision table on `dispatch_multi_term_or`.
-        //   AND → leapfrog intersection over the skip table via
-        //         `run_and_intersect`. Both share cursor construction
-        //         with the OR path so neither pays for cursor work
-        //         twice when the bench harness compares them.
+    /// Shared dispatch for [`Self::search`] and [`Self::search_excluding`]:
+    /// routes positives to the single-term / OR / AND kernel and threads
+    /// `filter` through to the heap-admission sites.
+    async fn search_positive(
+        &self,
+        column_id: u32,
+        terms: &[&str],
+        k: usize,
+        mode: BoolMode,
+        filter: Option<&mut ExcludeFilter>,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if terms.len() == 1 {
+            return self
+                .search_single_term_bmw(column_id, terms[0], k, filter)
+                .await;
+        }
         match mode {
-            BoolMode::Or => self.dispatch_multi_term_or(column_id, terms, k).await,
+            BoolMode::Or => {
+                self.dispatch_multi_term_or(column_id, terms, k, filter)
+                    .await
+            }
             BoolMode::And => {
                 // Build cursors; if any term is missing, the
                 // intersection is empty.
@@ -665,7 +709,7 @@ impl FtsReader {
                 if cursors.len() != terms.len() {
                     return Ok(Vec::new());
                 }
-                self.run_and_intersect(column_id, cursors, k)
+                self.run_and_intersect(column_id, cursors, k, filter)
             }
         }
     }
@@ -775,7 +819,8 @@ impl FtsReader {
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.run_max_score_bmm_range(column_id, cursors, k, doc_id_start, doc_id_end)
+        // The ranged (sub-range fan-out) path carries no negation in v1.
+        self.run_max_score_bmm_range(column_id, cursors, k, doc_id_start, doc_id_end, None)
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -826,6 +871,7 @@ impl FtsReader {
         column_id: u32,
         term: &str,
         k: usize,
+        mut filter: Option<&mut ExcludeFilter>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -845,6 +891,12 @@ impl FtsReader {
                 // is the entire result for any k ≥ 1.
                 let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
+                // Drop the lone match if a negated term excludes it.
+                if let Some(f) = filter.as_deref_mut()
+                    && !f.admits(doc_id)
+                {
+                    return Ok(Vec::new());
+                }
                 let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
                 let score =
                     crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
@@ -904,6 +956,12 @@ impl FtsReader {
 
             for j in 0..n {
                 let doc_id = buf_d[j];
+                // Drop docs excluded by a negated term (None = keep all).
+                if let Some(f) = filter.as_deref_mut()
+                    && !f.admits(doc_id)
+                {
+                    continue;
+                }
                 let tf = buf_t[j];
                 let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
                     idf_x_k1p1,
@@ -1246,8 +1304,9 @@ impl FtsReader {
         column_id: u32,
         cursors: Vec<TermCursor>,
         k: usize,
+        filter: Option<&mut ExcludeFilter>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX)
+        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX, filter)
     }
 
     /// Multi-term AND via leapfrog intersection over the skip table.
@@ -1274,6 +1333,7 @@ impl FtsReader {
         column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
+        filter: Option<&mut ExcludeFilter>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         if cursors.is_empty() {
             return Ok(Vec::new());
@@ -1299,9 +1359,9 @@ impl FtsReader {
         // straightforwardly generalize and the per-doc leapfrog still
         // amortizes well with the block-max pruning below.
         if cursors.len() == 2 {
-            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, k, &mut heap);
+            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, k, &mut heap, filter);
         } else {
-            self.run_and_intersect_general(&mut cursors, dl_norm_k1, k, &mut heap);
+            self.run_and_intersect_general(&mut cursors, dl_norm_k1, k, &mut heap, filter);
         }
 
         Ok(drain_top_k_desc(heap))
@@ -1322,6 +1382,7 @@ impl FtsReader {
         dl_norm_k1: &[f32],
         k: usize,
         heap: &mut BinaryHeap<TopKEntry>,
+        mut filter: Option<&mut ExcludeFilter>,
     ) {
         'outer: loop {
             if cursors[0].is_exhausted() {
@@ -1431,7 +1492,7 @@ impl FtsReader {
                             norm,
                         );
                     }
-                    and_heap_push(heap, k, score, a);
+                    and_heap_push(heap, k, filter.as_deref_mut(), score, a);
                     i += 1;
                     for o in others.iter_mut() {
                         o.pos += 1;
@@ -1469,6 +1530,7 @@ impl FtsReader {
         dl_norm_k1: &[f32],
         k: usize,
         heap: &mut BinaryHeap<TopKEntry>,
+        mut filter: Option<&mut ExcludeFilter>,
     ) {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
@@ -1547,7 +1609,7 @@ impl FtsReader {
                         c1.block_tfs[j],
                         norm,
                     );
-                    and_heap_push(heap, k, score, a);
+                    and_heap_push(heap, k, filter.as_deref_mut(), score, a);
                     i += 1;
                     j += 1;
                 }
@@ -1594,6 +1656,7 @@ impl FtsReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
+        mut filter: Option<&mut ExcludeFilter>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
@@ -1691,6 +1754,14 @@ impl FtsReader {
                     && cursors[0].current_doc_id() < doc_id_end
                 {
                     let candidate = cursors[0].current_doc_id();
+                    // Drop docs excluded by a negated term (None = keep
+                    // all): skip without scoring.
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(candidate)
+                    {
+                        cursors[0].next();
+                        continue;
+                    }
                     let norm = dl_norm_k1[candidate as usize];
                     let essential_score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
                         cursors[0].idf_x_k1p1,
@@ -1814,91 +1885,102 @@ impl FtsReader {
                 continue;
             }
 
-            // Score essential contributions at the candidate doc.
-            // SIMD-pack up to 4 cursors per scoring call. (Essential
-            // scoring has no early-bail; non-essential scoring below
-            // does, so it stays scalar to keep `score` always
-            // up-to-date for the bail check.)
-            let norm = dl_norm_k1[candidate as usize];
-            let mut score: f32 = 0.0;
-            let mut idfs = [0.0_f32; 4];
-            let mut tfs = [0.0_f32; 4];
-            let mut packed = 0;
-            for cursor in cursors.iter().take(f_essential) {
-                if cursor.current_doc_id() == candidate {
-                    idfs[packed] = cursor.idf_x_k1p1;
-                    tfs[packed] = cursor.current_tf() as f32;
-                    packed += 1;
-                    if packed == 4 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
-                        idfs = [0.0; 4];
-                        tfs = [0.0; 4];
-                        packed = 0;
+            // Drop docs excluded by a negated term before scoring —
+            // the non-essential probes below are the dominant per-doc
+            // cost and an excluded doc can never enter the heap. The
+            // essential-cursor advance after this block still runs, so
+            // the walk progresses.
+            let admitted = match filter.as_deref_mut() {
+                Some(f) => f.admits(candidate),
+                None => true,
+            };
+            if admitted {
+                // Score essential contributions at the candidate doc.
+                // SIMD-pack up to 4 cursors per scoring call. (Essential
+                // scoring has no early-bail; non-essential scoring below
+                // does, so it stays scalar to keep `score` always
+                // up-to-date for the bail check.)
+                let norm = dl_norm_k1[candidate as usize];
+                let mut score: f32 = 0.0;
+                let mut idfs = [0.0_f32; 4];
+                let mut tfs = [0.0_f32; 4];
+                let mut packed = 0;
+                for cursor in cursors.iter().take(f_essential) {
+                    if cursor.current_doc_id() == candidate {
+                        idfs[packed] = cursor.idf_x_k1p1;
+                        tfs[packed] = cursor.current_tf() as f32;
+                        packed += 1;
+                        if packed == 4 {
+                            score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                            idfs = [0.0; 4];
+                            tfs = [0.0; 4];
+                            packed = 0;
+                        }
                     }
                 }
-            }
-            if packed > 0 {
-                score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
-            }
-
-            // Per-doc UB tightening: bound the doc's max possible
-            // score by `essential_score + sum_non_essentials_term_max`.
-            // If even this can't beat threshold, skip the
-            // non-essential probe + heap update entirely. This is
-            // looser than the per-non-essential block_ub bound below
-            // but spares the `skip_to` cursor advances themselves —
-            // those are the dominant per-doc cost.
-            let non_essentials_term_ub = partial_max[f_essential];
-            if score + non_essentials_term_ub > threshold {
-                // Tighter pre-bail using non-essential block_max
-                // (which is tighter than term_max). Use shallow
-                // advance — moves the lightweight inspect-block
-                // pointer to candidate's block without decoding,
-                // amortized O(1). If even this tighter UB can't beat
-                // threshold, skip the deep skip_to pass entirely.
-                let mut remaining_block_ub: f32 = 0.0;
-                for cursor in cursors.iter_mut().skip(f_essential) {
-                    cursor.shallow_advance_block_to(candidate);
-                    remaining_block_ub += cursor.inspect_block_max_bm25();
+                if packed > 0 {
+                    score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
                 }
 
-                if score + remaining_block_ub > threshold {
+                // Per-doc UB tightening: bound the doc's max possible
+                // score by `essential_score + sum_non_essentials_term_max`.
+                // If even this can't beat threshold, skip the
+                // non-essential probe + heap update entirely. This is
+                // looser than the per-non-essential block_ub bound below
+                // but spares the `skip_to` cursor advances themselves —
+                // those are the dominant per-doc cost.
+                let non_essentials_term_ub = partial_max[f_essential];
+                if score + non_essentials_term_ub > threshold {
+                    // Tighter pre-bail using non-essential block_max
+                    // (which is tighter than term_max). Use shallow
+                    // advance — moves the lightweight inspect-block
+                    // pointer to candidate's block without decoding,
+                    // amortized O(1). If even this tighter UB can't beat
+                    // threshold, skip the deep skip_to pass entirely.
+                    let mut remaining_block_ub: f32 = 0.0;
                     for cursor in cursors.iter_mut().skip(f_essential) {
-                        let block_ub = cursor.inspect_block_max_bm25();
-                        if score + remaining_block_ub <= threshold {
-                            break;
+                        cursor.shallow_advance_block_to(candidate);
+                        remaining_block_ub += cursor.inspect_block_max_bm25();
+                    }
+
+                    if score + remaining_block_ub > threshold {
+                        for cursor in cursors.iter_mut().skip(f_essential) {
+                            let block_ub = cursor.inspect_block_max_bm25();
+                            if score + remaining_block_ub <= threshold {
+                                break;
+                            }
+                            cursor.skip_to(candidate);
+                            if cursor.current_doc_id() == candidate {
+                                score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                                    cursor.idf_x_k1p1,
+                                    cursor.current_tf(),
+                                    norm,
+                                );
+                            }
+                            remaining_block_ub -= block_ub;
                         }
-                        cursor.skip_to(candidate);
-                        if cursor.current_doc_id() == candidate {
-                            score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                                cursor.idf_x_k1p1,
-                                cursor.current_tf(),
-                                norm,
-                            );
-                        }
-                        remaining_block_ub -= block_ub;
                     }
                 }
-            }
-            // (If essential score + remaining_block_ub already ≤ threshold,
-            // we don't bother scoring non-essentials — the doc can't beat
-            // the kth-best.)
+                // (If essential score + remaining_block_ub already ≤ threshold,
+                // we don't bother scoring non-essentials — the doc can't beat
+                // the kth-best.)
 
-            // Update heap. `threshold` is kept in sync with
-            // heap.peek().0 every time we mutate the heap, so we can
-            // gate the replace-or-skip decision against the local
-            // f32 instead of paying for a heap.peek() per iter.
-            if heap.len() < k {
-                heap.push(TopKEntry(score, candidate));
-                if heap.len() == k {
+                // Update heap. `threshold` is kept in sync with
+                // heap.peek().0 every time we mutate the heap, so we can
+                // gate the replace-or-skip decision against the local
+                // f32 instead of paying for a heap.peek() per iter.
+                if heap.len() < k {
+                    heap.push(TopKEntry(score, candidate));
+                    if heap.len() == k {
+                        threshold = heap.peek().expect("non-empty").0;
+                        f_essential = recompute_f(&partial_max, threshold);
+                    }
+                } else if score > threshold {
+                    heap.pop();
+                    heap.push(TopKEntry(score, candidate));
                     threshold = heap.peek().expect("non-empty").0;
                     f_essential = recompute_f(&partial_max, threshold);
                 }
-            } else if score > threshold {
-                heap.pop();
-                heap.push(TopKEntry(score, candidate));
-                threshold = heap.peek().expect("non-empty").0;
-                f_essential = recompute_f(&partial_max, threshold);
             }
 
             // Advance every essential cursor that was at the candidate
@@ -2075,12 +2157,13 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         k: usize,
+        filter: Option<&mut ExcludeFilter>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let cursors = self.build_term_cursors(column_id, terms).await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.run_max_score_bmm(column_id, cursors, k)
+        self.run_max_score_bmm(column_id, cursors, k, filter)
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
@@ -2107,8 +2190,9 @@ impl FtsReader {
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
+        // Bench-only selector; never carries negation.
         match algo {
-            OrAlgo::Bmm => self.run_max_score_bmm(column_id, cursors, k),
+            OrAlgo::Bmm => self.run_max_score_bmm(column_id, cursors, k, None),
             OrAlgo::WandBmw => self.run_wand_bmw(column_id, cursors, k),
             OrAlgo::Exhaustive => self.run_exhaustive_union(column_id, cursors, k),
         }
@@ -2164,11 +2248,73 @@ fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
     out
 }
 
+/// Exclusion gate for negated (`-term`) clauses: holds one
+/// [`TermCursor`] per negated term, streamed with `skip_to` (a common
+/// negated list is never fully decoded). A doc is rejected if it appears
+/// in any negated term's list.
+///
+/// Kernels take `Option<&mut ExcludeFilter>` (`None` = no negation)
+/// rather than a generic filter parameter: monomorphizing the OR kernel
+/// measured 25-30% slower even with a no-op filter, while the `None`
+/// branch is constant per query, perfectly predicted, and free.
+struct ExcludeFilter {
+    cursors: Vec<TermCursor>,
+    /// Last doc-id passed to `admits`; guards the monotonic call order.
+    last_doc: u32,
+}
+
+impl ExcludeFilter {
+    fn new(cursors: Vec<TermCursor>) -> Self {
+        Self {
+            cursors,
+            last_doc: 0,
+        }
+    }
+}
+
+impl ExcludeFilter {
+    /// `false` iff `doc` is in any negated list.
+    ///
+    /// `doc` must be non-decreasing across a search: `skip_to` only
+    /// moves forward. Every kernel walks candidates ascending, so this
+    /// holds; the debug-assert guards a future caller that breaks it.
+    #[inline]
+    fn admits(&mut self, doc: u32) -> bool {
+        debug_assert!(
+            doc >= self.last_doc,
+            "ExcludeFilter fed non-monotonic doc: {doc} < {}",
+            self.last_doc
+        );
+        self.last_doc = doc;
+        for c in &mut self.cursors {
+            c.skip_to(doc);
+            if !c.is_exhausted() && c.current_doc_id() == doc {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Push `(score, doc_id)` into the top-k AND heap with the same
 /// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
 /// agree on score-tied docs.
+///
+/// `filter` drops docs excluded by a negated (`-term`) clause before
+/// they enter the heap; `None` admits everything.
 #[inline]
-fn and_heap_push(heap: &mut BinaryHeap<TopKEntry>, k: usize, score: f32, doc_id: u32) {
+fn and_heap_push(
+    heap: &mut BinaryHeap<TopKEntry>,
+    k: usize,
+    filter: Option<&mut ExcludeFilter>,
+    score: f32,
+    doc_id: u32,
+) {
+    if let Some(f) = filter
+        && !f.admits(doc_id)
+    {
+        return;
+    }
     if heap.len() < k {
         heap.push(TopKEntry(score, doc_id));
     } else if let Some(&worst) = heap.peek()
@@ -3283,5 +3429,66 @@ mod tests {
             postings_size_pfor > 20 * 36,
             "PFOR postings region should be hundreds of bytes; got {postings_size_pfor}"
         );
+    }
+
+    // ── ExcludeFilter (negation gate) ─────────────────────────────────
+    // `build_blob` plants: "rust" in docs 0 and 1, "java" in doc 2.
+
+    /// Build an `ExcludeFilter` over `terms` from the planted blob.
+    async fn exclude_filter_for(reader: &FtsReader, terms: &[&str]) -> ExcludeFilter {
+        let column_id = reader.resolve_column_id("body").expect("column exists");
+        let cursors = reader
+            .build_term_cursors(column_id, terms)
+            .await
+            .expect("build cursors");
+        ExcludeFilter::new(cursors)
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_rejects_docs_in_negated_list() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let mut f = exclude_filter_for(&r, &["rust"]).await;
+        // "rust" is in docs 0 and 1 → excluded; doc 2 survives.
+        assert!(!f.admits(0));
+        assert!(!f.admits(1));
+        assert!(f.admits(2));
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_missing_term_excludes_nothing() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // A negated term absent from the dictionary yields no cursor, so
+        // the filter admits every doc.
+        let mut f = exclude_filter_for(&r, &["nonexistent"]).await;
+        assert!(f.admits(0));
+        assert!(f.admits(1));
+        assert!(f.admits(2));
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_multiple_negated_terms() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // Negating "rust" (docs 0,1) and "java" (doc 2) excludes all
+        // three — a doc is dropped if it matches ANY negated term.
+        let mut f = exclude_filter_for(&r, &["rust", "java"]).await;
+        assert!(!f.admits(0));
+        assert!(!f.admits(1));
+        assert!(!f.admits(2));
+    }
+
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "non-monotonic")]
+    async fn exclude_filter_panics_on_non_monotonic_feed() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let mut f = exclude_filter_for(&r, &["rust"]).await;
+        // Feed a descending doc-id: `skip_to` can't seek backwards, so
+        // the debug assertion catches the contract violation.
+        let _ = f.admits(1);
+        let _ = f.admits(0);
     }
 }
