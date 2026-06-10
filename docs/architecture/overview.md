@@ -206,7 +206,7 @@ easy interop with existing data tooling.
 SQL, BM25, and IVF + RaBitQ vectors share one copy of the data and
 one consistency model, instead of syncing a DB + a search engine + a
 vector DB.
-- **Hybrid search is a first-class citizen.** Because every modality shares that one copy and one query path, you fuse keyword (BM25) and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. The same index machinery prunes segments across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
+- **Hybrid search is a first-class citizen — and an access path, not just an API.** In most systems, hybrid search ends at top-k: two retrievals (BM25, ANN) plus rank fusion. Here every modality shares one copy and one query path, so you fuse keyword and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. And because the retrievers are *relations* (table functions) and indexed text predicates resolve to candidate row sets inside the engine, search can be the first stage of a larger SQL plan — feeding joins, filters, and aggregates — rather than its result. The same index machinery prunes segments across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
 
 ### At a glance
 
