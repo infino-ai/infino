@@ -59,6 +59,7 @@ use chrono::Utc;
 use rayon::prelude::*;
 
 use crate::superfile::builder::SuperfileBuilder;
+use crate::supertable::manifest::commit::get_current_manifest_etag;
 
 use super::build::fanout_shards;
 use super::error::BuildError;
@@ -1702,7 +1703,7 @@ async fn try_commit_attempt(
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
 ) -> Result<crate::supertable::manifest::list::ManifestList, crate::supertable::CommitError> {
     use crate::storage::StorageError;
-    use crate::supertable::manifest::commit::{self as commit_mod, POINTER_PATH};
+    use crate::supertable::manifest::commit::{self as commit_mod};
     use crate::supertable::manifest::list::{
         FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
     };
@@ -1908,28 +1909,7 @@ async fn try_commit_attempt(
     // 6. Read the prior pointer's etag for the CAS. Fresh
     //    supertable → no pointer yet → None etag (initial
     //    commit).
-    let prev_etag = match storage.head(POINTER_PATH).await {
-        // Pointer exists with an etag: CAS against it.
-        Ok(meta) if meta.etag.is_some() => meta.etag,
-        // Pointer exists but HEAD returned no etag. Some
-        // S3-compatible stores (e.g. the `s3s-fs` test emulator)
-        // omit the ETag on HeadObject while still returning it on
-        // GetObject. Recover the etag via get() so the CAS uses
-        // `put_if_match` against the live pointer. Treating a
-        // missing etag as "no prior pointer" would downgrade to a
-        // create-only put that fails PreconditionFailed against
-        // the existing pointer on every retry, deadlocking the
-        // OCC loop.
-        Ok(_) => {
-            let (_, meta) = storage
-                .get(POINTER_PATH)
-                .await
-                .map_err(crate::supertable::CommitError::from)?;
-            meta.etag
-        }
-        Err(StorageError::NotFound { .. }) => None,
-        Err(e) => return Err(crate::supertable::CommitError::from(e)),
-    };
+    let prev_etag = get_current_manifest_etag(&storage, old).await?;
 
     // 7. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
