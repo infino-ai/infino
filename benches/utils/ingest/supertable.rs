@@ -217,7 +217,7 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
         let len = end - start;
         // Progress every ~4 commits (plus first + last) to keep the log
         // readable instead of one line per commit.
-        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx % 4 == 0 {
+        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx.is_multiple_of(4) {
             eprintln!(
                 "[supertable_ingest] commit {commit_idx}/{N_COMMIT_CHUNKS} (docs {start}..{})...",
                 end.saturating_sub(1),
@@ -337,7 +337,7 @@ fn build_sql_on_storage(
         let commit_idx = start / chunk_size + 1;
         let end = (start + chunk_size).min(n_docs);
         let len = end - start;
-        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx % 4 == 0 {
+        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx.is_multiple_of(4) {
             eprintln!(
                 "[supertable_ingest] commit {commit_idx}/{N_COMMIT_CHUNKS} (docs {start}..{})...",
                 end.saturating_sub(1),

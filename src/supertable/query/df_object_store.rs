@@ -238,7 +238,7 @@ mod tests {
         let err = store
             .get(&ObjPath::from("missing.parquet"))
             .await
-            .unwrap_err();
+            .expect_err("get of an unregistered path must fail");
         assert!(matches!(err, OsError::NotFound { .. }), "{err}");
     }
 
@@ -248,7 +248,7 @@ mod tests {
         let err = store
             .put(&p, PutPayload::from_static(b"x"))
             .await
-            .unwrap_err();
+            .expect_err("writes to the read-only store must fail");
         assert!(matches!(err, OsError::NotImplemented { .. }), "{err}");
     }
 }

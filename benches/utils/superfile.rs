@@ -229,7 +229,6 @@ pub mod fts {
     // ─── Manual timing helpers (infino-only extras) ───────────────────────
 
     /// Nearest-rank p50 of a duration set (sorts in place).
-
     fn p50(samples: &mut [Duration]) -> Duration {
         if samples.is_empty() {
             return Duration::ZERO;
