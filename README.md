@@ -36,6 +36,29 @@ rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
 The Python bindings (PyO3 + maturin) live in
 [`infino-python/`](infino-python/) — see its README to build and test.
 
+## Quick example in Node.js
+
+```javascript
+const { connect, IndexSpec } = require("infino");
+const { Table, vectorFromArray, tableToIPC, LargeUtf8 } = require("apache-arrow");
+
+const db = connect("memory://");                   // or "./data", "s3://bucket/prefix"
+
+// Arrow crosses the boundary as IPC bytes; FTS columns are LargeUtf8.
+const ipc = (titles) =>
+  Buffer.from(tableToIPC(new Table({ title: vectorFromArray(titles, new LargeUtf8()) }), "stream"));
+
+const docs = db.createTable("docs", ipc([]), new IndexSpec().fts("title"));
+docs.append(ipc(["the quick brown fox"]));         // an Arrow Table, serialized to IPC
+
+const hits = docs.bm25Search("title", "fox", 10);        // [{ id: 1n, score: ... }]
+const rows = db.querySql("SELECT _id, title FROM docs"); // Arrow IPC → tableFromIPC
+```
+
+The Node.js bindings (napi-rs) live in
+[`infino-node/`](infino-node/) — see its README to build and test. The
+API is synchronous; `_id` comes back as a JavaScript `bigint`.
+
 ## Quick example in Rust
 
 Open a connection, create a table with a full-text index, append rows,
@@ -155,6 +178,7 @@ reviewed as a contract change in the same pull request.
 - **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
   least one minor release first.
 - **Python.** The wheel tracks the crate version 1:1.
+- **Node.** The npm package tracks the crate version 1:1.
 
 ## Development
 
