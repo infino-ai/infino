@@ -392,9 +392,9 @@ fn add_batch_from_reader_mergeability_compatible_superfiles() {
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     // Should not error on compatible configuration
-    b.add_batch_from_reader(&r1)
+    b.add_batch_from_reader(&r1, None)
         .expect("add_batch_from_reader succeeds for compatible superfiles");
-    b.add_batch_from_reader(&r2)
+    b.add_batch_from_reader(&r2, None)
         .expect("add_batch_from_reader succeeds for compatible superfiles");
 }
 
@@ -445,7 +445,7 @@ fn add_batch_from_reader_mergeability_id_column_mismatch() {
     let orig_opts = BuilderOptions::new(builder_schema, "doc_id", vec![], vec![], None);
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for id column mismatch"
@@ -481,7 +481,7 @@ fn add_batch_from_reader_mergeability_schema_mismatch() {
     let orig_opts = BuilderOptions::new(orig_schema, "doc_id", vec![], vec![], None);
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for schema mismatch"
@@ -538,7 +538,7 @@ fn add_batch_from_reader_mergeability_fts_column_count_mismatch() {
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for FTS column count mismatch"
@@ -590,7 +590,7 @@ fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for FTS column name mismatch"
@@ -643,7 +643,7 @@ fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
     let orig_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for vector column count mismatch"
@@ -709,7 +709,7 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for vector column name mismatch"
@@ -775,9 +775,491 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
-    let err = orig_builder.add_batch_from_reader(&reader);
+    let err = orig_builder.add_batch_from_reader(&reader, None);
     assert!(
         err.is_err(),
         "expected mergeability error for vector dimension mismatch"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_records() {
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![100u64, 101, 102]);
+    let titles = LargeStringArray::from(vec!["doc0", "doc1", "doc2"]);
+    let bodies = LargeStringArray::from(vec!["body0", "body1", "body2"]);
+    let scores = Float32Array::from(vec![1.0, 2.0, 3.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Create bitmap to delete documents at local_doc_id 1 (doc_id=101)
+    let mut deleted = roaring::RoaringBitmap::new();
+    deleted.insert(1);
+
+    // Merge with deleted_docs_bitmap
+    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
+
+    builder2
+        .add_batch_from_reader(&reader, Some(Arc::new(deleted)))
+        .expect("add_batch_from_reader with deleted docs");
+
+    let bytes2 = Bytes::from(builder2.finish().expect("finish builder"));
+    let reader2 = SuperfileReader::open(bytes2).expect("open merged superfile");
+
+    // The merged superfile should only have 2 docs (doc 0 and doc 2)
+    assert_eq!(
+        reader2.n_docs(),
+        2,
+        "Expected 2 documents after filtering 1 deletion"
+    );
+
+    let parquet = reader2
+        .parquet_bytes()
+        .expect("eager open retains parquet bytes")
+        .clone();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet)
+        .expect("try_new ParquetRecordBatchReaderBuilder");
+    let mut parquet_reader = builder.build().expect("build parquet reader");
+    let read_batch = parquet_reader
+        .next()
+        .expect("at least one batch")
+        .expect("decode batch");
+
+    assert_eq!(read_batch.num_rows(), 2, "Parquet batch should have 2 rows");
+
+    // Verify the correct documents remain
+    let ids_array = read_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("downcast to Decimal128Array");
+    let id_vals: Vec<i128> = (0..ids_array.len()).map(|i| ids_array.value(i)).collect();
+    assert_eq!(id_vals, vec![100, 102], "Expected doc_ids 100 and 102");
+}
+
+#[test]
+fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_fts() {
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![100u64, 101, 102]);
+    let titles = LargeStringArray::from(vec!["rust async", "python data", "rust embedded"]);
+    let bodies = LargeStringArray::from(vec!["body0", "body1", "body2"]);
+    let scores = Float32Array::from(vec![1.0, 2.0, 3.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Create bitmap to delete document at local_doc_id 1 (python data)
+    let mut deleted = roaring::RoaringBitmap::new();
+    deleted.insert(1);
+
+    let builder2_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
+
+    builder2
+        .add_batch_from_reader(&reader, Some(Arc::new(deleted)))
+        .expect("add_batch_from_reader with deleted docs");
+
+    let bytes2 = Bytes::from(builder2.finish().expect("finish builder"));
+    let reader2 = SuperfileReader::open(bytes2).expect("open merged superfile");
+
+    assert_eq!(
+        reader2.n_docs(),
+        2,
+        "Expected 2 documents after FTS filtering"
+    );
+
+    // Search for "rust" should find 2 docs (original doc 0 and 2, now local_doc_ids 0 and 1)
+    let hits = futures::executor::block_on(async {
+        reader2
+            .bm25_search("title", "rust", SEARCH_K, BoolMode::Or)
+            .await
+            .expect("BM25 search")
+    });
+
+    assert_eq!(hits.len(), 2, "Expected 2 rust docs");
+    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    // After filtering and merging, local_doc_ids are 0 and 1
+    assert_eq!(
+        local_doc_ids,
+        vec![0, 1].into_iter().collect(),
+        "Expected local_doc_ids 0 and 1"
+    );
+
+    // Search for "python" should find 0 docs (it was deleted)
+    let python_hits = futures::executor::block_on(async {
+        reader2
+            .bm25_search("title", "python", SEARCH_K, BoolMode::Or)
+            .await
+            .expect("BM25 search")
+    });
+
+    assert_eq!(
+        python_hits.len(),
+        0,
+        "Expected 0 python docs (it was deleted)"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: EMB_DIM,
+            n_cent: N_CENT,
+            rot_seed: ROT_SEED,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![100u64, 101, 102]);
+    let titles = LargeStringArray::from(vec!["doc0", "doc1", "doc2"]);
+    let bodies = LargeStringArray::from(vec!["body0", "body1", "body2"]);
+    let scores = Float32Array::from(vec![1.0, 2.0, 3.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    // Create 3 unit-norm vectors with distinct axes
+    let mut flat = Vec::<f32>::with_capacity(3 * EMB_DIM);
+    let axes: [usize; 3] = [0, 1, 2];
+    for &a in &axes {
+        let mut v = vec![0.0f32; EMB_DIM];
+        v[a] = 1.0;
+        v[(a + 1) % EMB_DIM] = SECONDARY_AXIS_WEIGHT;
+        normalize(&mut v);
+        flat.extend_from_slice(&v);
+    }
+    b.add_batch(&batch, &[flat.as_slice()]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Create bitmap to delete document at local_doc_id 1 (axis 1)
+    let mut deleted = roaring::RoaringBitmap::new();
+    deleted.insert(1);
+
+    let builder2_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: EMB_DIM,
+            n_cent: N_CENT,
+            rot_seed: ROT_SEED,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        None,
+    );
+    let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
+
+    builder2
+        .add_batch_from_reader(&reader, Some(Arc::new(deleted)))
+        .expect("add_batch_from_reader with deleted docs");
+
+    let bytes2 = Bytes::from(builder2.finish().expect("finish builder"));
+    let reader2 = SuperfileReader::open(bytes2).expect("open merged superfile");
+
+    assert_eq!(
+        reader2.n_docs(),
+        2,
+        "Expected 2 documents after vector filtering"
+    );
+
+    // Query with a vector aligned to axis 0 (doc 0's axis)
+    let mut q = vec![0.0f32; EMB_DIM];
+    q[0] = 1.0;
+    q[1] = SECONDARY_AXIS_WEIGHT;
+    normalize(&mut q);
+
+    let hits = futures::executor::block_on(async {
+        reader2
+            .vector_search("emb", &q, 2, VectorSearchOptions::new().with_nprobe(NPROBE))
+            .await
+            .expect("vector search")
+    });
+
+    assert_eq!(hits.len(), 2, "Expected 2 results from vector search");
+    // After filtering, doc 0 is local_doc_id 0, doc 2 is local_doc_id 1
+    assert_eq!(
+        hits[0].0, 0,
+        "Top result should be local_doc_id 0 (original doc 0)"
+    );
+    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    assert_eq!(
+        local_doc_ids,
+        vec![0, 1].into_iter().collect(),
+        "Expected local_doc_ids 0 and 1"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_with_deleted_docs_bitmap_all_deletes() {
+    // Edge case: delete all documents
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![100u64, 101, 102]);
+    let titles = LargeStringArray::from(vec!["doc0", "doc1", "doc2"]);
+    let bodies = LargeStringArray::from(vec!["body0", "body1", "body2"]);
+    let scores = Float32Array::from(vec![1.0, 2.0, 3.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Create bitmap to delete all documents
+    let mut deleted = roaring::RoaringBitmap::new();
+    deleted.insert(0);
+    deleted.insert(1);
+    deleted.insert(2);
+
+    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
+
+    builder2
+        .add_batch_from_reader(&reader, Some(Arc::new(deleted)))
+        .expect("add_batch_from_reader with all docs deleted");
+
+    let bytes2 = builder2.finish().expect("finish builder");
+    // Empty superfile should return empty bytes
+    assert!(bytes2.is_empty(), "All-deleted superfile should be empty");
+}
+
+#[test]
+fn add_batch_from_reader_with_deleted_docs_bitmap_no_deletes() {
+    // Edge case: bitmap is provided but empty (no deletions)
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![100u64, 101]);
+    let titles = LargeStringArray::from(vec!["doc0", "doc1"]);
+    let bodies = LargeStringArray::from(vec!["body0", "body1"]);
+    let scores = Float32Array::from(vec![1.0, 2.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Create empty bitmap (no deletions)
+    let deleted = roaring::RoaringBitmap::new();
+
+    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
+
+    builder2
+        .add_batch_from_reader(&reader, Some(Arc::new(deleted)))
+        .expect("add_batch_from_reader with empty bitmap");
+
+    let bytes2 = Bytes::from(builder2.finish().expect("finish builder"));
+    let reader2 = SuperfileReader::open(bytes2).expect("open merged superfile");
+
+    // All documents should be present
+    assert_eq!(
+        reader2.n_docs(),
+        2,
+        "Expected all 2 documents with empty deletion bitmap"
+    );
+}
+
+#[test]
+fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes() {
+    // Test with both FTS and vectors, deleting documents in between
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: EMB_DIM,
+            n_cent: N_CENT,
+            rot_seed: ROT_SEED,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+    let ids = decimal128_ids(vec![100u64, 101, 102, 103]);
+    let titles = LargeStringArray::from(vec!["rust one", "python two", "rust three", "go four"]);
+    let bodies = LargeStringArray::from(vec!["body0", "body1", "body2", "body3"]);
+    let scores = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+
+    // Create 4 distinct vectors
+    let mut flat = Vec::<f32>::with_capacity(4 * EMB_DIM);
+    for a in 0..4 {
+        let mut v = vec![0.0f32; EMB_DIM];
+        v[a] = 1.0;
+        normalize(&mut v);
+        flat.extend_from_slice(&v);
+    }
+    b.add_batch(&batch, &[flat.as_slice()]).expect("add_batch");
+    let bytes = Bytes::from(b.finish().expect("finish builder"));
+    let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+    // Delete docs 1 and 3 (indices 1 and 3)
+    let mut deleted = roaring::RoaringBitmap::new();
+    deleted.insert(1);
+    deleted.insert(3);
+
+    let builder2_opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: EMB_DIM,
+            n_cent: N_CENT,
+            rot_seed: ROT_SEED,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+        }],
+        Some(default_tokenizer()),
+    );
+    let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
+
+    builder2
+        .add_batch_from_reader(&reader, Some(Arc::new(deleted)))
+        .expect("add_batch_from_reader with partial deletes");
+
+    let bytes2 = Bytes::from(builder2.finish().expect("finish builder"));
+    let reader2 = SuperfileReader::open(bytes2).expect("open merged superfile");
+
+    // Should have 2 documents (indices 0 and 2)
+    assert_eq!(
+        reader2.n_docs(),
+        2,
+        "Expected 2 documents after deleting 1 and 3"
+    );
+
+    // FTS: search for "rust" should find 2 docs (original docs 0 and 2)
+    let hits = futures::executor::block_on(async {
+        reader2
+            .bm25_search("title", "rust", SEARCH_K, BoolMode::Or)
+            .await
+            .expect("BM25 search")
+    });
+    assert_eq!(hits.len(), 2, "Expected 2 rust docs");
+    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    // After filtering out docs 1 and 3, only docs 0 and 2 remain (reassigned as 0 and 1)
+    assert_eq!(
+        local_doc_ids,
+        vec![0, 1].into_iter().collect(),
+        "Expected local_doc_ids 0 and 1"
+    );
+
+    // Vector search: search with axis-0 vector should find doc 0 (highest relevance)
+    let mut q = vec![0.0f32; EMB_DIM];
+    q[0] = 1.0;
+    normalize(&mut q);
+    let vec_hits = futures::executor::block_on(async {
+        reader2
+            .vector_search("emb", &q, 2, VectorSearchOptions::new().with_nprobe(NPROBE))
+            .await
+            .expect("vector search")
+    });
+    assert_eq!(vec_hits.len(), 2, "Expected 2 vector results");
+    assert_eq!(
+        vec_hits[0].0, 0,
+        "Top result should be local_doc_id 0 (original doc 0)"
     );
 }

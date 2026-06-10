@@ -511,7 +511,7 @@ impl TableProvider for SupertableProvider {
 /// Parsing the footer via [`ParquetRecordBatchReaderBuilder`] only
 /// touches metadata, not column data, and only happens when the
 /// segment actually has tombstones — clean tables pay nothing.
-fn tombstone_access_plan(
+pub fn tombstone_access_plan(
     parquet_bytes: &Bytes,
     bitmap: &RoaringBitmap,
 ) -> DfResult<Option<ParquetAccessPlan>> {
