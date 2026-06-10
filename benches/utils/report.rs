@@ -124,6 +124,9 @@ pub struct Report {
     cur: HashMap<String, f64>,
     color: bool,
     host: String,
+    /// When false (comparison sections), cells render as plain values —
+    /// no run-over-run delta annotations, no baseline persistence.
+    track_deltas: bool,
 }
 
 impl Report {
@@ -135,6 +138,22 @@ impl Report {
             cur: HashMap::new(),
             color: std::io::stderr().is_terminal(),
             host: machine_info(),
+            track_deltas: true,
+        }
+    }
+
+    /// A report without run-over-run deltas: cells render as plain
+    /// values, nothing is loaded or persisted as a baseline. Used by the
+    /// cross-engine comparison sections, whose only meaningful delta is
+    /// engine-vs-engine (computed by the caller as its own column).
+    pub fn load_plain(bench: &str) -> Self {
+        Self {
+            bench: bench.to_string(),
+            prev: HashMap::new(),
+            cur: HashMap::new(),
+            color: std::io::stderr().is_terminal(),
+            host: machine_info(),
+            track_deltas: false,
         }
     }
 
@@ -199,8 +218,11 @@ impl Report {
                         let header = block.headers.get(ci).map(String::as_str).unwrap_or("");
                         let key =
                             format!("{}|{}|{}|{}", section.anchor, block.subtitle, label, header);
-                        let (delta, color) =
-                            compute_delta(self.prev.get(&key).copied(), *raw, *better);
+                        let (delta, color) = if self.track_deltas {
+                            compute_delta(self.prev.get(&key).copied(), *raw, *better)
+                        } else {
+                            (String::new(), "")
+                        };
                         self.cur.insert(key, *raw);
                         rrow.push(Rendered {
                             value: shown.clone(),
@@ -221,6 +243,11 @@ impl Report {
     /// partial run (e.g. `-- superfile_fts_build`) updates only the
     /// metrics it measured and leaves the rest of the baseline intact.
     pub fn save(&self) {
+        // Plain (comparison) reports keep no baseline: nothing to diff
+        // against next run, so don't write one.
+        if !self.track_deltas {
+            return;
+        }
         let mut merged = self.prev.clone();
         for (k, v) in &self.cur {
             merged.insert(k.clone(), *v);
