@@ -582,6 +582,11 @@ mod tests {
 
     const TOP_K: usize = 10;
 
+    /// Total rows across the materialized search batches.
+    fn n_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
     #[test]
     fn memory_create_open_search_drop() {
         let conn = connect("memory://").expect("connect");
@@ -597,9 +602,9 @@ mod tests {
         // Re-open by name and search.
         let reopened = conn.open_table("docs").expect("open_table");
         let hits = reopened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or)
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
             .expect("bm25_search");
-        assert_eq!(hits.len(), 1, "expected one hit for 'fox'");
+        assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox'");
 
         conn.drop_table("docs").expect("drop_table");
         assert!(conn.list_tables().expect("list").is_empty());
@@ -665,10 +670,11 @@ mod tests {
             .append(&build_title_batch(&["a lazy sleeping fox"]))
             .expect("append");
         assert_eq!(
-            first
-                .bm25_search("title", "fox", TOP_K, BoolMode::Or)
-                .expect("search")
-                .len(),
+            n_rows(
+                &first
+                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+                    .expect("search")
+            ),
             1
         );
 
@@ -679,11 +685,13 @@ mod tests {
         let second = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("recreate");
-        assert!(
-            second
-                .bm25_search("title", "fox", TOP_K, BoolMode::Or)
-                .expect("search")
-                .is_empty(),
+        assert_eq!(
+            n_rows(
+                &second
+                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+                    .expect("search")
+            ),
+            0,
             "re-created table must not resurrect the dropped table's rows"
         );
     }
@@ -767,9 +775,9 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or)
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
             .expect("search");
-        assert_eq!(hits.len(), 1);
+        assert_eq!(n_rows(&hits), 1);
         // The disk cache got a per-table subdirectory.
         assert!(cache.path().join("docs").exists());
     }
@@ -794,8 +802,8 @@ mod tests {
         assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
         let table = conn.open_table("docs").expect("open_table");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or)
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
             .expect("bm25_search");
-        assert_eq!(hits.len(), 1, "expected the persisted doc to be searchable");
+        assert_eq!(n_rows(&hits), 1, "expected the persisted doc to be searchable");
     }
 }

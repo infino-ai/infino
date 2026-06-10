@@ -91,7 +91,7 @@ pub const DIM: usize = 384;
 pub type Hit = (u32, f32);
 
 /// Doc count for superfile-shape benches (one-segment scale). 1M ×
-/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the hot tier and
+/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the warm tier and
 /// is the single-superfile cold-open unit for the warm/cold tiers.
 pub const SUPERFILE_DOCS: usize = 1_000_000;
 
@@ -636,7 +636,7 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(reader.vector_search(column, q, k, opts)).expect("vector_search");
+        let hits = block_on_inmem(reader.vector_hits_async(column, q, k, opts)).expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -751,7 +751,7 @@ pub fn calibrate_superfile(
                 .with_rerank_mult(refine);
             let p50 = p50_micros(
                 || {
-                    let _ = block_on_inmem(reader.vector_search(column, q, k, opts))
+                    let _ = block_on_inmem(reader.vector_hits_async(column, q, k, opts))
                         .expect("vector_search");
                 },
                 p50_iter,

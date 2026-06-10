@@ -128,7 +128,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     // BM25 on a term that appears in every doc must hit at least
     // `k` docs. With k=10 across 1024 docs the floor is exactly 10.
     let common_hits = r
-        .bm25_search("title", "common", SPILL_TEST_BM25_K, BoolMode::Or)
+        .bm25_hits_async("title", "common", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search common");
     assert_eq!(
@@ -142,7 +142,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     // the body column gets `payload0500` only at row 500; the title
     // column never has it.
     let payload_hits = r
-        .bm25_search("body", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)
+        .bm25_hits_async("body", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search payload0500");
     assert_eq!(
@@ -155,7 +155,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     // and vice versa. Production path keeps per-column FST keys
     // (`<col>\x1F<term>`) so this scopes correctly.
     let payload_in_title = r
-        .bm25_search("title", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)
+        .bm25_hits_async("title", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search payload0500 in title");
     assert!(
@@ -164,7 +164,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     );
 
     let term_in_body = r
-        .bm25_search("body", "term0500", SPILL_TEST_BM25_K, BoolMode::Or)
+        .bm25_hits_async("body", "term0500", SPILL_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("search term0500 in body");
     assert!(

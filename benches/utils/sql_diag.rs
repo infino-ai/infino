@@ -71,7 +71,7 @@ use crate::markdown::fmt_count;
 /// segment count matches the headline SQL bench.
 const WRITE_CHUNK: usize = 65_536;
 
-/// Round-robin category labels (matches `sql_bench::CATEGORIES`).
+/// Round-robin category labels (matches `superfile::sql::CATEGORIES`).
 const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
 
 const TABLE: &str = "supertable";
@@ -321,7 +321,7 @@ pub fn run() {
         // 1. infino query_sql (full path).
         let (full_p50, full_mean, full_rows) = time_path(iters, || {
             table
-                .query_sql(shape.sql)
+                .reader().query_sql(shape.sql)
                 .map(|b| count_rows(&b))
                 .expect("query_sql")
         });

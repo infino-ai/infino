@@ -376,7 +376,7 @@ async fn supertable_smoke_via_azure_wire_protocol() {
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
     let batches = consumer
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query_sql via Azure");
     assert_eq!(batches.len(), 1);
     let post = cache.stats();
@@ -479,6 +479,7 @@ async fn supertable_real_azure_round_trip() {
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
+                None,
             )
             .map_err(|e| format!("cold BM25 over real Azure: {e}"))?;
         if bm25_hits.is_empty() {
@@ -494,6 +495,7 @@ async fn supertable_real_azure_round_trip() {
                 &query,
                 VECTOR_SEARCH_K,
                 VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
             )
             .map_err(|e| format!("cold vector search over real Azure: {e}"))?;
         if vector_hits.is_empty() {

@@ -29,7 +29,7 @@ docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
 
 docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
 
-hits = docs.bm25_search("title", "fox", 10)         # [{"_id": ..., "score": ...}]
+hits = docs.bm25_search("title", "fox", 10)         # pyarrow.Table (_id, title, score)
 rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
 ```
 
@@ -62,8 +62,10 @@ let batch = RecordBatch::try_new(
 docs.append(&batch)?;
 
 // Keyword search (BM25): hits carry the auto-injected `_id` + score.
-let hits = docs.bm25_search("title", "fox", 10, BoolMode::Or)?;
-assert_eq!(hits.len(), 1);
+// Returns Arrow rows. projection `None` = all columns; materialize `None`
+// = the method default (BM25 materializes; vector search does not).
+let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, None, None)?;
+assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
 // SQL across the catalog — every segment is also a valid Parquet file.
 let rows = db.query_sql("SELECT _id, title FROM docs")?;

@@ -256,7 +256,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
 
     let hits = st
         .reader()
-        .bm25_search(
+        .bm25_hits(
             "title",
             "nimblefox",
             BM25_TOP_K,

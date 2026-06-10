@@ -10,14 +10,14 @@ harness owns the measured lifecycle directly:
 - generate the corpus once;
 - build the artifact once;
 - run correctness on that built artifact;
-- run hot reads on that artifact;
+- run warm reads on that artifact;
 - upload or commit that same artifact for object-store tiers;
 - run cold reads against the uploaded/committed artifact with fresh cache state;
 - sample RSS around the measured phase;
 - render terminal and markdown reports through `report.rs`.
 
 The invariant is simple: **the first measured build produces the artifact used by
-correctness, hot reads, and cold upload/commit.** The benchmark must not rebuild a
+correctness, warm reads, and cold upload/commit.** The benchmark must not rebuild a
 second copy just to run correctness or object-store reads.
 
 ## Bench Shapes
@@ -25,8 +25,8 @@ second copy just to run correctness or object-store reads.
 - **Superfile** — single-artifact, in-memory read path. Default scale: `1M`
   docs, controlled by `INFINO_BENCH_DOC_COUNT`.
 - **Supertable** — multi-artifact table committed to object storage and read
-  through hot/cold table paths. Default scale: `10M` docs, controlled by
-  `INFINO_BENCH_DOC_COUNT`.
+  through warm/cold table paths. Default scale: `10M` docs, controlled by
+  `INFINO_BENCH_SUPERTABLE_DOCS`.
 - **Writer count** — build rows report `1 writer` and `N writers`. `N` defaults
   to the machine's logical core count and is controlled by
   `INFINO_BENCH_WRITERS`.
@@ -34,23 +34,35 @@ second copy just to run correctness or object-store reads.
 ## Invocation
 
 ```sh
-cargo bench --bench superfile_fts
-cargo bench --bench superfile_vector
-cargo bench --bench supertable_all
+# Run every tier × modality test, all phases.
+cargo bench --bench bench
 
-# Smaller local loop. Doc counts are plain integers (a `100K`/`1M`-style
-# suffix is not parsed and silently falls back to the default).
-INFINO_BENCH_DOC_COUNT=100000 cargo bench --bench superfile_fts
+# Run one test, all phases.
+cargo bench --bench bench -- superfile_fts
+cargo bench --bench bench -- superfile_vector
+cargo bench --bench bench -- superfile_sql
+cargo bench --bench bench -- supertable_fts
+cargo bench --bench bench -- supertable_vector
+cargo bench --bench bench -- supertable_sql
+
+# Select phases. Valid phases are: build, warm, cold.
+cargo bench --bench bench -- superfile_sql cold
+cargo bench --bench bench -- supertable_vector build warm
+
+# Smaller local loop.
+INFINO_BENCH_SUPERFILE_DOCS=100K cargo bench --bench bench -- superfile_fts warm
 
 # Override the N-writers build row.
-INFINO_BENCH_WRITERS=4 cargo bench --bench superfile_fts
+INFINO_BENCH_WRITERS=4 cargo bench --bench bench -- superfile_fts build
 
 # Refresh the markdown sections in this file.
-INFINO_BENCH_UPDATE_README=1 cargo bench --bench superfile_fts
+INFINO_BENCH_UPDATE_README=1 cargo bench --bench bench -- superfile_fts
 
 # Diagnostics (not part of the default bench loop).
 cargo bench --features bench-diagnostics --bench object-store
 cargo bench --features bench-diagnostics --bench scale -- vector_recall
+cargo bench --bench tombstone-overhead
+cargo bench --bench supertable-update
 ```
 
 ## Object-store backends
@@ -66,34 +78,37 @@ which credentials happen to be set:
 | `azure` | real Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
 
 ```sh
-# Superfile benches: any backend (s3s-fs is the zero-setup default).
-cargo bench --bench superfile_fts
+# Superfile cold tiers: any backend (s3s-fs is the zero-setup default).
+cargo bench --bench bench -- superfile_fts cold
 
-# Supertable bench: real object store only (s3 or azure). s3s-fs lacks the
+# Supertable tests: real object store only (s3 or azure). s3s-fs lacks the
 # multi-commit If-Match CAS the supertable commit needs, so it is rejected.
 INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket \
-  cargo bench --bench supertable_all
+  cargo bench --bench bench -- supertable_fts
 INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... \
-  cargo bench --bench supertable_all
+  cargo bench --bench bench -- supertable_sql cold
 ```
 
 A real-backend run writes under a unique prefix and deletes it on exit; set
 `INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
 emulator self-cleans and reproduces request/byte volume, not network latency.
 
-## Migration Status
+## Test Matrix
 
-Only migrated sections should be treated as current. Sections that still show a
-placeholder are waiting for their custom-harness migration.
+The main bench has six selectable tests:
 
-- FTS superfile: custom harness, artifact reuse fixed.
-- Vector superfile: pending `VectorEngine` migration.
-- SQL: pending `SqlEngine` migration.
-- Supertable object-store: pending custom harness migration.
+| Selector | Tier | Modality |
+|---|---|---|
+| `superfile_fts` | superfile | FTS |
+| `superfile_vector` | superfile | vector |
+| `superfile_sql` | superfile | SQL |
+| `supertable_fts` | supertable | FTS |
+| `supertable_vector` | supertable | vector |
+| `supertable_sql` | supertable | SQL |
 
-See `bench-harness-migration-plan.md` in this worktree for the uncommitted
-working plan.
+Each selector supports `build`, `warm`, and `cold`. If no selector is supplied,
+all six tests run. If no phase is supplied, all three phases run.
 
 ## Code Layout (`infino-bench-utils`)
 
@@ -102,9 +117,9 @@ corpus/                     synthetic corpora + brute-force oracles
 harness/                    engine interfaces and generic drivers
 report.rs                   terminal + markdown rendering with deltas
 rss.rs                      per-phase RSS sampling
-fts_superfile.rs            superfile FTS runner
-vector_superfile.rs         superfile vector runner (migration pending)
-ingest/, fixture/, bench/   supertable object-store helpers (migration pending)
+superfile.rs                superfile runners by modality (fts / vector / sql)
+supertable.rs               supertable object-store ingest runner
+ingest/, fixture/, bench/   supertable object-store helpers
 ```
 
 ## Result Anchors
@@ -177,7 +192,7 @@ Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Hot p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline comparison is the last two blocks: the *same* selective equality (one matching row) run against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects the candidate row, DataFusion verifies). Same predicate, same 1-row result, so the gap is purely the index. The first block is aggregations & count-filters (read + compute, return few rows) — general engine context, not a like-for-like index comparison; there is no bare `SELECT col` row because that only measures row materialization. `Rows` is the result-set size. Δ is vs the previous run.
+Warm p50 over `Supertable::query_sql` against the canonical 1-writer table. The headline comparison is the last two blocks: the *same* selective equality (one matching row) run against a non-indexed column (Plain Scan — DataFusion decodes + filters) vs the byte-identical FTS-indexed `title` column (FTS-pushdown — infino's token index selects the candidate row, DataFusion verifies). Same predicate, same 1-row result, so the gap is purely the index. The first block is aggregations & count-filters (read + compute, return few rows) — general engine context, not a like-for-like index comparison; there is no bare `SELECT col` row because that only measures row materialization. `Rows` is the result-set size. Δ is vs the previous run.
 
 **Aggregations & count-filters (read + compute, return few rows — not the index A/B)**
 

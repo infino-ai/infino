@@ -57,7 +57,7 @@ Three lanes beyond `cargo test`:
 
 - **Brute-force oracles** under `tests/` — BM25 top-K is compared against the textbook BM25 formula on planted corpora; full-nprobe IVF is compared against brute-force exact-nearest for L2Sq / Cosine / NegDot. These are the correctness gates; if you touch scoring math or vector distance kernels, the oracles run first.
 - **Recall measurement — the acceptance bar is recall@10 ≥ 0.99, full stop.** No change is accepted that drops vector recall@10 below 0.99 on the standard vector bench (10M-row supertable, default config); demonstrate it and report the number in the PR body. The lower floors currently hard-coded in the bench suite (recall@10 ≥ 0.90 / 0.95 in `benches/scale/vector_recall.rs`, and the 0.80 / 0.85 correctness floors) are loose regression tripwires only — **passing them is necessary but not sufficient.** The bar is 0.99.
-- **`make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`), not just when you touch `unsafe` directly. Cost: miri ~100-1000× slower than native; asan 2-3×.
+- `**make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`), not just when you touch `unsafe` directly. Cost: miri ~100-1000× slower than native; asan 2-3×.
 - **Property tests** — `proptest` is in dev-deps; used for round-trip invariants like PFOR encode/decode.
 
 Test deletions require explicit justification.
@@ -68,18 +68,18 @@ Test deletions require explicit justification.
 
 ### What `benches/` covers
 
-Criterion benches, bundled by topic in `[[bench]]` stanzas (`harness = false`). See `benches/README.md` for the full invocation guide and the recorded result tables. The default suite (`cargo bench`) runs:
+Benchmarks, bundled by topic in `[[bench]]` stanzas (`harness = false`). See `benches/README.md` for the full invocation guide and the recorded result tables. The default suite (`cargo bench`) runs:
 
-- **`superfile_fts`** — BM25 ingest + search over one 1M-doc superfile.
-- **`superfile_vector`** — IVF + RaBitQ ingest + search over one 1M × 384 superfile.
-- **`supertable_all`** — a combined 10M-row supertable (FTS + vector) built once and reused for ingest + FTS-search + vector-search timing; the BM25 oracle / vector-recall floor run before timing.
-- **`tombstone-overhead`** — query overhead of the delete / tombstone path.
-- **`supertable-update`** — the update / delete pipeline.
+- `**superfile_fts`** — BM25 ingest + search over one 1M-doc superfile.
+- `**superfile_vector**` — IVF + RaBitQ ingest + search over one 1M × 384 superfile.
+- `**supertable_all**` — a combined 10M-row supertable (FTS + vector) built once and reused for ingest + FTS-search + vector-search timing; the BM25 oracle / vector-recall floor run before timing.
+- `**tombstone-overhead**` — query overhead of the delete / tombstone path.
+- `**supertable-update**` — the update / delete pipeline.
 
 Diagnostic benches are opt-in behind `--features bench-diagnostics` and are *not* run by plain `cargo bench`:
 
-- **`object-store`** — S3-compatible cold lazy-fetch path (request count + bytes fetched) over a unified 1M superfile.
-- **`scale`** — release-profile recall gates (e.g. `vector_recall`).
+- `**object-store*`* — S3-compatible cold lazy-fetch path (request count + bytes fetched) over a unified 1M superfile.
+- `**scale**` — release-profile recall gates (e.g. `vector_recall`).
 
 Recorded numbers live in `benches/README.md`; the structured source of truth is criterion's `target/criterion/<group>/<bench>/new/estimates.json`.
 
@@ -208,8 +208,8 @@ surface is deliberately small: a connection-and-table API over the
 storage/superfile/supertable layers, which are themselves internal.
 
 - **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
-- **`Connection`** — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
-- **`Supertable`** (the table handle) — `append`, `update`, `delete`, `bm25_search`, `vector_search`, `schema`. BM25 and vector search return `Vec<SearchHit>`; the segment-local hit representation is internal and resolved to the public `_id` before it reaches the caller.
+- `**Connection`** — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
+- `**Supertable**` (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. `bm25_search` / `vector_search` return Arrow rows (`Vec<RecordBatch>`) and take a `projection` plus a `materialize` flag: `materialize = true` decodes the projected scalar columns (`_id`, the columns, `score`); `materialize = false` skips scalar decode and returns just `_id` + `score`. The unranked `token_match` / `exact_match` return `Vec<SearchHit>` (`_id` + score). The async kernels and the segment-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
 - **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `SearchHit`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
 
 Everything else — `SupertableReader`/`SupertableWriter`, the manifest
@@ -232,7 +232,7 @@ surface.
 
 When this file and a config file disagree, the config file wins. Authoritative sources:
 
-- `**Cargo.toml**` — dependencies, lint config (`#![deny(clippy::unwrap_used)]` lives in `lib.rs`), test/bench target declarations (`[[test]]` / `[[bench]]` stanzas), feature flags.
+- `**Cargo.toml`** — dependencies, lint config (`#![deny(clippy::unwrap_used)]` lives in `lib.rs`), test/bench target declarations (`[[test]]` / `[[bench]]` stanzas), feature flags.
 - `**Makefile**` — canonical command set (`check`, `test`, `ci`, `coverage`, `miri`, `asan`, `bench`, `bench-quick`, `clean`).
 - `**rust-toolchain.toml**` — the exact stable Rust version pinned for this crate.
 - `**.github/workflows/**` — what CI actually runs and fails on.

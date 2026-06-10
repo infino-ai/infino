@@ -150,7 +150,7 @@ async fn end_to_end_bm25_finds_rust_docs() {
     let bytes = build_pipeline_superfile();
     let r = SuperfileReader::open(bytes).expect("open superfile");
     let hits = r
-        .bm25_search("title", "rust", SEARCH_K, BoolMode::Or)
+        .bm25_hits_async("title", "rust", SEARCH_K, BoolMode::Or)
         .await
         .expect("BM25 search");
     let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -189,7 +189,7 @@ async fn end_to_end_vector_search_recovers_self() {
     q[4] = SECONDARY_AXIS_WEIGHT;
     normalize(&mut q);
     let hits = r
-        .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(NPROBE))
+        .vector_hits_async("emb", &q, 1, VectorSearchOptions::new().with_nprobe(NPROBE))
         .await
         .expect("vector search");
     assert_eq!(hits[0].0, 4, "self-query should recover doc 4");
@@ -300,7 +300,7 @@ async fn end_to_end_fts_only_blob_offsets_within_file() {
     assert!(r.fts().is_some());
     assert!(r.vec().is_none());
     let hits = r
-        .bm25_search("title", "alpha", SEARCH_K, BoolMode::Or)
+        .bm25_hits_async("title", "alpha", SEARCH_K, BoolMode::Or)
         .await
         .expect("BM25 search");
     assert_eq!(hits.len(), 1);
@@ -349,7 +349,7 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
     let r = SuperfileReader::open(bytes).expect("open superfile");
     assert_eq!(r.n_docs(), N_DOCS as u64);
     let hits = r
-        .bm25_search("title", "alpha", MULTI_TERM_K, BoolMode::Or)
+        .bm25_hits_async("title", "alpha", MULTI_TERM_K, BoolMode::Or)
         .await
         .expect("BM25 search");
     // alpha appears at local_doc_ids 0, 2, 4 (one per chunk).

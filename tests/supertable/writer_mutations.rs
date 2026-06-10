@@ -96,7 +96,7 @@ async fn writer_delete_tombstones_matching_rows() {
 
     // Follow-up SQL query no longer returns the row.
     let batches = st
-        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .reader().query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
         .iter()
@@ -118,7 +118,7 @@ async fn writer_delete_tombstones_matching_rows() {
     // hits.
     let hits = st
         .reader()
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or)
+        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
         .expect("fts");
     assert!(hits.is_empty(), "expected zero hits for tombstoned token");
 }
@@ -205,7 +205,7 @@ async fn writer_update_replaces_matching_rows() {
     drop(w);
 
     let batches = st
-        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .reader().query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
         .iter()

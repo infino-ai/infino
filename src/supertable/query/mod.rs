@@ -20,6 +20,7 @@
 //! term-range + centroid) shared across the query paths.
 
 pub mod candidate;
+pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
 pub mod fts;
@@ -66,13 +67,15 @@ pub struct SuperfileHit {
     pub score: f32,
 }
 
-/// A public search hit: the stable public `_id` plus the score.
+/// A resolved public search hit: the stable public `_id` plus the score.
 ///
 /// `id` is the supertable's auto-injected `_id`, **not** an internal,
-/// segment-local row offset. Returned by the public
-/// `Supertable::bm25_search` / `Supertable::vector_search`,
-/// best-scoring first. Score direction is method-dependent: BM25 is
-/// higher-is-better; vector distance is smaller-is-better.
+/// segment-local row offset. Returned by the lightweight public
+/// `Supertable::bm25_hits` / `vector_hits` / `token_match` /
+/// `exact_match`, best-scoring first (ranked methods) or unordered
+/// (the unranked match methods, where `score` is `0.0`). The
+/// row-returning `Supertable::bm25_search` / `vector_search` instead
+/// materialize full Arrow rows.
 ///
 /// `#[non_exhaustive]`: constructed only by the engine, so fields can be
 /// added later without breaking downstream `match`/struct-literal code.
@@ -84,3 +87,4 @@ pub struct SearchHit {
     /// Score for this hit (see the type-level note on direction).
     pub score: f32,
 }
+

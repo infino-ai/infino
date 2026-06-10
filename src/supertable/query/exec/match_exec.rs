@@ -410,7 +410,7 @@ mod tests {
     }
 
     fn rows(st: &Supertable, sql: &str) -> usize {
-        st.query_sql(sql)
+        st.reader().query_sql(sql)
             .expect("query_sql")
             .iter()
             .map(RecordBatch::num_rows)
@@ -466,7 +466,7 @@ mod tests {
     fn token_match_tvf_star_projection_appends_score() {
         let st = demo();
         let batches = st
-            .query_sql("SELECT * FROM token_match('title', 'rust')")
+            .reader().query_sql("SELECT * FROM token_match('title', 'rust')")
             .expect("query_sql");
         let b = &batches[0];
         // scalar schema (_id, title) + score.
@@ -478,12 +478,12 @@ mod tests {
     fn match_tvf_arity_errors() {
         let st = demo();
         assert!(
-            st.query_sql("SELECT _id FROM token_match('title')")
+            st.reader().query_sql("SELECT _id FROM token_match('title')")
                 .is_err(),
             "token_match needs >= 2 args"
         );
         assert!(
-            st.query_sql("SELECT _id FROM exact_match('title')")
+            st.reader().query_sql("SELECT _id FROM exact_match('title')")
                 .is_err(),
             "exact_match needs 2 args"
         );

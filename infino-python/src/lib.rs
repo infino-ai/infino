@@ -8,7 +8,7 @@
 //! and `table.append(...)` / `table.bm25_search(...)` /
 //! `table.vector_search(...)`. Arrow is the interchange — schemas and
 //! batches cross the boundary as pyarrow objects via the Arrow C Data
-//! Interface; search hits come back as `list[dict]`.
+//! Interface; search and SQL results come back as pyarrow `Table`s.
 //!
 //! Sync for v1 (data-science callers expect sync). Built standalone with
 //! maturin — it consumes the core crate's curated public API only (no
@@ -188,13 +188,7 @@ impl Connection {
         let batches = py
             .detach(|| self.inner.query_sql(sql))
             .map_err(py_err)?;
-        // `Vec<RecordBatch>` converts to a Python *list* of pyarrow
-        // RecordBatches; assemble them into a single pyarrow `Table`.
-        let py_batches = batches.to_pyarrow(py)?;
-        let pyarrow = py.import("pyarrow")?;
-        pyarrow
-            .getattr("Table")?
-            .call_method1("from_batches", (py_batches,))
+        batches_to_pyarrow_table(py, batches)
     }
 }
 
@@ -229,9 +223,13 @@ impl Table {
         }
     }
 
-    /// BM25 search over one FTS column. Returns `list[{"_id", "score"}]`,
-    /// best first. `mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, k, mode=None))]
+    /// BM25 search over one FTS column. Returns a pyarrow `Table`.
+    /// `materialize` controls the columns: `True` → `_id`, the table's
+    /// scalar columns, and a trailing `score` (higher is better);
+    /// `False` → only `_id` + `score` (skips scalar decode). Omitting it
+    /// uses the engine default — **BM25 materializes by default**.
+    /// `mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, k, mode=None, materialize=None))]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -239,25 +237,21 @@ impl Table {
         query: &str,
         k: usize,
         mode: Option<&str>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let mode = match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
-            "or" => BoolMode::Or,
-            "and" => BoolMode::And,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "mode must be 'or' or 'and', got {other:?}"
-                )));
-            }
-        };
-        let hits = py
-            .detach(|| self.inner.bm25_search(column, query, k, mode))
+        materialize: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mode = parse_mode(mode)?;
+        let batches = py
+            .detach(|| self.inner.bm25_search(column, query, k, mode, None, materialize))
             .map_err(py_err)?;
-        hits_to_pylist(py, &hits)
+        batches_to_pyarrow_table(py, batches)
     }
 
     /// Vector kNN over one vector column. `query` is a `list[float]`.
-    /// Returns `list[{"_id", "score"}]`, nearest first.
-    #[pyo3(signature = (column, query, k, nprobe=None))]
+    /// Returns a pyarrow `Table`. `materialize=True` → `_id`, the scalar
+    /// columns, and a trailing `score` (distance, smaller is nearer);
+    /// `False` → only `_id` + `score`. Omitting it uses the engine
+    /// default — **vector search does NOT materialize by default**.
+    #[pyo3(signature = (column, query, k, nprobe=None, materialize=None))]
     fn vector_search<'py>(
         &self,
         py: Python<'py>,
@@ -265,13 +259,45 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> PyResult<Bound<'py, PyList>> {
+        materialize: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
+        let batches = py
+            .detach(|| self.inner.vector_search(column, &query, k, opts, None, materialize))
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Unranked token match over one FTS column: `list[{"_id", "score"}]`
+    /// (`score` is `0.0`). `mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, mode=None))]
+    fn token_match<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        query: &str,
+        mode: Option<&str>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mode = parse_mode(mode)?;
         let hits = py
-            .detach(|| self.inner.vector_search(column, &query, k, opts))
+            .detach(|| self.inner.token_match(column, query, mode))
+            .map_err(py_err)?;
+        hits_to_pylist(py, &hits)
+    }
+
+    /// Unranked exact match of `value` against `column`:
+    /// `list[{"_id", "score"}]` (`score` is `0.0`).
+    fn exact_match<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        value: &str,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let hits = py
+            .detach(|| self.inner.exact_match(column, value))
             .map_err(py_err)?;
         hits_to_pylist(py, &hits)
     }
@@ -282,7 +308,31 @@ impl Table {
     }
 }
 
-/// Convert search hits to a Python `list[{"_id": int, "score": float}]`.
+/// Assemble `Vec<RecordBatch>` into a single pyarrow `Table`. Shared by
+/// `query_sql` and the row-returning search methods.
+fn batches_to_pyarrow_table<'py>(
+    py: Python<'py>,
+    batches: Vec<RecordBatch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py_batches = batches.to_pyarrow(py)?;
+    let pyarrow = py.import("pyarrow")?;
+    pyarrow
+        .getattr("Table")?
+        .call_method1("from_batches", (py_batches,))
+}
+
+/// Parse the `"or"` (default) / `"and"` boolean mode argument.
+fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
+    match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
+        "or" => Ok(BoolMode::Or),
+        "and" => Ok(BoolMode::And),
+        other => Err(PyValueError::new_err(format!(
+            "mode must be 'or' or 'and', got {other:?}"
+        ))),
+    }
+}
+
+/// Convert lightweight hits to a Python `list[{"_id": int, "score": float}]`.
 fn hits_to_pylist<'py>(
     py: Python<'py>,
     hits: &[infino::SearchHit],

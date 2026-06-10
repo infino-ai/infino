@@ -6,10 +6,11 @@
 // - `corpus/` — synthetic data (stream + optional grading cache)
 // - `ingest/` — stream corpus → append → commit → object storage
 // - `fixture/` — one shared 10M ingest per process (`supertable_all`)
-// - `fts_superfile`, `vector_superfile` — 1M superfile bench bodies
+// - `superfile`, `supertable` — tier-specific bench runners by modality
 // - `tiers`, `markdown`, `rss` — storage backends + reporting
 
 pub mod corpus;
+pub mod executors;
 pub mod fixture;
 pub mod harness;
 pub mod ingest;
@@ -18,9 +19,11 @@ pub mod report;
 pub mod rss;
 pub mod tiers;
 
-pub mod fts_superfile;
-pub mod sql_bench;
+pub mod superfile;
+pub mod supertable;
+
+pub mod scale;
 pub mod sql_diag;
-pub mod supertable_bench;
+pub mod supertable_update;
+pub mod tombstone_overhead;
 pub mod unified_object_store;
-pub mod vector_superfile;

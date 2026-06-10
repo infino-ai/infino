@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Shared hot / cold storage tier helpers for canonical benches.
+//! Shared warm / cold storage tier helpers for canonical benches.
 //!
-//! - **Hot**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
+//! - **Warm**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
 //! Backend is chosen explicitly by `INFINO_BENCH_STORE` (`s3s_fs` default |
@@ -50,16 +50,16 @@ const SUPERFILE_S3S_BUCKET: &str = "infino-bench-superfile";
 /// Storage tier exercised by a search bench row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    Hot,
+    Warm,
     Cold,
 }
 
 impl Tier {
-    pub const ALL: [Tier; 2] = [Tier::Hot, Tier::Cold];
+    pub const ALL: [Tier; 2] = [Tier::Warm, Tier::Cold];
 
     pub fn label(self) -> &'static str {
         match self {
-            Tier::Hot => "hot",
+            Tier::Warm => "warm",
             Tier::Cold => "cold",
         }
     }
@@ -68,7 +68,7 @@ impl Tier {
 /// Stable report group name for a tiered search bench family (`superfile_vec`, `supertable_fts`, …).
 pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) -> String {
     match tier {
-        Tier::Hot => format!("{family}_hot_search"),
+        Tier::Warm => format!("{family}_warm_search"),
         Tier::Cold => {
             let label = storage_label.expect("cold groups need a storage label");
             format!("{family}_{}_search_{label}", tier.label())
@@ -139,7 +139,7 @@ pub fn cleanup_prefix(cleanup: &PrefixCleanup) {
 pub struct SuperfileCommitted {
     pub storage: Arc<dyn StorageProvider>,
     pub uri: SuperfileUri,
-    /// Object key under the storage provider (same bytes the hot
+    /// Object key under the storage provider (same bytes the warm
     /// path built — uploaded verbatim for lazy vector open).
     pub object_path: String,
     pub object_size: u64,
@@ -458,6 +458,14 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     }
 }
 
+/// Backing object store for superfile-shaped warm/cold benches (1M).
+///
+/// Unlike [`supertable_storage_fixture`], this allows the default `s3s_fs`
+/// emulator because superfile-shaped benches do not rely on multi-commit OCC.
+pub async fn superfile_storage_fixture() -> StorageFixture {
+    backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await
+}
+
 fn env_gib(name: &str, default_gib: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -494,7 +502,7 @@ pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<Disk
 /// Budget selection (first match wins):
 /// 1. `INFINO_SUPERTABLE_SEARCH_CACHE_GIB` env var (explicit override).
 /// 2. `index_size_bytes + 10%` when the caller knows the total index
-///    size from the manifest — ensures the hot bench is truly hot.
+///    size from the manifest — ensures the warm bench is truly warm.
 /// 3. `INFINO_SUPERTABLE_INGEST_CACHE_GIB` or 8 GiB fallback.
 pub fn fresh_supertable_search_cache(
     storage: Arc<dyn StorageProvider>,

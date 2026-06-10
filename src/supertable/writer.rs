@@ -494,7 +494,7 @@ impl SupertableWriter {
         // writer session are not yet in the manifest.
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
-            .scan_ids_matching(predicate)
+            .reader().scan_ids_matching(predicate)
             .map_err(MutationError::PredicateEval)?;
         let matched = target_ids.len();
         if matched > MAX_TARGETS_PER_MUTATION {
@@ -569,7 +569,7 @@ impl SupertableWriter {
         // writer's buffer don't count toward the match set.
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
-            .scan_ids_matching(predicate)
+            .reader().scan_ids_matching(predicate)
             .map_err(MutationError::PredicateEval)?;
         let matched = target_ids.len();
         if matched > MAX_TARGETS_PER_MUTATION {
@@ -2379,7 +2379,7 @@ mod tests {
         let store = &st.options().store;
         let sf_reader = store.reader(&segment.uri).expect("reader");
         let hits = sf_reader
-            .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .bm25_hits_async("title", "alpha", 10, BoolMode::Or)
             .await
             .expect("bm25");
         // All 4 docs contain "alpha"; should all be returned.
