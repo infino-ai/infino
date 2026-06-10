@@ -246,7 +246,10 @@ mod tests {
         }
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs.len(), 2);
-        let a = jobs.iter().find(|j| j.partition_key == vec![0xA]).unwrap();
+        let a = jobs
+            .iter()
+            .find(|j| j.partition_key == vec![0xA])
+            .expect("partition A job");
         assert!(a.inputs.iter().all(|id| id.as_u128() < 5));
     }
 }
