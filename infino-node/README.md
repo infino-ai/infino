@@ -1,23 +1,27 @@
 # infino — Node.js bindings
 
-napi-rs bindings over infino's catalog API. Sync; Arrow is the
-interchange (crossing the JS↔Rust boundary as Arrow IPC bytes).
+napi-rs bindings over infino's catalog API. Sync and Node-idiomatic:
+pass arrays of objects (or apache-arrow Tables) in, get plain records
+out. A thin JS wrapper (`infino.js`) hides the Arrow-IPC boundary over
+the raw addon; pass `{ arrow: true }` to a search/query to get an
+apache-arrow `Table` instead.
 
 ```javascript
 const { connect, IndexSpec } = require("infino");
-const { Table, vectorFromArray, tableToIPC, LargeUtf8 } = require("apache-arrow");
+const { Schema, Field, LargeUtf8 } = require("apache-arrow");
 
 const db = connect("memory://"); // or "./data", "s3://bucket/prefix"
 
-// Arrow data crosses the boundary as IPC bytes. FTS columns must be
-// LargeUtf8 (not Utf8). An empty table carries just the schema.
-const ipc = (titles) =>
-  Buffer.from(tableToIPC(new Table({ title: vectorFromArray(titles, new LargeUtf8()) }), "stream"));
+// Schema is an apache-arrow Schema. FTS columns must be LargeUtf8.
+const schema = new Schema([new Field("title", new LargeUtf8(), false)]);
+const docs = db.createTable("docs", schema, new IndexSpec().fts("title"));
 
-const docs = db.createTable("docs", ipc([]), new IndexSpec().fts("title"));
-docs.append(ipc(["the quick brown fox"]));
+// append plain objects — the wrapper builds Arrow under the hood.
+docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 
-const hits = docs.bm25Search("title", "fox", 10); // [{ id: 1n, score: 1.23 }]
+const rows = docs.bm25Search("title", "fox", 10);  // matching rows as records
+const hits = docs.tokenMatch("title", "fox");      // unranked [{ id: 1n, score: 0 }]
+const out  = db.querySql("SELECT COUNT(*) AS n FROM docs"); // records (or { arrow: true })
 ```
 
 ## Build & test (requires online crates.io access + a Rust toolchain)
@@ -36,15 +40,25 @@ npm test            # node --test against the built addon
 
 ## Scope (v1 — mirrors the Python bindings)
 
+Node-idiomatic: objects in, records out; Arrow is optional.
+
 - `connect(uri, options?)` — backend from the URI scheme; S3-compatible
   static creds via `options = { endpoint, region, accessKey, secretKey }`
   (endpoint requires the other three).
-- `Connection`: `createTable(name, schemaIpc, IndexSpec)`, `openTable`,
-  `dropTable`, `listTables`, `querySql` → Arrow IPC `Buffer`
-  (`tableFromIPC`).
-- `Table`: `append(ipcBuffer)`, `bm25Search`, `vectorSearch`, `schema`.
-  `append` takes an Arrow IPC `Buffer` (`tableToIPC`) and re-wraps columns
-  under the table's declared schema; one `append` is one commit.
+- `Connection`: `createTable(name, arrowSchema, IndexSpec)`, `openTable`,
+  `dropTable`, `listTables`, `querySql(sql, { arrow? })`.
+- `Table`:
+  - `append(data)` — accepts an array of objects, an apache-arrow
+    `Table`/`RecordBatch`, or raw Arrow IPC bytes; one `append` is one
+    commit.
+  - `bm25Search(col, q, k, { mode?, materialize?, arrow? })` /
+    `vectorSearch(col, query, k, { nprobe?, materialize?, arrow? })` —
+    ranked search; return matching **rows** as records (or an apache-arrow
+    `Table` with `{ arrow: true }`). `query` is a `number[]` or
+    `Float32Array`. BM25 materializes by default; vector does not.
+  - `tokenMatch(col, q, mode?)` / `exactMatch(col, value)` — unranked
+    `_id` + score lists (`score` is `0`), `_id` as a `bigint`.
+  - `schema()` — the table's apache-arrow `Schema`.
 - `IndexSpec().fts(col).vector(col, dim, nCent, metric)`.
 
 ### Schema requirements
@@ -63,10 +77,13 @@ schema, but a genuine type mismatch errors).
   an additive follow-up.
 - **`SearchHit.id` is a `bigint`** — the core `_id` is 128-bit; JS
   `number` would lose precision past 2^53.
-- **Arrow IPC, not zero-copy C-Data** — JS↔Rust has no pyarrow-style
-  C-Data bridge, so bulk data crosses as IPC bytes (one copy), the
-  pragmatic Node approach. Query vectors are the exception: a
-  `Float32Array` crosses by reference.
+- **Objects in, records out** — the JS wrapper (`infino.js`) converts
+  arrays of objects ↔ Arrow and decodes results to plain records, the
+  same layered pattern LanceDB / nodejs-polars use (a hand-written
+  language layer over the napi addon, `index.js`). JS↔Rust has no
+  pyarrow-style zero-copy C-Data bridge, so bulk data crosses as Arrow
+  IPC (one copy); the wrapper hides it. Query vectors cross as a
+  `Float32Array` by reference.
 
 Next: `update` / `delete`; richer connect options (disk cache); prebuilt
 per-platform binaries + CI for `npm install infino` distribution.

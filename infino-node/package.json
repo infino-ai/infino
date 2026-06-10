@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "infino.js",
+  "types": "infino.d.ts",
   "napi": {
     "name": "infino",
     "triples": {
@@ -32,6 +32,8 @@
     "@napi-rs/cli": "^2.18.0"
   },
   "files": [
+    "infino.js",
+    "infino.d.ts",
     "index.js",
     "index.d.ts"
   ]

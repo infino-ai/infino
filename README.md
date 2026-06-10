@@ -40,24 +40,26 @@ The Python bindings (PyO3 + maturin) live in
 
 ```javascript
 const { connect, IndexSpec } = require("infino");
-const { Table, vectorFromArray, tableToIPC, LargeUtf8 } = require("apache-arrow");
+const { Schema, Field, LargeUtf8 } = require("apache-arrow");
 
 const db = connect("memory://");                   // or "./data", "s3://bucket/prefix"
 
-// Arrow crosses the boundary as IPC bytes; FTS columns are LargeUtf8.
-const ipc = (titles) =>
-  Buffer.from(tableToIPC(new Table({ title: vectorFromArray(titles, new LargeUtf8()) }), "stream"));
+// Schema is an apache-arrow Schema; FTS columns are LargeUtf8.
+const schema = new Schema([new Field("title", new LargeUtf8(), false)]);
+const docs = db.createTable("docs", schema, new IndexSpec().fts("title"));
 
-const docs = db.createTable("docs", ipc([]), new IndexSpec().fts("title"));
-docs.append(ipc(["the quick brown fox"]));         // an Arrow Table, serialized to IPC
+// append plain objects — the binding builds Arrow under the hood.
+docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 
-const hits = docs.bm25Search("title", "fox", 10);        // [{ id: 1n, score: ... }]
-const rows = db.querySql("SELECT _id, title FROM docs"); // Arrow IPC → tableFromIPC
+const rows = docs.bm25Search("title", "fox", 10);        // ranked rows as records
+const hits = docs.tokenMatch("title", "fox");            // unranked [{ id: 1n, score: 0 }]
+const sql  = db.querySql("SELECT _id, title FROM docs"); // records (or { arrow: true })
 ```
 
 The Node.js bindings (napi-rs) live in
 [`infino-node/`](infino-node/) — see its README to build and test. The
-API is synchronous; `_id` comes back as a JavaScript `bigint`.
+API is synchronous and Node-idiomatic: objects in, plain records out;
+`_id` comes back as a JavaScript `bigint`.
 
 ## Quick example in Rust
 

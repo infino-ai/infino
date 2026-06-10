@@ -121,6 +121,29 @@ fn write_batches_ipc(schema: &Schema, batches: &[RecordBatch]) -> Result<Buffer>
     Ok(Buffer::from(buf))
 }
 
+/// Serialize a query/search result (`Vec<RecordBatch>`) to an Arrow IPC
+/// `Buffer`. Schema comes from the first batch, or an empty schema for an
+/// empty result. Shared by `query_sql` and the row-returning searches.
+fn batches_to_ipc(batches: &[RecordBatch]) -> Result<Buffer> {
+    let schema = match batches.first() {
+        Some(batch) => batch.schema(),
+        None => Arc::new(Schema::empty()),
+    };
+    write_batches_ipc(schema.as_ref(), batches)
+}
+
+/// Parse a boolean-mode string (`"or"` default, or `"and"`).
+fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
+    match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
+        "or" => Ok(BoolMode::Or),
+        "and" => Ok(BoolMode::And),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("mode must be 'or' or 'and', got {other:?}"),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -294,11 +317,7 @@ impl Connection {
     #[napi]
     pub fn query_sql(&self, sql: String) -> Result<Buffer> {
         let batches = self.inner.query_sql(&sql).map_err(map_err)?;
-        let schema = match batches.first() {
-            Some(batch) => batch.schema(),
-            None => Arc::new(Schema::empty()),
-        };
-        write_batches_ipc(schema.as_ref(), &batches)
+        batches_to_ipc(&batches)
     }
 }
 
@@ -334,8 +353,13 @@ impl Table {
         self.inner.append(&aligned).map_err(map_err)
     }
 
-    /// BM25 search over one FTS column. Returns hits best-first. `mode` is
-    /// `"or"` (default) or `"and"`.
+    /// BM25 search over one FTS column. Returns matching rows as an Arrow
+    /// IPC `Buffer` (read with `tableFromIPC`). `mode` is `"or"` (default)
+    /// or `"and"`. `materialize` controls the columns: `true` → `_id`, the
+    /// table's scalar columns, and a trailing `score` (higher is better);
+    /// `false` → only `_id` + `score`. Omitting it uses the engine default
+    /// (BM25 materializes by default). For an unranked `_id` + score list,
+    /// see [`Table::token_match`].
     #[napi]
     pub fn bm25_search(
         &self,
@@ -343,26 +367,22 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
-    ) -> Result<Vec<SearchHit>> {
-        let mode = match mode.as_deref().unwrap_or("or").to_ascii_lowercase().as_str() {
-            "or" => BoolMode::Or,
-            "and" => BoolMode::And,
-            other => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("mode must be 'or' or 'and', got {other:?}"),
-                ));
-            }
-        };
-        let hits = self
+        materialize: Option<bool>,
+    ) -> Result<Buffer> {
+        let mode = parse_mode(mode.as_deref())?;
+        let batches = self
             .inner
-            .bm25_search(&column, &query, k as usize, mode)
+            .bm25_search(&column, &query, k as usize, mode, None, materialize)
             .map_err(map_err)?;
-        Ok(hits.iter().map(SearchHit::from_core).collect())
+        batches_to_ipc(&batches)
     }
 
     /// Vector kNN over one vector column. `query` is a `Float32Array`
-    /// (crosses by reference — no copy). Returns hits nearest-first.
+    /// (crosses by reference — no copy). Returns matching rows as an Arrow
+    /// IPC `Buffer` (read with `tableFromIPC`). `materialize=true` → `_id`,
+    /// the scalar columns, and a trailing `score` (distance, smaller is
+    /// nearer); `false` → only `_id` + `score`. Omitting it uses the engine
+    /// default — vector search does NOT materialize by default.
     #[napi]
     pub fn vector_search(
         &self,
@@ -370,14 +390,45 @@ impl Table {
         query: Float32Array,
         k: u32,
         nprobe: Option<u32>,
-    ) -> Result<Vec<SearchHit>> {
+        materialize: Option<bool>,
+    ) -> Result<Buffer> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n as usize);
         }
+        let batches = self
+            .inner
+            .vector_search(&column, query.as_ref(), k as usize, opts, None, materialize)
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
+    /// Unranked token match over one FTS column — documents containing the
+    /// query terms, as `_id` + `score` (`score` is `0.0`). `mode` is `"or"`
+    /// (default) or `"and"`. Lighter than [`Table::bm25_search`] when
+    /// ranking isn't needed.
+    #[napi]
+    pub fn token_match(
+        &self,
+        column: String,
+        query: String,
+        mode: Option<String>,
+    ) -> Result<Vec<SearchHit>> {
+        let mode = parse_mode(mode.as_deref())?;
         let hits = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts)
+            .token_match(&column, &query, mode)
+            .map_err(map_err)?;
+        Ok(hits.iter().map(SearchHit::from_core).collect())
+    }
+
+    /// Unranked exact match of `value` against `column`, as `_id` + `score`
+    /// (`score` is `0.0`).
+    #[napi]
+    pub fn exact_match(&self, column: String, value: String) -> Result<Vec<SearchHit>> {
+        let hits = self
+            .inner
+            .exact_match(&column, &value)
             .map_err(map_err)?;
         Ok(hits.iter().map(SearchHit::from_core).collect())
     }
