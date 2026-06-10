@@ -66,16 +66,16 @@ use datafusion::physical_plan::empty::EmptyExec;
 #[cfg(test)]
 use bytes::Bytes;
 use object_store::ObjectStore as OsObjectStore;
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 #[cfg(test)]
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use roaring::RoaringBitmap;
 
-use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::LazyByteSource;
+use crate::superfile::fts::reader::BoolMode;
 use crate::supertable::SuperfileEntry;
-use crate::supertable::query::df_object_store::SuperfileObjectStore;
 use crate::supertable::manifest::Manifest;
+use crate::supertable::query::df_object_store::SuperfileObjectStore;
 use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
 use crate::supertable::tombstones::SidecarCache;
@@ -657,7 +657,10 @@ fn build_access_plan(
 /// rows decoded), the correct result for a segment with no candidate.
 /// `row_counts[i]` is the row count of row group `i`, read from the
 /// segment footer through the unified store via [`build_access_plan`].
-fn selection_access_plan_from_counts(row_counts: &[u32], keep: &RoaringBitmap) -> ParquetAccessPlan {
+fn selection_access_plan_from_counts(
+    row_counts: &[u32],
+    keep: &RoaringBitmap,
+) -> ParquetAccessPlan {
     // Ascending — `RoaringBitmap::iter` yields sorted, so each row group
     // binary-searches its contiguous slice of kept ids.
     let kept: Vec<u32> = keep.iter().collect();

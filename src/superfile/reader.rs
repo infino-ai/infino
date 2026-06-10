@@ -469,9 +469,7 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub fn byte_source(&self) -> Arc<dyn crate::superfile::LazyByteSource> {
         match (&self.bytes, &self.source) {
-            (Some(bytes), _) => {
-                Arc::new(crate::superfile::BytesLazyByteSource::new(bytes.clone()))
-            }
+            (Some(bytes), _) => Arc::new(crate::superfile::BytesLazyByteSource::new(bytes.clone())),
             (None, Some(src)) => Arc::clone(src),
             (None, None) => {
                 unreachable!("a SuperfileReader has either resident bytes or a lazy source")

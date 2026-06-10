@@ -113,7 +113,8 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
     // First query against the consumer routes through the
     // disk cache → cold-fetch from storage.
     let batches = consumer
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("first query");
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
@@ -137,7 +138,8 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
 
     // Second query against the same segment — warm hit.
     let _batches = consumer
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("second query");
     let post_stats = cache.stats();
     assert_eq!(
@@ -181,7 +183,8 @@ fn producer_with_cache_reads_through_cache_path() {
     assert_eq!(pre.n_entries, 1, "writer should have warmed the cache");
 
     let batches = producer
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
     let post = cache.stats();
@@ -240,7 +243,8 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
 
     // Producer's query hits the warm cache — no cold-fetch.
     let batches = st
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
 
@@ -497,7 +501,8 @@ fn no_cache_path_still_uses_in_memory_store() {
     w.commit().expect("commit");
 
     let batches = st
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);

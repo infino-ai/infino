@@ -69,16 +69,16 @@
 
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
+use arrow::record_batch::RecordBatch;
 
 use super::exec::common::{
-    output_schema_with_score, resolve_hits, resolve_search_hits, SCORE_COLUMN,
+    SCORE_COLUMN, output_schema_with_score, resolve_hits, resolve_search_hits,
 };
 use super::{SearchHit, SuperfileHit};
 
@@ -408,10 +408,15 @@ impl SupertableReader {
                 ),
                 None => None,
             };
-            let batch =
-                resolve_hits(self, &hits, &scalar_schema, &output_schema, indices.as_deref())
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let batch = resolve_hits(
+                self,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                indices.as_deref(),
+            )
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?;
             Ok(vec![batch])
         })
     }
@@ -927,8 +932,8 @@ mod tests {
         // Single-segment `SuperfileReader` oracle: async-only search,
         // driven on a throwaway runtime. The supertable reader below
         // uses its sync public API.
-        let oracle_hits =
-            block_on(oracle.bm25_hits_async("title", "nimblefox", 5, BoolMode::Or)).expect("oracle");
+        let oracle_hits = block_on(oracle.bm25_hits_async("title", "nimblefox", 5, BoolMode::Or))
+            .expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
         let oracle_set: std::collections::HashSet<u32> =

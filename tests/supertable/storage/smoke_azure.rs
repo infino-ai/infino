@@ -376,7 +376,8 @@ async fn supertable_smoke_via_azure_wire_protocol() {
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
     let batches = consumer
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query_sql via Azure");
     assert_eq!(batches.len(), 1);
     let post = cache.stats();

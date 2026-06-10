@@ -216,17 +216,19 @@ fn run_vector(st: &Supertable) -> Vec<(String, u32)> {
 
 fn run_hybrid(st: &Supertable) -> Vec<i128> {
     id_vec(
-        &st.reader().query_sql(&format!(
-            "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{}', {K})",
-            csv_one_hot(0)
-        ))
-        .expect("hybrid query_sql"),
+        &st.reader()
+            .query_sql(&format!(
+                "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{}', {K})",
+                csv_one_hot(0)
+            ))
+            .expect("hybrid query_sql"),
     )
 }
 
 fn run_count(st: &Supertable) -> i64 {
     let batches = st
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("count query_sql");
     batches[0]
         .column_by_name("n")

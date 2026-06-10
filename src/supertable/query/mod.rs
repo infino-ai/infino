@@ -87,4 +87,3 @@ pub struct SearchHit {
     /// Score for this hit (see the type-level note on direction).
     pub score: f32,
 }
-

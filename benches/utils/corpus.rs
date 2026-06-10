@@ -640,7 +640,8 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(reader.vector_hits_async(column, q, k, opts)).expect("vector_search");
+        let hits =
+            block_on_inmem(reader.vector_hits_async(column, q, k, opts)).expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32

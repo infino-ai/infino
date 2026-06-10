@@ -193,8 +193,12 @@ impl VectorEngine for InfinoVectorEngine {
         let opts = VectorSearchOptions::new()
             .with_nprobe(search.nprobe)
             .with_rerank_mult(search.rerank_mult);
-        let hits = block_on_inmem(index.reader().vector_hits_async(&index.column, query, k, opts))
-            .expect("vector_search");
+        let hits = block_on_inmem(
+            index
+                .reader()
+                .vector_hits_async(&index.column, query, k, opts),
+        )
+        .expect("vector_search");
         hits.into_iter()
             .map(|(doc_id, distance)| VectorHit {
                 doc_id: u64::from(doc_id),

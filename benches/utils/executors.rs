@@ -43,10 +43,26 @@ pub mod fts {
     /// The full FTS query battery — single source of truth for both
     /// tiers' warm + cold search and the cross-engine recall grading.
     pub const FTS_BATTERY: &[FtsQuery] = &[
-        FtsQuery { name: "single_rare", terms: &["term09999"], mode: BoolMode::Or },
-        FtsQuery { name: "single_df1", terms: &["doc0500000"], mode: BoolMode::Or },
-        FtsQuery { name: "single_common", terms: &["term00001"], mode: BoolMode::Or },
-        FtsQuery { name: "two_term_or", terms: &["term00001", "term00050"], mode: BoolMode::Or },
+        FtsQuery {
+            name: "single_rare",
+            terms: &["term09999"],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "single_df1",
+            terms: &["doc0500000"],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "single_common",
+            terms: &["term00001"],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "two_term_or",
+            terms: &["term00001", "term00050"],
+            mode: BoolMode::Or,
+        },
         FtsQuery {
             name: "three_wide_or",
             terms: &["term00001", "term00050", "term00100"],
@@ -59,14 +75,28 @@ pub mod fts {
         },
         FtsQuery {
             name: "five_term_or",
-            terms: &["term00050", "term00051", "term00052", "term00053", "term00054"],
+            terms: &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+            ],
             mode: BoolMode::Or,
         },
         FtsQuery {
             name: "ten_term_or",
             terms: &[
-                "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
-                "term00056", "term00057", "term00058", "term00059",
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
             ],
             mode: BoolMode::Or,
         },
@@ -87,14 +117,28 @@ pub mod fts {
         },
         FtsQuery {
             name: "five_term_and",
-            terms: &["term00050", "term00051", "term00052", "term00053", "term00054"],
+            terms: &[
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+            ],
             mode: BoolMode::And,
         },
         FtsQuery {
             name: "ten_term_and",
             terms: &[
-                "term00050", "term00051", "term00052", "term00053", "term00054", "term00055",
-                "term00056", "term00057", "term00058", "term00059",
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
+                "term00055",
+                "term00056",
+                "term00057",
+                "term00058",
+                "term00059",
             ],
             mode: BoolMode::And,
         },
@@ -102,13 +146,23 @@ pub mod fts {
 
     /// OR query names, in table order.
     pub const OR_QUERIES: &[&str] = &[
-        "single_rare", "single_df1", "single_common", "two_term_or", "three_wide_or",
-        "three_similar_or", "five_term_or", "ten_term_or",
+        "single_rare",
+        "single_df1",
+        "single_common",
+        "two_term_or",
+        "three_wide_or",
+        "three_similar_or",
+        "five_term_or",
+        "ten_term_or",
     ];
 
     /// AND query names, in table order.
     pub const AND_QUERIES: &[&str] = &[
-        "two_term_and", "three_wide_and", "three_similar_and", "five_term_and", "ten_term_and",
+        "two_term_and",
+        "three_wide_and",
+        "three_similar_and",
+        "five_term_and",
+        "ten_term_and",
     ];
 
     pub fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
@@ -199,7 +253,11 @@ pub mod fts {
                     std::hint::black_box(rows);
                 }
                 let rss = sampler.stop_stats();
-                FtsQueryStat { name: q.name, p50: p50(&mut samples), rss }
+                FtsQueryStat {
+                    name: q.name,
+                    p50: p50(&mut samples),
+                    rss,
+                }
             })
             .collect()
     }
@@ -218,7 +276,10 @@ pub mod fts {
     ) -> HashMap<&'static str, Duration> {
         let mut out = HashMap::new();
         for q in battery {
-            eprintln!("[{log_prefix}] cold: query {} — {iters} fresh-cache iters...", q.name);
+            eprintln!(
+                "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
+                q.name
+            );
             let query = q.terms.join(" ");
             let mode = to_infino_mode(q.mode);
             let mut samples = Vec::with_capacity(iters);
@@ -241,9 +302,21 @@ pub mod fts {
                 let ns = q.p50.as_secs_f64() * NS_PER_SEC;
                 vec![
                     metric(ns, fmt_time(ns), Better::Lower),
-                    metric(q.rss.peak_rss_bytes as f64, rss::fmt_bytes(q.rss.peak_rss_bytes), Better::Lower),
-                    metric(q.rss.median_rss_bytes as f64, rss::fmt_bytes(q.rss.median_rss_bytes), Better::Lower),
-                    metric(q.rss.p90_rss_bytes as f64, rss::fmt_bytes(q.rss.p90_rss_bytes), Better::Lower),
+                    metric(
+                        q.rss.peak_rss_bytes as f64,
+                        rss::fmt_bytes(q.rss.peak_rss_bytes),
+                        Better::Lower,
+                    ),
+                    metric(
+                        q.rss.median_rss_bytes as f64,
+                        rss::fmt_bytes(q.rss.median_rss_bytes),
+                        Better::Lower,
+                    ),
+                    metric(
+                        q.rss.p90_rss_bytes as f64,
+                        rss::fmt_bytes(q.rss.p90_rss_bytes),
+                        Better::Lower,
+                    ),
                 ]
             }
             None => vec![text("—"), text("—"), text("—"), text("—")],
@@ -291,7 +364,9 @@ pub mod fts {
         let mut header_cols = vec!["Query".to_string()];
         if warm_map.is_some() {
             header_cols.extend(
-                ["warm", "Peak RSS", "Median RSS", "P90 RSS"].iter().map(|s| s.to_string()),
+                ["warm", "Peak RSS", "Median RSS", "P90 RSS"]
+                    .iter()
+                    .map(|s| s.to_string()),
             );
         }
         if cold.is_some() {
@@ -334,7 +409,12 @@ pub mod fts {
             });
         }
 
-        report.emit(&Section { anchor: anchor.into(), title, note: note.into(), blocks });
+        report.emit(&Section {
+            anchor: anchor.into(),
+            title,
+            note: note.into(),
+            blocks,
+        });
     }
 }
 
@@ -401,8 +481,13 @@ pub mod vector {
             rerank: usize,
         ) -> Vec<(u32, f32)> {
             // Single segment: local_doc_id == global id.
-            crate::tiers::block_on(self.vector_hits_async(column, query, k, search_opts(nprobe, rerank)))
-                .expect("superfile vector_search")
+            crate::tiers::block_on(self.vector_hits_async(
+                column,
+                query,
+                k,
+                search_opts(nprobe, rerank),
+            ))
+            .expect("superfile vector_search")
         }
     }
 
@@ -485,7 +570,12 @@ pub mod vector {
                     },
                     CALIBRATION_P50_ITERS,
                 );
-                let cand = Calibrated { probe, refine, recall, p50_micros: p50 };
+                let cand = Calibrated {
+                    probe,
+                    refine,
+                    recall,
+                    p50_micros: p50,
+                };
                 best = match best {
                     None => Some(cand),
                     Some(b) if cand.p50_micros < b.p50_micros => Some(cand),
@@ -526,7 +616,10 @@ pub mod vector {
             black_box(hits);
         }
         let rss = sampler.stop_stats();
-        VecTiming { p50_ns: p50(&mut samples).as_secs_f64() * NS_PER_SEC, rss }
+        VecTiming {
+            p50_ns: p50(&mut samples).as_secs_f64() * NS_PER_SEC,
+            rss,
+        }
     }
 
     /// Cold p50 (ns): `iters` fresh-reader opens, timing one search each.
@@ -570,9 +663,21 @@ pub mod vector {
 
     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
         vec![
-            metric(stats.peak_rss_bytes as f64, rss::fmt_bytes(stats.peak_rss_bytes), Better::Lower),
-            metric(stats.median_rss_bytes as f64, rss::fmt_bytes(stats.median_rss_bytes), Better::Lower),
-            metric(stats.p90_rss_bytes as f64, rss::fmt_bytes(stats.p90_rss_bytes), Better::Lower),
+            metric(
+                stats.peak_rss_bytes as f64,
+                rss::fmt_bytes(stats.peak_rss_bytes),
+                Better::Lower,
+            ),
+            metric(
+                stats.median_rss_bytes as f64,
+                rss::fmt_bytes(stats.median_rss_bytes),
+                Better::Lower,
+            ),
+            metric(
+                stats.p90_rss_bytes as f64,
+                rss::fmt_bytes(stats.p90_rss_bytes),
+                Better::Lower,
+            ),
         ]
     }
 
@@ -587,9 +692,17 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
     ) {
-        let mut headers = vec!["Recall target".to_string(), "(p, r)".to_string(), "recall".to_string()];
+        let mut headers = vec![
+            "Recall target".to_string(),
+            "(p, r)".to_string(),
+            "recall".to_string(),
+        ];
         if include_warm {
-            headers.extend(["warm", "Peak RSS", "Median RSS", "P90 RSS"].iter().map(|s| s.to_string()));
+            headers.extend(
+                ["warm", "Peak RSS", "Median RSS", "P90 RSS"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
         }
         if include_cold {
             headers.push("cold".to_string());
@@ -620,7 +733,11 @@ pub mod vector {
             anchor: anchor.into(),
             title,
             note: note.into(),
-            blocks: vec![Block { subtitle: String::new(), headers, rows: body }],
+            blocks: vec![Block {
+                subtitle: String::new(),
+                headers,
+                rows: body,
+            }],
         });
     }
 
@@ -689,8 +806,9 @@ pub mod vector {
                     recall: format!("{:.3}", c.recall),
                     warm: include_warm
                         .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
-                    cold_ns: include_cold
-                        .then(|| measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)),
+                    cold_ns: include_cold.then(|| {
+                        measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
+                    }),
                 }),
                 None => rows.push(RecallRow {
                     target: format!("{target:.2}"),
@@ -708,11 +826,27 @@ pub mod vector {
             warm: include_warm
                 .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
             cold_ns: include_cold.then(|| {
-                measure_cold(&open_cold, column, q0, k, default_nprobe, default_rerank, cold_iters)
+                measure_cold(
+                    &open_cold,
+                    column,
+                    q0,
+                    k,
+                    default_nprobe,
+                    default_rerank,
+                    cold_iters,
+                )
             }),
         });
 
-        emit_recall_table(report, anchor, title, note, &rows, include_warm, include_cold);
+        emit_recall_table(
+            report,
+            anchor,
+            title,
+            note,
+            &rows,
+            include_warm,
+            include_cold,
+        );
     }
 }
 
@@ -736,7 +870,10 @@ pub mod sql {
     /// Scalar SQL battery — aggregations + count-filters (read + compute,
     /// return few rows). Shared by both tiers' warm and cold paths.
     pub const SQL_BATTERY: &[SqlQuery] = &[
-        SqlQuery { name: "agg_max_title", sql: "SELECT MAX(title) AS m FROM supertable" },
+        SqlQuery {
+            name: "agg_max_title",
+            sql: "SELECT MAX(title) AS m FROM supertable",
+        },
         SqlQuery {
             name: "filter_category_count",
             sql: "SELECT COUNT(*) AS n FROM supertable WHERE category = 'rust'",
@@ -745,7 +882,10 @@ pub mod sql {
             name: "filter_rating_count",
             sql: "SELECT COUNT(*) AS n FROM supertable WHERE rating < 10",
         },
-        SqlQuery { name: "count_star", sql: "SELECT COUNT(*) AS n FROM supertable" },
+        SqlQuery {
+            name: "count_star",
+            sql: "SELECT COUNT(*) AS n FROM supertable",
+        },
         SqlQuery {
             name: "group_by_category",
             sql: "SELECT category, COUNT(*) AS n FROM supertable GROUP BY category",
@@ -774,7 +914,13 @@ pub mod sql {
             InfinoSqlEngine::read(self, sql).rows
         }
         fn query_count(&self, sql: &str) -> i64 {
-            scalar_i64(&self.table().reader().query_sql(sql).expect("query_sql count"))
+            scalar_i64(
+                &self
+                    .table()
+                    .reader()
+                    .query_sql(sql)
+                    .expect("query_sql count"),
+            )
         }
     }
 
@@ -812,7 +958,8 @@ pub mod sql {
             total, n_docs as i64,
             "[{log_prefix}] correctness: COUNT(*) {total} != {n_docs}"
         );
-        let rust = reader.query_count("SELECT COUNT(*) AS n FROM supertable WHERE category = 'rust'");
+        let rust =
+            reader.query_count("SELECT COUNT(*) AS n FROM supertable WHERE category = 'rust'");
         let expected = n_docs.div_ceil(4) as i64;
         assert_eq!(
             rust, expected,
@@ -850,7 +997,12 @@ pub mod sql {
             black_box(r);
         }
         let rss = sampler.stop_stats();
-        SqlQueryStat { name, p50: p50(&mut samples), rows: warm_rows, rss }
+        SqlQueryStat {
+            name,
+            p50: p50(&mut samples),
+            rows: warm_rows,
+            rss,
+        }
     }
 
     /// Measure every warm SQL query shape against `reader`. Identical for
@@ -865,65 +1017,215 @@ pub mod sql {
         let sample_title = inputs.sample_title.as_str();
         let sample_key = inputs.sample_key.as_str();
 
-        eprintln!("[{log_prefix}] scalar SQL battery ({} queries)...", SQL_BATTERY.len());
-        let scalar = SQL_BATTERY.iter().map(|q| timed(reader, q.name, q.sql, iters)).collect();
+        eprintln!(
+            "[{log_prefix}] scalar SQL battery ({} queries)...",
+            SQL_BATTERY.len()
+        );
+        let scalar = SQL_BATTERY
+            .iter()
+            .map(|q| timed(reader, q.name, q.sql, iters))
+            .collect();
 
-        eprintln!("[{log_prefix}] search table functions (bm25 / vector / hybrid / token / exact)...");
+        eprintln!(
+            "[{log_prefix}] search table functions (bm25 / vector / hybrid / token / exact)..."
+        );
         let tvf = vec![
-            timed(reader, "bm25_search", "SELECT _id FROM bm25_search('title', 'term00001', 10)", iters),
-            timed(reader, "vector_search", &format!("SELECT _id FROM vector_search('emb', '{qv}', 10)"), iters),
-            timed(reader, "hybrid_search", &format!("SELECT _id FROM hybrid_search('title', 'term00001', 'emb', '{qv}', 10)"), iters),
-            timed(reader, "token_match (all rows)", "SELECT _id FROM token_match('title', 'term00001 term00002', 'and')", iters),
-            timed(reader, "token_match (selective)", "SELECT _id FROM token_match('title', 'doc0500000', 'and')", iters),
-            timed(reader, "exact_match", &format!("SELECT _id FROM exact_match('title', '{sample_title}')"), iters),
+            timed(
+                reader,
+                "bm25_search",
+                "SELECT _id FROM bm25_search('title', 'term00001', 10)",
+                iters,
+            ),
+            timed(
+                reader,
+                "vector_search",
+                &format!("SELECT _id FROM vector_search('emb', '{qv}', 10)"),
+                iters,
+            ),
+            timed(
+                reader,
+                "hybrid_search",
+                &format!("SELECT _id FROM hybrid_search('title', 'term00001', 'emb', '{qv}', 10)"),
+                iters,
+            ),
+            timed(
+                reader,
+                "token_match (all rows)",
+                "SELECT _id FROM token_match('title', 'term00001 term00002', 'and')",
+                iters,
+            ),
+            timed(
+                reader,
+                "token_match (selective)",
+                "SELECT _id FROM token_match('title', 'doc0500000', 'and')",
+                iters,
+            ),
+            timed(
+                reader,
+                "exact_match",
+                &format!("SELECT _id FROM exact_match('title', '{sample_title}')"),
+                iters,
+            ),
         ];
 
-        eprintln!("[{log_prefix}] no-index vs FTS-index equality (sorted title vs unsorted key)...");
+        eprintln!(
+            "[{log_prefix}] no-index vs FTS-index equality (sorted title vs unsorted key)..."
+        );
         let plain_scan = vec![
-            timed(reader, "WHERE title = ?  (sorted col, min/max prunes)", &format!("SELECT title FROM supertable WHERE title_noidx = '{sample_title}'"), iters),
-            timed(reader, "WHERE key   = ?  (unsorted col, min/max defeated)", &format!("SELECT key FROM supertable WHERE key_noidx = '{sample_key}'"), iters),
+            timed(
+                reader,
+                "WHERE title = ?  (sorted col, min/max prunes)",
+                &format!("SELECT title FROM supertable WHERE title_noidx = '{sample_title}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "WHERE key   = ?  (unsorted col, min/max defeated)",
+                &format!("SELECT key FROM supertable WHERE key_noidx = '{sample_key}'"),
+                iters,
+            ),
         ];
         let fts_pushdown = vec![
-            timed(reader, "WHERE title = ?  (sorted col, min/max prunes)", &format!("SELECT title FROM supertable WHERE title = '{sample_title}'"), iters),
-            timed(reader, "WHERE key   = ?  (unsorted col, min/max defeated)", &format!("SELECT key FROM supertable WHERE key = '{sample_key}'"), iters),
+            timed(
+                reader,
+                "WHERE title = ?  (sorted col, min/max prunes)",
+                &format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "WHERE key   = ?  (unsorted col, min/max defeated)",
+                &format!("SELECT key FROM supertable WHERE key = '{sample_key}'"),
+                iters,
+            ),
         ];
 
-        eprintln!("[{log_prefix}] aggregate shapes over a candidate set: DataFusion only vs token_match...");
+        eprintln!(
+            "[{log_prefix}] aggregate shapes over a candidate set: DataFusion only vs token_match..."
+        );
         let agg_scan = vec![
-            timed(reader, "COUNT(*)            key=? (1 row)", &format!("SELECT COUNT(*) AS a FROM supertable WHERE key_noidx = '{sample_key}'"), iters),
-            timed(reader, "SUM(rating)         key=? (1 row)", &format!("SELECT SUM(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"), iters),
-            timed(reader, "MAX(rating)         key=? (1 row)", &format!("SELECT MAX(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"), iters),
-            timed(reader, "AVG(rating)         key=? (1 row)", &format!("SELECT AVG(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"), iters),
-            timed(reader, "SUM(rating) bucket IN all (1M rows)", &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket_noidx IN {BUCKET_IN_ALL}"), iters),
+            timed(
+                reader,
+                "COUNT(*)            key=? (1 row)",
+                &format!("SELECT COUNT(*) AS a FROM supertable WHERE key_noidx = '{sample_key}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "SUM(rating)         key=? (1 row)",
+                &format!(
+                    "SELECT SUM(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"
+                ),
+                iters,
+            ),
+            timed(
+                reader,
+                "MAX(rating)         key=? (1 row)",
+                &format!(
+                    "SELECT MAX(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"
+                ),
+                iters,
+            ),
+            timed(
+                reader,
+                "AVG(rating)         key=? (1 row)",
+                &format!(
+                    "SELECT AVG(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"
+                ),
+                iters,
+            ),
+            timed(
+                reader,
+                "SUM(rating) bucket IN all (1M rows)",
+                &format!(
+                    "SELECT SUM(rating) AS a FROM supertable WHERE bucket_noidx IN {BUCKET_IN_ALL}"
+                ),
+                iters,
+            ),
         ];
         let agg_idx = vec![
-            timed(reader, "COUNT(*)            key=? (1 row)", &format!("SELECT COUNT(*) AS a FROM supertable WHERE key = '{sample_key}'"), iters),
-            timed(reader, "SUM(rating)         key=? (1 row)", &format!("SELECT SUM(rating) AS a FROM supertable WHERE key = '{sample_key}'"), iters),
-            timed(reader, "MAX(rating)         key=? (1 row)", &format!("SELECT MAX(rating) AS a FROM supertable WHERE key = '{sample_key}'"), iters),
-            timed(reader, "AVG(rating)         key=? (1 row)", &format!("SELECT AVG(rating) AS a FROM supertable WHERE key = '{sample_key}'"), iters),
-            timed(reader, "SUM(rating) bucket IN all (1M rows)", &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"), iters),
+            timed(
+                reader,
+                "COUNT(*)            key=? (1 row)",
+                &format!("SELECT COUNT(*) AS a FROM supertable WHERE key = '{sample_key}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "SUM(rating)         key=? (1 row)",
+                &format!("SELECT SUM(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "MAX(rating)         key=? (1 row)",
+                &format!("SELECT MAX(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "AVG(rating)         key=? (1 row)",
+                &format!("SELECT AVG(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+                iters,
+            ),
+            timed(
+                reader,
+                "SUM(rating) bucket IN all (1M rows)",
+                &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"),
+                iters,
+            ),
         ];
 
-        QuerySets { scalar, tvf, plain_scan, fts_pushdown, agg_scan, agg_idx }
+        QuerySets {
+            scalar,
+            tvf,
+            plain_scan,
+            fts_pushdown,
+            agg_scan,
+            agg_idx,
+        }
     }
 
     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
         vec![
-            metric(stats.peak_rss_bytes as f64, rss::fmt_bytes(stats.peak_rss_bytes), Better::Lower),
-            metric(stats.median_rss_bytes as f64, rss::fmt_bytes(stats.median_rss_bytes), Better::Lower),
-            metric(stats.p90_rss_bytes as f64, rss::fmt_bytes(stats.p90_rss_bytes), Better::Lower),
+            metric(
+                stats.peak_rss_bytes as f64,
+                rss::fmt_bytes(stats.peak_rss_bytes),
+                Better::Lower,
+            ),
+            metric(
+                stats.median_rss_bytes as f64,
+                rss::fmt_bytes(stats.median_rss_bytes),
+                Better::Lower,
+            ),
+            metric(
+                stats.p90_rss_bytes as f64,
+                rss::fmt_bytes(stats.p90_rss_bytes),
+                Better::Lower,
+            ),
         ]
     }
 
     fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
         let ns = stat.p50.as_secs_f64() * 1e9;
-        let mut cells = vec![text(stat.name), metric(ns, fmt_time(ns), Better::Lower), text(fmt_count(stat.rows))];
+        let mut cells = vec![
+            text(stat.name),
+            metric(ns, fmt_time(ns), Better::Lower),
+            text(fmt_count(stat.rows)),
+        ];
         cells.extend(rss_cells(&stat.rss));
         cells
     }
 
     fn query_headers() -> Vec<String> {
-        vec!["Query".into(), "p50".into(), "Rows".into(), "Peak RSS".into(), "Median RSS".into(), "P90 RSS".into()]
+        vec![
+            "Query".into(),
+            "p50".into(),
+            "Rows".into(),
+            "Peak RSS".into(),
+            "Median RSS".into(),
+            "P90 RSS".into(),
+        ]
     }
 
     fn block(subtitle: &str, stats: &[SqlQueryStat]) -> Block {
@@ -935,7 +1237,13 @@ pub mod sql {
     }
 
     /// Render the full warm SQL query table (same blocks for both tiers).
-    pub fn emit_query(report: &mut Report, anchor: &str, title: String, note: &str, sets: &QuerySets) {
+    pub fn emit_query(
+        report: &mut Report,
+        anchor: &str,
+        title: String,
+        note: &str,
+        sets: &QuerySets,
+    ) {
         report.emit(&Section {
             anchor: anchor.into(),
             title,
@@ -959,7 +1267,10 @@ pub mod sql {
     ) -> HashMap<&'static str, Duration> {
         let mut out = HashMap::new();
         for q in SQL_BATTERY {
-            eprintln!("[{log_prefix}] cold: query {} — {iters} fresh-cache iters...", q.name);
+            eprintln!(
+                "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
+                q.name
+            );
             let mut samples = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let guard = open_fresh();
@@ -974,7 +1285,13 @@ pub mod sql {
         out
     }
 
-    pub fn emit_cold(report: &mut Report, anchor: &str, title: String, note: &str, cold: &HashMap<&'static str, Duration>) {
+    pub fn emit_cold(
+        report: &mut Report,
+        anchor: &str,
+        title: String,
+        note: &str,
+        cold: &HashMap<&'static str, Duration>,
+    ) {
         report.emit(&Section {
             anchor: anchor.into(),
             title,
@@ -985,8 +1302,15 @@ pub mod sql {
                 rows: SQL_BATTERY
                     .iter()
                     .map(|q| {
-                        let ns = cold.get(&q.name).map(|d| d.as_secs_f64() * 1e9).unwrap_or(f64::NAN);
-                        let cell = if ns.is_finite() { metric(ns, fmt_time(ns), Better::Lower) } else { text("—") };
+                        let ns = cold
+                            .get(&q.name)
+                            .map(|d| d.as_secs_f64() * 1e9)
+                            .unwrap_or(f64::NAN);
+                        let cell = if ns.is_finite() {
+                            metric(ns, fmt_time(ns), Better::Lower)
+                        } else {
+                            text("—")
+                        };
                         vec![text(q.name), cell]
                     })
                     .collect(),

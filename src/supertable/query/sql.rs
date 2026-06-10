@@ -413,7 +413,8 @@ mod tests {
         w.commit().expect("commit");
 
         let batches = st
-            .reader().query_sql(
+            .reader()
+            .query_sql(
                 "SELECT category, COUNT(*) AS n FROM supertable \
                  GROUP BY category ORDER BY category",
             )
@@ -578,7 +579,8 @@ mod tests {
             1,
         );
         let batches = st
-            .reader().query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
+            .reader()
+            .query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
             .expect("query");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
@@ -729,7 +731,8 @@ mod tests {
         w.commit().expect("c2");
 
         let batches = st
-            .reader().query_sql("SELECT _id FROM supertable ORDER BY _id")
+            .reader()
+            .query_sql("SELECT _id FROM supertable ORDER BY _id")
             .expect("query");
         let ids: Vec<i128> = batches
             .iter()
@@ -759,7 +762,8 @@ mod tests {
         w.commit().expect("c");
 
         let batches = st
-            .reader().query_sql("SELECT * FROM supertable LIMIT 1")
+            .reader()
+            .query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -790,7 +794,8 @@ mod tests {
     fn query_sql_invalid_sql_returns_plan_error() {
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let err = st
-            .reader().query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
+            .reader()
+            .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
         assert!(
             matches!(err, crate::supertable::error::QueryError::Plan(_)),
@@ -877,7 +882,8 @@ mod tests {
         w.commit().expect("commit");
 
         let batches = st
-            .reader().query_sql("SELECT * FROM supertable LIMIT 1")
+            .reader()
+            .query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -895,7 +901,8 @@ mod tests {
         w.commit().expect("commit");
 
         let err = st
-            .reader().query_sql("SELECT emb FROM supertable")
+            .reader()
+            .query_sql("SELECT emb FROM supertable")
             .expect_err("vector column should not be in the SQL schema");
         assert!(
             matches!(err, crate::supertable::error::QueryError::Plan(_)),

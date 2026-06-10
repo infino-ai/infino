@@ -648,12 +648,14 @@ mod tests {
         let st = supertable_one_segment(dim, 8);
         let q = csv_one_hot(dim, 0);
         let full = st
-            .reader().query_sql(&format!(
+            .reader()
+            .query_sql(&format!(
                 "SELECT _id, title, score FROM vector_search('emb', '{q}', 5)"
             ))
             .expect("query_sql");
         let only = st
-            .reader().query_sql(&format!("SELECT score FROM vector_search('emb', '{q}', 5)"))
+            .reader()
+            .query_sql(&format!("SELECT score FROM vector_search('emb', '{q}', 5)"))
             .expect("query_sql");
 
         let collect_scores = |batches: &[RecordBatch]| -> Vec<f32> {

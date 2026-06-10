@@ -849,6 +849,10 @@ mod tests {
         let hits = table
             .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
             .expect("bm25_search");
-        assert_eq!(n_rows(&hits), 1, "expected the persisted doc to be searchable");
+        assert_eq!(
+            n_rows(&hits),
+            1,
+            "expected the persisted doc to be searchable"
+        );
     }
 }

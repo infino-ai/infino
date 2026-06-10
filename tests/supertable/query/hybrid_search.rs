@@ -194,7 +194,8 @@ fn scores(batches: &[RecordBatch]) -> Vec<f32> {
 fn hybrid_search_star_projection_exposes_scalar_schema_plus_score() {
     let st = demo_two_segments();
     let batches = st
-        .reader().query_sql(&format!(
+        .reader()
+        .query_sql(&format!(
             "SELECT * FROM hybrid_search('title', 'rust', 'emb', '{}', {HYBRID_SCHEMA_TOP_K})",
             csv_one_hot(0)
         ))
@@ -220,22 +221,25 @@ fn hybrid_search_identity_set_is_union_of_subsearches_across_segments() {
     let k = HYBRID_ID_TOP_K;
 
     let hybrid = id_set(
-        &st.reader().query_sql(&format!(
-            "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
-        ))
-        .expect("hybrid query_sql"),
+        &st.reader()
+            .query_sql(&format!(
+                "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
+            ))
+            .expect("hybrid query_sql"),
     );
     let bm25 = id_set(
-        &st.reader().query_sql(&format!(
-            "SELECT _id FROM bm25_search('title', 'rust', {k})"
-        ))
-        .expect("bm25 query_sql"),
+        &st.reader()
+            .query_sql(&format!(
+                "SELECT _id FROM bm25_search('title', 'rust', {k})"
+            ))
+            .expect("bm25 query_sql"),
     );
     let vector = id_set(
-        &st.reader().query_sql(&format!(
-            "SELECT _id FROM vector_search('emb', '{qv}', {k})"
-        ))
-        .expect("vector query_sql"),
+        &st.reader()
+            .query_sql(&format!(
+                "SELECT _id FROM vector_search('emb', '{qv}', {k})"
+            ))
+            .expect("vector query_sql"),
     );
 
     // Both retrievers must actually return hits from each segment for

@@ -63,16 +63,16 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
+use arrow::record_batch::RecordBatch;
 
-use super::exec::common::{output_schema_with_score, resolve_hits, SCORE_COLUMN};
 use super::SuperfileHit;
+use super::exec::common::{SCORE_COLUMN, output_schema_with_score, resolve_hits};
 
 /// How to probe one segment in the vector fan-out: the globally-selected
 /// cluster ids for that segment, or — for a segment whose manifest
@@ -280,10 +280,15 @@ impl SupertableReader {
                 ),
                 None => None,
             };
-            let batch =
-                resolve_hits(self, &hits, &scalar_schema, &output_schema, indices.as_deref())
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let batch = resolve_hits(
+                self,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                indices.as_deref(),
+            )
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?;
             Ok(vec![batch])
         })
     }
@@ -676,10 +681,7 @@ mod tests {
         let mut q = vec![0f32; dim];
         q[0] = 1.0;
         let opts = VectorSearchOptions::new().with_nprobe(1);
-        let hits = st
-            .reader()
-            .vector_hits("emb", &q, 10, opts)
-            .expect("query");
+        let hits = st.reader().vector_hits("emb", &q, 10, opts).expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
         assert!(
@@ -743,7 +745,8 @@ mod tests {
         // The oracle is a single-segment `SuperfileReader` whose search
         // is async-only; drive it on a throwaway runtime. The supertable
         // reader below uses its sync public API.
-        let oracle_hits = block_on(oracle.vector_hits_async("emb", &q, 2, opts)).expect("oracle query");
+        let oracle_hits =
+            block_on(oracle.vector_hits_async("emb", &q, 2, opts)).expect("oracle query");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());

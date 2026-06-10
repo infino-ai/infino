@@ -415,8 +415,7 @@ async fn take_rows_object_store(
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?,
         );
     }
-    RecordBatch::try_new(out_schema, columns)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))
+    RecordBatch::try_new(out_schema, columns).map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 /// Extract a string literal argument (a column name, query text, ...).

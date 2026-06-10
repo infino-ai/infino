@@ -182,7 +182,8 @@ fn create_with_existing_pointer_delegates_to_open() {
         "create against existing pointer must load the committed manifest"
     );
     let batches = st
-        .reader().query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .reader()
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     let total = batches[0]
         .column(0)

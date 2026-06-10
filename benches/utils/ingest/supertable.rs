@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::tokenize::Tokenizer;
@@ -15,8 +17,8 @@ use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
 
 use crate::corpus::{self, DIM, MmapTextCorpus, SequentialSyntheticCorpus};
-use crate::markdown::fmt_count;
 use crate::harness::{emb_for, scatter_key, sql_options, sql_schema};
+use crate::markdown::fmt_count;
 use crate::tiers;
 
 /// Supertable-shape document count — the supplied parameter. Default 10M
@@ -246,7 +248,9 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
                 })
                 .collect::<Vec<_>>();
             columns.push(Arc::new(LargeStringArray::from(categories)));
-            let ratings = (start..end).map(|doc_id| (doc_id % 100) as i64).collect::<Vec<_>>();
+            let ratings = (start..end)
+                .map(|doc_id| (doc_id % 100) as i64)
+                .collect::<Vec<_>>();
             columns.push(Arc::new(Int64Array::from(ratings)));
         }
         if modality.has_text() {
@@ -299,7 +303,6 @@ pub fn build_on_storage(modality: Modality) -> IngestResult {
     }
 }
 
-
 fn build_sql_on_storage(
     storage_backend: tiers::StorageFixture,
     cache_dir: tempfile::TempDir,
@@ -342,8 +345,12 @@ fn build_sql_on_storage(
         }
         let titles = corpus.chunk_strs(start, len);
         let titles_noidx = titles.clone();
-        let bucket_vals: Vec<String> = (start..end).map(|doc_id| format!("b{}", doc_id % 10)).collect();
-        let key_vals: Vec<String> = (start..end).map(|doc_id| scatter_key(doc_id as u64)).collect();
+        let bucket_vals: Vec<String> = (start..end)
+            .map(|doc_id| format!("b{}", doc_id % 10))
+            .collect();
+        let key_vals: Vec<String> = (start..end)
+            .map(|doc_id| scatter_key(doc_id as u64))
+            .collect();
         let categories = (start..end)
             .map(|doc_id| match doc_id % 4 {
                 0 => "rust",
@@ -352,7 +359,9 @@ fn build_sql_on_storage(
                 _ => "sql",
             })
             .collect::<Vec<_>>();
-        let ratings = (start..end).map(|doc_id| (doc_id % 100) as i64).collect::<Vec<_>>();
+        let ratings = (start..end)
+            .map(|doc_id| (doc_id % 100) as i64)
+            .collect::<Vec<_>>();
         let mut flat = Vec::with_capacity(len * dim);
         for doc_id in start..end {
             flat.extend_from_slice(&emb_for(doc_id as u64));
@@ -369,10 +378,18 @@ fn build_sql_on_storage(
             vec![
                 Arc::new(LargeStringArray::from(titles)),
                 Arc::new(LargeStringArray::from(titles_noidx)),
-                Arc::new(LargeStringArray::from(bucket_vals.iter().map(String::as_str).collect::<Vec<_>>())),
-                Arc::new(LargeStringArray::from(bucket_vals.iter().map(String::as_str).collect::<Vec<_>>())),
-                Arc::new(LargeStringArray::from(key_vals.iter().map(String::as_str).collect::<Vec<_>>())),
-                Arc::new(LargeStringArray::from(key_vals.iter().map(String::as_str).collect::<Vec<_>>())),
+                Arc::new(LargeStringArray::from(
+                    bucket_vals.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                Arc::new(LargeStringArray::from(
+                    bucket_vals.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                Arc::new(LargeStringArray::from(
+                    key_vals.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                Arc::new(LargeStringArray::from(
+                    key_vals.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
                 Arc::new(LargeStringArray::from(categories)),
                 Arc::new(Int64Array::from(ratings)),
                 Arc::new(emb),
