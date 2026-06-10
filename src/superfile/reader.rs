@@ -602,34 +602,13 @@ impl SuperfileReader {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        // 4. Sort + dedup so the RowSelection's `(skip, select)`
-        //    pairs are strictly monotonic. local_doc_ids is dense
-        //    parquet-row index (one parquet row per doc, in id
-        //    order — invariant of the superfile body), so the
-        //    selection lines up directly with parquet row offsets.
-        //    Caller's original order (including duplicates) is
-        //    restored below via the rank-back step.
-        let mut sorted_ids: Vec<u32> = local_doc_ids.to_vec();
-        sorted_ids.sort_unstable();
-        sorted_ids.dedup();
-
-        // 5. Build the RowSelection as alternating skip/select
-        //    runs. This decodes only the rows containing the
-        //    requested doc ids — for k=10 hits over a 100k-doc
-        //    body, ~10 page-fragments instead of the entire
-        //    column. (With page indexes present, parquet skips
-        //    whole pages; without, it still avoids the full
-        //    concat_batches over a 100k-row decoded buffer.)
-        let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted_ids.len() * 2 + 1);
-        let mut cursor: u32 = 0;
-        for &id in &sorted_ids {
-            if id > cursor {
-                selectors.push(RowSelector::skip((id - cursor) as usize));
-            }
-            selectors.push(RowSelector::select(1));
-            cursor = id + 1;
-        }
-        let selection = RowSelection::from(selectors);
+        // 4+5. Sorted/dedup'd ids → monotonic skip/select runs.
+        //    local_doc_ids is dense parquet-row index (one parquet row
+        //    per doc, in id order — invariant of the superfile body),
+        //    so the selection lines up directly with parquet row
+        //    offsets. Caller's original order (including duplicates)
+        //    is restored below via the rank-back step.
+        let (sorted_ids, selection) = row_selection_for_ids(local_doc_ids);
 
         // Metadata-cached read: reuse the `ArrowReaderMetadata` parsed
         // at open (no per-call footer parse), so this targeted read
@@ -658,18 +637,9 @@ impl SuperfileReader {
             "RowSelection rows ≠ requested distinct doc ids"
         );
 
-        // 6. Rank back into the caller's order via take. For each
-        //    requested doc_id, binary-search its row position in
-        //    `sorted_ids` (which is also its row position in
-        //    `selected`). Cheap: typical k is 10..1000.
-        let mut indices_builder = UInt32Array::builder(local_doc_ids.len());
-        for &id in local_doc_ids {
-            let row = sorted_ids
-                .binary_search(&id)
-                .expect("requested id was inserted into sorted_ids above");
-            indices_builder.append_value(row as u32);
-        }
-        let indices = indices_builder.finish();
+        // 6. Rank back into the caller's order via take. Cheap:
+        //    typical k is 10..1000.
+        let indices = rank_back_indices(local_doc_ids, &sorted_ids);
 
         // 7. Gather columns in caller's projection order (the
         //    reader returns columns in file order, which may
@@ -1160,6 +1130,48 @@ fn slice_or_err(
 // into the FTS submodule.
 pub use crate::superfile::fts::reader::BoolMode as FtsBoolMode;
 
+/// Sorted, deduplicated copy of `ids` plus the parquet [`RowSelection`]
+/// selecting exactly those rows, as strictly monotonic alternating
+/// skip/select runs. Decodes only the rows the ids land on — for k=10
+/// hits over a 100k-doc body, ~10 page-fragments instead of the whole
+/// column (with page indexes present parquet skips whole pages).
+///
+/// Shared by [`SuperfileReader::take_by_local_doc_ids`] (sync decode
+/// over resident bytes) and the supertable's cold object-store row
+/// resolution — the row-selection contract is identical even though
+/// the I/O models differ. Pair with [`rank_back_indices`] to restore
+/// the caller's order afterwards.
+pub(crate) fn row_selection_for_ids(ids: &[u32]) -> (Vec<u32>, RowSelection) {
+    let mut sorted: Vec<u32> = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted.len() * 2 + 1);
+    let mut cursor: u32 = 0;
+    for &id in &sorted {
+        if id > cursor {
+            selectors.push(RowSelector::skip((id - cursor) as usize));
+        }
+        selectors.push(RowSelector::select(1));
+        cursor = id + 1;
+    }
+    (sorted, RowSelection::from(selectors))
+}
+
+/// Rank-back `take` indices restoring the caller's id order (duplicates
+/// honored) over rows selected via [`row_selection_for_ids`]: for each
+/// requested id, its row position in `sorted` is its row position in
+/// the selected batch. Cheap — typical k is 10..1000.
+pub(crate) fn rank_back_indices(ids: &[u32], sorted: &[u32]) -> UInt32Array {
+    let mut builder = UInt32Array::builder(ids.len());
+    for &id in ids {
+        let row = sorted
+            .binary_search(&id)
+            .expect("requested id present in the sorted selection");
+        builder.append_value(row as u32);
+    }
+    builder.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,6 +1318,21 @@ mod tests {
             .expect("decimal ids");
         assert_eq!(ids.value(0), 10_i128);
         assert_eq!(ids.value(3), 13_i128);
+    }
+
+    #[test]
+    fn row_selection_and_rank_back_honor_duplicates_and_gaps() {
+        // Caller order with a duplicate and out-of-order ids.
+        let ids = [7u32, 2, 7, 0];
+        let (sorted, selection) = row_selection_for_ids(&ids);
+        assert_eq!(sorted, vec![0, 2, 7]);
+        // select(0), skip(1), select(2), skip(4..7), select(7)
+        assert_eq!(selection.row_count(), 3, "one selected row per distinct id");
+
+        let indices = rank_back_indices(&ids, &sorted);
+        // Positions in `sorted`: 7→2, 2→1, 7→2, 0→0.
+        let got: Vec<u32> = (0..indices.len()).map(|i| indices.value(i)).collect();
+        assert_eq!(got, vec![2, 1, 2, 0]);
     }
 
     #[test]
