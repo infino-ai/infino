@@ -203,6 +203,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     );
 
     let batches = consumer
+        .reader()
         .query_sql("SELECT _id FROM supertable")
         .expect("query _id");
     let mut all: HashSet<i128> = HashSet::with_capacity(N_HANDLES * ROWS_PER_HANDLE as usize);

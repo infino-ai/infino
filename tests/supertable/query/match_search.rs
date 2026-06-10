@@ -164,7 +164,7 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
         .token_match("title", "rust", BoolMode::Or)
         .expect("token_match OR");
     let bm25 = reader
-        .bm25_search("title", "rust", TOP_K, BoolMode::Or)
+        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
         .expect("bm25_search OR");
 
     assert!(
@@ -191,7 +191,7 @@ fn token_match_and_intersects_tokens() {
         .token_match("title", "rust systems", BoolMode::And)
         .expect("token_match AND");
     let bm25 = reader
-        .bm25_search("title", "rust systems", TOP_K, BoolMode::And)
+        .bm25_hits("title", "rust systems", TOP_K, BoolMode::And)
         .expect("bm25_search AND");
 
     assert!(!token.is_empty(), "AND of present tokens must match a doc");
@@ -255,10 +255,10 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
         )
         .expect("hybrid_search");
     let bm25 = reader
-        .bm25_search("title", "rust", TOP_K, BoolMode::Or)
+        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
         .expect("bm25_search");
     let vector = reader
-        .vector_search("emb", &q, TOP_K, VectorSearchOptions::new())
+        .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new())
         .expect("vector_search");
 
     assert!(
@@ -304,10 +304,10 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
         )
         .expect("hybrid_search");
     let bm25 = reader
-        .bm25_search("title", "async", RANK_TOP_K, BoolMode::Or)
+        .bm25_hits("title", "async", RANK_TOP_K, BoolMode::Or)
         .expect("bm25_search");
     let vector = reader
-        .vector_search("emb", &q, RANK_TOP_K, VectorSearchOptions::new())
+        .vector_hits("emb", &q, RANK_TOP_K, VectorSearchOptions::new())
         .expect("vector_search");
 
     assert!(

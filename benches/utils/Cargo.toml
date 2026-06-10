@@ -7,10 +7,12 @@ publish = false
 
 [lib]
 path = "mod.rs"
+bench = false
 
 [[bin]]
 name = "profile_segment"
 path = "bin/profile_segment.rs"
+bench = false
 
 
 [dependencies]
@@ -19,6 +21,7 @@ arrow-schema = "58"
 async-trait = "0.1"
 bytemuck = "1"
 bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
 datafusion = "53"
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }

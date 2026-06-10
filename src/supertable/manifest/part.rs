@@ -97,6 +97,7 @@ impl ContentHash {
     }
 
     /// Hex representation, lower-case, 64 chars.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_hex(&self) -> String {
         let mut out = String::with_capacity(BLAKE3_HEX_LEN);
         for byte in self.0 {

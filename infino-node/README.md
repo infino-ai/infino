@@ -2,9 +2,10 @@
 
 napi-rs bindings over infino's catalog API. Sync and Node-idiomatic:
 pass arrays of objects (or apache-arrow Tables) in, get plain records
-out. A thin JS wrapper (`infino.js`) hides the Arrow-IPC boundary over
-the raw addon; pass `{ arrow: true }` to a search/query to get an
-apache-arrow `Table` instead.
+out. A thin TypeScript wrapper (`infino/index.ts`, compiled by `tsc`)
+hides the Arrow-IPC boundary over the napi addon (`infino/native.js`);
+pass `{ arrow: true }` to a search/query to get an apache-arrow `Table`
+instead.
 
 ```javascript
 const { connect, IndexSpec } = require("infino");
@@ -34,8 +35,8 @@ membership):
 ```sh
 cd infino-node
 npm install
-npm run build       # compiles the addon + generates index.js / index.d.ts
-npm test            # node --test against the built addon
+npm run build       # napi build (native addon) + tsc (compiles infino/index.ts)
+npm test            # node --test against the built wrapper
 ```
 
 ## Scope (v1 — mirrors the Python bindings)
@@ -77,10 +78,10 @@ schema, but a genuine type mismatch errors).
   an additive follow-up.
 - **`SearchHit.id` is a `bigint`** — the core `_id` is 128-bit; JS
   `number` would lose precision past 2^53.
-- **Objects in, records out** — the JS wrapper (`infino.js`) converts
-  arrays of objects ↔ Arrow and decodes results to plain records, the
-  same layered pattern LanceDB / nodejs-polars use (a hand-written
-  language layer over the napi addon, `index.js`). JS↔Rust has no
+- **Objects in, records out** — the TypeScript wrapper (`infino/index.ts`)
+  converts arrays of objects ↔ Arrow and decodes results to plain records,
+  the same layered pattern LanceDB / nodejs-polars use (a hand-written
+  TS layer over the napi addon, `infino/native.js`). JS↔Rust has no
   pyarrow-style zero-copy C-Data bridge, so bulk data crosses as Arrow
   IPC (one copy); the wrapper hides it. Query vectors cross as a
   `Float32Array` by reference.

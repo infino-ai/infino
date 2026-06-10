@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+  - repo: https://github.com/pre-commit/pre-commit
+    rev: v3.2.2
+    hooks:
+      - id: validate_manifest
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        description: Check if all files follow the rustfmt style
+        entry: cargo fmt --all -- --check --color always
+        language: system
+        pass_filenames: false
+      - id: cargo-check
+        name: cargo check
+        description: Check the package for errors.
+        entry: cargo check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: clippy
+        name: clippy
+        description: Lint rust sources
+        entry: cargo clippy
+        language: system
+        args: ["--", "-D", "warnings"]
+        types: [rust]
+        pass_filenames: false

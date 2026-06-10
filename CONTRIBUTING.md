@@ -15,6 +15,10 @@ clone to a green pull request.
   `rustup +nightly component add miri`.
 - **cargo-llvm-cov** — only required to run the coverage gate locally:
   `cargo install cargo-llvm-cov --locked`.
+- **pre-commit** — optional but recommended for local development. Install via
+  [pre-commit.com](https://pre-commit.com/#install) and run `pre-commit install`
+  in the repository root. This sets up git hooks to catch style and lint issues
+  before they reach CI.
 
 ## Build
 
@@ -40,6 +44,21 @@ cargo run --example demo
 cargo test --workspace        # full suite
 cargo test <name_substring>   # a single test or module
 cargo test bm25_oracle -- --nocapture   # ...with stdout
+```
+
+## Pre-commit hooks (optional but recommended)
+
+After running `pre-commit install`, git hooks will automatically run before each commit to catch:
+- Code formatting issues (`rustfmt`)
+- Compiler errors (`cargo check`)
+- Lint warnings (`clippy`)
+- File hygiene (trailing whitespace, line endings, merge conflicts, YAML syntax)
+
+To run them manually without committing:
+
+```bash
+pre-commit run --all-files        # check all files
+pre-commit run --files <file>     # check specific file(s)
 ```
 
 ## Before you open a pull request

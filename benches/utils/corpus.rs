@@ -91,7 +91,7 @@ pub const DIM: usize = 384;
 pub type Hit = (u32, f32);
 
 /// Doc count for superfile-shape benches (one-segment scale). 1M ×
-/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the hot tier and
+/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the warm tier and
 /// is the single-superfile cold-open unit for the warm/cold tiers.
 pub const SUPERFILE_DOCS: usize = 1_000_000;
 
@@ -101,16 +101,20 @@ pub const SUPERFILE_DOCS: usize = 1_000_000;
 /// over the object store.
 pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
-/// Superfile doc count — single-segment, in-memory. Default 1M; override
-/// with `INFINO_BENCH_DOC_COUNT`.
+/// Document count for the **superfile** test — a single-segment index
+/// built and queried entirely **in memory**. Defaults to
+/// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
+/// for a quicker local loop or a larger stress run.
 pub fn superfile_docs() -> usize {
-    docs_from_env("INFINO_BENCH_DOC_COUNT", SUPERFILE_DOCS)
+    docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
 }
 
-/// Supertable doc count — multi-segment, object storage. Default 10M;
-/// override with `INFINO_BENCH_DOC_COUNT`.
+/// Document count for the **supertable** test — a multi-segment table
+/// committed to and queried from **object storage**. Defaults to
+/// [`SUPERTABLE_DOCS`] (10M); override with
+/// `INFINO_BENCH_SUPERTABLE_DOCS`.
 pub fn supertable_docs() -> usize {
-    docs_from_env("INFINO_BENCH_DOC_COUNT", SUPERTABLE_DOCS)
+    docs_from_env("INFINO_BENCH_SUPERTABLE_DOCS", SUPERTABLE_DOCS)
 }
 
 /// Parse a positive doc-count override from `var`, falling back to
@@ -636,7 +640,8 @@ pub fn mean_recall_superfile(
         .with_rerank_mult(rerank_mult);
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = block_on_inmem(reader.vector_search(column, q, k, opts)).expect("vector_search");
+        let hits =
+            block_on_inmem(reader.vector_hits_async(column, q, k, opts)).expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -751,7 +756,7 @@ pub fn calibrate_superfile(
                 .with_rerank_mult(refine);
             let p50 = p50_micros(
                 || {
-                    let _ = block_on_inmem(reader.vector_search(column, q, k, opts))
+                    let _ = block_on_inmem(reader.vector_hits_async(column, q, k, opts))
                         .expect("vector_search");
                 },
                 p50_iter,

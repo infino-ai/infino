@@ -96,6 +96,7 @@ async fn writer_delete_tombstones_matching_rows() {
 
     // Follow-up SQL query no longer returns the row.
     let batches = st
+        .reader()
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -115,12 +116,14 @@ async fn writer_delete_tombstones_matching_rows() {
     );
 
     // Follow-up FTS query against the deleted token returns no
-    // hits.
+    // hits. The row-returning search yields one (possibly empty)
+    // batch, so assert on the row count, not the batch count.
     let hits = st
         .reader()
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or)
+        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
         .expect("fts");
-    assert!(hits.is_empty(), "expected zero hits for tombstoned token");
+    let n_rows: usize = hits.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(n_rows, 0, "expected zero hits for tombstoned token");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -205,6 +208,7 @@ async fn writer_update_replaces_matching_rows() {
     drop(w);
 
     let batches = st
+        .reader()
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches

@@ -25,9 +25,9 @@ Think of three ideas:
    sidecar index files to keep in sync, and the file is also a valid
    Apache Parquet file, so standard analytics tools (DuckDB,
    DataFusion, pandas/pyarrow) can read it directly.
-2. **Files are never edited, only added.** A *supertable* is a catalog
-  (the *manifest*) that lists which files currently make up the table.
-   Writes create new files and publish a new manifest; they never
+2. **Files are never edited, only added.** A *supertable* is described
+  by its *manifest* — the list of which files currently make up the
+   table. Writes create new files and publish a new manifest; they never
    modify existing files. This makes consistency simple and snapshots
    essentially free.
 3. **Storage and compute are separate.** The source of truth is object
@@ -37,18 +37,48 @@ Think of three ideas:
 
 ```text
         Application
-            │  SQL · keyword search · vector search
+            │  connect(uri) → Connection
             ▼
-        Supertable  ── manifest (the catalog of files) ──┐
-            │                                             │
-   stateless compute                              immutable files
-   + local cache (hot)                            (superfiles)
-            │                                             │
-            └──────────── byte-range reads ───────────────┘
+        Connection  ── catalog of tables (name → supertable) ──┐
+            │  create / open / list / drop · cross-table SQL    │
+            ▼                                                    │
+        Supertable  ── manifest (the file list) ──┐             │
+            │                                      │             │
+   stateless compute                       immutable files      │
+   + local cache (hot)                     (superfiles)          │
+            │                                      │             │
+            └──────────── byte-range reads ────────┴─────────────┘
                                  ▼
                       Object storage (S3) — cheap, durable,
                               the source of truth
 ```
+
+## Opening Infino
+
+Infino is an **embedded engine, not a server** — it runs inside your
+process, the way SQLite or DuckDB do. You install it as a library (the
+Rust crate via `cargo add infino`, or the Python wheel via
+`pip install infino`) and open a **connection** to a root location on
+storage from your own code; the engine, including its SQL (DataFusion
+under the hood), executes in-process. There is no wire protocol yet, so
+external SQL clients can't attach — SQL is reached through the
+connection's `query_sql`. From that connection you work with tables:
+
+- `connect("s3://bucket/prefix")` (or a local path, or `memory://`)
+  returns a **`Connection`** — a *catalog of tables* persisted at that
+  root. (Distinct from a supertable's *manifest*, which lists the files
+  within one table.)
+- From the connection you **create**, **open**, **list**, and **drop**
+  tables, and run **SQL across them** (`query_sql`) — joins and
+  aggregations span tables in the catalog in one engine.
+- Each table is a **`Supertable`** handle: `append` rows, `update` /
+  `delete`, and search it — `bm25_search` / `vector_search` (full-text
+  and vector kNN, returning Arrow rows), the unranked `token_match` /
+  `exact_match`, and `schema`. The same retrievers are also SQL
+  table-valued functions, so search composes with the rest of a query.
+
+The connection is the only entry point; everything below it (manifest,
+storage, cache, query fan-out) is internal.
 
 ## How a query runs
 
@@ -182,7 +212,7 @@ easy interop with existing data tooling.
 SQL, BM25, and IVF + RaBitQ vectors share one copy of the data and
 one consistency model, instead of syncing a DB + a search engine + a
 vector DB.
-- **Hybrid search is a first-class citizen.** Because every modality shares that one copy and one query path, you fuse keyword (BM25) and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. The same index machinery prunes segments across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
+- **Hybrid search is a first-class citizen — and an access path, not just an API.** In most systems, hybrid search ends at top-k: two retrievals (BM25, ANN) plus rank fusion. Here every modality shares one copy and one query path, so you fuse keyword and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. And because the retrievers are *relations* (table functions) and indexed text predicates resolve to candidate row sets inside the engine, search can be the first stage of a larger SQL plan — feeding joins, filters, and aggregates — rather than its result. The same index machinery prunes segments across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
 
 ### At a glance
 
@@ -210,7 +240,7 @@ multi-system sync, no duplicated copies, no client-side result merging.
 - **Predictable performance tiers.** Bounded ranged reads on cold data,
 local memory-mapped speed when hot, with the cache managing the
 transition automatically.
-- **Operational simplicity.** Immutable files + an atomic catalog swap
+- **Operational simplicity.** Immutable files + an atomic manifest swap
 give clean snapshots, safe concurrent writers, and stateless,
 disposable compute.
 - **Openness / no lock-in.** Segments are Parquet; data stays usable by
@@ -244,11 +274,15 @@ run one system that comfortably handles your scale and modalities, then where In
 
 ## A few terms you'll see through the repo
 
+- **Connection** — the entry point: a catalog of tables rooted at a URI,
+opened with `connect(uri)`. Create / open / list / drop tables and run
+SQL across them. (The table catalog; not to be confused with a single
+table's manifest.)
 - **Superfile** — one immutable segment file (columns + keyword index +
 vector index), also a valid Parquet file.
-- **Supertable** — the table: a manifest (catalog) over many
-superfiles, presenting them as one queryable table.
-- **Manifest** — the immutable list of which files make up the table
+- **Supertable** — the table: a manifest over many superfiles,
+presenting them as one queryable table. Obtained from a `Connection`.
+- **Manifest** — the immutable list of which files make up one table
 right now; each commit publishes a new one atomically.
 - **Snapshot read** — a query pinned to one manifest, so concurrent
 writes never change its answer.

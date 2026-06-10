@@ -136,7 +136,7 @@ fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
 /// index 0..N-1, so the reader's `local_doc_id` IS the user id.
 async fn infino_top_k(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
     let hits = reader
-        .bm25_search("title", query, k, BoolMode::Or)
+        .bm25_hits_async("title", query, k, BoolMode::Or)
         .await
         .expect("BM25 search");
     hits.into_iter().map(|(d, _)| d as u64).collect()
@@ -287,7 +287,7 @@ async fn infino_top_k_and(reader: &SuperfileReader, query: &str, k: usize) -> Ve
     // Returned `local_doc_id` == user `doc_id` thanks to the planted
     // 0..N row layout.
     let hits = reader
-        .bm25_search("title", query, k, BoolMode::And)
+        .bm25_hits_async("title", query, k, BoolMode::And)
         .await
         .expect("AND BM25 search");
     hits.into_iter().map(|(d, _)| d as u64).collect()
@@ -396,7 +396,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
     tok.tokenize_each("rust framework", &mut |t| terms.push(t.to_owned()));
 
     let infino_hits: Vec<(u64, f32)> = infino
-        .bm25_search("title", "rust framework", 10, BoolMode::And)
+        .bm25_hits_async("title", "rust framework", 10, BoolMode::And)
         .await
         .expect("AND search")
         .into_iter()

@@ -579,7 +579,7 @@ mod tests {
             "SELECT _id, title, score FROM vector_search('emb', '{}', 8)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.query_sql(&sql).expect("query_sql");
+        let batches = st.reader().query_sql(&sql).expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 8, "single segment, k=8 → all 8 docs resolved");
 
@@ -614,7 +614,7 @@ mod tests {
             "SELECT * FROM vector_search('emb', '{}', 3)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.query_sql(&sql).expect("query_sql");
+        let batches = st.reader().query_sql(&sql).expect("query_sql");
         let b = &batches[0];
         // Scalar schema (_id, title) + score.
         assert_eq!(b.num_columns(), 3);
@@ -632,7 +632,7 @@ mod tests {
             "SELECT score FROM vector_search('emb', '{}', 2)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.query_sql(&sql).expect("query_sql");
+        let batches = st.reader().query_sql(&sql).expect("query_sql");
         let b = &batches[0];
         assert_eq!(b.num_columns(), 1);
         assert_eq!(b.schema().field(0).name(), "score");
@@ -648,11 +648,13 @@ mod tests {
         let st = supertable_one_segment(dim, 8);
         let q = csv_one_hot(dim, 0);
         let full = st
+            .reader()
             .query_sql(&format!(
                 "SELECT _id, title, score FROM vector_search('emb', '{q}', 5)"
             ))
             .expect("query_sql");
         let only = st
+            .reader()
             .query_sql(&format!("SELECT score FROM vector_search('emb', '{q}', 5)"))
             .expect("query_sql");
 
@@ -682,7 +684,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("SELECT title FROM vector_search('emb', [{arr}], 1)");
-        let batches = st.query_sql(&sql).expect("query_sql");
+        let batches = st.reader().query_sql(&sql).expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
         assert_eq!(col_str(&batches[0], "title").value(0), "doc 0");
@@ -696,7 +698,7 @@ mod tests {
             "SELECT _id, score FROM vector_search('emb', '{}', 5)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.query_sql(&sql).expect("query_sql");
+        let batches = st.reader().query_sql(&sql).expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
     }

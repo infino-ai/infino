@@ -199,7 +199,7 @@ const K: usize = 10;
 fn run_bm25(st: &Supertable) -> Vec<(String, u32)> {
     hit_key(
         &st.reader()
-            .bm25_search("title", "rust", K, BoolMode::Or)
+            .bm25_hits("title", "rust", K, BoolMode::Or)
             .expect("bm25"),
     )
 }
@@ -209,23 +209,25 @@ fn run_vector(st: &Supertable) -> Vec<(String, u32)> {
     q[0] = 1.0;
     hit_key(
         &st.reader()
-            .vector_search("emb", &q, K, VectorSearchOptions::new())
+            .vector_hits("emb", &q, K, VectorSearchOptions::new())
             .expect("vector"),
     )
 }
 
 fn run_hybrid(st: &Supertable) -> Vec<i128> {
     id_vec(
-        &st.query_sql(&format!(
-            "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{}', {K})",
-            csv_one_hot(0)
-        ))
-        .expect("hybrid query_sql"),
+        &st.reader()
+            .query_sql(&format!(
+                "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{}', {K})",
+                csv_one_hot(0)
+            ))
+            .expect("hybrid query_sql"),
     )
 }
 
 fn run_count(st: &Supertable) -> i64 {
     let batches = st
+        .reader()
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("count query_sql");
     batches[0]

@@ -93,6 +93,7 @@ use crate::superfile::vector::distance::Metric;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use parquet::basic::Compression;
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 
 /// Per-column FTS configuration. The `column` must exist in
@@ -546,7 +547,11 @@ impl SuperfileBuilder {
     ///
     /// Returns `BuildError::VectorDimMismatch` if vector column names or
     /// dimensions don't match the builder's configuration.
-    pub fn add_batch_from_reader(&mut self, reader: &SuperfileReader) -> Result<(), BuildError> {
+    pub fn add_batch_from_reader(
+        &mut self,
+        reader: &SuperfileReader,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<(), BuildError> {
         self.opts.check_mergeability(
             reader.id_column(),
             reader.schema(),
@@ -556,7 +561,7 @@ impl SuperfileBuilder {
                 .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
         )?;
         let record_batch = reader
-            .get_record_batch()
+            .get_record_batch(deleted_docs_bitmap.clone())
             .map_err(|_| BuildError::BatchReadError)?;
 
         let num_rows = record_batch.num_rows();
@@ -590,7 +595,13 @@ impl SuperfileBuilder {
                 let result = v
                     .get_vectors_fp32(&reader_col.name)
                     .map_err(|_| BuildError::VectorReadError)?;
-                for single_row in result {
+                for (row_idx, single_row) in result.iter().enumerate() {
+                    // Skip deleted documents: only include rows not in the deleted_docs_bitmap
+                    if let Some(ref bitmap) = deleted_docs_bitmap
+                        && bitmap.contains(row_idx as u32)
+                    {
+                        continue;
+                    }
                     this_col_vectors.extend_from_slice(single_row.as_slice());
                 }
                 vectors.push(this_col_vectors);
@@ -1202,7 +1213,7 @@ mod tests {
 
         // Create a new builder and add from reader
         let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-        b2.add_batch_from_reader(&reader)
+        b2.add_batch_from_reader(&reader, None)
             .expect("add_batch_from_reader");
         let merged_bytes = b2.finish().expect("finish builder");
 
@@ -1233,7 +1244,7 @@ mod tests {
         // Read and verify parquet data
         let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open superfile reader");
         let reader_batch = reader
-            .get_record_batch()
+            .get_record_batch(None)
             .expect("get_record_batch from reader");
 
         // Should have 2 rows
@@ -1241,7 +1252,7 @@ mod tests {
 
         // Now add to a new builder
         let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-        b2.add_batch_from_reader(&reader)
+        b2.add_batch_from_reader(&reader, None)
             .expect("add_batch_from_reader");
         let merged_bytes = b2.finish().expect("finish builder");
 
@@ -1249,7 +1260,7 @@ mod tests {
         let reader2 =
             SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged superfile reader");
         let merged_batch = reader2
-            .get_record_batch()
+            .get_record_batch(None)
             .expect("get_record_batch from merged reader");
         assert_eq!(merged_batch.num_rows(), 2);
     }
@@ -1281,7 +1292,7 @@ mod tests {
             .expect("get vectors fp32");
 
         let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-        b2.add_batch_from_reader(&reader)
+        b2.add_batch_from_reader(&reader, None)
             .expect("add_batch_from_reader");
         let merged_bytes = b2.finish().expect("finish builder");
 
@@ -1333,7 +1344,7 @@ mod tests {
 
         // Add to new builder
         let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-        b2.add_batch_from_reader(&reader)
+        b2.add_batch_from_reader(&reader, None)
             .expect("add_batch_from_reader");
         let merged_bytes = b2.finish().expect("finish builder");
 
@@ -1397,7 +1408,7 @@ mod tests {
             .add_batch(&batch2, &[v2.as_slice()])
             .expect("add_batch");
         merged
-            .add_batch_from_reader(&reader1)
+            .add_batch_from_reader(&reader1, None)
             .expect("add_batch_from_reader");
         let merged_bytes = merged.finish().expect("finish builder");
 
@@ -1406,7 +1417,9 @@ mod tests {
             SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
 
         // Should have 4 docs total (2 from batch2 + 2 from reader1)
-        let merged_batch = merged_reader.get_record_batch().expect("get_record_batch");
+        let merged_batch = merged_reader
+            .get_record_batch(None)
+            .expect("get_record_batch");
         assert_eq!(merged_batch.num_rows(), 4);
 
         // Verify vectors are correct
@@ -1548,7 +1561,7 @@ mod tests {
         // Create merged superfile with data from reader
         let mut b_merged = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         b_merged
-            .add_batch_from_reader(&reader1)
+            .add_batch_from_reader(&reader1, None)
             .expect("add_batch_from_reader");
         let merged_bytes = b_merged.finish().expect("finish builder");
 
@@ -1583,7 +1596,9 @@ mod tests {
         assert!(!fts_results.is_empty(), "fts search should return results");
 
         // Verify parquet query works
-        let batch = reader_merged.get_record_batch().expect("get_record_batch");
+        let batch = reader_merged
+            .get_record_batch(None)
+            .expect("get_record_batch");
         assert_eq!(batch.num_rows(), 2);
     }
 }

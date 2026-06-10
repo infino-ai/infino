@@ -25,6 +25,7 @@ use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
 use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::vector::reader::VectorReader;
+use crate::supertable::query::provider::tombstone_access_plan;
 use arrow::compute::{concat_batches, take};
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::{Field, Schema};
@@ -35,6 +36,7 @@ use parquet::arrow::arrow_reader::{
     RowSelector,
 };
 use parquet::file::metadata::PageIndexPolicy;
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -81,6 +83,15 @@ pub struct SuperfileReader {
     /// bytes). Carries the page index when present so `RowSelection`
     /// can skip whole pages.
     arrow_meta: Option<ArrowReaderMetadata>,
+    /// The lazy byte source the reader was opened over, retained only
+    /// on the [`open_lazy`] path. `None` on the eager [`open`] path
+    /// (resident bytes already cover every range). Lets
+    /// [`byte_source`](Self::byte_source) hand callers one uniform
+    /// whole-segment byte source regardless of how the reader opened.
+    ///
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    /// [`open`]: SuperfileReader::open
+    source: Option<Arc<dyn crate::superfile::LazyByteSource>>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -272,6 +283,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: None,
             arrow_meta: None,
+            source: Some(source),
             schema,
             id_column,
             n_docs,
@@ -376,6 +388,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: Some(bytes),
             arrow_meta: Some(arrow_meta),
+            source: None,
             schema,
             id_column,
             n_docs,
@@ -441,18 +454,39 @@ impl SuperfileReader {
         self.bytes.as_ref()
     }
     /// Returns a record batch containing all documents with all columns
-    pub fn get_record_batch(&self) -> Result<RecordBatch, ReadError> {
+    pub fn get_record_batch(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<RecordBatch, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
-            .ok_or(ReadError::LazyReaderUnsupported)?
-            .clone();
+            .ok_or(ReadError::LazyReaderUnsupported)?;
         let arrow_meta = self
             .arrow_meta
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?
             .clone();
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
+        let plan = if let Some(deleted_docs_bitmap) = deleted_docs_bitmap {
+            tombstone_access_plan(bytes, deleted_docs_bitmap.as_ref())
+                .map_err(|e| ReadError::Columnar(e.to_string()))?
+        } else {
+            None
+        };
+
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), arrow_meta);
+        if let Some(plan) = plan {
+            let row_groups = plan.row_group_indexes();
+            let selection = plan
+                .into_overall_row_selection(builder.metadata().row_groups())
+                .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+            builder = builder.with_row_groups(row_groups);
+            if let Some(selection) = selection {
+                builder = builder.with_row_selection(selection);
+            }
+        }
         let reader = builder
             .build()
             .map_err(|e| ReadError::Columnar(e.to_string()))?;
@@ -464,6 +498,31 @@ impl SuperfileReader {
             .map_err(|e| ReadError::Columnar(e.to_string()))?;
 
         Ok(record_batch)
+    }
+
+    /// A [`LazyByteSource`] over the **entire** segment, regardless of
+    /// how the reader was opened. The single byte-access handle the
+    /// SQL/DataFusion path reads through -- callers never branch on
+    /// storage mode:
+    ///
+    /// - resident-bytes readers (eager [`open`], disk-cache mmap) wrap
+    ///   their bytes in a [`BytesLazyByteSource`]; every `range` is a
+    ///   zero-copy `Bytes::slice` (a refcount bump, no copy).
+    /// - lazy readers ([`open_lazy`]) return the source they were
+    ///   opened over, so ranges stream straight from object storage.
+    ///
+    /// [`LazyByteSource`]: crate::superfile::LazyByteSource
+    /// [`BytesLazyByteSource`]: crate::superfile::BytesLazyByteSource
+    /// [`open`]: SuperfileReader::open
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    pub fn byte_source(&self) -> Arc<dyn crate::superfile::LazyByteSource> {
+        match (&self.bytes, &self.source) {
+            (Some(bytes), _) => Arc::new(crate::superfile::BytesLazyByteSource::new(bytes.clone())),
+            (None, Some(src)) => Arc::clone(src),
+            (None, None) => {
+                unreachable!("a SuperfileReader has either resident bytes or a lazy source")
+            }
+        }
     }
 
     /// Resolve in-segment row offsets to their durable identity.
@@ -697,8 +756,9 @@ impl SuperfileReader {
     ///
     /// `query` is tokenized by the same v1 tokenizer used at build
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
-    /// ordered by descending score.
-    pub async fn bm25_search(
+    /// hits ordered by descending score — this is the hit kernel, not a
+    /// row-returning search; row materialization is `take_by_local_doc_ids`.
+    pub async fn bm25_hits_async(
         &self,
         column: &str,
         query: &str,
@@ -966,7 +1026,7 @@ impl SuperfileReader {
     /// only a cold `Source::Lazy` miss actually `await`s an
     /// object-store GET. The CPU steps (centroid + 1-bit code scoring,
     /// rerank) parallelize on the global rayon pool.
-    pub async fn vector_search(
+    pub async fn vector_hits_async(
         &self,
         column: &str,
         query: &[f32],
@@ -1290,7 +1350,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits_async("title", "rust", 5, BoolMode::Or)
             .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
@@ -1313,7 +1373,7 @@ mod tests {
         let bytes = Bytes::from(b.finish().expect("finish builder"));
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
-            .bm25_search("nope", "x", 1, BoolMode::Or)
+            .bm25_hits_async("nope", "x", 1, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
@@ -1408,7 +1468,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search("emb", &q, 1, VectorSearchOptions::default())
+            .vector_hits_async("emb", &q, 1, VectorSearchOptions::default())
             .await
             .expect("vector search");
         assert!(!hits.is_empty());
@@ -1424,7 +1484,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
+            .vector_hits_async("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
             .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
@@ -1452,7 +1512,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
-            .bm25_search("nonexistent", "rust", 5, BoolMode::Or)
+            .bm25_hits_async("nonexistent", "rust", 5, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::Fts(_)));

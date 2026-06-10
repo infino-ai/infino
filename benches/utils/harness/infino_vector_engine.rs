@@ -6,7 +6,7 @@
 //! The canonical `write` builds one unified superfile through
 //! `SuperfileBuilder`, opens a `SuperfileReader`, and retains both the
 //! bytes and the reader. In-tree benches use those retained bytes for
-//! cold upload and the retained reader for correctness/hot search.
+//! cold upload and the retained reader for correctness/warm search.
 
 use std::sync::Arc;
 
@@ -193,8 +193,12 @@ impl VectorEngine for InfinoVectorEngine {
         let opts = VectorSearchOptions::new()
             .with_nprobe(search.nprobe)
             .with_rerank_mult(search.rerank_mult);
-        let hits = block_on_inmem(index.reader().vector_search(&index.column, query, k, opts))
-            .expect("vector_search");
+        let hits = block_on_inmem(
+            index
+                .reader()
+                .vector_hits_async(&index.column, query, k, opts),
+        )
+        .expect("vector_search");
         hits.into_iter()
             .map(|(doc_id, distance)| VectorHit {
                 doc_id: u64::from(doc_id),

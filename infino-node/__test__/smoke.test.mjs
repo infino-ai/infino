@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { connect, IndexSpec } from "../infino.js";
+import { connect, IndexSpec } from "../infino/index.js";
 import { Schema, Field, LargeUtf8, Float32, FixedSizeList } from "apache-arrow";
 
 // FTS columns must be LargeUtf8; non-null to match the appended data.
@@ -40,9 +40,10 @@ test("memory roundtrip: create, append, search, drop", () => {
 
   const reopened = db.openTable("docs");
 
-  // bm25Search returns matching rows as plain records.
+  // bm25Search returns matching rows as plain records; `_id` is a bigint.
   const ranked = reopened.bm25Search("title", "fox", 10);
   assert.equal(ranked.length, 1);
+  assert.equal(typeof ranked[0]._id, "bigint");
 
   // tokenMatch returns the _id + score list (bigint _id).
   const hits = reopened.tokenMatch("title", "fox");
@@ -52,6 +53,14 @@ test("memory roundtrip: create, append, search, drop", () => {
 
   db.dropTable("docs");
   assert.deepEqual(db.listTables(), []);
+});
+
+test("createTable accepts a plain { column: type } descriptor", () => {
+  const db = connect("memory://");
+  // No apache-arrow needed to define the schema.
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }]);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
 });
 
 test("querySql returns records", () => {

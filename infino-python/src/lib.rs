@@ -8,7 +8,7 @@
 //! and `table.append(...)` / `table.bm25_search(...)` /
 //! `table.vector_search(...)`. Arrow is the interchange — schemas and
 //! batches cross the boundary as pyarrow objects via the Arrow C Data
-//! Interface; search hits come back as `list[dict]`.
+//! Interface; search and SQL results come back as pyarrow `Table`s.
 //!
 //! Sync for v1 (data-science callers expect sync). Built standalone with
 //! maturin — it consumes the core crate's curated public API only (no
@@ -61,27 +61,30 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
 #[pyfunction]
 #[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None))]
 fn connect(
+    py: Python<'_>,
     uri: &str,
     endpoint: Option<String>,
     region: Option<String>,
     access_key: Option<String>,
     secret_key: Option<String>,
 ) -> PyResult<Connection> {
-    let inner = match endpoint {
-        Some(endpoint) => {
-            let region =
-                region.ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
-            let access_key = access_key
-                .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
-            let secret_key = secret_key
-                .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
-            let opts =
-                ConnectOptions::new().with_s3_endpoint(endpoint, region, access_key, secret_key);
-            infino::connect_with(uri, opts)
-        }
-        None => infino::connect(uri),
-    }
-    .map_err(py_err)?;
+    // Opening a connection can touch object storage; release the GIL so
+    // other Python threads run during the (blocking) I/O.
+    let inner = py
+        .detach(|| match endpoint {
+            Some(endpoint) => {
+                let region = region
+                    .ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
+                let access_key = access_key
+                    .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
+                let secret_key = secret_key
+                    .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
+                let opts = ConnectOptions::new()
+                    .with_s3_endpoint(endpoint, region, access_key, secret_key);
+                infino::connect_with(uri, opts).map_err(py_err)
+            }
+            None => infino::connect(uri).map_err(py_err),
+        })?;
     Ok(Connection { inner })
 }
 
@@ -145,47 +148,47 @@ impl Connection {
     /// Create a table from a pyarrow `Schema` and an `IndexSpec`.
     fn create_table(
         &self,
+        py: Python<'_>,
         name: &str,
         schema: &Bound<'_, PyAny>,
         indexes: &IndexSpec,
     ) -> PyResult<Table> {
-        let schema = Schema::from_pyarrow_bound(schema)?;
+        // pyarrow conversions touch Python (hold the GIL); the table
+        // build commits to storage, so drop the GIL for that part.
+        let schema = Arc::new(Schema::from_pyarrow_bound(schema)?);
         let spec = indexes.to_rust()?;
-        let inner = self
-            .inner
-            .create_table(name, Arc::new(schema), spec)
+        let inner = py
+            .detach(|| self.inner.create_table(name, schema, spec))
             .map_err(py_err)?;
         Ok(Table { inner })
     }
 
     /// Open an existing table by name.
-    fn open_table(&self, name: &str) -> PyResult<Table> {
-        let inner = self.inner.open_table(name).map_err(py_err)?;
+    fn open_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
+        let inner = py
+            .detach(|| self.inner.open_table(name))
+            .map_err(py_err)?;
         Ok(Table { inner })
     }
 
     /// Drop (unregister) a table.
-    fn drop_table(&self, name: &str) -> PyResult<()> {
-        self.inner.drop_table(name).map_err(py_err)
+    fn drop_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        py.detach(|| self.inner.drop_table(name)).map_err(py_err)
     }
 
     /// List the catalog's table names.
-    fn list_tables(&self) -> PyResult<Vec<String>> {
-        self.inner.list_tables().map_err(py_err)
+    fn list_tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| self.inner.list_tables()).map_err(py_err)
     }
 
     /// Run SQL across the catalog's tables; returns a pyarrow `Table`.
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
-        let batches = self.inner.query_sql(sql).map_err(py_err)?;
-        // `Vec<RecordBatch>` converts to a Python *list* of pyarrow
-        // RecordBatches; assemble them into a single pyarrow `Table`.
-        let py_batches = batches.to_pyarrow(py)?;
-        let pyarrow = py.import("pyarrow")?;
-        pyarrow
-            .getattr("Table")?
-            .call_method1("from_batches", (py_batches,))
+        let batches = py
+            .detach(|| self.inner.query_sql(sql))
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
     }
 }
 
@@ -212,16 +215,21 @@ impl Table {
                 // accepts them. A genuine type or null mismatch still errors.
                 let aligned = RecordBatch::try_new(declared, batch.columns().to_vec())
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                self.inner.append(&aligned).map_err(py_err)
+                // Append commits a segment to storage — release the GIL.
+                py.detach(|| self.inner.append(&aligned)).map_err(py_err)
             }
             // Empty input — nothing to append (no empty commit).
             None => Ok(()),
         }
     }
 
-    /// BM25 search over one FTS column. Returns `list[{"_id", "score"}]`,
-    /// best first. `mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, k, mode=None))]
+    /// BM25 search over one FTS column. Returns a pyarrow `Table`.
+    /// `materialize` controls the columns: `True` → `_id`, the table's
+    /// scalar columns, and a trailing `score` (higher is better);
+    /// `False` → only `_id` + `score` (skips scalar decode). Omitting it
+    /// uses the engine default — **BM25 materializes by default**.
+    /// `mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, k, mode=None, materialize=None))]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -229,26 +237,21 @@ impl Table {
         query: &str,
         k: usize,
         mode: Option<&str>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let mode = match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
-            "or" => BoolMode::Or,
-            "and" => BoolMode::And,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "mode must be 'or' or 'and', got {other:?}"
-                )));
-            }
-        };
-        let hits = self
-            .inner
-            .bm25_search(column, query, k, mode)
+        materialize: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mode = parse_mode(mode)?;
+        let batches = py
+            .detach(|| self.inner.bm25_search(column, query, k, mode, None, materialize))
             .map_err(py_err)?;
-        hits_to_pylist(py, &hits)
+        batches_to_pyarrow_table(py, batches)
     }
 
     /// Vector kNN over one vector column. `query` is a `list[float]`.
-    /// Returns `list[{"_id", "score"}]`, nearest first.
-    #[pyo3(signature = (column, query, k, nprobe=None))]
+    /// Returns a pyarrow `Table`. `materialize=True` → `_id`, the scalar
+    /// columns, and a trailing `score` (distance, smaller is nearer);
+    /// `False` → only `_id` + `score`. Omitting it uses the engine
+    /// default — **vector search does NOT materialize by default**.
+    #[pyo3(signature = (column, query, k, nprobe=None, materialize=None))]
     fn vector_search<'py>(
         &self,
         py: Python<'py>,
@@ -256,14 +259,45 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> PyResult<Bound<'py, PyList>> {
+        materialize: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
-        let hits = self
-            .inner
-            .vector_search(column, &query, k, opts)
+        let batches = py
+            .detach(|| self.inner.vector_search(column, &query, k, opts, None, materialize))
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Unranked token match over one FTS column: `list[{"_id", "score"}]`
+    /// (`score` is `0.0`). `mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, mode=None))]
+    fn token_match<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        query: &str,
+        mode: Option<&str>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mode = parse_mode(mode)?;
+        let hits = py
+            .detach(|| self.inner.token_match(column, query, mode))
+            .map_err(py_err)?;
+        hits_to_pylist(py, &hits)
+    }
+
+    /// Unranked exact match of `value` against `column`:
+    /// `list[{"_id", "score"}]` (`score` is `0.0`).
+    fn exact_match<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        value: &str,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let hits = py
+            .detach(|| self.inner.exact_match(column, value))
             .map_err(py_err)?;
         hits_to_pylist(py, &hits)
     }
@@ -274,7 +308,31 @@ impl Table {
     }
 }
 
-/// Convert search hits to a Python `list[{"_id": int, "score": float}]`.
+/// Assemble `Vec<RecordBatch>` into a single pyarrow `Table`. Shared by
+/// `query_sql` and the row-returning search methods.
+fn batches_to_pyarrow_table<'py>(
+    py: Python<'py>,
+    batches: Vec<RecordBatch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py_batches = batches.to_pyarrow(py)?;
+    let pyarrow = py.import("pyarrow")?;
+    pyarrow
+        .getattr("Table")?
+        .call_method1("from_batches", (py_batches,))
+}
+
+/// Parse the `"or"` (default) / `"and"` boolean mode argument.
+fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
+    match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
+        "or" => Ok(BoolMode::Or),
+        "and" => Ok(BoolMode::And),
+        other => Err(PyValueError::new_err(format!(
+            "mode must be 'or' or 'and', got {other:?}"
+        ))),
+    }
+}
+
+/// Convert lightweight hits to a Python `list[{"_id": int, "score": float}]`.
 fn hits_to_pylist<'py>(
     py: Python<'py>,
     hits: &[infino::SearchHit],

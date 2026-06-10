@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
     ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
@@ -35,8 +33,9 @@ use crate::supertable::query::{SearchHit, SuperfileHit};
 /// Resolve segment-local hits to public [`SearchHit`]s: read the `_id`
 /// column (named `id_col`) for each `(segment, local_doc_id)` and pair
 /// it with the hit's score, preserving the kernel's rank order. Backs
-/// the public `Supertable::bm25_search` / `vector_search`, which expose
-/// `_id` + score rather than the internal segment-local position.
+/// the lightweight public `Supertable::token_match` / `exact_match`,
+/// which expose `_id` + score rather than the internal segment-local
+/// position.
 pub(crate) async fn resolve_search_hits(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
@@ -230,30 +229,60 @@ async fn resolve_columns(
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-    // Owned inputs so the rayon closure is `'static`. `rayon`'s
-    // ordered `collect` preserves segment order, so `per_segment[i]`
-    // still lines up with `seg_order[i]` for the `offsets`/`placement`
-    // reorder below.
-    let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
-    let inputs: Vec<(Arc<crate::superfile::SuperfileReader>, Vec<u32>)> =
-        opened.into_iter().zip(seg_locals).collect();
-    let pool = Arc::clone(&manifest.options.reader_pool);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    pool.spawn(move || {
-        let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-        let result: Result<Vec<RecordBatch>, _> = inputs
-            .into_par_iter()
-            .map(|(sf, locals)| sf.take_by_local_doc_ids(&locals, &name_refs))
-            .collect();
-        let _ = tx.send(result);
-    });
-    let per_segment: Vec<RecordBatch> = rx
-        .await
-        .map_err(|_| {
-            DataFusionError::Execution("resolve decode: reader pool dropped result".into())
-        })?
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
+    // Materialize each segment's projected hit rows. Reads stay lazy:
+    // a reader holding resident bytes (in-memory tier / freshly written)
+    // decodes locally via `take_by_local_doc_ids`; a lazy object-store
+    // reader streams ONLY the projected hit rows through parquet's async
+    // `ParquetObjectReader` (footer + projected column pages via range
+    // GETs), so a cold read never materializes the whole segment.
+    //
+    // Segment count here is bounded by the global top-k (one entry per
+    // distinct hit-bearing segment), so the per-segment fan-out is small
+    // and the concurrent range-GET reads overlap on the query runtime.
+    let per_segment: Vec<RecordBatch> = futures::future::try_join_all(
+        seg_order
+            .iter()
+            .zip(opened.iter())
+            .zip(seg_locals.iter())
+            .map(|((uri, reader), locals)| {
+                let storage = storage.cloned();
+                let file_size = manifest
+                    .superfiles
+                    .iter()
+                    .find(|e| e.uri == *uri)
+                    .and_then(|e| e.subsection_offsets.as_ref())
+                    .map(|o| o.total_size);
+                async move {
+                    if reader.parquet_bytes().is_some() {
+                        return reader
+                            .take_by_local_doc_ids(locals, names)
+                            .map_err(|e| DataFusionError::Execution(e.to_string()));
+                    }
+                    let storage = storage.ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "resolve_hits needs row bytes for {uri:?}, but the reader was lazy and no storage backend is attached"
+                        ))
+                    })?;
+                    let (store, path) =
+                        storage.object_store_handle(&uri.storage_path()).ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "resolve_hits: storage backend exposes no object_store handle for {uri:?}"
+                            ))
+                        })?;
+                    take_rows_object_store(
+                        store,
+                        path,
+                        file_size,
+                        reader.schema(),
+                        reader.n_docs(),
+                        locals,
+                        names,
+                    )
+                    .await
+                }
+            }),
+    )
+    .await?;
     // Concatenate, then reorder rows into global rank order.
     let cat_schema = per_segment[0].schema();
     let combined = concat_batches(&cat_schema, &per_segment)
@@ -276,6 +305,117 @@ async fn resolve_columns(
     }
     RecordBatch::try_new(combined.schema(), columns)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Stream the projected `names` columns at `local_doc_ids` from a lazy
+/// object-store segment via parquet's async `ParquetObjectReader`
+/// (footer + projected column pages fetched as range GETs). Mirrors
+/// [`SuperfileReader::take_by_local_doc_ids`]'s row-selection + rank-back,
+/// but never materializes the whole segment — this is the cold/object-
+/// store row-resolution path.
+///
+/// [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
+async fn take_rows_object_store(
+    store: Arc<dyn object_store::ObjectStore>,
+    path: object_store::path::Path,
+    file_size: Option<u64>,
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    use futures::TryStreamExt;
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+
+    // Projected column indices (file order) + output fields (caller order).
+    let mut col_indices = Vec::with_capacity(names.len());
+    let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
+    for &name in names {
+        let idx = file_schema
+            .index_of(name)
+            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
+        col_indices.push(idx);
+        out_fields.push(file_schema.field(idx).clone());
+    }
+    let out_schema = Arc::new(Schema::new(out_fields));
+
+    if local_doc_ids.is_empty() {
+        return Ok(RecordBatch::new_empty(out_schema));
+    }
+    for &d in local_doc_ids {
+        if u64::from(d) >= n_docs {
+            return Err(DataFusionError::Execution(format!(
+                "doc id {d} out of range (n_docs={n_docs})"
+            )));
+        }
+    }
+
+    // Distinct, sorted ids → monotonic skip/select runs (decode only the
+    // rows the hits land on, not the whole column).
+    let mut sorted: Vec<u32> = local_doc_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted.len() * 2 + 1);
+    let mut cursor: u32 = 0;
+    for &id in &sorted {
+        if id > cursor {
+            selectors.push(RowSelector::skip((id - cursor) as usize));
+        }
+        selectors.push(RowSelector::select(1));
+        cursor = id + 1;
+    }
+    let selection = RowSelection::from(selectors);
+
+    let mut object_reader = ParquetObjectReader::new(store, path);
+    if let Some(size) = file_size.filter(|&s| s > 0) {
+        // Skip the size-discovery HEAD when the manifest already knows it.
+        object_reader = object_reader.with_file_size(size);
+    }
+    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
+    let stream = builder
+        .with_projection(mask)
+        .with_row_selection(selection)
+        .build()
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(out_schema));
+    }
+    let read_schema = batches[0].schema();
+    let selected = concat_batches(&read_schema, &batches)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    // Rank back into the caller's (possibly duplicated) order.
+    let mut idx_builder = UInt32Array::builder(local_doc_ids.len());
+    for &id in local_doc_ids {
+        let row = sorted
+            .binary_search(&id)
+            .expect("requested id present in sorted set");
+        idx_builder.append_value(row as u32);
+    }
+    let indices = idx_builder.finish();
+
+    // Gather columns in caller projection order (parquet returns file order).
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(names.len());
+    for &name in names {
+        let idx = selected
+            .schema()
+            .index_of(name)
+            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
+        columns.push(
+            take(selected.column(idx), &indices, None)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+        );
+    }
+    RecordBatch::try_new(out_schema, columns).map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 /// Extract a string literal argument (a column name, query text, ...).

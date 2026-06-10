@@ -4,7 +4,7 @@
 // (TypeScript usage is identical — same imports, fully typed via infino.d.ts.
 // This file is .mjs so it runs with plain `node`, no build step.)
 
-import { connect, IndexSpec } from "../infino.js";
+import { connect, IndexSpec } from "../infino/index.js";
 import { Schema, Field, LargeUtf8, Float32, FixedSizeList } from "apache-arrow";
 
 const dim = 16;

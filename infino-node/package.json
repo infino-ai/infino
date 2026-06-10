@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
-  "main": "infino.js",
-  "types": "infino.d.ts",
+  "main": "infino/index.js",
+  "types": "infino/index.d.ts",
   "napi": {
     "name": "infino",
     "triples": {
@@ -21,20 +21,23 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
+    "build": "napi build --platform --release --js native.js --dts native.d.ts infino && tsc",
+    "build:debug": "napi build --platform --js native.js --dts native.d.ts infino && tsc",
+    "tsc": "tsc",
     "test": "node --test __test__/*.test.mjs"
   },
   "dependencies": {
     "apache-arrow": "^17"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@napi-rs/cli": "^2.18.0",
+    "typescript": "^5"
   },
   "files": [
-    "infino.js",
-    "infino.d.ts",
-    "index.js",
-    "index.d.ts"
+    "infino/index.js",
+    "infino/index.d.ts",
+    "infino/native.js",
+    "infino/native.d.ts",
+    "infino/*.node"
   ]
 }
