@@ -38,6 +38,8 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Schema;
 use uuid::Uuid;
 
+use crate::superfile::vector::distance::Metric;
+
 use bloom::Bloom;
 
 use super::options::SupertableOptions;
@@ -673,6 +675,12 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
+    /// Lazily-computed per-cluster `(Σcode, Σcode²)` — the
+    /// query-independent moments the folded L2 scoring needs to
+    /// reconstruct `‖centroid‖²` without dequantizing. Populated on
+    /// first L2 query (one pass over `codes`), 8 bytes per cluster;
+    /// never serialized (decode starts it empty).
+    pub code_moments: std::sync::OnceLock<Vec<(f32, f32)>>,
 }
 
 impl ClusterCentroids {
@@ -733,6 +741,70 @@ impl ClusterCentroids {
             mins,
             scales,
             counts,
+            code_moments: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Score every populated cluster against `query` directly in the
+    /// Sq8 code domain — no per-cluster dequantization, no scratch
+    /// buffer. The affine dequant (`v_j = min + scale·code_j`) folds
+    /// out of every metric:
+    ///
+    /// ```text
+    /// dot(q, centroid) = min·Σq + scale·(q · codes)
+    /// ‖centroid‖²      = d·min² + 2·min·scale·Σcode + scale²·Σcode²
+    /// L2²(q, centroid) = ‖q‖² − 2·dot(q, centroid) + ‖centroid‖²
+    /// ```
+    ///
+    /// so the only O(dim) work per cluster is one Sq8 dot product over
+    /// the already-contiguous `codes` row — the same AVX-512 / AVX2 /
+    /// `wide` kernel the rerank path uses. `sum_q` is `Σ query_j`;
+    /// `norm_q_sq` is `‖query‖²` (read only for L2). Calls
+    /// `emit(cluster_id, score)` for each cluster with a nonzero
+    /// indexed count. Scores equal `dequantize_into` + `distance` up
+    /// to f32 association order (gated by
+    /// `score_clusters_into_matches_dequantized_distance`).
+    pub fn score_clusters_into(
+        &self,
+        metric: Metric,
+        query: &[f32],
+        sum_q: f32,
+        norm_q_sq: f32,
+        mut emit: impl FnMut(u32, f32),
+    ) {
+        use crate::superfile::vector::distance::{
+            COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, sq8_dot, u8_sum_sumsq,
+        };
+        let d = self.dim as usize;
+        debug_assert_eq!(query.len(), d);
+        // L2 needs each cluster's query-independent code moments;
+        // computed once per `ClusterCentroids` (first L2 query) so the
+        // per-query, per-cluster O(dim) work stays a single Sq8 dot.
+        let moments = matches!(metric, Metric::L2Sq).then(|| {
+            self.code_moments.get_or_init(|| {
+                (0..self.n_cent as usize)
+                    .map(|c| u8_sum_sumsq(&self.codes[c * d..(c + 1) * d]))
+                    .collect()
+            })
+        });
+        for c in 0..self.n_cent as usize {
+            if self.counts[c] == 0 {
+                continue;
+            }
+            let codes = &self.codes[c * d..(c + 1) * d];
+            let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
+            let score = match metric {
+                Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
+                Metric::NegDot => -dot_qc,
+                Metric::L2Sq => {
+                    let (sum_c, sumsq_c) = moments.expect("moments built for L2 above")[c];
+                    let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
+                        + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
+                        + self.scales[c] * self.scales[c] * sumsq_c;
+                    norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
+                }
+            };
+            emit(c as u32, score);
         }
     }
 
@@ -757,6 +829,116 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::FtsConfig;
+    use crate::superfile::vector::distance::distance;
+
+    /// Deterministic synthetic fp32 centroids for the folded-scoring
+    /// tests: distinct per-cluster ranges so per-cluster Sq8
+    /// calibration (min/scale) actually varies.
+    fn synth_clusters(n_cent: u32, dim: u32, seed: u64) -> (ClusterCentroids, Vec<f32>) {
+        let (nc, d) = (n_cent as usize, dim as usize);
+        let mut centroids = vec![0f32; nc * d];
+        for c in 0..nc {
+            for j in 0..d {
+                let v = ((seed + (c * d + j) as u64 * 2_654_435_761) % 1000) as f32 / 250.0 - 2.0
+                    + c as f32 * 0.1;
+                centroids[c * d + j] = v;
+            }
+        }
+        let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
+        let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
+        (cc, centroids)
+    }
+
+    /// Folded Sq8-domain scoring must equal dequantize-then-distance
+    /// (the prior selection path) up to f32 association order, for all
+    /// three metrics, and must skip count-0 clusters.
+    #[test]
+    fn score_clusters_into_matches_dequantized_distance() {
+        let (n_cent, dim) = (17u32, 96u32);
+        let (cc, _) = synth_clusters(n_cent, dim, 7);
+        let query: Vec<f32> = (0..dim)
+            .map(|j| ((j as u64 * 40_503 + 11) % 997) as f32 / 500.0 - 1.0)
+            .collect();
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut folded: Vec<(u32, f32)> = Vec::new();
+            cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |c, s| {
+                folded.push((c, s));
+            });
+
+            // Reference: the old dequantize + distance loop.
+            let mut deq = vec![0f32; dim as usize];
+            let mut reference: Vec<(u32, f32)> = Vec::new();
+            for c in 0..n_cent as usize {
+                if cc.counts[c] == 0 {
+                    continue;
+                }
+                cc.dequantize_into(c, &mut deq);
+                reference.push((c as u32, distance(metric, &query, &deq)));
+            }
+
+            assert_eq!(
+                folded.len(),
+                reference.len(),
+                "{metric:?}: cluster sets differ (count-0 skip)"
+            );
+            for ((fc, fs), (rc, rs)) in folded.iter().zip(&reference) {
+                assert_eq!(fc, rc, "{metric:?}: cluster order");
+                let tol = 1e-3 * (1.0 + rs.abs());
+                assert!(
+                    (fs - rs).abs() <= tol,
+                    "{metric:?} cluster {fc}: folded {fs} vs dequantized {rs} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    /// Microbench: folded Sq8 scoring vs the old dequantize+distance
+    /// loop over a supertable-scale cluster set. Gated `#[ignore]`;
+    /// run via `cargo test --release --lib
+    /// score_clusters_microbench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn score_clusters_microbench() {
+        use std::time::Instant;
+        let (n_cent, dim) = (4096u32, 384u32);
+        let iters = 50usize;
+        let (cc, _) = synth_clusters(n_cent, dim, 99);
+        let query: Vec<f32> = (0..dim).map(|j| (j as f32).sin()).collect();
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+
+        for metric in [Metric::Cosine, Metric::L2Sq] {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut acc = 0f32;
+                cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |_, s| acc += s);
+                std::hint::black_box(acc);
+            }
+            let folded_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            let mut deq = vec![0f32; dim as usize];
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut acc = 0f32;
+                for c in 0..n_cent as usize {
+                    if cc.counts[c] == 0 {
+                        continue;
+                    }
+                    cc.dequantize_into(c, &mut deq);
+                    acc += distance(metric, &query, &deq);
+                }
+                std::hint::black_box(acc);
+            }
+            let dequant_us = t0.elapsed().as_micros() as f64 / iters as f64;
+            println!(
+                "score_clusters {metric:?}: folded {folded_us:.0} µs vs dequantize {dequant_us:.0} µs ({:.1}×)",
+                dequant_us / folded_us
+            );
+        }
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(

@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
-use crate::superfile::vector::distance::{Metric, distance};
+use crate::superfile::vector::distance::Metric;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
@@ -157,18 +157,18 @@ impl SupertableReader {
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         let mut fallback: Vec<usize> = Vec::new();
-        let mut deq = vec![0f32; query.len()];
+        // Folded Sq8-domain scoring (`ClusterCentroids::score_clusters_into`):
+        // Σq / ‖q‖² once per query, then one SIMD Sq8 dot per cluster over
+        // the contiguous code rows — no per-cluster dequantize, no scratch.
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
         for (si, entry) in superfiles.iter().enumerate() {
             match entry.vector_summary.get(column) {
                 Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
-                    let cl = &vs.clusters;
-                    for c in 0..cl.n_cent as usize {
-                        if cl.counts[c] == 0 {
-                            continue;
-                        }
-                        cl.dequantize_into(c, &mut deq);
-                        scored.push((si, c as u32, distance(metric, query, &deq)));
-                    }
+                    vs.clusters
+                        .score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+                            scored.push((si, c, score));
+                        });
                 }
                 _ => fallback.push(si),
             }

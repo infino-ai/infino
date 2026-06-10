@@ -42,12 +42,15 @@ const F32_BYTES: usize = 4;
 
 /// Cosine distance is `COSINE_DISTANCE_BASE - dot` on unit vectors,
 /// so smaller means closer without re-normalizing at query time.
-const COSINE_DISTANCE_BASE: f32 = 1.0;
+/// `pub(crate)`: the manifest's folded Sq8 centroid scoring applies
+/// the same identity.
+pub(crate) const COSINE_DISTANCE_BASE: f32 = 1.0;
 
 /// Cross-term coefficient in the squared-L2 identity
 /// `‖q − x‖² = ‖q‖² − L2_CROSS_TERM_COEFF·(q·x) + ‖x‖²`, used by the
-/// Sq8 kernels that reconstruct L2 from a fused dot product.
-const L2_CROSS_TERM_COEFF: f32 = 2.0;
+/// Sq8 kernels that reconstruct L2 from a fused dot product (and by
+/// the manifest's folded Sq8 centroid scoring).
+pub(crate) const L2_CROSS_TERM_COEFF: f32 = 2.0;
 
 /// Distance metric for a vector column. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
@@ -683,7 +686,7 @@ impl<'a> Sq8ResidualKernel<'a> {
 /// `debug_assert_eq!(code_bytes.len(), self.dim)`. `q_prime.len()`
 /// is guaranteed `== dim` by `Sq8Kernel::new`.
 #[inline]
-fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
+pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if avx512_enabled() {
@@ -696,6 +699,37 @@ fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
         }
     }
     sq8_dot_wide(q_prime, code_bytes, dim)
+}
+
+/// Upper chunk length for [`u8_sum_sumsq`]'s u32 accumulators:
+/// `U8_SUMSQ_CHUNK · 255² < u32::MAX`, so a per-chunk Σcode² cannot
+/// overflow before it spills into the u64 total.
+const U8_SUMSQ_CHUNK: usize = 16_384;
+
+/// Σcode and Σcode² over one Sq8 code row, both as f32.
+///
+/// Exact integer accumulation: u32 lane math inside bounded chunks
+/// (u8-widening adds + `pmaddwd`-shaped squares that LLVM
+/// auto-vectorizes at the `x86-64-v3` baseline — 64-bit accumulators
+/// would defeat vectorization), spilled into u64 totals between
+/// chunks so no input length can overflow. Used by the manifest's
+/// folded Sq8 centroid scoring to reconstruct `‖centroid‖²` without
+/// dequantizing.
+pub(crate) fn u8_sum_sumsq(codes: &[u8]) -> (f32, f32) {
+    let mut sum: u64 = 0;
+    let mut sumsq: u64 = 0;
+    for chunk in codes.chunks(U8_SUMSQ_CHUNK) {
+        let mut s: u32 = 0;
+        let mut sq: u32 = 0;
+        for &b in chunk {
+            let v = b as u32;
+            s += v;
+            sq += v * v;
+        }
+        sum += u64::from(s);
+        sumsq += u64::from(sq);
+    }
+    (sum as f32, sumsq as f32)
 }
 
 /// Portable `wide::f32x8` (256-bit) Sq8 dot product. Same per-

@@ -337,6 +337,7 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
             mins,
             scales,
             counts,
+            code_moments: std::sync::OnceLock::new(),
         },
     })
 }
