@@ -82,7 +82,7 @@
 use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
 use crate::superfile::format::{self, kv};
 use crate::superfile::fts::builder::FtsBuilder;
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::superfile::vector::builder::VectorBuilder;
 use crate::superfile::vector::reader::ColumnReader;
 use crate::superfile::{BuildError, SuperfileReader};
@@ -230,6 +230,45 @@ impl BuilderOptions {
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
         }
+    }
+
+    pub fn new_from_reader(reader: &SuperfileReader) -> Self {
+        // TODO: Fetch tokenizer from reader. Not possible at the moment because we don't
+        // store the tokenizer in the reader. Should work for now because we only have AsciiLowerTokenizer.
+        let tokenizer = Arc::new(AsciiLowerTokenizer);
+        let fts_columns = if let Some(fts) = &reader.fts() {
+            fts.fts_columns_config()
+                .map(|c| FtsConfig {
+                    column: c.name.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let vector_columns = if let Some(vec) = &reader.vec() {
+            vec.vector_columns_config()
+                .map(|v| {
+                    VectorConfig::new(
+                        v.name.clone(),
+                        v.dim,
+                        v.n_cent as usize,
+                        v.rot_seed,
+                        v.metric,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        BuilderOptions::new(
+            reader.schema().clone(),
+            reader.id_column(),
+            fts_columns,
+            vector_columns,
+            Some(tokenizer),
+        )
     }
 
     fn check_mergeability(
@@ -613,6 +652,23 @@ impl SuperfileBuilder {
         Ok(())
     }
 
+    /// Builds a superfile from the given readers, merging them into one.
+    pub fn build_from_readers(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    ) -> Result<Vec<u8>, BuildError> {
+        let first = readers.first().ok_or(BuildError::BatchReadError)?;
+
+        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+        for reader in readers {
+            superfile_builder.add_batch_from_reader(&reader.0, reader.1.clone())?;
+        }
+
+        let bytes = superfile_builder.finish()?;
+
+        Ok(bytes)
+    }
+
     /// Consume the builder and emit one self-contained superfile.
     ///
     /// If no `add_batch` calls have landed any rows, returns an
@@ -835,6 +891,8 @@ mod tests {
     use arrow_array::LargeStringArray;
     use arrow_schema::Field;
     use bytes::Bytes;
+    use roaring::RoaringBitmap;
+    use std::sync::Arc;
 
     fn schema_with_fts() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1600,5 +1658,399 @@ mod tests {
             .get_record_batch(None)
             .expect("get_record_batch");
         assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn build_from_readers_rejects_empty_readers_array() {
+        let result = SuperfileBuilder::build_from_readers(&[]);
+        assert!(result.is_err(), "should reject empty readers array");
+    }
+
+    fn empty_bitmap() -> Option<Arc<RoaringBitmap>> {
+        None
+    }
+
+    #[test]
+    fn build_from_readers_single_reader_produces_valid_superfile() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let original_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(original_bytes.clone()))
+            .expect("open superfile reader");
+
+        let merged_bytes =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+
+        // Verify result is a valid superfile
+        assert_eq!(&merged_bytes[..4], b"PAR1");
+        assert_eq!(&merged_bytes[merged_bytes.len() - 4..], b"PAR1");
+
+        // Verify data is preserved
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let merged_batch = merged_reader
+            .get_record_batch(None)
+            .expect("get_record_batch");
+        assert_eq!(merged_batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn build_from_readers_merges_multiple_readers_correctly() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+
+        // Create first superfile
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch1 = batch_two_rows(&schema);
+        b1.add_batch(&batch1, &[]).expect("add_batch");
+        let bytes1 = b1.finish().expect("finish builder");
+
+        // Create second superfile
+        let mut b2 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let ids2 = decimal128_ids(vec![20u64, 21]);
+        let title2 = LargeStringArray::from(vec!["foo bar", "baz qux"]);
+        let body2 = LargeStringArray::from(vec!["quux corge", "grault garply"]);
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids2), Arc::new(title2), Arc::new(body2)],
+        )
+        .expect("build RecordBatch");
+        b2.add_batch(&batch2, &[]).expect("add_batch");
+        let bytes2 = b2.finish().expect("finish builder");
+
+        let reader1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader1");
+        let reader2 = SuperfileReader::open(Bytes::from(bytes2)).expect("open reader2");
+
+        let merged_bytes = SuperfileBuilder::build_from_readers(&[
+            (Arc::new(reader1), empty_bitmap()),
+            (Arc::new(reader2), empty_bitmap()),
+        ])
+        .expect("build_from_readers");
+
+        // Verify merged superfile
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let merged_batch = merged_reader
+            .get_record_batch(None)
+            .expect("get_record_batch");
+
+        // Should have 4 rows total (2 + 2)
+        assert_eq!(merged_batch.num_rows(), 4);
+    }
+
+    #[test]
+    fn build_from_readers_preserves_vectors_and_fts() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![default_vector_config("emb", 7)],
+            Some(default_tokenizer()),
+        );
+
+        // Create superfile with both FTS and vectors
+        let mut b1 = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b1.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let bytes1 = b1.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader");
+
+        let merged_bytes =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+
+        // Verify merged superfile has both FTS and vector indexes
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+
+        // FTS should be present
+        assert!(merged_reader.fts().is_some(), "FTS index should be present");
+
+        // Vectors should be present
+        assert!(
+            merged_reader.vec().is_some(),
+            "Vector index should be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_from_readers_preserves_fts_search_functionality() {
+        use crate::superfile::fts::reader::BoolMode;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+
+        // Create superfile with FTS
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+
+        let reader1 = SuperfileReader::open(Bytes::from(bytes)).expect("open reader");
+
+        let mut b2 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b2.add_batch(&batch, &[]).expect("add batch");
+        let bytes = b2.finish().expect("finish builder");
+        let reader2 = SuperfileReader::open(Bytes::from(bytes)).expect("open reader");
+
+        // Build merged superfile
+        let merged_bytes = SuperfileBuilder::build_from_readers(&[
+            (Arc::new(reader1), empty_bitmap()),
+            (Arc::new(reader2), empty_bitmap()),
+        ])
+        .expect("build_from_readers");
+
+        // Verify FTS search works on merged
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let fts_reader_merged = merged_reader.fts().expect("get fts reader from merged");
+        let results_merged = fts_reader_merged
+            .search("title", &["hello"], 10, BoolMode::Or)
+            .await
+            .expect("search merged");
+        assert_eq!(results_merged.len(), 2);
+    }
+
+    #[test]
+    fn build_from_readers_three_superfiles() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+
+        // Create three superfiles
+        let mut bytes_list = Vec::new();
+        for base_id in [10u64, 20u64, 30u64] {
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            let schema = b.opts.schema.clone();
+            let ids = decimal128_ids(vec![base_id, base_id + 1]);
+            let title = LargeStringArray::from(vec!["foo", "bar"]);
+            let body = LargeStringArray::from(vec!["baz", "qux"]);
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(title), Arc::new(body)])
+                    .expect("build RecordBatch");
+            b.add_batch(&batch, &[]).expect("add_batch");
+            bytes_list.push(b.finish().expect("finish builder"));
+        }
+
+        // Create readers
+        let readers: Vec<_> = bytes_list
+            .iter()
+            .map(|b| {
+                (
+                    Arc::new(SuperfileReader::open(Bytes::from(b.clone())).expect("open reader")),
+                    empty_bitmap(),
+                )
+            })
+            .collect();
+
+        // Merge all three
+        let merged_bytes =
+            SuperfileBuilder::build_from_readers(&readers).expect("build_from_readers");
+
+        // Verify merged result has all rows
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let merged_batch = merged_reader
+            .get_record_batch(None)
+            .expect("get_record_batch");
+
+        // Should have 6 rows total (2 + 2 + 2)
+        assert_eq!(merged_batch.num_rows(), 6);
+    }
+
+    #[test]
+    fn build_from_readers_with_only_vectors_and_search() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+            None,
+        );
+
+        // Create first superfile with only vectors (no FTS)
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch1 = batch_two_rows(&schema);
+        let mut v1: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v1[0] = 1.0;
+        v1[16 + 1] = 1.0;
+        b1.add_batch(&batch1, &[v1.as_slice()]).expect("add_batch");
+        let bytes1 = b1.finish().expect("finish builder");
+
+        // Create second superfile with different vectors
+        let mut b2 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let ids2 = decimal128_ids(vec![20u64, 21]);
+        let title2 = LargeStringArray::from(vec!["foo bar", "baz qux"]);
+        let body2 = LargeStringArray::from(vec!["quux corge", "grault garply"]);
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids2), Arc::new(title2), Arc::new(body2)],
+        )
+        .expect("build RecordBatch");
+        let mut v2: Vec<f32> = vec![0.0; 32];
+        v2[1] = 1.0;
+        v2[16 + 2] = 1.0;
+        b2.add_batch(&batch2, &[v2.as_slice()]).expect("add_batch");
+        let bytes2 = b2.finish().expect("finish builder");
+
+        let reader1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader1");
+        let reader2 = SuperfileReader::open(Bytes::from(bytes2)).expect("open reader2");
+
+        // Merge both readers
+        let merged_bytes = SuperfileBuilder::build_from_readers(&[
+            (Arc::new(reader1), empty_bitmap()),
+            (Arc::new(reader2), empty_bitmap()),
+        ])
+        .expect("build_from_readers");
+
+        // Verify merged superfile
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+
+        // Should have vectors but no FTS
+        assert!(merged_reader.vec().is_some(), "should have vector index");
+        assert!(merged_reader.fts().is_none(), "should not have FTS index");
+
+        let batch = merged_reader
+            .get_record_batch(None)
+            .expect("get_record_batch");
+        assert_eq!(batch.num_rows(), 4, "should have 4 rows (2 + 2)");
+
+        // Perform vector search on merged data
+        let vec_reader = merged_reader.vec().expect("get vector reader");
+        let query = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let search_results = vec_reader
+            .search("emb", &query, 10, 4, 100)
+            .expect("vector search");
+
+        // Should return exactly 4 results (all vectors from both superfiles are returned)
+        assert_eq!(
+            search_results.len(),
+            4,
+            "vector search should return all 4 vectors from merged superfiles"
+        );
+    }
+
+    #[test]
+    fn build_from_readers_filters_deleted_documents() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+
+        // Create first superfile with 2 rows (indices 0, 1)
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch1 = batch_two_rows(&schema);
+        b1.add_batch(&batch1, &[]).expect("add_batch");
+        let bytes1 = b1.finish().expect("finish builder");
+
+        // Create second superfile with 2 rows (indices 0, 1)
+        let mut b2 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        let ids2 = decimal128_ids(vec![20u64, 21]);
+        let title2 = LargeStringArray::from(vec!["foo bar", "baz qux"]);
+        let body2 = LargeStringArray::from(vec!["quux corge", "grault garply"]);
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids2), Arc::new(title2), Arc::new(body2)],
+        )
+        .expect("build RecordBatch");
+        b2.add_batch(&batch2, &[]).expect("add_batch");
+        let bytes2 = b2.finish().expect("finish builder");
+
+        let reader1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader1");
+        let reader2 = SuperfileReader::open(Bytes::from(bytes2)).expect("open reader2");
+
+        // Create bitmaps to mark deleted rows
+        // For reader1: mark row 0 as deleted (keep row 1)
+        let mut bitmap1 = RoaringBitmap::new();
+        bitmap1.insert(0);
+
+        // For reader2: mark row 1 as deleted (keep row 0)
+        let mut bitmap2 = RoaringBitmap::new();
+        bitmap2.insert(1);
+
+        // Merge with deletion bitmaps
+        let merged_bytes = SuperfileBuilder::build_from_readers(&[
+            (Arc::new(reader1), Some(Arc::new(bitmap1))),
+            (Arc::new(reader2), Some(Arc::new(bitmap2))),
+        ])
+        .expect("build_from_readers");
+
+        // Verify merged superfile has only 2 rows (1 from each superfile after deletion)
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let merged_batch = merged_reader
+            .get_record_batch(None)
+            .expect("get_record_batch");
+
+        // Should have exactly 2 rows: row 1 from reader1 + row 0 from reader2
+        assert_eq!(
+            merged_batch.num_rows(),
+            2,
+            "merged superfile should have 2 rows after filtering deleted documents"
+        );
+
+        // Verify the correct rows are present by checking the parquet data
+        let title_col = merged_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title column");
+
+        // Row from reader1: "rust async" (second row from batch_two_rows)
+        // Row from reader2: "foo bar" (first row from second batch)
+        assert_eq!(title_col.value(0), "rust async");
+        assert_eq!(title_col.value(1), "foo bar");
     }
 }
