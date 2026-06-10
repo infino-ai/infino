@@ -18,50 +18,59 @@
 use std::sync::Arc;
 
 use arrow::compute::{concat_batches, take};
-use arrow_array::{
-    ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
-};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
+use futures::TryStreamExt;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use rayon::prelude::*;
 
 use crate::superfile::SuperfileReader;
+use crate::superfile::reader::{rank_back_indices, row_selection_for_ids};
 use crate::supertable::handle::SupertableReader;
 use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::query::{SearchHit, SuperfileHit};
+use crate::supertable::query::SuperfileHit;
 
-/// Resolve segment-local hits to public [`SearchHit`]s: read the `_id`
-/// column (named `id_col`) for each `(segment, local_doc_id)` and pair
-/// it with the hit's score, preserving the kernel's rank order. Backs
-/// the lightweight public `Supertable::token_match` / `exact_match`,
-/// which expose `_id` + score rather than the internal segment-local
-/// position.
-pub(crate) async fn resolve_search_hits(
+/// Resolve `hits` to one `RecordBatch`, with `projection` naming the
+/// output columns (any of `_id`, the visible scalar columns, or the
+/// trailing `score`); `None` returns the whole row. Names are resolved
+/// to output-schema indices and forwarded to [`resolve_hits`], which
+/// decodes only the projected columns. Shared by every public
+/// row-returning search method (`bm25_search`, `vector_search`,
+/// `token_match`, `exact_match`); `what` labels error messages with
+/// the calling method.
+pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
-    id_col: &str,
-) -> DfResult<Vec<SearchHit>> {
-    if hits.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rb = resolve_columns(reader, hits, &[id_col]).await?;
-    let ids = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!("id column {id_col:?} is not Decimal128"))
-        })?;
-    Ok(hits
-        .iter()
-        .enumerate()
-        .map(|(i, h)| SearchHit {
-            id: ids.value(i),
-            score: h.score,
-        })
-        .collect())
+    projection: Option<&[&str]>,
+    what: &str,
+) -> DfResult<RecordBatch> {
+    let scalar_schema = reader.options().scalar_schema();
+    let output_schema = output_schema_with_score(&scalar_schema);
+    let indices: Option<Vec<usize>> = match projection {
+        Some(names) => Some(
+            names
+                .iter()
+                .map(|name| {
+                    output_schema.index_of(name).map_err(|_| {
+                        DataFusionError::Execution(format!("{what}: unknown column {name:?}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        None => None,
+    };
+    resolve_hits(
+        reader,
+        hits,
+        &scalar_schema,
+        &output_schema,
+        indices.as_deref(),
+    )
+    .await
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -365,11 +374,6 @@ async fn take_rows_object_store(
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
-    use futures::TryStreamExt;
-    use parquet::arrow::ProjectionMask;
-    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-    use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-
     // Projected column indices (file order) + output fields (caller order).
     let mut col_indices = Vec::with_capacity(names.len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
@@ -394,20 +398,10 @@ async fn take_rows_object_store(
     }
 
     // Distinct, sorted ids → monotonic skip/select runs (decode only the
-    // rows the hits land on, not the whole column).
-    let mut sorted: Vec<u32> = local_doc_ids.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted.len() * 2 + 1);
-    let mut cursor: u32 = 0;
-    for &id in &sorted {
-        if id > cursor {
-            selectors.push(RowSelector::skip((id - cursor) as usize));
-        }
-        selectors.push(RowSelector::select(1));
-        cursor = id + 1;
-    }
-    let selection = RowSelection::from(selectors);
+    // rows the hits land on, not the whole column). Same selection
+    // contract as `take_by_local_doc_ids` — shared helpers, different
+    // I/O model (async range GETs here vs resident-bytes decode there).
+    let (sorted, selection) = row_selection_for_ids(local_doc_ids);
 
     let mut object_reader = ParquetObjectReader::new(store, path);
     if let Some(size) = file_size.filter(|&s| s > 0) {
@@ -435,14 +429,7 @@ async fn take_rows_object_store(
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
     // Rank back into the caller's (possibly duplicated) order.
-    let mut idx_builder = UInt32Array::builder(local_doc_ids.len());
-    for &id in local_doc_ids {
-        let row = sorted
-            .binary_search(&id)
-            .expect("requested id present in sorted set");
-        idx_builder.append_value(row as u32);
-    }
-    let indices = idx_builder.finish();
+    let indices = rank_back_indices(local_doc_ids, &sorted);
 
     // Gather columns in caller projection order (parquet returns file order).
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(names.len());

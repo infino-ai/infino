@@ -171,9 +171,14 @@ impl Connection {
         Ok(Table { inner })
     }
 
-    /// Drop (unregister) a table.
-    fn drop_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        py.detach(|| self.inner.drop_table(name)).map_err(py_err)
+    /// Drop (unregister) a table. `purge=True` also deletes the table's
+    /// storage subtree after the catalog commit; the default leaves the
+    /// bytes in place (readers pinned to a pre-drop snapshot keep
+    /// working).
+    #[pyo3(signature = (name, purge=false))]
+    fn drop_table(&self, py: Python<'_>, name: &str, purge: bool) -> PyResult<()> {
+        py.detach(|| self.inner.drop_table(name, purge))
+            .map_err(py_err)
     }
 
     /// List the catalog's table names.
@@ -224,12 +229,12 @@ impl Table {
     }
 
     /// BM25 search over one FTS column. Returns a pyarrow `Table`.
-    /// `materialize` controls the columns: `True` → `_id`, the table's
-    /// scalar columns, and a trailing `score` (higher is better);
-    /// `False` → only `_id` + `score` (skips scalar decode). Omitting it
-    /// uses the engine default — **BM25 materializes by default**.
+    /// `projection` names the output columns (`_id`, any scalar column,
+    /// or the trailing `score` — higher is better); omitting it returns
+    /// the whole row. Only projected scalar columns are decoded, so
+    /// `projection=["_id", "score"]` skips scalar decode entirely.
     /// `mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, k, mode=None, materialize=None))]
+    #[pyo3(signature = (column, query, k, mode=None, projection=None))]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -237,21 +242,24 @@ impl Table {
         query: &str,
         k: usize,
         mode: Option<&str>,
-        materialize: Option<bool>,
+        projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mode = parse_mode(mode)?;
         let batches = py
-            .detach(|| self.inner.bm25_search(column, query, k, mode, None, materialize))
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.bm25_search(column, query, k, mode, names.as_deref())
+            })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
     }
 
     /// Vector kNN over one vector column. `query` is a `list[float]`.
-    /// Returns a pyarrow `Table`. `materialize=True` → `_id`, the scalar
-    /// columns, and a trailing `score` (distance, smaller is nearer);
-    /// `False` → only `_id` + `score`. Omitting it uses the engine
-    /// default — **vector search does NOT materialize by default**.
-    #[pyo3(signature = (column, query, k, nprobe=None, materialize=None))]
+    /// Returns a pyarrow `Table`. `projection` names the output columns
+    /// (`_id`, any scalar column, or the trailing `score` — distance,
+    /// smaller is nearer); omitting it returns the whole row.
+    /// `projection=["_id", "score"]` skips scalar decode entirely.
+    #[pyo3(signature = (column, query, k, nprobe=None, projection=None))]
     fn vector_search<'py>(
         &self,
         py: Python<'py>,
@@ -259,53 +267,77 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
-        materialize: Option<bool>,
+        projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
         let batches = py
-            .detach(|| self.inner.vector_search(column, &query, k, opts, None, materialize))
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.vector_search(column, &query, k, opts, names.as_deref())
+            })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
     }
 
-    /// Unranked token match over one FTS column: `list[{"_id", "score"}]`
-    /// (`score` is `0.0`). `mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, mode=None))]
+    /// Unranked token match over one FTS column. Returns a pyarrow
+    /// `Table` like `bm25_search`, but `score` is `0.0` and row order is
+    /// unspecified. `mode` is `"or"` (default) or `"and"`; `projection`
+    /// follows the same rules as `bm25_search`.
+    #[pyo3(signature = (column, query, mode=None, projection=None))]
     fn token_match<'py>(
         &self,
         py: Python<'py>,
         column: &str,
         query: &str,
         mode: Option<&str>,
-    ) -> PyResult<Bound<'py, PyList>> {
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let mode = parse_mode(mode)?;
-        let hits = py
-            .detach(|| self.inner.token_match(column, query, mode))
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.token_match(column, query, mode, names.as_deref())
+            })
             .map_err(py_err)?;
-        hits_to_pylist(py, &hits)
+        batches_to_pyarrow_table(py, batches)
     }
 
-    /// Unranked exact match of `value` against `column`:
-    /// `list[{"_id", "score"}]` (`score` is `0.0`).
+    /// Unranked exact match of `value` against `column`. Returns a
+    /// pyarrow `Table` like `bm25_search`, with `score` fixed at `0.0`
+    /// and unspecified row order. `projection` follows the same rules
+    /// as `bm25_search`.
+    #[pyo3(signature = (column, value, projection=None))]
     fn exact_match<'py>(
         &self,
         py: Python<'py>,
         column: &str,
         value: &str,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let hits = py
-            .detach(|| self.inner.exact_match(column, value))
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.exact_match(column, value, names.as_deref())
+            })
             .map_err(py_err)?;
-        hits_to_pylist(py, &hits)
+        batches_to_pyarrow_table(py, batches)
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
     fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.schema().as_ref().to_pyarrow(py)
     }
+}
+
+/// Borrow an optional Python projection (`list[str]`) as the `&str`
+/// slices the Rust search APIs take. Shared by all four search methods.
+fn projection_refs(projection: &Option<Vec<String>>) -> Option<Vec<&str>> {
+    projection
+        .as_ref()
+        .map(|p| p.iter().map(String::as_str).collect())
 }
 
 /// Assemble `Vec<RecordBatch>` into a single pyarrow `Table`. Shared by
@@ -330,21 +362,6 @@ fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
             "mode must be 'or' or 'and', got {other:?}"
         ))),
     }
-}
-
-/// Convert lightweight hits to a Python `list[{"_id": int, "score": float}]`.
-fn hits_to_pylist<'py>(
-    py: Python<'py>,
-    hits: &[infino::SearchHit],
-) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
-    for hit in hits {
-        let row = PyDict::new(py);
-        row.set_item("_id", hit.id)?;
-        row.set_item("score", hit.score)?;
-        list.append(row)?;
-    }
-    Ok(list)
 }
 
 /// Coerce append input — a pyarrow `RecordBatch` / `Table`, a pandas

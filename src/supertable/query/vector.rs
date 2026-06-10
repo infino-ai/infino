@@ -10,10 +10,11 @@
 //!
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
-//! // Full rows (`_id`, scalar columns, `score`); `materialize = true`.
-//! let rows: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None, true)?;
-//! // Just `_id` + `score` (no scalar decode); `materialize = false`.
-//! let ids: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None, false)?;
+//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
+//! let rows: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None)?;
+//! // Just `_id` + `score` (no scalar decode): project them explicitly.
+//! let ids: Vec<RecordBatch> =
+//!     table.vector_search("emb", &query_vec, 10, opts, Some(&["_id", "score"]))?;
 //! ```
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
@@ -72,7 +73,7 @@ use crate::supertable::manifest::SuperfileEntry;
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
-use super::exec::common::{SCORE_COLUMN, output_schema_with_score, resolve_hits};
+use super::exec::common::resolve_hits_named;
 
 /// How to probe one segment in the vector fan-out: the globally-selected
 /// cluster ids for that segment, or — for a segment whose manifest
@@ -258,37 +259,13 @@ impl SupertableReader {
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
             let hits = self.vector_search_async(column, query, k, options).await?;
-            let scalar_schema = self.options().scalar_schema();
-            let output_schema = output_schema_with_score(&scalar_schema);
             // `projection` selects output columns by name (`_id`, the
             // visible scalar columns, or the trailing `score`); `None`
-            // returns the whole row. Resolved to `output_schema` indices
-            // and forwarded to the shared `resolve_hits`, which decodes
-            // only the projected columns.
-            let indices: Option<Vec<usize>> = match projection {
-                Some(names) => Some(
-                    names
-                        .iter()
-                        .map(|name| {
-                            output_schema.index_of(name).map_err(|_| {
-                                QueryError::Execute(format!(
-                                    "vector_search: unknown column {name:?}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<_, _>>()?,
-                ),
-                None => None,
-            };
-            let batch = resolve_hits(
-                self,
-                &hits,
-                &scalar_schema,
-                &output_schema,
-                indices.as_deref(),
-            )
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
+            // returns the whole row. The shared resolver decodes only
+            // the projected columns.
+            let batch = resolve_hits_named(self, &hits, projection, "vector_search")
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
             Ok(vec![batch])
         })
     }
@@ -357,17 +334,14 @@ impl Supertable {
     ///
     /// Pins a fresh reader (applying the read-consistency policy), runs
     /// the IVF fan-out, and resolves the top-`k` nearest hits to Arrow
-    /// rows. Each returned batch carries `_id`, the selected scalar
-    /// columns, and a trailing `score`.
+    /// rows.
     ///
-    /// - `materialize`: `Some(true)` decodes the scalar columns;
-    ///   `Some(false)` skips scalar decode and returns only `_id` +
-    ///   `score`. `None` uses this method's default — **vector search
-    ///   does NOT materialize by default** (kNN is usually a retrieval
-    ///   step; fetch full rows in a follow-up only for the hits you keep).
-    /// - `projection` only applies when materializing: it selects output
-    ///   columns by name (`_id`, any visible scalar column, or `score`);
-    ///   `None` returns the whole row. Ignored when not materializing.
+    /// `projection` selects output columns by name (any of `_id`, the
+    /// visible scalar columns, or the trailing `score`); `None` returns
+    /// the whole row. Only the projected scalar columns are decoded —
+    /// kNN is usually a retrieval step, so `Some(&["_id", "score"])` is
+    /// the cheap path when full rows are fetched in a follow-up only
+    /// for the hits you keep.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -386,11 +360,11 @@ impl Supertable {
     /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
     /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
-    /// // Default for vector search is `_id` + `score` only:
-    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None, None)?;
+    /// // Project just `_id` + `score` → no scalar decode at all:
+    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), Some(&["_id", "score"]))?;
     /// assert_eq!(hits[0].num_columns(), 2);
-    /// // Opt in to full rows:
-    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None, Some(true))?;
+    /// // `None` projection returns full rows:
+    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None)?;
     /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -401,21 +375,10 @@ impl Supertable {
         k: usize,
         options: VectorSearchOptions,
         projection: Option<&[&str]>,
-        materialize: Option<bool>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
-        let reader = self.reader();
-        // Vector search does NOT materialize by default.
-        if materialize.unwrap_or(false) {
-            reader
-                .vector_search(column, query, k, options, projection)
-                .map_err(crate::InfinoError::from)
-        } else {
-            let id_col = self.options().id_column.clone();
-            let ids_only = [id_col.as_str(), SCORE_COLUMN];
-            reader
-                .vector_search(column, query, k, options, Some(&ids_only))
-                .map_err(crate::InfinoError::from)
-        }
+        self.reader()
+            .vector_search(column, query, k, options, projection)
+            .map_err(crate::InfinoError::from)
     }
 }
 

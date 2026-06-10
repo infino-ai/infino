@@ -61,10 +61,11 @@ let batch = RecordBatch::try_new(
 )?;
 docs.append(&batch)?;
 
-// Keyword search (BM25): hits carry the auto-injected `_id` + score.
-// Returns Arrow rows. projection `None` = all columns; materialize `None`
-// = the method default (BM25 materializes; vector search does not).
-let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, None, None)?;
+// Keyword search (BM25): Arrow rows carrying the auto-injected `_id`,
+// the projected columns, and a trailing `score`. Only the projected
+// scalar columns are decoded; project just `_id` + `score` (or pass
+// `None` for the whole row) to control the decode cost.
+let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
 assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
 // SQL across the catalog — every segment is also a valid Parquet file.

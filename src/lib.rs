@@ -130,10 +130,10 @@ pub use error::InfinoError;
 pub use superfile::VectorSearchOptions;
 pub use superfile::fts::reader::BoolMode;
 pub use superfile::vector::distance::Metric;
+pub use supertable::MutationStats;
 /// Single-table handle: `append` / `update` / `delete` / `bm25_search`
 /// / `vector_search` / `schema`.
 pub use supertable::Supertable;
-pub use supertable::{MutationStats, SearchHit};
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)
