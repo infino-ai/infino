@@ -122,18 +122,11 @@ pub fn encode_parquet_body(
     batches: &[RecordBatch],
     compression: Compression,
     row_group_size: usize,
-    data_page_size_limit: usize,
     column_page_size_limits: &[(&str, usize)],
 ) -> Result<EncodedBody, FooterError> {
-    // The data page is parquet's decode unit: point lookups
-    // (`take_by_local_doc_ids`) decompress whole pages to extract a
-    // handful of rows, so the global page-size cap bounds the resolve
-    // cost of every materialized search hit. Per-column entries below
-    // override it (the id column runs tighter still).
     let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_row_count(Some(row_group_size))
-        .set_data_page_size_limit(data_page_size_limit);
+        .set_max_row_group_row_count(Some(row_group_size));
     for (col, limit) in column_page_size_limits {
         props_builder = props_builder
             .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
@@ -434,7 +427,6 @@ mod tests {
             batches,
             compression,
             row_group_size,
-            crate::superfile::builder::DEFAULT_DATA_PAGE_SIZE_LIMIT,
             column_page_size_limits,
         )?;
         splice_index_blobs(body, fts_blob, vec_blob, extra_kv)
