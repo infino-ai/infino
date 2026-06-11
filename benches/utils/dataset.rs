@@ -51,6 +51,12 @@ pub struct DatasetMeta {
     pub total_index_bytes: u64,
     /// Which build wrote the data. Provenance only — never a reuse gate.
     pub builder_id: String,
+    /// SQL query sample row (SQL datasets only). Deterministic from the corpus,
+    /// persisted so the consumer needn't regenerate it to run SQL predicates.
+    #[serde(default)]
+    pub sql_sample_title: Option<String>,
+    #[serde(default)]
+    pub sql_sample_key: Option<String>,
 }
 
 /// The dataset prefix from the environment, or `None` when not in dataset mode.
@@ -99,6 +105,8 @@ mod tests {
             n_superfiles: 13,
             total_index_bytes: 1_234_567_890,
             builder_id: "infino/0.1.0+abc1234".into(),
+            sql_sample_title: None,
+            sql_sample_key: None,
         };
         let bytes = serde_json::to_vec(&meta).expect("serialize");
         let back: DatasetMeta = serde_json::from_slice(&bytes).expect("deserialize");
@@ -113,6 +121,8 @@ mod tests {
             n_superfiles: 1,
             total_index_bytes: 0,
             builder_id: "x".into(),
+            sql_sample_title: None,
+            sql_sample_key: None,
         };
         verify(&meta, &knobs());
     }
@@ -125,6 +135,8 @@ mod tests {
             n_superfiles: 1,
             total_index_bytes: 0,
             builder_id: "x".into(),
+            sql_sample_title: None,
+            sql_sample_key: None,
         };
         let mut expected = knobs();
         expected.dim = 256;
@@ -140,6 +152,8 @@ mod tests {
             n_superfiles: 1,
             total_index_bytes: 0,
             builder_id: "infino/9.9.9+deadbee".into(),
+            sql_sample_title: None,
+            sql_sample_key: None,
         };
         verify(&meta, &knobs());
     }

@@ -354,6 +354,44 @@ impl Phases {
     };
 }
 
+/// Ingest a prepared corpus, sampling RSS over the build window. Returns the
+/// ingest measurements only for the build phase (it emits them).
+fn build_measured(
+    modality: Modality,
+    corpus: &supertable::PreparedCorpus,
+    phases: Phases,
+) -> (supertable::IngestResult, Option<ShapeMetrics>) {
+    let sampler = PeakSampler::start_default();
+    let t0 = Instant::now();
+    let built = supertable::build_on_storage(modality, corpus);
+    let wall = t0.elapsed();
+    let rss = sampler.stop_stats();
+    let metrics = phases.build.then_some(ShapeMetrics {
+        wall_ns: wall.as_secs_f64() * 1e9,
+        n_superfiles: built.n_superfiles,
+        peak_rss_bytes: rss.peak_rss_bytes,
+        median_rss_bytes: rss.median_rss_bytes,
+        p90_rss_bytes: rss.p90_rss_bytes,
+    });
+    (built, metrics)
+}
+
+/// Obtain the search artifact for modalities that don't need the corpus after
+/// build (FTS, SQL): in dataset mode open the pre-uploaded dataset (no corpus,
+/// no ingest); otherwise generate the corpus and ingest it. Vector keeps its
+/// corpus for recall ground truth and calls [`build_measured`] directly.
+fn build_or_open(
+    modality: Modality,
+    phases: Phases,
+) -> (supertable::IngestResult, Option<ShapeMetrics>) {
+    if crate::dataset::dataset_mode() {
+        return (supertable::open_dataset(modality), None);
+    }
+    // Corpus to disk + mmap BEFORE the sampler — engine-only window.
+    let corpus = supertable::prepare_corpus(modality);
+    build_measured(modality, &corpus, phases)
+}
+
 fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         Arc::clone(&built.storage),
@@ -397,33 +435,9 @@ pub mod fts {
             return;
         }
 
-        if phases.build {
-            eprintln!(
-                "[supertable_fts] ingesting {} docs to object storage...",
-                fmt_count(n_docs),
-            );
-        } else {
-            eprintln!(
-                "[supertable_fts] building search artifact ({} docs) for warm/cold phases...",
-                fmt_count(n_docs),
-            );
-        }
-        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-        let corpus = supertable::prepare_corpus(Modality::Fts);
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Fts, &corpus);
-        let wall = t0.elapsed();
-        let rss = sampler.stop_stats();
-        let metrics = ShapeMetrics {
-            wall_ns: wall.as_secs_f64() * 1e9,
-            n_superfiles: built.n_superfiles,
-            peak_rss_bytes: rss.peak_rss_bytes,
-            median_rss_bytes: rss.median_rss_bytes,
-            p90_rss_bytes: rss.p90_rss_bytes,
-        };
-        if phases.build {
-            emit_ingest(&mut report, n_docs, &metrics);
+        let (built, ingest_metrics) = build_or_open(Modality::Fts, phases);
+        if let Some(metrics) = &ingest_metrics {
+            emit_ingest(&mut report, n_docs, metrics);
         }
 
         if phases.warm || phases.cold {
@@ -602,36 +616,17 @@ pub mod vector {
         }
 
         let n_docs = supertable::n_docs();
-        if phases.build {
-            eprintln!(
-                "[supertable_vector] ingesting {} docs × dim={DIM} to object storage...",
-                fmt_count(n_docs),
-            );
-        } else {
-            eprintln!(
-                "[supertable_vector] building search artifact ({} docs) for warm/cold phases...",
-                fmt_count(n_docs),
-            );
-        }
-        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-        // Kept alive for the search phase: the same mmap backs the
-        // ground-truth recall measurement instead of a regeneration.
+        // Corpus to disk + mmap (engine-only window). Kept alive for the
+        // search phase: the same vectors back the brute-force ground truth,
+        // so dataset mode regenerates it too (skipping only the ingest).
         let corpus = supertable::prepare_corpus(Modality::Vector);
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Vector, &corpus);
-        let wall = t0.elapsed();
-        let rss = sampler.stop_stats();
-
         let mut report = Report::load("supertable_vector");
-        let metrics = ShapeMetrics {
-            wall_ns: wall.as_secs_f64() * 1e9,
-            n_superfiles: built.n_superfiles,
-            peak_rss_bytes: rss.peak_rss_bytes,
-            median_rss_bytes: rss.median_rss_bytes,
-            p90_rss_bytes: rss.p90_rss_bytes,
+        let (built, ingest_metrics) = if crate::dataset::dataset_mode() {
+            (supertable::open_dataset(Modality::Vector), None)
+        } else {
+            build_measured(Modality::Vector, &corpus, phases)
         };
-        if phases.build {
+        if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/vector/supertable/ingest".into(),
                 title: format!(
@@ -652,7 +647,7 @@ pub mod vector {
                         "Median RSS".into(),
                         "P90 RSS".into(),
                     ],
-                    rows: vec![ingest_row(n_docs, "vector-only", &metrics)],
+                    rows: vec![ingest_row(n_docs, "vector-only", metrics)],
                 }],
             });
         }
@@ -794,34 +789,9 @@ pub mod sql {
         }
 
         let n_docs = supertable::n_docs();
-        if phases.build {
-            eprintln!(
-                "[supertable_sql] ingesting {} rows to object storage...",
-                fmt_count(n_docs)
-            );
-        } else {
-            eprintln!(
-                "[supertable_sql] building query artifact ({} rows) for warm/cold phases...",
-                fmt_count(n_docs),
-            );
-        }
-        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-        let corpus = supertable::prepare_corpus(Modality::Sql);
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Sql, &corpus);
-        let wall = t0.elapsed();
-        let rss = sampler.stop_stats();
-
         let mut report = Report::load("supertable_sql");
-        let metrics = ShapeMetrics {
-            wall_ns: wall.as_secs_f64() * 1e9,
-            n_superfiles: built.n_superfiles,
-            peak_rss_bytes: rss.peak_rss_bytes,
-            median_rss_bytes: rss.median_rss_bytes,
-            p90_rss_bytes: rss.p90_rss_bytes,
-        };
-        if phases.build {
+        let (built, ingest_metrics) = build_or_open(Modality::Sql, phases);
+        if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/sql/supertable/ingest".into(),
                 title: format!(
@@ -841,7 +811,7 @@ pub mod sql {
                         "Median RSS".into(),
                         "P90 RSS".into(),
                     ],
-                    rows: vec![ingest_row(n_docs, "SQL", &metrics)],
+                    rows: vec![ingest_row(n_docs, "SQL", metrics)],
                 }],
             });
         }

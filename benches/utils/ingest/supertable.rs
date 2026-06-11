@@ -333,14 +333,6 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         total_index_bytes as f64 / (1u64 << 30) as f64,
         storage_backend.storage_label,
     );
-    if crate::dataset::dataset_mode() {
-        write_sidecar(
-            &storage_backend.storage,
-            modality,
-            n_superfiles,
-            total_index_bytes,
-        );
-    }
     // SQL query predicates sample the mid-corpus row (one mmap page
     // touch — not a corpus materialization).
     let mid = n_docs / 2;
@@ -353,6 +345,16 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
     } else {
         (None, None)
     };
+    if crate::dataset::dataset_mode() {
+        write_sidecar(
+            &storage_backend.storage,
+            modality,
+            n_superfiles,
+            total_index_bytes,
+            sql_sample_title.clone(),
+            sql_sample_key.clone(),
+        );
+    }
     IngestResult {
         storage: storage_backend.storage,
         storage_label: storage_backend.storage_label,
@@ -372,12 +374,16 @@ fn write_sidecar(
     modality: Modality,
     n_superfiles: usize,
     total_index_bytes: u64,
+    sql_sample_title: Option<String>,
+    sql_sample_key: Option<String>,
 ) {
     let meta = crate::dataset::DatasetMeta {
         knobs: current_knobs(modality),
         n_superfiles,
         total_index_bytes,
         builder_id: infino::BUILDER_ID.to_string(),
+        sql_sample_title,
+        sql_sample_key,
     };
     let json = serde_json::to_vec_pretty(&meta).expect("serialize dataset sidecar");
     tiers::block_on(storage.put_atomic(crate::dataset::SIDECAR, Bytes::from(json)))
@@ -387,6 +393,38 @@ fn write_sidecar(
         crate::dataset::SIDECAR,
         modality.dataset_dir(),
     );
+}
+
+/// Open a pre-uploaded dataset for the read phases: resolve storage at the
+/// fixed prefix, load and verify the sidecar, and return an [`IngestResult`]
+/// the warm/cold runners consume exactly like a freshly built one — no corpus
+/// generation, no ingest.
+pub fn open_dataset(modality: Modality) -> IngestResult {
+    let storage_backend = tiers::block_on(tiers::dataset_storage_fixture(modality.dataset_dir()));
+    let meta = read_sidecar(&storage_backend.storage);
+    crate::dataset::verify(&meta, &current_knobs(modality));
+    eprintln!(
+        "[supertable_dataset] opened {} dataset: {} superfiles, {:.2} GiB index bytes on {}",
+        modality.dataset_dir(),
+        meta.n_superfiles,
+        meta.total_index_bytes as f64 / (1u64 << 30) as f64,
+        storage_backend.storage_label,
+    );
+    IngestResult {
+        storage: storage_backend.storage,
+        storage_label: storage_backend.storage_label,
+        n_superfiles: meta.n_superfiles,
+        total_index_bytes: meta.total_index_bytes,
+        cleanup: None,
+        sql_sample_title: meta.sql_sample_title,
+        sql_sample_key: meta.sql_sample_key,
+    }
+}
+
+fn read_sidecar(storage: &Arc<dyn StorageProvider>) -> crate::dataset::DatasetMeta {
+    let (bytes, _) = tiers::block_on(storage.get(crate::dataset::SIDECAR))
+        .expect("read dataset sidecar — is the dataset prepared at this prefix?");
+    serde_json::from_slice(&bytes).expect("parse dataset sidecar")
 }
 
 /// One commit chunk's `RecordBatch` for `modality`, borrowing the text
