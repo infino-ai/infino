@@ -46,6 +46,7 @@ use std::sync::Arc;
 use futures::future;
 
 use crate::storage::{StorageError, StorageProvider};
+use crate::supertable::Manifest;
 use crate::supertable::error::CommitError;
 use crate::supertable::manifest::list::{self as list_mod, ManifestList};
 use crate::supertable::manifest::part::{
@@ -393,6 +394,30 @@ fn translate_contention(e: CommitError) -> CommitError {
         }
         other => other,
     }
+}
+
+/// Verifies the current in-memory manifest is the latest one and returns
+/// the current manifest etag for the given manifest, or `None` if the
+/// manifest is not yet committed.
+pub async fn get_current_manifest_etag(
+    storage: &Arc<dyn StorageProvider>,
+    current: Arc<Manifest>,
+) -> Result<Option<String>, CommitError> {
+    let (bytes, meta) = match storage.get(POINTER_PATH).await {
+        Ok((bytes, meta)) => (bytes, meta),
+        Err(StorageError::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(crate::supertable::CommitError::from(e)),
+    };
+
+    let pointer_file = PointerFile::from_bytes(&bytes)?;
+    let Some(meta_list) = current.list.as_ref() else {
+        // no manifest list for in-memory supertables
+        return Ok(None);
+    };
+    if pointer_file.manifest_id == meta_list.manifest_id {
+        return Ok(meta.etag);
+    }
+    Err(CommitError::WriteContentionExhausted)
 }
 
 #[cfg(test)]

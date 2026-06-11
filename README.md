@@ -40,19 +40,17 @@ The Python bindings (PyO3 + maturin) live in
 
 ```javascript
 const { connect, IndexSpec } = require("infino");
-const { Schema, Field, LargeUtf8 } = require("apache-arrow");
 
 const db = connect("memory://");                   // or "./data", "s3://bucket/prefix"
 
-// Schema is an apache-arrow Schema; FTS columns are LargeUtf8.
-const schema = new Schema([new Field("title", new LargeUtf8(), false)]);
-const docs = db.createTable("docs", schema, new IndexSpec().fts("title"));
+// A plain { column: type } schema — no apache-arrow needed.
+const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
 
-// append plain objects — the binding builds Arrow under the hood.
+// append plain objects; results come back as plain records.
 docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 
 const rows = docs.bm25Search("title", "fox", 10);        // ranked rows as records
-const hits = docs.tokenMatch("title", "fox");            // unranked [{ id: 1n, score: 0 }]
+const hits = docs.tokenMatch("title", "fox");            // unranked matching rows (score 0)
 const sql  = db.querySql("SELECT _id, title FROM docs"); // records (or { arrow: true })
 ```
 
@@ -86,10 +84,11 @@ let batch = RecordBatch::try_new(
 )?;
 docs.append(&batch)?;
 
-// Keyword search (BM25): hits carry the auto-injected `_id` + score.
-// Returns Arrow rows. projection `None` = all columns; materialize `None`
-// = the method default (BM25 materializes; vector search does not).
-let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, None, None)?;
+// Keyword search (BM25): Arrow rows carrying the auto-injected `_id`,
+// the projected columns, and a trailing `score`. Only the projected
+// scalar columns are decoded; project just `_id` + `score` (or pass
+// `None` for the whole row) to control the decode cost.
+let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
 assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
 // SQL across the catalog — every segment is also a valid Parquet file.

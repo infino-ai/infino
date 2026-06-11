@@ -21,7 +21,7 @@ const docs = db.createTable("docs", schema, new IndexSpec().fts("title"));
 docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 
 const rows = docs.bm25Search("title", "fox", 10);  // matching rows as records
-const hits = docs.tokenMatch("title", "fox");      // unranked [{ id: 1n, score: 0 }]
+const hits = docs.tokenMatch("title", "fox");      // unranked matching rows (score 0)
 const out  = db.querySql("SELECT COUNT(*) AS n FROM docs"); // records (or { arrow: true })
 ```
 
@@ -57,8 +57,10 @@ Node-idiomatic: objects in, records out; Arrow is optional.
     ranked search; return matching **rows** as records (or an apache-arrow
     `Table` with `{ arrow: true }`). `query` is a `number[]` or
     `Float32Array`. BM25 materializes by default; vector does not.
-  - `tokenMatch(col, q, mode?)` / `exactMatch(col, value)` — unranked
-    `_id` + score lists (`score` is `0`), `_id` as a `bigint`.
+  - `tokenMatch(col, q, { mode?, projection?, arrow? })` /
+    `exactMatch(col, value, { projection?, arrow? })` — unranked matching
+    rows (`score` is `0`); same records/`{ arrow: true }` shape as the
+    ranked searches.
   - `schema()` — the table's apache-arrow `Schema`.
 - `IndexSpec().fts(col).vector(col, dim, nCent, metric)`.
 

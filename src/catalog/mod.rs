@@ -20,6 +20,7 @@ mod search_tvf;
 mod uri;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -284,9 +285,14 @@ impl Connection {
     /// Remove a table from the catalog. Fails with
     /// [`InfinoError::NotFound`] if it isn't registered.
     ///
-    /// This unregisters the table; the underlying object-store data under
-    /// `<root>/<name>/` is left in place (physical reclamation is a
-    /// separate operation).
+    /// Unregistering is always logical and O(1): the `name → location`
+    /// entry leaves the catalog, and readers pinned to a pre-drop
+    /// snapshot keep working. `purge` additionally deletes the table's
+    /// storage subtree (its unique per-creation location) after the
+    /// catalog commit — the name is gone first, so a crash mid-purge
+    /// can only leave unreferenced orphans, never a half-deleted live
+    /// table. For `memory://`, tables live in-process and free with the
+    /// last handle, so `purge` has nothing extra to do.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -295,11 +301,11 @@ impl Connection {
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
     /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
-    /// db.drop_table("posts")?;
+    /// db.drop_table("posts", true)?; // purge: reclaim the bytes too
     /// assert!(db.list_tables()?.is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn drop_table(&self, name: &str) -> Result<(), InfinoError> {
+    pub fn drop_table(&self, name: &str, purge: bool) -> Result<(), InfinoError> {
         match &self.inner.store {
             CatalogStore::Memory(map) => map
                 .lock()
@@ -308,13 +314,35 @@ impl Connection {
                 .map(|_| ())
                 .ok_or_else(|| InfinoError::NotFound(name.to_string())),
             CatalogStore::Storage(root) => {
-                let name = name.to_string();
-                bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
-                    body.tables
-                        .remove(&name)
-                        .map(|_| ())
-                        .ok_or_else(|| InfinoError::NotFound(name.clone()))
-                }))
+                // Capture the removed entry's location out of the OCC
+                // closure; on a retry the freshest body is re-read, so
+                // the last successful attempt's location wins.
+                let mut location: Option<String> = None;
+                bridge_sync_to_async(commit_catalog(root.as_ref(), |body| {
+                    match body.tables.remove(name) {
+                        Some(entry) => {
+                            location = Some(entry.location);
+                            Ok(())
+                        }
+                        None => Err(InfinoError::NotFound(name.to_string())),
+                    }
+                }))?;
+                if purge {
+                    let location =
+                        location.expect("catalog commit succeeded => an entry was removed");
+                    // Delete everything under the table's unique
+                    // location. Listing is component-aware, so a sibling
+                    // location sharing a string prefix never matches;
+                    // deletes are idempotent, so re-running after a
+                    // partial failure converges.
+                    bridge_sync_to_async(async {
+                        let objects = root.list_with_prefix(&location).await?;
+                        futures::future::try_join_all(objects.iter().map(|uri| root.delete(uri)))
+                            .await?;
+                        Ok::<(), crate::storage::StorageError>(())
+                    })?;
+                }
+                Ok(())
             }
         }
     }
@@ -525,12 +553,12 @@ fn validate_name(name: &str) -> Result<(), InfinoError> {
 
 /// A unique-per-creation physical subtree for a table. The catalog name
 /// is the stable identity; this is only the storage location, made
-/// unique so a `drop_table` (logical — it leaves the bytes in place)
+/// unique so a `drop_table` (logical by default — without `purge` it
+/// leaves the bytes in place)
 /// followed by a re-create of the same name lands on a fresh subtree
 /// rather than re-opening the dropped table's committed data. Stays a
 /// single path segment (same depth as the old `<root>/<name>`).
 fn unique_location(name: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
     /// Process-local tiebreaker so two creations within the same
     /// nanosecond tick still get distinct locations.
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -602,11 +630,11 @@ mod tests {
         // Re-open by name and search.
         let reopened = conn.open_table("docs").expect("open_table");
         let hits = reopened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
             .expect("bm25_search");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox'");
 
-        conn.drop_table("docs").expect("drop_table");
+        conn.drop_table("docs", false).expect("drop_table");
         assert!(conn.list_tables().expect("list").is_empty());
         assert!(matches!(
             conn.open_table("docs"),
@@ -672,13 +700,13 @@ mod tests {
         assert_eq!(
             n_rows(
                 &first
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
                     .expect("search")
             ),
             1
         );
 
-        conn.drop_table("docs").expect("drop");
+        conn.drop_table("docs", false).expect("drop");
 
         // Re-create the same name: the old subtree is orphaned, the new
         // table starts empty.
@@ -688,11 +716,62 @@ mod tests {
         assert_eq!(
             n_rows(
                 &second
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
                     .expect("search")
             ),
             0,
             "re-created table must not resurrect the dropped table's rows"
+        );
+    }
+
+    #[test]
+    fn drop_with_purge_reclaims_the_storage_subtree() {
+        /// Count regular files under `dir` whose path contains a
+        /// component starting with `prefix` (the table's unique
+        /// `<name>-<nanos>-<seq>` location).
+        fn files_under_location(dir: &std::path::Path, prefix: &str) -> usize {
+            let mut n = 0;
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path
+                        .components()
+                        .any(|c| c.as_os_str().to_string_lossy().starts_with(prefix))
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        table
+            .append(&build_title_batch(&["a lazy sleeping fox"]))
+            .expect("append");
+        assert!(
+            files_under_location(dir.path(), "docs-") > 0,
+            "committed table must have bytes under its unique location"
+        );
+
+        conn.drop_table("docs", true).expect("drop with purge");
+        assert!(conn.list_tables().expect("list").is_empty());
+        assert_eq!(
+            files_under_location(dir.path(), "docs-"),
+            0,
+            "purge must delete every object under the dropped table's location"
         );
     }
 
@@ -820,7 +899,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
             .expect("search");
         assert_eq!(n_rows(&hits), 1);
         // The disk cache got a per-table subdirectory.
@@ -847,7 +926,7 @@ mod tests {
         assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
         let table = conn.open_table("docs").expect("open_table");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None, None)
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),

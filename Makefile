@@ -46,7 +46,7 @@ bench:
 	cargo bench --features test-helpers
 
 bench-quick:
-	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --features test-helpers -- superfile fts warm
+	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --features test-helpers --bench bench -- superfile fts warm
 
 # Memory safety oracles for the FTS / format `unsafe` surface.
 # The remaining `unsafe` surface is one bumpalo lifetime
@@ -120,7 +120,7 @@ python-wheel:
 # from the cargo workspace, so the core crate never needs a Node
 # toolchain. These targets require npm + a Rust toolchain on PATH.
 
-# Build the addon (debug, for speed) and run the node:test smoke suite.
+# Build the addon (debug) + run the node:test smoke suite.
 node-test:
 	cd infino-node && npm install && npm run build:debug && npm test
 

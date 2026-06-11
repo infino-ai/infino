@@ -29,12 +29,6 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
-/** An unranked match — the public `_id` (a `bigint`) plus a score. */
-export interface SearchHit {
-  id: bigint;
-  score: number;
-}
-
 /** Storage config the `connect` URI can't carry (S3-compatible creds). */
 export interface ConnectOptions {
   endpoint?: string;
@@ -45,12 +39,22 @@ export interface ConnectOptions {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  materialize?: boolean;
+  /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
+  projection?: string[];
   arrow?: boolean;
 }
 export interface VectorSearchOptions {
   nprobe?: number;
-  materialize?: boolean;
+  projection?: string[];
+  arrow?: boolean;
+}
+export interface TokenMatchOptions {
+  mode?: BoolMode;
+  projection?: string[];
+  arrow?: boolean;
+}
+export interface MatchOptions {
+  projection?: string[];
   arrow?: boolean;
 }
 export interface QueryOptions {
@@ -225,7 +229,7 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = this.inner.bm25Search(column, query, k, opts.mode, opts.materialize);
+    const buf = this.inner.bm25Search(column, query, k, opts.mode, opts.projection);
     return decode(buf, opts.arrow);
   }
 
@@ -234,18 +238,24 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
-    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.materialize);
+    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.projection);
     return decode(buf, opts.arrow);
   }
 
-  /** Unranked token match — `_id` + score list (`score` is `0`). */
-  tokenMatch(column: string, query: string, mode?: BoolMode): SearchHit[] {
-    return this.inner.tokenMatch(column, query, mode);
+  /** Unranked token match; matching rows as records (or an Arrow `Table`). */
+  tokenMatch(column: string, query: string, opts: TokenMatchOptions & { arrow: true }): arrow.Table;
+  tokenMatch(column: string, query: string, opts?: TokenMatchOptions): RowRecord[];
+  tokenMatch(column: string, query: string, opts: TokenMatchOptions = {}): RowRecord[] | arrow.Table {
+    const buf = this.inner.tokenMatch(column, query, opts.mode, opts.projection);
+    return decode(buf, opts.arrow);
   }
 
-  /** Unranked exact match — `_id` + score list (`score` is `0`). */
-  exactMatch(column: string, value: string): SearchHit[] {
-    return this.inner.exactMatch(column, value);
+  /** Unranked exact match; matching rows as records (or an Arrow `Table`). */
+  exactMatch(column: string, value: string, opts: MatchOptions & { arrow: true }): arrow.Table;
+  exactMatch(column: string, value: string, opts?: MatchOptions): RowRecord[];
+  exactMatch(column: string, value: string, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
+    const buf = this.inner.exactMatch(column, value, opts.projection);
+    return decode(buf, opts.arrow);
   }
 }
 
@@ -264,8 +274,8 @@ export class Connection {
     return new Table(this.inner.openTable(name));
   }
 
-  dropTable(name: string): void {
-    this.inner.dropTable(name);
+  dropTable(name: string, purge?: boolean): void {
+    this.inner.dropTable(name, purge);
   }
 
   listTables(): string[] {

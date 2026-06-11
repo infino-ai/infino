@@ -36,15 +36,39 @@ cargo test --lib superfile::vector::
 
 # All benches share one `bench` target; select cells with positional
 # tokens after `--`: [tier] [modality] [phase ...] (space-separated)
-cargo bench -- superfile fts
-cargo bench -- supertable vector build warm
+cargo bench --bench bench -- superfile fts
+cargo bench --bench bench -- supertable vector build warm
 # Diagnostics are tokens on the same binary:
 #   scale | tombstone | update | sql-diag | object-store
-cargo bench -- tombstone
+cargo bench --bench bench -- tombstone
 ```
 
 ## Code style beyond CONTRIBUTING.md
 
+- **Rayon for CPU, tokio for I/O — bridged, never mixed.** This split
+  was A/B-tested (all-tokio, all-rayon, and the hybrid; the hybrid won —
+  rayon saturates cores better, tokio drives I/O better) and is the
+  standing concurrency contract for the query and build paths:
+  - **tokio owns the I/O waves**: segment opens, object-store range
+    GETs, sidecar prefetches — `tokio::spawn` / `try_join_all` on the
+    shared multi-thread query runtime so connections pool and fetches
+    overlap. Never build a throwaway per-call runtime on a worker
+    thread (that exact anti-pattern once regressed cold vector search
+    from ~1.1 s to ~3.7–11 s).
+  - **rayon owns the CPU waves**: Parquet page decode, BM25 / vector
+    scoring, rerank, encode. Run them on `options.reader_pool` (the
+    configurable pool — not the global rayon pool) via
+    `pool.install(|| … par_iter …)`.
+  - **Bridge with a oneshot**: when an async task needs a CPU wave,
+    hand the work to the rayon pool and `await` a
+    `tokio::sync::oneshot` for the result, so tokio workers keep
+    driving I/O instead of blocking under the compute. Don't call
+    `par_iter` (or any long compute) inline in an async fn.
+  - If you change where work runs, benchmark before and after
+    (`cargo bench --bench bench -- supertable search` plus the
+    `INFINO_DIAG_QUERY_SQL_OVERHEAD` diagnostic for the SQL resolve
+    path) — a prior change silently moved warm decodes back onto
+    tokio and cost ~5× on `resolve_hits`.
 - **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
 - **No code duplication.** Read the surrounding modules *before* writing new code — there is usually an existing helper that already does what you need. Refactor shared logic into one helper rather than copy-pasting; duplicated logic drifts out of sync and is a correctness hazard.
 - **No `unsafe` outside the documented surface.** `unsafe` in `src/` is concentrated in three areas: SIMD intrinsic kernels (`superfile/vector/distance.rs`, `vector/sq8_simd.rs`, `vector/quant.rs`, `superfile/fts/tokenize.rs`), memory-mapped / page-advise I/O (`supertable/reader_cache/disk.rs`, `config/`), and the one `bumpalo` lifetime extension in `FtsBuilder::add_doc`. (Note: `superfile/format/` is *safe* byte parsing — no `unsafe` there.) New `unsafe` requires both `make miri` and `make asan` green plus a clear safety argument in a doc-comment above the block.
@@ -70,7 +94,7 @@ Performance *and* cost are first-class acceptance criteria for every change. A P
 
 ### What `benches/` covers
 
-One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
+One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench --bench bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
 
 - **`superfile` tier** — single-segment, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
 - **`supertable` tier** — multi-segment table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
@@ -209,9 +233,9 @@ surface is deliberately small: a connection-and-table API over the
 storage/superfile/supertable layers, which are themselves internal.
 
 - **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
-- `**Connection`** — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
-- `**Supertable**` (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. `bm25_search` / `vector_search` return Arrow rows (`Vec<RecordBatch>`) and take a `projection` plus a `materialize` flag: `materialize = true` decodes the projected scalar columns (`_id`, the columns, `score`); `materialize = false` skips scalar decode and returns just `_id` + `score`. The unranked `token_match` / `exact_match` return `Vec<SearchHit>` (`_id` + score). The async kernels and the segment-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
-- **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `SearchHit`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
+- `**Connection`** — `create_table`, `open_table`, `drop_table` (logical by default; `purge = true` also deletes the table's storage subtree), `list_tables`, `query_sql`.
+- `**Supertable**` (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All four search methods (`bm25_search`, `vector_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the whole row, and only the projected scalar columns are decoded — `Some(&["_id", "score"])` is the no-scalar-decode path. The async kernels and the segment-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
+- **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
 
 Everything else — `SupertableReader`/`SupertableWriter`, the manifest
 and summary types, the storage providers and `StorageProvider` trait,

@@ -13,8 +13,8 @@ docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
 
 docs.append(pa.record_batch([pa.array(["the quick brown fox"])], names=["title"]))
 
-rows = docs.bm25_search("title", "fox", 10)                    # pyarrow.Table (_id, title, score)
-ids = docs.bm25_search("title", "fox", 10, materialize=False)  # pyarrow.Table (_id, score)
+rows = docs.bm25_search("title", "fox", 10)                                # pyarrow.Table (_id, title, score)
+ids = docs.bm25_search("title", "fox", 10, projection=["_id", "score"])    # no scalar decode
 table = db.query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
 ```
 
@@ -39,10 +39,12 @@ pytest tests/
 - `Connection`: `create_table(name, pyarrow.Schema, IndexSpec)`,
   `open_table`, `drop_table`, `list_tables`, `query_sql` → pyarrow Table.
 - `Table`: `append(...)`, `schema`, and the search surface —
-  `bm25_search` / `vector_search` return a pyarrow `Table`; with
-  `materialize=True` (default) the columns are `_id`, the scalar columns,
-  and `score`, with `materialize=False` just `_id` + `score`. The
-  unranked `token_match` / `exact_match` return `list[{"_id", "score"}]`.
+  `bm25_search` / `vector_search` / `token_match` / `exact_match` all
+  return a pyarrow `Table`. `projection` names the output columns
+  (`_id`, any scalar column, or `score`); omitting it returns the whole
+  row, and only the projected scalar columns are decoded —
+  `projection=["_id", "score"]` skips scalar decode entirely. The
+  unranked `token_match` / `exact_match` rows carry `score == 0.0`.
   `append` accepts a pyarrow `RecordBatch` or `Table`, a pandas
   `DataFrame`, or a `list[dict]` — coerced to Arrow against the table's
   declared schema (Python sources are nullable; null-free columns are

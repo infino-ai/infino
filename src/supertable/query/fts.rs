@@ -9,17 +9,17 @@
 //! [`Supertable`](super::super::Supertable):
 //!
 //! ```ignore
-//! // Full rows (`_id`, scalar columns, `score`); `materialize = true`.
+//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
 //! let rows: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None, true)?;
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None)?;
 //!
-//! // Just `_id` + `score` (no scalar decode); `materialize = false`.
+//! // Just `_id` + `score` (no scalar decode): project them explicitly.
 //! let ids: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None, false)?;
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "score"]))?;
 //!
-//! // Unranked candidate sets (`SearchHit`, score == 0.0).
-//! let any: Vec<SearchHit> = table.token_match("title", "rust async", BoolMode::Or)?;
-//! let exact: Vec<SearchHit> = table.exact_match("title", "rust async")?;
+//! // Unranked candidate sets (Arrow rows, score == 0.0).
+//! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
+//! let exact = table.exact_match("title", "rust async", None)?;
 //! ```
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
@@ -77,10 +77,8 @@ use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use arrow::record_batch::RecordBatch;
 
-use super::exec::common::{
-    SCORE_COLUMN, output_schema_with_score, resolve_hits, resolve_search_hits,
-};
-use super::{SearchHit, SuperfileHit};
+use super::SuperfileHit;
+use super::exec::common::resolve_hits_named;
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -388,35 +386,13 @@ impl SupertableReader {
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
-            let scalar_schema = self.options().scalar_schema();
-            let output_schema = output_schema_with_score(&scalar_schema);
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
-            // returns the whole row. Names are resolved to `output_schema`
-            // indices and forwarded to the shared `resolve_hits`, which
-            // decodes only the projected columns.
-            let indices: Option<Vec<usize>> = match projection {
-                Some(names) => Some(
-                    names
-                        .iter()
-                        .map(|name| {
-                            output_schema.index_of(name).map_err(|_| {
-                                QueryError::Execute(format!("bm25_search: unknown column {name:?}"))
-                            })
-                        })
-                        .collect::<Result<_, _>>()?,
-                ),
-                None => None,
-            };
-            let batch = resolve_hits(
-                self,
-                &hits,
-                &scalar_schema,
-                &output_schema,
-                indices.as_deref(),
-            )
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
+            // returns the whole row. The shared resolver decodes only
+            // the projected columns.
+            let batch = resolve_hits_named(self, &hits, projection, "bm25_search")
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
             Ok(vec![batch])
         })
     }
@@ -621,17 +597,12 @@ impl Supertable {
     /// Arrow rows best-score-first (BM25 relevance, higher is better).
     ///
     /// Pins a fresh reader (applying the read-consistency policy), runs
-    /// the BM25 fan-out, and resolves the top-`k` hits to Arrow rows. Each
-    /// returned batch carries `_id`, the selected scalar columns, and a
-    /// trailing `score`.
+    /// the BM25 fan-out, and resolves the top-`k` hits to Arrow rows.
     ///
-    /// - `materialize`: `Some(true)` decodes the scalar columns;
-    ///   `Some(false)` skips scalar decode and returns only `_id` +
-    ///   `score` (the cheap "just the hits" path). `None` uses this
-    ///   method's default — **BM25 materializes by default**.
-    /// - `projection` only applies when materializing: it selects output
-    ///   columns by name (`_id`, any visible scalar column, or `score`);
-    ///   `None` returns the whole row. Ignored when not materializing.
+    /// `projection` selects output columns by name (any of `_id`, the
+    /// visible scalar columns, or the trailing `score`); `None` returns
+    /// the whole row. Only the projected scalar columns are decoded, so
+    /// `Some(&["_id", "score"])` is the cheap "just the hits" path.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -643,11 +614,11 @@ impl Supertable {
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
-    /// // Default for BM25 is full rows:
-    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, None, None)?;
+    /// // `None` projection returns full rows:
+    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
     /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    /// // Opt out of materialization → just `_id` + `score`:
-    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, None, Some(false))?;
+    /// // Project just `_id` + `score` → no scalar decode at all:
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "score"]))?;
     /// assert_eq!(hits[0].num_columns(), 2);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -658,57 +629,64 @@ impl Supertable {
         k: usize,
         mode: BoolMode,
         projection: Option<&[&str]>,
-        materialize: Option<bool>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
-        let reader = self.reader();
-        // BM25 materializes by default.
-        if materialize.unwrap_or(true) {
-            reader
-                .bm25_search(column, query, k, mode, projection)
-                .map_err(crate::InfinoError::from)
-        } else {
-            let id_col = self.options().id_column.clone();
-            let ids_only = [id_col.as_str(), SCORE_COLUMN];
-            reader
-                .bm25_search(column, query, k, mode, Some(&ids_only))
-                .map_err(crate::InfinoError::from)
-        }
+        self.reader()
+            .bm25_search(column, query, k, mode, projection)
+            .map_err(crate::InfinoError::from)
     }
 
     /// Unranked token match over one FTS column: every row whose
     /// `column` matches `query`'s tokens under `mode` (`Or` = any token,
-    /// `And` = every token). Returns [`SearchHit`]s with `score == 0.0`
-    /// and unspecified order — a candidate set, not a ranking.
+    /// `And` = every token). Returns Arrow rows like
+    /// [`Supertable::bm25_search`], but the `score` column is `0.0` and
+    /// row order is unspecified — a candidate set, not a ranking.
+    /// `projection` follows the same rules as `bm25_search`.
     pub fn token_match(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
-    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
         let reader = self.reader();
         let hits = reader
             .token_match(column, query, mode)
             .map_err(crate::InfinoError::from)?;
-        let id_col = self.options().id_column.clone();
-        self.block_on_query(resolve_search_hits(&reader, &hits, &id_col))
-            .map_err(|e| crate::InfinoError::Query(e.to_string()))
+        let batch = self
+            .block_on_query(resolve_hits_named(
+                &reader,
+                &hits,
+                projection,
+                "token_match",
+            ))
+            .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
+        Ok(vec![batch])
     }
 
     /// Unranked exact match: rows whose `column` value equals `value`
-    /// exactly (index-pruned, then text-verified). Returns
-    /// [`SearchHit`]s with `score == 0.0` and unspecified order.
+    /// exactly (index-pruned, then text-verified). Returns Arrow rows
+    /// like [`Supertable::bm25_search`], with `score` fixed at `0.0` and
+    /// unspecified row order. `projection` follows the same rules as
+    /// `bm25_search`.
     pub fn exact_match(
         &self,
         column: &str,
         value: &str,
-    ) -> Result<Vec<SearchHit>, crate::InfinoError> {
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
         let reader = self.reader();
         let hits = reader
             .exact_match(column, value)
             .map_err(crate::InfinoError::from)?;
-        let id_col = self.options().id_column.clone();
-        self.block_on_query(resolve_search_hits(&reader, &hits, &id_col))
-            .map_err(|e| crate::InfinoError::Query(e.to_string()))
+        let batch = self
+            .block_on_query(resolve_hits_named(
+                &reader,
+                &hits,
+                projection,
+                "exact_match",
+            ))
+            .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
+        Ok(vec![batch])
     }
 }
 

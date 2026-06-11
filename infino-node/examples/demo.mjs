@@ -33,7 +33,8 @@ for (const row of docs.bm25Search("title", "fox", 10)) console.log("  ", row);
 
 // --- 3b. unranked token match — lightweight _id (bigint) + score ---
 console.log("\ntokenMatch('fox'):");
-for (const h of docs.tokenMatch("title", "fox")) console.log(`  _id=${h.id}  score=${h.score}`);
+for (const r of docs.tokenMatch("title", "fox", { projection: ["_id", "score"] }))
+  console.log(`  _id=${r._id}  score=${r.score}`);
 
 // --- 4. SQL across the catalog — records by default ---
 console.log("\nquerySql rows:");

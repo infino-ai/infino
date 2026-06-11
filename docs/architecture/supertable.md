@@ -57,13 +57,12 @@ unset.
 
 Those segment-local hits are the reader's internal representation. The
 public `Supertable` search methods resolve each hit to the table's
-stable `_id` and return Arrow `RecordBatch` rows: `bm25_search` and
-`vector_search` take a `materialize` choice — decode the (optionally
-projected) scalar columns alongside `_id` + `score`, or skip the scalar
-decode and return just `_id` + `score`. BM25 materializes by default;
-vector search, typically a retrieval step feeding a follow-up fetch,
-does not. The unranked `token_match` / `exact_match` return the resolved
-`_id` + score directly.
+stable `_id` and return Arrow `RecordBatch` rows. All four (`bm25_search`,
+`vector_search`, and the unranked `token_match` / `exact_match`) take a
+column `projection`: `None` returns the whole row, and only the
+projected scalar columns are decoded — projecting just `_id` + `score`
+skips scalar decode entirely (the cheap shape for a retrieval step
+feeding a follow-up fetch).
 
 - **Vector search.** k-nearest-neighbor over a vector column for a
 query vector, returning the `k` closest rows ordered by ascending

@@ -45,11 +45,11 @@ test("memory roundtrip: create, append, search, drop", () => {
   assert.equal(ranked.length, 1);
   assert.equal(typeof ranked[0]._id, "bigint");
 
-  // tokenMatch returns the _id + score list (bigint _id).
+  // tokenMatch returns matching rows (unranked, score 0); `_id` is a bigint.
   const hits = reopened.tokenMatch("title", "fox");
   assert.equal(hits.length, 1);
-  assert.equal(typeof hits[0].id, "bigint");
-  assert.equal(typeof hits[0].score, "number");
+  assert.equal(typeof hits[0]._id, "bigint");
+  assert.equal(hits[0].score, 0);
 
   db.dropTable("docs");
   assert.deepEqual(db.listTables(), []);
@@ -81,14 +81,15 @@ test("querySql can return an Arrow table with { arrow: true }", () => {
   assert.equal(tbl.numRows, 1);
 });
 
-test("tokenMatch and exactMatch return _id + score lists", () => {
+test("tokenMatch and exactMatch return unranked rows", () => {
   const db = connect("memory://");
   const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
   docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 
-  const tok = docs.tokenMatch("title", "fox");
+  // Project to just _id + score (score is 0 for unranked matches).
+  const tok = docs.tokenMatch("title", "fox", { projection: ["_id", "score"] });
   assert.equal(tok.length, 1);
-  assert.equal(typeof tok[0].id, "bigint");
+  assert.equal(typeof tok[0]._id, "bigint");
   assert.equal(tok[0].score, 0);
 
   const ex = docs.exactMatch("title", "a lazy dog");

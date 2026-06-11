@@ -148,25 +148,6 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
 // Public types
 // ---------------------------------------------------------------------------
 
-/// One search hit: the public `_id` plus the score. `id` is the core's
-/// `i128` `_id` exposed as a JS `bigint` (JS `number` is f64-safe only to
-/// 2^53; `_id` can exceed that), matching the Python bindings' native
-/// integer.
-#[napi(object)]
-pub struct SearchHit {
-    pub id: BigInt,
-    pub score: f64,
-}
-
-impl SearchHit {
-    fn from_core(hit: &infino::SearchHit) -> Self {
-        SearchHit {
-            id: BigInt::from(hit.id),
-            score: hit.score as f64,
-        }
-    }
-}
-
 /// Storage config the `connect` URI can't carry. Today: an explicit
 /// S3-compatible endpoint + static credentials; omit for local /
 /// `memory://` / ambient-credential S3.
@@ -300,8 +281,8 @@ impl Connection {
 
     /// Drop (unregister) a table.
     #[napi]
-    pub fn drop_table(&self, name: String) -> Result<()> {
-        self.inner.drop_table(&name).map_err(map_err)
+    pub fn drop_table(&self, name: String, purge: Option<bool>) -> Result<()> {
+        self.inner.drop_table(&name, purge.unwrap_or(false)).map_err(map_err)
     }
 
     /// List the catalog's table names.
@@ -355,11 +336,8 @@ impl Table {
 
     /// BM25 search over one FTS column. Returns matching rows as an Arrow
     /// IPC `Buffer` (read with `tableFromIPC`). `mode` is `"or"` (default)
-    /// or `"and"`. `materialize` controls the columns: `true` → `_id`, the
-    /// table's scalar columns, and a trailing `score` (higher is better);
-    /// `false` → only `_id` + `score`. Omitting it uses the engine default
-    /// (BM25 materializes by default). For an unranked `_id` + score list,
-    /// see [`Table::token_match`].
+    /// or `"and"`. `projection` selects the returned columns — pass
+    /// `["_id", "score"]` for just id + score, or omit for full rows.
     #[napi]
     pub fn bm25_search(
         &self,
@@ -367,22 +345,23 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
-        materialize: Option<bool>,
+        projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
+        let proj: Option<Vec<&str>> =
+            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .bm25_search(&column, &query, k as usize, mode, None, materialize)
+            .bm25_search(&column, &query, k as usize, mode, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
 
     /// Vector kNN over one vector column. `query` is a `Float32Array`
     /// (crosses by reference — no copy). Returns matching rows as an Arrow
-    /// IPC `Buffer` (read with `tableFromIPC`). `materialize=true` → `_id`,
-    /// the scalar columns, and a trailing `score` (distance, smaller is
-    /// nearer); `false` → only `_id` + `score`. Omitting it uses the engine
-    /// default — vector search does NOT materialize by default.
+    /// IPC `Buffer` (read with `tableFromIPC`). `projection` selects the
+    /// returned columns (`["_id", "score"]` for just id + score, or omit
+    /// for full rows).
     #[napi]
     pub fn vector_search(
         &self,
@@ -390,47 +369,60 @@ impl Table {
         query: Float32Array,
         k: u32,
         nprobe: Option<u32>,
-        materialize: Option<bool>,
+        projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n as usize);
         }
+        let proj: Option<Vec<&str>> =
+            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts, None, materialize)
+            .vector_search(&column, query.as_ref(), k as usize, opts, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
 
-    /// Unranked token match over one FTS column — documents containing the
-    /// query terms, as `_id` + `score` (`score` is `0.0`). `mode` is `"or"`
-    /// (default) or `"and"`. Lighter than [`Table::bm25_search`] when
-    /// ranking isn't needed.
+    /// Unranked token match over one FTS column — every row whose `column`
+    /// matches the query's tokens under `mode` (`"or"` default, `"and"`).
+    /// Returns Arrow rows like [`Table::bm25_search`], with `score` = 0.0.
+    /// `projection` selects columns (omit for full rows).
     #[napi]
     pub fn token_match(
         &self,
         column: String,
         query: String,
         mode: Option<String>,
-    ) -> Result<Vec<SearchHit>> {
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
-        let hits = self
+        let proj: Option<Vec<&str>> =
+            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
             .inner
-            .token_match(&column, &query, mode)
+            .token_match(&column, &query, mode, proj.as_deref())
             .map_err(map_err)?;
-        Ok(hits.iter().map(SearchHit::from_core).collect())
+        batches_to_ipc(&batches)
     }
 
-    /// Unranked exact match of `value` against `column`, as `_id` + `score`
-    /// (`score` is `0.0`).
+    /// Unranked exact match of `value` against `column`. Returns Arrow rows
+    /// like [`Table::bm25_search`], with `score` = 0.0. `projection` selects
+    /// columns (omit for full rows).
     #[napi]
-    pub fn exact_match(&self, column: String, value: String) -> Result<Vec<SearchHit>> {
-        let hits = self
+    pub fn exact_match(
+        &self,
+        column: String,
+        value: String,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let proj: Option<Vec<&str>> =
+            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
             .inner
-            .exact_match(&column, &value)
+            .exact_match(&column, &value, proj.as_deref())
             .map_err(map_err)?;
-        Ok(hits.iter().map(SearchHit::from_core).collect())
+        batches_to_ipc(&batches)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

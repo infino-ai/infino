@@ -78,6 +78,7 @@ use crate::supertable::wal::state_doc::{
     IdSpan, OpKind, RowId, TombstoneOutcome, WalState, WalStateDoc,
 };
 use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+use crate::supertable::writer::build_subsection_offsets;
 
 /// Outcome of one append-phase invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,11 +417,10 @@ async fn do_apply(
         // which is correct for the Hash{n_buckets=1} default.
         partition_key: Vec::new(),
         partition_hint: None,
-        // WAL-committed segments don't yet embed open hints;
-        // the reader falls back to fetching vec/fts open ranges
-        // over the wire. Correct, just not 1-RTT-optimized — a
-        // follow-up can mirror the writer's `build_subsection_offsets`.
-        subsection_offsets: None,
+        // Mirror the commit path's 1-RTT cold-open hint; `None`
+        // only if the bytes don't parse (same fallback as the
+        // writer).
+        subsection_offsets: build_subsection_offsets(&bytes),
     });
 
     // ---- Step 6: PUT bytes + CAS-commit the manifest ----
