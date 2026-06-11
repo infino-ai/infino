@@ -47,19 +47,40 @@
 //! per-shard `SuperfileBuilder::add_batch` call. No bytes copied;
 //! just Arc reference counts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use arrow::ipc::writer::StreamWriter;
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch,
 };
 use bytes::Bytes;
 use chrono::Utc;
+use object_store::PutPayload;
 use rayon::prelude::*;
 
+use crate::storage::StorageError;
 use crate::superfile::builder::SuperfileBuilder;
+use crate::superfile::format::CRC_BYTES;
+use crate::superfile::format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr};
+use crate::superfile::format::vec::{
+    CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE, SUB_HEADER_SIZE, U32_BYTES,
+    dir_entry, outer_hdr, sub_hdr,
+};
+use crate::superfile::format::{footer::read_kv_metadata, kv};
+use crate::supertable::manifest::ManifestPartLoader;
+use crate::supertable::manifest::commit as commit_mod;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
+use crate::supertable::manifest::commit::read_pointer;
+use crate::supertable::manifest::list as list_mod;
+use crate::supertable::manifest::list::ManifestListEntry;
+use crate::supertable::manifest::list::{
+    FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
+};
+use crate::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
+use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
+use crate::supertable::manifest::{Manifest, SuperfileList};
 
 use super::build::fanout_shards;
 use super::error::BuildError;
@@ -1076,7 +1097,6 @@ fn build_one_shard(
 /// if the bytes don't parse — that path falls back to the
 /// 2-RTT cold open shape rather than failing the publish.
 pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
-    use crate::superfile::format::{footer::read_kv_metadata, kv};
     let kvs = read_kv_metadata(bytes).ok()?;
     let get = |k: &str| -> Option<u64> { kvs.get(k).and_then(|s| s.parse::<u64>().ok()) };
     let vec = match (get(kv::VEC_OFFSET), get(kv::VEC_LENGTH)) {
@@ -1157,11 +1177,6 @@ fn build_open_blob(
 }
 
 fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
-    use crate::superfile::format::CRC_BYTES;
-    use crate::superfile::format::vec::{
-        CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE, SUB_HEADER_SIZE, U32_BYTES,
-        U64_BYTES, dir_entry, outer_hdr, sub_hdr,
-    };
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
@@ -1238,7 +1253,6 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
 }
 
 fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
-    use crate::superfile::format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr};
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
@@ -1623,9 +1637,6 @@ pub(in crate::supertable) fn persist_commit(
     new_entries: Vec<Arc<SuperfileEntry>>,
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
 ) -> Result<crate::supertable::Manifest, crate::supertable::CommitError> {
-    use crate::supertable::Manifest;
-    use crate::supertable::manifest::ManifestPartLoader;
-
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
 
@@ -1740,15 +1751,6 @@ async fn try_commit_attempt(
     new_manifest_id: u64,
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
 ) -> Result<crate::supertable::manifest::list::ManifestList, crate::supertable::CommitError> {
-    use crate::storage::StorageError;
-    use crate::supertable::manifest::commit::{self as commit_mod};
-    use crate::supertable::manifest::list::{
-        FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
-    };
-    use crate::supertable::manifest::part::{self as part_mod, ManifestPart, PartId};
-    use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
-    use std::collections::{BTreeMap, HashMap, HashSet};
-
     // 1. Write each new segment's bytes to storage in parallel.
     //
     // Swallow `PreconditionFailed` per-PUT: on a retry after a
@@ -1985,9 +1987,6 @@ fn build_part_and_entry(
     ),
     crate::supertable::CommitError,
 > {
-    use crate::supertable::manifest::commit as commit_mod;
-    use crate::supertable::manifest::list::ManifestListEntry;
-    use crate::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
     let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
 
     let part = ManifestPart {
@@ -2036,11 +2035,6 @@ async fn refresh_inner_state_async(
     inner: &SupertableInner,
     storage: &Arc<dyn crate::storage::StorageProvider>,
 ) -> Result<(), crate::supertable::CommitError> {
-    use crate::supertable::manifest::ManifestPartLoader;
-    use crate::supertable::manifest::commit::read_pointer;
-    use crate::supertable::manifest::list as list_mod;
-    use crate::supertable::manifest::{Manifest, SuperfileList};
-
     let pointer = match read_pointer(storage.as_ref()).await? {
         Some(p) => p,
         // No pointer yet means nobody has committed; our next
@@ -2131,7 +2125,6 @@ async fn refresh_inner_state_async(
 /// by a finish marker. The recovery / append-phase reader
 /// decodes the same way.
 fn encode_record_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Bytes, String> {
-    use arrow::ipc::writer::StreamWriter;
     let mut out: Vec<u8> = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut out, &batch.schema())
@@ -2170,9 +2163,6 @@ async fn put_segment_multipart(
     path: &str,
     bytes: Bytes,
 ) -> Result<(), crate::storage::StorageError> {
-    use crate::storage::StorageError;
-    use object_store::PutPayload;
-
     const PART_BYTES: usize = 8 * (1 << 20);
 
     // Same-bytes retry skip. Failures other than NotFound
@@ -2261,14 +2251,17 @@ mod tests {
 
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use figment::Figment;
+    use figment::providers::{Format, Yaml};
     use rayon::ThreadPoolBuilder;
 
     use crate::superfile::builder::FtsConfig;
     use crate::superfile::builder::VectorConfig;
-
+    use crate::superfile::fts::reader::BoolMode;
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::SupertableOptions;
     use crate::supertable::handle::Supertable;
+    use crate::test_helpers::default_tokenizer as tok;
 
     fn schema_id_title() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -2291,8 +2284,6 @@ mod tests {
             Field::new("emb", fixed_list_f32(dim), false),
         ]))
     }
-
-    use crate::test_helpers::default_tokenizer as tok;
 
     fn options_id_title() -> SupertableOptions {
         SupertableOptions::new(
@@ -2385,7 +2376,6 @@ mod tests {
     async fn segment_is_queryable_via_store() {
         // The published segment's bytes are in the store; we
         // can fetch a SuperfileReader and run bm25_search on it.
-        use crate::superfile::fts::reader::BoolMode;
 
         let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -2589,9 +2579,6 @@ mod tests {
 
     #[test]
     fn apply_config_with_fixed_writer_threads_emits_that_many_segments() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
-
         let yaml = r#"
 commit_threshold_size_mb: 1024
 supertable:
