@@ -83,6 +83,16 @@ const ITERS: usize = 100;
 const POOL_THREADS: usize = 8;
 /// Top-k for every timed query.
 const K: usize = 10;
+/// Disk-cache budget for the mmap-mode consumer — far above any
+/// fixture's index size so eviction never interferes with timing.
+const MMAP_CACHE_BUDGET_BYTES: u64 = 8 << 30;
+/// Upper bound on waiting for full mmap promotion of the mmap-mode
+/// consumer; generous because promotion downloads every segment.
+const WARM_PROMOTION_TIMEOUT: Duration = Duration::from_secs(600);
+/// Position of `minflt` in `/proc/<pid>/task/<tid>/stat`, counting
+/// fields after the `)` that closes `comm` (state ppid pgrp session
+/// tty tpgid flags **minflt** ...).
+const MINFLT_AFTER_PAREN: usize = 7;
 
 fn options_title_only() -> SupertableOptions {
     let pool = Arc::new(
@@ -136,10 +146,6 @@ fn build_batch(seg: usize, schema: Arc<Schema>) -> RecordBatch {
 fn mmap_mode() -> bool {
     std::env::var("FLOOR_MMAP").is_ok_and(|v| v == "1")
 }
-
-/// Disk-cache budget for the mmap-mode consumer — far above any
-/// fixture's index size so eviction never interferes with timing.
-const MMAP_CACHE_BUDGET_BYTES: u64 = 8 << 30;
 
 fn build_supertable() -> (Supertable, Vec<TempDir>) {
     if !mmap_mode() {
@@ -195,7 +201,7 @@ fn build_supertable() -> (Supertable, Vec<TempDir>) {
         .bm25_hits("title", "common", K, BoolMode::Or)
         .expect("prewarm");
     consumer
-        .wait_until_warm(Duration::from_secs(600))
+        .wait_until_warm(WARM_PROMOTION_TIMEOUT)
         .expect("mmap promotion");
     (consumer, vec![store_dir, cache_dir])
 }
@@ -245,11 +251,6 @@ fn p50(samples: &mut [Duration]) -> Duration {
     samples.sort_unstable();
     samples[(samples.len() - 1) / 2]
 }
-
-/// Position of `minflt` in `/proc/self/stat`, counting fields after
-/// the `)` that closes `comm` (state ppid pgrp session tty tpgid
-/// flags **minflt** ...).
-const MINFLT_AFTER_PAREN: usize = 7;
 
 /// Process-wide minor page faults, summed over every live thread's
 /// `/proc/self/task/<tid>/stat`. `/proc/self/stat` alone counts only

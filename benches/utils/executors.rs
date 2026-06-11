@@ -264,6 +264,29 @@ pub mod fts {
         ) -> usize;
     }
 
+    /// Fetch-phase measurement for a raw superfile reader: kernel hits,
+    /// then materialize the searched column for the top-k rows. Shared
+    /// by the warm reader impl and the cold guard so the two tiers of
+    /// the superfile battery measure the identical operation.
+    pub fn superfile_rows_fetched(
+        reader: &SuperfileReader,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: InfinoBoolMode,
+    ) -> usize {
+        let hits = crate::tiers::block_on(reader.bm25_hits_async(column, query, k, mode))
+            .expect("superfile bm25_search");
+        if hits.is_empty() {
+            return 0;
+        }
+        let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
+        reader
+            .take_by_local_doc_ids(&locals, &[column])
+            .expect("superfile take rows")
+            .num_rows()
+    }
+
     impl FtsRead for SuperfileReader {
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize {
             crate::tiers::block_on(self.bm25_hits_async(column, query, k, mode))
@@ -278,15 +301,7 @@ pub mod fts {
             k: usize,
             mode: InfinoBoolMode,
         ) -> usize {
-            let hits = crate::tiers::block_on(self.bm25_hits_async(column, query, k, mode))
-                .expect("superfile bm25_search");
-            if hits.is_empty() {
-                return 0;
-            }
-            let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
-            self.take_by_local_doc_ids(&locals, &[column])
-                .expect("superfile take rows")
-                .num_rows()
+            superfile_rows_fetched(self, column, query, k, mode)
         }
     }
 

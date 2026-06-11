@@ -444,20 +444,7 @@ pub mod fts {
             k: usize,
             mode: InfinoBoolMode,
         ) -> usize {
-            let hits = tiers::block_on(async {
-                self.reader
-                    .bm25_hits_async(column, query, k, mode)
-                    .await
-                    .expect("cold bm25")
-            });
-            if hits.is_empty() {
-                return 0;
-            }
-            let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
-            self.reader
-                .take_by_local_doc_ids(&locals, &[column])
-                .expect("cold take rows")
-                .num_rows()
+            exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
         }
     }
 

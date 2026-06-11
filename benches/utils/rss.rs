@@ -215,13 +215,12 @@ pub fn log_rss_breakdown(label: &str) {
     // Everything resident that is neither anonymous heap nor shmem is
     // file-backed: mmap'd disk-cache segments, corpus files, binaries.
     let file_backed = rss.saturating_sub(anon).saturating_sub(shmem);
-    const KIB: u64 = 1024;
     eprintln!(
         "[rss-breakdown] {label}: rss={} anonymous={} file_backed={} shmem={}",
-        fmt_bytes(rss * KIB),
-        fmt_bytes(anon * KIB),
-        fmt_bytes(file_backed * KIB),
-        fmt_bytes(shmem * KIB),
+        fmt_bytes(rss * KIB_TO_BYTES),
+        fmt_bytes(anon * KIB_TO_BYTES),
+        fmt_bytes(file_backed * KIB_TO_BYTES),
+        fmt_bytes(shmem * KIB_TO_BYTES),
     );
 }
 

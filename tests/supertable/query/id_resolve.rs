@@ -32,6 +32,11 @@ const DOCS_PER_COMMIT: usize = 512;
 const POOL_THREADS: usize = 4;
 /// Top-k large enough to span multiple segments.
 const K: usize = 32;
+/// Doc index whose unique `token{:06}` the single-hit probe queries.
+const PROBE_DOC: usize = 7;
+/// Top-k for the single-hit probe — anything ≥ 1 works; small keeps
+/// the assertion focused on identity, not ranking.
+const PROBE_K: usize = 5;
 
 fn options_title_only() -> SupertableOptions {
     let pool = Arc::new(
@@ -140,14 +145,15 @@ fn bare_projection_ids_match_id_page_read_path() {
 
     // Unique-token probe: exactly one hit, deterministic identity on
     // both paths.
+    let probe_token = format!("token{PROBE_DOC:06}");
     let bare_one = reader
-        .bm25_search("title", "token000007", 5, BoolMode::Or, None)
+        .bm25_search("title", &probe_token, PROBE_K, BoolMode::Or, None)
         .expect("bare unique");
     let proj_one = reader
         .bm25_search(
             "title",
-            "token000007",
-            5,
+            &probe_token,
+            PROBE_K,
             BoolMode::Or,
             Some(&["_id", "title", "score"]),
         )
