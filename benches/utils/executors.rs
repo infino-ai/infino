@@ -1060,7 +1060,6 @@ pub mod vector {
     /// already-warm reader both correctness and warm timing run against;
     /// `open_cold` yields a fresh cold reader per cold iteration.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn run_search<R: VectorRead, G: VectorRead>(
         report: &mut Report,
         warm_reader: &R,
