@@ -220,14 +220,6 @@ impl WalStore {
 
     /// Return the [`uuid::Uuid`]s of every superfile that currently
     /// has a tombstone sidecar on storage (`superfiles/<id>.tombstones`).
-    ///
-    /// One LIST call against the `superfiles/` prefix; filenames that
-    /// don't parse as `<uuid>.tombstones` are silently skipped. The
-    /// result is unordered.
-    ///
-    /// Used by the compaction path to avoid issuing a GET per segment
-    /// just to check for a sidecar: the compactor lists once, then only
-    /// fetches sidecars for the superfiles in this set.
     pub async fn list_tombstone_ids(&self) -> Result<Vec<uuid::Uuid>, WalStoreError> {
         let uris = self
             .storage
