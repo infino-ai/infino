@@ -384,7 +384,10 @@ fn build_or_open(
     modality: Modality,
     phases: Phases,
 ) -> (supertable::IngestResult, Option<ShapeMetrics>) {
-    if crate::dataset::dataset_mode() {
+    // Dataset mode opens the pre-uploaded dataset only for read phases; a
+    // build phase is the prepare step, which still ingests (to the fixed
+    // prefix).
+    if crate::dataset::dataset_mode() && !phases.build {
         return (supertable::open_dataset(modality), None);
     }
     // Corpus to disk + mmap BEFORE the sampler — engine-only window.
@@ -621,7 +624,7 @@ pub mod vector {
         // so dataset mode regenerates it too (skipping only the ingest).
         let corpus = supertable::prepare_corpus(Modality::Vector);
         let mut report = Report::load("supertable_vector");
-        let (built, ingest_metrics) = if crate::dataset::dataset_mode() {
+        let (built, ingest_metrics) = if crate::dataset::dataset_mode() && !phases.build {
             (supertable::open_dataset(Modality::Vector), None)
         } else {
             build_measured(Modality::Vector, &corpus, phases)
