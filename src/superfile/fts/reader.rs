@@ -2497,18 +2497,13 @@ impl TermMeta {
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
-        // +1 quantization step: files written before the builder
-        // switched to round-up encoding truncated the fixed-point
-        // value, so the stored field can sit one step BELOW the true
-        // block max — not an upper bound. Compensating here makes the
-        // recovered value a true upper bound for old and new files
-        // alike; the cost is at most one needless block decode per
-        // 1e-3 of score slack.
+        // The builder ceil()s on encode, so the stored fixed-point
+        // value is a true upper bound on the block's BM25 — decode is
+        // a plain unscale.
         (
             last_doc_id,
             block_offset,
-            (max_bm25_x1000.saturating_add(1) as f32)
-                / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            max_bm25_x1000 as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
         )
     }
 
