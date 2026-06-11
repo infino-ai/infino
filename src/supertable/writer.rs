@@ -1202,9 +1202,16 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
         if centroids_off < SUB_HEADER_SIZE || cluster_idx_end > subsection_len {
             return None;
         }
+        // Stage only [cluster_idx .. cluster_idx_end]. The fp32 centroids that
+        // precede it are read solely by the rare fallback per-segment `nprobe`
+        // path (segments lacking a manifest cluster summary), which range-GETs
+        // them from the superfile on demand — they remain on disk. The hot
+        // cluster-probe path reads only `cluster_idx`, so keeping centroids out
+        // of the open_blob makes the manifest-inline open footprint independent
+        // of `n_cent` (centroids are ~99% of it at high `n_cent`).
         ranges.push((
-            off + subsection_off as u64 + centroids_off as u64,
-            (cluster_idx_end - centroids_off) as u64,
+            off + subsection_off as u64 + cluster_idx_off as u64,
+            (cluster_idx_end - cluster_idx_off) as u64,
         ));
         if codec_meta_size > 0 {
             let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
