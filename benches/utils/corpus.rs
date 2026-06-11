@@ -637,16 +637,77 @@ pub fn brute_force_topk_cosine(
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
-/// Brute-force top-k per query for a whole batch.
+/// Docs per parallel work unit in the transposed ground-truth pass —
+/// big enough to amortize per-chunk heap setup, small enough to
+/// load-balance the tail across the rayon pool.
+const GT_DOC_CHUNK: usize = 8192;
+
+/// Brute-force exact top-k for a whole query batch in ONE streaming
+/// pass over the corpus.
+///
+/// The loop is transposed (doc-major): every doc's vector is scored
+/// against all queries while its bytes are hot, with one bounded
+/// top-k list per query. At bench scale the corpus is an mmap many
+/// times larger than RAM, so the naive per-query loop costs
+/// O(queries × corpus_bytes) of page traffic — 7.7 TB of reads for
+/// 100 queries over a 50M×384 corpus, hours of wall time. The
+/// transpose makes it O(corpus_bytes) total, regardless of batch
+/// size. Ties break toward the lower doc id (the per-query reference
+/// kernel leaves tie order unspecified); equality with the reference
+/// is pinned by `transposed_ground_truth_matches_reference`.
 pub fn ground_truth(
     vectors: &[f32],
     n_docs: usize,
     queries: &[Vec<f32>],
     k: usize,
 ) -> Vec<Vec<u32>> {
-    queries
-        .iter()
-        .map(|q| brute_force_topk_cosine(vectors, n_docs, q, k))
+    use rayon::prelude::*;
+
+    assert_eq!(vectors.len(), n_docs * DIM);
+    if queries.is_empty() || n_docs == 0 || k == 0 {
+        return vec![Vec::new(); queries.len()];
+    }
+
+    // Per-query candidate lists sorted ascending by (neg_dot, id) —
+    // best first, worst last, at most k entries.
+    let better = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+    let merge = |mut acc: Vec<Vec<(f32, u32)>>, part: Vec<Vec<(f32, u32)>>| {
+        for (a, p) in acc.iter_mut().zip(part) {
+            a.extend(p);
+            a.sort_unstable_by(better);
+            a.truncate(k);
+        }
+        acc
+    };
+
+    vectors
+        .par_chunks(GT_DOC_CHUNK * DIM)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let base = (chunk_idx * GT_DOC_CHUNK) as u32;
+            let mut tops: Vec<Vec<(f32, u32)>> = vec![Vec::with_capacity(k + 1); queries.len()];
+            for (j, doc) in chunk.chunks_exact(DIM).enumerate() {
+                let id = base + j as u32;
+                for (top, q) in tops.iter_mut().zip(queries) {
+                    let mut dot = 0f32;
+                    for d in 0..DIM {
+                        dot += doc[d] * q[d];
+                    }
+                    let cand = (-dot, id);
+                    if top.len() == k && better(&cand, top.last().expect("non-empty at k")).is_ge()
+                    {
+                        continue;
+                    }
+                    let pos = top.partition_point(|e| better(e, &cand).is_lt());
+                    top.insert(pos, cand);
+                    top.truncate(k);
+                }
+            }
+            tops
+        })
+        .reduce(|| vec![Vec::new(); queries.len()], merge)
+        .into_iter()
+        .map(|top| top.into_iter().map(|(_, id)| id).collect())
         .collect()
 }
 
@@ -994,4 +1055,41 @@ pub fn build_superfile_with_metric(
 /// Open a finished superfile blob.
 pub fn open_superfile(bytes: Vec<u8>) -> SuperfileReader {
     SuperfileReader::open(Bytes::from(bytes)).expect("open superfile")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Corpus size for the oracle-equivalence test — a few parallel
+    /// chunks' worth so the chunked/merged path is exercised.
+    const GT_TEST_DOCS: usize = 3 * GT_DOC_CHUNK + 17;
+    /// Query batch size for the oracle-equivalence test.
+    const GT_TEST_QUERIES: usize = 7;
+    /// Top-k for the oracle-equivalence test.
+    const GT_TEST_K: usize = 10;
+    /// Seed for the test's corpus + queries.
+    const GT_TEST_SEED: u64 = 42;
+
+    #[test]
+    fn transposed_ground_truth_matches_reference() {
+        use rand::prelude::*;
+        let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
+        let mut vectors = vec![0f32; GT_TEST_DOCS * DIM];
+        for v in vectors.iter_mut() {
+            *v = rng.random::<f32>() - 0.5;
+        }
+        let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
+            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+
+        let transposed = ground_truth(&vectors, GT_TEST_DOCS, &queries, GT_TEST_K);
+        for (q, got) in queries.iter().zip(&transposed) {
+            let reference = brute_force_topk_cosine(&vectors, GT_TEST_DOCS, q, GT_TEST_K);
+            assert_eq!(
+                got, &reference,
+                "transposed oracle diverged from the per-query reference"
+            );
+        }
+    }
 }

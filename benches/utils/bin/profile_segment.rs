@@ -97,7 +97,7 @@ fn main() {
 
     // Warm the reader (touch pages, settle the allocator) before timing.
     for q in &queries {
-        let _ = futures::executor::block_on(reader.vector_search(
+        let _ = futures::executor::block_on(reader.vector_hits_async(
             "emb",
             q,
             TOP_K,
@@ -131,7 +131,7 @@ fn main() {
         let mut recall_sum = 0.0f64;
         for (qi, q) in queries.iter().enumerate() {
             let t = Instant::now();
-            let hits = futures::executor::block_on(reader.vector_search(
+            let hits = futures::executor::block_on(reader.vector_hits_async(
                 "emb",
                 q,
                 TOP_K,
