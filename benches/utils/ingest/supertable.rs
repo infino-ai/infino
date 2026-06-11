@@ -286,8 +286,15 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         if let Some(vectors) = &corpus.vectors {
             vectors.advise_consumed(start, len);
         }
+        // Anonymous-vs-file split per commit: a monotonic anonymous
+        // climb = producer-side retention (heap); a file-backed climb
+        // = freshly written cache mmaps staying resident.
+        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx.is_multiple_of(4) {
+            crate::rss::log_rss_breakdown(&format!("ingest commit {commit_idx}"));
+        }
     }
     drop(w);
+    crate::rss::log_rss_breakdown("ingest writer dropped");
     let reader = st.reader();
     let n_superfiles = reader.n_superfiles();
     let total_index_bytes: u64 = reader

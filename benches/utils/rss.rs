@@ -189,6 +189,42 @@ impl PeakSampler {
 /// Format a byte count as a right-justified human string —
 /// `"12.34 GiB"` / `"456.78 MiB"` / `"123.4 KiB"` — for the
 /// bench markdown tables.
+/// Log the anonymous-vs-file-backed RSS split from
+/// `/proc/self/smaps_rollup` with a phase label. The split is the
+/// discriminator for RSS investigations: anonymous = heap (allocator
+/// slack, retained `Bytes`, builder state); file-backed = mmap'd
+/// cache files (disk-cache segments, corpus files). Purges the
+/// allocator first so retained-but-free heap doesn't masquerade as a
+/// live working set.
+pub fn log_rss_breakdown(label: &str) {
+    purge_allocator();
+    let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
+        return;
+    };
+    let kb = |key: &str| -> u64 {
+        rollup
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let rss = kb("Rss:");
+    let anon = kb("Anonymous:");
+    let shmem = kb("Shmem:");
+    // Everything resident that is neither anonymous heap nor shmem is
+    // file-backed: mmap'd disk-cache segments, corpus files, binaries.
+    let file_backed = rss.saturating_sub(anon).saturating_sub(shmem);
+    const KIB: u64 = 1024;
+    eprintln!(
+        "[rss-breakdown] {label}: rss={} anonymous={} file_backed={} shmem={}",
+        fmt_bytes(rss * KIB),
+        fmt_bytes(anon * KIB),
+        fmt_bytes(file_backed * KIB),
+        fmt_bytes(shmem * KIB),
+    );
+}
+
 pub fn fmt_bytes(b: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;

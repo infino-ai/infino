@@ -493,6 +493,12 @@ pub mod fts {
         eprintln!(
             "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
         );
+        // Phase-boundary RSS splits (anonymous heap vs mmap'd files):
+        // the discriminator for "where do the warm-phase GiBs live" —
+        // ingest leftovers show up as anonymous bloat already present
+        // before the consumer opens; promotion double-residency shows
+        // up as anonymous ≈ file_backed after warm-up.
+        crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
         let first = &FTS_BATTERY[0];
@@ -509,6 +515,7 @@ pub mod fts {
         consumer
             .wait_until_warm(Duration::from_secs(600))
             .expect("supertable warm promotion");
+        crate::rss::log_rss_breakdown("supertable_fts after wait_until_warm");
         eprintln!(
             "[supertable_fts] warm: cache hot — timing {} queries × {WARM_ITERS} iters via bm25_search...",
             FTS_BATTERY.len(),
@@ -521,6 +528,7 @@ pub mod fts {
             WARM_ITERS,
             "supertable_fts",
         );
+        crate::rss::log_rss_breakdown("supertable_fts after warm battery");
         drop(consumer);
         drop(cache_dir);
         out
