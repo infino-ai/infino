@@ -135,10 +135,9 @@ A search TVF (`bm25_search('posts', 'body', 'alice', 10)`) can stand in
 for either side of the join, so keyword/vector results compose with the
 rest of the catalog the same way.
 
-## Search is an access path, not just an API
+## Hybrid Search
 
-In most engines, search ends at top-k: run BM25, run ANN, fuse, return.
-Infino also wires the same indexes into SQL execution as **physical
+Infino also wires indexes into SQL execution as **physical
 access paths**:
 
 ```sql
@@ -159,8 +158,8 @@ shared layer.
 
 Retrieval composes the same way. The ranked `bm25_search` /
 `vector_search` / `hybrid_search` and the unranked `token_match` /
-`exact_match` are table functions — relations, not endpoints — so a
-candidate set is the *first stage of a plan* rather than its result:
+`exact_match` are table functions so a candidate set is the 
+*first stage of a plan* rather than its result:
 
 ```sql
 -- Rank first; join and aggregate over just the candidates.
