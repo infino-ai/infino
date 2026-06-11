@@ -54,10 +54,10 @@ const hits = docs.tokenMatch("title", "fox");            // unranked matching ro
 const sql  = db.querySql("SELECT _id, title FROM docs"); // records (or { arrow: true })
 ```
 
-The Node.js bindings (napi-rs) live in
+The Node.js bindings live in
 [`infino-node/`](infino-node/) — see its README to build and test. The
-API is synchronous and Node-idiomatic: objects in, plain records out;
-`_id` comes back as a JavaScript `bigint`.
+API is synchronous: objects in, plain records out; `_id` comes back as a
+JavaScript `bigint`.
 
 ## Quick example in Rust
 

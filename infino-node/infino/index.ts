@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// Friendly, Node-idiomatic API over the raw napi addon (./native.js).
-//
-// The addon traffics in Arrow IPC `Buffer`s; this layer hides that. You
-// pass arrays of plain objects (or apache-arrow Tables / RecordBatches)
-// in, and get arrays of plain records out — mirroring LanceDB /
-// nodejs-polars (and the Python binding). Pass `{ arrow: true }` to a
-// search/query to get an apache-arrow `Table` instead of records.
+// Public Node.js API for infino. Pass arrays of objects (or apache-arrow
+// Tables) in; get plain records out. `{ arrow: true }` on a search or
+// query returns an apache-arrow `Table` instead of records.
 
 import * as arrow from "apache-arrow";
 import { connect as nativeConnect, IndexSpec } from "./native.js";
@@ -63,12 +59,10 @@ export interface QueryOptions {
 
 // --- Arrow <-> IPC helpers (the boundary this layer hides) ---
 
-// Build an arrow type in OUR instance from a foreign-instance type. We
-// cannot reuse the consumer's type objects directly: when apache-arrow is
-// loaded as two module instances (its ESM build for the consumer, our CJS
-// require — the "dual-package hazard"), our `makeData` can't dispatch on a
-// foreign type. The numeric `typeId` *is* readable across instances, so we
-// rebuild the type natively from it.
+// Rebuild an arrow type in our instance from the consumer's type. When
+// apache-arrow is loaded as two module instances, our `makeData` can't
+// dispatch on the consumer's type object, but its numeric `typeId` reads
+// across instances.
 function nativeTypeFromForeign(t: any): arrow.DataType {
   switch (t.typeId) {
     case arrow.Type.Utf8: return new arrow.Utf8();
