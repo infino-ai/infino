@@ -218,6 +218,43 @@ impl WalStore {
         Ok(out)
     }
 
+    /// Return the [`uuid::Uuid`]s of every superfile that currently
+    /// has a tombstone sidecar on storage (`superfiles/<id>.tombstones`).
+    ///
+    /// One LIST call against the `superfiles/` prefix; filenames that
+    /// don't parse as `<uuid>.tombstones` are silently skipped. The
+    /// result is unordered.
+    ///
+    /// Used by the compaction path to avoid issuing a GET per segment
+    /// just to check for a sidecar: the compactor lists once, then only
+    /// fetches sidecars for the superfiles in this set.
+    pub async fn list_tombstone_ids(&self) -> Result<Vec<uuid::Uuid>, WalStoreError> {
+        let uris = self
+            .storage
+            .list_with_prefix(SUPERFILES_DIR)
+            .await
+            .map_err(|source| WalStoreError::Storage {
+                path: SUPERFILES_DIR.into(),
+                source,
+            })?;
+        let suffix = format!(".{TOMBSTONES_EXT}");
+        let mut out = Vec::new();
+        for uri in uris {
+            let filename = match uri.rsplit_once('/') {
+                Some((_, fname)) => fname,
+                None => uri.as_str(),
+            };
+            let Some(stem) = filename.strip_suffix(&suffix) else {
+                continue;
+            };
+            let Ok(id) = uuid::Uuid::parse_str(stem) else {
+                continue;
+            };
+            out.push(id);
+        }
+        Ok(out)
+    }
+
     /// Write a brand-new WAL state doc atomically. Fails with
     /// `AlreadyExists` if the `wal_id`'s path is occupied —
     /// which is how a `wal_id` collision surfaces. Probability
