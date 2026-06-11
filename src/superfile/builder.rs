@@ -192,6 +192,16 @@ pub struct BuilderOptions {
     /// cost. Compression stays on; the only cost is a few extra
     /// page headers + offset-index entries for the id column.
     pub id_page_size_limit: usize,
+    /// Parquet data-page size limit (uncompressed bytes) for every
+    /// other data column. Same point-lookup rationale as
+    /// `id_page_size_limit`: search hits resolve k≈10 rows, and the
+    /// page is parquet's decode unit, so a default-size (1 MiB) page
+    /// makes each materialized hit decode tens of thousands of
+    /// values it doesn't need — measured at ~1.27 ms per hit on a
+    /// 40K-row segment's string column vs ~15 µs for the search
+    /// itself. Scans pay only the extra page headers (~0.1% of
+    /// chunk bytes at this default).
+    pub data_page_size_limit: usize,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -199,6 +209,17 @@ pub struct BuilderOptions {
 /// ~512 rows/page, vs the ~65 536-row single page a default
 /// (1 MiB) limit produces for a full row group.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
+
+/// Default data-page size limit for non-id columns (uncompressed
+/// bytes) — parquet's own default. Measured on the fanout-floor
+/// fixture (320K-doc segments, k=10): shrinking this to 32 KiB did
+/// NOT fix full-row resolve (1.27 ms → 1.19 ms) and regressed the
+/// `[_id, score]` path 8× (65 µs → 523 µs) — per-hit resolve cost is
+/// dominated by work that scales with page COUNT (selection planning
+/// / offset-index walks), not by page decode volume. Kept as an
+/// explicit knob for experiments; don't lower the default without a
+/// profile showing the planning cost is gone.
+pub const DEFAULT_DATA_PAGE_SIZE_LIMIT: usize = 1024 * 1024;
 
 impl BuilderOptions {
     /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
@@ -229,6 +250,7 @@ impl BuilderOptions {
                     .expect("zstd level 3 is in the valid 1..=22 range"),
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
+            data_page_size_limit: DEFAULT_DATA_PAGE_SIZE_LIMIT,
         }
     }
 
@@ -728,6 +750,7 @@ impl SuperfileBuilder {
                 &self.batches,
                 self.opts.compression,
                 self.opts.row_group_size,
+                self.opts.data_page_size_limit,
                 &id_page_limit,
             )
         };
