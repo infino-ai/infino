@@ -591,7 +591,6 @@ fn fresh_disk_cache_with_mode(
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: false,
-        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
     (dir, cache)
