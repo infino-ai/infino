@@ -86,15 +86,27 @@ impl Diagnostic {
     }
 }
 
+impl Tier {
+    fn token(self) -> &'static str {
+        match self {
+            Tier::Superfile => "superfile",
+            Tier::Supertable => "supertable",
+        }
+    }
+}
+
+impl Modality {
+    fn token(self) -> &'static str {
+        match self {
+            Modality::Fts => "fts",
+            Modality::Vector => "vector",
+            Modality::Sql => "sql",
+        }
+    }
+}
+
 fn run_cell(tier: Tier, modality: Modality, phases: Phases) {
-    let label = match (tier, modality) {
-        (Tier::Superfile, Modality::Fts) => "superfile_fts",
-        (Tier::Superfile, Modality::Vector) => "superfile_vector",
-        (Tier::Superfile, Modality::Sql) => "superfile_sql",
-        (Tier::Supertable, Modality::Fts) => "supertable_fts",
-        (Tier::Supertable, Modality::Vector) => "supertable_vector",
-        (Tier::Supertable, Modality::Sql) => "supertable_sql",
-    };
+    let label = format!("{}_{}", tier.token(), modality.token());
     eprintln!(
         "[bench] === {label} (build={}, warm={}, cold={}) ===",
         phases.build, phases.warm, phases.cold
@@ -106,6 +118,43 @@ fn run_cell(tier: Tier, modality: Modality, phases: Phases) {
         (Tier::Supertable, Modality::Fts) => infino_bench_utils::supertable::fts::run(phases),
         (Tier::Supertable, Modality::Vector) => infino_bench_utils::supertable::vector::run(phases),
         (Tier::Supertable, Modality::Sql) => infino_bench_utils::supertable::sql::run(phases),
+    }
+}
+
+/// Run one cell in a fresh child process (re-exec of this binary with
+/// exactly that cell's selectors). Multi-cell runs MUST isolate cells:
+/// RSS is per-process, and a cell that runs after another inherits its
+/// predecessors' residue — measured at 1M docs, the supertable FTS
+/// cell reported ~9 GiB when run after the three superfile cells vs
+/// ~1.1 GiB in a process of its own. Allocator purges don't fully
+/// return that residue; a process boundary does, by construction.
+///
+/// Stdio is inherited so logs and README updates behave exactly as
+/// inline; the per-cell report JSON is written by the child. Fails
+/// fast on a non-zero child exit.
+fn run_cell_in_child(tier: Tier, modality: Modality, phases: Phases, phase_selected: bool) {
+    let exe = std::env::current_exe().expect("bench binary path");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(tier.token()).arg(modality.token());
+    if phase_selected {
+        if phases.build {
+            cmd.arg("build");
+        }
+        if phases.warm {
+            cmd.arg("warm");
+        }
+        if phases.cold {
+            cmd.arg("cold");
+        }
+    }
+    let status = cmd.status().expect("spawn bench cell child");
+    if !status.success() {
+        eprintln!(
+            "[bench] cell {}_{} failed with {status}",
+            tier.token(),
+            modality.token()
+        );
+        std::process::exit(status.code().unwrap_or(1));
     }
 }
 
@@ -286,9 +335,17 @@ fn main() {
         sel.modalities.clone()
     };
 
+    // A single selected cell runs inline (its process IS the
+    // isolation). Multi-cell runs fork one child per cell so each
+    // cell's RSS sampling starts from a clean process — see
+    // `run_cell_in_child`.
+    if tiers.len() * modalities.len() == 1 {
+        run_cell(tiers[0], modalities[0], sel.phases);
+        return;
+    }
     for tier in tiers {
         for &modality in &modalities {
-            run_cell(tier, modality, sel.phases);
+            run_cell_in_child(tier, modality, sel.phases, sel.phase_selected);
         }
     }
 }
