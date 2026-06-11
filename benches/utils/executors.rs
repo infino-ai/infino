@@ -573,6 +573,14 @@ pub mod vector {
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
     use crate::rss::{self, PeakSampler, RssStats};
 
+    /// Largest doc count that still runs the brute-force ground-truth
+    /// oracle (correctness gate + recall calibration). The oracle
+    /// scans the entire vector corpus per query batch, so its cost —
+    /// compute and corpus residency — scales linearly with n_docs and
+    /// dominates wall time well before 25M. Above this, runs measure
+    /// the default config only; recall acceptance at scale is the
+    /// `scale` diagnostic's job.
+    pub const GROUND_TRUTH_MAX_DOCS: usize = 1_000_000;
     /// Recall correctness gate (shared by both tiers).
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
     pub const CORRECTNESS_NPROBE: usize = 64;
@@ -911,9 +919,9 @@ pub mod vector {
         default_nprobe: usize,
         default_rerank: usize,
         q_correct: &[Vec<f32>],
-        gt_correct: &[Vec<u32>],
+        gt_correct: Option<&[Vec<u32>]>,
         q_cal: &[Vec<f32>],
-        gt_cal: &[Vec<u32>],
+        gt_cal: Option<&[Vec<u32>]>,
         include_warm: bool,
         include_cold: bool,
         cold_iters: usize,
@@ -922,35 +930,48 @@ pub mod vector {
         title: String,
         note: &str,
     ) {
-        eprintln!(
-            "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
-            q_correct.len(),
-        );
-        let recall = mean_recall(
-            warm_reader,
-            column,
-            q_correct,
-            gt_correct,
-            k,
-            CORRECTNESS_NPROBE,
-            CORRECTNESS_RERANK_MULT,
-        );
-        assert!(
-            recall >= CORRECTNESS_RECALL_FLOOR,
-            "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
-        );
-        eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
-
-        let cal: Vec<Option<Calibrated>> = RECALL_TARGETS
-            .iter()
-            .map(|&target| {
+        match gt_correct {
+            Some(gt_correct) => {
                 eprintln!(
-                    "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
-                    q_cal.len(),
+                    "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
+                    q_correct.len(),
                 );
-                calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
-            })
-            .collect();
+                let recall = mean_recall(
+                    warm_reader,
+                    column,
+                    q_correct,
+                    gt_correct,
+                    k,
+                    CORRECTNESS_NPROBE,
+                    CORRECTNESS_RERANK_MULT,
+                );
+                assert!(
+                    recall >= CORRECTNESS_RECALL_FLOOR,
+                    "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                );
+                eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+            }
+            None => eprintln!(
+                "[{log_prefix}] correctness + recall calibration skipped: \
+                 n_docs > {GROUND_TRUTH_MAX_DOCS} (brute-force oracle gated to small runs)"
+            ),
+        }
+
+        let cal: Vec<Option<Calibrated>> = match gt_cal {
+            Some(gt_cal) => RECALL_TARGETS
+                .iter()
+                .map(|&target| {
+                    eprintln!(
+                        "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
+                        q_cal.len(),
+                    );
+                    calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
+                })
+                .collect(),
+            // No oracle → no calibrated (p, r) rows; only the default
+            // config row below is measured.
+            None => vec![None; RECALL_TARGETS.len()],
+        };
 
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();

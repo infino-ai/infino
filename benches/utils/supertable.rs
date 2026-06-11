@@ -686,15 +686,16 @@ pub mod vector {
 
         if phases.warm || phases.cold {
             // The ingested vectors are still mmapped from the prepared
-            // corpus — reuse them for brute-force ground truth instead
-            // of regenerating 10M×384 floats.
-            eprintln!(
-                "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
-            );
+            // corpus — queries (and, on small runs, brute-force ground
+            // truth) come from them instead of a regeneration. The
+            // oracle is gated: above GROUND_TRUTH_MAX_DOCS the full-
+            // corpus scan per query batch dominates the run, so only
+            // the default-config row is measured.
             let vslice = corpus
                 .vectors()
                 .expect("vector modality prepared a vector corpus")
                 .as_slice();
+            let with_ground_truth = n_docs <= exec_vec::GROUND_TRUTH_MAX_DOCS;
             let q_correct = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -703,7 +704,6 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_correct = corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K);
             let q_cal = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -712,9 +712,20 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_cal = corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K);
-            // Ground truth extracted; free the corpus pages + temp file
-            // so the warm/cold samplers measure the engine only.
+            let (gt_correct, gt_cal) = if with_ground_truth {
+                eprintln!(
+                    "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
+                );
+                (
+                    Some(corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K)),
+                    Some(corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K)),
+                )
+            } else {
+                (None, None)
+            };
+            // Queries + ground truth extracted; free the corpus pages
+            // + temp file so the warm/cold samplers measure the engine
+            // only.
             drop(corpus);
 
             // One consumer drives correctness + calibration. Full cache
@@ -756,9 +767,9 @@ pub mod vector {
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,
                 &q_correct,
-                &gt_correct,
+                gt_correct.as_deref(),
                 &q_cal,
-                &gt_cal,
+                gt_cal.as_deref(),
                 phases.warm,
                 phases.cold,
                 COLD_ITERS,
