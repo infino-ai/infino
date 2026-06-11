@@ -168,8 +168,8 @@ Build path: `SuperfileBuilder` → unified `.parquet` (same as production supert
 
 | Build | Time | Throughput | Bandwidth | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 writer | 16.78 s (new) | 59.6 K/s (new) | 119.8 MB/s (new) | 5.78 GiB (new) | 3.75 GiB (new) | 4.87 GiB (new) |
-| 16 writers | 2.11 s (new) | 473.5 K/s (new) | 951.8 MB/s (new) | 7.91 GiB (new) | 7.06 GiB (new) | 7.62 GiB (new) |
+| 1 writer | 17.04 s (+1.5% ~) | 58.7 K/s (-1.5% ~) | 118.0 MB/s (-1.5% ~) | 5.79 GiB (+0.2% ~) | 3.78 GiB (+0.7% ~) | 4.81 GiB (-1.3% ~) |
+| 16 writers | 2.11 s (-0.1% ~) | 473.7 K/s (+0.1% ~) | 952.2 MB/s (+0.1% ~) | 8.01 GiB (+1.3% ~) | 7.21 GiB (+2.1% ~) | 7.64 GiB (+0.3% ~) |
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
@@ -183,33 +183,33 @@ Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet`
 
 | Query | warm | warm +fetch | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| single_rare | 9.69 µs (+1339.2% worse) | 10.78 ms (new) | 3.69 GiB (+1829.6% worse) | 3.69 GiB (+1829.9% worse) | 3.69 GiB (+1829.6% worse) | 184.21 ms (new) | 27.83 ms (new) |
-| single_df1 | 559 ns (+68.4% worse) | 17.31 ms (new) | 3.69 GiB (+1829.2% worse) | 3.69 GiB (+1829.2% worse) | 3.69 GiB (+1829.2% worse) | 166.25 ms (new) | 11.26 µs (new) |
-| single_common | 1.94 ms (+20514.4% worse) | 43.15 ms (new) | 3.69 GiB (+1829.6% worse) | 3.69 GiB (+1830.0% worse) | 3.69 GiB (+1829.6% worse) | 136.85 ms (new) | 44.49 ms (new) |
-| two_term_or | 262.06 µs (+2547.3% worse) | 41.10 ms (new) | 3.69 GiB (+1830.7% worse) | 3.69 GiB (+1830.7% worse) | 3.69 GiB (+1830.7% worse) | 183.26 ms (new) | 56.60 ms (new) |
-| three_wide_or | 2.53 ms (+11236.6% worse) | 49.63 ms (new) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 255.93 ms (new) | 84.83 ms (new) |
-| three_similar_or | 10.64 ms (+34021.4% worse) | 55.88 ms (new) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 245.21 ms (new) | 92.85 ms (new) |
-| five_term_or | 18.00 ms (+14930.0% worse) | 65.25 ms (new) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 291.98 ms (new) | 101.58 ms (new) |
-| ten_term_or | 52.83 ms (+15858.8% worse) | 99.47 ms (new) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 3.69 GiB (+1830.8% worse) | 192.65 ms (new) | 129.15 ms (new) |
+| single_rare | 6.28 µs (+571.9% worse) | 10.64 ms (+19.0% worse) | 3.67 GiB (+904.3% worse) | 3.67 GiB (+904.3% worse) | 3.67 GiB (+904.3% worse) | 164.60 ms (-10.6% better) | 28.27 ms (+1.6% ~) |
+| single_df1 | 623 ns (+76.5% worse) | 17.26 ms (+4989028.0% worse) | 3.68 GiB (+909.7% worse) | 3.68 GiB (+909.7% worse) | 3.68 GiB (+909.7% worse) | 189.65 ms (+14.1% worse) | 11.13 µs (-1.1% ~) |
+| single_common | 2.00 ms (+4951.9% worse) | 42.85 ms (+196.2% worse) | 3.68 GiB (+904.3% worse) | 3.68 GiB (+904.3% worse) | 3.68 GiB (+904.3% worse) | 171.75 ms (+25.5% worse) | 58.68 ms (+31.9% worse) |
+| two_term_or | 226.83 µs (+920.1% worse) | 40.82 ms (+155.0% worse) | 3.68 GiB (+906.0% worse) | 3.68 GiB (+906.0% worse) | 3.68 GiB (+906.0% worse) | 218.66 ms (+19.3% worse) | 57.07 ms (+0.8% ~) |
+| three_wide_or | 2.44 ms (+4285.9% worse) | 48.86 ms (+218.7% worse) | 3.68 GiB (+902.2% worse) | 3.68 GiB (+902.2% worse) | 3.68 GiB (+902.2% worse) | 190.61 ms (-25.5% better) | 58.79 ms (-30.7% better) |
+| three_similar_or | 10.36 ms (+4975.0% worse) | 55.02 ms (+278.0% worse) | 3.68 GiB (+901.2% worse) | 3.68 GiB (+901.2% worse) | 3.68 GiB (+901.2% worse) | 218.08 ms (-11.1% better) | 52.64 ms (-43.3% better) |
+| five_term_or | 17.77 ms (+3393.8% worse) | 64.40 ms (+305.3% worse) | 3.68 GiB (+901.1% worse) | 3.68 GiB (+901.1% worse) | 3.68 GiB (+901.1% worse) | 200.83 ms (-31.2% better) | 59.16 ms (-41.8% better) |
+| ten_term_or | 52.39 ms (+3453.8% worse) | 98.39 ms (+517.7% worse) | 3.68 GiB (+901.2% worse) | 3.68 GiB (+901.2% worse) | 3.68 GiB (+901.2% worse) | 204.48 ms (+6.1% worse) | 112.53 ms (-12.9% better) |
 
 **AND queries**
 
 | Query | warm | warm +fetch | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| two_term_and | 563.16 µs (+2843.4% worse) | 41.27 ms (new) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 218.88 ms (new) | 63.92 ms (new) |
-| three_wide_and | 4.36 ms (+41274.3% worse) | 51.11 ms (new) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 166.18 ms (new) | 60.71 ms (new) |
-| three_similar_and | 6.27 ms (+68734.9% worse) | 51.60 ms (new) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 133.44 ms (new) | 44.19 ms (new) |
-| five_term_and | 7.55 ms (+63093.1% worse) | 54.61 ms (new) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 3.70 GiB (+1831.9% worse) | 195.90 ms (new) | 71.95 ms (new) |
-| ten_term_and | 8.68 ms (+47771.7% worse) | 54.06 ms (new) | 3.70 GiB (+1832.9% worse) | 3.70 GiB (+1832.9% worse) | 3.70 GiB (+1832.9% worse) | 186.91 ms (new) | 70.11 ms (new) |
+| two_term_and | 523.26 µs (+587.3% worse) | 41.28 ms (+155.9% worse) | 3.69 GiB (+902.7% worse) | 3.69 GiB (+902.7% worse) | 3.69 GiB (+902.7% worse) | 222.91 ms (+1.8% ~) | 56.13 ms (-12.2% better) |
+| three_wide_and | 4.28 ms (+5460.9% worse) | 50.67 ms (+229.2% worse) | 3.69 GiB (+902.6% worse) | 3.69 GiB (+902.6% worse) | 3.69 GiB (+902.6% worse) | 191.48 ms (+15.2% worse) | 59.73 ms (-1.6% ~) |
+| three_similar_and | 6.09 ms (+6556.7% worse) | 50.77 ms (+253.1% worse) | 3.68 GiB (+901.5% worse) | 3.68 GiB (+901.5% worse) | 3.68 GiB (+901.5% worse) | 171.49 ms (+28.5% worse) | 55.71 ms (+26.1% worse) |
+| five_term_and | 7.49 ms (+6574.1% worse) | 54.07 ms (+252.7% worse) | 3.68 GiB (+901.5% worse) | 3.68 GiB (+901.5% worse) | 3.68 GiB (+901.5% worse) | 201.46 ms (+2.8% ~) | 71.01 ms (-1.3% ~) |
+| ten_term_and | 8.65 ms (+6255.5% worse) | 53.39 ms (+40411.9% worse) | 3.68 GiB (+906.9% worse) | 3.68 GiB (+906.9% worse) | 3.68 GiB (+906.9% worse) | 256.80 ms (+37.4% worse) | 93.38 ms (+33.2% worse) |
 
 **Per-algorithm probes (WAND+BMW vs MaxScore+BMM)**
 
 | Shape | WAND+BMW | MaxScore+BMM |
 | --- | --- | --- |
-| wide_3_or | 9.36 ms (+23817.1% worse) | 2.64 ms (+12493.9% worse) |
-| similar_3_or | 15.51 ms (+29395.5% worse) | 10.58 ms (+33858.9% worse) |
-| similar_5_or | 44.33 ms (+20151.9% worse) | 17.96 ms (+15427.6% worse) |
-| similar_10_or | 307.01 ms (+24679.0% worse) | 52.76 ms (+16138.8% worse) |
+| wide_3_or | 9.23 ms (+4018.3% worse) | 2.47 ms (+4459.1% worse) |
+| similar_3_or | 15.04 ms (+4955.3% worse) | 10.30 ms (+5284.1% worse) |
+| similar_5_or | 44.07 ms (+3900.9% worse) | 17.80 ms (+3415.0% worse) |
+| similar_10_or | 302.85 ms (+4488.4% worse) | 52.55 ms (+3420.0% worse) |
 <!-- END: bench/fts/superfile/search -->
 
 ### FTS — supertable (multi-segment, 1M docs, real S3)
@@ -223,7 +223,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 | Shape | Time | Throughput | Superfiles | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| FTS-only | 22.02 s (-89.1% better) | 45.4 K/s (-8.0% worse) | 256 | 9.14 GiB (+64.9% worse) | 8.99 GiB (+291.3% worse) | 9.06 GiB (+89.5% worse) |
+| FTS-only | 25.87 s (+10.7% worse) | 38.7 K/s (-9.6% worse) | 256 | 1.31 GiB (+4.4% worse) | 1.10 GiB (+0.2% ~) | 1.23 GiB (+3.5% worse) |
 <!-- END: bench/fts/supertable/ingest -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
@@ -237,24 +237,24 @@ Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per
 
 | Query | warm | warm +fetch | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| single_rare | 1.17 ms (-89.7% better) | 11.97 ms (new) | 8.94 GiB (+537.7% worse) | 8.92 GiB (+545.5% worse) | 8.94 GiB (+537.7% worse) | 423.71 ms (-37.3% better) | 125.47 ms (-88.5% better) |
-| single_df1 | 55.45 µs (-98.8% better) | 2.45 ms (new) | 8.88 GiB (+531.7% worse) | 8.87 GiB (+531.3% worse) | 8.88 GiB (+531.7% worse) | 424.92 ms (-37.4% better) | 15.26 ms (-95.0% better) |
-| single_common | 1.51 ms (-80.2% better) | 10.91 ms (new) | 8.96 GiB (+523.3% worse) | 8.95 GiB (+523.0% worse) | 8.96 GiB (+523.3% worse) | 417.34 ms (-34.3% better) | 386.04 ms (-69.1% better) |
-| two_term_or | 1.17 ms (-90.0% better) | 10.65 ms (new) | 8.96 GiB (+347.5% worse) | 8.95 GiB (+349.0% worse) | 8.96 GiB (+347.5% worse) | 424.43 ms (-36.9% better) | 238.64 ms (-78.6% better) |
-| three_wide_or | 1.53 ms (-89.8% better) | 11.57 ms (new) | 8.95 GiB (+336.7% worse) | 8.95 GiB (+349.5% worse) | 8.95 GiB (+336.7% worse) | 458.43 ms (-39.9% better) | 265.22 ms (-75.9% better) |
-| three_similar_or | 2.30 ms (-89.4% better) | 11.01 ms (new) | 8.95 GiB (+330.3% worse) | 8.95 GiB (+335.6% worse) | 8.95 GiB (+331.5% worse) | 535.91 ms (-6.9% better) | 331.15 ms (-71.9% better) |
-| five_term_or | 3.06 ms (-91.4% better) | 12.44 ms (new) | 8.95 GiB (+325.7% worse) | 8.95 GiB (+336.8% worse) | 8.95 GiB (+325.7% worse) | 508.54 ms (-36.7% better) | 387.59 ms (-64.0% better) |
-| ten_term_or | 8.24 ms (-90.1% better) | 17.01 ms (new) | 8.95 GiB (+326.5% worse) | 8.94 GiB (+331.6% worse) | 8.94 GiB (+326.4% worse) | 427.10 ms (-38.8% better) | 404.35 ms (-60.5% better) |
+| single_rare | 1.14 ms (+7.7% worse) | 8.93 ms (+0.2% ~) | 942.10 MiB (+0.5% ~) | 932.93 MiB (+0.2% ~) | 942.10 MiB (+0.5% ~) | 556.11 ms (+31.2% worse) | 272.69 ms (+117.3% worse) |
+| single_df1 | 55.22 µs (-88.7% better) | 2.65 ms (-8.0% better) | 906.39 MiB (-0.2% ~) | 904.30 MiB (+0.5% ~) | 906.39 MiB (-0.2% ~) | 436.74 ms (+2.8% ~) | 16.64 ms (+9.0% worse) |
+| single_common | 1.31 ms (+5.5% worse) | 10.55 ms (-0.6% ~) | 1.15 GiB (+5.6% worse) | 1.07 GiB (+8.4% worse) | 1.15 GiB (+5.6% worse) | 444.48 ms (+6.5% worse) | 360.95 ms (-6.5% better) |
+| two_term_or | 1.16 ms (+11.3% worse) | 10.54 ms (+2.0% ~) | 1.22 GiB (+13.7% worse) | 1.11 GiB (+12.2% worse) | 1.22 GiB (+13.7% worse) | 440.47 ms (+3.8% worse) | 264.00 ms (+10.6% worse) |
+| three_wide_or | 1.29 ms (+3.6% worse) | 11.90 ms (+6.6% worse) | 1.20 GiB (+7.7% worse) | 1.09 GiB (+3.3% worse) | 1.20 GiB (+7.7% worse) | 423.31 ms (-7.7% better) | 361.95 ms (+36.5% worse) |
+| three_similar_or | 2.23 ms (+3.0% worse) | 10.79 ms (-1.4% ~) | 1.11 GiB (+1.8% ~) | 1013.32 MiB (-2.5% ~) | 1.11 GiB (+1.8% ~) | 505.38 ms (-5.7% better) | 397.19 ms (+19.9% worse) |
+| five_term_or | 3.39 ms (+8.2% worse) | 12.49 ms (+4.2% worse) | 1.14 GiB (+4.7% worse) | 1.06 GiB (+2.7% ~) | 1.14 GiB (+4.7% worse) | 474.28 ms (-6.7% better) | 302.61 ms (-21.9% better) |
+| ten_term_or | 7.93 ms (-2.5% ~) | 16.80 ms (+2.5% ~) | 1.18 GiB (+5.1% worse) | 1.07 GiB (+3.5% worse) | 1.18 GiB (+5.1% worse) | 417.63 ms (-2.2% ~) | 608.07 ms (+50.4% worse) |
 
 **AND queries**
 
 | Query | warm | warm +fetch | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| two_term_and | 1.29 ms (-89.5% better) | 10.55 ms (new) | 8.95 GiB (+322.4% worse) | 8.94 GiB (+323.6% worse) | 8.95 GiB (+322.4% worse) | 495.98 ms (-19.6% better) | 345.15 ms (-66.6% better) |
-| three_wide_and | 1.51 ms (-90.7% better) | 11.86 ms (new) | 8.95 GiB (+319.1% worse) | 8.94 GiB (+319.1% worse) | 8.95 GiB (+319.1% worse) | 474.04 ms (-52.0% better) | 314.13 ms (-69.3% better) |
-| three_similar_and | 1.96 ms (-88.5% better) | 11.03 ms (new) | 8.95 GiB (+319.6% worse) | 8.95 GiB (+328.0% worse) | 8.95 GiB (+319.6% worse) | 432.18 ms (-33.5% better) | 277.83 ms (-82.4% better) |
-| five_term_and | 2.22 ms (-87.8% better) | 11.37 ms (new) | 8.95 GiB (+320.6% worse) | 8.95 GiB (+324.7% worse) | 8.95 GiB (+322.1% worse) | 435.40 ms (-36.5% better) | 327.89 ms (-79.7% better) |
-| ten_term_and | 2.36 ms (-87.8% better) | 11.59 ms (new) | 8.95 GiB (+320.5% worse) | 8.95 GiB (+320.3% worse) | 8.95 GiB (+320.5% worse) | 384.99 ms (-42.5% better) | 291.47 ms (-75.0% better) |
+| two_term_and | 1.14 ms (-12.7% better) | 10.09 ms (-2.5% ~) | 1.10 GiB (+1.4% ~) | 1.05 GiB (+2.9% ~) | 1.10 GiB (+1.4% ~) | 488.90 ms (-1.4% ~) | 239.08 ms (-30.7% better) |
+| three_wide_and | 1.40 ms (-11.5% better) | 11.72 ms (-1.3% ~) | 1.16 GiB (+8.2% worse) | 1.03 GiB (+0.4% ~) | 1.16 GiB (+8.2% worse) | 454.35 ms (-4.2% better) | 205.77 ms (-34.5% better) |
+| three_similar_and | 1.88 ms (-8.0% better) | 10.90 ms (+0.6% ~) | 1.18 GiB (+11.5% worse) | 1.04 GiB (+3.9% worse) | 1.18 GiB (+11.5% worse) | 441.45 ms (+2.1% ~) | 203.19 ms (-26.9% better) |
+| five_term_and | 2.13 ms (+1.6% ~) | 11.33 ms (+0.3% ~) | 1.17 GiB (+6.8% worse) | 1.07 GiB (+4.4% worse) | 1.17 GiB (+6.8% worse) | 453.28 ms (+4.1% worse) | 343.62 ms (+4.8% worse) |
+| ten_term_and | 2.43 ms (-3.9% better) | 11.29 ms (-3.1% better) | 1.14 GiB (+1.4% ~) | 1.06 GiB (+6.1% worse) | 1.14 GiB (+1.4% ~) | 392.86 ms (+2.0% ~) | 304.12 ms (+4.3% worse) |
 <!-- END: bench/fts/supertable/search -->
 
 ### Vector — superfile (single-segment, 1M × 384)
@@ -268,8 +268,8 @@ Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. R
 
 | Build | Time | Throughput | Bandwidth | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 writer | 20.67 s (new) | 48.4 K/s (new) | 74.3 MB/s (new) | 4.39 GiB (new) | 2.29 GiB (new) | 3.33 GiB (new) |
-| 16 writers | 2.69 s (new) | 371.1 K/s (new) | 570.0 MB/s (new) | 7.85 GiB (new) | 6.87 GiB (new) | 7.85 GiB (new) |
+| 1 writer | 20.61 s (-0.3% ~) | 48.5 K/s (+0.3% ~) | 74.5 MB/s (+0.3% ~) | 3.87 GiB (-12.0% better) | 1.74 GiB (-24.0% better) | 2.79 GiB (-16.2% better) |
+| 16 writers | 2.66 s (-1.5% ~) | 376.6 K/s (+1.5% ~) | 578.5 MB/s (+1.5% ~) | 6.93 GiB (-11.7% better) | 6.85 GiB (-0.2% ~) | 6.93 GiB (-11.7% better) |
 <!-- END: bench/vector/superfile/ingest -->
 
 <!-- BEGIN: bench/vector/superfile/search -->
@@ -281,10 +281,10 @@ Correctness, warm search, and cold upload reuse the measured 1-writer artifact. 
 
 | Recall target | (p, r) | recall | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.90 | p=1, r=256 | 0.962 | 994.92 µs (new) | 4.27 GiB (new) | 4.27 GiB (new) | 4.27 GiB (new) | 77.74 µs (new) | 429.93 ms (new) |
-| 0.95 | p=1, r=1024 | 0.962 | 1.01 ms (new) | 4.28 GiB (new) | 4.27 GiB (new) | 4.28 GiB (new) | 58.20 µs (new) | 343.42 ms (new) |
-| 0.99 | p=10, r=256 | 0.998 | 1.40 ms (new) | 4.28 GiB (new) | 4.28 GiB (new) | 4.28 GiB (new) | 64.55 µs (new) | 493.51 ms (new) |
-| default | p=8, r=20 | — | 989.61 µs (new) | 4.28 GiB (new) | 4.28 GiB (new) | 4.28 GiB (new) | 73.24 µs (new) | 480.92 ms (new) |
+| 0.90 | p=1, r=256 | 0.962 | 1.04 ms (+1534.5% worse) | 4.11 GiB (+1779.5% worse) | 4.11 GiB (+1778.6% worse) | 4.11 GiB (+1779.5% worse) | 218.78 ms (+281331.1% worse) | 354.58 ms (-17.5% better) |
+| 0.95 | p=1, r=256 | 0.962 | 1.01 ms (+494.1% worse) | 4.12 GiB (+1784.4% worse) | 4.12 GiB (+1783.5% worse) | 4.12 GiB (+1784.4% worse) | 179.32 ms (+308040.5% worse) | 215.49 ms (-37.3% better) |
+| 0.99 | p=5, r=256 | 0.998 | 1.55 ms (+815.2% worse) | 4.13 GiB (+1785.4% worse) | 4.12 GiB (+1783.5% worse) | 4.13 GiB (+1785.4% worse) | 384.58 ms (+595665.8% worse) | 508.34 ms (+3.0% worse) |
+| default | p=8, r=20 | — | 947.29 µs (+871.6% worse) | 4.13 GiB (+1786.9% worse) | 4.13 GiB (+1786.0% worse) | 4.13 GiB (+1786.9% worse) | 353.10 ms (+481996.7% worse) | 372.97 ms (-22.4% better) |
 <!-- END: bench/vector/superfile/search -->
 
 ### Vector — supertable (multi-segment, 1M × 384, real S3)
@@ -298,7 +298,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 | Shape | Time | Throughput | Superfiles | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| vector-only | 29.53 s (+9.5% worse) | 33.9 K/s (-8.6% worse) | 256 | 10.71 GiB (+283.1% worse) | 9.89 GiB (+496.8% worse) | 10.60 GiB (+322.9% worse) |
+| vector-only | 24.66 s (-16.5% better) | 40.6 K/s (+19.7% better) | 256 | 2.62 GiB (-75.6% better) | 1.91 GiB (-80.7% better) | 2.50 GiB (-76.4% better) |
 <!-- END: bench/vector/supertable/ingest -->
 
 <!-- BEGIN: bench/vector/supertable/search -->
@@ -310,10 +310,10 @@ Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs
 
 | Recall target | (p, r) | recall | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.90 | p=5, r=1 | 0.988 | 5.17 ms (-6.2% better) | 10.39 GiB (+288.9% worse) | 10.39 GiB (+289.1% worse) | 10.39 GiB (+288.9% worse) | 2.17 s (-38.5% better) | 597.87 ms (-10.0% better) |
-| 0.95 | p=5, r=1 | 0.988 | 4.86 ms (-3.6% better) | 11.19 GiB (+327.8% worse) | 11.19 GiB (+328.3% worse) | 11.19 GiB (+327.8% worse) | 1.99 s (-35.0% better) | 522.71 ms (-31.5% better) |
-| 0.99 | p=10, r=1 | 0.996 | 5.23 ms (-7.4% better) | 10.75 GiB (+314.7% worse) | 10.75 GiB (+314.8% worse) | 10.75 GiB (+314.7% worse) | 1.90 s (-49.3% better) | 523.56 ms (-34.6% better) |
-| default | p=8, r=20 | — | 6.72 ms (-4.0% better) | 10.77 GiB (+315.2% worse) | 10.76 GiB (+315.2% worse) | 10.77 GiB (+315.2% worse) | 1.99 s (-36.8% better) | 630.17 ms (-24.0% better) |
+| 0.90 | p=5, r=1 | 0.988 | 5.13 ms (-0.8% ~) | 2.64 GiB (-74.6% better) | 2.64 GiB (-74.6% better) | 2.64 GiB (-74.6% better) | 2.19 s (+1.2% ~) | 604.99 ms (+1.2% ~) |
+| 0.95 | p=5, r=1 | 0.988 | 4.35 ms (-10.4% better) | 3.75 GiB (-66.4% better) | 3.75 GiB (-66.5% better) | 3.75 GiB (-66.4% better) | 2.00 s (+0.6% ~) | 429.61 ms (-17.8% better) |
+| 0.99 | p=10, r=1 | 0.996 | 5.29 ms (+1.0% ~) | 3.17 GiB (-70.5% better) | 3.16 GiB (-70.6% better) | 3.17 GiB (-70.5% better) | 1.89 s (-0.5% ~) | 466.60 ms (-10.9% better) |
+| default | p=8, r=20 | — | 6.82 ms (+1.5% ~) | 3.46 GiB (-67.9% better) | 3.45 GiB (-67.9% better) | 3.46 GiB (-67.9% better) | 1.96 s (-1.5% ~) | 585.76 ms (-7.0% better) |
 <!-- END: bench/vector/supertable/search -->
 
 ### Supertable — ingest summary (all shapes, real S3)
@@ -341,8 +341,8 @@ Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, 
 
 | Build | Time | Throughput | Bandwidth | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 writer | 10.10 s (new) | 99.0 K/s (new) | 198.9 MB/s (new) | 7.32 GiB (new) | 6.43 GiB (new) | 7.12 GiB (new) |
-| 16 writers | 5.17 s (new) | 193.4 K/s (new) | 388.7 MB/s (new) | 16.45 GiB (new) | 13.42 GiB (new) | 15.95 GiB (new) |
+| 1 writer | 10.10 s (-0.0% ~) | 99.0 K/s (+0.0% ~) | 199.0 MB/s (+0.0% ~) | 4.88 GiB (-33.4% better) | 3.85 GiB (-40.1% better) | 4.61 GiB (-35.3% better) |
+| 16 writers | 5.30 s (+2.5% ~) | 188.6 K/s (-2.5% ~) | 379.1 MB/s (-2.5% ~) | 14.08 GiB (-14.4% better) | 10.77 GiB (-19.7% better) | 13.42 GiB (-15.9% better) |
 <!-- END: bench/sql/build -->
 
 <!-- BEGIN: bench/sql/query -->
@@ -356,56 +356,56 @@ Warm p50 over `query_sql` against the canonical 1-writer table. The headline com
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| agg_max_title | 179.31 ms (new) | 1 | 7.92 GiB (new) | 7.89 GiB (new) | 7.92 GiB (new) |
-| filter_category_count | 10.18 ms (new) | 1 | 7.38 GiB (new) | 7.38 GiB (new) | 7.38 GiB (new) |
-| filter_rating_count | 7.55 ms (new) | 1 | 7.26 GiB (new) | 7.26 GiB (new) | 7.26 GiB (new) |
-| count_star | 6.09 ms (new) | 1 | 7.26 GiB (new) | 7.26 GiB (new) | 7.26 GiB (new) |
-| group_by_category | 7.86 ms (new) | 4 | 7.26 GiB (new) | 7.26 GiB (new) | 7.26 GiB (new) |
+| agg_max_title | 180.15 ms (+0.5% ~) | 1 | 5.63 GiB (-28.9% better) | 5.51 GiB (-30.1% better) | 5.57 GiB (-29.7% better) |
+| filter_category_count | 10.08 ms (-1.0% ~) | 1 | 4.92 GiB (-33.4% better) | 4.92 GiB (-33.4% better) | 4.92 GiB (-33.4% better) |
+| filter_rating_count | 7.50 ms (-0.6% ~) | 1 | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) |
+| count_star | 6.39 ms (+4.9% worse) | 1 | 4.79 GiB (-34.1% better) | 4.78 GiB (-34.2% better) | 4.79 GiB (-34.1% better) |
+| group_by_category | 7.62 ms (-3.0% ~) | 4 | 4.79 GiB (-34.1% better) | 4.78 GiB (-34.1% better) | 4.79 GiB (-34.1% better) |
 
 **Plain Scan (DataFusion only) — selective equality, 1 row (sorted vs unsorted col)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| WHERE title = ?  (sorted col, min/max prunes) | 8.20 ms (new) | 1 | 7.48 GiB (new) | 7.46 GiB (new) | 7.48 GiB (new) |
-| WHERE key   = ?  (unsorted col, min/max defeated) | 10.01 ms (new) | 1 | 7.50 GiB (new) | 7.50 GiB (new) | 7.50 GiB (new) |
+| WHERE title = ?  (sorted col, min/max prunes) | 7.76 ms (-5.3% better) | 1 | 5.02 GiB (-32.9% better) | 5.01 GiB (-32.9% better) | 5.02 GiB (-32.9% better) |
+| WHERE key   = ?  (unsorted col, min/max defeated) | 9.76 ms (-2.5% ~) | 1 | 5.05 GiB (-32.7% better) | 5.05 GiB (-32.7% better) | 5.05 GiB (-32.7% better) |
 
 **FTS-pushdown (DataFusion + Infino) — SAME equality, 1 row (sorted vs unsorted col)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| WHERE title = ?  (sorted col, min/max prunes) | 3.68 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
-| WHERE key   = ?  (unsorted col, min/max defeated) | 1.65 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
+| WHERE title = ?  (sorted col, min/max prunes) | 3.98 ms (+8.3% worse) | 1 | 4.97 GiB (-33.2% better) | 4.97 GiB (-33.2% better) | 4.97 GiB (-33.2% better) |
+| WHERE key   = ?  (unsorted col, min/max defeated) | 1.70 ms (+2.7% ~) | 1 | 4.97 GiB (-33.2% better) | 4.96 GiB (-33.2% better) | 4.97 GiB (-33.2% better) |
 
 **Aggregate over FTS candidates — Full Scan (DataFusion only)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| COUNT(*)            key=? (1 row) | 10.44 ms (new) | 1 | 7.44 GiB (new) | 7.43 GiB (new) | 7.44 GiB (new) |
-| SUM(rating)         key=? (1 row) | 10.25 ms (new) | 1 | 7.45 GiB (new) | 7.45 GiB (new) | 7.45 GiB (new) |
-| MAX(rating)         key=? (1 row) | 11.28 ms (new) | 1 | 7.45 GiB (new) | 7.45 GiB (new) | 7.45 GiB (new) |
-| AVG(rating)         key=? (1 row) | 10.18 ms (new) | 1 | 7.45 GiB (new) | 7.45 GiB (new) | 7.45 GiB (new) |
-| SUM(rating) bucket IN all (1M rows) | 14.88 ms (new) | 1 | 7.45 GiB (new) | 7.45 GiB (new) | 7.45 GiB (new) |
+| COUNT(*)            key=? (1 row) | 9.89 ms (-5.3% better) | 1 | 4.97 GiB (-33.2% better) | 4.97 GiB (-33.2% better) | 4.97 GiB (-33.2% better) |
+| SUM(rating)         key=? (1 row) | 10.63 ms (+3.7% worse) | 1 | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.3% better) |
+| MAX(rating)         key=? (1 row) | 11.12 ms (-1.4% ~) | 1 | 4.97 GiB (-33.4% better) | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.4% better) |
+| AVG(rating)         key=? (1 row) | 10.05 ms (-1.2% ~) | 1 | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.3% better) |
+| SUM(rating) bucket IN all (1M rows) | 14.58 ms (-2.0% ~) | 1 | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.3% better) | 4.97 GiB (-33.3% better) |
 
 **Aggregate over FTS candidates — FTS-pushdown (DataFusion + Infino token_match)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| COUNT(*)            key=? (1 row) | 1.89 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
-| SUM(rating)         key=? (1 row) | 2.31 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
-| MAX(rating)         key=? (1 row) | 2.32 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
-| AVG(rating)         key=? (1 row) | 2.19 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
-| SUM(rating) bucket IN all (1M rows) | 12.25 ms (new) | 1 | 7.43 GiB (new) | 7.43 GiB (new) | 7.43 GiB (new) |
+| COUNT(*)            key=? (1 row) | 1.95 ms (+3.4% worse) | 1 | 4.93 GiB (-33.6% better) | 4.93 GiB (-33.6% better) | 4.93 GiB (-33.6% better) |
+| SUM(rating)         key=? (1 row) | 2.17 ms (-6.1% better) | 1 | 4.94 GiB (-33.6% better) | 4.93 GiB (-33.6% better) | 4.94 GiB (-33.6% better) |
+| MAX(rating)         key=? (1 row) | 2.09 ms (-9.9% better) | 1 | 4.94 GiB (-33.6% better) | 4.94 GiB (-33.6% better) | 4.94 GiB (-33.6% better) |
+| AVG(rating)         key=? (1 row) | 1.87 ms (-14.4% better) | 1 | 4.94 GiB (-33.6% better) | 4.94 GiB (-33.6% better) | 4.94 GiB (-33.6% better) |
+| SUM(rating) bucket IN all (1M rows) | 12.06 ms (-1.5% ~) | 1 | 4.94 GiB (-33.5% better) | 4.94 GiB (-33.6% better) | 4.94 GiB (-33.5% better) |
 
 **Search table functions (bm25 / vector / hybrid / token / exact)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| bm25_search | 1.11 ms (new) | 10 | 7.26 GiB (new) | 7.26 GiB (new) | 7.26 GiB (new) |
-| vector_search | 1.36 ms (new) | 10 | 7.26 GiB (new) | 7.26 GiB (new) | 7.26 GiB (new) |
-| hybrid_search | 1.37 ms (new) | 10 | 7.26 GiB (new) | 7.26 GiB (new) | 7.26 GiB (new) |
-| token_match (all rows) | 89.99 ms (new) | 1000.0K | 7.58 GiB (new) | 7.57 GiB (new) | 7.58 GiB (new) |
-| token_match (selective) | 173.52 µs (new) | 1 | 7.46 GiB (new) | 7.46 GiB (new) | 7.46 GiB (new) |
-| exact_match | 2.80 ms (new) | 1 | 7.47 GiB (new) | 7.46 GiB (new) | 7.47 GiB (new) |
+| bm25_search | 913.73 µs (-17.7% better) | 10 | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) |
+| vector_search | 1.31 ms (-3.9% better) | 10 | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) |
+| hybrid_search | 1.26 ms (-7.4% better) | 10 | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) | 4.79 GiB (-34.1% better) |
+| token_match (all rows) | 67.83 ms (-24.6% better) | 1000.0K | 5.12 GiB (-32.4% better) | 5.09 GiB (-32.7% better) | 5.12 GiB (-32.4% better) |
+| token_match (selective) | 256.05 µs (+47.6% worse) | 1 | 5.00 GiB (-33.0% better) | 5.00 GiB (-33.0% better) | 5.00 GiB (-33.0% better) |
+| exact_match | 2.84 ms (+1.3% ~) | 1 | 5.01 GiB (-32.9% better) | 5.00 GiB (-32.9% better) | 5.01 GiB (-32.9% better) |
 <!-- END: bench/sql/query -->
 
 <!-- BEGIN: bench/sql/superfile/cold -->
@@ -417,11 +417,11 @@ Cold p50 over `reader().query_sql` after reopening the same SQL table shape from
 
 | Query | cold open | cold search |
 | --- | --- | --- |
-| agg_max_title | 369.56 ms (new) | 1.72 s (new) |
-| filter_category_count | 249.79 ms (new) | 267.76 ms (new) |
-| filter_rating_count | 275.04 ms (new) | 251.10 ms (new) |
-| count_star | 366.15 ms (new) | 26.41 ms (new) |
-| group_by_category | 383.92 ms (new) | 145.41 ms (new) |
+| agg_max_title | 277.21 ms (-25.0% better) | 1.93 s (+12.3% worse) |
+| filter_category_count | 273.12 ms (+9.3% worse) | 268.43 ms (+0.3% ~) |
+| filter_rating_count | 251.27 ms (-8.6% better) | 394.90 ms (+57.3% worse) |
+| count_star | 495.55 ms (+35.3% worse) | 69.88 ms (+164.6% worse) |
+| group_by_category | 245.43 ms (-36.1% better) | 174.96 ms (+20.3% worse) |
 <!-- END: bench/sql/superfile/cold -->
 
 ### SQL — supertable (multi-segment, 1M rows, real S3)
@@ -435,7 +435,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 | Shape | Time | Throughput | Superfiles | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| SQL | 40.94 s (-90.0% better) | 24.4 K/s (-0.3% ~) | 256 | 10.23 GiB (+6.9% worse) | 9.57 GiB (+61.3% worse) | 9.90 GiB (+21.7% worse) |
+| SQL | 41.30 s (+0.9% ~) | 24.2 K/s (-0.9% ~) | 256 | 2.08 GiB (-79.7% better) | 1.57 GiB (-83.6% better) | 1.95 GiB (-80.4% better) |
 <!-- END: bench/sql/supertable/ingest -->
 
 <!-- BEGIN: bench/sql/supertable/warm -->
@@ -449,56 +449,56 @@ Warm = committed table reopened with a disk cache sized to the index; p50 over r
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| agg_max_title | 179.53 ms (-89.1% better) | 1 | 11.48 GiB (+115.1% worse) | 11.46 GiB (+123.8% worse) | 11.48 GiB (+117.1% worse) |
-| filter_category_count | 23.80 ms (-74.3% better) | 1 | 11.21 GiB (+135.7% worse) | 11.21 GiB (+136.7% worse) | 11.21 GiB (+135.7% worse) |
-| filter_rating_count | 21.12 ms (-58.4% better) | 1 | 11.13 GiB (+135.3% worse) | 11.13 GiB (+136.7% worse) | 11.13 GiB (+135.3% worse) |
-| count_star | 20.96 ms (-53.4% better) | 1 | 11.13 GiB (+136.8% worse) | 11.13 GiB (+136.7% worse) | 11.13 GiB (+136.8% worse) |
-| group_by_category | 20.78 ms (-67.2% better) | 4 | 11.13 GiB (+141.2% worse) | 11.13 GiB (+141.2% worse) | 11.13 GiB (+141.2% worse) |
+| agg_max_title | 176.28 ms (-1.8% ~) | 1 | 2.91 GiB (-74.6% better) | 2.83 GiB (-75.3% better) | 2.91 GiB (-74.7% better) |
+| filter_category_count | 22.67 ms (-4.7% better) | 1 | 2.44 GiB (-78.3% better) | 2.44 GiB (-78.3% better) | 2.44 GiB (-78.3% better) |
+| filter_rating_count | 20.08 ms (-4.9% better) | 1 | 2.30 GiB (-79.3% better) | 2.30 GiB (-79.4% better) | 2.30 GiB (-79.3% better) |
+| count_star | 19.58 ms (-6.6% better) | 1 | 2.30 GiB (-79.3% better) | 2.30 GiB (-79.3% better) | 2.30 GiB (-79.3% better) |
+| group_by_category | 21.23 ms (+2.2% ~) | 4 | 2.30 GiB (-79.3% better) | 2.30 GiB (-79.3% better) | 2.30 GiB (-79.3% better) |
 
 **Plain Scan (DataFusion only) — selective equality, 1 row (sorted vs unsorted col)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| WHERE title = ?  (sorted col, min/max prunes) | 7.90 ms (-9.8% better) | 1 | 11.64 GiB (+91.8% worse) | 11.64 GiB (+91.7% worse) | 11.64 GiB (+91.8% worse) |
-| WHERE key   = ?  (unsorted col, min/max defeated) | 23.65 ms (-73.8% better) | 1 | 11.64 GiB (+77.4% worse) | 11.64 GiB (+86.0% worse) | 11.64 GiB (+77.4% worse) |
+| WHERE title = ?  (sorted col, min/max prunes) | 7.52 ms (-4.7% better) | 1 | 2.84 GiB (-75.6% better) | 2.83 GiB (-75.7% better) | 2.84 GiB (-75.6% better) |
+| WHERE key   = ?  (unsorted col, min/max defeated) | 21.90 ms (-7.4% better) | 1 | 2.84 GiB (-75.6% better) | 2.84 GiB (-75.6% better) | 2.84 GiB (-75.6% better) |
 
 **FTS-pushdown (DataFusion + Infino) — SAME equality, 1 row (sorted vs unsorted col)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| WHERE title = ?  (sorted col, min/max prunes) | 4.42 ms (+16.3% worse) | 1 | 11.59 GiB (+105.8% worse) | 11.59 GiB (+105.7% worse) | 11.59 GiB (+105.8% worse) |
-| WHERE key   = ?  (unsorted col, min/max defeated) | 1.60 ms (-29.2% better) | 1 | 11.59 GiB (+105.7% worse) | 11.59 GiB (+105.7% worse) | 11.59 GiB (+105.7% worse) |
+| WHERE title = ?  (sorted col, min/max prunes) | 4.23 ms (-4.4% better) | 1 | 2.77 GiB (-76.1% better) | 2.76 GiB (-76.2% better) | 2.77 GiB (-76.1% better) |
+| WHERE key   = ?  (unsorted col, min/max defeated) | 1.44 ms (-9.6% better) | 1 | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) |
 
 **Aggregate over FTS candidates — Full Scan (DataFusion only)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| COUNT(*)            key=? (1 row) | 23.17 ms (-74.3% better) | 1 | 11.59 GiB (+105.7% worse) | 11.59 GiB (+106.0% worse) | 11.59 GiB (+105.7% worse) |
-| SUM(rating)         key=? (1 row) | 23.49 ms (-73.9% better) | 1 | 11.59 GiB (+105.7% worse) | 11.58 GiB (+105.7% worse) | 11.59 GiB (+105.7% worse) |
-| MAX(rating)         key=? (1 row) | 24.36 ms (-74.6% better) | 1 | 11.59 GiB (+105.0% worse) | 11.59 GiB (+105.1% worse) | 11.59 GiB (+105.0% worse) |
-| AVG(rating)         key=? (1 row) | 23.45 ms (-73.9% better) | 1 | 11.58 GiB (+104.9% worse) | 11.58 GiB (+105.2% worse) | 11.58 GiB (+104.9% worse) |
-| SUM(rating) bucket IN all (1M rows) | 30.69 ms (-69.0% better) | 1 | 11.58 GiB (+105.3% worse) | 11.58 GiB (+106.4% worse) | 11.58 GiB (+105.3% worse) |
+| COUNT(*)            key=? (1 row) | 22.55 ms (-2.7% ~) | 1 | 2.77 GiB (-76.1% better) | 2.76 GiB (-76.2% better) | 2.77 GiB (-76.1% better) |
+| SUM(rating)         key=? (1 row) | 22.95 ms (-2.3% ~) | 1 | 2.77 GiB (-76.1% better) | 2.76 GiB (-76.1% better) | 2.77 GiB (-76.1% better) |
+| MAX(rating)         key=? (1 row) | 23.81 ms (-2.3% ~) | 1 | 2.77 GiB (-76.1% better) | 2.77 GiB (-76.1% better) | 2.77 GiB (-76.1% better) |
+| AVG(rating)         key=? (1 row) | 22.56 ms (-3.8% better) | 1 | 2.77 GiB (-76.1% better) | 2.76 GiB (-76.1% better) | 2.77 GiB (-76.1% better) |
+| SUM(rating) bucket IN all (1M rows) | 30.54 ms (-0.5% ~) | 1 | 2.77 GiB (-76.1% better) | 2.77 GiB (-76.1% better) | 2.77 GiB (-76.1% better) |
 
 **Aggregate over FTS candidates — FTS-pushdown (DataFusion + Infino token_match)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| COUNT(*)            key=? (1 row) | 1.68 ms (-35.5% better) | 1 | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.2% worse) | 11.58 GiB (+107.1% worse) |
-| SUM(rating)         key=? (1 row) | 1.88 ms (-43.5% better) | 1 | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.1% worse) |
-| MAX(rating)         key=? (1 row) | 2.08 ms (-38.2% better) | 1 | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.1% worse) |
-| AVG(rating)         key=? (1 row) | 2.00 ms (-42.4% better) | 1 | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.1% worse) |
-| SUM(rating) bucket IN all (1M rows) | 66.25 ms (-11.5% better) | 1 | 11.58 GiB (+107.0% worse) | 11.58 GiB (+107.1% worse) | 11.58 GiB (+107.0% worse) |
+| COUNT(*)            key=? (1 row) | 1.69 ms (+0.7% ~) | 1 | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) |
+| SUM(rating)         key=? (1 row) | 1.94 ms (+3.3% worse) | 1 | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) |
+| MAX(rating)         key=? (1 row) | 1.85 ms (-11.0% better) | 1 | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) |
+| AVG(rating)         key=? (1 row) | 1.84 ms (-8.0% better) | 1 | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) |
+| SUM(rating) bucket IN all (1M rows) | 66.05 ms (-0.3% ~) | 1 | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) | 2.76 GiB (-76.2% better) |
 
 **Search table functions (bm25 / vector / hybrid / token / exact)**
 
 | Query | p50 | Rows | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- |
-| bm25_search | 2.41 ms (-65.4% better) | 10 | 11.15 GiB (+138.1% worse) | 11.13 GiB (+141.2% worse) | 11.15 GiB (+138.1% worse) |
-| vector_search | 3.56 ms (-65.3% better) | 10 | 11.17 GiB (+135.0% worse) | 11.15 GiB (+134.6% worse) | 11.17 GiB (+135.0% worse) |
-| hybrid_search | 3.83 ms (-71.8% better) | 10 | 11.17 GiB (+135.1% worse) | 11.16 GiB (+135.0% worse) | 11.17 GiB (+135.1% worse) |
-| token_match (all rows) | 124.17 ms (-88.6% better) | 1000.0K | 11.73 GiB (+88.5% worse) | 11.71 GiB (+89.1% worse) | 11.72 GiB (+88.9% worse) |
-| token_match (selective) | 364.42 µs (-68.4% better) | 1 | 11.64 GiB (+92.1% worse) | 11.64 GiB (+92.1% worse) | 11.64 GiB (+92.1% worse) |
-| exact_match | 3.03 ms (-17.8% better) | 1 | 11.64 GiB (+91.8% worse) | 11.64 GiB (+92.1% worse) | 11.64 GiB (+91.8% worse) |
+| bm25_search | 2.42 ms (+0.2% ~) | 10 | 2.34 GiB (-79.0% better) | 2.30 GiB (-79.4% better) | 2.34 GiB (-79.0% better) |
+| vector_search | 3.75 ms (+5.4% worse) | 10 | 2.37 GiB (-78.8% better) | 2.34 GiB (-79.0% better) | 2.37 GiB (-78.8% better) |
+| hybrid_search | 3.66 ms (-4.5% better) | 10 | 2.37 GiB (-78.8% better) | 2.36 GiB (-78.8% better) | 2.37 GiB (-78.8% better) |
+| token_match (all rows) | 109.86 ms (-11.5% better) | 1000.0K | 2.93 GiB (-75.0% better) | 2.92 GiB (-75.1% better) | 2.93 GiB (-75.0% better) |
+| token_match (selective) | 563.35 µs (+54.6% worse) | 1 | 2.83 GiB (-75.7% better) | 2.83 GiB (-75.7% better) | 2.83 GiB (-75.7% better) |
+| exact_match | 2.87 ms (-5.3% better) | 1 | 2.84 GiB (-75.6% better) | 2.83 GiB (-75.7% better) | 2.84 GiB (-75.6% better) |
 <!-- END: bench/sql/supertable/warm -->
 
 <!-- BEGIN: bench/sql/supertable/cold -->
@@ -510,9 +510,9 @@ Cold = fresh disk cache + consumer per iteration, so each query pays the object-
 
 | Query | cold open | cold search |
 | --- | --- | --- |
-| agg_max_title | 1.00 s (-53.6% better) | 1.30 s (-80.3% better) |
-| filter_category_count | 977.62 ms (-57.8% better) | 1.19 s (-21.6% better) |
-| filter_rating_count | 992.82 ms (-64.5% better) | 1.27 s (+2.6% ~) |
-| count_star | 907.78 ms (-68.1% better) | 105.09 ms (-70.7% better) |
-| group_by_category | 1.18 s (-53.6% better) | 973.06 ms (-11.9% better) |
+| agg_max_title | 1.77 s (+77.2% worse) | 1.63 s (+25.4% worse) |
+| filter_category_count | 1.09 s (+11.3% worse) | 1.71 s (+44.1% worse) |
+| filter_rating_count | 1.05 s (+5.4% worse) | 1.53 s (+20.1% worse) |
+| count_star | 961.16 ms (+5.9% worse) | 122.19 ms (+16.3% worse) |
+| group_by_category | 1.04 s (-11.5% better) | 876.90 ms (-9.9% better) |
 <!-- END: bench/sql/supertable/cold -->
