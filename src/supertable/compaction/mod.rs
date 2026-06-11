@@ -8,8 +8,18 @@
 //! Compaction is single-level — a target-sized segment is never
 //! re-compacted.
 
-use crate::config::CompactionSettings;
-use std::collections::BTreeMap;
+use crate::{
+    Supertable,
+    config::CompactionSettings,
+    superfile::builder::SuperfileBuilder,
+    supertable::{
+        BuildError, SuperfileEntry,
+        query::dispatch::open_reader,
+        writer::{PreparedSegment, ShardOutput, prepare_segment},
+    },
+};
+use bytes::Bytes;
+use std::{collections::BTreeMap, sync::Arc};
 use uuid::Uuid;
 
 const MIB: u64 = 1024 * 1024;
@@ -133,9 +143,76 @@ impl PendingJob {
     }
 }
 
+impl Supertable {
+    /// Merges the given superfiles into one
+    pub(crate) async fn merge_superfiles(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+    ) -> Result<PreparedSegment, BuildError> {
+        let manifest = { self.inner().manifest.load().clone() };
+        let store = manifest.options.store.clone();
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let tombstone_cache = self.inner().tombstone_cache.clone();
+
+        let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
+        for entry in superfiles {
+            let open_fut = async {
+                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry).await;
+                (entry.superfile_id, r)
+            };
+            superfile_readers_fut.push(open_fut);
+        }
+        let readers = futures::future::join_all(superfile_readers_fut).await;
+
+        let now = std::time::Instant::now();
+        if let Some(tombstone_cache) = &tombstone_cache {
+            let superfile_ids = superfiles
+                .iter()
+                .map(|entry| entry.superfile_id)
+                .collect::<Vec<_>>();
+
+            tombstone_cache.prefetch(&superfile_ids, now).await;
+        }
+
+        let mut readers_with_tombstones = Vec::with_capacity(readers.len());
+        for (superfile_id, reader) in readers {
+            let bitmap = tombstone_cache
+                .as_ref()
+                .map(|t| t.bitmap_for(superfile_id, now))
+                .transpose()
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+
+            let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
+            readers_with_tombstones.push((reader.clone(), bitmap));
+        }
+
+        let (merged_bytes, superfile_stats) =
+            SuperfileBuilder::build_from_readers(&readers_with_tombstones)?;
+        let merged_bytes = Bytes::from(merged_bytes);
+
+        let shard = ShardOutput::new_with_params(
+            merged_bytes,
+            superfile_stats.n_docs,
+            superfile_stats.id_min,
+            superfile_stats.id_max,
+            superfile_stats.scalar_stats,
+        );
+
+        let prepared_segment = prepare_segment(self.inner().as_ref(), shard)?;
+
+        prepared_segment.ok_or(BuildError::NoDocsToBuild)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Supertable;
+    use crate::supertable::storage::LocalFsStorageProvider;
+    use crate::test_helpers::{build_title_batch, default_supertable_options};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn mib(n: u64) -> u64 {
         n * MIB
@@ -251,5 +328,307 @@ mod tests {
             .find(|j| j.partition_key == vec![0xA])
             .expect("partition A job");
         assert!(a.inputs.iter().all(|id| id.as_u128() < 5));
+    }
+
+    // Tests for merge_superfiles function
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_merges_two_superfiles() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        // Create first superfile with 2 rows
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["first doc", "second doc"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // Create second superfile with 2 rows
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["third doc", "fourth doc"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // Get the superfiles to merge
+        let reader = st.reader();
+        let superfiles: Vec<Arc<SuperfileEntry>> = reader
+            .manifest()
+            .superfile_list
+            .superfiles
+            .iter()
+            .take(2)
+            .cloned()
+            .collect();
+
+        assert_eq!(superfiles.len(), 2, "should have 2 superfiles");
+
+        // Merge the superfiles - should succeed
+        let _merged_segment = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_preserves_scalar_stats() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        // Create first superfile with apple/banana
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["apple", "banana"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // Create second superfile with cherry/date
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["cherry", "date"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader();
+        let superfiles: Vec<Arc<SuperfileEntry>> = reader
+            .manifest()
+            .superfile_list
+            .superfiles
+            .iter()
+            .take(2)
+            .cloned()
+            .collect();
+
+        // Precompute expected stats from source superfiles
+        let expected_n_docs: u64 = superfiles.iter().map(|sf| sf.n_docs).sum();
+        let expected_id_min = superfiles
+            .iter()
+            .map(|sf| sf.id_min)
+            .min()
+            .unwrap_or(i128::MAX);
+        let expected_id_max = superfiles
+            .iter()
+            .map(|sf| sf.id_max)
+            .max()
+            .unwrap_or(i128::MIN);
+
+        // Merge should succeed and preserve scalar stats
+        let merged_segment = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+
+        // Verify merged segment stats match expected values
+        assert_eq!(
+            merged_segment.entry.n_docs, expected_n_docs,
+            "n_docs should be sum of input superfiles"
+        );
+        assert_eq!(
+            merged_segment.entry.id_min, expected_id_min,
+            "id_min should be minimum across all superfiles"
+        );
+        assert_eq!(
+            merged_segment.entry.id_max, expected_id_max,
+            "id_max should be maximum across all superfiles"
+        );
+
+        // Verify scalar stats for title column (lexicographic ordering: apple < banana < cherry < date)
+        let title_stats = merged_segment
+            .entry
+            .scalar_stats
+            .cols
+            .get("title")
+            .expect("merged entry should have title column stats");
+
+        // Extract min and max string values from the arrays
+        let title_min_arr = title_stats
+            .0
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .expect("title column should be LargeStringArray");
+        let title_max_arr = title_stats
+            .1
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .expect("title column should be LargeStringArray");
+
+        // Verify exact min/max values (apple is min across all data, date is max)
+        let min_value = title_min_arr.value(0);
+        let max_value = title_max_arr.value(0);
+        assert_eq!(min_value, "apple", "minimum title should be 'apple'");
+        assert_eq!(max_value, "date", "maximum title should be 'date'");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_combines_multiple_superfiles() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        // Create three superfiles with 2 rows each. Each batch gets a
+        // unique word that survives tokenization (no underscores/numbers).
+        let batch_titles = [
+            ["alpha first", "alpha second"],
+            ["beta first", "beta second"],
+            ["gamma first", "gamma second"],
+        ];
+        for titles in &batch_titles {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(titles);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader();
+        let superfiles: Vec<Arc<SuperfileEntry>> = reader
+            .manifest()
+            .superfile_list
+            .superfiles
+            .iter()
+            .take(3)
+            .cloned()
+            .collect();
+
+        assert_eq!(superfiles.len(), 3, "should have 3 superfiles");
+
+        // Merging 3 superfiles should succeed
+        let merged_segment = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+
+        // Verify merged segment stats
+        assert_eq!(
+            merged_segment.entry.n_docs, 6,
+            "merged segment should have 6 documents (3 files × 2 docs each)"
+        );
+
+        let source_id_min = superfiles
+            .iter()
+            .map(|sf| sf.id_min)
+            .min()
+            .unwrap_or(i128::MAX);
+        let source_id_max = superfiles
+            .iter()
+            .map(|sf| sf.id_max)
+            .max()
+            .unwrap_or(i128::MIN);
+        assert_eq!(merged_segment.entry.id_min, source_id_min);
+        assert_eq!(merged_segment.entry.id_max, source_id_max);
+
+        // Verify no data loss by querying the merged reader
+        let merged_reader = merged_segment
+            .open_reader()
+            .expect("merged segment should have bytes")
+            .expect("open reader on merged segment");
+
+        assert_eq!(merged_reader.n_docs(), 6, "reader should report 6 docs");
+
+        // Each batch has 2 docs sharing a unique word — search for each batch's unique term
+        for term in &["alpha", "beta", "gamma"] {
+            let hits = merged_reader
+                .token_match("title", &[*term], crate::BoolMode::And)
+                .await
+                .unwrap_or_else(|_| panic!("token_match for '{term}'"));
+            assert_eq!(hits.len(), 2, "term '{term}' should match exactly 2 docs");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_single_superfile() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        // Create a single superfile
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["only doc", "second doc"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader();
+        let superfiles: Vec<Arc<SuperfileEntry>> = reader
+            .manifest()
+            .superfile_list
+            .superfiles
+            .iter()
+            .take(1)
+            .cloned()
+            .collect();
+
+        assert_eq!(superfiles.len(), 1, "should have 1 superfile");
+
+        // Merging a single superfile should succeed
+        let merged_segment = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+
+        // Verify merged segment stats
+        assert_eq!(
+            merged_segment.entry.n_docs, 2,
+            "merged segment should have 2 documents"
+        );
+
+        let source_id_min = superfiles
+            .iter()
+            .map(|sf| sf.id_min)
+            .min()
+            .unwrap_or(i128::MAX);
+        let source_id_max = superfiles
+            .iter()
+            .map(|sf| sf.id_max)
+            .max()
+            .unwrap_or(i128::MIN);
+        assert_eq!(merged_segment.entry.id_min, source_id_min);
+        assert_eq!(merged_segment.entry.id_max, source_id_max);
+
+        // Verify no data loss by querying the merged reader
+        let merged_reader = merged_segment
+            .open_reader()
+            .expect("merged segment should have bytes")
+            .expect("open reader on merged segment");
+
+        assert_eq!(merged_reader.n_docs(), 2, "reader should report 2 docs");
+
+        let only_hits = merged_reader
+            .token_match("title", &["only"], crate::BoolMode::And)
+            .await
+            .expect("token_match for 'only'");
+        assert_eq!(
+            only_hits.len(),
+            1,
+            "should find exactly 1 doc matching 'only'"
+        );
+
+        let second_hits = merged_reader
+            .token_match("title", &["second"], crate::BoolMode::And)
+            .await
+            .expect("token_match for 'second'");
+        assert_eq!(
+            second_hits.len(),
+            1,
+            "should find exactly 1 doc matching 'second'"
+        );
     }
 }

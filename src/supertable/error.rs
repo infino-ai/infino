@@ -24,6 +24,9 @@ use crate::superfile::error::BuildError as SuperfileBuildError;
 /// `SupertableOptions` / `SupertableWriter`.
 #[derive(Debug, Error)]
 pub enum BuildError {
+    #[error("no documents to build")]
+    NoDocsToBuild,
+
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
 

@@ -963,7 +963,7 @@ impl Drop for SupertableWriter {
 /// dropped, since the post-store `SuperfileReader` only exposes
 /// parquet row groups — Arrow batch min/max would require a full
 /// re-decode through DataFusion or parquet-rs's stats reader.
-struct ShardOutput {
+pub struct ShardOutput {
     bytes: Bytes,
     n_docs: u64,
     /// `id_min` / `id_max`: only meaningful when `n_docs > 0`.
@@ -979,6 +979,24 @@ struct ShardOutput {
     /// (FixedSizeList, struct, etc.) are absent and treated as
     /// "can't prune" by the skip planner.
     scalar_stats: ScalarStatsTable,
+}
+
+impl ShardOutput {
+    pub fn new_with_params(
+        bytes: Bytes,
+        n_docs: u64,
+        id_min: i128,
+        id_max: i128,
+        scalar_stats: ScalarStatsTable,
+    ) -> Self {
+        Self {
+            bytes,
+            n_docs,
+            id_min,
+            id_max,
+            scalar_stats,
+        }
+    }
 }
 
 /// Build one segment from one slice of buffered batches. Runs on
@@ -1276,8 +1294,8 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
 
 /// Per-shard publish artifacts produced in parallel before the
 /// serial manifest swap. One entry per non-empty shard.
-struct PreparedSegment {
-    entry: Arc<SuperfileEntry>,
+pub(crate) struct PreparedSegment {
+    pub(crate) entry: Arc<SuperfileEntry>,
     /// Bytes destined for the in-memory segment store. `Some` on
     /// the in-memory-only path and the storage-without-cache
     /// path; `None` on the cache-attached path (the disk cache
@@ -1287,11 +1305,29 @@ struct PreparedSegment {
     bytes_for_cache: Option<(SuperfileUri, Bytes)>,
 }
 
+impl PreparedSegment {
+    /// Open a `SuperfileReader` directly on this segment's bytes.
+    /// Returns `None` if no bytes are held (cache-attached path with
+    /// no prepopulation — bytes went to storage only).
+    #[cfg(test)]
+    pub(crate) fn open_reader(
+        &self,
+    ) -> Option<Result<crate::superfile::SuperfileReader, crate::superfile::ReadError>> {
+        let bytes = self
+            .bytes_for_store
+            .as_ref()
+            .or(self.bytes_for_storage.as_ref())
+            .or(self.bytes_for_cache.as_ref())
+            .map(|(_, b)| b.clone())?;
+        Some(crate::superfile::SuperfileReader::open(bytes))
+    }
+}
+
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
 /// mutable state, safe to run in parallel across shards.
-fn prepare_segment(
+pub(super) fn prepare_segment(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSegment>, BuildError> {
