@@ -686,16 +686,16 @@ pub mod vector {
 
         if phases.warm || phases.cold {
             // The ingested vectors are still mmapped from the prepared
-            // corpus — queries (and, on small runs, brute-force ground
-            // truth) come from them instead of a regeneration. The
-            // oracle is gated: above GROUND_TRUTH_MAX_DOCS the full-
-            // corpus scan per query batch dominates the run, so only
-            // the default-config row is measured.
+            // corpus — queries and ground truth come from them instead
+            // of a regeneration. Calibration ground truth is computed
+            // at every scale (the (p, r) recall rows are the product
+            // numbers); only the brute-force correctness gate is
+            // capped at GROUND_TRUTH_MAX_DOCS.
             let vslice = corpus
                 .vectors()
                 .expect("vector modality prepared a vector corpus")
                 .as_slice();
-            let with_ground_truth = n_docs <= exec_vec::GROUND_TRUTH_MAX_DOCS;
+            let with_correctness_gate = n_docs <= exec_vec::GROUND_TRUTH_MAX_DOCS;
             let q_correct = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -712,17 +712,16 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let (gt_correct, gt_cal) = if with_ground_truth {
+            let gt_correct = with_correctness_gate.then(|| {
                 eprintln!(
-                    "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
+                    "[supertable_vector] brute-force ground truth (correctness gate queries)...",
                 );
-                (
-                    Some(corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K)),
-                    Some(corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K)),
-                )
-            } else {
-                (None, None)
-            };
+                corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K)
+            });
+            eprintln!(
+                "[supertable_vector] brute-force ground truth (calibration queries) over the ingested corpus...",
+            );
+            let gt_cal = Some(corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K));
             // Queries + ground truth extracted; free the corpus pages
             // + temp file so the warm/cold samplers measure the engine
             // only.
