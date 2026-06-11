@@ -44,21 +44,43 @@ pub struct ColdTiming {
 pub fn open_all_segments(consumer: &infino::supertable::Supertable) {
     let reader = consumer.reader();
     let manifest = reader.manifest();
-    let store = &manifest.options.store;
-    let disk_cache = manifest.options.disk_cache.as_ref();
-    let storage = manifest.options.storage.as_ref();
-    crate::tiers::block_on(async {
-        futures::future::try_join_all(manifest.superfiles.iter().map(|e| {
-            infino::supertable::query::superfile_reader::superfile_reader(
-                store,
-                disk_cache,
-                storage,
-                &e.uri,
-                e.subsection_offsets.as_ref(),
-            )
-        }))
-        .await
-        .expect("cold open: open segment readers");
+    let store = manifest.options.store.clone();
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    // Snapshot the per-segment open inputs up front so each spawned task
+    // owns its data ('static). `tokio::spawn` per segment distributes the
+    // per-open CPU parse across the runtime's worker threads — matching the
+    // production vector fan-out (`tokio::spawn` per segment) instead of
+    // serializing all 256 parses on a single `try_join_all` poller.
+    let segments: Vec<_> = manifest
+        .superfiles
+        .iter()
+        .map(|e| (e.uri, e.subsection_offsets.clone()))
+        .collect();
+    crate::tiers::block_on(async move {
+        let handles: Vec<_> = segments
+            .into_iter()
+            .map(|(uri, offsets)| {
+                let store = store.clone();
+                let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    infino::supertable::query::superfile_reader::superfile_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        storage.as_ref(),
+                        &uri,
+                        offsets.as_ref(),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await
+                .expect("cold open: join segment open task")
+                .expect("cold open: open segment readers");
+        }
     });
 }
 
