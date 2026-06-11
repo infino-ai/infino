@@ -36,12 +36,12 @@ use crate::supertable::query::SuperfileHit;
 
 /// Resolve `hits` to one `RecordBatch`, with `projection` naming the
 /// output columns (any of `_id`, the visible scalar columns, or the
-/// trailing `score`); `None` returns the whole row. Names are resolved
-/// to output-schema indices and forwarded to [`resolve_hits`], which
-/// decodes only the projected columns. Shared by every public
-/// row-returning search method (`bm25_search`, `vector_search`,
-/// `token_match`, `exact_match`); `what` labels error messages with
-/// the calling method.
+/// trailing `score`); `None` returns the engine-native `_id` + `score`
+/// pair. Names are resolved to output-schema indices and forwarded to
+/// [`resolve_hits`], which decodes only the projected columns. Shared
+/// by every public row-returning search method (`bm25_search`,
+/// `vector_search`, `token_match`, `exact_match`); `what` labels error
+/// messages with the calling method.
 pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
@@ -50,19 +50,27 @@ pub(crate) async fn resolve_hits_named(
 ) -> DfResult<RecordBatch> {
     let scalar_schema = reader.options().scalar_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
-    let indices: Option<Vec<usize>> = match projection {
-        Some(names) => Some(
-            names
-                .iter()
-                .map(|name| {
-                    output_schema.index_of(name).map_err(|_| {
-                        DataFusionError::Execution(format!("{what}: unknown column {name:?}"))
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-        ),
-        None => None,
+    // `None` is the engine-native result: `_id` + `score` only.
+    // `_id` decodes from its own dedicated id pages (cheap by
+    // design) and `score` is synthesized from the hits, so the
+    // bare call never touches user-column data pages — projecting
+    // those is an explicit opt-in by name.
+    let id_column = reader.options().id_column.clone();
+    let bare: [&str; 2] = [id_column.as_str(), SCORE_COLUMN];
+    let names: &[&str] = match projection {
+        Some(names) => names,
+        None => &bare,
     };
+    let indices: Option<Vec<usize>> = Some(
+        names
+            .iter()
+            .map(|name| {
+                output_schema.index_of(name).map_err(|_| {
+                    DataFusionError::Execution(format!("{what}: unknown column {name:?}"))
+                })
+            })
+            .collect::<Result<_, _>>()?,
+    );
     resolve_hits(
         reader,
         hits,
@@ -143,8 +151,21 @@ pub(crate) async fn resolve_hits(
         }
     }
 
+    let id_column = reader.options().id_column.as_str();
     let resolved = if needed.is_empty() {
         None
+    } else if needed == [id_column] {
+        // Hit → `_id` translation without touching the file: ids are
+        // minted in contiguous spans and the superfile body stores
+        // rows in id order, so a segment whose manifest stats satisfy
+        // `id_max - id_min + 1 == n_docs` maps `local_doc_id` to
+        // `id_min + local_doc_id` by arithmetic. Falls back to the
+        // id-page read for any segment where the span check fails
+        // (multi-span commits can gap the range).
+        match resolve_ids_arithmetic(reader, hits) {
+            Some(batch) => Some(batch?),
+            None => Some(resolve_columns(reader, hits, &needed).await?),
+        }
     } else {
         Some(resolve_columns(reader, hits, &needed).await?)
     };
@@ -178,6 +199,62 @@ pub(crate) async fn resolve_hits(
         &RecordBatchOptions::new().with_row_count(Some(hits.len())),
     )
     .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Hit → stable-`_id` translation by manifest arithmetic — the
+/// no-I/O fast path for the bare (`None`) projection.
+///
+/// Ids are minted in contiguous spans and the superfile body stores
+/// rows in id order, so when a segment's manifest stats satisfy
+/// `id_max - id_min + 1 == n_docs` the stable id of row `local` is
+/// exactly `id_min + local`. Returns the single-`_id`-column batch in
+/// hit (rank) order, or `None` when any hit's segment fails the span
+/// check (e.g. a multi-span commit gapped the range) — the caller
+/// then falls back to the id-page read.
+fn resolve_ids_arithmetic(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+) -> Option<DfResult<RecordBatch>> {
+    use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
+    use arrow_array::Decimal128Array;
+
+    let manifest = reader.manifest();
+    // Hit sets are top-k sized, so per-segment memoization via a
+    // linear scan is cheaper than building a map.
+    let mut memo: Vec<(SuperfileUri, i128)> = Vec::new();
+    let mut ids: Vec<i128> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let base = match memo.iter().find(|(uri, _)| *uri == hit.segment) {
+            Some((_, base)) => *base,
+            None => {
+                let entry = manifest.superfiles.iter().find(|e| e.uri == hit.segment)?;
+                let n_docs = i128::from(entry.n_docs);
+                let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
+                if n_docs == 0 || span != n_docs {
+                    return None;
+                }
+                memo.push((hit.segment, entry.id_min));
+                entry.id_min
+            }
+        };
+        ids.push(base + i128::from(hit.local_doc_id));
+    }
+
+    let array = match Decimal128Array::from_iter_values(ids)
+        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+    {
+        Ok(a) => a,
+        Err(e) => return Some(Err(DataFusionError::Execution(e.to_string()))),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        reader.options().id_column.clone(),
+        DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
+        false,
+    )]));
+    Some(
+        RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef])
+            .map_err(|e| DataFusionError::Execution(e.to_string())),
+    )
 }
 
 /// Read `names` (scalar columns) at the `hits`' `(segment,

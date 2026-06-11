@@ -9,13 +9,13 @@
 //! [`Supertable`](super::super::Supertable):
 //!
 //! ```ignore
-//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
-//! let rows: Vec<RecordBatch> =
+//! // Bare call: `_id` + `score` only — no scalar decode.
+//! let ids: Vec<RecordBatch> =
 //!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None)?;
 //!
-//! // Just `_id` + `score` (no scalar decode): project them explicitly.
-//! let ids: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "score"]))?;
+//! // Materialize row data by naming the columns to decode.
+//! let rows: Vec<RecordBatch> =
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
 //!
 //! // Unranked candidate sets (Arrow rows, score == 0.0).
 //! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
@@ -517,8 +517,8 @@ impl SupertableReader {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
-            // returns the whole row. The shared resolver decodes only
-            // the projected columns.
+            // returns `_id` + `score` only. The shared resolver decodes
+            // only the projected columns.
             let batch = resolve_hits_named(self, &hits, projection, "bm25_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
@@ -730,8 +730,9 @@ impl Supertable {
     ///
     /// `projection` selects output columns by name (any of `_id`, the
     /// visible scalar columns, or the trailing `score`); `None` returns
-    /// the whole row. Only the projected scalar columns are decoded, so
-    /// `Some(&["_id", "score"])` is the cheap "just the hits" path.
+    /// the engine-native result — `_id` + `score` only. Only the
+    /// projected scalar columns are decoded, so materializing row data
+    /// is an explicit opt-in by column name.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -743,12 +744,12 @@ impl Supertable {
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
-    /// // `None` projection returns full rows:
-    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
-    /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    /// // Project just `_id` + `score` → no scalar decode at all:
-    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "score"]))?;
+    /// // Bare call → `_id` + `score`, no scalar decode:
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
+    /// // Name columns to materialize row data:
+    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "body", "score"]))?;
+    /// assert_eq!(rows[0].num_columns(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn bm25_search(

@@ -231,8 +231,8 @@ impl Table {
     /// BM25 search over one FTS column. Returns a pyarrow `Table`.
     /// `projection` names the output columns (`_id`, any scalar column,
     /// or the trailing `score` — higher is better); omitting it returns
-    /// the whole row. Only projected scalar columns are decoded, so
-    /// `projection=["_id", "score"]` skips scalar decode entirely.
+    /// the engine-native `_id` + `score` pair with no scalar decode.
+    /// Materializing row data is an explicit opt-in by naming columns.
     /// `mode` is `"or"` (default) or `"and"`.
     #[pyo3(signature = (column, query, k, mode=None, projection=None))]
     fn bm25_search<'py>(
@@ -257,8 +257,9 @@ impl Table {
     /// Vector kNN over one vector column. `query` is a `list[float]`.
     /// Returns a pyarrow `Table`. `projection` names the output columns
     /// (`_id`, any scalar column, or the trailing `score` — distance,
-    /// smaller is nearer); omitting it returns the whole row.
-    /// `projection=["_id", "score"]` skips scalar decode entirely.
+    /// smaller is nearer); omitting it returns the engine-native
+    /// `_id` + `score` pair with no scalar decode. Materializing row
+    /// data is an explicit opt-in by naming columns.
     #[pyo3(signature = (column, query, k, nprobe=None, projection=None))]
     fn vector_search<'py>(
         &self,
