@@ -212,6 +212,23 @@ Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet`
 | similar_10_or | 302.85 ms (+4488.4% worse) | 52.55 ms (+3420.0% worse) |
 <!-- END: bench/fts/superfile/search -->
 
+<!-- BEGIN: bench/fts/superfile/negation -->
+### Superfile FTS — negation (`-term`), warm (1M docs)
+
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Through the string `bm25_hits_async` path (parses the `-` sigil); a correctness gate (no hit contains a negated term) runs before timing. Δ is vs the previous run.
+
+**Negation queries**
+
+| Query | warm |
+| --- | --- |
+| mid_pos_common_neg | 1.63 ms (-0.4% ~) |
+| mid_pos_rare_neg | 27.96 µs (+1.1% ~) |
+| two_mid_or_common_neg | 4.55 ms (-0.8% ~) |
+| two_mid_and_common_neg | 5.15 ms (+3.2% worse) |
+<!-- END: bench/fts/superfile/negation -->
+
 ### FTS — supertable (multi-segment, 1M docs, real S3)
 
 <!-- BEGIN: bench/fts/supertable/ingest -->

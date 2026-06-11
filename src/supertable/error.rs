@@ -24,6 +24,9 @@ use crate::superfile::error::BuildError as SuperfileBuildError;
 /// `SupertableOptions` / `SupertableWriter`.
 #[derive(Debug, Error)]
 pub enum BuildError {
+    #[error("no documents to build")]
+    NoDocsToBuild,
+
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
 
@@ -249,6 +252,35 @@ pub enum OpenError {
     /// path) skips the check entirely.
     #[error("options_hash mismatch: caller={expected} list={actual}")]
     OptionsHashMismatch { expected: String, actual: String },
+}
+
+/// Errors raised by [`crate::supertable::Supertable::compact`].
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionError {
+    /// Compaction requires durable storage
+    /// (needs to seal sidecars and publish the merged superfile).
+    #[error("compaction requires a storage backend")]
+    NoStorage,
+
+    /// A superfile listed in a `CompactionJob` is not present in the
+    /// current manifest snapshot.
+    #[error("superfile {0} not found in manifest snapshot")]
+    SuperfileNotFound(uuid::Uuid),
+
+    /// The tombstone sidecar for `superfile_id` is already sealed by
+    /// a different compaction run. Caller must drive the abandoned
+    /// compaction to completion (or unwind it) before retrying.
+    #[error(
+        "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
+    )]
+    SidecarConflict {
+        superfile_id: uuid::Uuid,
+        existing_compaction_id: uuid::Uuid,
+    },
+
+    /// A WAL-store I/O error occurred while sealing a sidecar.
+    #[error("seal failed: {0}")]
+    Seal(String),
 }
 
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]

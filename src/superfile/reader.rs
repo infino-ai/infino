@@ -20,12 +20,8 @@
 //! single-segment SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use crate::superfile::ReadError;
-use crate::superfile::format::{self, footer, kv};
-use crate::superfile::fts::reader::{BoolMode, FtsReader};
-use crate::superfile::fts::tokenize::Tokenizer as _;
-use crate::superfile::vector::reader::VectorReader;
-use crate::supertable::query::provider::tombstone_access_plan;
+use std::sync::Arc;
+
 use arrow::compute::{concat_batches, take};
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::{Field, Schema};
@@ -37,7 +33,13 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::PageIndexPolicy;
 use roaring::RoaringBitmap;
-use std::sync::Arc;
+
+use crate::superfile::ReadError;
+use crate::superfile::format::{self, footer, kv};
+use crate::superfile::fts::reader::{BoolMode, FtsReader};
+use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+use crate::superfile::vector::reader::VectorReader;
+use crate::supertable::query::provider::tombstone_access_plan;
 
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -728,6 +730,14 @@ impl SuperfileReader {
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
     /// hits ordered by descending score — this is the hit kernel, not a
     /// row-returning search; row materialization is `take_by_local_doc_ids`.
+    ///
+    /// ## Negation (`-term`)
+    ///
+    /// A `-`-prefixed term excludes every doc containing it, regardless
+    /// of score; `mode` applies to the positive terms only. Example:
+    /// `"rust -python"` scores docs with `rust`, dropping any that also
+    /// contain `python`. A query with only negated terms is rejected
+    /// (`FtsError::NegationOnly`).
     pub async fn bm25_hits_async(
         &self,
         column: &str,
@@ -735,14 +745,18 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        let term_strings: Vec<String> = tok.tokenize(query).collect();
-        let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
-        self.bm25_search_pretokenized(column, &term_refs, k, mode)
+        let tok = AsciiLowerTokenizer;
+
+        // Split the query into positive and negated terms. The parsed
+        // tokens borrow `query`, so nothing is copied here.
+        let parsed = tok.parse(query);
+        let positives: Vec<&str> = parsed.positives.iter().map(|t| &**t).collect();
+        let negatives: Vec<&str> = parsed.negatives.iter().map(|t| &**t).collect();
+        self.bm25_search_pretokenized_excluding(column, &positives, &negatives, k, mode)
             .await
     }
 
-    /// Pre-tokenized variant of [`Self::bm25_search`] — the caller
+    /// Pre-tokenized variant of [`Self::bm25_hits_async`] — the caller
     /// supplies the already-tokenized term slice and we skip the
     /// `AsciiLowerTokenizer` pass.
     ///
@@ -869,6 +883,26 @@ impl SuperfileReader {
             }
         }
         Ok(out)
+    }
+
+    /// Pre-tokenized BM25 search with negated terms excluded — the
+    /// negation sibling of [`Self::bm25_search_pretokenized`]. The
+    /// supertable fan-out parses the `-` sigil once at the orchestrator
+    /// and hands every segment the split lists through here.
+    pub(crate) async fn bm25_search_pretokenized_excluding(
+        &self,
+        column: &str,
+        positives: &[&str],
+        negatives: &[&str],
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .search_excluding(column, positives, negatives, k, mode)
+            .await?)
     }
 
     /// Prefix-expanded BM25 search.

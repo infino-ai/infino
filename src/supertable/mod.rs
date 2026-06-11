@@ -59,7 +59,7 @@ pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
     StorageProvider,
 };
-pub use error::{BuildError, CommitError, OpenError, QueryError};
+pub use error::{BuildError, CommitError, CompactionError, OpenError, QueryError};
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;
 pub use manifest::{

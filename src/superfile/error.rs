@@ -169,6 +169,11 @@ pub enum FtsError {
     #[error("unknown FTS column {0:?}")]
     UnknownColumn(String),
 
+    /// The query has only negated (`-term`) clauses — nothing to rank.
+    /// Reject this case.
+    #[error("query has only negated terms; at least one positive term is required")]
+    NegationOnly,
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 }

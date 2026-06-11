@@ -24,6 +24,7 @@ pub mod format;
 pub mod fts;
 pub mod lazy_source;
 pub mod reader;
+pub mod stats;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};

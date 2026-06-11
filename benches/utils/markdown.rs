@@ -61,12 +61,25 @@ fn update_readme(path: &Path, section: &MarkdownSection) -> std::io::Result<()> 
     let end = format!("<!-- END: {} -->", section.anchor_id);
     let content = fs::read_to_string(path)?;
 
-    let begin_pos = content.find(&begin).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("marker not found: {begin}"),
-        )
-    })?;
+    // First emit of a brand-new anchor: no marker pair exists yet, so
+    // append the section (with its markers) at the end of the file —
+    // every later run then updates it in place. Move the block if a
+    // different position reads better; the markers travel with it.
+    let Some(begin_pos) = content.find(&begin) else {
+        let mut new = content;
+        if !new.ends_with('\n') {
+            new.push('\n');
+        }
+        new.push('\n');
+        new.push_str(&begin);
+        new.push('\n');
+        new.push_str(&section.body);
+        new.push('\n');
+        new.push_str(&end);
+        new.push('\n');
+        fs::write(path, new)?;
+        return Ok(());
+    };
     let after_begin = begin_pos + begin.len();
     let end_pos = content[after_begin..].find(&end).ok_or_else(|| {
         std::io::Error::new(
@@ -157,5 +170,49 @@ pub fn fmt_bandwidth(bytes_per_sec: f64) -> String {
         format!("{:.2} GB/s", bytes_per_sec / BYTES_PER_GB_DECIMAL)
     } else {
         format!("{:.1} MB/s", bytes_per_sec / BYTES_PER_MB_DECIMAL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn section(anchor: &str, body: &str) -> MarkdownSection {
+        MarkdownSection {
+            anchor_id: anchor.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn update_readme_replaces_existing_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("README.md");
+        fs::write(
+            &path,
+            "# Title\n\n<!-- BEGIN: a/b -->\nold\n<!-- END: a/b -->\ntail\n",
+        )
+        .expect("seed");
+        update_readme(&path, &section("a/b", "new body")).expect("update");
+        let got = fs::read_to_string(&path).expect("read");
+        assert!(got.contains("new body"));
+        assert!(!got.contains("old"));
+        assert!(got.ends_with("tail\n"), "content outside markers kept");
+    }
+
+    #[test]
+    fn update_readme_appends_new_section_with_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("README.md");
+        fs::write(&path, "# Title\n").expect("seed");
+        // First emit of a new anchor: appended with its marker pair...
+        update_readme(&path, &section("x/y", "first")).expect("append");
+        let got = fs::read_to_string(&path).expect("read");
+        assert!(got.contains("<!-- BEGIN: x/y -->\nfirst\n<!-- END: x/y -->"));
+        // ...and the second emit updates in place, no duplicate section.
+        update_readme(&path, &section("x/y", "second")).expect("replace");
+        let got = fs::read_to_string(&path).expect("read");
+        assert!(got.contains("second") && !got.contains("first"));
+        assert_eq!(got.matches("BEGIN: x/y").count(), 1);
     }
 }
