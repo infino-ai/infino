@@ -12,6 +12,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::superfile::vector::distance::Metric;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::storage::StorageProvider;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
@@ -39,6 +40,10 @@ const CORPUS_TEXT_SEED: u64 = 1;
 
 /// Random-rotation RNG seed for the bench vector index.
 const ROT_SEED: u64 = 7;
+/// Distance metric for the bench vector index.
+const BENCH_METRIC: Metric = Metric::Cosine;
+/// Rerank residual codec for the bench vector index.
+const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
 /// Writer auto-flush threshold (MiB) per segment roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget (8 GiB) capping resident RSS during ingest.
@@ -164,8 +169,8 @@ pub fn options_for(
             dim: DIM,
             n_cent: n_cent_per_segment,
             rot_seed: ROT_SEED,
-            metric: Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+            metric: BENCH_METRIC,
+            rerank_codec: BENCH_RERANK,
         }]
     } else {
         vec![]
@@ -183,6 +188,21 @@ pub fn options_for(
 
 pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> SupertableOptions {
     options_for(Modality::Combined, storage)
+}
+
+/// The corpus + index knobs this bench config builds with.
+pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
+    crate::dataset::Knobs {
+        doc_count: n_docs(),
+        dim: DIM,
+        n_cent_total: corpus::n_cent(n_docs()),
+        vec_seed: CORPUS_VEC_SEED,
+        text_seed: CORPUS_TEXT_SEED,
+        rot_seed: ROT_SEED,
+        metric: format!("{BENCH_METRIC:?}"),
+        rerank_codec: format!("{BENCH_RERANK:?}"),
+        modality: format!("{modality:?}"),
+    }
 }
 
 /// Corpus artifacts for one supertable build, generated to disk and
