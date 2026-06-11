@@ -9,6 +9,7 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::superfile::vector::distance::Metric;
@@ -93,6 +94,15 @@ impl Modality {
     }
     pub fn has_sql(self) -> bool {
         matches!(self, Modality::Sql)
+    }
+    /// Path token namespacing a prepared dataset by modality.
+    pub fn dataset_dir(self) -> &'static str {
+        match self {
+            Modality::Fts => "fts",
+            Modality::Vector => "vector",
+            Modality::Sql => "sql",
+            Modality::Combined => "combined",
+        }
     }
 }
 
@@ -262,7 +272,13 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         modality_label(modality),
         N_COMMIT_CHUNKS,
     );
-    let storage_backend = tiers::block_on(tiers::supertable_storage_fixture());
+    let storage_backend = tiers::block_on(async {
+        if crate::dataset::dataset_mode() {
+            tiers::dataset_storage_fixture(modality.dataset_dir()).await
+        } else {
+            tiers::supertable_storage_fixture().await
+        }
+    });
     let cleanup = storage_backend.cleanup.clone();
     // Disk cache attached only to keep segment bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
@@ -317,6 +333,14 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         total_index_bytes as f64 / (1u64 << 30) as f64,
         storage_backend.storage_label,
     );
+    if crate::dataset::dataset_mode() {
+        write_sidecar(
+            &storage_backend.storage,
+            modality,
+            n_superfiles,
+            total_index_bytes,
+        );
+    }
     // SQL query predicates sample the mid-corpus row (one mmap page
     // touch — not a corpus materialization).
     let mid = n_docs / 2;
@@ -338,6 +362,31 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         sql_sample_title,
         sql_sample_key,
     }
+}
+
+/// Write the dataset sidecar next to a freshly prepared dataset. Atomic
+/// create: a pre-existing sidecar means the prefix already holds a dataset, so
+/// this fails rather than clobbering it — re-prepare into a fresh prefix.
+fn write_sidecar(
+    storage: &Arc<dyn StorageProvider>,
+    modality: Modality,
+    n_superfiles: usize,
+    total_index_bytes: u64,
+) {
+    let meta = crate::dataset::DatasetMeta {
+        knobs: current_knobs(modality),
+        n_superfiles,
+        total_index_bytes,
+        builder_id: infino::BUILDER_ID.to_string(),
+    };
+    let json = serde_json::to_vec_pretty(&meta).expect("serialize dataset sidecar");
+    tiers::block_on(storage.put_atomic(crate::dataset::SIDECAR, Bytes::from(json)))
+        .expect("write dataset sidecar");
+    eprintln!(
+        "[supertable_ingest] wrote {} for the {} dataset",
+        crate::dataset::SIDECAR,
+        modality.dataset_dir(),
+    );
 }
 
 /// One commit chunk's `RecordBatch` for `modality`, borrowing the text
