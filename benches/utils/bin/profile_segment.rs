@@ -31,6 +31,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use futures::executor::block_on;
 use infino::superfile::reader::VectorSearchOptions;
 use infino_bench_utils::corpus::{self, DIM};
 
@@ -97,7 +98,7 @@ fn main() {
 
     // Warm the reader (touch pages, settle the allocator) before timing.
     for q in &queries {
-        let _ = futures::executor::block_on(reader.vector_search(
+        let _ = block_on(reader.vector_hits_async(
             "emb",
             q,
             TOP_K,
@@ -131,13 +132,9 @@ fn main() {
         let mut recall_sum = 0.0f64;
         for (qi, q) in queries.iter().enumerate() {
             let t = Instant::now();
-            let hits = futures::executor::block_on(reader.vector_search(
-                "emb",
-                q,
-                TOP_K,
-                opts(nprobe, rerank_mult),
-            ))
-            .expect("search");
+            let hits =
+                block_on(reader.vector_hits_async("emb", q, TOP_K, opts(nprobe, rerank_mult)))
+                    .expect("search");
             lats.push(t.elapsed().as_secs_f64() * MS_PER_SEC);
             let got: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
             let hit = gt[qi].iter().filter(|d| got.contains(d)).count();
