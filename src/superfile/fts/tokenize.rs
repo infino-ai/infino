@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Tokenization.
+//! Tokenization, plus BM25 query parsing ([`Tokenizer::parse`]).
+//! The parser lives here because the `-` negation sigil must be
+//! handled before tokenizing — the tokenizer splits on `-`.
 //!
 //! Ships one tokenizer: [`AsciiLowerTokenizer`]. The [`Tokenizer`]
 //! trait is the extension point for ICU / language-aware stemmers /
@@ -16,6 +18,8 @@
 //!     ASCII-only design is intentional; richer tokenizers can opt
 //!     into the trait without changing the FTS pipeline.
 //!   - Empty tokens are never emitted.
+
+use std::borrow::Cow;
 
 use wide::u8x16;
 
@@ -79,6 +83,28 @@ pub trait Tokenizer: Send + Sync + 'static {
     /// returns `self` cast to `&dyn Any`; concrete impls should
     /// not override unless they wrap another tokenizer.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Used to tokenize a query. The tokens handed to `f` stay alive
+    /// as long as `text` (the query) is alive.
+    fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
+        self.tokenize_each(text, &mut |t| f(Cow::Owned(t.to_owned())));
+    }
+
+    /// Used to parse a query: `"rust -python"` → positives `["rust"]`,
+    /// negatives `["python"]`. A query with no positives is not an
+    /// error here; the caller checks.
+    fn parse<'q>(&self, query: &'q str) -> ParsedQuery<'q> {
+        let mut parsed = ParsedQuery::default();
+        for run in query.split_whitespace() {
+            match run.strip_prefix('-') {
+                Some(rest) if !rest.is_empty() => {
+                    self.tokenize_each_query(rest, &mut |t| parsed.negatives.push(t));
+                }
+                _ => self.tokenize_each_query(run, &mut |t| parsed.positives.push(t)),
+            }
+        }
+        parsed
+    }
 }
 
 /// ASCII whitespace + punctuation split, ASCII lowercase, no stemming,
@@ -280,6 +306,15 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
     (pos, had_upper, had_non_ascii)
 }
 
+/// A parsed BM25 query: positive (scored) and negative (excluding)
+/// tokens. Tokens may borrow the query string, so this can't outlive
+/// the query.
+#[derive(Debug, Default)]
+pub struct ParsedQuery<'q> {
+    pub positives: Vec<Cow<'q, str>>,
+    pub negatives: Vec<Cow<'q, str>>,
+}
+
 impl Tokenizer for AsciiLowerTokenizer {
     fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
         Box::new(AsciiLowerIter::new(text.as_bytes()))
@@ -298,6 +333,31 @@ impl Tokenizer for AsciiLowerTokenizer {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Zero-copy override: an already-lowercase token borrows from
+    /// `text`; only a token that needs lowercasing is copied.
+    fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
+        let bytes = text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            pos = simd_skip_non_token(bytes, pos);
+            if pos >= bytes.len() {
+                return;
+            }
+            let start = pos;
+            let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
+            pos = end;
+            if had_non_ascii || start == pos {
+                continue;
+            }
+            let s = std::str::from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
+            if had_upper {
+                f(Cow::Owned(s.to_ascii_lowercase()));
+            } else {
+                f(Cow::Borrowed(s));
+            }
+        }
     }
 }
 
@@ -496,5 +556,114 @@ mod tests {
         let count = AsciiLowerTokenizer.tokenize(&big).count();
         // 8 tokens per chunk × 20_000 = 160_000.
         assert_eq!(count, 8 * 20_000);
+    }
+
+    // ---- parse (the `-` negation sigil) ----
+
+    fn parse(query: &str) -> ParsedQuery<'_> {
+        AsciiLowerTokenizer.parse(query)
+    }
+
+    #[test]
+    fn parse_default_trait_impl_matches_override() {
+        // A tokenizer that overrides nothing gets the same split via
+        // the default `parse` impl (owned tokens).
+        struct PlainTok;
+        impl Tokenizer for PlainTok {
+            fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+                AsciiLowerTokenizer.tokenize(text)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let p = PlainTok.parse("Rust -PYTHON");
+        assert_eq!(p.positives, vec!["rust"]);
+        assert_eq!(p.negatives, vec!["python"]);
+        assert!(matches!(p.positives[0], Cow::Owned(_)));
+    }
+
+    #[test]
+    fn parse_positives_only() {
+        let p = parse("rust async");
+        assert_eq!(p.positives, vec!["rust", "async"]);
+        assert!(p.negatives.is_empty());
+    }
+
+    #[test]
+    fn parse_single_negative() {
+        let p = parse("rust -python");
+        assert_eq!(p.positives, vec!["rust"]);
+        assert_eq!(p.negatives, vec!["python"]);
+    }
+
+    #[test]
+    fn parse_multiple_negatives() {
+        let p = parse("rust async -python -php");
+        assert_eq!(p.positives, vec!["rust", "async"]);
+        assert_eq!(p.negatives, vec!["python", "php"]);
+    }
+
+    #[test]
+    fn parse_negation_only() {
+        // No positive clause — the parser reports it faithfully; the
+        // caller turns this into an error.
+        let p = parse("-python");
+        assert!(p.positives.is_empty());
+        assert_eq!(p.negatives, vec!["python"]);
+    }
+
+    #[test]
+    fn parse_interior_hyphen_is_not_negation() {
+        // `a-b` is one run with an interior `-`; the scan splits it
+        // into two positive tokens. Nothing is negated.
+        let p = parse("a-b");
+        assert_eq!(p.positives, vec!["a", "b"]);
+        assert!(p.negatives.is_empty());
+    }
+
+    #[test]
+    fn parse_bare_dash_contributes_nothing() {
+        let p = parse("rust - python");
+        assert_eq!(p.positives, vec!["rust", "python"]);
+        assert!(p.negatives.is_empty());
+    }
+
+    #[test]
+    fn parse_double_dash_strips_one_then_tokenizes() {
+        // `--py`: strip the one leading `-`, leaving `-py`; the scan
+        // drops the remaining `-` and yields `py`.
+        let p = parse("--py");
+        assert!(p.positives.is_empty());
+        assert_eq!(p.negatives, vec!["py"]);
+    }
+
+    #[test]
+    fn parse_negated_term_is_normalized() {
+        // The negated side is lower-cased like the index.
+        let p = parse("rust -PYTHON");
+        assert_eq!(p.negatives, vec!["python"]);
+    }
+
+    #[test]
+    fn parse_empty_query() {
+        let p = parse("");
+        assert!(p.positives.is_empty());
+        assert!(p.negatives.is_empty());
+    }
+
+    #[test]
+    fn parse_lowercase_tokens_borrow_the_query() {
+        // Zero-copy contract: already-lowercase runs must not allocate.
+        let p = parse("rust -python");
+        assert!(matches!(p.positives[0], Cow::Borrowed(_)));
+        assert!(matches!(p.negatives[0], Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn parse_uppercase_token_is_the_only_copy() {
+        let p = parse("rust -PYTHON");
+        assert!(matches!(p.positives[0], Cow::Borrowed(_)));
+        assert!(matches!(p.negatives[0], Cow::Owned(_)));
     }
 }

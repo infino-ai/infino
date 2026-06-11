@@ -20,11 +20,8 @@
 //! single-segment SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use crate::superfile::ReadError;
-use crate::superfile::format::{self, footer, kv};
-use crate::superfile::fts::reader::{BoolMode, FtsReader};
-use crate::superfile::vector::reader::VectorReader;
-use crate::supertable::query::provider::tombstone_access_plan;
+use std::sync::Arc;
+
 use arrow::compute::{concat_batches, take};
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::{Field, Schema};
@@ -36,7 +33,13 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::PageIndexPolicy;
 use roaring::RoaringBitmap;
-use std::sync::Arc;
+
+use crate::superfile::ReadError;
+use crate::superfile::format::{self, footer, kv};
+use crate::superfile::fts::reader::{BoolMode, FtsReader};
+use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+use crate::superfile::vector::reader::VectorReader;
+use crate::supertable::query::provider::tombstone_access_plan;
 
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -742,11 +745,13 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        // Lift the `-` sigil before tokenizing — the tokenizer splits on `-`.
-        let parsed = crate::superfile::fts::parser::parse(query, &tok);
-        let positives: Vec<&str> = parsed.positives.iter().map(|s| s.as_str()).collect();
-        let negatives: Vec<&str> = parsed.negatives.iter().map(|s| s.as_str()).collect();
+        let tok = AsciiLowerTokenizer;
+
+        // Split the query into positive and negated terms. The parsed
+        // tokens borrow `query`, so nothing is copied here.
+        let parsed = tok.parse(query);
+        let positives: Vec<&str> = parsed.positives.iter().map(|t| &**t).collect();
+        let negatives: Vec<&str> = parsed.negatives.iter().map(|t| &**t).collect();
         self.bm25_search_pretokenized_excluding(column, &positives, &negatives, k, mode)
             .await
     }

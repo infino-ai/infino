@@ -67,7 +67,11 @@
 //! `SuperfileReaderCache::reader` call. Vector + SQL skip remain
 //! deferred (see those modules' headers).
 
+use std::borrow::Cow;
+use std::slice;
 use std::sync::Arc;
+
+use arrow::record_batch::RecordBatch;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
@@ -75,10 +79,9 @@ use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
-use arrow::record_batch::RecordBatch;
-
-use super::SuperfileHit;
-use super::exec::common::resolve_hits_named;
+use crate::supertable::query::SuperfileHit;
+use crate::supertable::query::exec::common::resolve_hits_named;
+use crate::supertable::query::prune::{PruneLeaf, select_segments};
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -113,32 +116,33 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
-        // Parse + tokenize ONCE at the orchestrator (the `-` sigil
-        // splits negated terms out). The split lists are reused for the
-        // bloom-skip masks and for every per-segment search, instead of
-        // re-parsing per segment.
-        let parsed = crate::superfile::fts::parser::parse(query, &AsciiLowerTokenizer);
-        let positives = parsed.positives;
-        let negatives = parsed.negatives;
+        // Parse the query once here, not per segment. The fan-out
+        // closures below need owned ('static) data for tokio::spawn,
+        // so this is the one place the tokens are copied — the prune
+        // and every per-segment search reuse them.
+        let parsed = AsciiLowerTokenizer.parse(query);
+        let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
+        let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
 
-        // Segment selection via the shared two-tier prune
-        // (`query::prune::select_segments`): part-level bloom-union
-        // skip → lazy-load surviving parts → per-segment bloom skip.
-        // FTS exact search is the single-`TermPresence`-leaf case of
-        // the same path SQL scalar filtering uses.
-        // Only POSITIVE terms prune. A negated term must never drop a
-        // segment: a segment without it is the best case (none of its
-        // docs can be excluded), and under `And` it would even prune
-        // every segment that lacks the negated term.
-        let kept = crate::supertable::query::prune::select_segments(
-            manifest.as_ref(),
-            &[crate::supertable::query::prune::PruneLeaf::TermPresence {
-                column: column_owned.clone(),
-                terms: positives.clone(),
-                mode,
-            }],
-        )
-        .await?;
+        // Pick the segments to search, via the shared two-tier bloom
+        // prune. Only positive terms prune — a negated term must never
+        // drop a segment: a segment without it is the best case (none
+        // of its docs can be excluded), and under `And` it would even
+        // prune every segment that lacks the negated term.
+        // The leaf takes `positives` by value to avoid cloning the
+        // list; we take it back right after the call.
+        let prune_leaf = PruneLeaf::TermPresence {
+            column: column_owned.clone(),
+            terms: positives,
+            mode,
+        };
+        let kept = select_segments(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let PruneLeaf::TermPresence {
+            terms: positives, ..
+        } = prune_leaf
+        else {
+            unreachable!("leaf constructed as TermPresence above")
+        };
         if kept.is_empty() {
             return Ok(Vec::new());
         }

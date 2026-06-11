@@ -652,7 +652,7 @@ impl FtsReader {
     ///
     /// No positives → [`FtsError::NegationOnly`] (nothing to rank).
     /// Empty positives *and* negatives → empty result.
-    pub async fn search_excluding(
+    pub(crate) async fn search_excluding(
         &self,
         column: &str,
         positives: &[&str],
@@ -670,20 +670,16 @@ impl FtsReader {
             }
             return Err(FtsError::NegationOnly);
         }
-        // Negated cursors are built separately from the positives: a
-        // term missing from the dictionary yields no cursor (excludes
-        // nothing) and must not trip the positive AND's cursor-count
-        // check. No negatives → `None`; positive-only queries skip all
-        // of this.
-        if negatives.is_empty() {
-            self.search_with_filters(column_id, positives, k, mode, None)
-                .await
-        } else {
-            let mut filter =
-                ExcludeFilter::new(self.build_term_cursors(column_id, negatives).await?);
-            self.search_with_filters(column_id, positives, k, mode, Some(&mut filter))
-                .await
-        }
+
+        let mut filter = match negatives {
+            [] => None,
+            _ => Some(ExcludeFilter::new(
+                self.build_term_cursors(column_id, negatives).await?,
+            )),
+        };
+
+        self.search_with_filters(column_id, positives, k, mode, filter.as_mut())
+            .await
     }
 
     /// Shared dispatch for [`Self::search`] and [`Self::search_excluding`]:
