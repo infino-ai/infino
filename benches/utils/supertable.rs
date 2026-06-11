@@ -279,7 +279,7 @@ pub fn run() {
         "[supertable] ingesting {} docs ({} commits) per shape to object storage, \
          one isolated process per shape...",
         fmt_count(n_docs),
-        supertable::N_COMMIT_CHUNKS
+        supertable::n_commits()
     );
 
     let shape_results = run_ingest_shapes_isolated();
@@ -300,7 +300,7 @@ pub fn run() {
             "Supertable — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
             fmt_count(n_docs),
             crate::corpus::DIM,
-            supertable::N_COMMIT_CHUNKS
+            supertable::n_commits()
         ),
         note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). \
                Each shape is built in its own subprocess, so Peak/Median/P90 RSS are measured from a \
@@ -470,7 +470,7 @@ pub mod fts {
             title: format!(
                 "Supertable FTS — ingest, multi-segment / object-store ({} docs, {} commits)",
                 fmt_count(n_docs),
-                supertable::N_COMMIT_CHUNKS
+                supertable::n_commits()
             ),
             note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
             blocks: vec![Block {
@@ -665,7 +665,7 @@ pub mod vector {
                     "Supertable vector — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
                     fmt_count(n_docs),
                     DIM,
-                    supertable::N_COMMIT_CHUNKS
+                    supertable::n_commits()
                 ),
                 note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
@@ -867,7 +867,7 @@ pub mod sql {
                 title: format!(
                     "Supertable SQL — ingest, multi-segment / object-store ({} rows, {} commits)",
                     fmt_count(n_docs),
-                    supertable::N_COMMIT_CHUNKS
+                    supertable::n_commits()
                 ),
                 note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {

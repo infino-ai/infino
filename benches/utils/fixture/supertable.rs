@@ -40,7 +40,7 @@ pub fn ensure_ingest(reason: &str) -> &'static IngestResult {
         eprintln!(
             "[supertable_all] ingesting {} docs ({} commits) to object storage for {reason}...",
             supertable::n_docs(),
-            supertable::N_COMMIT_CHUNKS
+            supertable::n_commits()
         );
     }
     INGEST.get_or_init(|| {

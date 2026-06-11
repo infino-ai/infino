@@ -27,8 +27,26 @@ use crate::tiers;
 pub fn n_docs() -> usize {
     corpus::supertable_docs()
 }
-/// Ingest commit chunks (not final superfile count).
-pub const N_COMMIT_CHUNKS: usize = 16;
+/// Minimum ingest commit chunks (not final superfile count) — the
+/// fixed shape every run ≤ 50M docs uses.
+const MIN_COMMIT_CHUNKS: usize = 16;
+/// Per-commit doc cap. The ingest working set (builder batch + index
+/// accumulators held through finalize) scales with the commit's doc
+/// count, not the table's — vector ingest measured 21.47 GiB peak at
+/// 50M docs / 16 commits (3.125M docs per commit) on a 31 GiB host.
+/// Capping docs-per-commit at that measured-safe size keeps ingest
+/// RSS flat at any scale: larger runs commit more chunks, not bigger
+/// ones.
+const MAX_DOCS_PER_COMMIT: usize = 3_125_000;
+
+/// Ingest commit count for this run's scale: the fixed 16-commit
+/// shape up to 50M docs, growing past it so no commit exceeds
+/// [`MAX_DOCS_PER_COMMIT`].
+pub fn n_commits() -> usize {
+    n_docs()
+        .div_ceil(MAX_DOCS_PER_COMMIT)
+        .max(MIN_COMMIT_CHUNKS)
+}
 pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
@@ -143,7 +161,7 @@ pub fn options_for(
         return opts;
     }
     let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_segment = (n_cent_total / N_COMMIT_CHUNKS).max(1);
+    let n_cent_per_segment = (n_cent_total / n_commits()).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus::get().max(1))
@@ -236,11 +254,11 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
 /// single-modality competitor.
 pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestResult {
     let n_docs = n_docs();
+    let commits = n_commits();
     eprintln!(
-        "[supertable_ingest] ingesting {} docs ({}) in {} commits to object storage...",
+        "[supertable_ingest] ingesting {} docs ({}) in {commits} commits to object storage...",
         fmt_count(n_docs),
         modality_label(modality),
-        N_COMMIT_CHUNKS,
     );
     let storage_backend = tiers::block_on(tiers::supertable_storage_fixture());
     let cleanup = storage_backend.cleanup.clone();
@@ -255,7 +273,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         .with_cache_prepopulation(false);
     let st = Supertable::create(opts).expect("create supertable");
     let mut w = st.writer().expect("writer");
-    let chunk_size = n_docs.div_ceil(N_COMMIT_CHUNKS);
+    let chunk_size = n_docs.div_ceil(commits);
     let schema = if modality.has_sql() {
         sql_schema()
     } else {
@@ -268,9 +286,9 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         let len = end - start;
         // Progress every ~4 commits (plus first + last) to keep the log
         // readable instead of one line per commit.
-        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx.is_multiple_of(4) {
+        if commit_idx == 1 || commit_idx == commits || commit_idx.is_multiple_of(4) {
             eprintln!(
-                "[supertable_ingest] commit {commit_idx}/{N_COMMIT_CHUNKS} (docs {start}..{})...",
+                "[supertable_ingest] commit {commit_idx}/{commits} (docs {start}..{})...",
                 end.saturating_sub(1),
             );
         }
@@ -289,7 +307,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         // Anonymous-vs-file split per commit: a monotonic anonymous
         // climb = producer-side retention (heap); a file-backed climb
         // = freshly written cache mmaps staying resident.
-        if commit_idx == 1 || commit_idx == N_COMMIT_CHUNKS || commit_idx.is_multiple_of(4) {
+        if commit_idx == 1 || commit_idx == commits || commit_idx.is_multiple_of(4) {
             crate::rss::log_rss_breakdown(&format!("ingest commit {commit_idx}"));
         }
     }
