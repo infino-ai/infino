@@ -60,7 +60,7 @@ use chrono::Utc;
 use object_store::PutPayload;
 use rayon::prelude::*;
 
-use crate::storage::StorageError;
+use crate::storage::{StorageError, StorageProvider};
 use crate::superfile::builder::SuperfileBuilder;
 use crate::superfile::format::CRC_BYTES;
 use crate::superfile::format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr};
@@ -69,6 +69,7 @@ use crate::superfile::format::vec::{
     dir_entry, outer_hdr, sub_hdr,
 };
 use crate::superfile::format::{footer::read_kv_metadata, kv};
+use crate::supertable::CommitError as SupertableCommitError;
 use crate::supertable::manifest::ManifestPartLoader;
 use crate::supertable::manifest::commit as commit_mod;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
@@ -1635,7 +1636,7 @@ pub(in crate::supertable) fn persist_commit(
     inner: &SupertableInner,
     storage: Arc<dyn crate::storage::StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
-    pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
+    mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
 ) -> Result<crate::supertable::Manifest, crate::supertable::CommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -1664,7 +1665,7 @@ pub(in crate::supertable) fn persist_commit(
             // `new_segment_list`.
             let old = inner.manifest.load_full();
             let new_segment_list = old.superfile_list.with_appended(new_entries.clone());
-            let pending_writes = pending_storage_writes.clone();
+            let pending_writes = &mut pending_storage_writes;
 
             match try_commit_attempt(
                 Arc::clone(&storage_async),
@@ -1723,6 +1724,73 @@ pub(in crate::supertable) fn persist_commit(
     })
 }
 
+// Writes the superfile list to storage. Performs the side-effect of modifying pending_storage_writes
+// to remove successfully written entries.
+// Swallow `PreconditionFailed` per-PUT: on a retry after a
+// lost pointer-CAS, the same URI was already written by
+// our prior attempt with bit-identical bytes (segment URIs
+// are UUID v4 — collision rate 2^-122). A "URI exists"
+// hit here means our own prior attempt; treat as success
+// so the retry path is fully idempotent.
+//
+// Size-gated dispatch: superfiles ≥
+// `put_multipart_threshold_bytes` route through
+// `put_multipart` (S3 multipart upload, in-place
+// streaming on LocalFS) instead of a single `put_atomic`
+// PUT. Smaller superfiles stay on the single-PUT path —
+// multipart has per-request overhead that isn't worth
+// the parallelism below the threshold. The default
+// threshold (100 MiB) matches the S3 SDK's standard
+// cutoff.
+pub async fn write_superfile_list(
+    storage: &Arc<dyn StorageProvider>,
+    opts: &Arc<SupertableOptions>,
+    pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
+) -> Result<(), SupertableCommitError> {
+    let multipart_threshold = opts.put_multipart_threshold_bytes;
+    let put_futs = pending_storage_writes
+        .iter_mut()
+        .enumerate()
+        .map(|(i, (uri, bytes))| {
+            let storage = Arc::clone(storage);
+            async move {
+                let path = segment_storage_path(uri);
+                let result = if (bytes.len() as u64) >= multipart_threshold {
+                    put_segment_multipart(storage.as_ref(), &path, bytes.clone()).await
+                } else {
+                    // Segment writes don't chain CAS, so the
+                    // returned etag isn't needed here.
+                    storage.put_atomic(&path, bytes.clone()).await.map(|_| ())
+                };
+                match result {
+                    Ok(()) => Ok(i),
+                    Err(StorageError::PreconditionFailed { .. }) => Ok(i),
+                    Err(e) => Err(SupertableCommitError::from(e)),
+                }
+            }
+        });
+
+    let mut err = None;
+    let mut successful_writes_idx = Vec::with_capacity(put_futs.len());
+
+    for r in futures::future::join_all(put_futs).await.into_iter().rev() {
+        match r {
+            Ok(i) => successful_writes_idx.push(i),
+            Err(e) => err = Some(e),
+        }
+    }
+
+    for idx in successful_writes_idx {
+        pending_storage_writes.remove(idx);
+    }
+
+    if let Some(e) = err {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
 /// One attempt at the commit sequence: write segment bytes
 /// → group new entries by partition → rewrite the latest part
 /// per touched partition (preserving untouched parts' URIs)
@@ -1749,48 +1817,10 @@ async fn try_commit_attempt(
     old: Arc<crate::supertable::Manifest>,
     new_entries: &[Arc<SuperfileEntry>],
     new_manifest_id: u64,
-    pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
-) -> Result<crate::supertable::manifest::list::ManifestList, crate::supertable::CommitError> {
+    pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
+) -> Result<ManifestList, SupertableCommitError> {
     // 1. Write each new segment's bytes to storage in parallel.
-    //
-    // Swallow `PreconditionFailed` per-PUT: on a retry after a
-    // lost pointer-CAS, the same URI was already written by
-    // our prior attempt with bit-identical bytes (segment URIs
-    // are UUID v4 — collision rate 2^-122). A "URI exists"
-    // hit here means our own prior attempt; treat as success
-    // so the retry path is fully idempotent.
-    //
-    // Size-gated dispatch: superfiles ≥
-    // `put_multipart_threshold_bytes` route through
-    // `put_multipart` (S3 multipart upload, in-place
-    // streaming on LocalFS) instead of a single `put_atomic`
-    // PUT. Smaller superfiles stay on the single-PUT path —
-    // multipart has per-request overhead that isn't worth
-    // the parallelism below the threshold. The default
-    // threshold (100 MiB) matches the S3 SDK's standard
-    // cutoff.
-    let multipart_threshold = opts.put_multipart_threshold_bytes;
-    let put_futs = pending_storage_writes.into_iter().map(|(uri, bytes)| {
-        let storage = Arc::clone(&storage);
-        async move {
-            let path = segment_storage_path(&uri);
-            let result = if (bytes.len() as u64) >= multipart_threshold {
-                put_segment_multipart(storage.as_ref(), &path, bytes).await
-            } else {
-                // Segment writes don't chain CAS, so the
-                // returned etag isn't needed here.
-                storage.put_atomic(&path, bytes).await.map(|_| ())
-            };
-            match result {
-                Ok(()) => Ok(()),
-                Err(StorageError::PreconditionFailed { .. }) => Ok(()),
-                Err(e) => Err(crate::supertable::CommitError::from(e)),
-            }
-        }
-    });
-    for r in futures::future::join_all(put_futs).await {
-        r?;
-    }
+    write_superfile_list(&storage, &opts, pending_storage_writes).await?;
 
     // 2. Resolve the effective partition strategy. Locked at
     //    first commit: read from the existing manifest list
