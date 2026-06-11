@@ -173,14 +173,14 @@ impl Supertable {
 
         // Fetch full sidecars (bitmap + seal record) only for segments
         // that actually have a file.
-        let manifest_ids: Vec<Uuid> = manifest
+        let superfile_ids: Vec<Uuid> = manifest
             .superfile_list
             .superfiles
             .iter()
             .map(|e| e.superfile_id)
             .filter(|id| tombstone_ids.contains(id))
             .collect();
-        let sidecar_futs = manifest_ids.iter().map(|id| {
+        let sidecar_futs = superfile_ids.iter().map(|id| {
             let ws = wal_store.clone();
             let id = *id;
             async move { (id, ws.get_tombstones(id).await) }
@@ -229,7 +229,7 @@ impl Supertable {
                         .iter()
                         .find(|e| e.superfile_id == *id)
                         .cloned()
-                        .ok_or(CompactionError::SegmentNotFound(*id))
+                        .ok_or(CompactionError::SuperfileNotFound(*id))
                 })
                 .collect::<Result<_, _>>()?;
 

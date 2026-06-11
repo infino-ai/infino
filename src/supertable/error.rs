@@ -265,7 +265,7 @@ pub enum CompactionError {
     /// A superfile listed in a `CompactionJob` is not present in the
     /// current manifest snapshot.
     #[error("superfile {0} not found in manifest snapshot")]
-    SegmentNotFound(uuid::Uuid),
+    SuperfileNotFound(uuid::Uuid),
 
     /// The tombstone sidecar for `superfile_id` is already sealed by
     /// a different compaction run. Caller must drive the abandoned
