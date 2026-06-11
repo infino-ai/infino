@@ -759,6 +759,7 @@ pub mod vector {
                 &consumer,
                 || SupertableVecColdGuard::open(&built),
                 supertable::VEC_COLUMN,
+                n_docs,
                 TOP_K,
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,

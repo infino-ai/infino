@@ -843,6 +843,7 @@ pub mod vector {
                 index.reader(),
                 open_cold,
                 VEC_COLUMN,
+                n_docs,
                 TOP_K,
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,
