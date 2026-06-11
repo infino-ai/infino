@@ -640,7 +640,8 @@ impl FtsReader {
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        self.search_positive(column_id, terms, k, mode, None).await
+        self.search_with_filters(column_id, terms, k, mode, None)
+            .await
     }
 
     /// BM25 search with negated (`-term`) terms excluded.
@@ -675,12 +676,12 @@ impl FtsReader {
         // check. No negatives → `None`; positive-only queries skip all
         // of this.
         if negatives.is_empty() {
-            self.search_positive(column_id, positives, k, mode, None)
+            self.search_with_filters(column_id, positives, k, mode, None)
                 .await
         } else {
             let mut filter =
                 ExcludeFilter::new(self.build_term_cursors(column_id, negatives).await?);
-            self.search_positive(column_id, positives, k, mode, Some(&mut filter))
+            self.search_with_filters(column_id, positives, k, mode, Some(&mut filter))
                 .await
         }
     }
@@ -688,7 +689,7 @@ impl FtsReader {
     /// Shared dispatch for [`Self::search`] and [`Self::search_excluding`]:
     /// routes positives to the single-term / OR / AND kernel and threads
     /// `filter` through to the heap-admission sites.
-    async fn search_positive(
+    async fn search_with_filters(
         &self,
         column_id: u32,
         terms: &[&str],

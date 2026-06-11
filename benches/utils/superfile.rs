@@ -42,6 +42,7 @@ pub mod fts {
     //! ```
 
     use std::collections::HashMap;
+    use std::hint::black_box;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -268,13 +269,13 @@ pub mod fts {
     /// One warmup call, then `WARM_ITERS` timed calls of `run`; returns
     /// the p50. Shared scaffold for the manual hot-timing paths.
     fn hot_p50<T>(mut run: impl FnMut() -> T) -> Duration {
-        std::hint::black_box(run());
+        black_box(run());
         let mut samples = Vec::with_capacity(WARM_ITERS);
         for _ in 0..WARM_ITERS {
             let t = Instant::now();
             let out = run();
             samples.push(t.elapsed());
-            std::hint::black_box(out);
+            black_box(out);
         }
         p50(&mut samples)
     }
@@ -778,7 +779,7 @@ pub mod vector {
     fn build_row(label: &str, n_docs: usize, wall: Duration, stats: rss::RssStats) -> Vec<Cell> {
         let secs = wall.as_secs_f64();
         let ns = secs * NS_PER_SEC;
-        let input_bytes = (n_docs * DIM * std::mem::size_of::<f32>()) as f64;
+        let input_bytes = (n_docs * DIM * size_of::<f32>()) as f64;
         let thr = n_docs as f64 / secs;
         let bw = input_bytes / secs;
         vec![
@@ -990,11 +991,13 @@ pub mod sql {
     //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile sql
     //! ```
 
-    use crate::executors::sql as exec_sql;
-    use crate::executors::sql::SqlRead;
+    use std::sync::Arc;
+
     use infino::supertable::Supertable;
 
     use crate::corpus::{self, MmapTextCorpus};
+    use crate::executors::sql as exec_sql;
+    use crate::executors::sql::SqlRead;
     use crate::harness::{
         EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
         build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
@@ -1139,7 +1142,7 @@ pub mod sql {
             fmt_count(rows.len())
         );
         let fixture = tiers::block_on(tiers::superfile_storage_fixture());
-        let (cache_dir, cache) = tiers::fresh_disk_cache(std::sync::Arc::clone(&fixture.storage));
+        let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&fixture.storage));
         let opts = sql_options(rows.len())
             .with_storage(std::sync::Arc::clone(&fixture.storage))
             .with_disk_cache(cache.clone())
