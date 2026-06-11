@@ -100,6 +100,30 @@ A real-backend run writes under a unique prefix and deletes it on exit; set
 `INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
 emulator self-cleans and reproduces request/byte volume, not network latency.
 
+## Vector search tuning
+
+The vector benches calibrate each recall target by sweeping a probe/refine
+grid, then report a user-facing `default` row. Three knobs control that row
+and let you skip the sweep:
+
+- `INFINO_BENCH_VECTOR_NPROBE` — probe count for the `default` row (default 8).
+- `INFINO_BENCH_VECTOR_RERANK` — rerank multiplier for the `default` row
+  (default 20).
+- `INFINO_BENCH_SKIP_CALIBRATION=1` — measure **only** the fixed
+  `(nprobe, rerank)` `default` row: skips the correctness gate, the
+  recall-target calibration sweep, and brute-force ground-truth generation.
+  This is the fast path for a fixed-config **cold-only** latency number on a
+  many-segment supertable, where sweeping the full grid over a cold table is
+  prohibitively slow.
+- `INFINO_BENCH_PREFETCH_CONCURRENCY` — disk-cache prefetch fan-out for the
+  cold-fill / promotion path on many-segment tables (default 8).
+
+```sh
+# Fast fixed-config cold vector latency (no calibration sweep):
+INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SKIP_CALIBRATION=1 \
+  INFINO_BENCH_VECTOR_NPROBE=8 INFINO_BENCH_VECTOR_RERANK=4 cargo bench -- supertable vector cold
+```
+
 ## Test Matrix
 
 The matrix is tier × modality — six cells:
