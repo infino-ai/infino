@@ -1823,7 +1823,7 @@ async fn try_commit_attempt(
 
     // 2. Rebalance the manifest for the commit.
     let (out_list_entries, parts_to_write) =
-        commit_mod::rebalance_for_commit(&opts, &old, new_entries).await?;
+        commit_mod::rebalance_for_commit(&opts, &old, new_entries, &[]).await?;
 
     // 3. Build the new manifest list. The options_hash
     //    digest covers (schema, id_column, fts/vector
