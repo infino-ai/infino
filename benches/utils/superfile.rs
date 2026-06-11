@@ -740,6 +740,7 @@ pub mod vector {
                 phases.warm,
                 phases.cold,
                 3,
+                false,
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(

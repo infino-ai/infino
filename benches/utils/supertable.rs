@@ -591,6 +591,30 @@ pub mod vector {
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
 
+    /// `INFINO_BENCH_SKIP_CALIBRATION=1` measures only the fixed
+    /// `(nprobe, rerank)` config — no correctness gate, no recall-target
+    /// grid, no brute-force ground truth. Gives a fast, prod-shaped
+    /// cold-only run without the 54-config calibration sweep.
+    fn skip_calibration() -> bool {
+        std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
+    }
+    /// Fixed probe count for the `default` row, overridable with
+    /// `INFINO_BENCH_VECTOR_NPROBE` (defaults to [`DEFAULT_NPROBE`]).
+    fn fixed_nprobe() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_NPROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_NPROBE)
+    }
+    /// Fixed rerank multiplier for the `default` row, overridable with
+    /// `INFINO_BENCH_VECTOR_RERANK` (defaults to [`DEFAULT_RERANK_MULT`]).
+    fn fixed_rerank_mult() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_RERANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_RERANK_MULT)
+    }
+
     /// Build a vector-only supertable, then measure warm + cold kNN search
     /// at calibrated recall targets (and a default config), with a
     /// correctness recall gate — the same measurement the superfile vector
@@ -658,12 +682,15 @@ pub mod vector {
         }
 
         if phases.warm || phases.cold {
+            let skip_cal = skip_calibration();
+            let nprobe = fixed_nprobe();
+            let rerank = fixed_rerank_mult();
+
             // The ingested vectors are still mmapped from the prepared
             // corpus — reuse them for brute-force ground truth instead
-            // of regenerating 10M×384 floats.
-            eprintln!(
-                "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
-            );
+            // of regenerating 10M×384 floats. Skip-calibration needs no
+            // ground truth (no recall gate / grid), so the expensive
+            // brute-force pass is elided there.
             let vslice = corpus
                 .vectors()
                 .expect("vector modality prepared a vector corpus")
@@ -676,7 +703,6 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_correct = corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K);
             let q_cal = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -685,7 +711,17 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_cal = corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K);
+            let (gt_correct, gt_cal): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if skip_cal {
+                (Vec::new(), Vec::new())
+            } else {
+                eprintln!(
+                    "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
+                );
+                (
+                    corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K),
+                    corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K),
+                )
+            };
 
             // One consumer drives correctness + calibration. Full cache
             // promotion (prewarm + wait_until_warm) only matters for the
@@ -703,7 +739,7 @@ pub mod vector {
                         supertable::VEC_COLUMN,
                         &q_cal[0],
                         TOP_K,
-                        exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
+                        exec_vec::search_opts(nprobe, rerank),
                         None,
                     )
                     .expect("warm prewarm vector_search");
@@ -723,8 +759,8 @@ pub mod vector {
                 || SupertableVecColdGuard::open(&built),
                 supertable::VEC_COLUMN,
                 TOP_K,
-                DEFAULT_NPROBE,
-                DEFAULT_RERANK_MULT,
+                nprobe,
+                rerank,
                 &q_correct,
                 &gt_correct,
                 &q_cal,
@@ -732,6 +768,7 @@ pub mod vector {
                 phases.warm,
                 phases.cold,
                 COLD_ITERS,
+                skip_cal,
                 "supertable_vector",
                 "bench/vector/supertable/search",
                 title,

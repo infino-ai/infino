@@ -40,6 +40,13 @@ const INDEX_CACHE_HEADROOM_DIVISOR: u64 = 10;
 const SUPERFILE_CACHE_GIB: u64 = 4;
 /// Parallel cold-fetch streams used by the bench disk cache.
 const BENCH_COLD_FETCH_STREAMS: usize = 8;
+/// Default concurrent background-fill permits (mirrors the library
+/// default). Override with `INFINO_BENCH_PREFETCH_CONCURRENCY`: warm
+/// promotion runs at most this many segment fills at once, so a
+/// many-segment supertable promotes in `ceil(n_segments / this)` waves —
+/// at the default 8, a 256-segment table needs 32 waves and can miss the
+/// `wait_until_warm` timeout; 64 brings it to 4 waves.
+const BENCH_DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Cold-fetch range chunk size (8 MiB) used by the bench disk cache.
 const BENCH_COLD_FETCH_CHUNK_BYTES: u64 = 8 * MIB_BYTES;
 /// Mmap promotion timers disabled in benches (no idle eviction).
@@ -481,6 +488,20 @@ fn supertable_search_cache_gib() -> Option<u64> {
         .filter(|&v| v > 0)
 }
 
+/// Concurrent background-fill permits for the bench disk cache. Raising
+/// `INFINO_BENCH_PREFETCH_CONCURRENCY` lets a many-segment supertable
+/// finish `wait_until_warm` within the timeout (256 segments promote in
+/// `ceil(256 / concurrency)` waves). Background memory scales as
+/// `concurrency × cold_fetch_streams × cold_fetch_chunk_bytes`, so e.g.
+/// 64 × 8 × 8 MiB ≈ 4 GiB of in-flight fill buffers.
+fn bench_prefetch_concurrency() -> usize {
+    std::env::var("INFINO_BENCH_PREFETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(BENCH_DEFAULT_PREFETCH_CONCURRENCY)
+}
+
 /// Fresh disk cache for ingest producers (8 GiB budget).
 ///
 /// Ingest attaches this cache only to keep segment bytes out of the
@@ -565,6 +586,7 @@ fn fresh_disk_cache_with_mode(
         cold_fetch_mode,
         cold_fetch_streams: BENCH_COLD_FETCH_STREAMS,
         cold_fetch_chunk_bytes: BENCH_COLD_FETCH_CHUNK_BYTES,
+        prefetch_concurrency: bench_prefetch_concurrency(),
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
