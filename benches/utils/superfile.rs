@@ -744,11 +744,9 @@ pub mod vector {
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,
                 queries_correctness(),
-                // The brute-force correctness gate is capped at small
-                // runs; calibration ground truth runs at every scale.
-                (n_docs <= exec_vec::GROUND_TRUTH_MAX_DOCS).then(ground_truth_correctness),
+                ground_truth_correctness(),
                 queries_calibration(),
-                Some(ground_truth_calibration()),
+                ground_truth_calibration(),
                 phases.warm,
                 phases.cold,
                 3,

@@ -687,15 +687,13 @@ pub mod vector {
         if phases.warm || phases.cold {
             // The ingested vectors are still mmapped from the prepared
             // corpus — queries and ground truth come from them instead
-            // of a regeneration. Calibration ground truth is computed
-            // at every scale (the (p, r) recall rows are the product
-            // numbers); only the brute-force correctness gate is
-            // capped at GROUND_TRUTH_MAX_DOCS.
+            // of a regeneration. Both query batches share ONE streamed
+            // oracle pass: the pass is I/O-bound over a corpus several
+            // times RAM, so its cost is corpus bytes, not query count.
             let vslice = corpus
                 .vectors()
                 .expect("vector modality prepared a vector corpus")
                 .as_slice();
-            let with_correctness_gate = n_docs <= exec_vec::GROUND_TRUTH_MAX_DOCS;
             let q_correct = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -712,16 +710,15 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_correct = with_correctness_gate.then(|| {
-                eprintln!(
-                    "[supertable_vector] brute-force ground truth (correctness gate queries)...",
-                );
-                corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K)
-            });
             eprintln!(
-                "[supertable_vector] brute-force ground truth (calibration queries) over the ingested corpus...",
+                "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
+                q_correct.len() + q_cal.len(),
             );
-            let gt_cal = Some(corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K));
+            let all_queries: Vec<Vec<f32>> =
+                q_correct.iter().chain(q_cal.iter()).cloned().collect();
+            let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
+            let gt_cal = gt_all.split_off(q_correct.len());
+            let gt_correct = gt_all;
             // Queries + ground truth extracted; free the corpus pages
             // + temp file so the warm/cold samplers measure the engine
             // only.
@@ -766,9 +763,9 @@ pub mod vector {
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,
                 &q_correct,
-                gt_correct.as_deref(),
+                &gt_correct,
                 &q_cal,
-                gt_cal.as_deref(),
+                &gt_cal,
                 phases.warm,
                 phases.cold,
                 COLD_ITERS,
