@@ -47,7 +47,7 @@
 //! per-shard `SuperfileBuilder::add_batch` call. No bytes copied;
 //! just Arc reference counts.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -71,16 +71,14 @@ use crate::superfile::format::vec::{
 use crate::superfile::format::{footer::read_kv_metadata, kv};
 use crate::supertable::CommitError as SupertableCommitError;
 use crate::supertable::manifest::ManifestPartLoader;
-use crate::supertable::manifest::commit as commit_mod;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
 use crate::supertable::manifest::commit::read_pointer;
+use crate::supertable::manifest::commit::{self as commit_mod, MANIFEST_ZSTD_LEVEL};
 use crate::supertable::manifest::list as list_mod;
-use crate::supertable::manifest::list::ManifestListEntry;
 use crate::supertable::manifest::list::{
     FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
 };
-use crate::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
-use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
+use crate::supertable::manifest::part::{self as part_mod, ManifestPart, PartId};
 use crate::supertable::manifest::{Manifest, SuperfileList};
 
 use super::build::fanout_shards;
@@ -102,12 +100,6 @@ use super::wal::state_doc::{
     IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
     WalStateDoc,
 };
-
-/// Zstd compression level for manifest parts and the manifest list.
-/// Level 3 is zstd's own default — a balanced ratio/speed point that
-/// keeps commit latency low while compressing the Avro-encoded
-/// manifest well. (Valid range is 1..=22.)
-const MANIFEST_ZSTD_LEVEL: i32 = 3;
 
 /// Single-writer append + commit handle.
 ///
@@ -1829,130 +1821,22 @@ async fn try_commit_attempt(
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(&storage, &opts, pending_storage_writes).await?;
 
-    // 2. Resolve the effective partition strategy. Locked at
-    //    first commit: read from the existing manifest list
-    //    if present, else use the options default.
-    let strategy: PartitionStrategy = old
-        .list
-        .as_ref()
-        .map(|l| l.partition_strategy.clone())
-        .unwrap_or_else(|| opts.effective_partition_strategy());
+    // 2. Rebalance the manifest for the commit.
+    let (out_list_entries, parts_to_write) =
+        commit_mod::rebalance_for_commit(&opts, &old, new_entries).await?;
 
-    // 3. Group new entries by partition_key (the on-disk
-    //    encoding the list + parts carry).
-    let mut new_by_partition: BTreeMap<Vec<u8>, Vec<Arc<SuperfileEntry>>> = BTreeMap::new();
-    for entry in new_entries {
-        let pk = assign_partition(entry, &strategy)?;
-        new_by_partition
-            .entry(encode_partition_key(&pk))
-            .or_default()
-            .push(Arc::clone(entry));
-    }
-
-    // 4. Walk the existing list entries, classify each by
-    //    whether it's the *latest* entry for its partition.
-    //    The plan's "rewrite latest part" policy: only the
-    //    most recent entry per partition is a candidate for
-    //    rewrite; older entries for the same partition (from
-    //    a prior part-split) carry over unchanged.
-    let mut latest_index_for_partition: HashMap<Vec<u8>, usize> = HashMap::new();
-    if let Some(old_list) = old.list.as_ref() {
-        for (i, entry) in old_list.parts.iter().enumerate() {
-            latest_index_for_partition.insert(entry.partition_key.clone(), i);
-        }
-    }
-
-    // The output list entries — built incrementally as we
-    // walk existing entries + emit new ones for cold
-    // partitions. Order: existing entries (touched ones
-    // replaced in place; untouched preserved) followed by
-    // entries for cold partitions.
-    let mut out_list_entries: Vec<ManifestListEntry> = Vec::new();
-    let mut parts_to_write: Vec<ManifestPart> = Vec::new();
-    let mut handled_partitions: HashSet<Vec<u8>> = HashSet::new();
-
-    if let Some(old_list) = old.list.as_ref() {
-        for (i, entry) in old_list.parts.iter().enumerate() {
-            let is_latest_for_partition = latest_index_for_partition
-                .get(&entry.partition_key)
-                .copied()
-                == Some(i);
-            let touched = new_by_partition.contains_key(&entry.partition_key);
-
-            if is_latest_for_partition && touched {
-                // Rewrite path: rebuild this part with its
-                // existing superfiles + the new ones for this
-                // partition.
-                let new_for_pk = new_by_partition
-                    .remove(&entry.partition_key)
-                    .expect("touched implies present");
-                let existing_part = old.part(entry.part_id).await.map_err(|e| {
-                    crate::supertable::CommitError::PointerParse(format!(
-                        "loading existing part {} for partition rewrite: {e}",
-                        entry.part_id.0
-                    ))
-                })?;
-                let combined_n = existing_part.superfiles.len() + new_for_pk.len();
-                let combined_superfiles: Vec<Arc<SuperfileEntry>> = existing_part
-                    .superfiles
-                    .iter()
-                    .cloned()
-                    .chain(new_for_pk)
-                    .collect();
-
-                if combined_n as u64 > opts.target_superfiles_per_partition {
-                    // Split: keep the existing entry as-is
-                    // (older split entry from now on) and
-                    // emit a fresh part with just the new
-                    // superfiles for this partition.
-                    out_list_entries.push(entry.clone());
-                    let new_segs: Vec<Arc<SuperfileEntry>> =
-                        combined_superfiles[existing_part.superfiles.len()..].to_vec();
-                    let (fresh_entry, fresh_part) =
-                        build_part_and_entry(&opts, new_segs, entry.partition_key.clone())?;
-                    out_list_entries.push(fresh_entry);
-                    parts_to_write.push(fresh_part);
-                } else {
-                    // Rewrite: replace this entry with the
-                    // combined-superfiles part.
-                    let (rebuilt_entry, rebuilt_part) = build_part_and_entry(
-                        &opts,
-                        combined_superfiles,
-                        entry.partition_key.clone(),
-                    )?;
-                    out_list_entries.push(rebuilt_entry);
-                    parts_to_write.push(rebuilt_part);
-                }
-                handled_partitions.insert(entry.partition_key.clone());
-            } else {
-                // Carry over: either an older entry for a
-                // touched partition (handled when we hit the
-                // latest), or an entry for an untouched
-                // partition. Either way, content-hash + URI
-                // unchanged — no re-encode, no PUT.
-                out_list_entries.push(entry.clone());
-            }
-        }
-    }
-
-    // Cold partitions (touched but no prior entry): emit a
-    // fresh part with just the new superfiles.
-    for (pk, new_for_pk) in new_by_partition {
-        if handled_partitions.contains(&pk) {
-            continue;
-        }
-        let (fresh_entry, fresh_part) = build_part_and_entry(&opts, new_for_pk, pk)?;
-        out_list_entries.push(fresh_entry);
-        parts_to_write.push(fresh_part);
-    }
-
-    // 5. Build the new manifest list. The options_hash
+    // 3. Build the new manifest list. The options_hash
     //    digest covers (schema, id_column, fts/vector
     //    column declarations, partition strategy);
     //    Supertable::open validates the caller's options
     //    against this so a schema mismatch surfaces as a
     //    typed error rather than a downstream decode
     //    failure.
+    let strategy: PartitionStrategy = old
+        .list
+        .as_ref()
+        .map(|l| l.partition_strategy.clone())
+        .unwrap_or_else(|| opts.effective_partition_strategy());
     let opts_hash =
         crate::supertable::manifest::options_hash::compute_options_hash(opts.as_ref(), &strategy);
     let new_list = ManifestList {
@@ -1983,12 +1867,12 @@ async fn try_commit_attempt(
         parts: out_list_entries,
     };
 
-    // 6. Read the prior pointer's etag for the CAS. Fresh
+    // 4. Read the prior pointer's etag for the CAS. Fresh
     //    supertable → no pointer yet → None etag (initial
     //    commit).
     let prev_etag = get_current_manifest_etag(&storage, old).await?;
 
-    // 7. Parallel-issue (touched parts) + list PUTs, then
+    // 5. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
     //    Untouched parts are NOT re-PUT — their URIs (and
     //    content-hashes) are unchanged in the new list.
@@ -2007,51 +1891,6 @@ async fn try_commit_attempt(
     let _ = std::marker::PhantomData::<(PartId, part_mod::ContentHash)>;
 
     Ok(new_list)
-}
-
-/// build one `ManifestPart` from `superfiles` + the
-/// matching `ManifestListEntry`. Encodes the part once,
-/// content-hashes it, and computes the list-level aggregate
-/// skip summaries that `list_prune` reads at query time.
-fn build_part_and_entry(
-    opts: &SupertableOptions,
-    superfiles: Vec<Arc<SuperfileEntry>>,
-    partition_key: Vec<u8>,
-) -> Result<
-    (
-        crate::supertable::manifest::list::ManifestListEntry,
-        crate::supertable::manifest::part::ManifestPart,
-    ),
-    crate::supertable::CommitError,
-> {
-    let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
-
-    let part = ManifestPart {
-        format_version: part_mod::FORMAT_VERSION.into(),
-        part_id: PartId::new_v4(),
-        superfiles,
-    };
-    let compressed = part_mod::encode(&part, MANIFEST_ZSTD_LEVEL);
-    let size_compressed = compressed.len() as u64;
-    let content_hash = ContentHash::of(&compressed);
-    let size_uncompressed = zstd::stream::decode_all(compressed.as_slice())
-        .map(|v| v.len() as u64)
-        .unwrap_or(size_compressed);
-    let aggregates = crate::supertable::manifest::aggregates::compute(&part.superfiles);
-    let entry = ManifestListEntry {
-        part_id: part.part_id,
-        uri: commit_mod::part_uri(&content_hash),
-        n_superfiles: part.superfiles.len() as u64,
-        size_bytes_compressed: size_compressed,
-        size_bytes_uncompressed: size_uncompressed,
-        content_hash,
-        partition_key,
-        id_range: aggregates.id_range,
-        scalar_stats_agg: aggregates.scalar_stats_agg,
-        fts_summary_agg: aggregates.fts_summary_agg,
-        vector_summary_agg: aggregates.vector_summary_agg,
-    };
-    Ok((entry, part))
 }
 
 /// Re-read the manifest pointer from storage, load any newer
