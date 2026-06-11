@@ -195,11 +195,11 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError>;
 
-    /// Streaming multipart upload — for segments larger than
+    /// Streaming multipart upload — for superfiles larger than
     /// `SupertableOptions::put_multipart_threshold_bytes`
     /// (default 100 MB), the writer routes through this path
     /// instead of `put_atomic` to avoid buffering the whole
-    /// segment in RAM during commit.
+    /// superfile in RAM during commit.
     ///
     /// Returns the underlying `object_store::MultipartUpload`
     /// handle; callers drive it via its own `put_part` /
@@ -239,7 +239,7 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// Used by the SQL scan and search-hit row resolution to hand
     /// DataFusion's `ParquetSource` the real object store so it issues
     /// async footer / row-group / page range GETs against object
-    /// storage, instead of buffering whole segments into memory.
+    /// storage, instead of buffering whole superfiles into memory.
     ///
     /// `None` for providers without a native `object_store` handle
     /// (mocks / in-memory test doubles); those callers fall back to the

@@ -9,11 +9,11 @@ and as a search index by infino's reader.
 ## Links
 
 - **[Superfile architecture →](docs/architecture/superfile.md)** —
-  the single-file segment format: a valid Parquet file with embedded
+  the single-file superfile format: a valid Parquet file with embedded
   full-text and vector indexes. Covers the layout, Parquet
   compatibility, and the full-text and vector index design.
 - **[Supertable architecture →](docs/architecture/supertable.md)** —
-  the table layer over superfile segments: manifest snapshots, the
+  the table layer over superfile superfiles: manifest snapshots, the
   commit/publish path, pluggable storage, query fan-out with
   manifest-only skip pruning, and reader/writer concurrency.
 
@@ -54,7 +54,7 @@ let db = connect("memory://")?; // or "./data", "s3://bucket/prefix"
 let schema = Arc::new(Schema::new(vec![Field::new("title", DataType::LargeUtf8, false)]));
 let docs = db.create_table("docs", schema.clone(), IndexSpec::new().fts("title"))?;
 
-// One `append` == one commit == one sealed, immutable segment.
+// One `append` == one commit == one sealed, immutable superfile.
 let batch = RecordBatch::try_new(
     schema,
     vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))],
@@ -68,7 +68,7 @@ docs.append(&batch)?;
 let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
 assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
-// SQL across the catalog — every segment is also a valid Parquet file.
+// SQL across the catalog — every superfile is also a valid Parquet file.
 let rows = db.query_sql("SELECT _id, title FROM docs")?;
 assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -152,7 +152,7 @@ GROUP BY category;
 
 Equality, `IN`, and boolean combinations on an indexed text column
 resolve through the index to an exact candidate row set before any
-column data is read. Segments that can't match are never opened at all:
+column data is read. Superfiles that can't match are never opened at all:
 term blooms, value ranges, and vector centroids live side by side in the
 manifest, so scalar, keyword, and vector signals prune through one
 shared layer.

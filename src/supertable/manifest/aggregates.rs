@@ -14,19 +14,19 @@
 //!   bytes (same encoding `ManifestListEntry` uses).
 //! - `fts_summary_agg.term_range_union`: per FTS column,
 //!   `(min(min_term), max(max_term))` across superfiles with
-//!   non-empty FSTs. Absent (`None`) if every segment's FST
+//!   non-empty FSTs. Absent (`None`) if every superfile's FST
 //!   for that column is empty.
 //! - `vector_summary_agg`: per vector column, mean-of-
-//!   centroids + max(distance + segment_radius). Bounds every
-//!   segment's vector ball with one outer ball, so the
+//!   centroids + max(distance + superfile_radius). Bounds every
+//!   superfile's vector ball with one outer ball, so the
 //!   list-level vector skip is correct by construction (no
 //!   false negatives).
 //!
 //! `fts_summary_agg.term_bloom_union` is currently emitted
 //! empty (interpreted as "always-keep" by the list-level
 //! pruner) and `n_terms_distinct` as 0; HLL-sized blooms over
-//! the union of per-segment FSTs would require a per-commit
-//! cardinality estimate over each segment's terms.
+//! the union of per-superfile FSTs would require a per-commit
+//! cardinality estimate over each superfile's terms.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -49,7 +49,7 @@ pub struct AggregateSet {
 }
 
 /// Build the aggregate set for one manifest part from its
-/// segment list.
+/// superfile list.
 ///
 /// Empty `superfiles` → all-default `AggregateSet` (id_range
 /// `(0, 0)`, empty maps). The list-level pruner treats empty
@@ -76,7 +76,7 @@ pub fn compute(superfiles: &[Arc<SuperfileEntry>]) -> AggregateSet {
 // ---------------------------------------------------------
 
 fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, ScalarStatsAgg> {
-    // Gather, per column, all per-segment (min, max) ArrayRefs.
+    // Gather, per column, all per-superfile (min, max) ArrayRefs.
     let mut per_column: HashMap<String, (Vec<ArrayRef>, Vec<ArrayRef>)> = HashMap::new();
     for seg in superfiles {
         for (col, (mn, mx)) in &seg.scalar_stats.cols {
@@ -227,10 +227,10 @@ fn ipc_encode_length1(col_name: &str, arr: &ArrayRef) -> Vec<u8> {
 // FTS summary aggregate: term_range_union + term_bloom_union.
 // ---------------------------------------------------------
 //
-// Bloom union is the bit-OR of each segment's bloom for the
+// Bloom union is the bit-OR of each superfile's bloom for the
 // column. Same bloom-shape across all superfiles (the writer
 // builds with `BloomBuilder::new()` — fixed `DEFAULT_N_BLOCKS`
-// + xxh3_64), so bit-OR preserves "any segment contained
+// + xxh3_64), so bit-OR preserves "any superfile contained
 // this term" with the same FPR. The block-and-mask scheme
 // `Bloom::contains` uses is positional, not arithmetic,
 // so bit-OR is exact for the union semantic. The
@@ -243,7 +243,7 @@ type FtsColumnAccumulator = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, 
 fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSummaryAgg> {
     // Per-column accumulators: (min, max, union-bloom-bytes,
     // n_blocks). The union bloom starts at zero-init the
-    // first time we see a segment with a populated bloom for
+    // first time we see a superfile with a populated bloom for
     // that column; subsequent superfiles bit-OR into it.
     let mut per_column: HashMap<String, FtsColumnAccumulator> = HashMap::new();
     for seg in superfiles {
@@ -262,7 +262,7 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
                     _ => entry.1 = Some(summary.term_range.1.clone()),
                 }
             }
-            // Union the segment's bloom into the part-level
+            // Union the superfile's bloom into the part-level
             // bloom. Skip zero-length blooms (superfiles with
             // no FST entries for this column).
             let seg_bytes = summary.term_bloom.to_bytes();
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_stats_agg_unions_utf8_min_max_across_segments() {
+    fn scalar_stats_agg_unions_utf8_min_max_across_superfiles() {
         let segs = vec![
             seg_with_string_minmax("title", "alpha", "delta", false),
             seg_with_string_minmax("title", "bravo", "echo", false),
@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_stats_agg_unions_large_utf8_min_max_across_segments() {
+    fn scalar_stats_agg_unions_large_utf8_min_max_across_superfiles() {
         let segs = vec![
             seg_with_string_minmax("body", "mango", "papaya", true),
             seg_with_string_minmax("body", "apple", "orange", true),

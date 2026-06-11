@@ -712,7 +712,7 @@ impl SuperfileBuilder {
             ));
         }
 
-        // A segment has three independent build outputs: the scalar /
+        // A superfile has three independent build outputs: the scalar /
         // relational Parquet body (the SQL-queryable columns), the FTS
         // blob, and the vector blob. None reads another's bytes — blobs
         // are appended after the last row group, and FTS/vector

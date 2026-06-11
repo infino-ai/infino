@@ -103,7 +103,7 @@ pub enum BuildError {
     )]
     SupertableInUse,
 
-    #[error("segment store: {0}")]
+    #[error("superfile store: {0}")]
     Store(String),
 
     #[error("rayon thread pool creation failed: {0}")]
@@ -169,17 +169,17 @@ pub enum CommitError {
     #[error("write contention exhausted retries")]
     WriteContentionExhausted,
 
-    /// A segment's column range spans multiple
+    /// A superfile's column range spans multiple
     /// partitions under the configured `PartitionStrategy`.
-    /// For `TimeRange` / `ColumnRange`, the segment's
+    /// For `TimeRange` / `ColumnRange`, the superfile's
     /// `(min, max)` straddles a bucket boundary. For `Hash`,
-    /// the segment's `partition_hint` is unset — the writer
+    /// the superfile's `partition_hint` is unset — the writer
     /// didn't pre-shard.
     ///
     /// Single-bucket Hash strategies (`n_buckets == 1`) are
     /// special-cased to bypass this check, since every
     /// possible value hashes to bucket 0.
-    #[error("segment spans partition boundary: {detail}")]
+    #[error("superfile spans partition boundary: {detail}")]
     SuperfileSpansPartition { detail: String },
 }
 
@@ -243,7 +243,7 @@ pub enum OpenError {
     /// inconsistent with the on-disk supertable (schema /
     /// partition strategy / id column changed) or the
     /// manifest was written by a different supertable.
-    /// Surfaced ahead of any per-segment decode so callers
+    /// Surfaced ahead of any per-superfile decode so callers
     /// see a typed mismatch instead of a downstream parquet
     /// or arrow error.
     ///
@@ -266,7 +266,7 @@ pub enum OpenError {
 /// failed mid-scan".
 #[derive(Debug, Error)]
 pub enum QueryError {
-    #[error("segment store error during query: {0}")]
+    #[error("superfile store error during query: {0}")]
     Store(String),
 
     #[error("error reading parquet bytes during scan: {0}")]

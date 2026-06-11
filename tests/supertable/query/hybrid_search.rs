@@ -4,10 +4,10 @@
 //! Public-API integration coverage for the `hybrid_search` SQL TVF.
 //!
 //! `hybrid_exec.rs` carries the in-crate unit tests (RRF math, single
-//! segment). This file exercises the function the way a consumer does:
+//! superfile). This file exercises the function the way a consumer does:
 //! through the published `infino::supertable::Supertable::query_sql`
-//! surface, over a **multi-segment** corpus so the BM25 + vector
-//! retrievers fan out across segments and fuse the cross-segment
+//! surface, over a **multi-superfile** corpus so the BM25 + vector
+//! retrievers fan out across superfiles and fuse the cross-superfile
 //! results. It pins three contracts the plan promises:
 //!
 //!   1. `SELECT *` over `hybrid_search(...)` yields the scalar schema
@@ -100,11 +100,11 @@ fn build_batch(titles: &[&str], base_dim: usize, schema: Arc<Schema>) -> RecordB
     RecordBatch::try_new(schema, vec![Arc::new(title_arr), Arc::new(fsl)]).expect("batch")
 }
 
-/// Two-segment corpus (docs 0-7, then 8-15). `rust` is sprinkled
-/// across both segments; `async` is unique to doc 0. Doc `i`'s
+/// Two-superfile corpus (docs 0-7, then 8-15). `rust` is sprinkled
+/// across both superfiles; `async` is unique to doc 0. Doc `i`'s
 /// embedding is one-hot at dim `i`, so a one-hot query at dim 0 is the
 /// exact nearest neighbour of doc 0.
-fn demo_two_segments() -> Supertable {
+fn demo_two_superfiles() -> Supertable {
     let st = Supertable::create(options_title_emb()).expect("create");
     let schema = st.options().schema.clone();
     let mut w = st.writer().expect("writer");
@@ -192,7 +192,7 @@ fn scores(batches: &[RecordBatch]) -> Vec<f32> {
 
 #[test]
 fn hybrid_search_star_projection_exposes_scalar_schema_plus_score() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     let batches = st
         .reader()
         .query_sql(&format!(
@@ -213,8 +213,8 @@ fn hybrid_search_star_projection_exposes_scalar_schema_plus_score() {
 }
 
 #[test]
-fn hybrid_search_identity_set_is_union_of_subsearches_across_segments() {
-    let st = demo_two_segments();
+fn hybrid_search_identity_set_is_union_of_subsearches_across_superfiles() {
+    let st = demo_two_superfiles();
     let qv = csv_one_hot(0);
     // k ≥ the total doc count (16) so RRF never truncates the fused
     // list — the union equality only holds when |bm25 ∪ vector| ≤ k.
@@ -242,9 +242,12 @@ fn hybrid_search_identity_set_is_union_of_subsearches_across_segments() {
             .expect("vector query_sql"),
     );
 
-    // Both retrievers must actually return hits from each segment for
-    // this to be a meaningful cross-segment union (guards corpus drift).
-    assert!(bm25.len() >= 4, "'rust' should match across both segments");
+    // Both retrievers must actually return hits from each superfile for
+    // this to be a meaningful cross-superfile union (guards corpus drift).
+    assert!(
+        bm25.len() >= 4,
+        "'rust' should match across both superfiles"
+    );
     assert!(!vector.is_empty(), "vector retriever returned nothing");
 
     let expected: HashSet<i128> = bm25.union(&vector).copied().collect();
@@ -256,7 +259,7 @@ fn hybrid_search_identity_set_is_union_of_subsearches_across_segments() {
 
 #[test]
 fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     // `async` is unique to doc 0 (BM25 rank 1); a one-hot query at dim
     // 0 makes doc 0 the exact vector match (rank 1). Top in both →
     // highest RRF → emitted first.

@@ -17,7 +17,7 @@
 //! Eager at the blob level (both blobs sliced once at `open()`), lazy
 //! within each blob (per-(column,term) postings + per-cluster vector
 //! codes are read on-demand by the underlying readers). The
-//! single-segment SuperfileReader does no I/O after `open()`; a
+//! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
 use std::sync::Arc;
@@ -74,7 +74,7 @@ impl Default for OpenOptions {
 pub struct SuperfileReader {
     /// Full Parquet bytes, `Some` only for the eager [`open`]
     /// path. The lazy [`open_lazy`] path drops the
-    /// whole-segment hold — pass-through SQL / external-Parquet
+    /// whole-superfile hold — pass-through SQL / external-Parquet
     /// callers (`parquet_bytes`) see `None` and must take a
     /// different path. Vector + FTS queries work on either,
     /// since each carries its own source under the inner readers.
@@ -89,7 +89,7 @@ pub struct SuperfileReader {
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
     /// [`byte_source`](Self::byte_source) hand callers one uniform
-    /// whole-segment byte source regardless of how the reader opened.
+    /// whole-superfile byte source regardless of how the reader opened.
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     /// [`open`]: SuperfileReader::open
@@ -141,7 +141,7 @@ impl SuperfileReader {
     /// fetch centroids, cluster indexes, and per-cluster blocks on
     /// demand via the source.
     ///
-    /// The returned reader does **not** hold the full segment;
+    /// The returned reader does **not** hold the full superfile;
     /// `parquet_bytes()` returns `None`. Callers that need the
     /// full Parquet bytes (DataFusion register, DuckDB,
     /// pyarrow) must use the eager [`open`] path.
@@ -155,12 +155,12 @@ impl SuperfileReader {
 
     /// Like [`open_lazy`] but with explicit [`OpenOptions`].
     ///
-    /// Lazy opens do not run whole-segment CRC scans. Forcing CRC
-    /// verification here would require reading the full segment through
+    /// Lazy opens do not run whole-superfile CRC scans. Forcing CRC
+    /// verification here would require reading the full superfile through
     /// range GETs, which is exactly what the lazy path is meant to avoid;
     /// the embedded vector/FTS lazy readers therefore use their
     /// object-store options (`verify_crc = false`) while eager cache
-    /// promotion can verify after the full segment is materialized.
+    /// promotion can verify after the full superfile is materialized.
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
@@ -445,7 +445,7 @@ impl SuperfileReader {
     /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
     ///
     /// Returns `None` for readers opened via [`open_lazy`] — the
-    /// lazy path does not materialize the full segment,
+    /// lazy path does not materialize the full superfile,
     /// so external-Parquet pass-throughs need either the eager
     /// [`open`] path or an explicit `LazyByteSource::range(0, size)`
     /// against the source.
@@ -502,7 +502,7 @@ impl SuperfileReader {
         Ok(record_batch)
     }
 
-    /// A [`LazyByteSource`] over the **entire** segment, regardless of
+    /// A [`LazyByteSource`] over the **entire** superfile, regardless of
     /// how the reader was opened. The single byte-access handle the
     /// SQL/DataFusion path reads through -- callers never branch on
     /// storage mode:
@@ -527,19 +527,19 @@ impl SuperfileReader {
         }
     }
 
-    /// Resolve in-segment row offsets to their durable identity.
+    /// Resolve in-superfile row offsets to their durable identity.
     ///
-    /// Given a slice of `local_doc_id`s — the per-segment row
+    /// Given a slice of `local_doc_id`s — the per-superfile row
     /// offsets produced by [`bm25_search`](Self::bm25_search) /
     /// [`vector_search`](Self::vector_search) and carried in a
     /// `SuperfileHit` — return a [`RecordBatch`] of the requested
     /// `projection` columns at exactly those rows, in the same
     /// order as `local_doc_ids`. This is the bridge from a hit's
-    /// `(segment, local_doc_id)` to the supertable's durable `_id`
+    /// `(superfile, local_doc_id)` to the supertable's durable `_id`
     /// plus any projected scalar columns: pass
     /// [`id_column`](Self::id_column) in `projection` to recover the
     /// primary key, and zip the result rows back to the per-hit
-    /// scores positionally (row `i` is the segment row at
+    /// scores positionally (row `i` is the superfile row at
     /// `local_doc_ids[i]`).
     ///
     /// Output columns are `projection` in the given order (not file
@@ -617,7 +617,7 @@ impl SuperfileReader {
         // only pays the projected-column page decode. The page index
         // (when present) lets `RowSelection` seek to the relevant
         // pages. CPU-bound over in-memory bytes — callers fan these
-        // across `options.reader_pool` for cross-segment parallelism.
+        // across `options.reader_pool` for cross-superfile parallelism.
         let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
         let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
         let reader = builder
@@ -677,7 +677,7 @@ impl SuperfileReader {
         let bytes = self.bytes.clone().ok_or_else(|| {
             ReadError::Io(std::io::Error::other(
                 "id_lookup requires an eager-opened superfile; this reader was opened via \
-                 the lazy path and does not hold the full segment bytes",
+                 the lazy path and does not hold the full superfile bytes",
             ))
         })?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
@@ -760,11 +760,11 @@ impl SuperfileReader {
     /// supplies the already-tokenized term slice and we skip the
     /// `AsciiLowerTokenizer` pass.
     ///
-    /// Used by the supertable layer's fan-out: the cross-segment
+    /// Used by the supertable layer's fan-out: the cross-superfile
     /// search tokenizes the query once at the orchestrator (to
     /// compute the bloom-skip mask) and then passes the same
-    /// `terms` slice to every per-segment search, avoiding
-    /// `(N+1)·T` redundant tokenizations across N segments and
+    /// `terms` slice to every per-superfile search, avoiding
+    /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
     /// Terms must be already lower-cased ASCII alphanumeric tokens
@@ -870,7 +870,7 @@ impl SuperfileReader {
     /// Pre-tokenized BM25 search with negated terms excluded — the
     /// negation sibling of [`Self::bm25_search_pretokenized`]. The
     /// supertable fan-out parses the `-` sigil once at the orchestrator
-    /// and hands every segment the split lists through here.
+    /// and hands every superfile the split lists through here.
     pub(crate) async fn bm25_search_pretokenized_excluding(
         &self,
         column: &str,
@@ -931,8 +931,8 @@ impl SuperfileReader {
     ///
     /// Mirrors [`Self::bm25_search_pretokenized`] in `BoolMode::Or`
     /// shape but only scores docs in `[doc_id_start, doc_id_end)`.
-    /// Used by the supertable layer's intra-segment parallel
-    /// fan-out: the supertable splits each segment into N
+    /// Used by the supertable layer's intra-superfile parallel
+    /// fan-out: the supertable splits each superfile into N
     /// equal-width sub-ranges, runs one call per sub-range in
     /// parallel on the reader pool, then merges the per-sub-range
     /// top-K heaps.
@@ -963,7 +963,7 @@ impl SuperfileReader {
     /// AsciiLower the prefix, walk the FST for matching terms, run
     /// BM25 OR over the term set — but only docs in
     /// `[doc_id_start, doc_id_end)` are eligible. Used by the
-    /// supertable layer's intra-segment parallel fan-out on prefix
+    /// supertable layer's intra-superfile parallel fan-out on prefix
     /// queries; the per-sub-range expansion is identical (same FST,
     /// same column) so each sub-range expands locally rather than
     /// passing pre-expanded terms across the task boundary.
@@ -1019,7 +1019,7 @@ impl SuperfileReader {
     ///
     /// Async — consistent with [`Self::bm25_search`]: the reader's
     /// search surfaces are `async` so the supertable fan-out can drive
-    /// every segment concurrently on the shared query runtime. The
+    /// every superfile concurrently on the shared query runtime. The
     /// public `Supertable` API remains strictly sync; it wraps these
     /// kernels in `block_on_query`. Per-range byte access
     /// routes through
@@ -1048,8 +1048,8 @@ impl SuperfileReader {
     }
 
     /// As [`Self::vector_search`], but probes an **externally chosen**
-    /// set of IVF cluster ids — selected globally across segments from
-    /// the manifest's per-cluster centroids — instead of this segment's
+    /// set of IVF cluster ids — selected globally across superfiles from
+    /// the manifest's per-cluster centroids — instead of this superfile's
     /// own `nprobe` centroid scoring. `rerank_mult` is still derived from
     /// `options`; `options.nprobe` is unused on this path.
     pub async fn vector_search_clusters(

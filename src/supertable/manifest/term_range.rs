@@ -3,25 +3,25 @@
 
 //! Lex term range — the second skip-pruning summary per FTS column.
 //!
-//! Where the bloom drives **exact-term** skip ("does this segment
+//! Where the bloom drives **exact-term** skip ("does this superfile
 //! contain term X?"), the term range drives **prefix-query** skip
-//! ("could this segment contain any term starting with prefix P?").
+//! ("could this superfile contain any term starting with prefix P?").
 //! Stored on `FtsSummary` as `(min_term, max_term)` — the
-//! lex-smallest and lex-largest terms in the segment's FST for
+//! lex-smallest and lex-largest terms in the superfile's FST for
 //! that column.
 //!
-//! A prefix `p` matches some term in the segment iff the half-open
+//! A prefix `p` matches some term in the superfile iff the half-open
 //! lex interval `[p, prefix_upper_bound(p))` overlaps the
-//! segment's `[min_term, max_term]`. The two helpers below — one
+//! superfile's `[min_term, max_term]`. The two helpers below — one
 //! to compute `prefix_upper_bound` and one to check overlap — are
-//! the entire skip operation; the manifest's segment list scan
-//! does this comparison once per segment, before any byte of
+//! the entire skip operation; the manifest's superfile list scan
+//! does this comparison once per superfile, before any byte of
 //! payload is touched.
 //!
 //! # Edge cases
 //!
 //! - **Empty prefix** matches every term, so there's no upper
-//!   bound and the range overlaps every non-empty segment.
+//!   bound and the range overlaps every non-empty superfile.
 //! - **All-`0xFF` prefix** has no successor in the byte ordering
 //!   (you can't increment past `0xFF`); only terms that are
 //!   exactly `prefix` or are lex-greater starting with all-`0xFF`
@@ -72,11 +72,11 @@ pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// `prefix`.
 ///
 /// Concretely: the half-open interval `[prefix,
-/// prefix_upper_bound(prefix))` overlaps the segment's closed
+/// prefix_upper_bound(prefix))` overlaps the superfile's closed
 /// interval `[min_term, max_term]`.
 ///
 /// Used by the prefix-query skip helper to decide whether to fan
-/// out into a segment. False positives over-fetch (segment is
+/// out into a superfile. False positives over-fetch (superfile is
 /// scanned but no term matches) — acceptable. False negatives
 /// under-fetch — never allowed; would silently drop matching
 /// terms.
@@ -85,7 +85,7 @@ pub fn prefix_overlaps_range(prefix: &[u8], min_term: &[u8], max_term: &[u8]) ->
     if prefix.is_empty() {
         return true;
     }
-    // The segment's max term must be ≥ the prefix itself, OR
+    // The superfile's max term must be ≥ the prefix itself, OR
     // start with the prefix. Equivalently: max_term must be ≥ prefix
     // when compared lex.
     if max_term < prefix {
@@ -221,23 +221,23 @@ mod tests {
 
     #[test]
     fn prefix_inside_range_overlaps() {
-        // segment's terms are in [b"checkin", b"checkout"], prefix
+        // superfile's terms are in [b"checkin", b"checkout"], prefix
         // "check" should overlap.
         assert!(prefix_overlaps_range(b"check", b"checkin", b"checkout"));
-        // Single-term segment matching the prefix.
+        // Single-term superfile matching the prefix.
         assert!(prefix_overlaps_range(b"err", b"errand", b"errand"));
     }
 
     #[test]
     fn prefix_above_max_term_does_not_overlap() {
-        // segment terms ≤ "alpha", prefix "beta" can't appear.
+        // superfile terms ≤ "alpha", prefix "beta" can't appear.
         assert!(!prefix_overlaps_range(b"beta", b"a", b"alpha"));
         assert!(!prefix_overlaps_range(b"zzz", b"a", b"y"));
     }
 
     #[test]
     fn prefix_below_min_term_does_not_overlap() {
-        // segment terms ≥ "g", prefix "a" can't appear (since
+        // superfile terms ≥ "g", prefix "a" can't appear (since
         // every "a..." is < "g").
         assert!(!prefix_overlaps_range(b"a", b"g", b"z"));
         assert!(!prefix_overlaps_range(b"abc", b"def", b"xyz"));
@@ -245,13 +245,13 @@ mod tests {
 
     #[test]
     fn prefix_equals_min_term_overlaps() {
-        // Segment min is exactly the prefix.
+        // Superfile min is exactly the prefix.
         assert!(prefix_overlaps_range(b"err", b"err", b"erz"));
     }
 
     #[test]
     fn prefix_equals_max_term_overlaps() {
-        // Segment max is exactly the prefix.
+        // Superfile max is exactly the prefix.
         assert!(prefix_overlaps_range(b"err", b"a", b"err"));
     }
 
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn prefix_overlap_property_no_false_negatives() {
-        // For any segment range and any prefix, if `prefix` is a
+        // For any superfile range and any prefix, if `prefix` is a
         // strict prefix of any term in [min, max], the helper must
         // return true (false negatives would silently drop matching
         // terms — unsound).
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn prefix_overlap_handles_trailing_ff_in_prefix() {
-        // prefix [0xFE, 0xFF, 0xFF] → upper [0xFF]. Segments whose
+        // prefix [0xFE, 0xFF, 0xFF] → upper [0xFF]. Superfiles whose
         // min is < [0xFF] and max ≥ [0xFE, 0xFF, 0xFF] overlap.
         let p = &[0xFE, 0xFF, 0xFF];
         assert!(prefix_overlaps_range(

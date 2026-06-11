@@ -3,16 +3,16 @@
 
 //! Shared build-side dispatch for supertable commit fan-out.
 //!
-//! Query paths use `query::dispatch` so FTS, vector, and SQL segment
+//! Query paths use `query::dispatch` so FTS, vector, and SQL superfile
 //! work share one runtime and one fan-out primitive. Builds have the
 //! same outer shape at the supertable layer: a commit partitions
-//! buffered rows into segment shards, then builds one superfile per
+//! buffered rows into superfile shards, then builds one superfile per
 //! shard. This module owns that fan-out so FTS-only, vector-only, and
 //! combined commits all go through the same scheduler — no per-modality
 //! branching.
 //!
 //! The work function decides what a shard means; for the current writer
-//! it is one `SuperfileBuilder` producing one immutable segment. The
+//! it is one `SuperfileBuilder` producing one immutable superfile. The
 //! fan-out is a single rayon level: every shard is dispatched onto
 //! `pool` at once via `par_iter`. Each shard's kernel is free to expose
 //! its own intra-shard rayon work (e.g. the vector builder's row-parallel

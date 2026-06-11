@@ -6,7 +6,7 @@
 //! immediately (paying only the cold-open byte budget
 //! against object storage), a background task waits for the
 //! foreground lazy reader to release, downloads the full
-//! segment to NVMe + mmaps it, and **any subsequent
+//! superfile to NVMe + mmaps it, and **any subsequent
 //! `reader(uri)` call returns the mmap-backed reader** — the
 //! corresponding search issues zero S3 GETs.
 //!
@@ -14,7 +14,7 @@
 //!
 //! - The cold-foreground reader is functional immediately
 //!   (FTS queries return correct results) without waiting for
-//!   the background segment fill.
+//!   the background superfile fill.
 //! - The warm-path zero-S3-GET invariant: after the
 //!   background promotion completes, a second `reader(uri)`
 //!   plus a search resolves entirely from mmap — the counting
@@ -212,7 +212,7 @@ async fn wait_for_mmap_promotion(
 /// cold reader from
 /// `LazyForegroundWithBackgroundFill` is functional
 /// immediately. The reader is FTS-queryable without waiting
-/// for the background segment fill; the warm-promotion
+/// for the background superfile fill; the warm-promotion
 /// guarantee is a separate, additive property tested below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_foreground_cold_reader_is_queryable_immediately() {
@@ -238,7 +238,7 @@ async fn lazy_foreground_cold_reader_is_queryable_immediately() {
     assert_eq!(hits.len(), 2, "two docs contain 'special'");
 }
 
-/// The background full-segment fill must not compete with a
+/// The background full-superfile fill must not compete with a
 /// foreground lazy reader. Holding the reader across a short
 /// delay should not issue cache-fill range GETs; promotion begins
 /// only after the reader is dropped.
@@ -385,12 +385,12 @@ async fn lazy_foreground_concurrent_cold_readers_coalesce_to_one_promotion() {
 }
 
 /// the cold-path bandwidth profile is **2× per
-/// cold miss** (per-query ranges + background full-segment
+/// cold miss** (per-query ranges + background full-superfile
 /// download). This test documents that property by asserting
-/// the total `get_range` bytes are at least `segment_size`
+/// the total `get_range` bytes are at least `superfile_size`
 /// (the background fill) plus the cold foreground's per-query
 /// range — i.e., that the background fill actually runs.
-/// Counter-balances `hybrid_bandwidth_per_cold_miss_equals_segment_size`'s
+/// Counter-balances `hybrid_bandwidth_per_cold_miss_equals_superfile_size`'s
 /// 1× invariant for the hybrid mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_foreground_total_bandwidth_includes_background_fill() {
@@ -398,7 +398,7 @@ async fn lazy_foreground_total_bandwidth_includes_background_fill() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_fts_only_bytes();
-    let segment_size = bytes.len();
+    let superfile_size = bytes.len();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
 
@@ -415,10 +415,10 @@ async fn lazy_foreground_total_bandwidth_includes_background_fill() {
 
     let total_bytes = proxy.bytes();
     assert!(
-        total_bytes >= segment_size,
-        "background fill must download the full segment ({} bytes); \
+        total_bytes >= superfile_size,
+        "background fill must download the full superfile ({} bytes); \
          counting proxy observed {} bytes total",
-        segment_size,
+        superfile_size,
         total_bytes,
     );
 }

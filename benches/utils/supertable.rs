@@ -3,7 +3,7 @@
 
 //! Supertable object-store bench (infino-only entry point).
 //!
-//! Multi-segment ingest to object storage at the supertable scale
+//! Multi-superfile ingest to object storage at the supertable scale
 //! (`INFINO_BENCH_SUPERTABLE_DOCS`, default 10M), built through the
 //! production `SupertableWriter::append` + `commit` path. Three index
 //! shapes are measured for apples-to-apples comparison against
@@ -297,7 +297,7 @@ pub fn run() {
     report.emit(&Section {
         anchor: "bench/supertable/ingest".into(),
         title: format!(
-            "Supertable — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
+            "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits)",
             fmt_count(n_docs),
             crate::corpus::DIM,
             supertable::N_COMMIT_CHUNKS
@@ -306,7 +306,7 @@ pub fn run() {
                Each shape is built in its own subprocess, so Peak/Median/P90 RSS are measured from a \
                clean address space and are comparable across shapes. Rows are the three index shapes \
                built from the same seeded corpus, so each is directly comparable to its single-modality \
-               peer. Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the \
+               peer. Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the \
                previous run."
             .into(),
         blocks: vec![Block {
@@ -441,7 +441,7 @@ pub mod fts {
                 &mut report,
                 "bench/fts/supertable/search",
                 format!(
-                    "Supertable FTS — search, multi-segment / object-store ({} docs)",
+                    "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
                 "Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query \
@@ -465,11 +465,11 @@ pub mod fts {
         report.emit(&Section {
             anchor: "bench/fts/supertable/ingest".into(),
             title: format!(
-                "Supertable FTS — ingest, multi-segment / object-store ({} docs, {} commits)",
+                "Supertable FTS — ingest, multi-superfile / object-store ({} docs, {} commits)",
                 fmt_count(n_docs),
                 supertable::N_COMMIT_CHUNKS
             ),
-            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
             blocks: vec![Block {
                 subtitle: String::new(),
                 headers: vec![
@@ -538,7 +538,7 @@ pub mod fts {
 
     /// Cold-tier guard: a fresh disk cache + consumer per open. The
     /// constructor performs the full cold open (consumer + manifest +
-    /// every segment reader), so the timed `bm25_rows` pays only the
+    /// every superfile reader), so the timed `bm25_rows` pays only the
     /// cold search work — open and search are reported separately.
     struct SupertableColdGuard {
         _cache_dir: TempDir,
@@ -548,7 +548,7 @@ pub mod fts {
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-            crate::executors::open_all_segments(&consumer);
+            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -594,7 +594,7 @@ pub mod vector {
     /// Build a vector-only supertable, then measure warm + cold kNN search
     /// at calibrated recall targets (and a default config), with a
     /// correctness recall gate — the same measurement the superfile vector
-    /// runner produces, over the multi-segment object-store consumer.
+    /// runner produces, over the multi-superfile object-store consumer.
     pub fn run(phases: Phases) {
         if let Err(reason) = tiers::supertable_backend_check() {
             eprintln!("[supertable_vector] skipped: {reason}");
@@ -635,12 +635,12 @@ pub mod vector {
             report.emit(&Section {
                 anchor: "bench/vector/supertable/ingest".into(),
                 title: format!(
-                    "Supertable vector — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
+                    "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits)",
                     fmt_count(n_docs),
                     DIM,
                     supertable::N_COMMIT_CHUNKS
                 ),
-                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
                     subtitle: String::new(),
                     headers: vec![
@@ -690,7 +690,7 @@ pub mod vector {
             // One consumer drives correctness + calibration. Full cache
             // promotion (prewarm + wait_until_warm) only matters for the
             // warm timing rows — a cold-only run skips it (fts/sql gate
-            // the same way) so it doesn't pull every segment into the
+            // the same way) so it doesn't pull every superfile into the
             // cache just to throw it away.
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
             if phases.warm {
@@ -713,7 +713,7 @@ pub mod vector {
             }
 
             let title = format!(
-                "Supertable vector — search, multi-segment / object-store ({} docs × dim={})",
+                "Supertable vector — search, multi-superfile / object-store ({} docs × dim={})",
                 fmt_count(n_docs),
                 DIM
             );
@@ -757,7 +757,7 @@ pub mod vector {
     impl SupertableVecColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
-            crate::executors::open_all_segments(&consumer);
+            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -825,11 +825,11 @@ pub mod sql {
             report.emit(&Section {
                 anchor: "bench/sql/supertable/ingest".into(),
                 title: format!(
-                    "Supertable SQL — ingest, multi-segment / object-store ({} rows, {} commits)",
+                    "Supertable SQL — ingest, multi-superfile / object-store ({} rows, {} commits)",
                     fmt_count(n_docs),
                     supertable::N_COMMIT_CHUNKS
                 ),
-                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
                     subtitle: String::new(),
                     headers: vec![
@@ -926,7 +926,7 @@ pub mod sql {
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
-            crate::executors::open_all_segments(&consumer);
+            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,

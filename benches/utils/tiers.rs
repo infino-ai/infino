@@ -96,7 +96,7 @@ enum StorageKeepalive {
 
 /// A real-backend prefix a bench run created and must delete on exit so it
 /// accrues no storage cost. The supertable build writes many objects
-/// (segments, manifests, the pointer) under one unique prefix; cleanup lists
+/// (superfiles, manifests, the pointer) under one unique prefix; cleanup lists
 /// every key beneath it and deletes them. `root` is an *un*-prefixed provider
 /// (bucket/container root): `list_with_prefix` takes an absolute key prefix
 /// and `delete` targets the absolute keys it returns verbatim, so both sides
@@ -415,7 +415,7 @@ emulator is not usable here: it does not implement conditional If-Match PUTs, \
 which the supertable's multi-commit OCC requires, so every commit after the \
 first would lose the CAS.";
 
-/// Supertable-shaped backing store (multi-segment, multi-commit benches).
+/// Supertable-shaped backing store (multi-superfile, multi-commit benches).
 ///
 /// **Real object store only** (S3 or Azure). The supertable build commits
 /// many times, so its OCC pointer update rides on the conditional `If-Match`
@@ -483,7 +483,7 @@ fn supertable_search_cache_gib() -> Option<u64> {
 
 /// Fresh disk cache for ingest producers (8 GiB budget).
 ///
-/// Ingest attaches this cache only to keep segment bytes out of the
+/// Ingest attaches this cache only to keep superfile bytes out of the
 /// unbounded in-memory tier; commit-time cache prepopulation is disabled,
 /// so this budget is not meant to hold the searchable working set.
 pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {

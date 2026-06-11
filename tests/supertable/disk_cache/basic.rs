@@ -10,7 +10,7 @@
 //! through the invariants it promises:
 //!
 //! - cold miss triggers cold-fetch (range-GETs to assemble
-//!   the segment file)
+//!   the superfile file)
 //! - warm hit issues zero `get_range` calls
 //! - 100 concurrent cold readers on the same URI coalesce to
 //!   exactly one fetch fan-out
@@ -158,7 +158,7 @@ fn build_test_superfile_bytes() -> Bytes {
     Bytes::from(b.finish().expect("finish"))
 }
 
-async fn seed_segment(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
+async fn seed_superfile(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
     let path = uri.storage_path();
     storage.put_atomic(&path, bytes).await.expect("seed put");
 }
@@ -196,7 +196,7 @@ async fn cold_miss_triggers_range_fetches_warm_hit_does_not() {
 
     let uri = SuperfileUri::new_v4();
     let bytes = build_test_superfile_bytes();
-    seed_segment(&*proxy, uri, bytes.clone()).await;
+    seed_superfile(&*proxy, uri, bytes.clone()).await;
 
     let (_cdir, cache) = fresh_cache_with_storage(
         Arc::clone(&proxy) as Arc<dyn StorageProvider>,
@@ -234,7 +234,7 @@ async fn concurrent_cold_readers_coalesce_to_one_fetch() {
 
     let uri = SuperfileUri::new_v4();
     let bytes = build_test_superfile_bytes();
-    seed_segment(&*proxy, uri, bytes).await;
+    seed_superfile(&*proxy, uri, bytes).await;
 
     let (_cdir, cache) = fresh_cache_with_storage(
         Arc::clone(&proxy) as Arc<dyn StorageProvider>,
@@ -272,7 +272,7 @@ async fn reader_returns_working_superfile_reader() {
 
     let uri = SuperfileUri::new_v4();
     let bytes = build_test_superfile_bytes();
-    seed_segment(&*local, uri, bytes).await;
+    seed_superfile(&*local, uri, bytes).await;
 
     let (_cdir, cache) = fresh_cache_with_storage(Arc::clone(&local), DISK_CACHE_BUDGET_BYTES);
     let reader = cache.reader(&uri).await.expect("reader");
@@ -290,7 +290,7 @@ async fn reader_returns_working_superfile_reader() {
 #[tokio::test]
 async fn eviction_respects_pinned_set() {
     // Two superfiles, budget tight enough that only one fits.
-    // Pin segment A; ask for B; expect A to survive
+    // Pin superfile A; ask for B; expect A to survive
     // (BudgetExceeded surfaces because the policy can't evict
     // A and B alone exceeds budget when A is held).
     let store_dir = TempDir::new().expect("storage tempdir");
@@ -301,8 +301,8 @@ async fn eviction_respects_pinned_set() {
     let uri_b = SuperfileUri::new_v4();
     let bytes = build_test_superfile_bytes();
     let size = bytes.len() as u64;
-    seed_segment(&*local, uri_a, bytes.clone()).await;
-    seed_segment(&*local, uri_b, bytes).await;
+    seed_superfile(&*local, uri_a, bytes.clone()).await;
+    seed_superfile(&*local, uri_b, bytes).await;
 
     // Pinned-fn pins exactly URI A.
     let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(move || {
@@ -314,7 +314,7 @@ async fn eviction_respects_pinned_set() {
     let cache_dir = TempDir::new().expect("cache tempdir");
     let cfg = DiskCacheConfig {
         cache_root: cache_dir.path().to_path_buf(),
-        // Budget tight: fits exactly one segment, not two.
+        // Budget tight: fits exactly one superfile, not two.
         cold_fetch_mode: infino::supertable::reader_cache::ColdFetchMode::HybridWithPrefetch,
         disk_budget_bytes: size + (size / 2),
         cold_fetch_streams: COLD_FETCH_STREAMS,
@@ -356,9 +356,9 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
     let uri_c = SuperfileUri::new_v4();
     let bytes = build_test_superfile_bytes();
     let size = bytes.len() as u64;
-    seed_segment(&*local, uri_a, bytes.clone()).await;
-    seed_segment(&*local, uri_b, bytes.clone()).await;
-    seed_segment(&*local, uri_c, bytes).await;
+    seed_superfile(&*local, uri_a, bytes.clone()).await;
+    seed_superfile(&*local, uri_b, bytes.clone()).await;
+    seed_superfile(&*local, uri_c, bytes).await;
 
     let cache_dir = TempDir::new().expect("cache");
     let cfg = DiskCacheConfig {
@@ -407,7 +407,7 @@ async fn reservation_race_preserves_budget_invariant() {
         .map(|_| SuperfileUri::new_v4())
         .collect();
     for u in &uris {
-        seed_segment(&*local, *u, bytes.clone()).await;
+        seed_superfile(&*local, *u, bytes.clone()).await;
     }
 
     let cache_dir = TempDir::new().expect("cache");

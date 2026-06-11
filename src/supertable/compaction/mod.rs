@@ -5,7 +5,7 @@
 //!
 //! no I/O. `supertable::compact` gathers the
 //! stats, calls [`select`], then merges each [`CompactionJob`].
-//! Compaction is single-level — a target-sized segment is never
+//! Compaction is single-level — a target-sized superfile is never
 //! re-compacted.
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     supertable::{
         BuildError, SuperfileEntry,
         query::dispatch::open_reader,
-        writer::{PreparedSegment, ShardOutput, prepare_segment},
+        writer::{PreparedSuperfile, ShardOutput, prepare_superfile},
     },
 };
 use bytes::Bytes;
@@ -26,7 +26,7 @@ const MIB: u64 = 1024 * 1024;
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentStats {
+pub struct SuperfileStats {
     pub superfile_id: Uuid,
     /// Partition it belongs to.
     /// never merge across partitions.
@@ -38,7 +38,7 @@ pub struct SegmentStats {
     pub sealed_by_other: bool,
 }
 
-impl SegmentStats {
+impl SuperfileStats {
     fn live_docs(&self) -> u64 {
         self.n_docs.saturating_sub(self.tombstoned_docs)
     }
@@ -61,16 +61,16 @@ pub struct CompactionJob {
     pub estimated_output_bytes: u64,
 }
 
-/// Plan compaction: pack each partition's small segments into
+/// Plan compaction: pack each partition's small superfiles into
 /// as many target-sized jobs as they fill. Leftovers that can't
 /// reach the floor are left for next time.
-pub fn select(segments: &[SegmentStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
-    let target_bytes = cfg.target_segment_size_mb.saturating_mul(MIB);
+pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
+    let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
     let min_output_bytes =
         (target_bytes as u128 * cfg.min_fill_percent.clamp(1, 100) as u128 / 100) as u64;
 
-    let mut by_partition: BTreeMap<&[u8], Vec<&SegmentStats>> = BTreeMap::new();
-    for s in segments {
+    let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
+    for s in superfiles {
         by_partition.entry(&s.partition_key).or_default().push(s);
     }
 
@@ -83,14 +83,14 @@ pub fn select(segments: &[SegmentStats], cfg: &CompactionSettings) -> Vec<Compac
 
 fn pack_partition(
     key: &[u8],
-    segs: Vec<&SegmentStats>,
+    segs: Vec<&SuperfileStats>,
     target_bytes: u64,
     min_output_bytes: u64,
     jobs: &mut Vec<CompactionJob>,
 ) {
-    // Exclude segments already at target size — they are done and
+    // Exclude superfiles already at target size — they are done and
     // re-compacting them gains nothing.
-    let mut candidates: Vec<&SegmentStats> = segs
+    let mut candidates: Vec<&SuperfileStats> = segs
         .into_iter()
         .filter(|s| !s.sealed_by_other && s.size_bytes < min_output_bytes)
         .collect();
@@ -121,11 +121,11 @@ struct PendingJob {
 }
 
 impl PendingJob {
-    fn fits(&self, s: &SegmentStats, target_bytes: u64) -> bool {
+    fn fits(&self, s: &SuperfileStats, target_bytes: u64) -> bool {
         self.live_bytes + s.live_bytes() <= target_bytes
     }
 
-    fn push(&mut self, s: &SegmentStats) {
+    fn push(&mut self, s: &SuperfileStats) {
         self.inputs.push(s.superfile_id);
         self.live_bytes += s.live_bytes();
     }
@@ -148,7 +148,7 @@ impl Supertable {
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
-    ) -> Result<PreparedSegment, BuildError> {
+    ) -> Result<PreparedSuperfile, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
@@ -199,9 +199,9 @@ impl Supertable {
             superfile_stats.scalar_stats,
         );
 
-        let prepared_segment = prepare_segment(self.inner().as_ref(), shard)?;
+        let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
 
-        prepared_segment.ok_or(BuildError::NoDocsToBuild)
+        prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 }
 
@@ -218,8 +218,8 @@ mod tests {
         n * MIB
     }
 
-    fn seg(id: u128, size_mib: u64, n_docs: u64, tombstoned: u64) -> SegmentStats {
-        SegmentStats {
+    fn seg(id: u128, size_mib: u64, n_docs: u64, tombstoned: u64) -> SuperfileStats {
+        SuperfileStats {
             superfile_id: Uuid::from_u128(id),
             partition_key: Vec::new(),
             size_bytes: mib(size_mib),
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn splits_many_segments_into_multiple_jobs() {
+    fn splits_many_superfiles_into_multiple_jobs() {
         // 12 × 200 MiB: two jobs of 5, last 2 left over.
         let segs: Vec<_> = (0..12).map(|i| seg(i, 200, 1000, 0)).collect();
         let jobs = select(&segs, &default_cfg());
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn already_target_sized_segment_is_never_re_compacted() {
+    fn already_target_sized_superfile_is_never_re_compacted() {
         let big = seg(99, 1024, 1_000_000, 0);
         let mut segs = vec![big.clone()];
         segs.extend((0..5).map(|i| seg(i, 200, 1000, 0)));
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(superfiles.len(), 2, "should have 2 superfiles");
 
         // Merge the superfiles - should succeed
-        let _merged_segment = st
+        let _merged_superfile = st
             .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
@@ -425,27 +425,27 @@ mod tests {
             .unwrap_or(i128::MIN);
 
         // Merge should succeed and preserve scalar stats
-        let merged_segment = st
+        let merged_superfile = st
             .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
 
-        // Verify merged segment stats match expected values
+        // Verify merged superfile stats match expected values
         assert_eq!(
-            merged_segment.entry.n_docs, expected_n_docs,
+            merged_superfile.entry.n_docs, expected_n_docs,
             "n_docs should be sum of input superfiles"
         );
         assert_eq!(
-            merged_segment.entry.id_min, expected_id_min,
+            merged_superfile.entry.id_min, expected_id_min,
             "id_min should be minimum across all superfiles"
         );
         assert_eq!(
-            merged_segment.entry.id_max, expected_id_max,
+            merged_superfile.entry.id_max, expected_id_max,
             "id_max should be maximum across all superfiles"
         );
 
         // Verify scalar stats for title column (lexicographic ordering: apple < banana < cherry < date)
-        let title_stats = merged_segment
+        let title_stats = merged_superfile
             .entry
             .scalar_stats
             .cols
@@ -507,15 +507,15 @@ mod tests {
         assert_eq!(superfiles.len(), 3, "should have 3 superfiles");
 
         // Merging 3 superfiles should succeed
-        let merged_segment = st
+        let merged_superfile = st
             .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
 
-        // Verify merged segment stats
+        // Verify merged superfile stats
         assert_eq!(
-            merged_segment.entry.n_docs, 6,
-            "merged segment should have 6 documents (3 files × 2 docs each)"
+            merged_superfile.entry.n_docs, 6,
+            "merged superfile should have 6 documents (3 files × 2 docs each)"
         );
 
         let source_id_min = superfiles
@@ -528,14 +528,14 @@ mod tests {
             .map(|sf| sf.id_max)
             .max()
             .unwrap_or(i128::MIN);
-        assert_eq!(merged_segment.entry.id_min, source_id_min);
-        assert_eq!(merged_segment.entry.id_max, source_id_max);
+        assert_eq!(merged_superfile.entry.id_min, source_id_min);
+        assert_eq!(merged_superfile.entry.id_max, source_id_max);
 
         // Verify no data loss by querying the merged reader
-        let merged_reader = merged_segment
+        let merged_reader = merged_superfile
             .open_reader()
-            .expect("merged segment should have bytes")
-            .expect("open reader on merged segment");
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
 
         assert_eq!(merged_reader.n_docs(), 6, "reader should report 6 docs");
 
@@ -579,15 +579,15 @@ mod tests {
         assert_eq!(superfiles.len(), 1, "should have 1 superfile");
 
         // Merging a single superfile should succeed
-        let merged_segment = st
+        let merged_superfile = st
             .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
 
-        // Verify merged segment stats
+        // Verify merged superfile stats
         assert_eq!(
-            merged_segment.entry.n_docs, 2,
-            "merged segment should have 2 documents"
+            merged_superfile.entry.n_docs, 2,
+            "merged superfile should have 2 documents"
         );
 
         let source_id_min = superfiles
@@ -600,14 +600,14 @@ mod tests {
             .map(|sf| sf.id_max)
             .max()
             .unwrap_or(i128::MIN);
-        assert_eq!(merged_segment.entry.id_min, source_id_min);
-        assert_eq!(merged_segment.entry.id_max, source_id_max);
+        assert_eq!(merged_superfile.entry.id_min, source_id_min);
+        assert_eq!(merged_superfile.entry.id_max, source_id_max);
 
         // Verify no data loss by querying the merged reader
-        let merged_reader = merged_segment
+        let merged_reader = merged_superfile
             .open_reader()
-            .expect("merged segment should have bytes")
-            .expect("open reader on merged segment");
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
 
         assert_eq!(merged_reader.n_docs(), 2, "reader should report 2 docs");
 

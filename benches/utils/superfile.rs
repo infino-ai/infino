@@ -375,7 +375,7 @@ pub mod fts {
                 &mut report,
                 "bench/fts/superfile/search",
                 format!(
-                    "Superfile FTS — search, single-segment / in-memory ({} docs)",
+                    "Superfile FTS — search, single-superfile / in-memory ({} docs)",
                     fmt_count(n_docs)
                 ),
                 "Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on \
@@ -627,7 +627,7 @@ pub mod fts {
         report.emit(&Section {
             anchor: "bench/fts/superfile/ingest".into(),
             title: format!(
-                "Superfile FTS — ingest, single-segment / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
+                "Superfile FTS — ingest, single-superfile / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
                 fmt_count(n_docs)
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable \
@@ -846,7 +846,7 @@ pub mod vector {
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(
-                    "Superfile vector — search, single-segment / in-memory ({} docs × dim={DIM})",
+                    "Superfile vector — search, single-superfile / in-memory ({} docs × dim={DIM})",
                     fmt_count(n_docs)
                 ),
                 "Correctness, warm search, and cold upload reuse the measured 1-writer artifact. Recall rows use the lowest-p50 calibrated point meeting each target; `default` is the user-facing option baseline. Δ is vs the previous run.",
@@ -949,7 +949,7 @@ pub mod vector {
         report.emit(&Section {
             anchor: "bench/vector/superfile/ingest".into(),
             title: format!(
-                "Superfile vector — ingest, single-segment / in-memory ({} docs × dim={DIM})",
+                "Superfile vector — ingest, single-superfile / in-memory ({} docs × dim={DIM})",
                 fmt_count(n_docs)
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. Rows are by writer count; `1 writer` is the canonical artifact used by correctness/search/cold upload. Δ is vs the previous run.".into(),
@@ -1190,7 +1190,7 @@ pub mod sql {
         let cold = exec_sql::measure_cold(
             || {
                 let (cache_dir, table) = open_cold_consumer(&artifact);
-                crate::executors::open_all_segments(&table);
+                crate::executors::open_all_superfiles(&table);
                 SqlColdGuard {
                     _cache_dir: cache_dir,
                     table,

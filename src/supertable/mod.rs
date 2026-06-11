@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Supertable layer — the in-memory cross-segment query + manifest
+//! Supertable layer — the in-memory cross-superfile query + manifest
 //! layer over [`SuperfileBuilder`] / [`SuperfileReader`].
 //!
 //! A supertable is to superfile what an Iceberg / Delta table is

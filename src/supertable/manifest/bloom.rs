@@ -3,13 +3,13 @@
 
 //! FTS term-presence bloom filter.
 //!
-//! One bloom per (segment, FTS column). Built once at commit time
-//! by feeding the segment's FST term iterator through a
+//! One bloom per (superfile, FTS column). Built once at commit time
+//! by feeding the superfile's FST term iterator through a
 //! [`BloomBuilder`]; queried at skip-prune time via
-//! [`Bloom::contains`] to decide whether a segment could contain
+//! [`Bloom::contains`] to decide whether a superfile could contain
 //! at least one of a query's terms. Returns `false` definitively
-//! (skip the segment) or `true` with the bloom's false-positive
-//! rate (scan the segment).
+//! (skip the superfile) or `true` with the bloom's false-positive
+//! rate (scan the superfile).
 //!
 //! # Algorithm: block bloom + XXH3-64 + portable SIMD bit-test
 //!
@@ -42,7 +42,7 @@
 //! - 64 KiB total → 1024 blocks of 64 B each (`n_blocks` is always
 //!   a power of two so the modulo is a bit-AND).
 //! - K = 4 hash functions per block.
-//! - At ~100 K distinct terms (a typical Zipfian 1 M-doc segment),
+//! - At ~100 K distinct terms (a typical Zipfian 1 M-doc superfile),
 //!   that's ~100 items / block, ~7% FPR — meaningful skip without
 //!   blowing manifest RAM.
 //!
@@ -71,7 +71,7 @@ const BLOCK_WORDS: usize = BLOCK_BYTES / 8; // 8
 pub const K: usize = 4;
 
 /// Default bloom size: 64 KiB / 1024 blocks. Sized so a typical
-/// Zipfian 1 M-doc segment with ~100 K distinct terms hits ~7%
+/// Zipfian 1 M-doc superfile with ~100 K distinct terms hits ~7%
 /// FPR.
 pub const DEFAULT_N_BLOCKS: usize = 1024;
 /// Default bloom byte size (64 KiB).
@@ -83,7 +83,7 @@ pub const DEFAULT_BLOOM_BYTES: usize = DEFAULT_N_BLOCKS * BLOCK_BYTES;
 const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Term-presence bloom filter for a single FTS column in a single
-/// segment.
+/// superfile.
 ///
 /// Cheap to clone (`Arc::clone` on the underlying word buffer); a
 /// `FtsSummary` clone shares this Arc with all manifest copies in
@@ -134,7 +134,7 @@ impl Bloom {
     }
 
     /// Test whether `key` may have been inserted. `false` is
-    /// definitive (the segment doesn't contain `key`); `true` may
+    /// definitive (the superfile doesn't contain `key`); `true` may
     /// be a false positive at the bloom's configured FPR.
     #[inline]
     pub fn contains(&self, key: &[u8]) -> bool {
@@ -168,7 +168,7 @@ impl Bloom {
 /// fed with [`BloomBuilder::insert`]; finalized with
 /// [`BloomBuilder::finish`].
 ///
-/// One builder per (segment, FTS column) at commit time.
+/// One builder per (superfile, FTS column) at commit time.
 pub struct BloomBuilder {
     words: Vec<u64>,
     n_blocks_mask: u32,
@@ -200,7 +200,7 @@ impl BloomBuilder {
         let (block_idx, mask) = block_and_mask(h, self.n_blocks_mask);
         let block_offset = block_idx * BLOCK_WORDS;
         // OR each mask word into the corresponding block word.
-        // Insert is uncommon enough (per-segment-build, not per-
+        // Insert is uncommon enough (per-superfile-build, not per-
         // query) that we don't bother SIMDing this path.
         let block = &mut self.words[block_offset..block_offset + BLOCK_WORDS];
         for (b, m) in block.iter_mut().zip(mask.iter()) {

@@ -14,7 +14,7 @@
 //! ## Scale policy
 //!
 //! Scale is fixed by *shape*, not by an environment variable:
-//! superfile-shape benches use [`SUPERFILE_DOCS`] (1M, one-segment
+//! superfile-shape benches use [`SUPERFILE_DOCS`] (1M, one-superfile
 //! scale), supertable-shape benches use [`SUPERTABLE_DOCS`] (10M,
 //! sharding scale). Vector at 10M × 384 (f32) = 14.6 GB resident —
 //! needs a 32 GB+ machine. There is deliberately no `INFINO_BENCH_FULL`
@@ -90,7 +90,7 @@ pub const DIM: usize = 384;
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
 pub type Hit = (u32, f32);
 
-/// Doc count for superfile-shape benches (one-segment scale). 1M ×
+/// Doc count for superfile-shape benches (one-superfile scale). 1M ×
 /// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the warm tier and
 /// is the single-superfile cold-open unit for the warm/cold tiers.
 pub const SUPERFILE_DOCS: usize = 1_000_000;
@@ -101,7 +101,7 @@ pub const SUPERFILE_DOCS: usize = 1_000_000;
 /// over the object store.
 pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
-/// Document count for the **superfile** test — a single-segment index
+/// Document count for the **superfile** test — a single-superfile index
 /// built and queried entirely **in memory**. Defaults to
 /// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
 /// for a quicker local loop or a larger stress run.
@@ -109,7 +109,7 @@ pub fn superfile_docs() -> usize {
     docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
 }
 
-/// Document count for the **supertable** test — a multi-segment table
+/// Document count for the **supertable** test — a multi-superfile table
 /// committed to and queried from **object storage**. Defaults to
 /// [`SUPERTABLE_DOCS`] (10M); override with
 /// `INFINO_BENCH_SUPERTABLE_DOCS`.
@@ -799,7 +799,7 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
 /// Build a stand-alone vector index. `vectors` is flat `n_docs * DIM`.
 ///
 /// Bench harness picks `Sq8` by default to match the on-disk
-/// default for production segments. Per-cluster scale/offset
+/// default for production superfiles. Per-cluster scale/offset
 /// quantizer is the active codec (drop ≤ 0.04 on the
 /// pathological planted-cluster synthetic; expected near-zero on
 /// real embeddings). Callers measuring the Fp32 baseline (recall

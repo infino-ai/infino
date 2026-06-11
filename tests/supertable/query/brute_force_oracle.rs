@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! BM25 correctness oracle for the supertable's multi-segment
+//! BM25 correctness oracle for the supertable's multi-superfile
 //! search path.
 //!
 //! The supertable shards the corpus across N superfiles. Each
-//! superfile runs its own BM25 with its own per-segment IDF +
-//! avgdl, and the supertable merges the per-segment top-k into a
-//! global top-k. This oracle mirrors that shape with a per-segment
+//! superfile runs its own BM25 with its own per-superfile IDF +
+//! avgdl, and the supertable merges the per-superfile top-k into a
+//! global top-k. This oracle mirrors that shape with a per-superfile
 //! brute-force BM25 and a global merge, then asserts the
 //! supertable's hits match.
 //!
 //! ## What this oracle catches
 //!
-//! Per-segment brute-force catches per-segment scoring bugs (same
-//! as the single-segment oracle in
-//! `tests/superfile/fts/brute_force_oracle.rs`). The cross-segment
-//! merge catches a separate class of bugs that the single-segment
-//! oracle can't see: wrong segment partitioning, wrong tagging of
-//! per-segment hits with their segment URI, wrong score-direction
+//! Per-superfile brute-force catches per-superfile scoring bugs (same
+//! as the single-superfile oracle in
+//! `tests/superfile/fts/brute_force_oracle.rs`). The cross-superfile
+//! merge catches a separate class of bugs that the single-superfile
+//! oracle can't see: wrong superfile partitioning, wrong tagging of
+//! per-superfile hits with their superfile URI, wrong score-direction
 //! in the top-k merge.
 //!
 //! ## Tolerances
@@ -110,10 +110,10 @@ fn planted_corpus() -> Vec<(u64, &'static str)> {
     ]
 }
 
-const SEGMENTS: usize = 4;
-const N_PREFIX_TERMS: usize = SEGMENTS;
+const SUPERFILES: usize = 4;
+const N_PREFIX_TERMS: usize = SUPERFILES;
 const N_PLANTED: usize = 60;
-const CHUNK_SIZE: usize = N_PLANTED / SEGMENTS;
+const CHUNK_SIZE: usize = N_PLANTED / SUPERFILES;
 /// Standard oracle top-k (with headroom) for the comparison queries.
 const ORACLE_TOP_K: usize = 10;
 /// Smaller oracle top-k for the single-/few-match queries.
@@ -173,8 +173,8 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
     st
 }
 
-/// Convert supertable hits to global doc_ids using the segment-
-/// append order (segment_index * chunk_size + local_doc_id).
+/// Convert supertable hits to global doc_ids using the superfile-
+/// append order (superfile_index * chunk_size + local_doc_id).
 fn supertable_to_global_ids(
     st: &Supertable,
     hits: Vec<SuperfileHit>,
@@ -187,8 +187,8 @@ fn supertable_to_global_ids(
             let seg_idx = manifest
                 .superfiles
                 .iter()
-                .position(|e| e.uri == h.segment)
-                .expect("segment in manifest");
+                .position(|e| e.uri == h.superfile)
+                .expect("superfile in manifest");
             (seg_idx as u64) * (chunk_size as u64) + (h.local_doc_id as u64)
         })
         .collect()
@@ -228,11 +228,11 @@ fn supertable_prefix_global(
     supertable_to_global_ids(st, hits, chunk_size)
 }
 
-// ---- Brute-force oracle (per-segment + global merge) ---------------
+// ---- Brute-force oracle (per-superfile + global merge) ---------------
 
-/// Build a per-segment BruteForceBm25 oracle list. Index i scores
-/// segment i with that segment's own IDF/avgdl, mirroring the
-/// supertable's per-segment scoring shape.
+/// Build a per-superfile BruteForceBm25 oracle list. Index i scores
+/// superfile i with that superfile's own IDF/avgdl, mirroring the
+/// supertable's per-superfile scoring shape.
 fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForceBm25> {
     let tok = default_tokenizer();
     let chunk_size = corpus.len().div_ceil(n_superfiles);
@@ -247,7 +247,7 @@ fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForc
         .collect()
 }
 
-/// Run per-segment brute-force BM25 and merge into a global top-k
+/// Run per-superfile brute-force BM25 and merge into a global top-k
 /// in the same shape the supertable's fan-out produces.
 fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
     let tok = default_tokenizer();
@@ -265,9 +265,9 @@ fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u
 }
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
-/// AND query. Each segment scores its AND intersection
+/// AND query. Each superfile scores its AND intersection
 /// independently; the global merge keeps the highest-scoring docs
-/// across segments. Mirrors the supertable's AND fan-out shape.
+/// across superfiles. Mirrors the supertable's AND fan-out shape.
 fn brute_force_and_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
@@ -319,8 +319,8 @@ struct StandardFixture {
 
 static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
     let corp = corpus_with_prefix_terms();
-    let infino = build_supertable(&corp, SEGMENTS);
-    let oracles = build_oracles(&corp, SEGMENTS);
+    let infino = build_supertable(&corp, SUPERFILES);
+    let oracles = build_oracles(&corp, SUPERFILES);
     StandardFixture { infino, oracles }
 });
 
@@ -328,7 +328,7 @@ static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
 
 #[test]
 fn oracle_single_rare_top1_matches() {
-    // "rare-token-zzz" appears in exactly 1 doc (id=17, segment 1).
+    // "rare-token-zzz" appears in exactly 1 doc (id=17, superfile 1).
     let f = &*STANDARD_FIXTURE;
     let inf_hits =
         supertable_search_global(&f.infino, "rare-token-zzz", ORACLE_TOP_K_SMALL, CHUNK_SIZE);
@@ -422,13 +422,13 @@ fn oracle_five_term_or_top5_matches() {
     assert_eq!(ora_top, want);
 }
 
-// ---- Tests: AND-mode oracle (multi-segment intersection) ------------
+// ---- Tests: AND-mode oracle (multi-superfile intersection) ------------
 
 #[test]
 fn oracle_two_term_and_matches() {
     // "rust" + "async" co-occur in docs 0, 20, 22 — split across
-    // segments 0 (doc 0) and 1 (docs 20, 22), so this exercises
-    // multi-segment AND fan-out.
+    // superfiles 0 (doc 0) and 1 (docs 20, 22), so this exercises
+    // multi-superfile AND fan-out.
     let f = &*STANDARD_FIXTURE;
     let inf_hits = supertable_search_and_global(&f.infino, "rust async", ORACLE_TOP_K, CHUNK_SIZE);
     let ora_hits = brute_force_and_top_k(&f.oracles, "rust async", ORACLE_TOP_K);
@@ -441,7 +441,7 @@ fn oracle_two_term_and_matches() {
 
 #[test]
 fn oracle_three_term_and_singleton_match() {
-    // "rust" + "async" + "tokio" intersect only at doc 0 (segment 0).
+    // "rust" + "async" + "tokio" intersect only at doc 0 (superfile 0).
     let f = &*STANDARD_FIXTURE;
     let inf_hits =
         supertable_search_and_global(&f.infino, "rust async tokio", ORACLE_TOP_K, CHUNK_SIZE);
@@ -463,12 +463,12 @@ fn oracle_and_missing_term_returns_empty() {
 }
 
 #[test]
-fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
-    // "rust" + "kafka" — "rust" appears in every segment, but
-    // "kafka" only appears in doc 15 (segment 1) where "rust" does
+fn oracle_and_superfile_locally_missing_term_still_intersects_elsewhere() {
+    // "rust" + "kafka" — "rust" appears in every superfile, but
+    // "kafka" only appears in doc 15 (superfile 1) where "rust" does
     // not co-occur. The intersection is empty across the whole
-    // table, but the test confirms that segments with the missing
-    // term contribute nothing and segments without the missing term
+    // table, but the test confirms that superfiles with the missing
+    // term contribute nothing and superfiles without the missing term
     // also contribute nothing.
     let f = &*STANDARD_FIXTURE;
     let inf_hits = supertable_search_and_global(&f.infino, "rust kafka", ORACLE_TOP_K, CHUNK_SIZE);
@@ -487,8 +487,8 @@ fn oracle_and_segment_locally_missing_term_still_intersects_elsewhere() {
 
 #[test]
 fn oracle_prefix_query_matches_explicit_term_or() {
-    // The supertable expands `alphafox` via per-segment FST walk,
-    // then runs a per-segment OR over the expansion. Mirror this
+    // The supertable expands `alphafox` via per-superfile FST walk,
+    // then runs a per-superfile OR over the expansion. Mirror this
     // by running a brute-force OR over the same explicit term list.
     let f = &*STANDARD_FIXTURE;
     let prefix = "alphafox";
@@ -507,8 +507,8 @@ fn oracle_prefix_query_matches_explicit_term_or() {
 }
 
 #[test]
-fn prefix_skip_prunes_segments_without_matching_lex_range() {
-    // Plant a prefix term in only one segment; verify the prefix
+fn prefix_skip_prunes_superfiles_without_matching_lex_range() {
+    // Plant a prefix term in only one superfile; verify the prefix
     // search returns exactly that doc and skip pruning prevents
     // other superfiles from contributing.
     let mut corp: Vec<(u64, String)> = planted_corpus()
@@ -516,7 +516,7 @@ fn prefix_skip_prunes_segments_without_matching_lex_range() {
         .map(|(id, t)| (id, t.to_string()))
         .collect();
     corp[0].1.push_str(" quokka_unique");
-    let infino = build_supertable(&corp, SEGMENTS);
+    let infino = build_supertable(&corp, SUPERFILES);
     let r = infino.reader();
     let hits = r
         .bm25_search_prefix("title", "quokka", ORACLE_TOP_K_SMALL)
@@ -524,7 +524,7 @@ fn prefix_skip_prunes_segments_without_matching_lex_range() {
     assert_eq!(hits.len(), 1);
     let manifest = r.manifest();
     let target_uri = manifest.superfiles[0].uri;
-    assert_eq!(hits[0].segment, target_uri);
+    assert_eq!(hits[0].superfile, target_uri);
     assert_eq!(hits[0].local_doc_id, 0);
 }
 
@@ -583,16 +583,16 @@ fn zipfian_corpus(n_docs: usize, seed: u64) -> Vec<(u64, String)> {
 
 #[test]
 fn oracle_zipfian_corpus_query_shapes_match() {
-    // 5K docs × 4 superfiles = 1250 docs/segment. Brute-force across
-    // segments is the exact same scoring path the supertable runs
-    // (per-segment IDF + global top-k merge with identical
+    // 5K docs × 4 superfiles = 1250 docs/superfile. Brute-force across
+    // superfiles is the exact same scoring path the supertable runs
+    // (per-superfile IDF + global top-k merge with identical
     // tie-breaker), so set overlap on the top-k is expected to be
     // tight; we keep the 60 % threshold loose to absorb any future
     // BM25 dl-norm refinements without test churn.
     let n_docs = 5_000;
     let corp = zipfian_corpus(n_docs, 42);
-    let infino = build_supertable(&corp, SEGMENTS);
-    let oracles = build_oracles(&corp, SEGMENTS);
+    let infino = build_supertable(&corp, SUPERFILES);
+    let oracles = build_oracles(&corp, SUPERFILES);
     let k = ZIPFIAN_TOP_K;
 
     let queries = [
@@ -607,7 +607,7 @@ fn oracle_zipfian_corpus_query_shapes_match() {
     ];
 
     for (label, q) in queries {
-        let inf = supertable_search_global(&infino, q, k, n_docs / SEGMENTS);
+        let inf = supertable_search_global(&infino, q, k, n_docs / SUPERFILES);
         let ora = brute_force_top_k(&oracles, q, k);
         let inf_set: HashSet<u64> = inf.iter().copied().collect();
         let ora_set: HashSet<u64> = ora.iter().copied().collect();

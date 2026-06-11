@@ -21,7 +21,7 @@ pub(crate) struct S3Config {
     pub(crate) secret_key: String,
 }
 
-/// How a disk-cache miss is serviced when reading cold segments from
+/// How a disk-cache miss is serviced when reading cold superfiles from
 /// object storage. Only meaningful when a disk cache is configured
 /// ([`ConnectOptions::with_cache_dir`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,7 +33,7 @@ pub enum ColdFetchMode {
     /// query-once / stateless callers.
     RangeOnly,
     /// A lazy reader serves the query immediately (a few range-GETs);
-    /// the full segment is downloaded to the cache in the background.
+    /// the full superfile is downloaded to the cache in the background.
     /// Lowest cold-query latency — the default.
     #[default]
     LazyForegroundWithBackgroundFill,
@@ -81,7 +81,7 @@ impl ConnectOptions {
     }
 
     /// Enable a local disk cache rooted at `dir` (off by default). Cold
-    /// segment reads are cached to NVMe; per table, under
+    /// superfile reads are cached to NVMe; per table, under
     /// `<dir>/<table>`. No effect on `memory://` catalogs.
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());

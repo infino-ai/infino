@@ -20,7 +20,7 @@
 //!   - The pointer file is missing or still references the
 //!     prior committed `manifest_id` → open returns the prior
 //!     state (or `PointerUnreadable` on a fresh supertable).
-//!     Any segment / manifest-part / manifest-list bytes
+//!     Any superfile / manifest-part / manifest-list bytes
 //!     written before the crash but never referenced by a
 //!     committed pointer are **orphans**: tolerated by
 //!     readers and GC'd by compaction.
@@ -39,9 +39,9 @@
 //!
 //! | Test fn                                                      | Crash point                                | Expected post-crash open state                    |
 //! |--------------------------------------------------------------|---------------------------------------------|----------------------------------------------------|
-//! | `crash_post_segment_no_prior_commit_yields_pointer_unreadable` | After 1st segment PUT, before list/pointer | `OpenError::PointerUnreadable`                     |
+//! | `crash_post_superfile_no_prior_commit_yields_pointer_unreadable` | After 1st superfile PUT, before list/pointer | `OpenError::PointerUnreadable`                     |
 //! | `crash_post_list_no_prior_commit_yields_pointer_unreadable`    | After 1st list PUT, before pointer         | `OpenError::PointerUnreadable`                     |
-//! | `crash_post_segment_on_second_commit_yields_v1`                | First commit succeeds; 2nd commit's segment PUT triggers | `manifest_id == 1` (v_prev), orphan v2 segment    |
+//! | `crash_post_superfile_on_second_commit_yields_v1`                | First commit succeeds; 2nd commit's superfile PUT triggers | `manifest_id == 1` (v_prev), orphan v2 superfile    |
 //! | `crash_post_list_on_second_commit_yields_v1`                   | First commit succeeds; 2nd commit's list PUT triggers   | `manifest_id == 1`, orphan v2 list + part         |
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
 //!
@@ -267,17 +267,17 @@ fn dispatch_child_if_set() -> Option<()> {
 }
 
 #[test]
-fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
+fn crash_post_superfile_no_prior_commit_yields_pointer_unreadable() {
     if dispatch_child_if_set().is_some() {
         return; // unreachable; child never returns
     }
     let dir = spawn_crash_child(
-        "crash_post_segment_no_prior_commit_yields_pointer_unreadable",
+        "crash_post_superfile_no_prior_commit_yields_pointer_unreadable",
         KP_SEG_FIRST,
     );
 
     // Parent verifies. The crash fired after the first
-    // segment PUT, before any manifest writes. No pointer
+    // superfile PUT, before any manifest writes. No pointer
     // exists yet → open must return PointerUnreadable.
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
@@ -288,8 +288,8 @@ fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
         "expected PointerUnreadable, got {err:?}"
     );
 
-    // The orphan segment file is present and ignored — the
-    // segment is just bytes under data/; readers don't
+    // The orphan superfile file is present and ignored — the
+    // superfile is just bytes under data/; readers don't
     // discover it without a committed manifest list.
     let data_dir = dir.join("data");
     let n_orphans = std::fs::read_dir(&data_dir)
@@ -297,7 +297,7 @@ fn crash_post_segment_no_prior_commit_yields_pointer_unreadable() {
         .unwrap_or(0);
     assert!(
         n_orphans >= 1,
-        "orphan segment must be present on disk; found {n_orphans} in {data_dir:?}"
+        "orphan superfile must be present on disk; found {n_orphans} in {data_dir:?}"
     );
 }
 
@@ -332,12 +332,12 @@ fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
 }
 
 #[test]
-fn crash_post_segment_on_second_commit_yields_v1() {
+fn crash_post_superfile_on_second_commit_yields_v1() {
     if dispatch_child_if_set().is_some() {
         return;
     }
     let dir = spawn_crash_child(
-        "crash_post_segment_on_second_commit_yields_v1",
+        "crash_post_superfile_on_second_commit_yields_v1",
         KP_SEG_SECOND,
     );
 
@@ -349,7 +349,7 @@ fn crash_post_segment_on_second_commit_yields_v1() {
     assert_eq!(
         consumer.reader().n_superfiles(),
         1,
-        "v1 has exactly the first commit's segment; v2's orphan segment is invisible"
+        "v1 has exactly the first commit's superfile; v2's orphan superfile is invisible"
     );
 }
 

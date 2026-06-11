@@ -24,7 +24,7 @@
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
 //! [`SupertableReader`], whose `bm25_search` (rows) / `bm25_hits`
-//! ([`SuperfileHit`], segment-local) / `bm25_search_prefix` methods are
+//! ([`SuperfileHit`], superfile-local) / `bm25_search_prefix` methods are
 //! the engine-facing surface. Ranked results are sorted by score
 //! *descending* — higher BM25 score is more relevant.
 //!
@@ -32,38 +32,38 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible segment we:
+//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
 //!
-//!   1. Fetch the segment's `SuperfileReader` from the store.
+//!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::bm25_search` /
 //!      `bm25_search_prefix` (already implemented at the superfile
-//!      layer; per-segment top-k with BlockMaxWAND skip).
-//!   3. Tag each `(local_doc_id, score)` with the segment URI.
+//!      layer; per-superfile top-k with BlockMaxWAND skip).
+//!   3. Tag each `(local_doc_id, score)` with the superfile URI.
 //!   4. Concatenate across superfiles and global-top-k by score.
 //!
-//! Rayon fan-out runs on `options.reader_pool`. For an N-segment
-//! supertable we issue N parallel per-segment searches; the pool
+//! Rayon fan-out runs on `options.reader_pool`. For an N-superfile
+//! supertable we issue N parallel per-superfile searches; the pool
 //! caps concurrency at the configured reader thread count.
 //!
 //! ## Score comparability across superfiles
 //!
-//! BM25's IDF is computed from per-segment `n_docs` and `df`,
-//! so a rare term in a small segment can score higher than the
-//! same term in a larger segment. This is the classical sharded-
+//! BM25's IDF is computed from per-superfile `n_docs` and `df`,
+//! so a rare term in a small superfile can score higher than the
+//! same term in a larger superfile. This is the classical sharded-
 //! BM25 problem:
-//! treating per-segment scores as comparable is a documented
+//! treating per-superfile scores as comparable is a documented
 //! approximation, accepted in v1 because (a) global IDF would
 //! require either a manifest-wide df table or a two-pass query
 //! (df gather + score), both with non-trivial memory/latency
 //! cost; (b) for k ≥ 10 and reasonably balanced superfiles the top-k
 //! *set* converges to the global answer even if score *order*
 //! within the set wiggles. Oracle tests assert set membership at
-//! `k = 10` against a single-segment ground truth.
+//! `k = 10` against a single-superfile ground truth.
 //!
 //! Manifest-level skip pruning is wired in: each call computes a
-//! per-segment keep/prune mask from the FTS bloom (exact-term
+//! per-superfile keep/prune mask from the FTS bloom (exact-term
 //! mode) or the lex term range (prefix mode) before issuing
-//! per-segment work, so pruned superfiles never trigger a
+//! per-superfile work, so pruned superfiles never trigger a
 //! `SuperfileReaderCache::reader` call. Vector + SQL skip remain
 //! deferred (see those modules' headers).
 
@@ -81,7 +81,7 @@ use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use crate::supertable::query::SuperfileHit;
 use crate::supertable::query::exec::common::resolve_hits_named;
-use crate::supertable::query::prune::{PruneLeaf, select_segments};
+use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -90,9 +90,9 @@ impl SupertableReader {
     ///
     /// `query` is tokenized by the v1 [`AsciiLowerTokenizer`] —
     /// the same tokenizer used at index time. Returns
-    /// [`QueryError::Store`] if any segment is unreachable, or
-    /// [`QueryError::Parquet`] if a segment's bytes can't be
-    /// queried (column missing from the segment's FTS index, etc.).
+    /// [`QueryError::Store`] if any superfile is unreachable, or
+    /// [`QueryError::Parquet`] if a superfile's bytes can't be
+    /// queried (column missing from the superfile's FTS index, etc.).
     ///
     /// Empty supertable (no superfiles) returns an empty `Vec`
     /// without consulting the store.
@@ -116,19 +116,19 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
-        // Parse the query once here, not per segment. The fan-out
+        // Parse the query once here, not per superfile. The fan-out
         // closures below need owned ('static) data for tokio::spawn,
         // so this is the one place the tokens are copied — the prune
-        // and every per-segment search reuse them.
+        // and every per-superfile search reuse them.
         let parsed = AsciiLowerTokenizer.parse(query);
         let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
 
-        // Pick the segments to search, via the shared two-tier bloom
+        // Pick the superfiles to search, via the shared two-tier bloom
         // prune. Only positive terms prune — a negated term must never
-        // drop a segment: a segment without it is the best case (none
+        // drop a superfile: a superfile without it is the best case (none
         // of its docs can be excluded), and under `And` it would even
-        // prune every segment that lacks the negated term.
+        // prune every superfile that lacks the negated term.
         // The leaf takes `positives` by value to avoid cloning the
         // list; we take it back right after the call.
         let prune_leaf = PruneLeaf::TermPresence {
@@ -136,7 +136,7 @@ impl SupertableReader {
             terms: positives,
             mode,
         };
-        let kept = select_segments(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
         let PruneLeaf::TermPresence {
             terms: positives, ..
         } = prune_leaf
@@ -149,7 +149,7 @@ impl SupertableReader {
 
         // Build the work-unit list. When the reader pool has more
         // threads than there are kept superfiles AND we're on the
-        // multi-term OR hot path, slice each segment into doc_id
+        // multi-term OR hot path, slice each superfile into doc_id
         // sub-ranges so the fan-out can saturate every pool thread.
         // Single-term OR and AND stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
@@ -164,11 +164,11 @@ impl SupertableReader {
 
         // One shared fan-out (`query::dispatch::fanout`) — the same
         // orchestrator the vector path uses. It warms the tombstone
-        // sidecars in one batch, opens each segment reader and runs the
+        // sidecars in one batch, opens each superfile reader and runs the
         // kernel under `tokio::spawn` so cold GETs overlap, then tags +
         // tombstone-filters each unit's hits. The per-unit `params` is
         // the optional doc-id sub-range; `None` searches the whole
-        // segment.
+        // superfile.
         let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
@@ -208,7 +208,7 @@ impl SupertableReader {
 
     /// Prefix-expanded BM25 search across the pinned manifest's
     /// superfiles. The prefix is ASCII-lowercased before expansion
-    /// (matching the v1 tokenizer) and expanded per-segment to the
+    /// (matching the v1 tokenizer) and expanded per-superfile to the
     /// concrete term list before `BoolMode::Or` BM25 scoring.
     ///
     /// Returns up to `k` highest-scoring hits, sorted descending
@@ -240,10 +240,10 @@ impl SupertableReader {
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();
 
-        // Segment selection via the shared two-tier prune — the
+        // Superfile selection via the shared two-tier prune — the
         // single-`Prefix`-leaf case (part-level term-range skip →
-        // lazy-load surviving parts → per-segment term-range skip).
-        let kept = crate::supertable::query::prune::select_segments(
+        // lazy-load surviving parts → per-superfile term-range skip).
+        let kept = crate::supertable::query::prune::select_superfiles(
             manifest.as_ref(),
             &[crate::supertable::query::prune::PruneLeaf::Prefix {
                 column: column_owned.clone(),
@@ -291,7 +291,7 @@ impl SupertableReader {
     /// Unranked token match across the pinned snapshot. Returns
     /// every row matching `query`'s tokens under `mode` (`Or` = any
     /// token, `And` = every token) as [`SuperfileHit`]s — **no scoring**
-    /// (`score` is left `0.0`; these results are unordered). Segment
+    /// (`score` is left `0.0`; these results are unordered). Superfile
     /// skip uses the same term-bloom prune as BM25.
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
@@ -307,7 +307,7 @@ impl SupertableReader {
         if term_strings.is_empty() {
             return Ok(Vec::new());
         }
-        let kept = crate::supertable::query::prune::select_segments(
+        let kept = crate::supertable::query::prune::select_superfiles(
             manifest.as_ref(),
             &[crate::supertable::query::prune::PruneLeaf::TermPresence {
                 column: column.to_owned(),
@@ -342,7 +342,7 @@ impl SupertableReader {
     /// against `column` across the pinned snapshot. Returns the rows
     /// whose stored value equals `value` exactly as [`SuperfileHit`]s —
     /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
-    /// for the per-segment two-pass (token-AND prune + raw verify).
+    /// for the per-superfile two-pass (token-AND prune + raw verify).
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::exact_match`].
@@ -353,7 +353,7 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
         let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
-        // Tokens prune segments via the term bloom (AND); a token-less
+        // Tokens prune superfiles via the term bloom (AND); a token-less
         // value (e.g. punctuation only) can't prune, so keep all.
         let leaves = if term_strings.is_empty() {
             Vec::new()
@@ -365,7 +365,7 @@ impl SupertableReader {
             }]
         };
         let kept =
-            crate::supertable::query::prune::select_segments(manifest.as_ref(), &leaves).await?;
+            crate::supertable::query::prune::select_superfiles(manifest.as_ref(), &leaves).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -476,8 +476,8 @@ impl SupertableReader {
     }
 }
 
-/// One unit of per-segment search work scheduled into the reader
-/// pool's `par_iter`. `range == None` means "the whole segment" and
+/// One unit of per-superfile search work scheduled into the reader
+/// pool's `par_iter`. `range == None` means "the whole superfile" and
 /// dispatches to the un-ranged BM25 API; `range == Some((start,
 /// end))` means "only doc_ids in [start, end)" and dispatches to
 /// the range-aware OR path.
@@ -490,47 +490,47 @@ struct WorkUnit {
 /// more pool-scheduling + per-shard top-K-merge overhead than it
 /// saves in scoring work. Tuned to be coarse — the heuristic only
 /// needs to avoid splitting toy superfiles; production superfiles at
-/// the scales we benchmark (1.25M docs/segment after 10M × cpus/2
+/// the scales we benchmark (1.25M docs/superfile after 10M × cpus/2
 /// row-shard) are well above this floor.
 const SUBRANGE_MIN_DOCS: u32 = 50_000;
 
 /// Minimum query term count that makes OR sub-range fan-out eligible.
 /// The range-aware Block-Max MaxScore path is only wired up for
-/// multi-term OR, so single-term queries stay whole-segment.
+/// multi-term OR, so single-term queries stay whole-superfile.
 const OR_FANOUT_MIN_TERMS: usize = 2;
 
-/// How a query fans out over the kept segments.
+/// How a query fans out over the kept superfiles.
 enum FanOut {
-    /// One un-ranged unit per segment.
-    PerSegment,
-    /// Additionally slice big segments into doc-id sub-ranges when the
+    /// One un-ranged unit per superfile.
+    PerSuperfile,
+    /// Additionally slice big superfiles into doc-id sub-ranges when the
     /// reader pool has spare threads.
     SubRanges,
 }
 
 /// Pick the fan-out for a term query: only multi-term OR has a
 /// range-aware kernel, and negation has no ranged kernel (v1), so
-/// everything else stays one un-ranged unit per segment.
+/// everything else stays one un-ranged unit per superfile.
 fn fanout_for(mode: BoolMode, n_positives: usize, has_negatives: bool) -> FanOut {
     if mode == BoolMode::Or && n_positives >= OR_FANOUT_MIN_TERMS && !has_negatives {
         FanOut::SubRanges
     } else {
-        FanOut::PerSegment
+        FanOut::PerSuperfile
     }
 }
 
 /// Slice the kept superfiles into parallel work units — one
-/// [`WorkUnit`] per (segment, doc_id sub-range) tuple.
+/// [`WorkUnit`] per (superfile, doc_id sub-range) tuple.
 ///
 /// `FanOut::SubRanges` slices only when:
 ///   1. The reader pool has more threads than kept superfiles —
-///      otherwise every thread is already saturated by one segment
+///      otherwise every thread is already saturated by one superfile
 ///      and splitting just adds overhead.
 ///   2. The candidate sub-range width is at least
 ///      `SUBRANGE_MIN_DOCS` — below that, BMM bookkeeping +
 ///      cross-sub-range top-K merge dominate the parallel win.
 ///
-/// Otherwise each kept segment becomes a single un-ranged work unit
+/// Otherwise each kept superfile becomes a single un-ranged work unit
 /// — identical to the original `par_iter` over superfiles shape.
 fn build_work_units(
     kept: &[&Arc<SuperfileEntry>],
@@ -538,7 +538,7 @@ fn build_work_units(
     pool_threads: usize,
 ) -> Vec<WorkUnit> {
     let want_subranges = pool_threads.div_ceil(kept.len().max(1)).max(1);
-    if matches!(fanout, FanOut::PerSegment) || want_subranges <= 1 {
+    if matches!(fanout, FanOut::PerSuperfile) || want_subranges <= 1 {
         return kept
             .iter()
             .map(|e| WorkUnit {
@@ -556,10 +556,10 @@ fn build_work_units(
         }
         // Round the sub-range count down to avoid producing
         // narrower-than-floor slices. With `want_subranges = 2` on
-        // a 1.25M-doc segment, stride = 625K (well above floor) so
-        // both sub-ranges fire. With a tiny segment (e.g., 10K
+        // a 1.25M-doc superfile, stride = 625K (well above floor) so
+        // both sub-ranges fire. With a tiny superfile (e.g., 10K
         // docs, well below `SUBRANGE_MIN_DOCS`), the division
-        // collapses to 1 sub-range = full segment.
+        // collapses to 1 sub-range = full superfile.
         let cap_by_floor = (n_docs / SUBRANGE_MIN_DOCS).max(1) as usize;
         let n_sub = want_subranges.min(cap_by_floor);
         if n_sub <= 1 {
@@ -583,10 +583,10 @@ fn build_work_units(
     units
 }
 
-/// Merge per-segment hits and return the top-k by *descending*
+/// Merge per-superfile hits and return the top-k by *descending*
 /// score (highest BM25 = most relevant). Uses a min-heap of size k
 /// so we never sort more than k elements.
-fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
+fn top_k_descending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
@@ -609,7 +609,7 @@ fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superf
     }
 
     let mut heap = BinaryHeap::with_capacity(k + 1);
-    for hit in per_segment.into_iter().flatten() {
+    for hit in per_superfile.into_iter().flatten() {
         if heap.len() < k {
             heap.push(MinByScore(hit));
         } else if let Some(worst) = heap.peek()
@@ -748,7 +748,7 @@ mod tests {
     use crate::test_helpers::default_tokenizer as tok;
 
     /// Drive an async future to completion on a throwaway current-thread
-    /// runtime. Used only for the single-segment `SuperfileReader`
+    /// runtime. Used only for the single-superfile `SuperfileReader`
     /// oracle, whose search surface is async-only; the supertable
     /// reader's own search methods are sync and need no runtime here.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -767,7 +767,7 @@ mod tests {
         )]))
     }
 
-    fn options_one_segment_per_commit() -> SupertableOptions {
+    fn options_one_superfile_per_commit() -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -793,7 +793,7 @@ mod tests {
 
     /// Build a single SuperfileBuilder containing the same docs as
     /// the supertable across all superfiles. Used as the oracle for
-    /// per-segment-vs-global BM25 set-membership tests.
+    /// per-superfile-vs-global BM25 set-membership tests.
     fn build_oracle_superfile(titles: &[&str]) -> Arc<crate::superfile::SuperfileReader> {
         // The oracle path goes directly through SuperfileBuilder
         // (not through Supertable::append's auto-injection), so
@@ -836,10 +836,10 @@ mod tests {
     }
 
     #[test]
-    fn negation_excludes_across_segments() {
-        // 3 commits → 3 segments. "alpha -beta" must drop the one doc
+    fn negation_excludes_across_superfiles() {
+        // 3 commits → 3 superfiles. "alpha -beta" must drop the one doc
         // containing beta and keep the other two alpha docs.
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
             .expect("append");
@@ -863,12 +863,12 @@ mod tests {
     }
 
     #[test]
-    fn negated_term_does_not_prune_segments() {
-        // "delta" exists only in segment 2. Under And, if the negated
-        // term leaked into the bloom prune, segments 1 and 3 (no delta)
+    fn negated_term_does_not_prune_superfiles() {
+        // "delta" exists only in superfile 2. Under And, if the negated
+        // term leaked into the bloom prune, superfiles 1 and 3 (no delta)
         // would be wrongly dropped and the result would be empty; the
-        // correct answer is segment 1's two alpha docs.
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        // correct answer is superfile 1's two alpha docs.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["alpha one", "alpha two"]))
             .expect("append");
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn negation_only_query_errors() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["alpha beta"])).expect("append");
         w.commit().expect("commit");
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
             .bm25_hits("title", "rust", 5, BoolMode::Or)
@@ -909,7 +909,7 @@ mod tests {
 
     #[test]
     fn bm25_search_k_zero_short_circuits() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn bm25_search_returns_descending_score_order() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(
             0,
@@ -948,8 +948,8 @@ mod tests {
     }
 
     #[test]
-    fn bm25_search_carries_segment_uri_for_each_hit() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+    fn bm25_search_carries_superfile_uri_for_each_hit() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust rust async"])).expect("a1");
         w.commit().expect("c1");
@@ -962,8 +962,8 @@ mod tests {
             .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 2);
-        // Both segment URIs should appear.
-        let mut uris: Vec<_> = hits.iter().map(|h| h.segment).collect();
+        // Both superfile URIs should appear.
+        let mut uris: Vec<_> = hits.iter().map(|h| h.superfile).collect();
         uris.sort();
         let expected: Vec<_> = {
             let mut v: Vec<_> = r.manifest().superfiles.iter().map(|e| e.uri).collect();
@@ -976,13 +976,13 @@ mod tests {
     #[test]
     fn bm25_search_oracle_top_k_set_matches_single_superfile() {
         // Plant a corpus where the top-k under BM25 is unambiguous
-        // regardless of per-segment-vs-global IDF variation: 3 docs
+        // regardless of per-superfile-vs-global IDF variation: 3 docs
         // contain the rare term `nimblefox`, distributed across 3
         // superfiles; the other 9 docs share only generic terms with
         // each other and with the query, so they score zero against
         // `nimblefox`. The set membership check survives even
-        // though per-segment IDF for `nimblefox` differs from
-        // global IDF (it's `df=1` in each segment vs `df=3` global).
+        // though per-superfile IDF for `nimblefox` differs from
+        // global IDF (it's `df=1` in each superfile vs `df=3` global).
         let titles = vec![
             "lookup nimblefox special token",   // 0  — match
             "ordinary common everyday text",    // 1
@@ -992,13 +992,13 @@ mod tests {
             "generic page that adds nothing",   // 5
             "another stuffer no rare terms",    // 6
             "more padding here for filler",     // 7
-            "tail nimblefox final segment",     // 8  — match
+            "tail nimblefox final superfile",   // 8  — match
             "another tail row",                 // 9
             "yet another normal title",         // 10
             "wrapping up the corpus today",     // 11
         ];
 
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for chunk_start in (0..titles.len()).step_by(4) {
             let end = (chunk_start + 4).min(titles.len());
@@ -1010,7 +1010,7 @@ mod tests {
         assert_eq!(st.reader().n_superfiles(), 3);
 
         let oracle = build_oracle_superfile(&titles);
-        // Single-segment `SuperfileReader` oracle: async-only search,
+        // Single-superfile `SuperfileReader` oracle: async-only search,
         // driven on a throwaway runtime. The supertable reader below
         // uses its sync public API.
         let oracle_hits = block_on(oracle.bm25_hits_async("title", "nimblefox", 5, BoolMode::Or))
@@ -1026,7 +1026,7 @@ mod tests {
             .bm25_hits("title", "nimblefox", 5, BoolMode::Or)
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
-        // Resolve supertable hits to global doc-ids via segment
+        // Resolve supertable hits to global doc-ids via superfile
         // ordering (superfiles appear in append order; chunk size = 4).
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -1035,8 +1035,8 @@ mod tests {
                 let seg_idx = manifest
                     .superfiles
                     .iter()
-                    .position(|e| e.uri == h.segment)
-                    .expect("segment in manifest");
+                    .position(|e| e.uri == h.superfile)
+                    .expect("superfile in manifest");
                 (seg_idx as u32) * 4 + h.local_doc_id
             })
             .collect();
@@ -1055,7 +1055,7 @@ mod tests {
             "rusty pipe rebuild",
             "go concurrency model",
         ];
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for chunk_start in (0..titles.len()).step_by(2) {
             let end = (chunk_start + 2).min(titles.len());
@@ -1081,8 +1081,8 @@ mod tests {
                 let seg_idx = manifest
                     .superfiles
                     .iter()
-                    .position(|e| e.uri == h.segment)
-                    .expect("segment in manifest");
+                    .position(|e| e.uri == h.superfile)
+                    .expect("superfile in manifest");
                 (seg_idx as u32) * 2 + h.local_doc_id
             })
             .collect();
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn bm25_search_prefix_unmatched_prefix_returns_empty() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
@@ -1110,7 +1110,7 @@ mod tests {
         // Index stores tokenized terms (lowercased); user provides
         // mixed-case prefix; we lowercase before expansion so the
         // FST walk finds the matching subtree.
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["Rust async runtime"]))
             .expect("append");
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn bm25_search_unknown_column_errors() {
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust"])).expect("append");
         w.commit().expect("commit");
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn bm25_search_results_global_top_k_caps_at_k() {
         // 4 superfiles × 1 doc each = 4 hits; ask for k=2; expect 2.
-        let st = Supertable::create(options_one_segment_per_commit()).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         for i in 0..4 {
             w.append(&build_batch(i * 10, &["rust async runtime"]))

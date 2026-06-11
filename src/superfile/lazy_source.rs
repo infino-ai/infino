@@ -4,7 +4,7 @@
 //! [`LazyByteSource`] — pulls byte ranges from an arbitrary
 //! backing (mmap, network range-fetch, broadcast subscription)
 //! so [`SuperfileReader::open_lazy`] can construct a reader
-//! without materializing the full segment up-front.
+//! without materializing the full superfile up-front.
 //!
 //! The trait lives next to the `superfile` reader; concrete
 //! impls live wherever the backing does. Errors propagate
@@ -16,13 +16,13 @@
 //!
 //! [`SuperfileReader::open_lazy`] accepts a source instead
 //! of bytes-in-hand. The caller no longer materializes the
-//! segment before calling; the source decides where the
+//! superfile before calling; the source decides where the
 //! bytes come from (mmap of a local file, range-fetched
 //! object store, a coalescing broadcaster that fans one
 //! fetch out to many subscribers).
 //!
 //! Opening reads only the metadata ranges the reader needs,
-//! not the whole segment: the Parquet footer, then the FTS
+//! not the whole superfile: the Parquet footer, then the FTS
 //! and vector section headers and directories. The inner
 //! readers thread the source through their own lookups, so
 //! queries fetch only the bytes they touch — `FtsReader`
@@ -30,7 +30,7 @@
 //! postings region is never read in full), and `VectorReader`
 //! fetches centroids and then only the probed clusters'
 //! blocks. A source-opened [`SuperfileReader`] therefore does
-//! not retain the full segment; `parquet_bytes()` returns
+//! not retain the full superfile; `parquet_bytes()` returns
 //! `None`, and pass-through Parquet callers use the eager
 //! `open` path instead.
 //!
@@ -363,7 +363,7 @@ impl Source {
 }
 
 /// In-memory `LazyByteSource` adapter — useful for tests and
-/// for callers that already have the full segment bytes.
+/// for callers that already have the full superfile bytes.
 #[derive(Debug, Clone)]
 pub struct BytesLazyByteSource {
     bytes: Bytes,
@@ -500,7 +500,7 @@ pub(crate) struct PrefetchedSource {
     inner: Arc<dyn LazyByteSource>,
     /// (absolute_start, bytes). One entry per pre-fetched
     /// range. Lookup walks the vec linearly — the open-time
-    /// path installs ≤ 3 ranges per segment so the linear
+    /// path installs ≤ 3 ranges per superfile so the linear
     /// scan is faster than a tree-keyed structure (cache-line
     /// hot, no allocation).
     prefetched: Vec<(u64, Bytes)>,

@@ -307,7 +307,7 @@ jobs:
           cd "$HOME/infino-src"
           export INFINO_BENCH_STORE=azure
           [ "$KEEP" = "true" ] && export INFINO_BENCH_KEEP_TABLE=1
-          # The multi-commit build holds many segment files + object-store
+          # The multi-commit build holds many superfile files + object-store
           # connections open at once; raise the fd soft limit to the hard
           # max so commits don't hit EMFILE ("too many open files").
           ulimit -n "$(ulimit -Hn)"

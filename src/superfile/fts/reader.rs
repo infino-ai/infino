@@ -561,7 +561,7 @@ impl FtsReader {
 
     /// Resolve a column name to its dense column_id, or
     /// `FtsError::UnknownColumn` if the column isn't FTS-indexed in
-    /// this segment. Shared by every public search entry point.
+    /// this superfile. Shared by every public search entry point.
     fn resolve_column_id(&self, column: &str) -> Result<u32, FtsError> {
         self.column_id_by_name
             .get(column)
@@ -570,13 +570,13 @@ impl FtsReader {
     }
 
     /// Walk the FST and collect every term registered under
-    /// `column`, in lex order. Used to populate per-segment FTS
+    /// `column`, in lex order. Used to populate per-superfile FTS
     /// skip-pruning summaries (term-presence bloom + lex term
     /// range) at commit time.
     ///
     /// Returns an empty `Vec` if `column` is not registered as
-    /// an FTS column in this segment. Cost is O(terms in column)
-    /// FST decodes; intended to be called once per (segment,
+    /// an FTS column in this superfile. Cost is O(terms in column)
+    /// FST decodes; intended to be called once per (superfile,
     /// column) at commit time, not on the query hot path.
     pub fn iter_column_terms(&self, column: &str) -> Result<Vec<Vec<u8>>, FtsError> {
         self.iter_terms_with_prefix(column, b"")
@@ -751,7 +751,7 @@ impl FtsReader {
     /// metadata header. Returns `0` if the token isn't in the column's
     /// dictionary. Used by the candidate planner to estimate a `WHERE`
     /// predicate's match count *ahead of* running `token_match`, so a
-    /// predicate that would match a large fraction of the segment can
+    /// predicate that would match a large fraction of the superfile can
     /// fall back to a plain scan instead of a (losing) index pushdown.
     pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, FtsError> {
         let column_id = self.resolve_column_id(column)?;
@@ -787,8 +787,8 @@ impl FtsReader {
     /// Same scoring semantics as [`Self::search`] in `BoolMode::Or`
     /// for the multi-term case, but only docs whose id falls within
     /// `[doc_id_start, doc_id_end)` are eligible. Used by the
-    /// supertable's intra-segment parallel fan-out: when the reader
-    /// pool has more threads than segments, each segment is sliced
+    /// supertable's intra-superfile parallel fan-out: when the reader
+    /// pool has more threads than superfiles, each superfile is sliced
     /// into N equal-width doc-id sub-ranges and one task per
     /// sub-range runs here in parallel; the caller merges the
     /// per-sub-range top-K heaps.
@@ -1632,8 +1632,8 @@ impl FtsReader {
 
     /// MaxScore+BMM constrained to the doc_id half-open range
     /// `[doc_id_start, doc_id_end)`. Used by the supertable layer's
-    /// intra-segment parallel fan-out: when the reader pool has more
-    /// threads than segments, each segment is split into N sub-ranges
+    /// intra-superfile parallel fan-out: when the reader pool has more
+    /// threads than superfiles, each superfile is split into N sub-ranges
     /// and the per-sub-range searches run in parallel, each producing
     /// its own top-K heap that the caller merges.
     ///
@@ -2009,12 +2009,12 @@ impl FtsReader {
     /// it narrowly wins, and we want the option available for future
     /// re-routing work without re-implementing it.
     ///
-    /// **When this can beat BMM (measured at 10M × 8 segments)**:
+    /// **When this can beat BMM (measured at 10M × 8 superfiles)**:
     /// - **Prefix expansions over very-rare terms, in parallel mode.**
     ///   E.g., `term0009*` expanding to 10 terms at Zipfian rank
     ///   90–99 (df ≈ 0.1% each). On the supertable parallel bench,
     ///   exhaustive ran at 40.2 ms vs BMM's 54.0 ms — a 26% win. The
-    ///   per-segment work is tiny (∼12 K matching docs across 10
+    ///   per-superfile work is tiny (∼12 K matching docs across 10
     ///   short cursors) so BMM's per-block bookkeeping
     ///   (`f_essential` recomputation, `shallow_advance_block_to`,
     ///   `inspect_block_max_bm25`) dominates over actual scoring

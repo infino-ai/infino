@@ -5,7 +5,7 @@
 //!
 //! One implementation of each benchmark's query battery, query
 //! execution, warm/cold measurement, and report rendering. Both the
-//! superfile (single-segment, in-memory) and supertable (multi-segment,
+//! superfile (single-superfile, in-memory) and supertable (multi-superfile,
 //! object-store) runners call these functions; the only thing each tier
 //! supplies is a *reader* (and, for cold, a way to open a fresh one).
 //! The reader type is an implementation detail hidden behind the
@@ -26,7 +26,7 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
 
 /// Cold timings for one query, split at the open/search boundary:
 /// `open` is the fresh-consumer open (consumer + manifest + every
-/// segment reader), `search` is the first query over the opened but
+/// superfile reader), `search` is the first query over the opened but
 /// data-cold table. Timed separately so cold search latency never
 /// bills the one-time open bookkeeping — the same cold-open vs
 /// cold-first-search split the quick-iter object-store harness uses.
@@ -36,12 +36,12 @@ pub struct ColdTiming {
     pub search: Duration,
 }
 
-/// Force-open every segment reader on the consumer's pinned snapshot —
-/// the "cold open" phase of a cold iteration. Runs the same per-segment
+/// Force-open every superfile reader on the consumer's pinned snapshot —
+/// the "cold open" phase of a cold iteration. Runs the same per-superfile
 /// open the query fan-out would lazily trigger (in-memory tier → disk
 /// cache admit → lazy range-GET fallback), concurrently like the query
 /// path, so the subsequent timed search pays only the search work.
-pub fn open_all_segments(consumer: &infino::supertable::Supertable) {
+pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
     let reader = consumer.reader();
     let manifest = reader.manifest();
     let store = &manifest.options.store;
@@ -58,7 +58,7 @@ pub fn open_all_segments(consumer: &infino::supertable::Supertable) {
             )
         }))
         .await
-        .expect("cold open: open segment readers");
+        .expect("cold open: open superfile readers");
     });
 }
 
@@ -305,7 +305,7 @@ pub mod fts {
     /// [`ColdTiming`]). `open_fresh` returns a guard that both
     /// implements [`FtsRead`] and owns the cache/consumer resources it
     /// must drop after the timed read; the guard's constructor performs
-    /// the full open (consumer + segment readers).
+    /// the full open (consumer + superfile readers).
     pub fn measure_cold<G: FtsRead>(
         open_fresh: impl Fn() -> G,
         battery: &[FtsQuery],
@@ -514,7 +514,7 @@ pub mod vector {
 
     /// A reader the vector executor runs kNN against, returning **global**
     /// `(doc_id, score)` hits so recall can be graded against brute-force
-    /// ground truth regardless of how many segments back the reader.
+    /// ground truth regardless of how many superfiles back the reader.
     pub trait VectorRead {
         fn topk_global(
             &self,
@@ -535,7 +535,7 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            // Single segment: local_doc_id == global id.
+            // Single superfile: local_doc_id == global id.
             crate::tiers::block_on(self.vector_hits_async(
                 column,
                 query,
@@ -560,7 +560,7 @@ pub mod vector {
                 .vector_hits(column, query, k, search_opts(nprobe, rerank))
                 .expect("supertable vector_hits");
             let manifest = reader.manifest();
-            // Per-segment global-id base offsets in manifest order.
+            // Per-superfile global-id base offsets in manifest order.
             let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
             let mut acc: u32 = 0;
             for entry in manifest.superfiles.iter() {
@@ -572,8 +572,8 @@ pub mod vector {
                     let seg_idx = manifest
                         .superfiles
                         .iter()
-                        .position(|e| e.uri == h.segment)
-                        .expect("hit segment present in manifest");
+                        .position(|e| e.uri == h.superfile)
+                        .expect("hit superfile present in manifest");
                     (offsets[seg_idx] + h.local_doc_id, h.score)
                 })
                 .collect()

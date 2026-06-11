@@ -150,10 +150,10 @@ existed yet.
 Current numbers: 1M docs per tier, real AWS S3 (us-east-1), recorded
 2026-06-09. Supertable tables are 256 superfiles across 16 commits.
 
-### FTS — superfile (single-segment, 1M docs)
+### FTS — superfile (single-superfile, 1M docs)
 
 <!-- BEGIN: bench/fts/superfile/ingest -->
-### Superfile FTS — ingest, single-segment / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
+### Superfile FTS — ingest, single-superfile / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
 
 _Host: unknown CPU · 10C/10T · macos/aarch64_
 
@@ -166,7 +166,7 @@ Build path: `SuperfileBuilder` → unified `.parquet` (same as production supert
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
-### Superfile FTS — search, single-segment / in-memory (1M docs)
+### Superfile FTS — search, single-superfile / in-memory (1M docs)
 
 _Host: unknown CPU · 10C/10T · macos/aarch64_
 
@@ -222,10 +222,10 @@ Through the string `bm25_hits_async` path (parses the `-` sigil); a correctness 
 | two_mid_and_common_neg | 5.15 ms (+3.2% worse) |
 <!-- END: bench/fts/superfile/negation -->
 
-### FTS — supertable (multi-segment, 1M docs, real S3)
+### FTS — supertable (multi-superfile, 1M docs, real S3)
 
 <!-- BEGIN: bench/fts/supertable/ingest -->
-### Supertable FTS — ingest, multi-segment / object-store (1M docs, 16 commits)
+### Supertable FTS — ingest, multi-superfile / object-store (1M docs, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -235,7 +235,7 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 <!-- END: bench/fts/supertable/ingest -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
-### Supertable FTS — search, multi-segment / object-store (1M docs)
+### Supertable FTS — search, multi-superfile / object-store (1M docs)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -263,10 +263,10 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 | ten_term_and | 34.90 ms (new) | 8.67 GiB (new) | 8.67 GiB (new) | 8.67 GiB (new) | 544.50 ms (new) |
 <!-- END: bench/fts/supertable/search -->
 
-### Vector — superfile (single-segment, 1M × 384)
+### Vector — superfile (single-superfile, 1M × 384)
 
 <!-- BEGIN: bench/vector/superfile/ingest -->
-### Superfile vector — ingest, single-segment / in-memory (1M docs × dim=384)
+### Superfile vector — ingest, single-superfile / in-memory (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -277,7 +277,7 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 <!-- END: bench/vector/superfile/ingest -->
 
 <!-- BEGIN: bench/vector/superfile/search -->
-### Superfile vector — search, single-segment / in-memory (1M docs × dim=384)
+### Superfile vector — search, single-superfile / in-memory (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -289,10 +289,10 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 | default | p=8, r=20 | — | 853.92 µs (new) | 4.30 GiB (new) | 4.30 GiB (new) | 4.30 GiB (new) | 593.77 ms (new) |
 <!-- END: bench/vector/superfile/search -->
 
-### Vector — supertable (multi-segment, 1M × 384, real S3)
+### Vector — supertable (multi-superfile, 1M × 384, real S3)
 
 <!-- BEGIN: bench/vector/supertable/ingest -->
-### Supertable vector — ingest, multi-segment / object-store (1M docs × dim=384, 16 commits)
+### Supertable vector — ingest, multi-superfile / object-store (1M docs × dim=384, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -302,7 +302,7 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 <!-- END: bench/vector/supertable/ingest -->
 
 <!-- BEGIN: bench/vector/supertable/search -->
-### Supertable vector — search, multi-segment / object-store (1M docs × dim=384)
+### Supertable vector — search, multi-superfile / object-store (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -319,7 +319,7 @@ Correctness gate: recall@10 = 0.995 (nprobe=64, rerank=256, 20 queries).
 ### Supertable — ingest summary (all shapes, real S3)
 
 <!-- BEGIN: bench/supertable/ingest -->
-### Supertable — ingest, multi-segment / object-store (1M docs, 16 commits)
+### Supertable — ingest, multi-superfile / object-store (1M docs, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -424,10 +424,10 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 | group_by_category | 203.36 ms (new) |
 <!-- END: bench/sql/superfile/cold -->
 
-### SQL — supertable (multi-segment, 1M rows, real S3)
+### SQL — supertable (multi-superfile, 1M rows, real S3)
 
 <!-- BEGIN: bench/sql/supertable/ingest -->
-### Supertable SQL — ingest, multi-segment / object-store (1M rows, 16 commits)
+### Supertable SQL — ingest, multi-superfile / object-store (1M rows, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 

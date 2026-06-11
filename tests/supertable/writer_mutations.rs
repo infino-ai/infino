@@ -263,7 +263,7 @@ async fn writer_update_cardinality_mismatch_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn update_emitted_segment_carries_subsection_offsets() {
+async fn update_emitted_superfile_carries_subsection_offsets() {
     let dir = TempDir::new().expect("tempdir");
     let cache_dir = TempDir::new().expect("cache");
     let storage: Arc<dyn StorageProvider> =
@@ -295,10 +295,10 @@ async fn update_emitted_segment_carries_subsection_offsets() {
         .superfiles
         .iter()
         .find(|e| e.n_docs == 1)
-        .expect("update-emitted single-row segment present");
+        .expect("update-emitted single-row superfile present");
     let offsets = emitted
         .subsection_offsets
         .as_ref()
-        .expect("update-emitted segment carries subsection_offsets");
+        .expect("update-emitted superfile carries subsection_offsets");
     assert!(offsets.total_size > 0, "total_size is stamped");
 }

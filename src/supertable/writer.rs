@@ -190,7 +190,7 @@ struct BufferedBatch {
 ///
 /// Trailing empty shards (only possible when `total_rows < n_shards`)
 /// are dropped before return; callers see exactly the shards that
-/// will produce a non-empty segment.
+/// will produce a non-empty superfile.
 fn split_buffer_into_row_shards(
     buffer: Vec<BufferedBatch>,
     n_shards: usize,
@@ -256,7 +256,7 @@ impl Supertable {
     /// Append one batch of rows and commit — durable when this returns.
     ///
     /// Folds the buffered writer + commit into a single call: one
-    /// `append` == one commit == one sealed segment, so callers batch
+    /// `append` == one commit == one sealed superfile, so callers batch
     /// rows per call rather than calling once per row.
     ///
     /// ```
@@ -1021,7 +1021,7 @@ impl ShardOutput {
     }
 }
 
-/// Build one segment from one slice of buffered batches. Runs on
+/// Build one superfile from one slice of buffered batches. Runs on
 /// a rayon worker thread inside the writer pool's `install`.
 fn build_one_shard(
     slice: &[BufferedBatch],
@@ -1118,8 +1118,8 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
 
     // capture the open-time batch bytes (parquet
     // footer tail + vector open ranges + FTS open ranges) so the
-    // reader can resolve a segment's open metadata straight from
-    // the manifest part, issuing zero per-segment open GETs.
+    // reader can resolve a superfile's open metadata straight from
+    // the manifest part, issuing zero per-superfile open GETs.
     let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &fts_open_ranges);
 
     Some(SubsectionOffsets {
@@ -1132,14 +1132,14 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
     })
 }
 
-/// Slice the bytes for the segment's open-time batch out of the
+/// Slice the bytes for the superfile's open-time batch out of the
 /// freshly-written superfile so the manifest can carry them
 /// inline. Mirrors the cold-fetch open batch in
 /// `DiskCacheStore::cold_fetch_lazy_with_hints`: the parquet
 /// footer tail (matching the 64 KiB speculation length) plus each
 /// vector / FTS open range. Returns `(absolute_offset, bytes)`
 /// tuples; an empty `Vec` disables the inline-open fast path for
-/// this segment.
+/// this superfile.
 fn build_open_blob(
     bytes: &Bytes,
     total_size: u64,
@@ -1309,9 +1309,9 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
 
 /// Per-shard publish artifacts produced in parallel before the
 /// serial manifest swap. One entry per non-empty shard.
-pub(crate) struct PreparedSegment {
+pub(crate) struct PreparedSuperfile {
     pub(crate) entry: Arc<SuperfileEntry>,
-    /// Bytes destined for the in-memory segment store. `Some` on
+    /// Bytes destined for the in-memory superfile store. `Some` on
     /// the in-memory-only path and the storage-without-cache
     /// path; `None` on the cache-attached path (the disk cache
     /// hydrates lazily from storage).
@@ -1320,8 +1320,8 @@ pub(crate) struct PreparedSegment {
     bytes_for_cache: Option<(SuperfileUri, Bytes)>,
 }
 
-impl PreparedSegment {
-    /// Open a `SuperfileReader` directly on this segment's bytes.
+impl PreparedSuperfile {
+    /// Open a `SuperfileReader` directly on this superfile's bytes.
     /// Returns `None` if no bytes are held (cache-attached path with
     /// no prepopulation — bytes went to storage only).
     #[cfg(test)]
@@ -1342,10 +1342,10 @@ impl PreparedSegment {
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
 /// mutable state, safe to run in parallel across shards.
-pub(super) fn prepare_segment(
+pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
-) -> Result<Option<PreparedSegment>, BuildError> {
+) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
     }
@@ -1355,7 +1355,7 @@ pub(super) fn prepare_segment(
     let bytes_for_storage = inner.options.storage.is_some().then(|| shard.bytes.clone());
     let cache_attached = inner.options.disk_cache.is_some() && inner.options.storage.is_some();
     // `bytes_for_store` (in-memory tier) is gated only on cache attachment —
-    // a cache-attached producer keeps segment bytes out of the unbounded
+    // a cache-attached producer keeps superfile bytes out of the unbounded
     // in-memory store regardless of whether we pre-populate the disk cache.
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
     // Pre-populating the disk cache is opt-out: a write-only producer that
@@ -1369,19 +1369,19 @@ pub(super) fn prepare_segment(
     // straight to object storage without a RAM detour, which is
     // what removes the 100GB OOM trap (the in-memory cache doesn't
     // evict, so a long-running writer with cache + storage would
-    // otherwise accumulate every segment's bytes in RAM forever).
+    // otherwise accumulate every superfile's bytes in RAM forever).
     let reader = crate::superfile::SuperfileReader::open_with(
         shard.bytes.clone(),
         inner.options.superfile_open_options(),
     )
-    .map_err(|e| BuildError::Store(format!("opening segment for summary: {e}")))?;
+    .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
     let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
         for fc in &inner.options.fts_columns {
             let terms = fts_reader
                 .iter_column_terms(&fc.column)
-                .expect("FST bytes valid: segment just built");
+                .expect("FST bytes valid: superfile just built");
             let n_terms_distinct = terms.len() as u32;
             let (min_term, max_term) = match (terms.first(), terms.last()) {
                 (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -1407,8 +1407,8 @@ pub(super) fn prepare_segment(
         for vc in &inner.options.vector_columns {
             if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
                 // Stage the per-cluster centroids (Sq8) into the
-                // manifest so a query can rank this segment's clusters
-                // globally without opening the segment.
+                // manifest so a query can rank this superfile's clusters
+                // globally without opening the superfile.
                 let clusters = vec_reader
                     .cluster_centroids(&vc.column)
                     .map(|(n_cent, dim, fp32, counts)| {
@@ -1453,7 +1453,7 @@ pub(super) fn prepare_segment(
         subsection_offsets,
     });
 
-    Ok(Some(PreparedSegment {
+    Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
         bytes_for_storage: bytes_for_storage.map(|b| (uri, b)),
@@ -1461,8 +1461,8 @@ pub(super) fn prepare_segment(
     }))
 }
 
-/// Insert each shard's bytes into the segment store, derive
-/// per-segment summaries from the stored `SuperfileReader`, and
+/// Insert each shard's bytes into the superfile store, derive
+/// per-superfile summaries from the stored `SuperfileReader`, and
 /// publish all entries in one `ArcSwap` of the manifest.
 ///
 /// Per-shard work (reader open, FTS bloom build, vector summary,
@@ -1475,10 +1475,10 @@ fn publish_superfiles(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
 ) -> Result<(), BuildError> {
-    let prepared: Vec<PreparedSegment> = inner.options.writer_pool.install(|| {
+    let prepared: Vec<PreparedSuperfile> = inner.options.writer_pool.install(|| {
         outputs
             .into_par_iter()
-            .filter_map(|shard| prepare_segment(inner, shard).transpose())
+            .filter_map(|shard| prepare_superfile(inner, shard).transpose())
             .collect::<Result<Vec<_>, _>>()
     })?;
 
@@ -1510,7 +1510,7 @@ fn publish_superfiles(
     let old = inner.manifest.load();
 
     // Storage write-through: when storage is attached, persist
-    // each segment's bytes + the new manifest (parts + list +
+    // each superfile's bytes + the new manifest (parts + list +
     // pointer) before swapping the in-memory state. If any
     // storage operation fails the commit fails as a whole —
     // the in-memory manifest is **not** updated, so callers
@@ -1527,12 +1527,12 @@ fn publish_superfiles(
 
         // Warm the cache with the superfiles we just persisted.
         // Skips the cold-fetch round-trip on the producer's
-        // next query against its own superfiles (each segment
+        // next query against its own superfiles (each superfile
         // otherwise costs one storage HEAD + parallel
         // range-GETs to refetch what we already have in
         // hand). Best-effort: a cache insert failure (e.g.,
         // budget exhausted) is logged via the error path but
-        // doesn't fail the commit — the segment is durably
+        // doesn't fail the commit — the superfile is durably
         // in storage, and a subsequent query will cold-fetch
         // it as if pre-population hadn't been attempted.
         if !pending_cache_inserts.is_empty()
@@ -1608,7 +1608,7 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// **OCC retry semantics.** On each iteration:
 ///  1. Reload `inner.manifest` to incorporate any commit a
 ///     racing writer published since our last attempt.
-///  2. Derive `new_segment_list = old.superfile_list.with_appended(new_entries.clone())`.
+///  2. Derive `new_superfile_list = old.superfile_list.with_appended(new_entries.clone())`.
 ///  3. Try `try_commit_attempt` (write superfiles → write part +
 ///     list → conditional pointer PUT).
 ///  4. On `WriteContentionExhausted` with retries left: refresh
@@ -1618,9 +1618,9 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 ///  5. After `opts.max_commit_retries` exhausted: surface
 ///     `CommitError::WriteContentionExhausted` to the caller.
 ///
-/// **Idempotency across retries.** Segment URIs are UUID v4 —
+/// **Idempotency across retries.** Superfile URIs are UUID v4 —
 /// statically random, so a retry uses the same URIs as the
-/// prior attempt. The segment-bytes PUT swallows
+/// prior attempt. The superfile-bytes PUT swallows
 /// `PreconditionFailed` (URI already exists with bit-identical
 /// content from our prior attempt). Manifest parts are
 /// content-addressed; identical content yields identical URIs
@@ -1662,9 +1662,9 @@ pub(in crate::supertable) fn persist_commit(
             // racing writer's commit (visible via
             // `refresh_inner_state_async` below from a prior
             // iteration) feeds into our successor's
-            // `new_segment_list`.
+            // `new_superfile_list`.
             let old = inner.manifest.load_full();
-            let new_segment_list = old.superfile_list.with_appended(new_entries.clone());
+            let new_superfile_list = old.superfile_list.with_appended(new_entries.clone());
             let pending_writes = &mut pending_storage_writes;
 
             match try_commit_attempt(
@@ -1672,13 +1672,13 @@ pub(in crate::supertable) fn persist_commit(
                 Arc::clone(&opts),
                 Arc::clone(&old),
                 &new_entries,
-                new_segment_list.manifest_id,
+                new_superfile_list.manifest_id,
                 pending_writes,
             )
             .await
             {
                 Ok(new_list) => {
-                    return Ok::<_, crate::supertable::CommitError>((new_list, new_segment_list));
+                    return Ok::<_, crate::supertable::CommitError>((new_list, new_superfile_list));
                 }
                 Err(crate::supertable::CommitError::WriteContentionExhausted)
                     if attempt + 1 < max_retries =>
@@ -1698,7 +1698,7 @@ pub(in crate::supertable) fn persist_commit(
         Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
     };
 
-    let (new_list, new_segment_list) = match tokio::runtime::Handle::try_current() {
+    let (new_list, new_superfile_list) = match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // Ambient tokio runtime present — use it. Don't
             // touch `inner.query_runtime()` so we don't risk
@@ -1717,7 +1717,7 @@ pub(in crate::supertable) fn persist_commit(
     // list + a fresh ManifestPartLoader installed.
     let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &new_list));
     Ok(Manifest {
-        superfile_list: new_segment_list,
+        superfile_list: new_superfile_list,
         list: Some(new_list),
         parts: dashmap::DashMap::new(),
         loader: Some(loader),
@@ -1728,7 +1728,7 @@ pub(in crate::supertable) fn persist_commit(
 // to remove successfully written entries.
 // Swallow `PreconditionFailed` per-PUT: on a retry after a
 // lost pointer-CAS, the same URI was already written by
-// our prior attempt with bit-identical bytes (segment URIs
+// our prior attempt with bit-identical bytes (superfile URIs
 // are UUID v4 — collision rate 2^-122). A "URI exists"
 // hit here means our own prior attempt; treat as success
 // so the retry path is fully idempotent.
@@ -1754,11 +1754,11 @@ pub async fn write_superfile_list(
         .map(|(i, (uri, bytes))| {
             let storage = Arc::clone(storage);
             async move {
-                let path = segment_storage_path(uri);
+                let path = superfile_storage_path(uri);
                 let result = if (bytes.len() as u64) >= multipart_threshold {
-                    put_segment_multipart(storage.as_ref(), &path, bytes.clone()).await
+                    put_superfile_multipart(storage.as_ref(), &path, bytes.clone()).await
                 } else {
-                    // Segment writes don't chain CAS, so the
+                    // Superfile writes don't chain CAS, so the
                     // returned etag isn't needed here.
                     storage.put_atomic(&path, bytes.clone()).await.map(|_| ())
                 };
@@ -1791,7 +1791,7 @@ pub async fn write_superfile_list(
     Ok(())
 }
 
-/// One attempt at the commit sequence: write segment bytes
+/// One attempt at the commit sequence: write superfile bytes
 /// → group new entries by partition → rewrite the latest part
 /// per touched partition (preserving untouched parts' URIs)
 /// → conditional pointer PUT. The retry loop in
@@ -1819,7 +1819,7 @@ async fn try_commit_attempt(
     new_manifest_id: u64,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<ManifestList, SupertableCommitError> {
-    // 1. Write each new segment's bytes to storage in parallel.
+    // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(&storage, &opts, pending_storage_writes).await?;
 
     // 2. Resolve the effective partition strategy. Locked at
@@ -1886,7 +1886,7 @@ async fn try_commit_attempt(
                     ))
                 })?;
                 let combined_n = existing_part.superfiles.len() + new_for_pk.len();
-                let combined_segments: Vec<Arc<SuperfileEntry>> = existing_part
+                let combined_superfiles: Vec<Arc<SuperfileEntry>> = existing_part
                     .superfiles
                     .iter()
                     .cloned()
@@ -1900,7 +1900,7 @@ async fn try_commit_attempt(
                     // superfiles for this partition.
                     out_list_entries.push(entry.clone());
                     let new_segs: Vec<Arc<SuperfileEntry>> =
-                        combined_segments[existing_part.superfiles.len()..].to_vec();
+                        combined_superfiles[existing_part.superfiles.len()..].to_vec();
                     let (fresh_entry, fresh_part) =
                         build_part_and_entry(&opts, new_segs, entry.partition_key.clone())?;
                     out_list_entries.push(fresh_entry);
@@ -1910,7 +1910,7 @@ async fn try_commit_attempt(
                     // combined-superfiles part.
                     let (rebuilt_entry, rebuilt_part) = build_part_and_entry(
                         &opts,
-                        combined_segments,
+                        combined_superfiles,
                         entry.partition_key.clone(),
                     )?;
                     out_list_entries.push(rebuilt_entry);
@@ -2124,21 +2124,21 @@ async fn refresh_inner_state_async(
         new_parts.insert(*pid, Arc::new(cell));
     }
 
-    let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
+    let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
     for entry in &new_list.parts {
         let cell = new_parts.get(&entry.part_id).expect("part inserted above");
         let part = cell
             .value()
             .get()
             .expect("eager-fetched or inherited; must be set");
-        all_segments.extend(part.superfiles.iter().cloned());
+        all_superfiles.extend(part.superfiles.iter().cloned());
     }
 
-    let mut new_segment_list = SuperfileList::empty(inner.options.clone());
-    new_segment_list.manifest_id = pointer.manifest_id;
-    new_segment_list.superfiles = all_segments;
+    let mut new_superfile_list = SuperfileList::empty(inner.options.clone());
+    new_superfile_list.manifest_id = pointer.manifest_id;
+    new_superfile_list.superfiles = all_superfiles;
     let new_manifest = Manifest {
-        superfile_list: new_segment_list,
+        superfile_list: new_superfile_list,
         list: Some(new_list),
         parts: new_parts,
         loader: Some(new_loader),
@@ -2147,7 +2147,7 @@ async fn refresh_inner_state_async(
     Ok(())
 }
 
-/// Storage path for a segment's bytes. Lives under `data/`
+/// Storage path for a superfile's bytes. Lives under `data/`
 /// alongside the `_supertable/` manifest hierarchy.
 /// IPC-encode a `RecordBatch` to a byte buffer. Mirrors the
 /// shape the WAL's arrow sidecar carries: an
@@ -2165,16 +2165,16 @@ fn encode_record_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Bytes, St
     Ok(Bytes::from(out))
 }
 
-fn segment_storage_path(uri: &SuperfileUri) -> String {
+fn superfile_storage_path(uri: &SuperfileUri) -> String {
     uri.storage_path()
 }
 
-/// Multipart-upload variant of the writer's per-segment put.
+/// Multipart-upload variant of the writer's per-superfile put.
 /// Routes through [`crate::storage::StorageProvider::put_multipart`]
 /// for superfiles large enough that a single PUT is wasteful
 /// (slow on a backend stall, high RSS during the put).
 ///
-/// Idempotency: segment URIs are UUID v4, so the only "URI
+/// Idempotency: superfile URIs are UUID v4, so the only "URI
 /// exists" hit on retry comes from our own prior attempt
 /// with bit-identical bytes. Head-first lets us short-circuit
 /// that case before re-running the multipart dance. The
@@ -2188,7 +2188,7 @@ fn segment_storage_path(uri: &SuperfileUri) -> String {
 /// 16-MiB chunk reads on the way back out. Parts are pushed
 /// in declaration order; the parts run concurrently inside
 /// `object_store` after their futures are polled.
-async fn put_segment_multipart(
+async fn put_superfile_multipart(
     storage: &dyn crate::storage::StorageProvider,
     path: &str,
     bytes: Bytes,
@@ -2237,7 +2237,7 @@ async fn put_segment_multipart(
 }
 
 /// Drive `DiskCacheStore::insert_warm` for each
-/// just-published segment via the same sync→async bridge
+/// just-published superfile via the same sync→async bridge
 /// the rest of the writer uses (`block_in_place +
 /// Handle::block_on` when an ambient runtime is present;
 /// `inner.query_runtime()` otherwise).
@@ -2258,7 +2258,7 @@ fn warm_cache_after_commit(
             if let Err(e) = cache.insert_warm(&uri, bytes).await {
                 eprintln!(
                     "supertable: warm cache pre-population failed for {}: {} \
-                     (segment is durable in storage; first query will cold-fetch)",
+                     (superfile is durable in storage; first query will cold-fetch)",
                     uri.0, e
                 );
             }
@@ -2381,7 +2381,7 @@ mod tests {
     // ---- single-writer end-to-end (serial pool) ----------------------
 
     #[test]
-    fn append_then_commit_publishes_one_segment() {
+    fn append_then_commit_publishes_one_superfile() {
         let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 4)).expect("append");
@@ -2403,8 +2403,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_is_queryable_via_store() {
-        // The published segment's bytes are in the store; we
+    async fn superfile_is_queryable_via_store() {
+        // The published superfile's bytes are in the store; we
         // can fetch a SuperfileReader and run bm25_search on it.
 
         let st = Supertable::create(options_id_title_serial()).expect("create");
@@ -2413,9 +2413,9 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader();
-        let segment = &r.manifest().superfiles[0];
+        let superfile = &r.manifest().superfiles[0];
         let store = &st.options().store;
-        let sf_reader = store.reader(&segment.uri).expect("reader");
+        let sf_reader = store.reader(&superfile.uri).expect("reader");
         let hits = sf_reader
             .bm25_hits_async("title", "alpha", 10, BoolMode::Or)
             .await
@@ -2427,7 +2427,7 @@ mod tests {
     // ---- id_min / id_max + n_docs ------------------------------------
 
     #[test]
-    fn segment_entry_records_id_range_and_n_docs() {
+    fn superfile_entry_records_id_range_and_n_docs() {
         let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(100, 3)).expect("a");
@@ -2448,7 +2448,7 @@ mod tests {
     // ---- FTS summary --------------------------------------------------
 
     #[test]
-    fn segment_entry_carries_fts_summary() {
+    fn superfile_entry_carries_fts_summary() {
         let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 4)).expect("append");
@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_entry_carries_vector_summary() {
+    fn superfile_entry_carries_vector_summary() {
         let dim = 16;
         let st = Supertable::create(options_with_vector(dim)).expect("create");
         let mut w = st.writer().expect("writer");
@@ -2545,7 +2545,7 @@ mod tests {
         assert_eq!(vs.centroid.len(), dim);
         assert!(vs.radius >= 0.0);
         // Per-cluster centroids are staged into the manifest for
-        // cross-segment global cluster selection.
+        // cross-superfile global cluster selection.
         assert!(
             !vs.clusters.is_empty(),
             "cluster centroids must be populated"
@@ -2557,7 +2557,7 @@ mod tests {
         assert_eq!(vs.clusters.scales.len(), vs.clusters.n_cent as usize);
         assert_eq!(vs.clusters.codes.len(), vs.clusters.n_cent as usize * dim);
         // Every indexed doc lands in exactly one cluster, so the
-        // per-cluster counts sum to the segment's doc count.
+        // per-cluster counts sum to the superfile's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();
         assert_eq!(total, seg.n_docs);
     }
@@ -2565,7 +2565,7 @@ mod tests {
     // ---- rayon-shard parallelism -------------------------------------
 
     #[test]
-    fn commit_produces_one_segment_per_writer_pool_thread() {
+    fn commit_produces_one_superfile_per_writer_pool_thread() {
         // With N writer-pool threads and a buffer of M >= N
         // batches, commit should emit N superfiles (one per
         // shard).
@@ -2608,7 +2608,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_config_with_fixed_writer_threads_emits_that_many_segments() {
+    fn apply_config_with_fixed_writer_threads_emits_that_many_superfiles() {
         let yaml = r#"
 commit_threshold_size_mb: 1024
 supertable:
@@ -2620,7 +2620,7 @@ supertable:
 
         // End-to-end: build options, route them through apply_config,
         // and verify the writer pool actually sized to the config's
-        // 4 threads (one segment per shard).
+        // 4 threads (one superfile per shard).
         let opts = options_id_title().apply_config(&cfg).expect("apply_config");
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
@@ -2655,7 +2655,7 @@ supertable:
         assert_eq!(st.manifest_id(), 1, "auto-flush should fire");
         assert_eq!(w.buffered_batches(), 0, "buffer drained on auto-flush");
 
-        // No further commit should land an empty segment.
+        // No further commit should land an empty superfile.
         w.commit().expect("commit-empty");
         assert_eq!(st.manifest_id(), 1);
     }
@@ -2673,7 +2673,7 @@ supertable:
     // ---- manifest copy-on-write across multiple commits -------------
 
     #[test]
-    fn each_commit_appends_to_existing_segments() {
+    fn each_commit_appends_to_existing_superfiles() {
         let st = Supertable::create(options_id_title_serial()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_simple_batch(0, 2)).expect("a1");

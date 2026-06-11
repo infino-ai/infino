@@ -7,7 +7,7 @@
 //! `bm25_search_prefix`, ...) produce a `Vec<SuperfileHit>` from a
 //! kernel and then face the same two jobs:
 //!
-//!   1. **Resolve** each `(segment, local_doc_id)` hit to the
+//!   1. **Resolve** each `(superfile, local_doc_id)` hit to the
 //!      supertable's `_id` + projected scalar columns via
 //!      [`SuperfileReader::take_by_local_doc_ids`], preserving the
 //!      kernel's rank order, and append a `score` column.
@@ -96,11 +96,11 @@ pub(crate) fn output_schema_with_score(scalar_schema: &SchemaRef) -> SchemaRef {
 /// column ([`output_schema_with_score`]); `projection` indexes into
 /// it, exactly as DataFusion hands to `scan`. **Only the scalar
 /// columns the projection actually selects are decoded** — a query
-/// that selects just `score` opens no segment readers and touches no
+/// that selects just `score` opens no superfile readers and touches no
 /// scalar bytes (cost-first: never decode a column the query did not
 /// select). The `score` column is synthesized from the hits.
 ///
-/// Selected scalar columns are read per segment (each
+/// Selected scalar columns are read per superfile (each
 /// `take_by_local_doc_ids` is a column-projected read), concatenated,
 /// then a single `take` reorders rows back into the global rank order
 /// so row `i` is the `i`-th hit.
@@ -180,11 +180,11 @@ pub(crate) async fn resolve_hits(
     .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
-/// Read `names` (scalar columns) at the `hits`' `(segment,
+/// Read `names` (scalar columns) at the `hits`' `(superfile,
 /// local_doc_id)` rows and return them in global rank order.
 ///
-/// Hits are grouped by segment for one column-projected
-/// [`take_by_local_doc_ids`] per segment; the per-segment batches are
+/// Hits are grouped by superfile for one column-projected
+/// [`take_by_local_doc_ids`] per superfile; the per-superfile batches are
 /// concatenated and a single `take` restores rank order. Caller
 /// guarantees `hits` and `names` are both non-empty.
 ///
@@ -194,16 +194,16 @@ async fn resolve_columns(
     hits: &[SuperfileHit],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
-    // Group local_doc_ids by segment, preserving first-seen segment
+    // Group local_doc_ids by superfile, preserving first-seen superfile
     // order and recording where each global hit lands.
     let mut seg_order: Vec<SuperfileUri> = Vec::new();
     let mut seg_locals: Vec<Vec<u32>> = Vec::new();
     let mut placement: Vec<(usize, usize)> = Vec::with_capacity(hits.len());
     for hit in hits {
-        let seg_idx = match seg_order.iter().position(|s| *s == hit.segment) {
+        let seg_idx = match seg_order.iter().position(|s| *s == hit.superfile) {
             Some(i) => i,
             None => {
-                seg_order.push(hit.segment);
+                seg_order.push(hit.superfile);
                 seg_locals.push(Vec::new());
                 seg_order.len() - 1
             }
@@ -213,7 +213,7 @@ async fn resolve_columns(
         placement.push((seg_idx, row));
     }
 
-    // Open every distinct segment reader concurrently on the tokio
+    // Open every distinct superfile reader concurrently on the tokio
     // runtime — these are async I/O (in-memory cache lookups /
     // disk-cache cold fetches), so overlapping them is the right
     // model and they cost ~microseconds when warm.
@@ -230,7 +230,7 @@ async fn resolve_columns(
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-    // Materialize each segment's projected hit rows, split by tier:
+    // Materialize each superfile's projected hit rows, split by tier:
     //
     //   - **Resident readers** (in-memory tier / freshly written):
     //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode
@@ -241,11 +241,11 @@ async fn resolve_columns(
     //   - **Lazy readers** stream ONLY the projected hit rows through
     //     parquet's async `ParquetObjectReader` (footer + projected
     //     column pages via range GETs) — async I/O that belongs on the
-    //     query runtime; a cold read never materializes the segment.
+    //     query runtime; a cold read never materializes the superfile.
     //
     // Both waves run concurrently and stitch back in `seg_order`
-    // order. Segment count here is bounded by the global top-k (one
-    // entry per distinct hit-bearing segment), so the fan-out is small.
+    // order. Superfile count here is bounded by the global top-k (one
+    // entry per distinct hit-bearing superfile), so the fan-out is small.
     let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
     let mut cold_units: Vec<(usize, &SuperfileUri, &Arc<SuperfileReader>, &[u32])> = Vec::new();
     for (i, ((uri, rd), locals)) in seg_order
@@ -329,18 +329,18 @@ async fn resolve_columns(
     for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
         slots[i] = Some(batch);
     }
-    let per_segment: Vec<RecordBatch> = slots
+    let per_superfile: Vec<RecordBatch> = slots
         .into_iter()
-        .map(|s| s.expect("invariant: every segment resolved by exactly one wave"))
+        .map(|s| s.expect("invariant: every superfile resolved by exactly one wave"))
         .collect();
     // Concatenate, then reorder rows into global rank order.
-    let cat_schema = per_segment[0].schema();
-    let combined = concat_batches(&cat_schema, &per_segment)
+    let cat_schema = per_superfile[0].schema();
+    let combined = concat_batches(&cat_schema, &per_superfile)
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-    let mut offsets: Vec<u32> = Vec::with_capacity(per_segment.len());
+    let mut offsets: Vec<u32> = Vec::with_capacity(per_superfile.len());
     let mut acc: u32 = 0;
-    for batch in &per_segment {
+    for batch in &per_superfile {
         offsets.push(acc);
         acc += batch.num_rows() as u32;
     }
@@ -358,10 +358,10 @@ async fn resolve_columns(
 }
 
 /// Stream the projected `names` columns at `local_doc_ids` from a lazy
-/// object-store segment via parquet's async `ParquetObjectReader`
+/// object-store superfile via parquet's async `ParquetObjectReader`
 /// (footer + projected column pages fetched as range GETs). Mirrors
 /// [`SuperfileReader::take_by_local_doc_ids`]'s row-selection + rank-back,
-/// but never materializes the whole segment — this is the cold/object-
+/// but never materializes the whole superfile — this is the cold/object-
 /// store row-resolution path.
 ///
 /// [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
