@@ -4,7 +4,7 @@ Read `[CONTRIBUTING.md](CONTRIBUTING.md)` first — it covers prerequisites, bui
 
 ## Project overview
 
-**Infino is a fast retrieval engine that keeps your data on cheap object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system**. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
+**Infino is a fast retrieval engine that stores your data on object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system**. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
 
 For the plain-language tour — what Infino is, the mental model, and how it compares to other systems — see `docs/architecture/overview.md`. For design references, read `docs/architecture/superfile.md` and `docs/architecture/supertable.md` before touching format or manifest code.
 
