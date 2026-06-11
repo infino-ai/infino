@@ -573,14 +573,13 @@ pub mod vector {
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
     use crate::rss::{self, PeakSampler, RssStats};
 
-    /// Largest doc count that still runs the brute-force correctness
-    /// gate (the recall assert on 20 held-out queries). The check's
-    /// full-corpus oracle scan adds nothing at scale — correctness is
-    /// already pinned at small sizes and by the `scale` diagnostic —
-    /// so above this cap only the gate is skipped. Recall
-    /// *calibration* (the (p, r) grid, with its own oracle pass over
-    /// the calibration queries) runs at every scale: those rows are
-    /// the bench's product numbers.
+    /// Largest doc count that still runs the brute-force ground-truth
+    /// oracle (correctness gate + recall calibration). The oracle
+    /// scans the entire vector corpus per query batch, so its cost —
+    /// compute and corpus residency — scales linearly with n_docs and
+    /// dominates wall time well before 25M. Above this, runs measure
+    /// the default config only; recall acceptance at scale is the
+    /// `scale` diagnostic's job.
     pub const GROUND_TRUTH_MAX_DOCS: usize = 1_000_000;
     /// Recall correctness gate (shared by both tiers).
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
@@ -953,8 +952,8 @@ pub mod vector {
                 eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
             }
             None => eprintln!(
-                "[{log_prefix}] brute-force correctness gate skipped: \
-                 n_docs > {GROUND_TRUTH_MAX_DOCS}"
+                "[{log_prefix}] correctness + recall calibration skipped: \
+                 n_docs > {GROUND_TRUTH_MAX_DOCS} (brute-force oracle gated to small runs)"
             ),
         }
 
