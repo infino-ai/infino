@@ -575,6 +575,22 @@ pub mod fts {
                 .map(|b| b.num_rows())
                 .sum()
         }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> usize {
+            self.consumer
+                .reader()
+                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("cold bm25_search fetched")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
+        }
     }
 }
 

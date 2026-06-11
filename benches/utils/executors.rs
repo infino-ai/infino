@@ -233,10 +233,35 @@ pub mod fts {
     /// A reader the FTS executor can run a BM25 query against. Hides
     /// whether the bytes are an in-memory superfile or an object-store
     /// supertable consumer.
+    ///
+    /// Two measurement surfaces per tier, mirroring the search-engine
+    /// phases:
+    ///
+    ///   * [`bm25_rows`](FtsRead::bm25_rows) — the **query phase**:
+    ///     id + score, no row materialization. Superfile = the raw
+    ///     kernel (`bm25_hits_async`); supertable = the public
+    ///     `bm25_search(.., None)` (bare projection — arithmetic `_id`
+    ///     resolve, no Parquet).
+    ///   * [`bm25_rows_fetched`](FtsRead::bm25_rows_fetched) — the
+    ///     **fetch phase**: same search plus materializing the text
+    ///     column for the top-k rows. Superfile = kernel +
+    ///     `take_by_local_doc_ids`; supertable = the public
+    ///     `bm25_search(.., Some([_id, column, score]))`.
     pub trait FtsRead {
-        /// Run one BM25 search; return the materialized hit/row count
-        /// (used as a black-box sink so the search is not optimized out).
+        /// Query phase: one BM25 search returning id + score; the hit
+        /// count is the black-box sink so the search is not optimized
+        /// out.
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize;
+
+        /// Fetch phase: query + materialize the searched column for
+        /// the top-k hits.
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize;
     }
 
     impl FtsRead for SuperfileReader {
@@ -244,6 +269,24 @@ pub mod fts {
             crate::tiers::block_on(self.bm25_hits_async(column, query, k, mode))
                 .expect("superfile bm25_search")
                 .len()
+        }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize {
+            let hits = crate::tiers::block_on(self.bm25_hits_async(column, query, k, mode))
+                .expect("superfile bm25_search");
+            if hits.is_empty() {
+                return 0;
+            }
+            let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
+            self.take_by_local_doc_ids(&locals, &[column])
+                .expect("superfile take rows")
+                .num_rows()
         }
     }
 
@@ -255,18 +298,36 @@ pub mod fts {
                 .map(|b| b.num_rows())
                 .sum()
         }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize {
+            self.bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("supertable bm25_search fetched")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
+        }
     }
 
-    /// Warm p50 (+ per-query RSS) for one query.
+    /// Warm p50 (+ per-query RSS) for one query: `p50` is the query
+    /// phase (id + score), `p50_fetched` the fetch phase (+ the text
+    /// column for the top-k rows).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
         pub p50: Duration,
+        pub p50_fetched: Duration,
         pub rss: RssStats,
     }
 
     /// Measure the warm battery against an already-warm reader: one
-    /// untimed prewarm per query, then `iters` timed iterations.
+    /// untimed prewarm per query, then `iters` timed iterations for
+    /// the query phase and `iters` for the fetch phase.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -290,10 +351,19 @@ pub mod fts {
                     samples.push(t.elapsed());
                     std::hint::black_box(rows);
                 }
+                let _ = reader.bm25_rows_fetched(column, &query, k, mode);
+                let mut fetched_samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let rows = reader.bm25_rows_fetched(column, &query, k, mode);
+                    fetched_samples.push(t.elapsed());
+                    std::hint::black_box(rows);
+                }
                 let rss = sampler.stop_stats();
                 FtsQueryStat {
                     name: q.name,
                     p50: p50(&mut samples),
+                    p50_fetched: p50(&mut fetched_samples),
                     rss,
                 }
             })
@@ -349,8 +419,10 @@ pub mod fts {
         match stat {
             Some(q) => {
                 let ns = q.p50.as_secs_f64() * NS_PER_SEC;
+                let fetched_ns = q.p50_fetched.as_secs_f64() * NS_PER_SEC;
                 vec![
                     metric(ns, fmt_time(ns), Better::Lower),
+                    metric(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                     metric(
                         q.rss.peak_rss_bytes as f64,
                         rss::fmt_bytes(q.rss.peak_rss_bytes),
@@ -368,7 +440,7 @@ pub mod fts {
                     ),
                 ]
             }
-            None => vec![text("—"), text("—"), text("—"), text("—")],
+            None => vec![text("—"), text("—"), text("—"), text("—"), text("—")],
         }
     }
 
@@ -418,7 +490,7 @@ pub mod fts {
         let mut header_cols = vec!["Query".to_string()];
         if warm_map.is_some() {
             header_cols.extend(
-                ["warm", "Peak RSS", "Median RSS", "P90 RSS"]
+                ["warm", "warm +fetch", "Peak RSS", "Median RSS", "P90 RSS"]
                     .iter()
                     .map(|s| s.to_string()),
             );
