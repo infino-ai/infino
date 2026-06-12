@@ -254,6 +254,35 @@ pub enum OpenError {
     OptionsHashMismatch { expected: String, actual: String },
 }
 
+/// Errors raised by [`crate::supertable::Supertable::compact`].
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionError {
+    /// Compaction requires durable storage
+    /// (needs to seal sidecars and publish the merged superfile).
+    #[error("compaction requires a storage backend")]
+    NoStorage,
+
+    /// A superfile listed in a `CompactionJob` is not present in the
+    /// current manifest snapshot.
+    #[error("superfile {0} not found in manifest snapshot")]
+    SuperfileNotFound(uuid::Uuid),
+
+    /// The tombstone sidecar for `superfile_id` is already sealed by
+    /// a different compaction run. Caller must drive the abandoned
+    /// compaction to completion (or unwind it) before retrying.
+    #[error(
+        "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
+    )]
+    SidecarConflict {
+        superfile_id: uuid::Uuid,
+        existing_compaction_id: uuid::Uuid,
+    },
+
+    /// A WAL-store I/O error occurred while sealing a sidecar.
+    #[error("seal failed: {0}")]
+    Seal(String),
+}
+
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]
 /// (`query_sql`; future: `bm25_search`, `vector_search`).
 ///

@@ -14,7 +14,9 @@ use crate::{
     superfile::builder::SuperfileBuilder,
     supertable::{
         BuildError, SuperfileEntry,
+        error::CompactionError,
         query::dispatch::open_reader,
+        wal::{WalStore, tombstones_admin, tombstones_admin::TombstonesAdminError},
         writer::{PreparedSuperfile, ShardOutput, prepare_superfile},
     },
 };
@@ -144,6 +146,140 @@ impl PendingJob {
 }
 
 impl Supertable {
+    /// Compaction entry point.
+    /// Gathers per-superfile stats from the current manifest snapshot,
+    /// selects compaction jobs, then for each job seals every input
+    /// superfile's tombstone sidecar so no concurrent deletes can land
+    /// during the merge window.
+    pub(crate) async fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
+        let inner = self.inner();
+        let manifest = inner.manifest.load_full();
+
+        let storage = manifest
+            .options
+            .storage
+            .as_ref()
+            .ok_or(CompactionError::NoStorage)?
+            .clone();
+        let wal_store = WalStore::new(storage);
+
+        // One LIST to find which superfiles have a tombstone sidecar.
+        let tombstone_ids: std::collections::HashSet<Uuid> = wal_store
+            .list_tombstone_ids()
+            .await
+            .map_err(|e| CompactionError::Seal(e.to_string()))?
+            .into_iter()
+            .collect();
+
+        // Fetch full sidecars (bitmap + seal record) only for superfiles
+        // that actually have a file.
+        let superfile_ids: Vec<Uuid> = manifest
+            .superfile_list
+            .superfiles
+            .iter()
+            .map(|e| e.superfile_id)
+            .filter(|id| tombstone_ids.contains(id))
+            .collect();
+        let sidecar_futs = superfile_ids.iter().map(|id| {
+            let ws = wal_store.clone();
+            let id = *id;
+            async move { (id, ws.get_tombstones(id).await) }
+        });
+        let sidecar_results = futures::future::join_all(sidecar_futs).await;
+        let sidecar_map: std::collections::HashMap<Uuid, _> = sidecar_results
+            .into_iter()
+            .filter_map(|(id, result)| result.ok().flatten().map(|(sc, _etag)| (id, sc)))
+            .collect();
+
+        // Build SuperfileStats for every superfile in the snapshot.
+        let stats: Vec<SuperfileStats> = manifest
+            .superfile_list
+            .superfiles
+            .iter()
+            .map(|entry| {
+                let sidecar = sidecar_map.get(&entry.superfile_id);
+                let tombstoned_docs = sidecar.map(|sc| sc.bitmap.len()).unwrap_or(0);
+                let sealed_by_other = sidecar.map(|sc| sc.seal.is_some()).unwrap_or(false);
+                SuperfileStats {
+                    superfile_id: entry.superfile_id,
+                    partition_key: entry.partition_key.clone(),
+                    size_bytes: entry
+                        .subsection_offsets
+                        .as_ref()
+                        .map(|o| o.total_size)
+                        .unwrap_or(0),
+                    n_docs: entry.n_docs,
+                    tombstoned_docs,
+                    sealed_by_other,
+                }
+            })
+            .collect();
+
+        let jobs = select(&stats, cfg);
+
+        for job in jobs {
+            // Resolve input Arc<SuperfileEntry> from the snapshot.
+            let inputs: Vec<Arc<SuperfileEntry>> = job
+                .inputs
+                .iter()
+                .map(|id| {
+                    manifest
+                        .superfile_list
+                        .superfiles
+                        .iter()
+                        .find(|e| e.superfile_id == *id)
+                        .cloned()
+                        .ok_or(CompactionError::SuperfileNotFound(*id))
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Seal every input sidecar.
+            // once sealed, further incoming updates are rejected
+            // and this seal flag helps to prevent overlapping compactions
+            // on same files
+            let compaction_id = Uuid::new_v4();
+            let sealed_at = chrono::Utc::now();
+            for entry in &inputs {
+                loop {
+                    match tombstones_admin::seal(
+                        &wal_store,
+                        entry.superfile_id,
+                        compaction_id,
+                        sealed_at,
+                    )
+                    .await
+                    {
+                        Ok(_) => break,
+                        Err(TombstonesAdminError::CasLost { .. }) => {
+                            // A writer landed a tombstone bit between our
+                            // GET and our PUT. Re-read and retry — the
+                            // seal will succeed on the next attempt unless
+                            // another compactor raced us.
+                            continue;
+                        }
+                        Err(TombstonesAdminError::AlreadySealed {
+                            superfile_id,
+                            existing_compaction_id,
+                        }) => {
+                            return Err(CompactionError::SidecarConflict {
+                                superfile_id,
+                                existing_compaction_id,
+                            });
+                        }
+                        Err(TombstonesAdminError::WalStore(e)) => {
+                            return Err(CompactionError::Seal(e.to_string()));
+                        }
+                    }
+                }
+            }
+
+            // TODO(pranav): merge_superfiles(&inputs) + try_commit_attempt
+            let _ = inputs;
+        }
+
+        Ok(())
+    }
+
     /// Merges the given superfiles into one
     pub(crate) async fn merge_superfiles(
         &self,
