@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+//
 // A walkthrough of how someone uses the infino Node binding, end to end.
 // Run after building the addon:  node examples/demo.mjs
 //
-// (TypeScript usage is identical — same imports, fully typed via infino.d.ts.
+// (TypeScript usage is identical — same imports, fully typed.
 // This file is .mjs so it runs with plain `node`, no build step.)
 
 import { connect, IndexSpec } from "../infino/index.js";

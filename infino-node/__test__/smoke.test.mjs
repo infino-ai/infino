@@ -13,9 +13,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { connect, IndexSpec } from "../infino/index.js";
-import { Schema, Field, LargeUtf8, Float32, FixedSizeList } from "apache-arrow";
+import { Schema, Field, LargeUtf8, Float32, FixedSizeList, Table, vectorFromArray } from "apache-arrow";
 
 // FTS columns must be LargeUtf8; non-null to match the appended data.
 const titleSchema = () => new Schema([new Field("title", new LargeUtf8(), false)]);
@@ -33,7 +36,7 @@ test("memory roundtrip: create, append, search, drop", () => {
   const db = connect("memory://");
   const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
 
-  // append takes plain objects — the wrapper builds Arrow internally.
+  // append takes plain objects (also an apache-arrow Table / RecordBatch).
   docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 
   assert.deepEqual(db.listTables(), ["docs"]);
@@ -53,6 +56,15 @@ test("memory roundtrip: create, append, search, drop", () => {
 
   db.dropTable("docs");
   assert.deepEqual(db.listTables(), []);
+});
+
+test("append accepts an apache-arrow RecordBatch", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  // A RecordBatch (or a Table) can be appended directly, not just objects.
+  const batch = new Table({ title: vectorFromArray(["the quick brown fox"], new LargeUtf8()) }).batches[0];
+  docs.append(batch);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
 });
 
 test("createTable accepts a plain { column: type } descriptor", () => {
@@ -102,7 +114,7 @@ test("unknown table throws", () => {
 });
 
 test("localfs persists across reconnect", () => {
-  const dir = `${process.env.TMPDIR ?? "/tmp"}/infino-node-smoke-${process.pid}`;
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-smoke-"));
   const db = connect(dir);
   const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
   docs.append([{ title: "a lazy sleeping fox" }]);

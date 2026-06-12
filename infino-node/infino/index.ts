@@ -147,26 +147,32 @@ function buildColumn(field: arrow.Field, rows: RowRecord[]): arrow.Vector {
   return arrow.vectorFromArray(values, field.type);
 }
 
-// Normalize append input -> IPC bytes.
+// Normalize append input -> IPC bytes. An array of objects, or an
+// apache-arrow Table / RecordBatch (normalized to rows via its own
+// `toArray()`/`toJSON()`); either way the columns are rebuilt in our arrow
+// instance from the declared schema. (We can't feed the consumer's Table
+// straight into our `tableToIPC` — a different module instance isn't
+// recognized.)
 function dataToIpc(data: AppendData, getSchema: () => arrow.Schema): Buffer {
   if (Buffer.isBuffer(data)) return data;
   if (data instanceof Uint8Array) return Buffer.from(data);
-  if (Array.isArray(data)) {
-    const schema = getSchema();
-    const cols: Record<string, arrow.Vector> = {};
-    for (const field of schema.fields) cols[field.name] = buildColumn(field, data);
-    return Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM));
-  }
-  // Duck-typed (cross-instance-safe): a Table has a `batches` array; a
-  // RecordBatch has a `schema` + numeric `numRows`.
+
+  let rows: RowRecord[];
   const d = data as any;
-  if (d && Array.isArray(d.batches)) return Buffer.from(arrow.tableToIPC(d, STREAM));
-  if (d && d.schema && typeof d.numRows === "number") {
-    return Buffer.from(arrow.tableToIPC(new arrow.Table([d]), STREAM));
+  if (Array.isArray(data)) {
+    rows = data as RowRecord[];
+  } else if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
+    rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
+  } else {
+    throw new TypeError(
+      "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
+    );
   }
-  throw new TypeError(
-    "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
-  );
+
+  const schema = getSchema();
+  const cols: Record<string, arrow.Vector> = {};
+  for (const field of schema.fields) cols[field.name] = buildColumn(field, rows);
+  return Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM));
 }
 
 // A Decimal128 value renders as a 4×u32 little-endian array in records.
