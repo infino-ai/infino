@@ -15,6 +15,7 @@ impl core::marker::Freeze for infino::BoolMode
 impl core::marker::Send for infino::BoolMode
 impl core::marker::Sync for infino::BoolMode
 impl core::marker::Unpin for infino::BoolMode
+impl core::marker::UnsafeUnpin for infino::BoolMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::BoolMode
 impl core::panic::unwind_safe::UnwindSafe for infino::BoolMode
 pub enum infino::ColdFetchMode
@@ -36,6 +37,7 @@ impl core::marker::Freeze for infino::ColdFetchMode
 impl core::marker::Send for infino::ColdFetchMode
 impl core::marker::Sync for infino::ColdFetchMode
 impl core::marker::Unpin for infino::ColdFetchMode
+impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 pub enum infino::CompactionError
@@ -54,6 +56,7 @@ impl core::marker::Freeze for infino::CompactionError
 impl core::marker::Send for infino::CompactionError
 impl core::marker::Sync for infino::CompactionError
 impl core::marker::Unpin for infino::CompactionError
+impl core::marker::UnsafeUnpin for infino::CompactionError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionError
 impl core::panic::unwind_safe::UnwindSafe for infino::CompactionError
 #[non_exhaustive] pub enum infino::InfinoError
@@ -73,6 +76,7 @@ impl core::marker::Freeze for infino::InfinoError
 impl core::marker::Send for infino::InfinoError
 impl core::marker::Sync for infino::InfinoError
 impl core::marker::Unpin for infino::InfinoError
+impl core::marker::UnsafeUnpin for infino::InfinoError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::InfinoError
 impl core::panic::unwind_safe::UnwindSafe for infino::InfinoError
 pub enum infino::Metric
@@ -92,6 +96,7 @@ impl core::marker::Freeze for infino::Metric
 impl core::marker::Send for infino::Metric
 impl core::marker::Sync for infino::Metric
 impl core::marker::Unpin for infino::Metric
+impl core::marker::UnsafeUnpin for infino::Metric
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Metric
 impl core::panic::unwind_safe::UnwindSafe for infino::Metric
 pub struct infino::CompactionSettings
@@ -116,6 +121,7 @@ impl core::marker::Freeze for infino::CompactionSettings
 impl core::marker::Send for infino::CompactionSettings
 impl core::marker::Sync for infino::CompactionSettings
 impl core::marker::Unpin for infino::CompactionSettings
+impl core::marker::UnsafeUnpin for infino::CompactionSettings
 impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionSettings
 impl core::panic::unwind_safe::UnwindSafe for infino::CompactionSettings
 pub struct infino::ConnectOptions
@@ -135,6 +141,7 @@ impl core::marker::Freeze for infino::ConnectOptions
 impl core::marker::Send for infino::ConnectOptions
 impl core::marker::Sync for infino::ConnectOptions
 impl core::marker::Unpin for infino::ConnectOptions
+impl core::marker::UnsafeUnpin for infino::ConnectOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ConnectOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::ConnectOptions
 pub struct infino::Connection
@@ -150,6 +157,7 @@ impl core::marker::Freeze for infino::Connection
 impl core::marker::Send for infino::Connection
 impl core::marker::Sync for infino::Connection
 impl core::marker::Unpin for infino::Connection
+impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
 pub struct infino::IndexSpec
@@ -167,6 +175,7 @@ impl core::marker::Freeze for infino::IndexSpec
 impl core::marker::Send for infino::IndexSpec
 impl core::marker::Sync for infino::IndexSpec
 impl core::marker::Unpin for infino::IndexSpec
+impl core::marker::UnsafeUnpin for infino::IndexSpec
 impl core::panic::unwind_safe::RefUnwindSafe for infino::IndexSpec
 impl core::panic::unwind_safe::UnwindSafe for infino::IndexSpec
 #[non_exhaustive] pub struct infino::MutationStats
@@ -186,6 +195,7 @@ impl core::marker::Freeze for infino::MutationStats
 impl core::marker::Send for infino::MutationStats
 impl core::marker::Sync for infino::MutationStats
 impl core::marker::Unpin for infino::MutationStats
+impl core::marker::UnsafeUnpin for infino::MutationStats
 impl core::panic::unwind_safe::RefUnwindSafe for infino::MutationStats
 impl core::panic::unwind_safe::UnwindSafe for infino::MutationStats
 pub struct infino::Supertable
@@ -211,6 +221,7 @@ impl core::marker::Freeze for infino::Supertable
 impl core::marker::Send for infino::Supertable
 impl core::marker::Sync for infino::Supertable
 impl core::marker::Unpin for infino::Supertable
+impl core::marker::UnsafeUnpin for infino::Supertable
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Supertable
 impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
 pub struct infino::VectorSearchOptions
@@ -233,6 +244,7 @@ impl core::marker::Freeze for infino::VectorSearchOptions
 impl core::marker::Send for infino::VectorSearchOptions
 impl core::marker::Sync for infino::VectorSearchOptions
 impl core::marker::Unpin for infino::VectorSearchOptions
+impl core::marker::UnsafeUnpin for infino::VectorSearchOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::VectorSearchOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::VectorSearchOptions
 pub const infino::BUILDER_ID: &str
