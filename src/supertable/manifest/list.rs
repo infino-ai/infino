@@ -154,6 +154,16 @@ pub struct ManifestListEntry {
 pub struct ScalarStatsAgg {
     pub min: Vec<u8>,
     pub max: Vec<u8>,
+    /// Σ null_count across the part's segments; `None` when any
+    /// segment lacks the stat (total unknowable, never zero).
+    pub null_count: Option<u64>,
+    /// Part-wide exact sum as Arrow-IPC length-1 bytes (same typing
+    /// as the per-segment `ScalarStatsTable.sums`); `None` when any
+    /// segment lacks it or the fold overflowed.
+    pub sum: Option<Vec<u8>>,
+    /// Merged HLL distinct sketch (raw registers); `None` when any
+    /// segment lacks one.
+    pub hll: Option<Vec<u8>>,
 }
 
 /// Aggregate FTS summary across a part's superfiles.
@@ -313,6 +323,14 @@ struct ManifestListEntryDto {
 struct ScalarStatsAggDto {
     min: String, // base64
     max: String, // base64
+    /// `None` ↔ field absent in JSON (parts written before the stat
+    /// existed decode cleanly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    null_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sum: Option<String>, // base64
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hll: Option<String>, // base64
 }
 
 #[derive(Serialize, Deserialize)]
@@ -390,6 +408,9 @@ fn entry_to_dto(e: &ManifestListEntry) -> ManifestListEntryDto {
                     ScalarStatsAggDto {
                         min: encode_b64(&v.min),
                         max: encode_b64(&v.max),
+                        null_count: v.null_count,
+                        sum: v.sum.as_deref().map(encode_b64),
+                        hll: v.hll.as_deref().map(encode_b64),
                     },
                 )
             })
@@ -443,6 +464,17 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
             ScalarStatsAgg {
                 min: decode_b64(&v.min, "scalar_stats_agg.min")?,
                 max: decode_b64(&v.max, "scalar_stats_agg.max")?,
+                null_count: v.null_count,
+                sum: v
+                    .sum
+                    .as_deref()
+                    .map(|s| decode_b64(s, "scalar_stats_agg.sum"))
+                    .transpose()?,
+                hll: v
+                    .hll
+                    .as_deref()
+                    .map(|s| decode_b64(s, "scalar_stats_agg.hll"))
+                    .transpose()?,
             },
         );
     }
@@ -684,6 +716,9 @@ mod tests {
             ScalarStatsAgg {
                 min: vec![seed, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
                 max: vec![seed, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9],
+                null_count: Some(u64::from(seed)),
+                sum: Some(vec![seed, 0x10, 0x20]),
+                hll: Some(vec![seed; 4]),
             },
         );
 

@@ -799,7 +799,10 @@ mod tests {
                 Arc::new(StringArray::from(vec!["zulu"])) as ArrayRef,
             ),
         );
-        ScalarStatsTable { cols }
+        ScalarStatsTable {
+            cols,
+            ..Default::default()
+        }
     }
 
     fn make_rich_segment() -> Arc<SuperfileEntry> {

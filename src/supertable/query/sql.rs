@@ -145,6 +145,13 @@ impl SupertableReader {
             reader.tombstone_cache.clone(),
         );
         let ctx = SessionContext::new();
+        // Covered/residual aggregate rewrite: filter-aligned range
+        // aggregates answer covered segments from manifest statistics
+        // and scan only the boundary segments. Appended after the
+        // built-in rules so it sees pushed-down, normalized plans.
+        ctx.add_optimizer_rule(Arc::new(
+            crate::supertable::query::covered_agg::CoveredAggregateRewrite,
+        ));
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(|e| QueryError::Plan(e.to_string()))?;
         // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to

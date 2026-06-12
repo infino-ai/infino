@@ -47,13 +47,17 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::DFSchema;
+use datafusion::common::stats::Precision;
+use datafusion::common::{ColumnStatistics, DFSchema, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
-use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::physical_plan::{
+    FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
+};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -62,11 +66,16 @@ use datafusion::object_store::path::Path as ObjPath;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 
 use bytes::Bytes;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use object_store::ObjectStore as OsObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use parquet::file::metadata::ParquetMetaData;
 use roaring::RoaringBitmap;
 
 use crate::superfile::LazyByteSource;
@@ -139,6 +148,13 @@ pub(crate) struct SupertableProvider {
     /// [`SUPERFILE_STORE_URL_PREFIX`]). Unique across providers so a
     /// multi-table query's registrations don't collide.
     store_url: ObjectStoreUrl,
+    /// Restriction to a segment subset, set only by the
+    /// covered/residual aggregate rewrite (the residual scan reads
+    /// boundary segments only; covered segments were answered from
+    /// manifest statistics). `None` = the whole snapshot. Also the
+    /// rewrite's idempotency guard: a restricted provider is never
+    /// rewritten again.
+    segment_filter: Option<std::collections::HashSet<uuid::Uuid>>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -175,6 +191,47 @@ impl SupertableProvider {
             disk_cache,
             tombstone_cache,
             store_url,
+            segment_filter: None,
+        }
+    }
+
+    /// Clone of this provider restricted to `segments` — used by the
+    /// covered/residual aggregate rewrite for the residual (boundary
+    /// segment) scan. Gets its own object-store registry key so the
+    /// restricted scan's registration can't collide with the parent's.
+    pub(crate) fn restricted_to(&self, segments: std::collections::HashSet<uuid::Uuid>) -> Self {
+        let mut restricted = Self::new(
+            Arc::clone(&self.schema),
+            Arc::clone(&self.manifest),
+            Arc::clone(&self.store),
+            self.disk_cache.clone(),
+            self.tombstone_cache.clone(),
+        );
+        restricted.segment_filter = Some(segments);
+        restricted
+    }
+
+    /// `true` when this provider is a covered/residual residual scan —
+    /// the rewrite's idempotency guard.
+    pub(crate) fn is_segment_restricted(&self) -> bool {
+        self.segment_filter.is_some()
+    }
+
+    /// The pinned manifest snapshot (covered/residual rewrite input).
+    pub(crate) fn manifest(&self) -> &Arc<Manifest> {
+        &self.manifest
+    }
+
+    /// Whether `entry` currently has a clean (empty, resolvable from
+    /// cache) tombstone view — the precondition for answering any part
+    /// of an aggregate from its manifest statistics.
+    pub(crate) fn entry_is_clean(&self, entry: &SuperfileEntry) -> bool {
+        match self.tombstone_cache.as_ref() {
+            None => true,
+            Some(cache) => cache
+                .bitmap_for(entry.superfile_id, std::time::Instant::now())
+                .map(|bitmap| bitmap.is_empty())
+                .unwrap_or(false),
         }
     }
 
@@ -218,9 +275,16 @@ impl SupertableProvider {
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
         let leaves = self.predicates_to_prune_leaves(predicates);
-        crate::supertable::query::prune::select_segments(self.manifest.as_ref(), &leaves)
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))
+        let mut survivors =
+            crate::supertable::query::prune::select_segments(self.manifest.as_ref(), &leaves)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        // Covered/residual residual scans read only their boundary
+        // segments; everything else was answered from statistics.
+        if let Some(allowed) = self.segment_filter.as_ref() {
+            survivors.retain(|entry| allowed.contains(&entry.superfile_id));
+        }
+        Ok(survivors)
     }
 
     /// The set of FTS-indexed column names — used by the candidate
@@ -244,6 +308,196 @@ impl SupertableProvider {
             .expect("select survivors")
             .len()
     }
+
+    /// Statistics over `entries`, assembled entirely from the manifest
+    /// (plus cached tombstone views) — no I/O, no scan:
+    ///
+    ///   * `num_rows` is **Exact** (Σ `n_docs` − Σ tombstone-bitmap
+    ///     cardinalities) when every entry's tombstone view resolves
+    ///     from cache; Inexact (Σ `n_docs`) otherwise.
+    ///   * per-column min/max come from the manifest's per-segment
+    ///     skip stats (`scalar_stats`, plus the dedicated `_id`
+    ///     range) and are **Exact only on a tombstone-free view** — a
+    ///     deleted row may hold the extremum — Inexact otherwise.
+    ///
+    /// Exact statistics let DataFusion's `AggregateStatistics` rule
+    /// fold `COUNT(*)` / `MIN` / `MAX` into literals, eliminating the
+    /// scan entirely; Inexact ones still feed planner estimates.
+    fn statistics_for(&self, entries: &[Arc<SuperfileEntry>]) -> Statistics {
+        let total_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
+        let now = std::time::Instant::now();
+
+        // Tombstone view: resolved-from-cache only (this path must be
+        // sync and I/O-free). A missing/stale view degrades to
+        // Inexact, never blocks.
+        let mut deleted: u64 = 0;
+        let mut views_resolved = true;
+        if let Some(cache) = self.tombstone_cache.as_ref() {
+            for entry in entries {
+                match cache.bitmap_for(entry.superfile_id, now) {
+                    Ok(bitmap) => deleted += bitmap.len(),
+                    Err(_) => {
+                        views_resolved = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let num_rows = if views_resolved {
+            Precision::Exact((total_rows - deleted) as usize)
+        } else {
+            Precision::Inexact(total_rows as usize)
+        };
+        let clean = views_resolved && deleted == 0;
+
+        // Wrap a known stat in the exactness the tombstone view
+        // allows: deleted rows may hold the extremum / contribute to
+        // a sum, so anything value-derived is only Exact on a clean
+        // view.
+        let wrap = |v: ScalarValue| {
+            if clean {
+                Precision::Exact(v)
+            } else {
+                Precision::Inexact(v)
+            }
+        };
+        let id_column = self.manifest.options.id_column.as_str();
+        let column_statistics = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let name = field.name().as_str();
+                if name == id_column {
+                    // `_id` is engine-injected: non-null and unique by
+                    // construction, range tracked in the manifest.
+                    let mut stats = ColumnStatistics::new_unknown();
+                    if let Some((min, max)) = id_min_max(entries) {
+                        stats.min_value = wrap(min);
+                        stats.max_value = wrap(max);
+                    }
+                    stats.null_count = Precision::Exact(0);
+                    stats.distinct_count = num_rows;
+                    return stats;
+                }
+                let mut stats = ColumnStatistics::new_unknown();
+                if let Some((min, max)) = scalar_min_max(entries, name) {
+                    stats.min_value = wrap(min);
+                    stats.max_value = wrap(max);
+                }
+                if let Some(nulls) = scalar_null_count(entries, name) {
+                    stats.null_count = if clean {
+                        Precision::Exact(nulls as usize)
+                    } else {
+                        Precision::Inexact(nulls as usize)
+                    };
+                }
+                if let Some(sum) = scalar_sum(entries, name) {
+                    stats.sum_value = wrap(sum);
+                }
+                if let Some(distinct) = scalar_distinct(entries, name) {
+                    // A sketch estimate — never exact.
+                    stats.distinct_count = Precision::Inexact(distinct);
+                }
+                stats
+            })
+            .collect();
+
+        Statistics {
+            num_rows,
+            total_byte_size: Precision::Absent,
+            column_statistics,
+        }
+    }
+}
+
+/// Min/max of the supertable-injected `_id` column across `entries`,
+/// from the manifest's dedicated id range fields.
+fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarValue)> {
+    use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
+    let min = entries.iter().map(|e| e.id_min).min()?;
+    let max = entries.iter().map(|e| e.id_max).max()?;
+    Some((
+        ScalarValue::Decimal128(Some(min), DECIMAL128_PRECISION, DECIMAL128_SCALE),
+        ScalarValue::Decimal128(Some(max), DECIMAL128_PRECISION, DECIMAL128_SCALE),
+    ))
+}
+
+/// Min/max of scalar column `name` across `entries`, folded from the
+/// per-segment skip stats. `None` (no statistics) if any entry lacks
+/// the column's stats, holds a null bound, or the bounds don't order —
+/// conservative: stats are only reported when every segment
+/// contributes a real value.
+/// Total null count of column `name` across `entries`; `None` unless
+/// every entry carries the stat (a missing side makes the total
+/// unknowable).
+fn scalar_null_count(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<u64> {
+    entries.iter().try_fold(0u64, |acc, entry| {
+        acc.checked_add(*entry.scalar_stats.null_counts.get(name)?)
+    })
+}
+
+/// Exact sum of column `name` across `entries`; `None` unless every
+/// entry carries it and the fold doesn't overflow.
+fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue> {
+    let mut acc: Option<ArrayRef> = None;
+    for entry in entries {
+        let part = entry.scalar_stats.sums.get(name)?;
+        acc = Some(match acc {
+            None => Arc::clone(part),
+            Some(total) => crate::supertable::manifest::add_sum_arrays(&total, part)?,
+        });
+    }
+    ScalarValue::try_from_array(&acc?, 0).ok()
+}
+
+/// HLL distinct-count estimate for column `name` across `entries`;
+/// `None` unless every entry carries a sketch. Sketch unions are
+/// exact, so the merged estimate has single-sketch accuracy.
+fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize> {
+    use crate::supertable::manifest::hll::HllSketch;
+    let mut merged: Option<HllSketch> = None;
+    for entry in entries {
+        let sketch = HllSketch::from_bytes(entry.scalar_stats.hll.get(name)?)?;
+        merged = Some(match merged {
+            None => sketch,
+            Some(mut acc) => {
+                acc.merge(&sketch);
+                acc
+            }
+        });
+    }
+    Some(merged?.estimate().round() as usize)
+}
+
+fn scalar_min_max(
+    entries: &[Arc<SuperfileEntry>],
+    name: &str,
+) -> Option<(ScalarValue, ScalarValue)> {
+    let mut acc: Option<(ScalarValue, ScalarValue)> = None;
+    for entry in entries {
+        let (min_arr, max_arr) = entry.scalar_stats.cols.get(name)?;
+        let min = ScalarValue::try_from_array(min_arr, 0).ok()?;
+        let max = ScalarValue::try_from_array(max_arr, 0).ok()?;
+        if min.is_null() || max.is_null() {
+            return None;
+        }
+        acc = match acc {
+            None => Some((min, max)),
+            Some((cur_min, cur_max)) => {
+                let new_min = match min.partial_cmp(&cur_min)? {
+                    std::cmp::Ordering::Less => min,
+                    _ => cur_min,
+                };
+                let new_max = match max.partial_cmp(&cur_max)? {
+                    std::cmp::Ordering::Greater => max,
+                    _ => cur_max,
+                };
+                Some((new_min, new_max))
+            }
+        };
+    }
+    acc
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -283,6 +537,21 @@ impl TableProvider for SupertableProvider {
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    /// Whole-table statistics from the manifest (no I/O) — feeds
+    /// logical planning; the physical fold reads the scan node's
+    /// statistics, attached in [`scan`](Self::scan).
+    fn statistics(&self) -> Option<Statistics> {
+        // Hierarchical manifests keep segments inside lazily-loaded
+        // parts; the flat `superfiles` view may be empty or partial
+        // there, so whole-table claims would be wrong. The scan-level
+        // statistics (computed from the actually-flattened survivors)
+        // still apply in that mode.
+        if self.manifest.list.is_some() {
+            return None;
+        }
+        Some(self.statistics_for(&self.manifest.superfiles))
     }
 
     async fn scan(
@@ -355,6 +624,10 @@ impl TableProvider for SupertableProvider {
             size: u64,
             candidates: Option<RoaringBitmap>,
             tombstones: Arc<RoaringBitmap>,
+            /// Footer metadata the segment's reader parsed at open —
+            /// row-group counts and DataFusion's opener both read from
+            /// this; the scan never re-parses a footer.
+            parquet_meta: Arc<ParquetMetaData>,
         }
         let mut segments: Vec<SegmentScan> = Vec::with_capacity(survivors.len());
 
@@ -412,22 +685,31 @@ impl TableProvider for SupertableProvider {
                 size,
                 candidates,
                 tombstones,
+                parquet_meta: Arc::clone(reader.parquet_metadata()),
             });
         }
 
         // The single object store DataFusion reads every survivor through.
         let store: Arc<dyn OsObjectStore> = Arc::new(SuperfileObjectStore::from_sources(sources));
 
-        // Build each segment's PartitionedFile + access plan. Row-group
-        // counts come from the footer read through the same store: a
-        // zero-copy footer slice on warm/mmap segments, a small range GET
-        // on cold ones.
+        // Build each segment's PartitionedFile + access plan. An access
+        // plan exists only when the index bounded the rows or tombstones
+        // must be skipped; a plain full scan needs no row-group map at
+        // all. Row-group counts come from the footer metadata the
+        // reader parsed at open — never re-read per query.
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(segments.len());
         for seg in &segments {
-            let row_counts =
-                row_group_rows_object_store(Arc::clone(&store), seg.path.clone(), Some(seg.size))
-                    .await?;
-            let access_plan = build_access_plan(&row_counts, &seg.candidates, &seg.tombstones);
+            let access_plan = if seg.candidates.is_some() || !seg.tombstones.is_empty() {
+                let row_counts: Vec<u32> = seg
+                    .parquet_meta
+                    .row_groups()
+                    .iter()
+                    .map(|rg| rg.num_rows() as u32)
+                    .collect();
+                build_access_plan(&row_counts, &seg.candidates, &seg.tombstones)
+            } else {
+                None
+            };
             let mut file = PartitionedFile::new(seg.path.to_string(), seg.size);
             if let Some(plan) = access_plan {
                 file = file.with_extensions(Arc::new(plan));
@@ -470,6 +752,33 @@ impl TableProvider for SupertableProvider {
                 .with_pushdown_filters(true)
                 .with_reorder_filters(true);
         }
+        // Serve DataFusion's opener the footers the readers already
+        // parsed — without this the opener re-reads + re-parses every
+        // segment's footer on every query (~half the warm flat cost at
+        // 256 segments).
+        let metas: HashMap<ObjPath, Arc<ParquetMetaData>> = segments
+            .iter()
+            .map(|s| (s.path.clone(), Arc::clone(&s.parquet_meta)))
+            .collect();
+        source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
+            store: Arc::clone(&store),
+            metas,
+        }));
+
+        // Manifest-derived statistics for the scan node. Exact only
+        // when the scan emits exactly the survivor rows minus
+        // tombstones — i.e. no filters (no index candidate bounding,
+        // no FilterExec re-verification above). With filters the scan
+        // may emit fewer rows than the manifest totals, so everything
+        // degrades to inexact estimates.
+        let scan_stats = {
+            let stats = self.statistics_for(&survivor_entries);
+            if filters.is_empty() {
+                stats
+            } else {
+                stats.to_inexact()
+            }
+        };
 
         let url = self.store_url.clone();
         state
@@ -480,6 +789,7 @@ impl TableProvider for SupertableProvider {
             builder = builder.with_file(file);
         }
         let config = builder
+            .with_statistics(scan_stats)
             .with_projection_indices(projection.cloned())?
             .with_limit(effective_limit)
             .build();
@@ -580,10 +890,10 @@ fn tombstone_access_plan_from_counts(
 }
 
 /// Row counts per row group, parsed from a resident parquet footer.
-/// Test-only: the scan path reads row-group counts through the unified
-/// [`SuperfileObjectStore`] via [`row_group_rows_object_store`]; this
-/// byte-sourced variant backs [`tombstone_access_plan`] — the superfile
-/// reader's deleted-docs batching and the resident-bytes unit tests.
+/// The scan path reads row-group counts from each reader's open-time
+/// footer parse; this byte-sourced variant backs
+/// [`tombstone_access_plan`] — the superfile reader's deleted-docs
+/// batching and the resident-bytes unit tests.
 fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
         .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
@@ -595,29 +905,81 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
         .collect())
 }
 
-/// Row counts per row group, parsed lazily via parquet's async object-store
-/// reader (footer metadata only, no whole-object materialization).
-async fn row_group_rows_object_store(
+/// Serves DataFusion's parquet opener the footer metadata each
+/// segment's [`SuperfileReader`] parsed at open, so a scan never
+/// re-reads or re-parses footers. Byte ranges still flow through the
+/// unified [`SuperfileObjectStore`] (zero-copy slices on warm
+/// segments, range GETs on cold ones).
+///
+/// [`SuperfileReader`]: crate::superfile::SuperfileReader
+struct CachedMetadataReaderFactory {
     store: Arc<dyn OsObjectStore>,
-    path: ObjPath,
-    file_size: Option<u64>,
-) -> DfResult<Vec<u32>> {
-    use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+    metas: HashMap<ObjPath, Arc<ParquetMetaData>>,
+}
 
-    let mut object_reader = ParquetObjectReader::new(store, path);
-    if let Some(size) = file_size.filter(|&s| s > 0) {
-        // Skip an extra HEAD when the manifest already knows segment size.
-        object_reader = object_reader.with_file_size(size);
+impl std::fmt::Debug for CachedMetadataReaderFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedMetadataReaderFactory")
+            .field("segments", &self.metas.len())
+            .finish()
     }
-    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
-    Ok(builder
-        .metadata()
-        .row_groups()
-        .iter()
-        .map(|rg| rg.num_rows() as u32)
-        .collect())
+}
+
+/// [`AsyncFileReader`] handed to DataFusion's opener: byte ranges
+/// delegate to the plain object-store reader; `get_metadata` returns
+/// the open-time parse instead of re-fetching the footer.
+struct CachedMetadataReader {
+    inner: ParquetObjectReader,
+    /// `None` only for a file outside the survivors loop (never
+    /// expected) — falls back to the inner reader's footer fetch.
+    meta: Option<Arc<ParquetMetaData>>,
+}
+
+impl AsyncFileReader for CachedMetadataReader {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.inner.get_bytes(range)
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        self.inner.get_byte_ranges(ranges)
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        match self.meta.clone() {
+            Some(meta) => async move { Ok(meta) }.boxed(),
+            None => self.inner.get_metadata(options),
+        }
+    }
+}
+
+impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
+    fn create_reader(
+        &self,
+        _partition_index: usize,
+        partitioned_file: PartitionedFile,
+        metadata_size_hint: Option<usize>,
+        _metrics: &ExecutionPlanMetricsSet,
+    ) -> DfResult<Box<dyn AsyncFileReader + Send>> {
+        let location = &partitioned_file.object_meta.location;
+        let mut inner = ParquetObjectReader::new(Arc::clone(&self.store), location.clone())
+            .with_file_size(partitioned_file.object_meta.size);
+        if let Some(hint) = metadata_size_hint {
+            inner = inner.with_footer_size_hint(hint);
+        }
+        Ok(Box::new(CachedMetadataReader {
+            meta: self.metas.get(location).cloned(),
+            inner,
+        }))
+    }
 }
 
 /// Assemble the per-segment [`ParquetAccessPlan`] from row-group counts:
@@ -720,7 +1082,10 @@ fn selection_access_plan_from_counts(
 /// `literal <op> column`) shapes over a column present in `schema`
 /// are recognized — everything else is silently dropped (it just
 /// doesn't contribute pruning; `FilterExec` still applies it).
-fn exprs_to_scalar_predicates(filters: &[Expr], schema: &SchemaRef) -> Vec<ScalarPredicate> {
+pub(crate) fn exprs_to_scalar_predicates(
+    filters: &[Expr],
+    schema: &SchemaRef,
+) -> Vec<ScalarPredicate> {
     let mut out = Vec::new();
     for filter in filters {
         collect_conjuncts(filter, schema, &mut out);

@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema};
 use thiserror::Error;
 
@@ -88,14 +88,21 @@ pub enum DecodeError {
 // ScalarStatsTable: arrow-ipc encoding.
 // ---------------------------------------------------------
 //
-// One RecordBatch carries every column's (min, max) pair as
-// two length-1 columns named `<col>__min` and `<col>__max`.
-// The schema is reconstructed at decode time by stripping
-// those suffixes; column data types are preserved by the IPC
-// format itself.
+// One RecordBatch carries every column's stats as length-1
+// columns named by suffix: `<col>__min` / `<col>__max`
+// (always, paired), plus optional `<col>__nulls` (UInt64),
+// `<col>__sum` (the column's SUM result type) and
+// `<col>__hll` (Binary, raw HLL registers). The logical
+// schema is reconstructed at decode time by stripping the
+// suffixes; data types are preserved by the IPC format
+// itself. Decoding tolerates absent optional stats (segments
+// written before they existed), never inventing values.
 
 const MIN_SUFFIX: &str = "__min";
 const MAX_SUFFIX: &str = "__max";
+const NULLS_SUFFIX: &str = "__nulls";
+const SUM_SUFFIX: &str = "__sum";
+const HLL_SUFFIX: &str = "__hll";
 
 pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
     if stats.cols.is_empty() {
@@ -109,8 +116,8 @@ pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
     let mut keys: Vec<&String> = stats.cols.keys().collect();
     keys.sort();
 
-    let mut fields: Vec<Field> = Vec::with_capacity(keys.len() * 2);
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(keys.len() * 2);
+    let mut fields: Vec<Field> = Vec::new();
+    let mut arrays: Vec<ArrayRef> = Vec::new();
     for key in keys {
         let (mn, mx) = &stats.cols[key];
         fields.push(Field::new(
@@ -125,6 +132,32 @@ pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
         ));
         arrays.push(mn.clone());
         arrays.push(mx.clone());
+        if let Some(&nulls) = stats.null_counts.get(key) {
+            fields.push(Field::new(
+                format!("{key}{NULLS_SUFFIX}"),
+                arrow_schema::DataType::UInt64,
+                true,
+            ));
+            arrays.push(Arc::new(arrow_array::UInt64Array::from(vec![nulls])) as ArrayRef);
+        }
+        if let Some(sum) = stats.sums.get(key) {
+            fields.push(Field::new(
+                format!("{key}{SUM_SUFFIX}"),
+                sum.data_type().clone(),
+                true,
+            ));
+            arrays.push(sum.clone());
+        }
+        if let Some(sketch) = stats.hll.get(key) {
+            fields.push(Field::new(
+                format!("{key}{HLL_SUFFIX}"),
+                arrow_schema::DataType::Binary,
+                true,
+            ));
+            arrays.push(
+                Arc::new(arrow_array::BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef,
+            );
+        }
     }
     let schema = Arc::new(Schema::new(fields));
     let batch =
@@ -153,38 +186,61 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError
     }
     let batch = &batches[0];
     let schema = batch.schema();
-    let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
-    // Walk pairs (min_field, max_field).
-    let fields = schema.fields();
-    let mut i = 0;
-    while i + 1 < fields.len() {
-        let mn = fields[i].name();
-        let mx = fields[i + 1].name();
-        if !mn.ends_with(MIN_SUFFIX) || !mx.ends_with(MAX_SUFFIX) {
+
+    // Bucket fields by stripped base name; min/max must pair up,
+    // everything else is optional.
+    let mut mins: HashMap<String, ArrayRef> = HashMap::new();
+    let mut maxes: HashMap<String, ArrayRef> = HashMap::new();
+    let mut stats = ScalarStatsTable::new();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        let column = batch.column(i);
+        if let Some(base) = name.strip_suffix(MIN_SUFFIX) {
+            mins.insert(base.to_string(), column.clone());
+        } else if let Some(base) = name.strip_suffix(MAX_SUFFIX) {
+            maxes.insert(base.to_string(), column.clone());
+        } else if let Some(base) = name.strip_suffix(NULLS_SUFFIX) {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| {
+                    DecodeError::ArrowIpc(format!("{name}: __nulls column is not UInt64"))
+                })?;
+            if !arr.is_empty() && !arr.is_null(0) {
+                stats.null_counts.insert(base.to_string(), arr.value(0));
+            }
+        } else if let Some(base) = name.strip_suffix(SUM_SUFFIX) {
+            stats.sums.insert(base.to_string(), column.clone());
+        } else if let Some(base) = name.strip_suffix(HLL_SUFFIX) {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .ok_or_else(|| {
+                    DecodeError::ArrowIpc(format!("{name}: __hll column is not Binary"))
+                })?;
+            if !arr.is_empty() && !arr.is_null(0) {
+                stats.hll.insert(base.to_string(), arr.value(0).to_vec());
+            }
+        } else {
             return Err(DecodeError::ArrowIpc(format!(
-                "expected paired __min/__max columns; got {mn}, {mx}"
+                "unrecognized stats column suffix: {name}"
             )));
         }
-        let base = mn.strip_suffix(MIN_SUFFIX).expect("just checked");
-        let base_max = mx.strip_suffix(MAX_SUFFIX).expect("just checked");
-        if base != base_max {
-            return Err(DecodeError::ArrowIpc(format!(
-                "mismatched __min/__max base names: {base} vs {base_max}"
-            )));
-        }
-        cols.insert(
-            base.to_string(),
-            (batch.column(i).clone(), batch.column(i + 1).clone()),
-        );
-        i += 2;
     }
-    if i != fields.len() {
+    if mins.len() != maxes.len() {
         return Err(DecodeError::ArrowIpc(format!(
-            "odd column count {} — expected paired __min/__max",
-            fields.len()
+            "unpaired __min/__max columns: {} mins vs {} maxes",
+            mins.len(),
+            maxes.len()
         )));
     }
-    Ok(ScalarStatsTable { cols })
+    for (base, mn) in mins {
+        let mx = maxes.remove(&base).ok_or_else(|| {
+            DecodeError::ArrowIpc(format!("column {base} has __min but no __max"))
+        })?;
+        stats.cols.insert(base, (mn, mx));
+    }
+    Ok(stats)
 }
 
 // ---------------------------------------------------------

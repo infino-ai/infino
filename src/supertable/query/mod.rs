@@ -20,6 +20,7 @@
 //! term-range + centroid) shared across the query paths.
 
 pub mod candidate;
+pub mod covered_agg;
 pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;

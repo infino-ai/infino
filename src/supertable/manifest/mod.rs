@@ -24,6 +24,7 @@ pub mod aggregates;
 pub mod bloom;
 pub mod commit;
 pub mod encoding;
+pub mod hll;
 pub mod list;
 pub mod list_prune;
 pub mod options_hash;
@@ -477,6 +478,18 @@ pub struct ScalarStatsTable {
     /// `cols[col_name] = (min_array, max_array)`. Both arrays are
     /// length-1 with the column's logical Arrow type.
     pub cols: HashMap<String, (ArrayRef, ArrayRef)>,
+    /// Per-column null counts over the segment's rows. Keyed like
+    /// `cols`; a missing entry means "not computed" (older segments),
+    /// never zero.
+    pub null_counts: HashMap<String, u64>,
+    /// Per-column exact sums, as length-1 arrays typed to match SQL
+    /// `SUM`'s result for the column (signed ints → `Int64`, unsigned
+    /// → `UInt64`, floats → `Float64`). Missing for non-summable
+    /// types or when the exact sum overflows the result type.
+    pub sums: HashMap<String, ArrayRef>,
+    /// Per-column HyperLogLog distinct-count sketches (raw register
+    /// bytes, see [`hll::HllSketch`]). Planner estimates only.
+    pub hll: HashMap<String, Vec<u8>>,
 }
 
 impl ScalarStatsTable {
@@ -502,9 +515,9 @@ impl ScalarStatsTable {
     /// columns, peak overhead is one column's worth (~MB) — far
     /// below the parquet footprint we're already paying.
     pub fn from_batches(scalar_schema: &Schema, batches: &[&RecordBatch]) -> Self {
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut stats = Self::default();
         if batches.is_empty() {
-            return Self { cols };
+            return stats;
         }
         for (idx, field) in scalar_schema.fields().iter().enumerate() {
             let arrays: Vec<&dyn arrow_array::Array> =
@@ -516,22 +529,40 @@ impl ScalarStatsTable {
                 // prune", which is the safe default.
                 Err(_) => continue,
             };
-            if let Some(pair) = column_min_max(&combined) {
-                cols.insert(field.name().clone(), pair);
-            }
+            stats.insert_column(field.name(), &combined);
         }
-        Self { cols }
+        stats
     }
 
     pub fn from_batch(scalar_schema: &Schema, batch: &RecordBatch) -> Self {
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut stats = Self::default();
         for (idx, field) in scalar_schema.fields().iter().enumerate() {
-            let arrays = batch.column(idx);
-            if let Some(pair) = column_min_max(arrays) {
-                cols.insert(field.name().clone(), pair);
+            stats.insert_column(field.name(), batch.column(idx));
+        }
+        stats
+    }
+
+    /// Compute every per-column stat this table carries from one
+    /// resident column: min/max (skip-pruning), null count, exact sum,
+    /// and the HLL distinct sketch (SQL planner statistics). One pass
+    /// over the values beyond the min/max kernels; cost is linear in
+    /// rows and freed before the next column.
+    fn insert_column(&mut self, name: &str, column: &ArrayRef) {
+        if let Some(pair) = column_min_max(column) {
+            self.cols.insert(name.to_string(), pair);
+            // The companion stats only exist for columns that carry
+            // min/max (same orderable-type set), so consumers can key
+            // everything off `cols`.
+            self.null_counts
+                .insert(name.to_string(), column.null_count() as u64);
+            if let Some(sum) = column_sum(column) {
+                self.sums.insert(name.to_string(), sum);
+            }
+            if let Some(sketch) = column_hll(column) {
+                self.hll
+                    .insert(name.to_string(), sketch.as_bytes().to_vec());
             }
         }
-        Self { cols }
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -549,7 +580,40 @@ impl ScalarStatsTable {
                     .insert(name.clone(), (other_min.clone(), other_max.clone()));
             }
         }
+        // Additive stats combine only when BOTH sides know them — a
+        // side without the stat makes the total unknowable, so the
+        // merged entry is dropped (consumers treat missing as
+        // "no statistics", never as zero).
+        merge_known(&mut self.null_counts, &other.null_counts, |a, b| {
+            a.checked_add(*b)
+        });
+        merge_known(&mut self.sums, &other.sums, add_sum_arrays);
+        merge_known(&mut self.hll, &other.hll, |a, b| {
+            let mut merged = hll::HllSketch::from_bytes(a)?;
+            merged.merge(&hll::HllSketch::from_bytes(b)?);
+            Some(merged.as_bytes().to_vec())
+        });
     }
+}
+
+/// Merge additive stat maps with intersection semantics: entries
+/// present on both sides combine via `combine` (`None` = combination
+/// failed, e.g. overflow → drop); entries present on only one side are
+/// dropped — the other side's contribution is unknown.
+fn merge_known<V: Clone>(
+    ours: &mut HashMap<String, V>,
+    theirs: &HashMap<String, V>,
+    combine: impl Fn(&V, &V) -> Option<V>,
+) {
+    let mut merged: HashMap<String, V> = HashMap::new();
+    for (name, a) in ours.iter() {
+        if let Some(b) = theirs.get(name)
+            && let Some(c) = combine(a, b)
+        {
+            merged.insert(name.clone(), c);
+        }
+    }
+    *ours = merged;
 }
 
 /// Merge min/max arrays by comparing values and keeping the actual min and max.
@@ -702,6 +766,136 @@ fn merge_min_max_arrays(
 /// (f32, f64), boolean, Utf8, LargeUtf8. The supertable schema
 /// rejects vector columns up at the SupertableOptions layer, so
 /// `FixedSizeList<Float32>` won't appear here in practice.
+/// Exact column sum as a length-1 array typed to match SQL `SUM`'s
+/// result for the column (signed → `Int64`, unsigned → `UInt64`,
+/// floats → `Float64`). `None` for non-summable types (utf8, bool,
+/// decimal) or when the exact total overflows the result type —
+/// consumers treat missing as "no statistics".
+fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    macro_rules! signed {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let total: i128 = a.iter().flatten().map(i128::from).sum();
+            let v = i64::try_from(total).ok()?;
+            Some(Arc::new(Int64Array::from(vec![v])) as ArrayRef)
+        }};
+    }
+    macro_rules! unsigned {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let total: u128 = a.iter().flatten().map(u128::from).sum();
+            let v = u64::try_from(total).ok()?;
+            Some(Arc::new(UInt64Array::from(vec![v])) as ArrayRef)
+        }};
+    }
+    macro_rules! float {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let total: f64 = a.iter().flatten().map(f64::from).sum();
+            Some(Arc::new(Float64Array::from(vec![total])) as ArrayRef)
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Int8 => signed!(Int8Array),
+        DataType::Int16 => signed!(Int16Array),
+        DataType::Int32 => signed!(Int32Array),
+        DataType::Int64 => signed!(Int64Array),
+        DataType::UInt8 => unsigned!(UInt8Array),
+        DataType::UInt16 => unsigned!(UInt16Array),
+        DataType::UInt32 => unsigned!(UInt32Array),
+        DataType::UInt64 => unsigned!(UInt64Array),
+        DataType::Float32 => float!(Float32Array),
+        DataType::Float64 => float!(Float64Array),
+        _ => None,
+    }
+}
+
+/// Add two length-1 sum arrays of the same type (see [`column_sum`]).
+/// `None` on type mismatch or `Int64`/`UInt64` overflow. Shared with
+/// the SQL provider's cross-segment statistics fold.
+pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    match (a.data_type(), b.data_type()) {
+        (DataType::Int64, DataType::Int64) => {
+            let x = a.as_any().downcast_ref::<Int64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<Int64Array>()?.value(0);
+            Some(Arc::new(Int64Array::from(vec![x.checked_add(y)?])) as ArrayRef)
+        }
+        (DataType::UInt64, DataType::UInt64) => {
+            let x = a.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            Some(Arc::new(UInt64Array::from(vec![x.checked_add(y)?])) as ArrayRef)
+        }
+        (DataType::Float64, DataType::Float64) => {
+            let x = a.as_any().downcast_ref::<Float64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<Float64Array>()?.value(0);
+            Some(Arc::new(Float64Array::from(vec![x + y])) as ArrayRef)
+        }
+        _ => None,
+    }
+}
+
+/// HyperLogLog distinct sketch over a column's non-null values.
+/// `None` for types the sketch doesn't cover. Values hash by their
+/// canonical byte representation (little-endian for numerics, raw
+/// bytes for strings, IEEE bits for floats).
+fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    use xxhash_rust::xxh3::xxh3_64;
+
+    let mut sketch = hll::HllSketch::new();
+    macro_rules! ints {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(&v.to_le_bytes()));
+            }
+        }};
+    }
+    match col.data_type() {
+        DataType::Int8 => ints!(Int8Array),
+        DataType::Int16 => ints!(Int16Array),
+        DataType::Int32 => ints!(Int32Array),
+        DataType::Int64 => ints!(Int64Array),
+        DataType::UInt8 => ints!(UInt8Array),
+        DataType::UInt16 => ints!(UInt16Array),
+        DataType::UInt32 => ints!(UInt32Array),
+        DataType::UInt64 => ints!(UInt64Array),
+        DataType::Float32 => {
+            let a = col.as_any().downcast_ref::<Float32Array>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(&v.to_bits().to_le_bytes()));
+            }
+        }
+        DataType::Float64 => {
+            let a = col.as_any().downcast_ref::<Float64Array>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(&v.to_bits().to_le_bytes()));
+            }
+        }
+        DataType::Utf8 => {
+            let a = col.as_any().downcast_ref::<StringArray>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(v.as_bytes()));
+            }
+        }
+        DataType::LargeUtf8 => {
+            let a = col.as_any().downcast_ref::<LargeStringArray>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(v.as_bytes()));
+            }
+        }
+        _ => return None,
+    }
+    Some(sketch)
+}
+
 fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     use arrow::compute::kernels::aggregate as agg;
     use arrow_array::*;

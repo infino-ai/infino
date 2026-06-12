@@ -520,7 +520,10 @@ mod tests {
                 n_docs: 1,
                 id_min,
                 id_max: id_min,
-                scalar_stats: ScalarStatsTable { cols },
+                scalar_stats: ScalarStatsTable {
+                    cols,
+                    ..Default::default()
+                },
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -566,7 +569,10 @@ mod tests {
                 n_docs: 1,
                 id_min: id_lo,
                 id_max: id_hi,
-                scalar_stats: ScalarStatsTable { cols },
+                scalar_stats: ScalarStatsTable {
+                    cols,
+                    ..Default::default()
+                },
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),

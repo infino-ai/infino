@@ -110,11 +110,52 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Scal
         };
         let min_bytes = ipc_encode_length1(&col, &agg_min);
         let max_bytes = ipc_encode_length1(&col, &agg_max);
+
+        // Additive rollups (null count / sum / HLL) combine with
+        // intersection semantics: every segment must carry the stat or
+        // the part-level value is unknowable (`None`, never zero).
+        let null_count = superfiles.iter().try_fold(0u64, |acc, seg| {
+            acc.checked_add(*seg.scalar_stats.null_counts.get(&col)?)
+        });
+        let sum = superfiles
+            .iter()
+            .try_fold(None::<ArrayRef>, |acc, seg| {
+                let part = seg.scalar_stats.sums.get(&col)?;
+                Some(Some(match acc {
+                    None => part.clone(),
+                    Some(total) => crate::supertable::manifest::add_sum_arrays(&total, part)?,
+                }))
+            })
+            .flatten()
+            .map(|total| ipc_encode_length1(&col, &total));
+        let hll = superfiles
+            .iter()
+            .try_fold(
+                None::<crate::supertable::manifest::hll::HllSketch>,
+                |acc, seg| {
+                    let sketch = crate::supertable::manifest::hll::HllSketch::from_bytes(
+                        seg.scalar_stats.hll.get(&col)?,
+                    )?;
+                    Some(Some(match acc {
+                        None => sketch,
+                        Some(mut merged) => {
+                            merged.merge(&sketch);
+                            merged
+                        }
+                    }))
+                },
+            )
+            .flatten()
+            .map(|sketch| sketch.as_bytes().to_vec());
+
         out.insert(
             col,
             ScalarStatsAgg {
                 min: min_bytes,
                 max: max_bytes,
+                null_count,
+                sum,
+                hll,
             },
         );
     }
@@ -417,7 +458,10 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable { cols },
+            scalar_stats: ScalarStatsTable {
+                cols,
+                ..Default::default()
+            },
             fts_summary: HashMap::<String, FtsSummary>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

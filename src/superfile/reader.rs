@@ -85,6 +85,12 @@ pub struct SuperfileReader {
     /// bytes). Carries the page index when present so `RowSelection`
     /// can skip whole pages.
     arrow_meta: Option<ArrowReaderMetadata>,
+    /// The Parquet footer metadata parsed at open — set on BOTH paths
+    /// (eager: shared with `arrow_meta`; lazy: the footer
+    /// `open_lazy_with` already fetched). Lets the SQL scan path serve
+    /// row-group counts and DataFusion's parquet opener from one
+    /// per-open parse instead of re-reading footers on every query.
+    parquet_meta: Arc<parquet::file::metadata::ParquetMetaData>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -207,12 +213,15 @@ impl SuperfileReader {
             .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
 
         // 3. Arrow schema from decoded Parquet metadata — no
-        //    extra range GET.
+        //    extra range GET. The parsed footer is retained on the
+        //    reader (`parquet_meta`) so later consumers (the SQL scan
+        //    path) never re-fetch or re-parse it.
         let file_meta = metadata.file_metadata();
         let schema = Arc::new(
             parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata())
                 .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?,
         );
+        let parquet_meta = Arc::new(metadata);
 
         // 4 + 5. Vector + FTS subsections — Tail-fetch path:
         //   fires both subsection fetches **concurrently** via
@@ -285,6 +294,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: None,
             arrow_meta: None,
+            parquet_meta,
             source: Some(source),
             schema,
             id_column,
@@ -389,6 +399,7 @@ impl SuperfileReader {
 
         Ok(Self {
             bytes: Some(bytes),
+            parquet_meta: Arc::clone(arrow_meta.metadata()),
             arrow_meta: Some(arrow_meta),
             source: None,
             schema,
@@ -397,6 +408,14 @@ impl SuperfileReader {
             fts,
             vec,
         })
+    }
+
+    /// The Parquet footer metadata parsed at open — page index included
+    /// on the eager path. One parse per reader lifetime; the SQL scan
+    /// path serves row-group counts and DataFusion's parquet opener
+    /// from this instead of re-reading the footer per query.
+    pub fn parquet_metadata(&self) -> &Arc<parquet::file::metadata::ParquetMetaData> {
+        &self.parquet_meta
     }
 
     /// Arrow schema of the user-visible columns (Parquet rows).
