@@ -760,8 +760,15 @@ pub mod vector {
         if let Some(&r) = memo.get(&(probe, refine)) {
             return r;
         }
+        // Announce BEFORE the work: one evaluation is a full query
+        // battery (minutes at large scale), and a run that logs only
+        // on completion is indistinguishable from a hung one.
+        eprintln!(
+            "    [{log_prefix}] staircase eval p={probe} r={refine} ({} queries)...",
+            queries.len()
+        );
         let recall = mean_recall(reader, column, queries, truths, k, probe, refine);
-        eprintln!("    [{log_prefix}] staircase eval p={probe} r={refine} → recall {recall:.3}");
+        eprintln!("    [{log_prefix}]   → recall {recall:.3}");
         memo.insert((probe, refine), recall);
         recall
     }
@@ -796,31 +803,17 @@ pub mod vector {
         let mut recall_memo: HashMap<(usize, usize), f32> = HashMap::new();
         let mut p50_memo: HashMap<(usize, usize), f32> = HashMap::new();
 
-        // Reachability corner: dominates every grid point, so a target
-        // it can't reach is unreachable everywhere.
+        // No upfront reachability probe: it would pre-pay the single
+        // most expensive grid point (max probe × max refine). The walk
+        // answers reachability on its own — an unreachable target
+        // misses across every row and its last evaluation IS that
+        // corner; a reachable one never pays it at all.
         let p_max = *PROBES.last().expect("non-empty probe grid");
         let r_max = *REFINES.last().expect("non-empty refine grid");
-        let peak = eval_grid_point(
-            reader,
-            column,
-            queries,
-            truths,
-            k,
-            p_max,
-            r_max,
-            &mut recall_memo,
-            log_prefix,
-        );
 
         RECALL_TARGETS
             .iter()
             .map(|&target| {
-                if peak < target {
-                    eprintln!(
-                        "    [{log_prefix}] no point hit recall ≥ {target:.2}; peak = {peak:.3}"
-                    );
-                    return None;
-                }
                 // Walk from (smallest probe, largest refine): a clear
                 // step moves refine down (tighter), a miss moves probe
                 // up (wider). Each row's minimal clearing refine joins
@@ -860,6 +853,19 @@ pub mod vector {
                 }
                 if let Some((ri, rec)) = row_clear.take() {
                     frontier.push((PROBES[p_i.min(PROBES.len() - 1)], REFINES[ri], rec));
+                }
+                if frontier.is_empty() {
+                    // No row cleared, so the walk's last evaluation was
+                    // the (max probe, max refine) corner — the grid's
+                    // recall ceiling.
+                    let peak = recall_memo
+                        .get(&(p_max, r_max))
+                        .copied()
+                        .unwrap_or_default();
+                    eprintln!(
+                        "    [{log_prefix}] no point hit recall ≥ {target:.2}; peak = {peak:.3}"
+                    );
+                    return None;
                 }
                 // Lowest-p50 frontier point wins; timings memoized
                 // across targets (frontiers overlap heavily).
