@@ -1,10 +1,10 @@
-name: Benchmark prepared dataset (Azure)
+name: Dataset bench (Azure)
 
-# Runs ONLY the read phases (warm / cold query + search) of a supertable
-# bench against a dataset already in Azure Blob — no corpus generation, no
-# ingest. Pick the dataset name, the workflow opens it and reports query
-# latency. Build the dataset first with the regular "Benchmark (Azure)"
-# workflow in dataset mode (INFINO_BENCH_DATASET_PREFIX set, a `build` phase).
+# Prepare and/or benchmark a reusable dataset in Azure Blob, via the bench
+# binary's `dataset` verbs:
+#   prepare — generate the corpus, ingest it to the prefix, write the sidecar
+#   bench   — open the existing dataset and run the read phases (no ingest)
+#   run     — prepare if absent, then bench
 
 on:
   workflow_dispatch:
@@ -13,8 +13,14 @@ on:
         description: "Dataset prefix in the blob container (e.g. datasets/bench-10m)."
         required: true
         type: string
+      mode:
+        description: "prepare the dataset, bench an existing one, or run end-to-end."
+        required: false
+        default: bench
+        type: choice
+        options: [bench, prepare, run]
       modality:
-        description: "Which index to query."
+        description: "Which index to prepare/query."
         required: false
         default: vector
         type: choice
@@ -71,9 +77,10 @@ jobs:
     environment: ci
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
-      # Fail before spending a VM if the dataset (its sidecar) isn't there.
+      # Fail before spending a VM when the mode can't succeed: bench needs
+      # the dataset (its sidecar) present, prepare needs the prefix free.
       # `modality` is also the dataset's sub-prefix (see Modality::dataset_dir).
-      - name: Pre-flight — dataset exists
+      - name: Pre-flight — dataset state vs mode
         env:
           ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
           KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
@@ -83,11 +90,17 @@ jobs:
           sidecar="${{ inputs.dataset }}/${{ inputs.modality }}/dataset.json"
           exists="$(az storage blob exists --account-name "$ACC" --account-key "$KEY" \
                      -c "$CONTAINER" -n "$sidecar" --query exists -o tsv)"
-          if [ "$exists" != "true" ]; then
-            echo "::error::dataset not found: container=$CONTAINER blob=$sidecar — prepare it first."
-            exit 1
-          fi
-          echo "dataset OK: $sidecar"
+          case "${{ inputs.mode }}" in
+            bench)
+              [ "$exists" = "true" ] \
+                || { echo "::error::dataset not found: $sidecar — prepare it first."; exit 1; } ;;
+            prepare)
+              [ "$exists" != "true" ] \
+                || { echo "::error::dataset already exists: $sidecar — bench it or pick a new prefix."; exit 1; } ;;
+            run)
+              echo "dataset exists=$exists — run will $([ "$exists" = "true" ] && echo 'skip prepare' || echo 'prepare first')" ;;
+          esac
+          echo "pre-flight OK: mode=${{ inputs.mode }} sidecar=$sidecar"
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -210,8 +223,9 @@ jobs:
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
-             INFINO_BENCH_DATASET_PREFIX='${{ inputs.dataset }}' \
              CACHE_GIB='${{ inputs.cache_gib }}' \
+             MODE='${{ inputs.mode }}' \
+             DATASET='${{ inputs.dataset }}' \
              MODALITY='${{ inputs.modality }}' \
              PHASE='${{ inputs.phase }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
@@ -221,9 +235,9 @@ jobs:
           [ -n "$CACHE_GIB" ] && export INFINO_SUPERTABLE_SEARCH_CACHE_GIB="$CACHE_GIB"
           ulimit -n "$(ulimit -Hn)"
           BIN="$(cat "$HOME/bench-bin")"
-          echo "===== BENCH ${MODALITY} ${PHASE} START ====="
-          "$BIN" supertable "$MODALITY" "$PHASE" 2>&1
-          echo "===== BENCH ${MODALITY} ${PHASE} END ====="
+          echo "===== DATASET ${MODE} ${DATASET} ${MODALITY} ${PHASE} START ====="
+          "$BIN" dataset "$MODE" "$DATASET" "$MODALITY" "$PHASE" 2>&1
+          echo "===== DATASET ${MODE} ${DATASET} ${MODALITY} ${PHASE} END ====="
           REMOTE
 
       - name: Summarize results
@@ -233,7 +247,7 @@ jobs:
           SUMMARY="$GITHUB_STEP_SUMMARY"
           LOG=/tmp/bench.clean
           {
-            echo "## Dataset bench — \`${{ inputs.modality }}\` on \`${{ inputs.dataset }}\`"
+            echo "## Dataset \`${{ inputs.mode }}\` — \`${{ inputs.modality }}\` on \`${{ inputs.dataset }}\`"
             echo ""
             echo "- docs: \`${{ inputs.docs }}\` · phase: \`${{ inputs.phase }}\` · vm: \`${{ inputs.vm_size }}\` · ref: \`${{ inputs.ref }}\`"
             echo ""
