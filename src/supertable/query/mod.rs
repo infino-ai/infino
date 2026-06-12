@@ -11,8 +11,8 @@
 //! - [`vector`] — cluster-aware kNN fan-out method on
 //!   [`super::SupertableReader`].
 //!
-//! All non-SQL paths return [`SuperfileHit`] tuples — `(segment_uri,
-//! local_doc_id, score)`. Doc-id space is local to a segment in
+//! All non-SQL paths return [`SuperfileHit`] tuples — `(superfile_uri,
+//! local_doc_id, score)`. Doc-id space is local to a superfile in
 //! v1, so global identity resolution is the caller's
 //! responsibility.
 //!
@@ -38,20 +38,20 @@ use super::manifest::SuperfileUri;
 
 /// One scored result from a fan-out query (BM25 or vector).
 ///
-/// `local_doc_id` is the row offset *within* `segment`; doc-id
-/// space is local to a segment in v1. Resolving to a global
+/// `local_doc_id` is the row offset *within* `superfile`; doc-id
+/// space is local to a superfile in v1. Resolving to a global
 /// identity goes through the caller's primary-key column —
 /// typically a
 /// `Supertable::query_sql("SELECT pk FROM supertable WHERE
-/// segment = ? AND doc_id = ?")` follow-up, or by carrying the
+/// superfile = ? AND doc_id = ?")` follow-up, or by carrying the
 /// caller's own surrogate key as a scalar column.
 ///
 /// Cheap to copy: 16 bytes for `SuperfileUri` (Uuid) + 4 + 4 = 24 B.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SuperfileHit {
-    /// Source segment.
-    pub segment: SuperfileUri,
-    /// Row offset within `segment`.
+    /// Source superfile.
+    pub superfile: SuperfileUri,
+    /// Row offset within `superfile`.
     pub local_doc_id: u32,
     /// Score. Direction is method-dependent — see the originating
     /// method's docs:

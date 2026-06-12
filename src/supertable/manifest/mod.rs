@@ -44,7 +44,7 @@ use super::options::SupertableOptions;
 
 /// One immutable point-in-time view of the supertable.
 ///
-/// **Construction is copy-on-write.** Adding a segment via
+/// **Construction is copy-on-write.** Adding a superfile via
 /// [`Manifest::with_appended`] returns a new `Manifest` whose
 /// `superfiles` is `Vec::clone()` + new entries appended; the original
 /// `Manifest`'s `superfiles` is unchanged. `Arc<SuperfileEntry>` shares
@@ -74,7 +74,7 @@ pub struct SuperfileList {
     /// Pointer back to the immutable per-supertable configuration.
     /// Same Arc across all manifests of one supertable.
     pub options: Arc<SupertableOptions>,
-    /// Append-only list of segment entries. Each entry's `Arc`-share
+    /// Append-only list of superfile entries. Each entry's `Arc`-share
     /// is what makes the copy-on-write per-commit construction
     /// cheap.
     pub superfiles: Vec<Arc<SuperfileEntry>>,
@@ -309,8 +309,8 @@ pub enum ManifestLoadError {
     Parse(#[from] part::PartParseError),
 }
 
-/// One segment's metadata + skip-pruning summaries. The bytes that
-/// back the segment live in the segment store keyed by `uri` —
+/// One superfile's metadata + skip-pruning summaries. The bytes that
+/// back the superfile live in the superfile store keyed by `uri` —
 /// `superfile_id` is for debugging / observability, `uri` is for
 /// store routing.
 #[derive(Debug)]
@@ -351,7 +351,7 @@ pub struct SuperfileEntry {
     /// from the configured strategy at commit time.
     pub partition_key: Vec<u8>,
     /// Hash partitioning operates per-row, but at commit time we
-    /// only have per-segment summaries. Hash strategy requires
+    /// only have per-superfile summaries. Hash strategy requires
     /// superfiles to be pre-sharded — each builder-shard stamps the
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
@@ -367,7 +367,7 @@ pub struct SuperfileEntry {
     /// the values are by construction consistent with what the
     /// parquet KV metadata would later say).
     ///
-    /// `None` on segments produced by older writers that did not
+    /// `None` on superfiles produced by older writers that did not
     /// stamp this field; the cold open path falls back to the
     /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
@@ -394,10 +394,10 @@ pub struct SubsectionOffsets {
     /// but available without any I/O.
     pub total_size: u64,
     /// Absolute `(offset, length)` of the vector subsection. `None`
-    /// when the segment carries no vector subsection.
+    /// when the superfile carries no vector subsection.
     pub vec: Option<(u64, u64)>,
     /// Absolute `(offset, length)` of the FTS subsection. `None`
-    /// when the segment carries no FTS subsection.
+    /// when the superfile carries no FTS subsection.
     pub fts: Option<(u64, u64)>,
     /// Absolute ranges that fully cover vector open-time metadata.
     /// The hinted cache path prefetches these in the first network
@@ -408,20 +408,20 @@ pub struct SubsectionOffsets {
     /// header+dictionary and doc-length tables. Query-time postings
     /// stay lazy.
     pub fts_open_ranges: Vec<(u64, u64)>,
-    /// the actual bytes covering the segment's
+    /// the actual bytes covering the superfile's
     /// open-time batch (parquet footer tail + the
     /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
     /// in the manifest part.
     ///
     /// When non-empty, the cold-fetch path installs these directly
     /// into the reader's prefetch overlay and issues **zero**
-    /// open-time GETs against the segment object — the bytes
+    /// open-time GETs against the superfile object — the bytes
     /// already arrived in the single part GET that `cold_open`
-    /// performs. The genuine first-touch per-segment cost then
+    /// performs. The genuine first-touch per-superfile cost then
     /// collapses from 2 RTT-batches (open metadata + cluster
     /// postings) to 1 (postings only).
     ///
-    /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
+    /// Each tuple is `(absolute_offset, bytes)`. Empty on superfiles
     /// produced by older writers that did not capture it, or when
     /// blob capture is disabled
     /// — the path then falls back to fetching `vec_open_ranges` /
@@ -429,7 +429,7 @@ pub struct SubsectionOffsets {
     pub open_blob: Vec<(u64, Vec<u8>)>,
 }
 
-/// Opaque store key — wraps a UUID v4. The segment store treats
+/// Opaque store key — wraps a UUID v4. The superfile store treats
 /// this as a hash-eq token and doesn't peek inside. An
 /// object-store-backed variant could swap to a path-shaped URI
 /// without changing any caller, since the trait shape stays the
@@ -439,21 +439,21 @@ pub struct SuperfileUri(pub Uuid);
 
 impl SuperfileUri {
     /// Generate a fresh URI. Called by the writer at commit time
-    /// when assigning a key for a new segment's bytes.
+    /// when assigning a key for a new superfile's bytes.
     pub fn new_v4() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Object-store / LocalFS path for committed segment bytes.
+    /// Object-store / LocalFS path for committed superfile bytes.
     /// `.sf.parquet` double suffix — on disk this is still valid
     /// Parquet (row groups + optional embedded FTS/vector blobs +
     /// footer), while the `.sf` marker flags it as a Superfile
-    /// segment without making the file look non-standard.
+    /// superfile without making the file look non-standard.
     pub fn storage_path(self) -> String {
         format!("data/seg-{}.sf.parquet", self.0)
     }
 
-    /// Disk-cache filename for a promoted segment.
+    /// Disk-cache filename for a promoted superfile.
     pub fn cache_filename(self) -> String {
         format!("seg-{}.sf.parquet", self.0)
     }
@@ -464,7 +464,7 @@ impl SuperfileUri {
     }
 }
 
-/// Per-scalar-column min/max for a segment, used by scalar skip
+/// Per-scalar-column min/max for a superfile, used by scalar skip
 /// pruning. Each column's min/max is a length-1 `ArrayRef` of the
 /// column's data type — the most general shape that doesn't
 /// require pulling DataFusion into this layer. The skip helper
@@ -488,7 +488,7 @@ impl ScalarStatsTable {
     /// integer / float / boolean / utf8).
     ///
     /// Used by [`crate::supertable::writer::SupertableWriter`] at
-    /// commit time to populate per-segment scalar skip stats. The
+    /// commit time to populate per-superfile scalar skip stats. The
     /// resulting table maps `column_name → (min_arr, max_arr)`,
     /// where each entry is a length-1 [`ArrayRef`] of the column's
     /// type — zero-pad isn't needed since the skip planner reads
@@ -784,13 +784,13 @@ fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 #[derive(Debug, Clone)]
 pub struct FtsSummary {
     /// Term-presence bloom filter — sized to ~7% FPR at typical
-    /// per-column term cardinalities (64 KiB / column / segment
+    /// per-column term cardinalities (64 KiB / column / superfile
     /// is the default).
     pub term_bloom: Bloom,
     /// Number of distinct terms seen at build time. Useful for
     /// validating the bloom's sizing in tests + for observability.
     pub n_terms_distinct: u32,
-    /// Lex-smallest and lex-largest term in this segment's FST for
+    /// Lex-smallest and lex-largest term in this superfile's FST for
     /// this column. Prefix skip checks
     /// `[prefix, prefix_upper_bound)` overlap with this range.
     pub term_range: (Vec<u8>, Vec<u8>),
@@ -808,11 +808,11 @@ pub struct VectorSummary {
     /// Cluster centroid; length matches the vector column's `dim`
     /// declared in `SupertableOptions::vector_columns`.
     pub centroid: Vec<f32>,
-    /// Maximum distance from any indexed vector in this segment to
+    /// Maximum distance from any indexed vector in this superfile to
     /// `centroid`, in the same metric the column was built with.
     pub radius: f32,
     /// Per-cluster IVF centroids (Sq8, per-cluster calibration) for
-    /// cross-segment global cluster selection. Empty when the segment
+    /// cross-superfile global cluster selection. Empty when the superfile
     /// has no vector index for this column.
     pub clusters: ClusterCentroids,
 }
@@ -824,9 +824,9 @@ const SQ8_CODE_MAX: f32 = 255.0;
 
 /// Per-cluster IVF centroids for one vector column, Sq8-quantized with
 /// per-cluster calibration. Carried in the manifest so a query can rank
-/// every segment's clusters globally — without opening the segment —
+/// every superfile's clusters globally — without opening the superfile —
 /// and probe only the globally-closest clusters. The 1-bit shortlist +
-/// rerank still run on the segment's on-disk compressed vectors; these
+/// rerank still run on the superfile's on-disk compressed vectors; these
 /// drive cluster *selection* only.
 ///
 /// Quantization is value-only (no metric); the selector applies the
@@ -847,7 +847,7 @@ pub struct ClusterCentroids {
 }
 
 impl ClusterCentroids {
-    /// The "no cluster centroids" value — a segment without a vector
+    /// The "no cluster centroids" value — a superfile without a vector
     /// index for the column.
     pub fn empty() -> Self {
         Self::default()
@@ -977,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn with_appended_increments_manifest_id_and_extends_segments() {
+    fn with_appended_increments_manifest_id_and_extends_superfiles() {
         let m0 = Manifest::empty(opts());
         let entry = seg_entry(Uuid::new_v4(), 100);
         let m1 = m0.with_appended(vec![entry.clone()]);
@@ -1005,10 +1005,10 @@ mod tests {
     }
 
     #[test]
-    fn with_appended_shares_old_segments_via_arc() {
+    fn with_appended_shares_old_superfiles_via_arc() {
         // The new manifest's superfiles[0] should be the SAME Arc as
         // the original's superfiles[0] — copy-on-write doesn't
-        // re-allocate per-segment. (Verified by Arc::ptr_eq.)
+        // re-allocate per-superfile. (Verified by Arc::ptr_eq.)
         let entry = seg_entry(Uuid::new_v4(), 1);
         let m0 = Manifest::empty(opts()).with_appended(vec![entry.clone()]);
         let m1 = m0.with_appended(vec![seg_entry(Uuid::new_v4(), 2)]);
@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_uri_is_distinct_per_call() {
+    fn superfile_uri_is_distinct_per_call() {
         let a = SuperfileUri::new_v4();
         let b = SuperfileUri::new_v4();
         assert_ne!(a, b);

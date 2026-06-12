@@ -208,7 +208,7 @@ impl Table {
     /// Append data. Accepts a pyarrow `RecordBatch` or `Table`, a pandas
     /// `DataFrame`, or a `list[dict]` (coerced to Arrow with the table's
     /// declared schema). Durable when this returns — one `append` == one
-    /// commit == one sealed segment, so batch rows per call.
+    /// commit == one sealed superfile, so batch rows per call.
     fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let declared = self.inner.schema();
         let py_schema = declared.as_ref().to_pyarrow(py)?;
@@ -220,7 +220,7 @@ impl Table {
                 // accepts them. A genuine type or null mismatch still errors.
                 let aligned = RecordBatch::try_new(declared, batch.columns().to_vec())
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                // Append commits a segment to storage — release the GIL.
+                // Append commits a superfile to storage — release the GIL.
                 py.detach(|| self.inner.append(&aligned)).map_err(py_err)
             }
             // Empty input — nothing to append (no empty commit).
@@ -400,7 +400,7 @@ fn coerce_to_record_batch(
     };
 
     // Collapse the Table's chunks into a single RecordBatch — one append
-    // is one commit / one sealed segment.
+    // is one commit / one sealed superfile.
     let batches = table
         .call_method0("combine_chunks")?
         .call_method0("to_batches")?;

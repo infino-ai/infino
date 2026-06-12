@@ -12,7 +12,7 @@
 //!   `SuperfileReader::open_lazy` against any storage
 //!   backend. This is the `ColdFetchMode::RangeOnly` path —
 //!   stateless callers that don't want to materialize the
-//!   segment in the disk cache.
+//!   superfile in the disk cache.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

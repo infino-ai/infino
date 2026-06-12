@@ -16,7 +16,7 @@
 # Nested keys are addressed with `__` (double underscore) in env vars.
 # Examples below.
 
-# Supertable runtime knobs. Reader fan-out (skip + per-segment
+# Supertable runtime knobs. Reader fan-out (skip + per-superfile
 # search + top-k merge) and writer commit-time rayon-shard run on
 # separate pools so a long-running commit can't spike reader p99 or
 # vice versa.
@@ -49,10 +49,10 @@ supertable:
 
   # Threshold above which the supertable's writer triggers an
   # internal commit() to flush the in-memory buffer to disk-
-  # equivalent (one segment per writer-pool thread). Specified
+  # equivalent (one superfile per writer-pool thread). Specified
   # in mebibytes (1 MiB = 1024 × 1024 bytes). Set 0 to disable
   # auto-flush — only caller-driven commit() will produce
-  # segments.
+  # superfiles.
   commit_threshold_size_mb: 1024
 
   # Verify the trailing whole-blob CRC and per-subsection CRCs
@@ -83,8 +83,8 @@ storage:
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native
   # cold path: foreground opens/searches with exact range GETs (or zero
-  # segment GETs at open when manifest open-batch bytes are present)
-  # while background fill promotes the full segment to mmap.
+  # superfile GETs at open when manifest open-batch bytes are present)
+  # while background fill promotes the full superfile to mmap.
   disk_cache_root:
   disk_budget_bytes: 10737418240
   cold_fetch_mode: lazy_foreground_with_background_fill
@@ -93,21 +93,21 @@ storage:
   mmap_cold_threshold_secs: 300
   mmap_sweep_interval_secs: 75
 
-# Compaction merges the small segments produced by individual
-# commits into one target-sized segment, cutting query fan-out.
+# Compaction merges the small superfiles produced by individual
+# commits into one target-sized superfile, cutting query fan-out.
 # Sizes are in mb (1 MiB = 1024 × 1024 bytes).
 #
 # Env overrides (note the double underscore for nesting):
-#   INFINO_COMPACTION__TARGET_SEGMENT_SIZE_MB=2048
+#   INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB=2048
 #   INFINO_COMPACTION__MIN_FILL_PERCENT=80
 #   INFINO_COMPACTION__MAX_MEMORY_MB=3072
 compaction:
   # Size a compacted output aims for.
-  target_segment_size_mb: 1024
+  target_superfile_size_mb: 1024
 
   # Minimum estimated live bytes to trigger a merge,
-  # as a percentage of `target_segment_size_mb`.
-  # E.g. at 80% with a 1 GiB target, two 200 MiB segments (400 MiB) do not compact.
+  # as a percentage of `target_superfile_size_mb`.
+  # E.g. at 80% with a 1 GiB target, two 200 MiB superfiles (400 MiB) do not compact.
   min_fill_percent: 80
 
   # Maximum memory budget for materializing inputs during a single merge, in MiB.

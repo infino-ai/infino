@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Unified segment-selection (pruning) for the boolean-predicate
+//! Unified superfile-selection (pruning) for the boolean-predicate
 //! query paths.
 //!
 //! FTS (exact + prefix) and SQL scalar filtering ask the *same*
-//! question before they touch any segment bytes: "which segments could
+//! question before they touch any superfile bytes: "which superfiles could
 //! possibly contain a row this predicate matches?" Each answers it by
 //! conservatively evaluating a per-column test against the manifest's
 //! summaries — term bloom, term range, scalar min/max — first over the
-//! list's part-level aggregates, then over the surviving segments'
-//! per-segment summaries.
+//! list's part-level aggregates, then over the surviving superfiles'
+//! per-superfile summaries.
 //!
 //! This module owns that two-tier walk so the three call sites
 //! (`bm25_search`, `bm25_search_prefix`, the SQL `SupertableProvider`)
 //! share one selection path instead of each re-deriving it. The
 //! per-leaf math is **not** reimplemented here: each [`PruneLeaf`]
-//! delegates to the existing helpers in [`super::skip`] (segment tier)
+//! delegates to the existing helpers in [`super::skip`] (superfile tier)
 //! and [`crate::supertable::manifest::list_prune`] (part tier), so edge
 //! behavior — empty-term handling, missing-column "always keep",
 //! conservatism — is inherited verbatim.
@@ -48,10 +48,10 @@ use super::skip::{
 
 /// One conjunct of a prune predicate: a per-column test backed by a
 /// manifest summary. The full predicate is the **conjunction** of its
-/// leaves — a segment survives only if every leaf keeps it. (A
+/// leaves — a superfile survives only if every leaf keeps it. (A
 /// `TermPresence` leaf carries its own intra-leaf OR/AND over terms via
 /// [`BoolMode`]; cross-column OR isn't expressible yet and isn't needed
-/// — an unprunable predicate simply contributes no leaf and the segment
+/// — an unprunable predicate simply contributes no leaf and the superfile
 /// is kept.)
 pub(crate) enum PruneLeaf {
     /// Exact-term presence on an FTS column → term bloom.
@@ -93,7 +93,7 @@ impl PruneLeaf {
 ///
 /// The aggregate min/max live as length-1 Arrow IPC batches
 /// (`ScalarStatsAgg.{min,max}`); we decode them and reuse the same
-/// comparison core the segment tier uses ([`scalar_value_may_match`]).
+/// comparison core the superfile tier uses ([`scalar_value_may_match`]).
 fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId> {
     list.parts
         .iter()
@@ -132,19 +132,19 @@ fn decode_length1_scalar(bytes: &[u8]) -> Option<ScalarValue> {
     None
 }
 
-/// Select the segments a predicate could match, newest-first in
+/// Select the superfiles a predicate could match, newest-first in
 /// manifest order, applying the two prune tiers (part aggregates →
-/// per-segment summaries). Returns the surviving segment entries; the
+/// per-superfile summaries). Returns the surviving superfile entries; the
 /// caller drives execution over them (search fan-out or DataFusion
 /// scan).
 ///
-/// An empty `leaves` slice keeps every segment (the no-`WHERE` scan).
-pub(crate) async fn select_segments(
+/// An empty `leaves` slice keeps every superfile (the no-`WHERE` scan).
+pub(crate) async fn select_superfiles(
     manifest: &Manifest,
     leaves: &[PruneLeaf],
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
     // ---- Tier A: part-level prune (only when a hierarchical list
-    // exists; otherwise the flat segment view is the whole table).
+    // exists; otherwise the flat superfile view is the whole table).
     let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
         Some(list) => {
             // Intersect each constraining leaf's kept-part set. A leaf
@@ -171,14 +171,14 @@ pub(crate) async fn select_segments(
             };
             hierarchical_iter::load_and_flatten(manifest, &ordered).await?
         }
-        None => hierarchical_iter::fallback_to_flat_segments(manifest),
+        None => hierarchical_iter::fallback_to_flat_superfiles(manifest),
     };
 
     if superfiles.is_empty() {
         return Ok(Vec::new());
     }
 
-    // ---- Tier B: per-segment prune. Start all-keep, AND each leaf's
+    // ---- Tier B: per-superfile prune. Start all-keep, AND each leaf's
     // mask. Scalar leaves are evaluated together (one `scalar_skip`
     // conjunction call) to match the pre-unification semantics.
     let mut mask = vec![true; superfiles.len()];
@@ -223,7 +223,7 @@ pub(crate) async fn select_segments(
 }
 
 /// Element-wise `dst &= src`. Both slices are one bool per surviving
-/// segment, in the same order, so the index alignment holds.
+/// superfile, in the same order, so the index alignment holds.
 fn and_into(dst: &mut [bool], src: &[bool]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, s) in dst.iter_mut().zip(src.iter()) {
@@ -373,7 +373,7 @@ mod tests {
         )
     }
 
-    /// A single segment whose `title` column carries both the scalar
+    /// A single superfile whose `title` column carries both the scalar
     /// min/max (what a plain Parquet reader exposes) and an FTS term
     /// bloom + range (what infino adds). Each title is treated as one
     /// token, so the bloom is exact membership over the title values.
@@ -422,16 +422,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fts_bloom_prunes_segment_that_scalar_minmax_cannot() {
-        // Pathology: a segment whose title values straddle the queried
+    async fn fts_bloom_prunes_superfile_that_scalar_minmax_cannot() {
+        // Pathology: a superfile whose title values straddle the queried
         // value lexicographically, so the scalar [min,max] (the only
         // signal a plain Parquet+DataFusion scan has) can't rule it out
-        // — yet the segment provably does not contain the value.
+        // — yet the superfile provably does not contain the value.
         //
-        // Segment A: {apple, zebra} → range ["apple","zebra"] spans
+        // Superfile A: {apple, zebra} → range ["apple","zebra"] spans
         //   "mango", so scalar min/max keeps it; its term bloom lacks
         //   "mango".
-        // Segment B: {kiwi, mango} → actually contains "mango".
+        // Superfile B: {kiwi, mango} → actually contains "mango".
         let a = seg_title(&["apple", "zebra"]);
         let b = seg_title(&["kiwi", "mango"]);
         let manifest = Manifest::empty(opts_title_fts()).with_appended(vec![a.clone(), b.clone()]);
@@ -448,37 +448,37 @@ mod tests {
         };
 
         // DataFusion-equivalent: scalar min/max only. "mango" is within
-        // both segments' lexicographic ranges, so neither is pruned.
-        let scalar_only = select_segments(&manifest, std::slice::from_ref(&scalar_leaf))
+        // both superfiles' lexicographic ranges, so neither is pruned.
+        let scalar_only = select_superfiles(&manifest, std::slice::from_ref(&scalar_leaf))
             .await
             .expect("select");
         assert_eq!(
             scalar_only.len(),
             2,
-            "scalar min/max alone cannot prune either segment"
+            "scalar min/max alone cannot prune either superfile"
         );
 
-        // infino's term bloom proves "mango" absent from segment A and
-        // prunes it; only the segment that can actually match remains.
-        let with_fts = select_segments(&manifest, &[scalar_leaf, term_leaf])
+        // infino's term bloom proves "mango" absent from superfile A and
+        // prunes it; only the superfile that can actually match remains.
+        let with_fts = select_superfiles(&manifest, &[scalar_leaf, term_leaf])
             .await
             .expect("select");
         let kept: Vec<_> = with_fts.iter().map(|e| e.superfile_id).collect();
         assert_eq!(
             kept,
             vec![b.superfile_id],
-            "FTS bloom prunes the segment plain min/max could not, keeping only the real match"
+            "FTS bloom prunes the superfile plain min/max could not, keeping only the real match"
         );
     }
 
     // ---- Unified-substrate coverage across leaf modes -------------
     //
-    // These drive `select_segments` (the path SQL + FTS share) on a
-    // flat (no-list) manifest, so they exercise the segment tier + the
+    // These drive `select_superfiles` (the path SQL + FTS share) on a
+    // flat (no-list) manifest, so they exercise the superfile tier + the
     // AND-combination of leaves. Part-tier behavior is covered directly
     // by the `scalar_keep_parts` tests above and the `list_prune` suite.
 
-    /// Segment carrying both a scalar min/max (what a plain Parquet
+    /// Superfile carrying both a scalar min/max (what a plain Parquet
     /// reader exposes) and an FTS term bloom + range (what infino adds)
     /// for the `title` column. `bloom_tokens` are inserted as exact
     /// terms; the term range is their lex span.
@@ -535,7 +535,7 @@ mod tests {
     }
 
     async fn ids(m: &Manifest, leaves: &[PruneLeaf]) -> Vec<Uuid> {
-        select_segments(m, leaves)
+        select_superfiles(m, leaves)
             .await
             .expect("select")
             .iter()
@@ -573,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn multi_token_equality_prunes_when_any_token_absent() {
         // `title = 'rust async'`: the literal tokenizes to {rust,async}.
-        // Segment has 'rust' but not 'async', and its lex range spans
+        // Superfile has 'rust' but not 'async', and its lex range spans
         // the literal — so min/max keeps it, the AND-bloom prunes it.
         let a = seg("a", "z", &["rust", "tokio"]);
         let m = manifest(vec![a.clone()]);
@@ -591,14 +591,14 @@ mod tests {
             )
             .await
             .is_empty(),
-            "AND-bloom prunes a segment missing one of the literal's tokens"
+            "AND-bloom prunes a superfile missing one of the literal's tokens"
         );
     }
 
     #[tokio::test]
-    async fn bloom_keeps_only_the_token_holder_across_many_wide_segments() {
-        // Four segments whose scalar ranges all span "mango", plus the
-        // one segment that holds it. Plain min/max prunes none; the
+    async fn bloom_keeps_only_the_token_holder_across_many_wide_superfiles() {
+        // Four superfiles whose scalar ranges all span "mango", plus the
+        // one superfile that holds it. Plain min/max prunes none; the
         // bloom isolates the single holder.
         let s1 = seg("a", "z", &["alpha", "omega"]);
         let s2 = seg("a", "z", &["beta", "gamma"]);
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(
             ids(&m, &[eq("title", "mango")]).await.len(),
             4,
-            "min/max cannot prune any wide-range segment"
+            "min/max cannot prune any wide-range superfile"
         );
         assert_eq!(
             ids(
@@ -620,7 +620,7 @@ mod tests {
             )
             .await,
             vec![hit.superfile_id],
-            "bloom keeps exactly the segment that holds the token"
+            "bloom keeps exactly the superfile that holds the token"
         );
     }
 
@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(
             ids(&m, &[term("title", &["alpha", "missing"], BoolMode::Or)]).await,
             vec![a.superfile_id],
-            "OR keeps a segment with any matching term, prunes one with none"
+            "OR keeps a superfile with any matching term, prunes one with none"
         );
     }
 
@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_predicate_keeps_all_segments() {
+    async fn empty_predicate_keeps_all_superfiles() {
         let m = manifest(vec![seg("a", "b", &[]), seg("c", "d", &[])]);
         assert_eq!(ids(&m, &[]).await.len(), 2, "no leaves → full scan");
     }
@@ -687,17 +687,17 @@ mod tests {
         assert_eq!(
             ids(&m, &[eq("missing", "v")]).await,
             vec![a.superfile_id],
-            "scalar on a column with no stats keeps the segment"
+            "scalar on a column with no stats keeps the superfile"
         );
         assert_eq!(
             ids(&m, &[term("missing", &["v"], BoolMode::And)]).await,
             vec![a.superfile_id],
-            "term presence on a column with no FTS summary keeps the segment"
+            "term presence on a column with no FTS summary keeps the superfile"
         );
     }
 
     #[tokio::test]
-    async fn segment_holding_all_tokens_is_never_dropped() {
+    async fn superfile_holding_all_tokens_is_never_dropped() {
         let a = seg("a", "z", &["rust", "async", "tokio"]);
         let m = manifest(vec![a.clone()]);
         assert_eq!(
@@ -710,7 +710,7 @@ mod tests {
             )
             .await,
             vec![a.superfile_id],
-            "a segment whose terms cover the literal is always kept"
+            "a superfile whose terms cover the literal is always kept"
         );
     }
 }

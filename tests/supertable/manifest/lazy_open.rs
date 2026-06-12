@@ -81,7 +81,7 @@ fn one_part_eager_fetches_under_default_threshold() {
 
 #[test]
 fn many_parts_skip_eager_fetch() {
-    // target_superfiles_per_partition=1 + 5 single-segment
+    // target_superfiles_per_partition=1 + 5 single-superfile
     // commits → 5 list entries, all sharing the same
     // partition_key (the partition-split path). With default
     // threshold=4, 5 > 4 → lazy.

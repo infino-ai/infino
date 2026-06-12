@@ -128,7 +128,7 @@ const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
 /// observationally "no partitioning".
 const DEFAULT_PARTITION_N_BUCKETS: u32 = 1;
 
-/// Read-path freshness policy — how an open handle picks up segments
+/// Read-path freshness policy — how an open handle picks up superfiles
 /// committed (by this or another process) after it opened.
 ///
 /// Modeled on the same knob every object-store-native engine exposes
@@ -170,7 +170,7 @@ impl Default for Consistency {
 ///
 /// Holds both the immutable per-supertable configuration (schema,
 /// FTS / vector columns, tokenizer) and the runtime resources the
-/// writer / reader paths use (thread pools, segment store,
+/// writer / reader paths use (thread pools, superfile store,
 /// commit-flush threshold). Held by `SupertableInner` as
 /// `Arc<SupertableOptions>` so readers, the writer, and rayon
 /// shard workers all see the same instances without copying.
@@ -196,7 +196,7 @@ pub struct SupertableOptions {
     /// Shared tokenizer for all FTS columns. Required iff
     /// `fts_columns` is non-empty.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    /// Pool used by reader fan-out (skip + per-segment fan-out +
+    /// Pool used by reader fan-out (skip + per-superfile fan-out +
     /// top-k merge). Default: every logical core.
     pub reader_pool: Arc<ThreadPool>,
     /// Pool used by writer commit-time rayon-shard. Default:
@@ -214,13 +214,13 @@ pub struct SupertableOptions {
     /// `SuperfileReaderCache`) unless a `disk_cache` is attached,
     /// in which case the reader path routes through the cache.
     pub storage: Option<Arc<dyn crate::storage::StorageProvider>>,
-    /// Disk cache for storage-backed segment reads.
+    /// Disk cache for storage-backed superfile reads.
     /// When attached together with `storage`, the supertable's
-    /// reader path routes segment-bytes lookups through this
+    /// reader path routes superfile-bytes lookups through this
     /// cache instead of relying solely on the in-memory `store`
     /// — the load-bearing change that lets a cross-process
     /// `Supertable::open` answer queries on a 100GB index
-    /// without pulling every segment into RAM.
+    /// without pulling every superfile into RAM.
     ///
     /// Construction stays user-managed (`Arc<DiskCacheStore>`)
     /// so callers retain full control over cache root, budget,
@@ -259,12 +259,12 @@ pub struct SupertableOptions {
     /// but does NOT proactively bound the RSS.
     pub memory_budget_bytes: Option<u64>,
     /// When `true` (default), each commit pre-populates the
-    /// attached `disk_cache` with the segment bytes it just
+    /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
     /// cold-fetch round-trip). Set `false` for a write-only
     /// producer that drops the cache right after ingest: the
     /// pre-population is then pure wasted work (and, when the
-    /// segment set exceeds the cache budget, floods the log
+    /// superfile set exceeds the cache budget, floods the log
     /// with "budget exceeded" warnings). No effect without
     /// `disk_cache` attached.
     pub prepopulate_cache_on_commit: bool,
@@ -275,7 +275,7 @@ pub struct SupertableOptions {
     /// When `None` at [`Supertable::create`] time, resolved
     /// to `Hash { column: id_column, n_buckets: 1 }` — a
     /// single-bucket strategy that's observationally
-    /// equivalent to "no partitioning" (every segment lands
+    /// equivalent to "no partitioning" (every superfile lands
     /// in the one bucket → one `ManifestPart` per commit).
     /// Callers wanting real partitioning set this via
     /// [`Self::with_partition_strategy`].
@@ -334,11 +334,11 @@ pub struct SupertableOptions {
     /// caller-driven `commit()` produces superfiles.
     /// Default: 1024 (1 GiB).
     pub commit_threshold_size_mb: u64,
-    /// Segment size (in bytes) at or above which the writer
+    /// Superfile size (in bytes) at or above which the writer
     /// routes the storage write through
     /// [`StorageProvider::put_multipart`] instead of
     /// [`StorageProvider::put_atomic`]. The single-PUT path
-    /// pins the whole segment in `Bytes` at issue time and
+    /// pins the whole superfile in `Bytes` at issue time and
     /// re-uploads everything on retry; the multipart path
     /// splits the upload into 8-MiB chunks driven in
     /// parallel, lowering both peak RSS during the put and
@@ -348,7 +348,7 @@ pub struct SupertableOptions {
     /// standard S3 SDK multipart threshold. Set to
     /// `u64::MAX` to disable multipart routing entirely;
     /// set to a tiny value (e.g. `1`) to force every
-    /// segment through the multipart path (useful for tests).
+    /// superfile through the multipart path (useful for tests).
     pub put_multipart_threshold_bytes: u64,
     /// Whether the supertable's read-side opens of
     /// `SuperfileReader` should verify the trailing whole-
@@ -601,7 +601,7 @@ impl SupertableOptions {
         self
     }
 
-    /// Override the segment store. Default is
+    /// Override the superfile store. Default is
     /// [`InMemoryReaderCache`]; tests + production deployments
     /// with persistence swap this for an mmap- or object-store-
     /// backed implementation.
@@ -612,7 +612,7 @@ impl SupertableOptions {
 
     /// Attach an object-store backend. Engages the
     /// write-through path: each successful commit persists
-    /// segment bytes + the new manifest (parts + list +
+    /// superfile bytes + the new manifest (parts + list +
     /// pointer) to storage via the `commit_manifest`
     /// primitive.
     ///
@@ -632,13 +632,13 @@ impl SupertableOptions {
     ///
     /// When attached:
     ///   - The writer's commit path **skips** the in-memory
-    ///     `store.put` — segment bytes go to object storage
+    ///     `store.put` — superfile bytes go to object storage
     ///     only, and the cache hydrates lazily on first query.
     ///     This removes the OOM trap at 100GB scale (the
     ///     in-memory `SuperfileReaderCache` doesn't evict, so a
     ///     long-running writer would otherwise accumulate every
-    ///     segment's bytes in RAM forever).
-    ///   - Reader paths route segment-byte lookups through the
+    ///     superfile's bytes in RAM forever).
+    ///   - Reader paths route superfile-byte lookups through the
     ///     cache (in-memory tier checked first for hot writes
     ///     made in this process, then disk cache, then
     ///     cold-fetch from object storage).
@@ -727,7 +727,7 @@ impl SupertableOptions {
         self
     }
 
-    /// Override the segment-size threshold (bytes) at which
+    /// Override the superfile-size threshold (bytes) at which
     /// the writer routes through `put_multipart` instead of
     /// `put_atomic`. See [`Self::put_multipart_threshold_bytes`].
     /// Default `100 MiB`.
@@ -764,7 +764,7 @@ impl SupertableOptions {
     /// as-is (clamped to ≥ 1).
     ///
     /// The schema, FTS / vector configuration, tokenizer, and
-    /// in-memory segment store are preserved. If
+    /// in-memory superfile store are preserved. If
     /// `cfg.storage.backend` is not `none`, this method attaches
     /// the requested storage provider; if
     /// `cfg.storage.disk_cache_root` is set, it also attaches a

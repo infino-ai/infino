@@ -27,12 +27,12 @@
 //! The provider's `scan` does the real work — see
 //! [`crate::supertable::query::provider`]. In short, it applies
 //! **two tiers of pruning**: infino's [`scalar_skip`] drops
-//! definitely-irrelevant *segments* from the pushed-down `WHERE`
+//! definitely-irrelevant *superfiles* from the pushed-down `WHERE`
 //! predicates, then DataFusion's `ParquetSource` prunes *row
 //! groups / pages* and pushes projection + limit into the Parquet
-//! reader over the surviving segments. This replaces the v1
+//! reader over the surviving superfiles. This replaces the v1
 //! `MemTable` path, which eagerly decoded every row group of every
-//! segment regardless of the query.
+//! superfile regardless of the query.
 //!
 //! [`scalar_skip`]: crate::supertable::query::skip::scalar_skip
 //! [`SupertableProvider`]: crate::supertable::query::provider::SupertableProvider
@@ -43,7 +43,7 @@
 //! contains id + scalar columns + FTS columns; vector columns are
 //! stored in the embedded vector blob and never exposed via SQL
 //! (callers reach them through `vector_search`). The parquet body
-//! of each segment was written with this same scalar schema, so
+//! of each superfile was written with this same scalar schema, so
 //! round-trip shape matches without projection or rewrite.
 
 use std::sync::Arc;
@@ -113,7 +113,7 @@ impl SupertableReader {
     /// `register_*` setup. Shared by [`query_sql`](Self::query_sql)
     /// (SQL string) and [`scan_ids_matching`](Self::scan_ids_matching)
     /// (programmatic `Expr`), so mutation id-capture gets the same
-    /// segment-skip + row-group/page pruning + lazy tombstone
+    /// superfile-skip + row-group/page pruning + lazy tombstone
     /// filtering the read path uses.
     ///
     /// Freshness policy is applied when the reader is created by
@@ -183,10 +183,10 @@ impl SupertableReader {
     /// Runs through the same pushdown-aware [`SupertableProvider`]
     /// as `query_sql` (via [`sql_session_context`](Self::sql_session_context)):
     /// `expr` is applied as a `DataFrame::filter` and the result
-    /// projected to just `_id`. Segment skip, row-group / page
+    /// projected to just `_id`. Superfile skip, row-group / page
     /// pruning, and lazy tombstone filtering all apply, so a
     /// large-table delete/update predicate never materializes every
-    /// segment into memory.
+    /// superfile into memory.
     ///
     /// Note: the resolution is against the **current** manifest
     /// snapshot, exactly like a contemporaneous `query_sql` would
@@ -312,7 +312,7 @@ mod tests {
 
     fn options_id_cat_title() -> SupertableOptions {
         // Single-threaded writer pool so each commit produces
-        // exactly one segment — keeps assertions on per-segment
+        // exactly one superfile — keeps assertions on per-superfile
         // counts deterministic.
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_scans_across_multiple_segments() {
+    fn query_sql_scans_across_multiple_superfiles() {
         // Three commits → three superfiles. SQL must aggregate across
         // all of them.
         let st = Supertable::create(options_id_cat_title()).expect("create");
@@ -487,10 +487,10 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_equality_on_fts_column_across_segments_is_correct() {
+    fn query_sql_equality_on_fts_column_across_superfiles_is_correct() {
         // Equality on the FTS-indexed `title` column drives the new
         // term-bloom prune leaf (plus the scalar min/max leaf). The two
-        // segments whose bloom lacks "bravo" may be pruned, but the
+        // superfiles whose bloom lacks "bravo" may be pruned, but the
         // result must still be exactly the one matching row — proving
         // the bloom prune never drops a match.
         let st = Supertable::create(options_id_cat_title()).expect("create");
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn query_sql_multiword_equality_on_fts_column_is_correct() {
         // Multi-word literal: the equality lowers to a `TermPresence`
-        // leaf over {rust, async, runtime} (AND). The second segment's
+        // leaf over {rust, async, runtime} (AND). The second superfile's
         // bloom lacks those tokens and is pruned, yet results are exact
         // — DataFusion's FilterExec re-applies the full string equality.
         let st = Supertable::create(options_id_cat_title()).expect("create");
@@ -542,7 +542,7 @@ mod tests {
             ),
             1
         );
-        // Tokens present in segment 1, but no row equals this exact
+        // Tokens present in superfile 1, but no row equals this exact
         // string — the prune is an optimization, correctness holds.
         assert_eq!(
             run_count(
@@ -557,7 +557,7 @@ mod tests {
     fn query_sql_fts_equality_superset_is_narrowed_to_exact_match() {
         // Index-driven row selection: the candidate plan resolves
         // `WHERE title = 'rust async'` to the term-AND posting set, which
-        // within one segment is a *superset* — both rows below contain
+        // within one superfile is a *superset* — both rows below contain
         // {rust, async}. The FilterExec above the scan must narrow that
         // candidate superset to the single exact-equality row, proving
         // the row-level prune never over-returns.
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_select_orders_ids_across_segments() {
+    fn query_sql_select_orders_ids_across_superfiles() {
         // Verifies row identity round-trips through MemTable +
         // DataFusion: rows planted across two superfiles come back
         // in monotonic _id order under ORDER BY. The _id values

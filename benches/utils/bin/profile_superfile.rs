@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Standalone profiling harness for the per-segment vector query path.
+//! Standalone profiling harness for the per-superfile vector query path.
 //!
-//! Builds ONE supertable-segment-sized superfile (default 2.5M docs,
+//! Builds ONE supertable-superfile-sized superfile (default 2.5M docs,
 //! `n_cent = 1024`, dim 384, Sq8 / Cosine — i.e. one of the four
-//! 10M-supertable segments) and times the warm in-memory
+//! 10M-supertable superfiles) and times the warm in-memory
 //! `SuperfileReader::search` across an `(nprobe, rerank_mult)` grid,
 //! reporting per-config latency and recall@10.
 //!
@@ -17,16 +17,16 @@
 //!   * sweep `nprobe` at small `rerank_mult` -> coarse 1-bit scan cost
 //!   * sweep `rerank_mult` at fixed `nprobe` -> Sq8 rerank cost
 //!
-//! and the recall column shows whether per-segment recall keeps
+//! and the recall column shows whether per-superfile recall keeps
 //! climbing past the old 16-probe cap (the ceiling question).
 //!
-//! To A/B the within-segment rayon parallelism, flip
+//! To A/B the within-superfile rayon parallelism, flip
 //! `PARALLEL_SCAN_MIN` in `src/superfile/vector/reader.rs`
 //! (`usize::MAX` forces serial, `0` forces parallel) and rerun.
 //!
 //! Run:
-//!   cargo run --release -p infino-bench-utils --bin profile_segment
-//!   cargo run --release -p infino-bench-utils --bin profile_segment -- 625000 256
+//!   cargo run --release -p infino-bench-utils --bin profile_superfile
+//!   cargo run --release -p infino-bench-utils --bin profile_superfile -- 625000 256
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -40,9 +40,9 @@ const N_QUERIES: usize = 30;
 const TOP_K: usize = 10;
 const SIGMA: f32 = 0.1;
 
-/// Default segment doc count (one 10M-shard slice) when no CLI arg.
+/// Default superfile doc count (one 10M-shard slice) when no CLI arg.
 const DEFAULT_N_DOCS: usize = 2_500_000;
-/// Default IVF centroid count when no CLI arg (matches a supertable segment).
+/// Default IVF centroid count when no CLI arg (matches a supertable superfile).
 const DEFAULT_N_CENT: usize = 1024;
 /// XOR mask decorrelating the query seed from the corpus seed.
 const QUERY_SEED_XOR: u64 = 0x9e37;
@@ -66,7 +66,7 @@ fn main() {
         .unwrap_or(DEFAULT_N_CENT);
 
     eprintln!(
-        "[profile] building 1 segment: {n_docs} docs, n_cent={n_cent}, dim={DIM}, Sq8/Cosine"
+        "[profile] building 1 superfile: {n_docs} docs, n_cent={n_cent}, dim={DIM}, Sq8/Cosine"
     );
     let t = Instant::now();
     let vectors = corpus::generate_vector_corpus(n_docs, n_cent, SEED, true);

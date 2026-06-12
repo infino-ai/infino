@@ -7,7 +7,7 @@
 //! aggregate skip tests in [`ManifestListEntry`] to identify
 //! candidate parts for a given query shape. Survivors are
 //! the parts the query layer should load (via
-//! [`Manifest::part`]) for per-segment pruning.
+//! [`Manifest::part`]) for per-superfile pruning.
 //!
 //! These functions are standalone — they don't depend on
 //! the in-memory `Manifest` or its `ManifestPartLoader`.
@@ -16,11 +16,11 @@
 //!
 //! ## Correctness invariants
 //!
-//! - **Monotonic**: every part the flat (segment-level) prune
+//! - **Monotonic**: every part the flat (superfile-level) prune
 //!   would visit is also a survivor here. Aggregate
 //!   summaries are constructed to over-approximate the union
-//!   of segment-level skip data, so a query that matches any
-//!   segment in a part necessarily matches the part's
+//!   of superfile-level skip data, so a query that matches any
+//!   superfile in a part necessarily matches the part's
 //!   aggregate.
 //! - **"Always-keep" defaults**: parts with empty `*_agg`
 //!   entries for the queried column trivially survive (e.g.
@@ -68,7 +68,7 @@ fn part_overlaps_prefix(
         return true;
     };
     let Some((min_term, max_term)) = agg.term_range_union.as_ref() else {
-        // Every segment had an empty FST for this column;
+        // Every superfile had an empty FST for this column;
         // nothing to match. Skip.
         return false;
     };
@@ -104,7 +104,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Filter the list's parts to those whose
 /// `term_bloom_union[column]` allows at least one query
 /// term (mode = Or) or all of them (mode = And) — i.e. the
-/// list-level analogue of segment-level `fts_bloom_skip`.
+/// list-level analogue of superfile-level `fts_bloom_skip`.
 ///
 /// Parts without a bloom union entry for this column (e.g.,
 /// pre-aggregate manifests or aggregates that fell back
@@ -116,7 +116,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Used by `bm25_search` (exact-term) to prune entire parts
 /// before lazy-loading. Complements
 /// `prune_parts_for_fts_prefix` (which uses term-range
-/// overlap on prefix queries) and segment-level
+/// overlap on prefix queries) and superfile-level
 /// `fts_bloom_skip` (applied after a part is loaded).
 pub fn prune_parts_for_fts_terms(
     list: &ManifestList,
@@ -199,7 +199,7 @@ pub fn prune_parts_for_id_range(
 ///
 /// Distance is L2; for cosine workloads, the query vector + centroids
 /// should be normalized at the caller layer (matching the convention the
-/// segment-level vector skip already uses).
+/// superfile-level vector skip already uses).
 pub fn prune_parts_for_vector(
     list: &ManifestList,
     column: &str,
@@ -218,7 +218,7 @@ pub fn prune_parts_for_vector(
             }
             let envelope = decode_centroid_envelope(&agg.centroid_envelope);
             if envelope.len() != query.len() {
-                // Dim mismatch — keep (the per-segment prune
+                // Dim mismatch — keep (the per-superfile prune
                 // will reject correctly).
                 return Some(entry.part_id);
             }
@@ -343,7 +343,7 @@ mod tests {
         })
     }
 
-    fn entry_from_segments(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
+    fn entry_from_superfiles(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
         let aggs = aggregates::compute(superfiles);
         ManifestListEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_compute_id_range_is_min_max_across_segments() {
+    fn aggregates_compute_id_range_is_min_max_across_superfiles() {
         let s_a = seg(100, 199, &["alpha"], None, 0.0);
         let s_b = seg(0, 99, &["beta"], None, 0.0);
         let s_c = seg(500, 599, &["gamma"], None, 0.0);
@@ -475,13 +475,13 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_compute_vector_envelope_bounds_all_segment_balls() {
+    fn aggregates_compute_vector_envelope_bounds_all_superfile_balls() {
         let s_a = seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 0.5);
         let s_b = seg(11, 20, &[], Some(vec![0.0, 1.0, 0.0]), 0.5);
         let aggs = aggregates::compute(&[s_a.clone(), s_b.clone()]);
         let v = aggs.vector_summary_agg.get("emb").expect("vec agg");
         let mean = [0.5, 0.5, 0.0];
-        // Each segment's centroid is ~0.707 from the mean; +
+        // Each superfile's centroid is ~0.707 from the mean; +
         // radius 0.5 → envelope_radius >= 1.207.
         assert!(
             v.envelope_radius >= 1.207 - 0.01,
@@ -584,10 +584,10 @@ mod tests {
 
     #[test]
     fn prune_parts_for_id_range_filters_non_overlapping_parts() {
-        let part0 = entry_from_segments(&[seg(0, 99, &[], None, 0.0)], 0);
-        let part1 = entry_from_segments(&[seg(100, 199, &[], None, 0.0)], 1);
-        let part2 = entry_from_segments(&[seg(200, 299, &[], None, 0.0)], 2);
-        let part3 = entry_from_segments(&[seg(300, 399, &[], None, 0.0)], 3);
+        let part0 = entry_from_superfiles(&[seg(0, 99, &[], None, 0.0)], 0);
+        let part1 = entry_from_superfiles(&[seg(100, 199, &[], None, 0.0)], 1);
+        let part2 = entry_from_superfiles(&[seg(200, 299, &[], None, 0.0)], 2);
+        let part3 = entry_from_superfiles(&[seg(300, 399, &[], None, 0.0)], 3);
         let list = list_with(vec![part0, part1.clone(), part2.clone(), part3]);
 
         let survivors = prune_parts_for_id_range(&list, 150, 250);
@@ -600,10 +600,10 @@ mod tests {
     #[test]
     fn prune_parts_for_fts_prefix_filters_disjoint_term_ranges() {
         let part0 =
-            entry_from_segments(&[seg(0, 10, &["alpha", "bravo", "charlie"], None, 0.0)], 0);
+            entry_from_superfiles(&[seg(0, 10, &["alpha", "bravo", "charlie"], None, 0.0)], 0);
         let part1 =
-            entry_from_segments(&[seg(11, 20, &["delta", "echo", "foxtrot"], None, 0.0)], 1);
-        let part2 = entry_from_segments(&[seg(21, 30, &["hotel", "kilo", "lima"], None, 0.0)], 2);
+            entry_from_superfiles(&[seg(11, 20, &["delta", "echo", "foxtrot"], None, 0.0)], 1);
+        let part2 = entry_from_superfiles(&[seg(21, 30, &["hotel", "kilo", "lima"], None, 0.0)], 2);
         let list = list_with(vec![part0, part1.clone(), part2]);
 
         let survivors = prune_parts_for_fts_prefix(&list, "title", b"echo");
@@ -615,7 +615,7 @@ mod tests {
     fn prune_parts_for_fts_prefix_keeps_part_with_no_aggregate() {
         // Part has no FTS aggregate for the queried column —
         // always-keep.
-        let part = entry_from_segments(&[seg(0, 10, &[], None, 0.0)], 0);
+        let part = entry_from_superfiles(&[seg(0, 10, &[], None, 0.0)], 0);
         let list = list_with(vec![part.clone()]);
         let survivors = prune_parts_for_fts_prefix(&list, "missing", b"any");
         assert_eq!(survivors, vec![part.part_id]);
@@ -623,8 +623,9 @@ mod tests {
 
     #[test]
     fn prune_parts_for_vector_filters_far_parts() {
-        let part_a = entry_from_segments(&[seg(0, 10, &[], Some(vec![10.0, 0.0, 0.0]), 0.5)], 0);
-        let part_b = entry_from_segments(&[seg(11, 20, &[], Some(vec![-10.0, 0.0, 0.0]), 0.5)], 1);
+        let part_a = entry_from_superfiles(&[seg(0, 10, &[], Some(vec![10.0, 0.0, 0.0]), 0.5)], 0);
+        let part_b =
+            entry_from_superfiles(&[seg(11, 20, &[], Some(vec![-10.0, 0.0, 0.0]), 0.5)], 1);
         let list = list_with(vec![part_a.clone(), part_b]);
         let survivors = prune_parts_for_vector(&list, "emb", &[10.0, 0.0, 0.0], 1.0);
         assert_eq!(survivors.len(), 1);
@@ -633,8 +634,8 @@ mod tests {
 
     #[test]
     fn prune_parts_for_vector_keeps_overlapping_envelope() {
-        let part_a = entry_from_segments(&[seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 1.0)], 0);
-        let part_b = entry_from_segments(&[seg(11, 20, &[], Some(vec![-1.0, 0.0, 0.0]), 1.0)], 1);
+        let part_a = entry_from_superfiles(&[seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 1.0)], 0);
+        let part_b = entry_from_superfiles(&[seg(11, 20, &[], Some(vec![-1.0, 0.0, 0.0]), 1.0)], 1);
         let list = list_with(vec![part_a, part_b]);
         let survivors = prune_parts_for_vector(&list, "emb", &[0.0, 0.0, 0.0], 1.0);
         assert_eq!(
@@ -646,10 +647,10 @@ mod tests {
 
     #[test]
     fn pruning_is_monotonic_no_false_negatives() {
-        // Property: any segment the flat (segment-level)
+        // Property: any superfile the flat (superfile-level)
         // pruner would visit is necessarily in a part the
         // list-level pruner keeps. Aggregates over-
-        // approximate the segment-level skip data.
+        // approximate the superfile-level skip data.
         let segs_part0 = vec![
             seg(0, 10, &["apple"], None, 0.0),
             seg(11, 20, &["banana", "cherry"], None, 0.0),
@@ -658,8 +659,8 @@ mod tests {
             seg(21, 30, &["alpha"], None, 0.0),
             seg(31, 40, &["echo", "foxtrot"], None, 0.0),
         ];
-        let part0 = entry_from_segments(&segs_part0, 0);
-        let part1 = entry_from_segments(&segs_part1, 1);
+        let part0 = entry_from_superfiles(&segs_part0, 0);
+        let part1 = entry_from_superfiles(&segs_part1, 1);
         let list = list_with(vec![part0.clone(), part1.clone()]);
 
         let survivors = prune_parts_for_fts_prefix(&list, "title", b"ban");

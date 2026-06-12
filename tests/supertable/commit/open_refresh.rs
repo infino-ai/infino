@@ -62,8 +62,8 @@ fn open_sees_writes_made_by_a_different_handle() {
     assert_eq!(consumer.reader().n_superfiles(), 1);
     // Note: full query parity post-open requires the deferred
     // query-path integration through `DiskCacheStore` —
-    // the reader sees the manifest's segment list but
-    // segment *bytes* live only in object storage and aren't
+    // the reader sees the manifest's superfile list but
+    // superfile *bytes* live only in object storage and aren't
     // yet routed through the cache. That wiring is the next
     // step. This test validates the manifest-side open here; an
     // end-to-end query test on a post-open Supertable lands

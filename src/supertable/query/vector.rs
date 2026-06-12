@@ -19,7 +19,7 @@
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
 //! [`SupertableReader`], whose `vector_search` (rows) / `vector_hits`
-//! ([`SuperfileHit`], segment-local) methods are the engine-facing
+//! ([`SuperfileHit`], superfile-local) methods are the engine-facing
 //! surface. Results are sorted by distance *ascending* — smaller is
 //! closer (cosine: `1 - dot`, L2-sq: squared distance).
 //!
@@ -27,36 +27,36 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible segment we:
+//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
 //!
-//!   1. Fetch the segment's `SuperfileReader` from the store.
+//!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::vector_search`
 //!      (cluster-aware IVF + 1-bit RaBitQ shortlist + full-precision
-//!      rerank, all inside one segment).
-//!   3. Tag each `(local_doc_id, distance)` with the segment URI.
+//!      rerank, all inside one superfile).
+//!   3. Tag each `(local_doc_id, distance)` with the superfile URI.
 //!   4. Concatenate across superfiles and global-top-k by distance.
 //!
 //! Unlike BM25, vector distances are inherently comparable across
 //! superfiles — both cosine and L2-sq are functions of the query
-//! and the per-doc vector only, not of segment-scoped statistics.
-//! So the per-segment top-k → concatenate → global top-k pattern
-//! recovers exact recall (modulo each per-segment IVF's nprobe-
+//! and the per-doc vector only, not of superfile-scoped statistics.
+//! So the per-superfile top-k → concatenate → global top-k pattern
+//! recovers exact recall (modulo each per-superfile IVF's nprobe-
 //! driven recall tradeoff, which is identical to the single-
 //! superfile case).
 //!
 //! Fan-out uses centroid pruning:
 //!
 //!   1. **Score & sort** — compute `distance(query, centroid)`
-//!      for each segment (SIMD-accelerated: AVX-512 / AVX2 /
-//!      NEON). Derive a lower bound per segment:
+//!      for each superfile (SIMD-accelerated: AVX-512 / AVX2 /
+//!      NEON). Derive a lower bound per superfile:
 //!      `max(0, centroid_dist − radius)`. Sort ascending.
 //!      This is free — centroids are manifest metadata, no
 //!      S3 GETs.
 //!   2. **Search closest** — search the top `k*2` (min 3)
-//!      segments in parallel (`tokio::spawn` per segment).
+//!      superfiles in parallel (`tokio::spawn` per superfile).
 //!      Merge results via bounded heap.
 //!
-//! Every skipped segment is a batch of GET requests the
+//! Every skipped superfile is a batch of GET requests the
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
@@ -75,9 +75,9 @@ use arrow::record_batch::RecordBatch;
 use super::SuperfileHit;
 use super::exec::common::resolve_hits_named;
 
-/// How to probe one segment in the vector fan-out: the globally-selected
-/// cluster ids for that segment, or — for a segment whose manifest
-/// summary carries no per-cluster centroids — a normal per-segment
+/// How to probe one superfile in the vector fan-out: the globally-selected
+/// cluster ids for that superfile, or — for a superfile whose manifest
+/// summary carries no per-cluster centroids — a normal per-superfile
 /// `nprobe` probe (fallback, never silently dropped).
 enum Probe {
     Clusters(Vec<u32>),
@@ -92,7 +92,7 @@ impl SupertableReader {
     /// `query` must match the column's declared `dim`.
     ///
     /// `options` (see [`VectorSearchOptions`]) controls per-
-    /// segment recall-vs-latency knobs (`nprobe`, `rerank_mult`).
+    /// superfile recall-vs-latency knobs (`nprobe`, `rerank_mult`).
     /// Defaults recover ≥0.9 recall@10 on typical IVF setups.
     ///
     /// Empty supertable (no superfiles) and `k == 0` short-circuit
@@ -127,7 +127,7 @@ impl SupertableReader {
                 )
                 .await?
             }
-            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
+            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_superfiles(
                 manifest.as_ref(),
             ),
         };
@@ -135,18 +135,18 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // ---- Global cross-segment cluster selection.
+        // ---- Global cross-superfile cluster selection.
         //
-        // Each kept segment's manifest summary carries its per-cluster
-        // (Sq8) centroids. Rank every (segment, cluster) by centroid
+        // Each kept superfile's manifest summary carries its per-cluster
+        // (Sq8) centroids. Rank every (superfile, cluster) by centroid
         // distance to the query and probe only the globally-closest
-        // clusters — so a query touches just the segments that own a
-        // near cluster, instead of running `nprobe` in every segment.
-        // (A single per-segment centroid can't do this: a time-ordered
-        // segment is a broad mix, so its mean sits near the global
+        // clusters — so a query touches just the superfiles that own a
+        // near cluster, instead of running `nprobe` in every superfile.
+        // (A single per-superfile centroid can't do this: a time-ordered
+        // superfile is a broad mix, so its mean sits near the global
         // centroid. Per-cluster centroids are fine-grained enough to
-        // rank.) A segment whose summary has no cluster centroids falls
-        // back to a normal per-segment `nprobe` probe — never dropped.
+        // rank.) A superfile whose summary has no cluster centroids falls
+        // back to a normal per-superfile `nprobe` probe — never dropped.
         let metric = manifest
             .options
             .vector_columns
@@ -174,10 +174,10 @@ impl SupertableReader {
             }
         }
 
-        // Global probe budget: the closest `nprobe × (eligible segments)`
-        // clusters — the same total probe count as the old per-segment
-        // `nprobe`, but selected globally, so near segments get more
-        // probes and far segments are skipped entirely. (Stage-4 recall
+        // Global probe budget: the closest `nprobe × (eligible superfiles)`
+        // clusters — the same total probe count as the old per-superfile
+        // `nprobe`, but selected globally, so near superfiles get more
+        // probes and far superfiles are skipped entirely. (Stage-4 recall
         // tuning may lower this.)
         let n_eligible = superfiles.len().saturating_sub(fallback.len());
         let budget = options
@@ -195,10 +195,10 @@ impl SupertableReader {
             per_seg.entry(si).or_default().push(c);
         }
 
-        // Build fan-out units: selected segments probe their chosen
-        // clusters; fallback segments probe `nprobe` normally; segments
+        // Build fan-out units: selected superfiles probe their chosen
+        // clusters; fallback superfiles probe `nprobe` normally; superfiles
         // with centroids but no globally-selected cluster are skipped
-        // (the cross-segment win).
+        // (the cross-superfile win).
         let fallback: std::collections::HashSet<usize> = fallback.into_iter().collect();
         let mut units: Vec<(Arc<SuperfileEntry>, Probe)> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
@@ -213,10 +213,10 @@ impl SupertableReader {
         }
 
         // Fan out through the shared [`query::dispatch::fanout`] (also
-        // used by FTS): one tokio task per probed segment opens the
-        // reader and runs the kNN kernel — cold GETs across segments are
+        // used by FTS): one tokio task per probed superfile opens the
+        // reader and runs the kNN kernel — cold GETs across superfiles are
         // concurrent (tokio owns I/O), shortlist + rerank stay on rayon.
-        // Skipped segments issue zero GETs.
+        // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let kernel = move |reader: Arc<SuperfileReader>, probe: Probe| {
@@ -234,9 +234,9 @@ impl SupertableReader {
                 res.map_err(|e| QueryError::Parquet(e.to_string()))
             }
         };
-        let per_segment = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
 
-        Ok(top_k_ascending(per_segment, k))
+        Ok(top_k_ascending(per_superfile, k))
     }
 }
 
@@ -286,11 +286,11 @@ impl SupertableReader {
     }
 }
 
-/// Merge per-segment hits and return the top-k by *ascending*
+/// Merge per-superfile hits and return the top-k by *ascending*
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
-fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
+fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
@@ -312,7 +312,7 @@ fn top_k_ascending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Superfi
     }
 
     let mut heap = BinaryHeap::with_capacity(k + 1);
-    for hit in per_segment.into_iter().flatten() {
+    for hit in per_superfile.into_iter().flatten() {
         if heap.len() < k {
             heap.push(MaxByScore(hit));
         } else if let Some(worst) = heap.peek()
@@ -401,7 +401,7 @@ mod tests {
     use crate::test_helpers::default_tokenizer as tok;
 
     /// Drive an async future to completion on a throwaway current-thread
-    /// runtime. Used only for the single-segment `SuperfileReader`
+    /// runtime. Used only for the single-superfile `SuperfileReader`
     /// oracle, whose search surface is async-only; the supertable
     /// reader's own search methods are sync and need no runtime here.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -429,7 +429,7 @@ mod tests {
         ]))
     }
 
-    fn options_one_segment_per_commit(dim: usize) -> SupertableOptions {
+    fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn vector_search_empty_supertable_returns_empty() {
-        let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(16)).expect("create");
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn vector_search_k_zero_short_circuits() {
-        let st = Supertable::create(options_one_segment_per_commit(16)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(16)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, 16, schema)).expect("a");
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn vector_search_returns_ascending_distance_order() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn vector_search_top_k_caps_at_k() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         // Three commits → three superfiles × 8 docs = 24 docs.
@@ -622,15 +622,15 @@ mod tests {
 
     #[test]
     fn vector_search_global_selection_recovers_neighbors_under_low_budget() {
-        // 10 segments × 16 one-hot docs. Query e_0's true neighbors are
-        // the 10 docs with id % dim == 0 (one per segment) at cosine
+        // 10 superfiles × 16 one-hot docs. Query e_0's true neighbors are
+        // the 10 docs with id % dim == 0 (one per superfile) at cosine
         // distance 0; every other doc is orthogonal (distance 1). With
         // nprobe = 1 the global budget is only 10 clusters across all 10
-        // segments — so this exercises real cross-segment cluster
+        // superfiles — so this exercises real cross-superfile cluster
         // pruning (most of the 10 × n_cent clusters are skipped), and
         // recall@10 must still recover the concentrated neighbors.
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         let n_seg = 10u64;
@@ -655,9 +655,9 @@ mod tests {
     }
 
     #[test]
-    fn vector_search_carries_segment_uris_for_multi_segment_results() {
+    fn vector_search_carries_superfile_uris_for_multi_superfile_results() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         for chunk in 0..3u64 {
@@ -670,21 +670,22 @@ mod tests {
         let hits = r
             .vector_hits("emb", &q, 24, VectorSearchOptions::new())
             .expect("query");
-        let segment_uris: std::collections::HashSet<_> = hits.iter().map(|h| h.segment).collect();
+        let superfile_uris: std::collections::HashSet<_> =
+            hits.iter().map(|h| h.superfile).collect();
         // All three superfiles should contribute (high k pulls from
         // each).
-        assert_eq!(segment_uris.len(), 3);
+        assert_eq!(superfile_uris.len(), 3);
     }
 
     #[test]
     fn vector_search_oracle_top_k_set_matches_single_superfile() {
-        // Vector distances are segment-independent — cosine /
+        // Vector distances are superfile-independent — cosine /
         // L2-sq are functions of the query + per-doc vector only.
-        // So the per-segment-top-k → global-top-k pattern recovers
+        // So the per-superfile-top-k → global-top-k pattern recovers
         // the same set as a single-superfile search, modulo each
         // IVF's nprobe-driven recall (we use a high-recall config).
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         // 24 docs across 3 superfiles.
@@ -705,7 +706,7 @@ mod tests {
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
 
-        // The oracle is a single-segment `SuperfileReader` whose search
+        // The oracle is a single-superfile `SuperfileReader` whose search
         // is async-only; drive it on a throwaway runtime. The supertable
         // reader below uses its sync public API.
         let oracle_hits =
@@ -725,8 +726,8 @@ mod tests {
                 let seg_idx = manifest
                     .superfiles
                     .iter()
-                    .position(|e| e.uri == h.segment)
-                    .expect("segment in manifest");
+                    .position(|e| e.uri == h.superfile)
+                    .expect("superfile in manifest");
                 (seg_idx as u32) * 8 + h.local_doc_id
             })
             .collect();
@@ -737,7 +738,7 @@ mod tests {
     #[test]
     fn vector_search_unknown_column_errors() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
@@ -810,7 +811,7 @@ mod tests {
         let entry = synthetic_entry(sf_id);
         let mut hits: Vec<SuperfileHit> = (0..8u32)
             .map(|d| SuperfileHit {
-                segment: entry.uri,
+                superfile: entry.uri,
                 local_doc_id: d,
                 score: d as f32,
             })
@@ -833,7 +834,7 @@ mod tests {
         let entry = synthetic_entry(Uuid::from_u128(0xABCD));
         let mut hits: Vec<SuperfileHit> = (0..4u32)
             .map(|d| SuperfileHit {
-                segment: entry.uri,
+                superfile: entry.uri,
                 local_doc_id: d,
                 score: 0.0,
             })
@@ -863,7 +864,7 @@ mod tests {
         let entry = synthetic_entry(Uuid::from_u128(0x1111));
         let mut hits: Vec<SuperfileHit> = (0..4u32)
             .map(|d| SuperfileHit {
-                segment: entry.uri,
+                superfile: entry.uri,
                 local_doc_id: d,
                 score: 0.0,
             })

@@ -45,7 +45,7 @@ const ROT_SEED: u64 = 7;
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Rerank residual codec for the bench vector index.
 const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
-/// Writer auto-flush threshold (MiB) per segment roll.
+/// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget (8 GiB) capping resident RSS during ingest.
 const WRITER_MEMORY_BUDGET_BYTES: u64 = 8 * (1u64 << 30);
@@ -158,7 +158,7 @@ pub fn options_for(
         return opts;
     }
     let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_segment = (n_cent_total / N_COMMIT_CHUNKS).max(1);
+    let n_cent_per_superfile = (n_cent_total / N_COMMIT_CHUNKS).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus::get().max(1))
@@ -177,7 +177,7 @@ pub fn options_for(
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim: DIM,
-            n_cent: n_cent_per_segment,
+            n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
             rerank_codec: BENCH_RERANK,
@@ -280,7 +280,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         }
     });
     let cleanup = storage_backend.cleanup.clone();
-    // Disk cache attached only to keep segment bytes out of the unbounded
+    // Disk cache attached only to keep superfile bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
     let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));

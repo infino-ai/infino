@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Tiered segment-bytes lookup.
+//! Tiered superfile-bytes lookup.
 //!
 //! [`superfile_reader`] is the single accessor the query paths
 //! (`bm25_search`, `vector_search`, `query_sql`) use to turn a
@@ -9,7 +9,7 @@
 //!
 //!   1. **In-memory tier first.** If `store.reader(uri)`
 //!      succeeds — i.e., this process's writer recently
-//!      published the segment and the bytes are still in
+//!      published the superfile and the bytes are still in
 //!      `InMemoryReaderCache` — return that reader. Fast
 //!      path; no syscalls.
 //!   2. **Disk cache fallback.** Miss in the in-memory tier
@@ -72,7 +72,7 @@ pub async fn superfile_reader(
     if let Some(cache) = disk_cache {
         match cache.reader_with_hints(uri, offsets).await {
             Ok(reader) => return Ok(reader),
-            // Cache can't admit this segment (e.g. it's larger than the
+            // Cache can't admit this superfile (e.g. it's larger than the
             // whole budget). Stream it directly via range GETs instead
             // of failing the query.
             Err(DiskCacheError::BudgetExceeded) => {

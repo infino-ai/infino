@@ -10,7 +10,7 @@
 //!
 //! Every public search call is **sync**: it `block_on`s the
 //! supertable's shared query runtime. Underneath, `fanout` spawns one
-//! tokio task per segment for the I/O wave, and each per-segment kernel
+//! tokio task per superfile for the I/O wave, and each per-superfile kernel
 //! offloads its scoring onto the global **rayon** pool. Driving that
 //! from many OS threads at once is the classic deadlock surface:
 //!
@@ -53,14 +53,14 @@ use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::{default_tokenizer, default_vector_config};
 
 const DIM: usize = 16;
-const SEGMENTS: usize = 4;
-const DOCS_PER_SEGMENT: usize = 8;
+const SUPERFILES: usize = 4;
+const DOCS_PER_SUPERFILE: usize = 8;
 
 const N_THREADS: usize = 16;
 const ITERS_PER_THREAD: usize = 25;
 /// Random-rotation seed for the fanout fixture's vector index.
 const VECTOR_ROT_SEED: u64 = 7;
-/// Rayon CPU pool size used to orchestrate cross-segment fanout.
+/// Rayon CPU pool size used to orchestrate cross-superfile fanout.
 const RAYON_POOL_THREADS: usize = 4;
 /// Number of distinct query kinds cycled in the stress loop.
 const QUERY_KIND_COUNT: usize = 4;
@@ -110,15 +110,15 @@ fn options_title_emb() -> SupertableOptions {
 }
 
 /// Doc `i` within the batch gets a "rust …" title (so BM25 `rust`
-/// fans out across every segment) and a one-hot embedding at global
+/// fans out across every superfile) and a one-hot embedding at global
 /// dim `base_dim + i`.
 fn build_batch(base_dim: usize, schema: Arc<Schema>) -> RecordBatch {
-    let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
+    let titles: Vec<String> = (0..DOCS_PER_SUPERFILE)
         .map(|i| format!("rust topic {} variant", base_dim + i))
         .collect();
     let title_arr = LargeStringArray::from(titles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    let mut flat = Vec::<f32>::with_capacity(DOCS_PER_SEGMENT * DIM);
-    for i in 0..DOCS_PER_SEGMENT {
+    let mut flat = Vec::<f32>::with_capacity(DOCS_PER_SUPERFILE * DIM);
+    for i in 0..DOCS_PER_SUPERFILE {
         let active = (base_dim + i) % DIM;
         for d in 0..DIM {
             flat.push(if d == active { 1.0 } else { 0.0 });
@@ -138,8 +138,8 @@ fn build_supertable() -> Supertable {
     let st = Supertable::create(options_title_emb()).expect("create");
     let schema = st.options().schema.clone();
     let mut w = st.writer().expect("writer");
-    for seg in 0..SEGMENTS {
-        w.append(&build_batch(seg * DOCS_PER_SEGMENT, schema.clone()))
+    for seg in 0..SUPERFILES {
+        w.append(&build_batch(seg * DOCS_PER_SUPERFILE, schema.clone()))
             .expect("append");
         w.commit().expect("commit");
     }
@@ -155,13 +155,13 @@ fn csv_one_hot(active: usize) -> String {
 }
 
 /// Stable, order-independent identity for a hit list:
-/// sorted `(segment, local_doc_id)`. Segment is rendered via its
+/// sorted `(superfile, local_doc_id)`. Superfile is rendered via its
 /// `Debug` form so the test needs no extra type imports and is immune
 /// to fan-out / merge ordering.
 fn hit_key(hits: &[SuperfileHit]) -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = hits
         .iter()
-        .map(|h| (format!("{:?}", h.segment), h.local_doc_id))
+        .map(|h| (format!("{:?}", h.superfile), h.local_doc_id))
         .collect();
     v.sort();
     v
@@ -261,7 +261,7 @@ fn fanout_under_concurrency_is_live_and_deterministic() {
         !gold.hybrid_ids.is_empty(),
         "hybrid golden must be non-empty"
     );
-    assert_eq!(gold.count, (SEGMENTS * DOCS_PER_SEGMENT) as i64);
+    assert_eq!(gold.count, (SUPERFILES * DOCS_PER_SUPERFILE) as i64);
 
     // Run the whole stress on a coordinator thread and gate it behind a
     // watchdog so a deadlock trips the timeout instead of hanging the

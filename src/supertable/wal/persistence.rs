@@ -218,6 +218,35 @@ impl WalStore {
         Ok(out)
     }
 
+    /// Return the [`uuid::Uuid`]s of every superfile that currently
+    /// has a tombstone sidecar on storage (`superfiles/<id>.tombstones`).
+    pub async fn list_tombstone_ids(&self) -> Result<Vec<uuid::Uuid>, WalStoreError> {
+        let uris = self
+            .storage
+            .list_with_prefix(SUPERFILES_DIR)
+            .await
+            .map_err(|source| WalStoreError::Storage {
+                path: SUPERFILES_DIR.into(),
+                source,
+            })?;
+        let suffix = format!(".{TOMBSTONES_EXT}");
+        let mut out = Vec::new();
+        for uri in uris {
+            let filename = match uri.rsplit_once('/') {
+                Some((_, fname)) => fname,
+                None => uri.as_str(),
+            };
+            let Some(stem) = filename.strip_suffix(&suffix) else {
+                continue;
+            };
+            let Ok(id) = uuid::Uuid::parse_str(stem) else {
+                continue;
+            };
+            out.push(id);
+        }
+        Ok(out)
+    }
+
     /// Write a brand-new WAL state doc atomically. Fails with
     /// `AlreadyExists` if the `wal_id`'s path is occupied —
     /// which is how a `wal_id` collision surfaces. Probability

@@ -15,7 +15,7 @@
 //!
 //! ## Scope
 //!
-//! - Manifest-side counters: pinned version, live segment
+//! - Manifest-side counters: pinned version, live superfile
 //!   count, manifest-part counts (referenced + hydrated).
 //! - Process-level memory: OS-reported RSS.
 //! - Disk-cache aggregates (when a cache is attached): mmap

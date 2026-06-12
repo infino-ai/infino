@@ -17,7 +17,7 @@ use crate::supertable::manifest::SuperfileUri;
 /// [`ColdFetchMode::HybridWithPrefetch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColdFetchMode {
-    /// Parallel range-GETs fan out over the segment; each
+    /// Parallel range-GETs fan out over the superfile; each
     /// response is Arc-cloned and tee'd to (a) the foreground
     /// caller (in-memory `SuperfileReader`) and (b) a
     /// fire-and-forget pwrite into the cache file. Foreground
@@ -40,8 +40,8 @@ pub enum ColdFetchMode {
     /// [`SuperfileReader::open_lazy`]-built reader over a
     /// [`StorageRangeSource`]; pays only the cold-open
     /// + cold-search byte budget against object storage
-    /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB segment).
-    /// A background task downloads the full segment to NVMe
+    /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB superfile).
+    /// A background task downloads the full superfile to NVMe
     /// after foreground lazy readers release, then mmaps it
     /// + replaces the cache entry;
     /// any subsequent `reader(uri)` call returns the
@@ -49,11 +49,11 @@ pub enum ColdFetchMode {
     /// **zero** S3 GETs.
     ///
     /// **Up to 2× bandwidth per cold miss** — foreground
-    /// per-query ranges and the eventual full-segment cache
+    /// per-query ranges and the eventual full-superfile cache
     /// fill both read from object storage, but the fill is
     /// deferred until the latency-critical foreground reader
     /// is dropped. The tradeoff: minimal cold-query latency
-    /// (one-segment hot working set fits in a few range-GETs)
+    /// (one-superfile hot working set fits in a few range-GETs)
     /// at the cost of extra cold-fetch bandwidth vs.
     /// `HybridWithPrefetch`.
     /// Pick this mode for object-storage-native deployments
@@ -71,7 +71,7 @@ pub enum ColdFetchMode {
 /// `DiskCacheSettings` from `Config`; one converts to the
 /// other at supertable construction).
 pub struct DiskCacheConfig {
-    /// Filesystem root for cached segment files. Created
+    /// Filesystem root for cached superfile files. Created
     /// (recursively) at `DiskCacheStore::new`.
     pub cache_root: PathBuf,
     /// Tier 1 size cap. Soft cap — exceeded transiently
@@ -88,11 +88,11 @@ pub struct DiskCacheConfig {
     /// product `cold_fetch_streams × cold_fetch_chunk_bytes`
     /// bounds peak in-flight memory per cold miss — the
     /// chunk size is fixed at this value regardless of
-    /// segment size, so a large segment fans out into more
+    /// superfile size, so a large superfile fans out into more
     /// chunks rather than inflating per-chunk memory.
     pub cold_fetch_chunk_bytes: u64,
-    /// Global cap on concurrent **background** segment fills
-    /// (the `LazyForegroundWithBackgroundFill` full-segment
+    /// Global cap on concurrent **background** superfile fills
+    /// (the `LazyForegroundWithBackgroundFill` full-superfile
     /// download). Each in-flight fill is itself bounded to
     /// `cold_fetch_streams × cold_fetch_chunk_bytes`, so the
     /// process-wide background-fill memory ceiling is
@@ -130,7 +130,7 @@ const DEFAULT_COLD_FETCH_STREAMS: usize = 16;
 /// Default range-GET chunk size (16 MiB); peak in-flight bytes is
 /// `streams × chunk`.
 const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 16 * (1 << 20);
-/// Default number of concurrent background full-segment fills.
+/// Default number of concurrent background full-superfile fills.
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is `MADV_DONTNEED`-swept.
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;

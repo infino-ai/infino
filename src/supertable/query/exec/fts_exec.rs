@@ -543,6 +543,23 @@ mod tests {
     }
 
     #[test]
+    fn bm25_search_tvf_negation_excludes_term() {
+        let st = demo_corpus();
+        // `-systems` drops doc 4; only doc 0 matches `rust` without it.
+        let rows = st
+            .reader()
+            .query_sql("SELECT title FROM bm25_search('title', 'rust -systems', 10)")
+            .expect("query_sql");
+        assert_eq!(titles_of(&rows), vec!["rust async runtime".to_string()]);
+
+        // A negation-only query has nothing to rank → error.
+        let res = st
+            .reader()
+            .query_sql("SELECT title FROM bm25_search('title', '-rust', 10)");
+        assert!(res.is_err(), "negation-only must error; got {res:?}");
+    }
+
+    #[test]
     fn bm25_search_prefix_tvf_expands_prefix() {
         let st = demo_corpus();
         // `rus` expands to `rust` → docs 0 + 4.

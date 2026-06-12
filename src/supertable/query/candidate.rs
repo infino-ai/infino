@@ -8,16 +8,16 @@
 //! non-matching rows. The inverted index already knows which rows
 //! contain a term, so we resolve a small **candidate row set** from the
 //! postings and decode only those rows — the row-level analog of the
-//! term-bloom *segment* prune.
+//! term-bloom *superfile* prune.
 //!
 //! ## How (two passes)
 //!
 //!   1. **Candidate generation (this module).** The `WHERE` `Expr` tree
 //!      is lowered to a [`CandidatePlan`] — a boolean tree whose leaves
 //!      retrieve rows via [`SuperfileReader::token_match`]. Evaluated
-//!      against one segment it yields a `RoaringBitmap` of candidate
+//!      against one superfile it yields a `RoaringBitmap` of candidate
 //!      `local_doc_id`s, or `None` ("no usable bound — scan the
-//!      segment").
+//!      superfile").
 //!   2. **Verification (DataFusion).** The provider turns the candidate
 //!      set into a Parquet row selection so only those rows decode, and
 //!      DataFusion's `FilterExec` (filters are reported `Inexact`)
@@ -49,16 +49,16 @@ use crate::superfile::SuperfileReader;
 use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::Tokenizer;
 
-/// A segment-independent boolean plan over FTS term retrievals, lowered
+/// A superfile-independent boolean plan over FTS term retrievals, lowered
 /// once from a SQL `WHERE` clause and [`evaluate`](CandidatePlan::evaluate)d
-/// per segment to a superset of the rows satisfying the FTS-resolvable
+/// per superfile to a superset of the rows satisfying the FTS-resolvable
 /// part of the predicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidatePlan {
     /// Rows whose `column` contains every one of `tokens` (term-AND).
     /// The candidate superset of `column = '<text tokenizing to tokens>'`;
     /// the exact predicate is re-verified by the `FilterExec` above the
-    /// scan (filters are reported `Inexact`). Resolved per segment by a
+    /// scan (filters are reported `Inexact`). Resolved per superfile by a
     /// single `token_match(.., And)` — postings only, no column decode —
     /// so verification + projection happen together in DataFusion's one
     /// scan pass. (An `exact_match`-per-leaf alternative was measured and
@@ -69,7 +69,7 @@ pub(crate) enum CandidatePlan {
     And(Vec<CandidatePlan>),
     /// Union of children (logical `OR`).
     Or(Vec<CandidatePlan>),
-    /// No usable bound: scan the segment and let `FilterExec` verify.
+    /// No usable bound: scan the superfile and let `FilterExec` verify.
     Unbounded,
 }
 
@@ -97,7 +97,7 @@ impl CandidatePlan {
         )
     }
 
-    /// Evaluate against one segment's reader. `Ok(None)` means "no bound
+    /// Evaluate against one superfile's reader. `Ok(None)` means "no bound
     /// — scan all rows"; `Ok(Some(bitmap))` is the candidate
     /// `local_doc_id` superset (possibly empty). `TermsAll` is one
     /// `token_match(.., And)`; `And`/`Or` intersect/union children.
@@ -147,13 +147,13 @@ impl CandidatePlan {
 
 impl CandidatePlan {
     /// Cheap upper-bound estimate of how many rows this plan would match
-    /// in `reader`'s segment, computed from per-term `df` only (no
+    /// in `reader`'s superfile, computed from per-term `df` only (no
     /// `token_match`, no posting decode). The bound follows the boolean
     /// tree: a term-`AND` can't exceed the **smallest** term's `df`
     /// (`min`); an `OR`/`IN` union can't exceed the **sum** of branch
     /// estimates (capped at `n_docs`); `Unbounded` is `n_docs` (no
     /// bound). The provider uses this to skip the index pushdown when a
-    /// predicate would match a large fraction of the segment — there the
+    /// predicate would match a large fraction of the superfile — there the
     /// matches saturate the data pages so an index `RowSelection` can't
     /// skip any, and a plain scan is cheaper.
     pub(crate) fn estimate<'a>(

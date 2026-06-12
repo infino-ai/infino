@@ -6,14 +6,14 @@
 //! and `hybrid_search`.
 //!
 //! The in-crate unit tests (`match_exec.rs`, `hybrid_exec.rs`) cover the
-//! SQL table-valued functions and the RRF math on a single segment.
+//! SQL table-valued functions and the RRF math on a single superfile.
 //! This file exercises the published
 //! `SupertableReader::{token_match, exact_match, hybrid_search}` surface
 //! the way a Rust consumer calls it — `st.reader().token_match(..)` —
-//! over a committed **multi-segment** corpus so the per-segment work
-//! fans out and merges across segments.
+//! over a committed **multi-superfile** corpus so the per-superfile work
+//! fans out and merges across superfiles.
 //!
-//! Hits are identified by their `(segment, local_doc_id)` pair (the same
+//! Hits are identified by their `(superfile, local_doc_id)` pair (the same
 //! identity RRF fuses on); expectations are pinned by comparing against
 //! the `bm25_search` / `vector_search` sub-searches rather than by
 //! hand-mapping doc positions, so the assertions hold regardless of how
@@ -48,11 +48,11 @@ const QUERY_DIM: usize = 0;
 const TOP_K: usize = 32;
 /// Smaller top-k for the ranking-order assertions.
 const RANK_TOP_K: usize = 8;
-/// `rust` is sprinkled across both segments; this guards against corpus
-/// drift silently making the cross-segment assertions trivial.
+/// `rust` is sprinkled across both superfiles; this guards against corpus
+/// drift silently making the cross-superfile assertions trivial.
 const MIN_RUST_HITS: usize = 4;
 
-/// First segment's titles; doc `i`'s embedding is one-hot at dim `i`.
+/// First superfile's titles; doc `i`'s embedding is one-hot at dim `i`.
 const SEG1_TITLES: &[&str] = &[
     "rust async",   // 0  — `async` is unique to this doc
     "python data",  // 1
@@ -63,7 +63,7 @@ const SEG1_TITLES: &[&str] = &[
     "kotlin flow",  // 6
     "rust systems", // 7  — only doc with both `rust` and `systems`
 ];
-/// Second segment's titles; doc `i` (global) is one-hot at dim `i`.
+/// Second superfile's titles; doc `i` (global) is one-hot at dim `i`.
 const SEG2_TITLES: &[&str] = &[
     "swift ui",      // 8
     "rust web",      // 9
@@ -129,8 +129,8 @@ fn build_batch(titles: &[&str], base_dim: usize, schema: Arc<Schema>) -> RecordB
     RecordBatch::try_new(schema, vec![Arc::new(title_arr), Arc::new(fsl)]).expect("batch")
 }
 
-/// Two committed segments built from [`SEG1_TITLES`] then [`SEG2_TITLES`].
-fn demo_two_segments() -> Supertable {
+/// Two committed superfiles built from [`SEG1_TITLES`] then [`SEG2_TITLES`].
+fn demo_two_superfiles() -> Supertable {
     let st = Supertable::create(options_title_emb()).expect("create");
     let schema = st.options().schema.clone();
     let mut w = st.writer().expect("writer");
@@ -150,15 +150,15 @@ fn one_hot(active: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Stable per-row identity: the `(segment, local_doc_id)` pair RRF and
+/// Stable per-row identity: the `(superfile, local_doc_id)` pair RRF and
 /// the resolve path both key on.
 fn hit_ids(hits: &[SuperfileHit]) -> HashSet<(SuperfileUri, u32)> {
-    hits.iter().map(|h| (h.segment, h.local_doc_id)).collect()
+    hits.iter().map(|h| (h.superfile, h.local_doc_id)).collect()
 }
 
 #[test]
 fn token_match_or_is_the_unranked_bm25_candidate_set() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     let reader = st.reader();
     let token = reader
         .token_match("title", "rust", BoolMode::Or)
@@ -169,7 +169,7 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
 
     assert!(
         bm25.len() >= MIN_RUST_HITS,
-        "'rust' should match across both segments"
+        "'rust' should match across both superfiles"
     );
     assert_eq!(
         hit_ids(&token),
@@ -184,7 +184,7 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
 
 #[test]
 fn token_match_and_intersects_tokens() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     let reader = st.reader();
     // Only "rust systems" carries both tokens.
     let token = reader
@@ -204,7 +204,7 @@ fn token_match_and_intersects_tokens() {
 
 #[test]
 fn exact_match_is_raw_value_equality_not_token() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     let reader = st.reader();
     // The raw title "rust async" equals exactly the docs that the
     // token-AND prune leaves (only doc 0 has both `rust` and `async`).
@@ -239,7 +239,7 @@ fn exact_match_is_raw_value_equality_not_token() {
 
 #[test]
 fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     let reader = st.reader();
     let q = one_hot(QUERY_DIM);
 
@@ -263,7 +263,7 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
 
     assert!(
         bm25.len() >= MIN_RUST_HITS,
-        "'rust' should match across both segments"
+        "'rust' should match across both superfiles"
     );
     assert!(!vector.is_empty(), "vector retriever returned nothing");
 
@@ -285,7 +285,7 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
 
 #[test]
 fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
-    let st = demo_two_segments();
+    let st = demo_two_superfiles();
     let reader = st.reader();
     let q = one_hot(QUERY_DIM);
 
@@ -314,15 +314,15 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
         !hybrid.is_empty() && !bm25.is_empty() && !vector.is_empty(),
         "all retrievers must return hits"
     );
-    let top = (hybrid[0].segment, hybrid[0].local_doc_id);
+    let top = (hybrid[0].superfile, hybrid[0].local_doc_id);
     assert_eq!(
         top,
-        (bm25[0].segment, bm25[0].local_doc_id),
+        (bm25[0].superfile, bm25[0].local_doc_id),
         "fused #1 must be the BM25 #1"
     );
     assert_eq!(
         top,
-        (vector[0].segment, vector[0].local_doc_id),
+        (vector[0].superfile, vector[0].local_doc_id),
         "fused #1 must also be the vector #1 (top in both ⇒ first)"
     );
 }
