@@ -100,6 +100,32 @@ A real-backend run writes under a unique prefix and deletes it on exit; set
 `INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
 emulator self-cleans and reproduces request/byte volume, not network latency.
 
+## Prepared datasets
+
+The supertable corpus is fully seeded, so an ingested table is reusable.
+`dataset` verbs split the run: **prepare** once (ingest to a fixed prefix and
+write a `dataset.json` sidecar), then **bench** the read phases against it as
+many times as needed — no corpus generation, no ingest. Real object store
+only.
+
+```sh
+# Prepare a dataset (one sub-prefix per modality: <prefix>/{fts,vector,sql}).
+INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
+  cargo bench -- dataset prepare datasets/bench-10m
+
+# Benchmark an existing dataset (fails fast if it is not there).
+cargo bench -- dataset bench datasets/bench-10m vector warm
+
+# End-to-end: prepare if absent, then bench.
+cargo bench -- dataset run datasets/bench-10m fts
+```
+
+The sidecar records the corpus/index knobs the dataset was built with; the
+bench refuses to open a dataset whose knobs don't match its own config
+(re-prepare instead). `INFINO_BENCH_SUPERTABLE_DOCS` must therefore match the
+prepare-time count. The `Dataset bench (Azure)` workflow drives the same
+verbs from CI.
+
 ## Test Matrix
 
 The matrix is tier × modality — six cells:
