@@ -2337,6 +2337,7 @@ dependencies = [
  "rayon",
  "s3s",
  "s3s-fs",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

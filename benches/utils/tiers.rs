@@ -431,6 +431,30 @@ pub async fn supertable_storage_fixture() -> StorageFixture {
     }
 }
 
+/// Storage for a prepared dataset at a fixed prefix — no unique suffix, no
+/// cleanup, so the data persists across runs. `subdir` namespaces the modality
+/// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. Real backend only,
+/// same as [`supertable_storage_fixture`].
+pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
+    let backend = match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
+        Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
+        backend => backend,
+    };
+    let base = crate::dataset::dataset_prefix()
+        .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
+    let prefix = format!("{}/{subdir}", base.trim_matches('/'));
+    let label = backend.label();
+    let storage = backend.provider(&prefix).expect("dataset provider");
+    eprintln!("[tiers] dataset {label} prefix={prefix}");
+    StorageFixture {
+        storage,
+        storage_label: label,
+        remote: true,
+        cleanup: None,
+        _keepalive: StorageKeepalive::Remote,
+    }
+}
+
 /// Upload one superfile blob for superfile-shaped warm/cold benches (1M).
 pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     let fixture = backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await;
