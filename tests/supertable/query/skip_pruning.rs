@@ -4,7 +4,7 @@
 //! Manifest-level skip pruning end-to-end.
 //!
 //! These tests are the load-bearing perf claim of the skip
-//! layer: a segment that doesn't match a query must never
+//! layer: a superfile that doesn't match a query must never
 //! trigger a [`SuperfileReaderCache::reader`] call. We assert that by
 //! wrapping the in-memory store in a counting decorator and
 //! comparing per-URI reader-call counts taken before and after
@@ -14,20 +14,20 @@
 //!
 //!   1. **Exact-term BM25** — `nimblefox` is planted in exactly
 //!      one of N superfiles. After running `bm25_search`, only that
-//!      segment's reader has been opened. The N-1 pruned superfiles
+//!      superfile's reader has been opened. The N-1 pruned superfiles
 //!      stay cold.
 //!   2. **Prefix BM25** — terms beginning with `quokka` are
-//!      planted in exactly one segment (the others contain only
+//!      planted in exactly one superfile (the others contain only
 //!      `apple`/`banana`/etc. — no overlap with the lex range
 //!      `[quokka, quokka_upper_bound)`). `bm25_search_prefix`
-//!      opens only the matching segment.
+//!      opens only the matching superfile.
 //!
 //! Vector centroid skip is not asserted here — the v1
 //! `vector_centroid_skip` returns all-keep (cutoff-driven skip
-//! is deferred), so the test would just confirm "every segment
+//! is deferred), so the test would just confirm "every superfile
 //! is opened" which isn't a useful invariant. Scalar skip via
 //! SQL is similarly deferred: the SQL path uses a `MemTable`
-//! that opens every segment at registration time; a future
+//! that opens every superfile at registration time; a future
 //! custom `TableProvider` will integrate `PruningPredicate`
 //! and revisit this.
 
@@ -50,12 +50,12 @@ use infino::test_helpers::{build_title_batch, default_tokenizer, schema_id_title
 
 /// Single-thread rayon pool for deterministic skip-pruning.
 const RAYON_POOL_THREADS: usize = 1;
-/// Four-segment corpus for the exact-term skip tests.
-const EXACT_TERM_SEGMENT_COUNT: usize = 4;
+/// Four-superfile corpus for the exact-term skip tests.
+const EXACT_TERM_SUPERFILE_COUNT: usize = 4;
 /// BM25 / prefix top-k used across the skip-pruning queries.
 const BM25_TOP_K: usize = 5;
-/// Segments with no matching term (bloom-prune-all fixture).
-const NO_MATCH_SEGMENT_COUNT: u64 = 3;
+/// Superfiles with no matching term (bloom-prune-all fixture).
+const NO_MATCH_SUPERFILE_COUNT: u64 = 3;
 
 /// Decorator over an `InMemoryReaderCache` that counts
 /// per-URI `reader` calls. Wraps without behavior change.
@@ -136,11 +136,11 @@ fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
 }
 
 #[test]
-fn bm25_exact_term_skip_opens_only_matching_segment() {
+fn bm25_exact_term_skip_opens_only_matching_superfile() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
-    // Four superfiles. Plant the rare term `nimblefox` in segment 0
+    // Four superfiles. Plant the rare term `nimblefox` in superfile 0
     // only; the other three superfiles share generic terms only.
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&[
@@ -170,14 +170,14 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
     drop(w);
 
     let r = st.reader();
-    assert_eq!(r.n_superfiles(), EXACT_TERM_SEGMENT_COUNT);
+    assert_eq!(r.n_superfiles(), EXACT_TERM_SUPERFILE_COUNT);
 
-    // Identify the URI of segment 0 (the planted segment).
+    // Identify the URI of superfile 0 (the planted superfile).
     let manifest = r.manifest();
     let target_uri = manifest.superfiles[0].uri;
 
     // Snapshot reader-call counts AFTER commits (writer publishes
-    // each segment via one reader call to derive summaries). We
+    // each superfile via one reader call to derive summaries). We
     // measure the delta over the query alone.
     let before = store.snapshot();
 
@@ -190,29 +190,29 @@ fn bm25_exact_term_skip_opens_only_matching_segment() {
         )
         .expect("query");
     assert_eq!(hits.len(), 1, "exactly one doc matches `nimblefox`");
-    assert_eq!(hits[0].segment, target_uri);
+    assert_eq!(hits[0].superfile, target_uri);
 
     let delta = store.delta(&before);
     assert_eq!(
         delta.len(),
         1,
-        "skip should open exactly one segment for an exact-term query \
+        "skip should open exactly one superfile for an exact-term query \
          where 3 of 4 superfiles have the term definitively absent — got {delta:?}"
     );
     assert!(
         delta.contains_key(&target_uri),
-        "the one opened segment must be the planted one"
+        "the one opened superfile must be the planted one"
     );
 }
 
 #[test]
-fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
+fn bm25_prefix_skip_opens_only_superfiles_overlapping_prefix_range() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
-    // Four superfiles. Segment 1 contains terms starting with
+    // Four superfiles. Superfile 1 contains terms starting with
     // `quokka`; the other three contain only terms strictly
-    // lex-less-than `quokka` so each segment's lex term range
+    // lex-less-than `quokka` so each superfile's lex term range
     // is fully below `[quokka, quokka_upper_bound)` and the
     // term-range skip prunes them.
     let mut w = st.writer().expect("writer");
@@ -234,7 +234,7 @@ fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     drop(w);
 
     let r = st.reader();
-    assert_eq!(r.n_superfiles(), EXACT_TERM_SEGMENT_COUNT);
+    assert_eq!(r.n_superfiles(), EXACT_TERM_SUPERFILE_COUNT);
 
     let manifest = r.manifest();
     let quokka_uri = manifest.superfiles[1].uri;
@@ -243,29 +243,29 @@ fn bm25_prefix_skip_opens_only_segments_overlapping_prefix_range() {
     let hits = r
         .bm25_search_prefix("title", "quokka", BM25_TOP_K)
         .expect("prefix query");
-    assert_eq!(hits.len(), 2, "two docs in segment 1 begin with `quokka`");
+    assert_eq!(hits.len(), 2, "two docs in superfile 1 begin with `quokka`");
     for h in &hits {
-        assert_eq!(h.segment, quokka_uri);
+        assert_eq!(h.superfile, quokka_uri);
     }
 
     let delta = store.delta(&before);
     assert_eq!(
         delta.len(),
         1,
-        "term-range skip should open exactly the one segment whose \
+        "term-range skip should open exactly the one superfile whose \
          lex term range overlaps [quokka, quokka_upper_bound) — got {delta:?}"
     );
     assert!(delta.contains_key(&quokka_uri));
 }
 
 #[test]
-fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
+fn bm25_search_with_no_matching_superfiles_opens_no_superfiles_at_all() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
     // Three superfiles — none contains the rare query term.
     let mut w = st.writer().expect("writer");
-    for _i in 0..NO_MATCH_SEGMENT_COUNT {
+    for _i in 0..NO_MATCH_SUPERFILE_COUNT {
         w.append(&build_title_batch(&[
             "ordinary term filler",
             "another mundane title",
@@ -296,13 +296,13 @@ fn bm25_search_with_no_matching_segments_opens_no_segments_at_all() {
 }
 
 #[test]
-fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
+fn bm25_and_mode_skip_requires_all_terms_present_in_superfile() {
     let store = Arc::new(CountingStore::new());
     let st = Supertable::create(options_with_counting_store(Arc::clone(&store))).expect("create");
 
-    // Two superfiles. Segment 0 has both `alpha` and `beta`; segment
+    // Two superfiles. Superfile 0 has both `alpha` and `beta`; superfile
     // 1 has `alpha` only. AND-mode for "alpha beta" must prune
-    // segment 1 (missing `beta`) but keep segment 0.
+    // superfile 1 (missing `beta`) but keep superfile 0.
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&["alpha beta gamma", "doc with beta"]))
         .expect("append");
@@ -333,7 +333,7 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_segment() {
     assert_eq!(
         delta.len(),
         1,
-        "AND mode should prune the segment missing one of the terms"
+        "AND mode should prune the superfile missing one of the terms"
     );
     assert!(delta.contains_key(&kept_uri));
 }

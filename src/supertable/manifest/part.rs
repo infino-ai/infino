@@ -8,7 +8,7 @@
 //! the blake3 hash of the compressed bytes. The blake3 hash
 //! is the part's URI (modulo backend prefix); content
 //! addressing means commits that don't change a part's
-//! segment set reuse it across manifest versions without a
+//! superfile set reuse it across manifest versions without a
 //! re-PUT.
 
 use std::collections::HashMap;
@@ -245,7 +245,7 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
     // part twice would produce different bytes → different
     // blake3 → different URI. Iceberg manifest files take the
     // same approach for the same reason.
-    let segment_records: Vec<AvroValue> = part
+    let superfile_records: Vec<AvroValue> = part
         .superfiles
         .iter()
         .map(|seg| {
@@ -308,7 +308,7 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
             "part_id".into(),
             AvroValue::String(part.part_id.0.to_string()),
         ),
-        ("superfiles".into(), AvroValue::Array(segment_records)),
+        ("superfiles".into(), AvroValue::Array(superfile_records)),
     ]);
 
     let avro_bytes = to_avro_datum(schema(), record).expect("avro datum encode");
@@ -349,16 +349,16 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
         Uuid::parse_str(&part_id_str).map_err(|e| PartParseError::BadSuperfileId(e.to_string()))?,
     );
 
-    let segments_val = map
+    let superfiles_val = map
         .remove("superfiles")
         .ok_or(PartParseError::MissingField("superfiles"))?;
-    let segs = match segments_val {
+    let segs = match superfiles_val {
         AvroValue::Array(a) => a,
         _ => return Err(PartParseError::WrongFieldType("superfiles")),
     };
     let mut superfiles = Vec::with_capacity(segs.len());
     for seg_val in segs {
-        superfiles.push(Arc::new(decode_segment(seg_val)?));
+        superfiles.push(Arc::new(decode_superfile(seg_val)?));
     }
 
     Ok(ManifestPart {
@@ -368,12 +368,12 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
     })
 }
 
-fn decode_segment(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
+fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let fields = match v {
         AvroValue::Record(r) => r,
         _ => {
             return Err(PartParseError::SchemaMismatch(
-                "segment not a record".into(),
+                "superfile not a record".into(),
             ));
         }
     };
@@ -700,8 +700,8 @@ fn _encoding_used() {
 mod tests {
     //! Avro+zstd round-trip tests for `ManifestPart`.
     //!
-    //! Covers: empty / single / multi-segment round-trip;
-    //! every per-segment summary type (scalar stats, fts
+    //! Covers: empty / single / multi-superfile round-trip;
+    //! every per-superfile summary type (scalar stats, fts
     //! summary, vector summary) survives bit-exactly through
     //! encode → decode; centroid f32 values are bit-identical
     //! (no decimal-string round-trip); content_hash covers
@@ -720,7 +720,7 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    fn fresh_segment(n_docs: u64) -> Arc<SuperfileEntry> {
+    fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
             superfile_id: id,
@@ -802,7 +802,7 @@ mod tests {
         ScalarStatsTable { cols }
     }
 
-    fn make_rich_segment() -> Arc<SuperfileEntry> {
+    fn make_rich_superfile() -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         let mut fts = HashMap::new();
         fts.insert(
@@ -840,7 +840,7 @@ mod tests {
         })
     }
 
-    fn assert_segments_equal(a: &SuperfileEntry, b: &SuperfileEntry) {
+    fn assert_superfiles_equal(a: &SuperfileEntry, b: &SuperfileEntry) {
         assert_eq!(a.superfile_id, b.superfile_id, "superfile_id");
         assert_eq!(a.uri, b.uri, "uri");
         assert_eq!(a.n_docs, b.n_docs, "n_docs");
@@ -919,29 +919,29 @@ mod tests {
     }
 
     #[test]
-    fn single_minimal_segment_roundtrip() {
-        let part = fresh_part(vec![fresh_segment(100)]);
+    fn single_minimal_superfile_roundtrip() {
+        let part = fresh_part(vec![fresh_superfile(100)]);
         let bytes = encode(&part, 3);
         let decoded = decode(&bytes).expect("decode minimal");
         assert_eq!(decoded.superfiles.len(), 1);
-        assert_segments_equal(&decoded.superfiles[0], &part.superfiles[0]);
+        assert_superfiles_equal(&decoded.superfiles[0], &part.superfiles[0]);
     }
 
     #[test]
-    fn multi_segment_with_full_summaries_roundtrip() {
-        let superfiles: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| make_rich_segment()).collect();
+    fn multi_superfile_with_full_summaries_roundtrip() {
+        let superfiles: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| make_rich_superfile()).collect();
         let part = fresh_part(superfiles);
         let bytes = encode(&part, 3);
         let decoded = decode(&bytes).expect("decode rich");
         assert_eq!(decoded.superfiles.len(), 5);
         for (a, b) in decoded.superfiles.iter().zip(part.superfiles.iter()) {
-            assert_segments_equal(a, b);
+            assert_superfiles_equal(a, b);
         }
     }
 
     #[test]
     fn content_hash_covers_all_bytes() {
-        let part = fresh_part(vec![make_rich_segment()]);
+        let part = fresh_part(vec![make_rich_superfile()]);
         let bytes = encode(&part, 3);
         let hash = ContentHash::of(&bytes);
 
@@ -960,7 +960,7 @@ mod tests {
         // Same superfiles + same part_id ⇒ bit-identical Avro
         // output, bit-identical zstd output, same blake3 —
         // the property cross-version part-reuse rides on.
-        let superfiles = vec![make_rich_segment(), make_rich_segment()];
+        let superfiles = vec![make_rich_superfile(), make_rich_superfile()];
         let part_a = ManifestPart {
             format_version: FORMAT_VERSION.into(),
             part_id: PartId(Uuid::nil()),
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn incompatible_major_version_rejected() {
-        let mut part = fresh_part(vec![fresh_segment(1)]);
+        let mut part = fresh_part(vec![fresh_superfile(1)]);
         part.format_version = "2.0".into();
         let bytes = encode(&part, 3);
         let err = decode(&bytes).expect_err("major 2 must reject");
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn minor_version_compatible() {
-        let mut part = fresh_part(vec![fresh_segment(7)]);
+        let mut part = fresh_part(vec![fresh_superfile(7)]);
         part.format_version = "1.99".into();
         let bytes = encode(&part, 3);
         let decoded = decode(&bytes).expect("minor 99 must accept");
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn zstd_corruption_surfaces_typed_error() {
-        let part = fresh_part(vec![fresh_segment(1)]);
+        let part = fresh_part(vec![fresh_superfile(1)]);
         let mut bytes = encode(&part, 3);
         bytes[0] ^= 0xff;
         bytes[1] ^= 0xff;
@@ -1061,7 +1061,7 @@ mod tests {
     fn bytes_payload_is_well_formed_use_via_bytes_type() {
         // Sanity: wire shape is acceptable to bytes::Bytes
         // for the storage layer downstream.
-        let part = fresh_part(vec![make_rich_segment()]);
+        let part = fresh_part(vec![make_rich_superfile()]);
         let raw = encode(&part, 3);
         let wrapped = Bytes::from(raw.clone());
         let decoded = decode(&wrapped).expect("decode from Bytes");

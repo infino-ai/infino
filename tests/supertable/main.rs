@@ -11,7 +11,7 @@
 //!   assignment, in-process concurrency, stats accessor.
 //! - **query/**: hierarchical-manifest query path, skip-
 //!   pruning end-to-end, brute-force BM25 oracle for
-//!   multi-segment search.
+//!   multi-superfile search.
 //! - **manifest/**: the eager-vs-lazy-open threshold path.
 //! - **disk_cache/**: the cold-fetch coordinator + hybrid /
 //!   sweep policies + supertable-disk-cache integration.

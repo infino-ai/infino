@@ -14,7 +14,7 @@
 //!   correction is applied only to that set. Default codec.
 //! - [`RerankCodec::RabitqOnly`]: no rerank column at all. The
 //!   1-bit RaBitQ shortlist is the final ranking — opt-in,
-//!   recall-degraded, shrinks the segment by ~30× at 1M × 384.
+//!   recall-degraded, shrinks the superfile by ~30× at 1M × 384.
 //!   Named `RabitqOnly` rather than `None` to (a) avoid shadowing
 //!   `Option::None` at every call site and (b) describe the search
 //!   behaviour rather than the absence of a codec.
@@ -24,7 +24,7 @@
 //! The codec choice rides as a single byte in the per-column
 //! subsection-directory entry at offset 52 (bytes 53..55 stay
 //! reserved). A zero byte at slot 52 deserializes to
-//! [`RerankCodec::Fp32`], so fp32-only segments that left the
+//! [`RerankCodec::Fp32`], so fp32-only superfiles that left the
 //! slot zero round-trip identically.
 //!
 //! ## `codec_meta` region
@@ -34,7 +34,7 @@
 //! `codec_meta` region between the `codes` region and the
 //! `full[]` region. The region's relative offset within the
 //! subsection is recorded in sub-header bytes 12..16 as
-//! `codec_meta_off: u32`. `Fp32` / `RabitqOnly` segments
+//! `codec_meta_off: u32`. `Fp32` / `RabitqOnly` superfiles
 //! write `codec_meta_off = 0`.
 
 use serde::{Deserialize, Serialize};
@@ -92,7 +92,7 @@ pub enum RerankCodec {
     /// No rerank column at all. The 1-bit RaBitQ shortlist is
     /// the final ranking. Opt-in — recall drops 0.05–0.15 on
     /// typical normalized-Gaussian / image-embedding corpora;
-    /// trade-off is a ~30× segment-size shrink at 1M × 384.
+    /// trade-off is a ~30× superfile-size shrink at 1M × 384.
     ///
     /// Spelled `RabitqOnly` rather than `None` so call sites
     /// don't collide with `Option::None` and the variant name
@@ -115,7 +115,7 @@ impl Default for RerankCodec {
 impl RerankCodec {
     /// On-disk discriminator byte. Lives at offset 52 inside the
     /// 64-byte per-column directory entry. `0` is reserved for
-    /// [`Self::Fp32`] so fp32-only segments that left the slot
+    /// [`Self::Fp32`] so fp32-only superfiles that left the slot
     /// zero round-trip identically.
     #[inline]
     pub const fn codec_id(self) -> u8 {
@@ -128,7 +128,7 @@ impl RerankCodec {
 
     /// Inverse of [`Self::codec_id`]. Returns `None` for unknown
     /// discriminator bytes — the reader treats that as a
-    /// `MalformedVersion` failure so a corrupted / future segment
+    /// `MalformedVersion` failure so a corrupted / future superfile
     /// fails loud rather than mis-decoding.
     #[inline]
     pub const fn from_codec_id(id: u8) -> Option<Self> {
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(RerankCodec::default(), RerankCodec::Sq8Residual);
     }
 
-    /// `Fp32`'s codec_id is zero. Older segments have all-zero
+    /// `Fp32`'s codec_id is zero. Older superfiles have all-zero
     /// reserved bytes in the directory-entry slot we squat on
     /// for the codec discriminator; the zero match keeps them
     /// readable as `Fp32` without a format bump.

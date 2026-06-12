@@ -174,61 +174,82 @@ existed yet.
 Current numbers: 1M docs per tier, real AWS S3 (us-east-1), recorded
 2026-06-09. Supertable tables are 256 superfiles across 16 commits.
 
-### FTS — superfile (single-segment, 1M docs)
+### FTS — superfile (single-superfile, 1M docs)
 
 <!-- BEGIN: bench/fts/superfile/ingest -->
-### Superfile FTS — ingest, single-segment / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
+### Superfile FTS — ingest, single-superfile / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
 
-_Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit), through the engine-generic `run_fts` driver the cross-engine comparison also uses. Rows are by writer count: `1 writer` is the single-threaded build (and the index queries run against); `N writers` is the sharded parallel build. Bandwidth is over the logical input text payload. Δ is vs the previous run.
 
 | Build | Time | Throughput | Bandwidth | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 writer | 18.44 s (new) | 54.2 K/s (new) | 109.0 MB/s (new) | 5.55 GiB (new) | 3.66 GiB (new) | 4.59 GiB (new) |
-| 16 writers | 2.21 s (new) | 451.5 K/s (new) | 907.6 MB/s (new) | 7.98 GiB (new) | 7.15 GiB (new) | 7.90 GiB (new) |
+| 1 writer | 23.11 s (new) | 43.3 K/s (new) | 87.0 MB/s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| 10 writers | 3.80 s (new) | 262.9 K/s (new) | 528.4 MB/s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
-### Superfile FTS — search, single-segment / in-memory (1M docs)
+### Superfile FTS — search, single-superfile / in-memory (1M docs)
 
-_Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). Δ is vs the previous run.
 
 **OR queries**
 
-| Query | warm | Peak RSS | Median RSS | P90 RSS | cold |
-| --- | --- | --- | --- | --- | --- |
-| single_rare | 1.43 µs (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 199.76 ms (new) |
-| single_df1 | 914 ns (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 169.00 ms (new) |
-| single_common | 19.48 µs (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 203.42 ms (new) |
-| two_term_or | 271.51 µs (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 172.27 ms (new) |
-| three_wide_or | 2.50 ms (new) | 3.74 GiB (new) | 3.74 GiB (new) | 3.74 GiB (new) | 169.25 ms (new) |
-| three_similar_or | 10.63 ms (new) | 3.74 GiB (new) | 3.74 GiB (new) | 3.74 GiB (new) | 169.78 ms (new) |
-| five_term_or | 18.02 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 172.84 ms (new) |
-| ten_term_or | 52.98 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 224.68 ms (new) |
+| Query | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
+| --- | --- | --- | --- | --- | --- | --- |
+| single_rare | 1.25 µs (+7.2% worse) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.67 s (new) |
+| single_df1 | 958 ns (+64.3% worse) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 7.88 µs (new) |
+| single_common | 18.33 µs (-6.2% better) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.68 s (new) |
+| two_term_or | 262.75 µs (+2.6% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.03 s (new) | 1.69 s (new) |
+| three_wide_or | 2.98 ms (-2.7% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.62 s (new) |
+| three_similar_or | 11.39 ms (-2.6% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.62 s (new) |
+| five_term_or | 20.29 ms (-0.7% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.67 s (new) |
+| ten_term_or | 65.84 ms (-2.5% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.73 s (new) |
 
 **AND queries**
 
-| Query | warm | Peak RSS | Median RSS | P90 RSS | cold |
-| --- | --- | --- | --- | --- | --- |
-| two_term_and | 227.52 µs (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 217.68 ms (new) |
-| three_wide_and | 3.87 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 229.61 ms (new) |
-| three_similar_and | 6.25 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 187.86 ms (new) |
-| five_term_and | 7.47 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 207.28 ms (new) |
-| ten_term_and | 8.75 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 237.93 ms (new) |
+| Query | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
+| --- | --- | --- | --- | --- | --- | --- |
+| two_term_and | 282.79 µs (+4.5% worse) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.67 s (new) |
+| three_wide_and | 4.30 ms (-1.1% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.62 s (new) |
+| three_similar_and | 7.05 ms (-0.9% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.63 s (new) |
+| five_term_and | 8.54 ms (+1.5% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.08 s (new) | 1.66 s (new) |
+| ten_term_and | 10.31 ms (-0.1% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.67 s (new) |
 
 **Per-algorithm probes (WAND+BMW vs MaxScore+BMM)**
 
 | Shape | WAND+BMW | MaxScore+BMM |
 | --- | --- | --- |
-| wide_3_or | 8.52 ms (new) | 2.49 ms (new) |
-| similar_3_or | 15.78 ms (new) | 10.35 ms (new) |
-| similar_5_or | 46.14 ms (new) | 18.00 ms (new) |
-| similar_10_or | 312.96 ms (new) | 53.29 ms (new) |
+| wide_3_or | 9.63 ms (+2.6% ~) | 3.04 ms (-0.0% ~) |
+| similar_3_or | 18.14 ms (+0.7% ~) | 11.89 ms (+0.7% ~) |
+| similar_5_or | 49.85 ms (+1.3% ~) | 20.29 ms (+0.7% ~) |
+| similar_10_or | 425.63 ms (+1.1% ~) | 67.01 ms (-1.3% ~) |
 <!-- END: bench/fts/superfile/search -->
 
-### FTS — supertable (multi-segment, 1M docs, real S3)
+<!-- BEGIN: bench/fts/superfile/negation -->
+### Superfile FTS — negation (`-term`), warm (1M docs)
+
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Through the string `bm25_hits_async` path (parses the `-` sigil); a correctness gate (no hit contains a negated term) runs before timing. Δ is vs the previous run.
+
+**Negation queries**
+
+| Query | warm |
+| --- | --- |
+| mid_pos_common_neg | 1.63 ms (-0.4% ~) |
+| mid_pos_rare_neg | 27.96 µs (+1.1% ~) |
+| two_mid_or_common_neg | 4.55 ms (-0.8% ~) |
+| two_mid_and_common_neg | 5.15 ms (+3.2% worse) |
+<!-- END: bench/fts/superfile/negation -->
+
+### FTS — supertable (multi-superfile, 1M docs, real S3)
 
 <!-- BEGIN: bench/fts/supertable/ingest -->
-### Supertable FTS — ingest, multi-segment / object-store (1M docs, 16 commits)
+### Supertable FTS — ingest, multi-superfile / object-store (1M docs, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -238,7 +259,7 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 <!-- END: bench/fts/supertable/ingest -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
-### Supertable FTS — search, multi-segment / object-store (1M docs)
+### Supertable FTS — search, multi-superfile / object-store (1M docs)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -266,10 +287,10 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 | ten_term_and | 34.90 ms (new) | 8.67 GiB (new) | 8.67 GiB (new) | 8.67 GiB (new) | 544.50 ms (new) |
 <!-- END: bench/fts/supertable/search -->
 
-### Vector — superfile (single-segment, 1M × 384)
+### Vector — superfile (single-superfile, 1M × 384)
 
 <!-- BEGIN: bench/vector/superfile/ingest -->
-### Superfile vector — ingest, single-segment / in-memory (1M docs × dim=384)
+### Superfile vector — ingest, single-superfile / in-memory (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -280,7 +301,7 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 <!-- END: bench/vector/superfile/ingest -->
 
 <!-- BEGIN: bench/vector/superfile/search -->
-### Superfile vector — search, single-segment / in-memory (1M docs × dim=384)
+### Superfile vector — search, single-superfile / in-memory (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -292,10 +313,10 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 | default | p=8, r=20 | — | 853.92 µs (new) | 4.30 GiB (new) | 4.30 GiB (new) | 4.30 GiB (new) | 593.77 ms (new) |
 <!-- END: bench/vector/superfile/search -->
 
-### Vector — supertable (multi-segment, 1M × 384, real S3)
+### Vector — supertable (multi-superfile, 1M × 384, real S3)
 
 <!-- BEGIN: bench/vector/supertable/ingest -->
-### Supertable vector — ingest, multi-segment / object-store (1M docs × dim=384, 16 commits)
+### Supertable vector — ingest, multi-superfile / object-store (1M docs × dim=384, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -305,7 +326,7 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 <!-- END: bench/vector/supertable/ingest -->
 
 <!-- BEGIN: bench/vector/supertable/search -->
-### Supertable vector — search, multi-segment / object-store (1M docs × dim=384)
+### Supertable vector — search, multi-superfile / object-store (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -322,7 +343,7 @@ Correctness gate: recall@10 = 0.995 (nprobe=64, rerank=256, 20 queries).
 ### Supertable — ingest summary (all shapes, real S3)
 
 <!-- BEGIN: bench/supertable/ingest -->
-### Supertable — ingest, multi-segment / object-store (1M docs, 16 commits)
+### Supertable — ingest, multi-superfile / object-store (1M docs, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -427,10 +448,10 @@ _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 | group_by_category | 203.36 ms (new) |
 <!-- END: bench/sql/superfile/cold -->
 
-### SQL — supertable (multi-segment, 1M rows, real S3)
+### SQL — supertable (multi-superfile, 1M rows, real S3)
 
 <!-- BEGIN: bench/sql/supertable/ingest -->
-### Supertable SQL — ingest, multi-segment / object-store (1M rows, 16 commits)
+### Supertable SQL — ingest, multi-superfile / object-store (1M rows, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 

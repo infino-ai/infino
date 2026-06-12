@@ -1,25 +1,25 @@
 # Supertable
 
 A supertable is infino's table layer over [superfile](./superfile.md)
-segments. It presents many immutable superfiles as a single table that
+superfiles. It presents many immutable superfiles as a single table that
 supports SQL, full-text, and vector search, while keeping readers
 consistent under concurrent writes.
 
-This document describes the table model and its guarantees. The segment
+This document describes the table model and its guarantees. The superfile
 format is described in [superfile](./superfile.md).
 
 ## Design
 
-- **Table over segments.** A supertable is a set of immutable superfile
-segments plus a manifest that defines the current contents of the
+- **Table over superfiles.** A supertable is a set of immutable superfile
+superfiles plus a manifest that defines the current contents of the
 table.
 - **Snapshot reads.** A reader observes a single, consistent snapshot
 of the table for its entire lifetime, regardless of writes that land
 afterward.
 - **Append by commit.** Writes are staged and published as a commit. A
-commit produces new segments and a new manifest; it never mutates
-existing segments.
-- **Pluggable storage.** Segment bytes live behind a storage backend,
+commit produces new superfiles and a new manifest; it never mutates
+existing superfiles.
+- **Pluggable storage.** Superfile bytes live behind a storage backend,
 and the table layer behaves the same way over in-memory, local-disk,
 and object storage.
 
@@ -36,7 +36,7 @@ the unranked `token_match` / `exact_match`), and `schema`.
 Internally those methods drive a **reader** (a pinned, consistent
 snapshot) for queries and a single **writer** (staged changes published
 by commit) for mutations, with a **stats** view for introspection. The
-reader / writer / stats accessors, the manifest, and the segment
+reader / writer / stats accessors, the manifest, and the superfile
 internals behind them are implementation details, never part of the
 public surface.
 
@@ -49,13 +49,13 @@ taken, so a sequence of queries observes one consistent view of the
 table regardless of concurrent writes.
 
 Every read returns the same shape internally: a list of hits. A hit
-references a single row by its segment and the row's offset within that
-segment, plus a score when the query ranks results. BM25 fills the score
+references a single row by its superfile and the row's offset within that
+superfile, plus a score when the query ranks results. BM25 fills the score
 with relevance (higher is better); vector search fills it with distance
 under the column's metric (smaller is closer); a SQL filter leaves it
 unset.
 
-Those segment-local hits are the reader's internal representation. The
+Those superfile-local hits are the reader's internal representation. The
 public `Supertable` search methods resolve each hit to the table's
 stable `_id` and return Arrow `RecordBatch` rows. All four (`bm25_search`,
 `vector_search`, and the unranked `token_match` / `exact_match`) take a
@@ -104,12 +104,12 @@ and order search results alongside scalar columns:
   a single function.
   Each function runs against the reader's pinned snapshot and yields
   the table's `_id`, the projected scalar columns, and a `score`. Vector
-  columns are never scanned as SQL columns — they live in the segment's
+  columns are never scanned as SQL columns — they live in the superfile's
   embedded blob — so they are reached only through `vector_search` (or
   `hybrid_search`, which calls it).
 
-The reader also answers cheap snapshot questions — segment count,
-document count, manifest identity — without touching segment bytes. A
+The reader also answers cheap snapshot questions — superfile count,
+document count, manifest identity — without touching superfile bytes. A
 separate **stats** view adds process-level observability (cache
 residency, resident memory) for the whole table.
 
@@ -139,16 +139,16 @@ never refresh by hand.
 
 ## Manifest
 
-The manifest is the source of truth for which segments make up the
+The manifest is the source of truth for which superfiles make up the
 table at a point in time. It holds table-level configuration (schema,
-indexed columns, tokenizer) and an ordered list of segment entries.
+indexed columns, tokenizer) and an ordered list of superfile entries.
 
 ```mermaid
 flowchart TD
     reader["Reader<br/>(pinned snapshot)"] --> manifest["Manifest<br/>(immutable snapshot)"]
-    manifest --> e1["Segment entry (summary)"]
-    manifest --> e2["Segment entry (summary)"]
-    manifest --> e3["Segment entry (summary)"]
+    manifest --> e1["Superfile entry (summary)"]
+    manifest --> e2["Superfile entry (summary)"]
+    manifest --> e3["Superfile entry (summary)"]
     e1 --> s1["Superfile bytes"]
     e2 --> s2["Superfile bytes"]
     e3 --> s3["Superfile bytes"]
@@ -162,41 +162,41 @@ flowchart TD
 The manifest is immutable. Each commit builds a successor manifest and
 publishes it atomically; a reader pins the manifest current at the time
 it was created and never observes a partially applied commit.
-Successor manifests share the segment entries they carry forward, so
+Successor manifests share the superfile entries they carry forward, so
 publishing a commit allocates only the new entries rather than copying
 the whole list.
 
-Each segment entry is a summary of one superfile, holding the
+Each superfile entry is a summary of one superfile, holding the
 information the table layer needs to route and prune queries without
-reading the segment bytes:
+reading the superfile bytes:
 
-- **Location.** A storage-backend identifier for the segment's bytes.
-- **Row range.** The segment's document count and the range of primary
+- **Location.** A storage-backend identifier for the superfile's bytes.
+- **Row range.** The superfile's document count and the range of primary
 identifiers it covers.
 - **Scalar statistics.** Per-column minimum and maximum values for the
-scalar columns, used to skip segments for predicate queries.
+scalar columns, used to skip superfiles for predicate queries.
 - **Full-text summary.** Per text column, a term presence filter (a
-bloom filter over the segment's terms) and the lexicographic range of
-its terms, used to skip segments for term and prefix queries.
+bloom filter over the superfile's terms) and the lexicographic range of
+its terms, used to skip superfiles for term and prefix queries.
 - **Vector summary.** Per vector column, a representative centroid and
 radius, used to order and route vector queries.
 
-The segment bytes themselves are held by the storage backend, not the
+The superfile bytes themselves are held by the storage backend, not the
 manifest, so a manifest stays small and cheap to share across many
 concurrent readers.
 
 ### Partitioned, hierarchical manifest
 
-At scale the entry list is not a single flat array. Segments are
+At scale the entry list is not a single flat array. Superfiles are
 assigned to partitions by a partition strategy that is chosen when the
 table is created and is immutable thereafter. Within a partition,
-entries are grouped into manifest *parts*; a new commit's segments
+entries are grouped into manifest *parts*; a new commit's superfiles
 append to a partition's current part until that part crosses a soft
 cap on either entry count or compressed size, at which point the next
 commit starts a fresh part rather than rewriting the existing one. A
 top-level manifest list names the parts and carries the per-part
 aggregate summaries used for pruning, so a query can discard whole
-parts before touching any per-segment entry.
+parts before touching any per-superfile entry.
 
 Parts load on one of two paths, selected by a threshold on part count:
 
@@ -210,33 +210,33 @@ part share a single fetch.
 
 ## Commit pipeline
 
-A commit turns staged record batches into new segments and a new
+A commit turns staged record batches into new superfiles and a new
 manifest. It runs in the following stages:
 
 - **Stage.** Appended record batches accumulate in a write buffer. A
 commit consumes the current buffer; a size threshold can also trigger
 a commit automatically to bound the buffer's footprint.
 - **Shard.** The buffered rows are partitioned into balanced shards so
-that segment builds run in parallel, independent of how the caller
+that superfile builds run in parallel, independent of how the caller
 batched its appends.
 - **Build.** Each shard is built into one superfile, including its
 full-text and vector indexes, on a worker pool.
-- **Summarize.** Each new segment's manifest entry is derived — row
+- **Summarize.** Each new superfile's manifest entry is derived — row
 range, scalar statistics, and the full-text and vector summaries.
-- **Publish.** The segment bytes are written to the storage backend and
+- **Publish.** The superfile bytes are written to the storage backend and
 a successor manifest containing the existing and new entries is
 published atomically.
 
 ## Storage
 
-Segment files are stored as ordinary Parquet files. The manifest is a
-catalog over those files; it does not change the segment format. Any
-Parquet reader can open an individual segment file and read its
+Superfile files are stored as ordinary Parquet files. The manifest is a
+catalog over those files; it does not change the superfile format. Any
+Parquet reader can open an individual superfile file and read its
 columnar data directly, ignoring the embedded indexes.
 
 For persistent tables, the storage backend holds three things: the
-segment files, the manifest, and a pointer to the current manifest.
-Publishing a commit writes the new segments and manifest first, then
+superfile files, the manifest, and a pointer to the current manifest.
+Publishing a commit writes the new superfiles and manifest first, then
 swings the pointer in a single atomic step, so a reader resolving the
 pointer always lands on a complete manifest. When multiple processes
 write the same table, the pointer update is guarded so that a writer
@@ -246,8 +246,8 @@ refreshing from the current manifest and rebuilding on top, up to a
 bounded number of attempts before the commit surfaces a contention
 error.
 
-Segment uploads adapt to size. Below a configurable threshold a
-segment is written in a single put; at or above it the upload is split
+Superfile uploads adapt to size. Below a configurable threshold a
+superfile is written in a single put; at or above it the upload is split
 into fixed-size chunks driven in parallel, which lowers peak memory
 during the write and limits the cost of a transient backend failure
 mid-upload.
@@ -257,7 +257,7 @@ that many bytes or a typed error — a reader never sees a silently short
 buffer. Recovering from transient backend truncation or connection
 flakiness sits beneath this contract, in the storage layer.
 
-Readers may verify the segment's embedded checksums when opening it.
+Readers may verify the superfile's embedded checksums when opening it.
 This is on by default and can be turned off when the underlying
 storage already guarantees integrity (a content-addressed object
 store, a checksumming filesystem), trading that guarantee for faster
@@ -266,11 +266,11 @@ cold opens.
 ## Disk cache
 
 When a table is backed by remote storage, an optional disk cache keeps
-hot segments local. A cold query is served from remote byte ranges
-while the full segment is fetched in the background; once a segment is
+hot superfiles local. A cold query is served from remote byte ranges
+while the full superfile is fetched in the background; once a superfile is
 resident it is served from a local memory-mapped file. The cache tracks
-residency per segment and is bounded by a configurable budget, evicting
-cold segments when the budget is reached.
+residency per superfile and is bounded by a configurable budget, evicting
+cold superfiles when the budget is reached.
 
 The cache distinguishes on-disk residency from memory residency. An
 optional memory budget bounds the mapped working set rather than the
@@ -286,38 +286,38 @@ correctly and eviction is only ever a reclaim-and-refetch cost.
 SQL, full-text, and vector search share the same fan-out shape:
 
 1. Start from the reader's pinned manifest.
-2. Use the manifest summaries to skip segments that cannot match the
+2. Use the manifest summaries to skip superfiles that cannot match the
   query.
-3. Run the per-segment query against each remaining segment in
+3. Run the per-superfile query against each remaining superfile in
   parallel.
-4. Merge the per-segment results into a single ranked result for the
+4. Merge the per-superfile results into a single ranked result for the
   table.
 
-Skip pruning reads only the manifest summaries, never the segment
+Skip pruning reads only the manifest summaries, never the superfile
 bytes, and is always conservative: when the manifest cannot prove a
-segment is irrelevant, the segment is kept. The pruning inputs are:
+superfile is irrelevant, the superfile is kept. The pruning inputs are:
 
-- **Term queries** use each segment's term presence filter.
-- **Prefix queries** use each segment's lexicographic term range.
+- **Term queries** use each superfile's term presence filter.
+- **Prefix queries** use each superfile's lexicographic term range.
 - **Predicate (SQL) queries** use the per-column scalar statistics.
 - **Vector queries** use the per-column vector summary to order and
 route work.
 
-Pruning can remove work but never a correct result; a kept segment that
-turns out not to match only costs a per-segment query, while a segment
+Pruning can remove work but never a correct result; a kept superfile that
+turns out not to match only costs a per-superfile query, while a superfile
 is never wrongly dropped.
 
-Full-text and vector search delegate to each segment's index (the same
-search the single-segment reader runs) and merge globally. SQL is
+Full-text and vector search delegate to each superfile's index (the same
+search the single-superfile reader runs) and merge globally. SQL is
 executed over the columnar (Parquet) data and does not require the
 search indexes — but it can still reach them through the search
 table-valued functions (`vector_search`, `bm25_search`,
 `bm25_search_prefix`, `token_match`, `exact_match`), which run the same
-per-segment index fan-out and hand their results back into the SQL plan
+per-superfile index fan-out and hand their results back into the SQL plan
 as a relation.
 
 A SQL `WHERE` predicate on a full-text column also uses the index
-directly, as the **row-level** companion to the segment-level term
+directly, as the **row-level** companion to the superfile-level term
 skip: an equality (and its `AND`/`OR`/`IN` combinations) is resolved
 through the term postings to a candidate set of rows, so only those
 rows are decoded and the engine re-checks the exact predicate over
@@ -337,17 +337,17 @@ SQL-level fusion, not a separate engine kernel.
 
 - **Reader/writer isolation.** Reads and writes do not block each
 other. A reader holds an immutable manifest snapshot; a writer builds
-new segments and a new manifest independently.
+new superfiles and a new manifest independently.
 - **Atomic publication.** A reader sees either the manifest before a
 commit or the manifest after it, never an intermediate state.
 - **Single writer.** One writer is active per table at a time.
-- **Separate pools.** Query fan-out and segment builds use separate
+- **Separate pools.** Query fan-out and superfile builds use separate
 worker pools, so background writes do not starve foreground reads.
 
 ## Scope
 
-- Segments are immutable; updates are expressed by publishing a new
-manifest over different segments.
+- Superfiles are immutable; updates are expressed by publishing a new
+manifest over different superfiles.
 - One writer is active per table at a time.
 - Full-text and vector search are distinct query paths; combined
 relevance scoring is left to the caller.

@@ -177,13 +177,13 @@ pub struct FtsSummaryAgg {
     /// part's superfiles. `0` for the `Default` shape.
     pub n_terms_distinct: u64,
     /// `(min, max)` term range across the part. `None` if
-    /// every segment's FST was empty for this column.
+    /// every superfile's FST was empty for this column.
     pub term_range_union: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Aggregate vector summary across a part's superfiles —
-/// mean-of-centroids + max-distance-with-segment-radius (one
-/// outer ball bounding every segment's vector ball). The
+/// mean-of-centroids + max-distance-with-superfile-radius (one
+/// outer ball bounding every superfile's vector ball). The
 /// `Default` shape is treated as "always-keep" by the list-
 /// level pruner.
 #[derive(Debug, Clone, Default, PartialEq)]

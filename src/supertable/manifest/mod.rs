@@ -44,7 +44,7 @@ use super::options::SupertableOptions;
 
 /// One immutable point-in-time view of the supertable.
 ///
-/// **Construction is copy-on-write.** Adding a segment via
+/// **Construction is copy-on-write.** Adding a superfile via
 /// [`Manifest::with_appended`] returns a new `Manifest` whose
 /// `superfiles` is `Vec::clone()` + new entries appended; the original
 /// `Manifest`'s `superfiles` is unchanged. `Arc<SuperfileEntry>` shares
@@ -74,7 +74,7 @@ pub struct SuperfileList {
     /// Pointer back to the immutable per-supertable configuration.
     /// Same Arc across all manifests of one supertable.
     pub options: Arc<SupertableOptions>,
-    /// Append-only list of segment entries. Each entry's `Arc`-share
+    /// Append-only list of superfile entries. Each entry's `Arc`-share
     /// is what makes the copy-on-write per-commit construction
     /// cheap.
     pub superfiles: Vec<Arc<SuperfileEntry>>,
@@ -309,8 +309,8 @@ pub enum ManifestLoadError {
     Parse(#[from] part::PartParseError),
 }
 
-/// One segment's metadata + skip-pruning summaries. The bytes that
-/// back the segment live in the segment store keyed by `uri` —
+/// One superfile's metadata + skip-pruning summaries. The bytes that
+/// back the superfile live in the superfile store keyed by `uri` —
 /// `superfile_id` is for debugging / observability, `uri` is for
 /// store routing.
 #[derive(Debug)]
@@ -351,7 +351,7 @@ pub struct SuperfileEntry {
     /// from the configured strategy at commit time.
     pub partition_key: Vec<u8>,
     /// Hash partitioning operates per-row, but at commit time we
-    /// only have per-segment summaries. Hash strategy requires
+    /// only have per-superfile summaries. Hash strategy requires
     /// superfiles to be pre-sharded — each builder-shard stamps the
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
@@ -367,7 +367,7 @@ pub struct SuperfileEntry {
     /// the values are by construction consistent with what the
     /// parquet KV metadata would later say).
     ///
-    /// `None` on segments produced by older writers that did not
+    /// `None` on superfiles produced by older writers that did not
     /// stamp this field; the cold open path falls back to the
     /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
@@ -394,10 +394,10 @@ pub struct SubsectionOffsets {
     /// but available without any I/O.
     pub total_size: u64,
     /// Absolute `(offset, length)` of the vector subsection. `None`
-    /// when the segment carries no vector subsection.
+    /// when the superfile carries no vector subsection.
     pub vec: Option<(u64, u64)>,
     /// Absolute `(offset, length)` of the FTS subsection. `None`
-    /// when the segment carries no FTS subsection.
+    /// when the superfile carries no FTS subsection.
     pub fts: Option<(u64, u64)>,
     /// Absolute ranges that fully cover vector open-time metadata.
     /// The hinted cache path prefetches these in the first network
@@ -408,20 +408,20 @@ pub struct SubsectionOffsets {
     /// header+dictionary and doc-length tables. Query-time postings
     /// stay lazy.
     pub fts_open_ranges: Vec<(u64, u64)>,
-    /// the actual bytes covering the segment's
+    /// the actual bytes covering the superfile's
     /// open-time batch (parquet footer tail + the
     /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
     /// in the manifest part.
     ///
     /// When non-empty, the cold-fetch path installs these directly
     /// into the reader's prefetch overlay and issues **zero**
-    /// open-time GETs against the segment object — the bytes
+    /// open-time GETs against the superfile object — the bytes
     /// already arrived in the single part GET that `cold_open`
-    /// performs. The genuine first-touch per-segment cost then
+    /// performs. The genuine first-touch per-superfile cost then
     /// collapses from 2 RTT-batches (open metadata + cluster
     /// postings) to 1 (postings only).
     ///
-    /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
+    /// Each tuple is `(absolute_offset, bytes)`. Empty on superfiles
     /// produced by older writers that did not capture it, or when
     /// blob capture is disabled
     /// — the path then falls back to fetching `vec_open_ranges` /
@@ -429,7 +429,7 @@ pub struct SubsectionOffsets {
     pub open_blob: Vec<(u64, Vec<u8>)>,
 }
 
-/// Opaque store key — wraps a UUID v4. The segment store treats
+/// Opaque store key — wraps a UUID v4. The superfile store treats
 /// this as a hash-eq token and doesn't peek inside. An
 /// object-store-backed variant could swap to a path-shaped URI
 /// without changing any caller, since the trait shape stays the
@@ -439,21 +439,21 @@ pub struct SuperfileUri(pub Uuid);
 
 impl SuperfileUri {
     /// Generate a fresh URI. Called by the writer at commit time
-    /// when assigning a key for a new segment's bytes.
+    /// when assigning a key for a new superfile's bytes.
     pub fn new_v4() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Object-store / LocalFS path for committed segment bytes.
+    /// Object-store / LocalFS path for committed superfile bytes.
     /// `.sf.parquet` double suffix — on disk this is still valid
     /// Parquet (row groups + optional embedded FTS/vector blobs +
     /// footer), while the `.sf` marker flags it as a Superfile
-    /// segment without making the file look non-standard.
+    /// superfile without making the file look non-standard.
     pub fn storage_path(self) -> String {
         format!("data/seg-{}.sf.parquet", self.0)
     }
 
-    /// Disk-cache filename for a promoted segment.
+    /// Disk-cache filename for a promoted superfile.
     pub fn cache_filename(self) -> String {
         format!("seg-{}.sf.parquet", self.0)
     }
@@ -464,7 +464,7 @@ impl SuperfileUri {
     }
 }
 
-/// Per-scalar-column min/max for a segment, used by scalar skip
+/// Per-scalar-column min/max for a superfile, used by scalar skip
 /// pruning. Each column's min/max is a length-1 `ArrayRef` of the
 /// column's data type — the most general shape that doesn't
 /// require pulling DataFusion into this layer. The skip helper
@@ -488,7 +488,7 @@ impl ScalarStatsTable {
     /// integer / float / boolean / utf8).
     ///
     /// Used by [`crate::supertable::writer::SupertableWriter`] at
-    /// commit time to populate per-segment scalar skip stats. The
+    /// commit time to populate per-superfile scalar skip stats. The
     /// resulting table maps `column_name → (min_arr, max_arr)`,
     /// where each entry is a length-1 [`ArrayRef`] of the column's
     /// type — zero-pad isn't needed since the skip planner reads
@@ -519,6 +519,177 @@ impl ScalarStatsTable {
             }
         }
         Self { cols }
+    }
+
+    pub fn from_batch(scalar_schema: &Schema, batch: &RecordBatch) -> Self {
+        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        for (idx, field) in scalar_schema.fields().iter().enumerate() {
+            let arrays = batch.column(idx);
+            if let Some(pair) = column_min_max(arrays) {
+                cols.insert(field.name().clone(), pair);
+            }
+        }
+        Self { cols }
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for (name, (other_min, other_max)) in &other.cols {
+            if let Some(existing) = self.cols.get_mut(name) {
+                // Merge by comparing and keeping the actual min and max across both stats
+                if let Some((merged_min, merged_max)) =
+                    merge_min_max_arrays(&existing.0, other_min, &existing.1, other_max)
+                {
+                    existing.0 = merged_min;
+                    existing.1 = merged_max;
+                }
+            } else {
+                self.cols
+                    .insert(name.clone(), (other_min.clone(), other_max.clone()));
+            }
+        }
+    }
+}
+
+/// Merge min/max arrays by comparing values and keeping the actual min and max.
+///
+/// Takes existing (min, max) and other (min, max) arrays and returns the
+/// merged (min, max) where min is the smaller value and max is the larger.
+/// Both arrays are assumed to be length-1 and of the same type.
+fn merge_min_max_arrays(
+    existing_min: &ArrayRef,
+    other_min: &ArrayRef,
+    existing_max: &ArrayRef,
+    other_max: &ArrayRef,
+) -> Option<(ArrayRef, ArrayRef)> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    macro_rules! prim_merge {
+        ($array_ty:ty) => {{
+            let ex_min_arr = existing_min.as_any().downcast_ref::<$array_ty>()?;
+            let ot_min_arr = other_min.as_any().downcast_ref::<$array_ty>()?;
+            let ex_max_arr = existing_max.as_any().downcast_ref::<$array_ty>()?;
+            let ot_max_arr = other_max.as_any().downcast_ref::<$array_ty>()?;
+
+            let ex_min = ex_min_arr.value(0);
+            let ot_min = ot_min_arr.value(0);
+            let ex_max = ex_max_arr.value(0);
+            let ot_max = ot_max_arr.value(0);
+
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+
+            Some((
+                Arc::new(<$array_ty>::from(vec![merged_min])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merged_max])) as ArrayRef,
+            ))
+        }};
+    }
+
+    match existing_min.data_type() {
+        DataType::UInt8 => prim_merge!(UInt8Array),
+        DataType::UInt16 => prim_merge!(UInt16Array),
+        DataType::UInt32 => prim_merge!(UInt32Array),
+        DataType::UInt64 => prim_merge!(UInt64Array),
+        DataType::Int8 => prim_merge!(Int8Array),
+        DataType::Int16 => prim_merge!(Int16Array),
+        DataType::Int32 => prim_merge!(Int32Array),
+        DataType::Int64 => prim_merge!(Int64Array),
+        DataType::Float32 => prim_merge!(Float32Array),
+        DataType::Float64 => prim_merge!(Float64Array),
+        DataType::Boolean => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(0);
+            let ot_min = other_min.as_any().downcast_ref::<BooleanArray>()?.value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(0);
+            let ot_max = other_max.as_any().downcast_ref::<BooleanArray>()?.value(0);
+            let merged_min = ex_min && ot_min;
+            let merged_max = ex_max || ot_max;
+            Some((
+                Arc::new(BooleanArray::from(vec![merged_min])),
+                Arc::new(BooleanArray::from(vec![merged_max])),
+            ))
+        }
+        DataType::Utf8 => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(0);
+            let ot_min = other_min.as_any().downcast_ref::<StringArray>()?.value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(0);
+            let ot_max = other_max.as_any().downcast_ref::<StringArray>()?.value(0);
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            Some((
+                Arc::new(StringArray::from(vec![merged_min])),
+                Arc::new(StringArray::from(vec![merged_max])),
+            ))
+        }
+        DataType::LargeUtf8 => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let ot_min = other_min
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let ot_max = other_max
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            Some((
+                Arc::new(LargeStringArray::from(vec![merged_min])),
+                Arc::new(LargeStringArray::from(vec![merged_max])),
+            ))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let ot_min = other_min
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let ot_max = other_max
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            Some((
+                Arc::new(
+                    Decimal128Array::from(vec![merged_min])
+                        .with_precision_and_scale(*precision, *scale)
+                        .ok()?,
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![merged_max])
+                        .with_precision_and_scale(*precision, *scale)
+                        .ok()?,
+                ),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -613,13 +784,13 @@ fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 #[derive(Debug, Clone)]
 pub struct FtsSummary {
     /// Term-presence bloom filter — sized to ~7% FPR at typical
-    /// per-column term cardinalities (64 KiB / column / segment
+    /// per-column term cardinalities (64 KiB / column / superfile
     /// is the default).
     pub term_bloom: Bloom,
     /// Number of distinct terms seen at build time. Useful for
     /// validating the bloom's sizing in tests + for observability.
     pub n_terms_distinct: u32,
-    /// Lex-smallest and lex-largest term in this segment's FST for
+    /// Lex-smallest and lex-largest term in this superfile's FST for
     /// this column. Prefix skip checks
     /// `[prefix, prefix_upper_bound)` overlap with this range.
     pub term_range: (Vec<u8>, Vec<u8>),
@@ -637,11 +808,11 @@ pub struct VectorSummary {
     /// Cluster centroid; length matches the vector column's `dim`
     /// declared in `SupertableOptions::vector_columns`.
     pub centroid: Vec<f32>,
-    /// Maximum distance from any indexed vector in this segment to
+    /// Maximum distance from any indexed vector in this superfile to
     /// `centroid`, in the same metric the column was built with.
     pub radius: f32,
     /// Per-cluster IVF centroids (Sq8, per-cluster calibration) for
-    /// cross-segment global cluster selection. Empty when the segment
+    /// cross-superfile global cluster selection. Empty when the superfile
     /// has no vector index for this column.
     pub clusters: ClusterCentroids,
 }
@@ -653,9 +824,9 @@ const SQ8_CODE_MAX: f32 = 255.0;
 
 /// Per-cluster IVF centroids for one vector column, Sq8-quantized with
 /// per-cluster calibration. Carried in the manifest so a query can rank
-/// every segment's clusters globally — without opening the segment —
+/// every superfile's clusters globally — without opening the superfile —
 /// and probe only the globally-closest clusters. The 1-bit shortlist +
-/// rerank still run on the segment's on-disk compressed vectors; these
+/// rerank still run on the superfile's on-disk compressed vectors; these
 /// drive cluster *selection* only.
 ///
 /// Quantization is value-only (no metric); the selector applies the
@@ -676,7 +847,7 @@ pub struct ClusterCentroids {
 }
 
 impl ClusterCentroids {
-    /// The "no cluster centroids" value — a segment without a vector
+    /// The "no cluster centroids" value — a superfile without a vector
     /// index for the column.
     pub fn empty() -> Self {
         Self::default()
@@ -806,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn with_appended_increments_manifest_id_and_extends_segments() {
+    fn with_appended_increments_manifest_id_and_extends_superfiles() {
         let m0 = Manifest::empty(opts());
         let entry = seg_entry(Uuid::new_v4(), 100);
         let m1 = m0.with_appended(vec![entry.clone()]);
@@ -834,10 +1005,10 @@ mod tests {
     }
 
     #[test]
-    fn with_appended_shares_old_segments_via_arc() {
+    fn with_appended_shares_old_superfiles_via_arc() {
         // The new manifest's superfiles[0] should be the SAME Arc as
         // the original's superfiles[0] — copy-on-write doesn't
-        // re-allocate per-segment. (Verified by Arc::ptr_eq.)
+        // re-allocate per-superfile. (Verified by Arc::ptr_eq.)
         let entry = seg_entry(Uuid::new_v4(), 1);
         let m0 = Manifest::empty(opts()).with_appended(vec![entry.clone()]);
         let m1 = m0.with_appended(vec![seg_entry(Uuid::new_v4(), 2)]);
@@ -858,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_uri_is_distinct_per_call() {
+    fn superfile_uri_is_distinct_per_call() {
         let a = SuperfileUri::new_v4();
         let b = SuperfileUri::new_v4();
         assert_ne!(a, b);
@@ -907,6 +1078,206 @@ mod tests {
         };
         assert_eq!(s.centroid.len(), 3);
         assert!((s.radius - 0.5).abs() < 1e-9);
+    }
+
+    // ============================================================
+    // ScalarStatsTable::merge tests — verify min/max comparison
+    // across different types (integers, floats, strings, decimal128)
+    // ============================================================
+
+    #[test]
+    fn merge_integer_columns_keeps_actual_min_max() {
+        use arrow_array::Int64Array;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "id".to_string(),
+            (
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![50])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "id".to_string(),
+            (
+                Arc::new(Int64Array::from(vec![5])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        let (min_arr, max_arr) = stats1.cols.get("id").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array")
+            .value(0);
+
+        assert_eq!(min_val, 5, "min should be the smaller value");
+        assert_eq!(max_val, 100, "max should be the larger value");
+    }
+
+    #[test]
+    fn merge_string_columns_keeps_lexicographic_min_max() {
+        use arrow_array::LargeStringArray;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "name".to_string(),
+            (
+                Arc::new(LargeStringArray::from(vec!["bob"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["zebra"])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "name".to_string(),
+            (
+                Arc::new(LargeStringArray::from(vec!["alice"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["charlie"])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        let (min_arr, max_arr) = stats1.cols.get("name").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("should be LargeStringArray")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("should be LargeStringArray")
+            .value(0);
+
+        assert_eq!(min_val, "alice", "min should be lexicographically smaller");
+        assert_eq!(max_val, "zebra", "max should be lexicographically larger");
+    }
+
+    #[test]
+    fn merge_float_columns_keeps_numeric_min_max() {
+        use arrow_array::Float64Array;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "value".to_string(),
+            (
+                Arc::new(Float64Array::from(vec![1.5])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![9.9])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "value".to_string(),
+            (
+                Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![10.5])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        let (min_arr, max_arr) = stats1.cols.get("value").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("should be Float64Array")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("should be Float64Array")
+            .value(0);
+
+        assert!((min_val - 0.5).abs() < 1e-9, "min should be 0.5");
+        assert!((max_val - 10.5).abs() < 1e-9, "max should be 10.5");
+    }
+
+    #[test]
+    fn merge_adds_new_columns() {
+        use arrow_array::UInt32Array;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "col1".to_string(),
+            (
+                Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![10])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "col2".to_string(),
+            (
+                Arc::new(UInt32Array::from(vec![20])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![30])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        assert_eq!(stats1.cols.len(), 2, "should have both columns");
+        assert!(stats1.cols.contains_key("col1"), "col1 should exist");
+        assert!(stats1.cols.contains_key("col2"), "col2 should exist");
+    }
+
+    #[test]
+    fn merge_multiple_times_maintains_correct_min_max() {
+        use arrow_array::Int32Array;
+        let mut stats = ScalarStatsTable::new();
+        stats.cols.insert(
+            "count".to_string(),
+            (
+                Arc::new(Int32Array::from(vec![50])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![150])) as ArrayRef,
+            ),
+        );
+
+        // First merge
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "count".to_string(),
+            (
+                Arc::new(Int32Array::from(vec![30])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![200])) as ArrayRef,
+            ),
+        );
+        stats.merge(&stats2);
+
+        // Second merge
+        let mut stats3 = ScalarStatsTable::new();
+        stats3.cols.insert(
+            "count".to_string(),
+            (
+                Arc::new(Int32Array::from(vec![10])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![100])) as ArrayRef,
+            ),
+        );
+        stats.merge(&stats3);
+
+        let (min_arr, max_arr) = stats.cols.get("count").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("should be Int32Array")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("should be Int32Array")
+            .value(0);
+
+        assert_eq!(min_val, 10, "min should be 10 after two merges");
+        assert_eq!(max_val, 200, "max should be 200 after two merges");
     }
 
     // ============================================================

@@ -141,7 +141,7 @@ pub enum ReadError {
     #[error("column {0:?} not found in superfile schema")]
     UnknownColumn(String),
 
-    #[error("local_doc_id {doc_id} out of range (segment has {n_docs} docs)")]
+    #[error("local_doc_id {doc_id} out of range (superfile has {n_docs} docs)")]
     DocIdOutOfRange { doc_id: u32, n_docs: u64 },
 
     #[error("take-by-doc-id requires eager bytes; reader was opened via open_lazy")]
@@ -168,6 +168,11 @@ impl From<VectorError> for ReadError {
 pub enum FtsError {
     #[error("unknown FTS column {0:?}")]
     UnknownColumn(String),
+
+    /// The query has only negated (`-term`) clauses — nothing to rank.
+    /// Reject this case.
+    #[error("query has only negated terms; at least one positive term is required")]
+    NegationOnly,
 
     #[error("read error: {0}")]
     Read(#[from] ReadError),

@@ -41,7 +41,7 @@ use std::sync::Arc;
 /// 60-doc planted corpus with mixed term frequencies. Enough to
 /// make BM25's tf + idf + dl-norm interaction non-trivial, small
 /// enough to keep the test fast.
-fn corpus() -> Vec<(u64, &'static str)> {
+pub fn corpus() -> Vec<(u64, &'static str)> {
     vec![
         (0, "rust async runtime tokio"),
         (1, "rust embedded systems firmware"),
@@ -107,7 +107,7 @@ fn corpus() -> Vec<(u64, &'static str)> {
 }
 
 /// Build an infino superfile from the corpus.
-fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
+pub fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
@@ -502,7 +502,7 @@ const BM25_SCORE_ABS_TOLERANCE: f32 = 1e-3;
 /// * `delta` — every 7th doc        → ~143 postings → 2 blocks
 /// * `epsilon` — every 20th doc     → ~50 postings  → 1 block
 /// * `noXXX` — per-doc filler tokens to vary doc lengths
-fn build_multi_block_corpus() -> Vec<(u64, String)> {
+pub fn build_multi_block_corpus() -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = Vec::with_capacity(MULTI_BLOCK_N_DOCS as usize);
     for d in 0..MULTI_BLOCK_N_DOCS {
         let mut toks: Vec<&'static str> = Vec::new();
@@ -535,7 +535,7 @@ fn build_multi_block_corpus() -> Vec<(u64, String)> {
     out
 }
 
-fn build_multi_block_reader(owned: &[(u64, String)]) -> SuperfileReader {
+pub fn build_multi_block_reader(owned: &[(u64, String)]) -> SuperfileReader {
     let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
     build_infino_superfile(&refs)
 }

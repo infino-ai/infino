@@ -16,7 +16,7 @@
 //!   - **Latest-part rewrite under default strategy.** After
 //!     three commits, the manifest list has exactly one
 //!     entry (one partition), and that entry's
-//!     `n_superfiles` equals the cumulative segment count.
+//!     `n_superfiles` equals the cumulative superfile count.
 //!     The `part_id` differs from commit to commit (each
 //!     rewrite produces a fresh part with a new
 //!     content-hash).
@@ -32,7 +32,7 @@
 //!     yet (deferred), so a Hash strategy with n_buckets >
 //!     1 fails the partition-assignment contract.
 //!   - **TimeRange decoder wired up.** Int64 / Timestamp*
-//!     columns drive bucket assignment from per-segment
+//!     columns drive bucket assignment from per-superfile
 //!     min/max stats; superfiles spanning a granularity
 //!     boundary surface `SuperfileSpansPartition` at commit
 //!     time. Unsupported column types (e.g. UInt64) also
@@ -97,7 +97,7 @@ fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a
     );
     assert_eq!(
         list.parts[0].n_superfiles, 3,
-        "after 3 single-segment commits the part should hold 3 superfiles"
+        "after 3 single-superfile commits the part should hold 3 superfiles"
     );
     // partition_key is the 4-byte LE encoding of bucket 0.
     assert_eq!(list.parts[0].partition_key, [0u8, 0, 0, 0]);
@@ -137,7 +137,7 @@ fn rewrite_path_produces_fresh_part_id_per_commit() {
 #[test]
 fn target_superfiles_per_partition_triggers_part_split() {
     // With target_superfiles_per_partition = 2 and
-    // single-segment commits, the third commit pushes the
+    // single-superfile commits, the third commit pushes the
     // partition over the cap and emits a fresh part. The
     // list grows from 1 entry to 2 entries (both for the
     // same partition_key — the old entry preserved, the
@@ -170,8 +170,8 @@ fn target_superfiles_per_partition_triggers_part_split() {
         list.parts[0].partition_key, list.parts[1].partition_key,
         "both entries should share the same partition_key (same partition, split into 2 parts)"
     );
-    let total_segments: u64 = list.parts.iter().map(|p| p.n_superfiles).sum();
-    assert_eq!(total_segments, 3);
+    let total_superfiles: u64 = list.parts.iter().map(|p| p.n_superfiles).sum();
+    assert_eq!(total_superfiles, 3);
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn time_range_strategy_on_unsupported_column_type_errors_cleanly() {
 }
 
 #[test]
-fn time_range_assigns_int64_segments_to_bucket_zero() {
+fn time_range_assigns_int64_superfiles_to_bucket_zero() {
     // Happy path: an Int64-keyed schema with TimeRange
     // partition_strategy, single-bucket-spanning batch →
     // commit succeeds + the manifest list's entry carries
@@ -314,7 +314,7 @@ fn time_range_assigns_int64_segments_to_bucket_zero() {
 }
 
 #[test]
-fn time_range_segment_spanning_two_buckets_errors() {
+fn time_range_superfile_spanning_two_buckets_errors() {
     // Bucket-spanning batch (ts crosses a day boundary)
     // surfaces `SuperfileSpansPartition` so the writer
     // doesn't silently group two days' rows under one

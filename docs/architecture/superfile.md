@@ -1,10 +1,10 @@
 # Superfile
 
-A superfile is infino's segment format. Each superfile is a single,
+A superfile is infino's superfile format. Each superfile is a single,
 self-contained file that is also a valid
 [Apache Parquet](https://parquet.apache.org/docs/) file. Standard
 Parquet tools read it as an ordinary columnar table; infino reads the
-same file as a search segment, with full-text and vector indexes
+same file as a search superfile, with full-text and vector indexes
 available alongside the columnar data.
 
 This document describes the format and its guarantees. The table layer
@@ -13,7 +13,7 @@ that composes many superfiles into one queryable table is described in
 
 ## Design
 
-- **Single file.** One superfile is one segment: the columnar data and
+- **Single file.** One superfile is one superfile: the columnar data and
   its search indexes live in the same file, with no sidecars to keep
   in sync.
 - **Parquet-compatible.** A superfile is a standards-compliant Parquet
@@ -22,7 +22,7 @@ that composes many superfiles into one queryable table is described in
 - **Immutable.** A superfile is written once and never modified in
   place. Changes are expressed by writing new superfiles.
 - **Search-native.** Full-text and vector search indexes are part of
-  the segment, not a separate system layered on top of it.
+  the superfile, not a separate system layered on top of it.
 
 ## Layout
 
@@ -164,13 +164,13 @@ ranged reads. It offers a zero-copy fast path for ranges already
 resident in memory and an asynchronous fetch for ranges that are not,
 can present a sub-region of a larger object as its own source, and can
 overlay a handful of pre-fetched ranges so that the several small
-reads issued while opening a segment are satisfied from one fetch
+reads issued while opening a superfile are satisfied from one fetch
 rather than many round-trips.
 
 Opening this way reads only the metadata ranges the reader needs, not
-the whole segment: the Parquet footer, then the full-text and vector
+the whole superfile: the Parquet footer, then the full-text and vector
 section headers and directories. The reader does not retain the full
-segment bytes — a source-opened reader cannot hand back the original
+superfile bytes — a source-opened reader cannot hand back the original
 Parquet file for a pass-through tool, and a caller that needs that uses
 the eager open path instead.
 
@@ -178,13 +178,13 @@ Queries then fetch only the regions they touch. A full-text query
 resolves its terms through the dictionary and fetches each term's
 posting list on demand; the postings region is never read in full. A
 vector query fetches the centroids and then only the blocks of the
-clusters it probes. So a segment on object storage answers a query by
+clusters it probes. So a superfile on object storage answers a query by
 pulling a bounded set of ranges rather than downloading the file
 first.
 
 ## Scope
 
-- A superfile is a single segment. Querying across many segments is the
+- A superfile is a single superfile. Querying across many superfiles is the
   table layer's responsibility (see [supertable](./supertable.md)).
 - A superfile is immutable and is queryable only once it is fully
   written.

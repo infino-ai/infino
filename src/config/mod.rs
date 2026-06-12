@@ -102,7 +102,7 @@ pub struct SupertableSettings {
     /// an internal `commit()` to flush the in-memory buffer.
     /// In mebibytes (1 MiB == 1024 × 1024 bytes). `0`
     /// disables auto-flush — only caller-driven `commit()`
-    /// produces segments.
+    /// produces superfiles.
     pub commit_threshold_size_mb: u64,
     /// Verify the trailing whole-blob CRC and per-subsection
     /// CRCs on every `SuperfileReader::open`. Defaults to
@@ -130,18 +130,18 @@ const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
 
 // Compaction defaults
-const DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB: u64 = 1024;
+const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
 const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
-const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB + 2048;
+const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
 /// Compaction subsection of [`Config`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CompactionSettings {
-    /// Target size of a compacted segment, in MiB.
-    pub target_segment_size_mb: u64,
+    /// Target size of a compacted superfile, in MiB.
+    pub target_superfile_size_mb: u64,
     /// Minimum estimated live bytes to trigger a merge,
-    /// as a percentage of `target_segment_size_mb`.
+    /// as a percentage of `target_superfile_size_mb`.
     pub min_fill_percent: u8,
     /// Maximum memory budget for materializing inputs during a single merge, in MiB.
     pub max_memory_mb: u64,
@@ -150,7 +150,7 @@ pub struct CompactionSettings {
 impl Default for CompactionSettings {
     fn default() -> Self {
         Self {
-            target_segment_size_mb: DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB,
+            target_superfile_size_mb: DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB,
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
         }
@@ -185,14 +185,14 @@ pub enum StorageColdFetchMode {
     /// Parallel range GETs serve both the foreground reader and the
     /// disk-cache fill. Foreground returns after the range fetches;
     /// pwrite, mmap, and cache registration finish in the background.
-    /// Uses one copy of segment bandwidth per cold miss.
+    /// Uses one copy of superfile bandwidth per cold miss.
     HybridWithPrefetch,
     /// Single-range sequential fetches (no background fill). Useful
     /// for constrained environments where parallelism is undesirable.
     RangeOnly,
     /// Foreground returns a lazy reader and a background task fills
     /// the disk cache asynchronously. With manifest open-batch bytes
-    /// present, open issues zero segment-object GETs; otherwise it
+    /// present, open issues zero superfile-object GETs; otherwise it
     /// fetches the parquet tail plus vector/FTS open ranges. First
     /// query pays per-cluster range GETs; subsequent queries resolve
     /// from mmap once the fill completes.
@@ -213,8 +213,8 @@ pub struct StorageSettings {
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
     /// Logical key prefix inside the bucket. All manifest and
-    /// segment objects are written under
-    /// `<bucket>/<prefix>/<manifest|segments>/…`. Empty means the
+    /// superfile objects are written under
+    /// `<bucket>/<prefix>/<manifest|superfiles>/…`. Empty means the
     /// bucket root. Not used by the `local_fs` backend (use
     /// `local_root` instead).
     pub prefix: String,
@@ -226,16 +226,16 @@ pub struct StorageSettings {
     pub cold_fetch_mode: StorageColdFetchMode,
     pub cold_fetch_streams: usize,
     pub cold_fetch_chunk_bytes: u64,
-    /// Global cap on concurrent background segment fills. See
+    /// Global cap on concurrent background superfile fills. See
     /// [`crate::supertable::reader_cache::DiskCacheConfig::prefetch_concurrency`].
     pub prefetch_concurrency: usize,
-    /// Minimum age (seconds) before an mmap'd segment is
+    /// Minimum age (seconds) before an mmap'd superfile is
     /// considered cold and eligible for eviction by the sweep.
-    /// Default: 300 s (5 min). Prevents thrashing on segments
+    /// Default: 300 s (5 min). Prevents thrashing on superfiles
     /// that just finished their background fill.
     pub mmap_cold_threshold_secs: u64,
     /// Interval (seconds) between mmap eviction sweeps. The sweep
-    /// drops pages for segments older than
+    /// drops pages for superfiles older than
     /// `mmap_cold_threshold_secs` and not accessed since the
     /// previous sweep. Default: 75 s.
     pub mmap_sweep_interval_secs: u64,
@@ -266,7 +266,7 @@ const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
 const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
 /// Default cold-fetch range chunk size (4 MiB).
 const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 4 * (1 << 20);
-/// Default concurrent background full-segment fills.
+/// Default concurrent background full-superfile fills.
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is swept.
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
@@ -693,8 +693,8 @@ supertable:
         let cfg = Config::defaults().expect("embedded default must parse");
         let c = &cfg.compaction;
         assert_eq!(
-            c.target_segment_size_mb,
-            DEFAULT_COMPACTION_TARGET_SEGMENT_SIZE_MB
+            c.target_superfile_size_mb,
+            DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB
         );
         assert_eq!(c.min_fill_percent, DEFAULT_COMPACTION_MIN_FILL_PERCENT);
         assert_eq!(
@@ -714,14 +714,14 @@ supertable:
     fn compaction_yaml_layer_overrides_defaults() {
         let yaml = r#"
                compaction:
-                    target_segment_size_mb: 2048
+                    target_superfile_size_mb: 2048
                     min_fill_percent: 50
            "#;
         let fig = Figment::new()
             .merge(Yaml::string(EMBEDDED_DEFAULT))
             .merge(Yaml::string(yaml));
         let cfg = Config::from_figment(fig).expect("layered yaml");
-        assert_eq!(cfg.compaction.target_segment_size_mb, 2048);
+        assert_eq!(cfg.compaction.target_superfile_size_mb, 2048);
         assert_eq!(cfg.compaction.min_fill_percent, 50);
         assert_eq!(cfg.compaction.max_memory_mb, 3072);
     }
@@ -730,14 +730,14 @@ supertable:
     fn compaction_nested_env_var_overrides_field() {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         unsafe {
-            std::env::set_var("INFINO_COMPACTION__TARGET_SEGMENT_SIZE_MB", "4096");
+            std::env::set_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB", "4096");
             std::env::set_var("INFINO_COMPACTION__MIN_FILL_PERCENT", "60");
         }
         let cfg = Config::load().expect("load with compaction env override");
-        assert_eq!(cfg.compaction.target_segment_size_mb, 4096);
+        assert_eq!(cfg.compaction.target_superfile_size_mb, 4096);
         assert_eq!(cfg.compaction.min_fill_percent, 60);
         unsafe {
-            std::env::remove_var("INFINO_COMPACTION__TARGET_SEGMENT_SIZE_MB");
+            std::env::remove_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB");
             std::env::remove_var("INFINO_COMPACTION__MIN_FILL_PERCENT");
         }
     }
@@ -747,12 +747,12 @@ supertable:
         let fig = Figment::new()
             .merge(Yaml::string(EMBEDDED_DEFAULT))
             .merge(Yaml::string(
-                "compaction:\n  target_segment_size_mb: \"not-a-number\"\n",
+                "compaction:\n  target_superfile_size_mb: \"not-a-number\"\n",
             ));
         let err = Config::from_figment(fig).expect_err("expected error");
         let msg = err.to_string();
         assert!(
-            msg.contains("target_segment_size_mb")
+            msg.contains("target_superfile_size_mb")
                 || msg.contains("invalid type")
                 || msg.contains("expected"),
             "expected a typed-error message; got {msg:?}"

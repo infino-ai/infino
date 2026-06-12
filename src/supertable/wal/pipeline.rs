@@ -382,7 +382,7 @@ async fn do_apply(
     //
     // FTS + vector summaries are derived from a fresh
     // `SuperfileReader` on the just-built bytes — same shape the
-    // writer's `prepare_segment` uses. Scalar stats come from
+    // writer's `prepare_superfile` uses. Scalar stats come from
     // the in-memory `RecordBatch` directly; nothing needs to
     // round-trip through Parquet.
     let reader = SuperfileReader::open_with(bytes.clone(), inner.options.superfile_open_options())
@@ -542,7 +542,7 @@ fn prepend_id_column(
 
 /// Per-FTS-column bloom + range summary derived from the
 /// just-built superfile's `SuperfileReader`. Mirrors the shape
-/// the writer's `prepare_segment` builds so summaries match
+/// the writer's `prepare_superfile` builds so summaries match
 /// regardless of which code path produced the superfile.
 fn build_fts_summary(
     reader: &SuperfileReader,
@@ -555,7 +555,7 @@ fn build_fts_summary(
     for fc in &options.fts_columns {
         let terms = fts_reader
             .iter_column_terms(&fc.column)
-            .expect("FST bytes valid: segment just built");
+            .expect("FST bytes valid: superfile just built");
         let n_terms_distinct = terms.len() as u32;
         let (min_term, max_term) = match (terms.first(), terms.last()) {
             (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -1101,7 +1101,7 @@ fn resolve_target_id_in_manifest(
             }
         };
 
-        // id_lookup requires the full segment bytes (eager open).
+        // id_lookup requires the full superfile bytes (eager open).
         // A lazy-opened reader from the cache path will return an Io
         // error here; fall back to a direct storage fetch in that case.
         let lookup_result = match reader.id_lookup(target) {

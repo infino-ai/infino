@@ -76,7 +76,7 @@ pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
 /// f32 dot product. Dispatches to the AVX-512 16-lane FMA kernel when
 /// the runtime CPUID gate passes; otherwise the `wide::f32x8` AVX2 /
 /// NEON / scalar kernel (which has been the universal kernel since the
-/// segment-builder existed). Both kernels handle non-multiple-of-lane
+/// superfile-builder existed). Both kernels handle non-multiple-of-lane
 /// inputs via a scalar tail.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {

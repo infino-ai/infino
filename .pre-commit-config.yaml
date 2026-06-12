@@ -33,7 +33,7 @@ repos:
       - id: clippy
         name: clippy
         description: Lint rust sources
-        entry: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
         language: system
         args: ["--", "-D", "warnings"]
         types: [rust]
