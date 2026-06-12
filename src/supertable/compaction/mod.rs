@@ -841,9 +841,7 @@ mod tests {
 
     fn commit_titles(st: &Supertable, titles: &[&str]) {
         let mut w = st.writer().expect("writer");
-        for _i in 0..4096 {
-            w.append(&build_title_batch(titles)).expect("append");
-        }
+        w.append(&build_title_batch(titles)).expect("append");
         w.commit().expect("commit");
     }
 
@@ -1287,33 +1285,41 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let st = make_st(&dir);
 
-        // commit_titles loops 4096× per call, appending 2-doc batches each time.
-        // Each call = 4096 × 2 = 8192 docs in one superfile.
+        // Each superfile must be large enough that 30 combined overflow the 1 MiB
+        // target, forcing the selector to emit two jobs. Write 4096 batches per
+        // commit so each superfile holds 4096 × 2 = 8192 docs.
+        let commit_bulk = |titles: &[&str]| {
+            let mut w = st.writer().expect("writer");
+            for _ in 0..4096 {
+                w.append(&build_title_batch(titles)).expect("append");
+            }
+            w.commit().expect("commit");
+        };
 
         // Batch A: ten superfiles; 10 × 8192 = 81920 docs total.
-        commit_titles(&st, &["alpha first", "alpha second"]);
-        commit_titles(&st, &["bravo first", "bravo second"]);
-        commit_titles(&st, &["charlie first", "charlie second"]);
-        commit_titles(&st, &["delta first", "delta second"]);
-        commit_titles(&st, &["echo first", "echo second"]);
-        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
-        commit_titles(&st, &["golf first", "golf second"]);
-        commit_titles(&st, &["hotel first", "hotel second"]);
-        commit_titles(&st, &["india first", "india second"]);
-        commit_titles(&st, &["juliet first", "juliet second"]);
+        commit_bulk(&["alpha first", "alpha second"]);
+        commit_bulk(&["bravo first", "bravo second"]);
+        commit_bulk(&["charlie first", "charlie second"]);
+        commit_bulk(&["delta first", "delta second"]);
+        commit_bulk(&["echo first", "echo second"]);
+        commit_bulk(&["foxtrot first", "foxtrot second"]);
+        commit_bulk(&["golf first", "golf second"]);
+        commit_bulk(&["hotel first", "hotel second"]);
+        commit_bulk(&["india first", "india second"]);
+        commit_bulk(&["juliet first", "juliet second"]);
 
         // Batch B: twenty superfiles (2 iterations × 10 terms); 20 × 8192 = 163840 docs total.
         for _ in 0..2 {
-            commit_titles(&st, &["kilo first", "kilo second"]);
-            commit_titles(&st, &["lima first", "lima second"]);
-            commit_titles(&st, &["mike first", "mike second"]);
-            commit_titles(&st, &["november first", "november second"]);
-            commit_titles(&st, &["oscar first", "oscar second"]);
-            commit_titles(&st, &["papa first", "papa second"]);
-            commit_titles(&st, &["quebec first", "quebec second"]);
-            commit_titles(&st, &["romeo first", "romeo second"]);
-            commit_titles(&st, &["sierra first", "sierra second"]);
-            commit_titles(&st, &["tango first", "tango second"]);
+            commit_bulk(&["kilo first", "kilo second"]);
+            commit_bulk(&["lima first", "lima second"]);
+            commit_bulk(&["mike first", "mike second"]);
+            commit_bulk(&["november first", "november second"]);
+            commit_bulk(&["oscar first", "oscar second"]);
+            commit_bulk(&["papa first", "papa second"]);
+            commit_bulk(&["quebec first", "quebec second"]);
+            commit_bulk(&["romeo first", "romeo second"]);
+            commit_bulk(&["sierra first", "sierra second"]);
+            commit_bulk(&["tango first", "tango second"]);
         }
 
         // 30 superfiles total; 81920 + 163840 = 245760 docs.
