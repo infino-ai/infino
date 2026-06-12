@@ -24,7 +24,6 @@
 //!   `SupertableReader` (snapshot-pinned reader).
 
 pub(crate) mod build;
-#[allow(dead_code)]
 pub(crate) mod compaction;
 pub mod error;
 pub mod handle;

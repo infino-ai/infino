@@ -154,7 +154,17 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
-    pub(crate) async fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
+    pub fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
+        crate::runtime_bridge::bridge_on_runtime(
+            self.compact_async(cfg),
+            &self.inner().query_runtime(),
+        )
+    }
+
+    pub(crate) async fn compact_async(
+        &self,
+        cfg: &CompactionSettings,
+    ) -> Result<(), CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
 
@@ -231,6 +241,7 @@ impl Supertable {
     }
 
     /// Merges the given superfiles into one
+    #[allow(dead_code)]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
