@@ -901,7 +901,9 @@ mod tests {
             .max()
             .expect("at least one superfile before compaction");
 
-        st.compact(&small_compact_cfg()).await.expect("compact");
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
 
         let after = st.reader();
         let sfs = &after.manifest().superfiles;
@@ -978,7 +980,9 @@ mod tests {
         let before_manifest_id = st.manifest_id();
         let before_n = st.reader().n_superfiles();
 
-        st.compact(&small_compact_cfg()).await.expect("compact");
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
 
         assert_eq!(
             st.manifest_id(),
@@ -1006,7 +1010,7 @@ mod tests {
             min_fill_percent: 100,
             ..CompactionSettings::default()
         };
-        st.compact(&cfg).await.expect("compact");
+        st.compact_async(&cfg).await.expect("compact");
 
         assert_eq!(
             st.manifest_id(),
@@ -1037,7 +1041,9 @@ mod tests {
         let before_n = reader_before.n_superfiles();
         let before_manifest_id = reader_before.manifest_id();
 
-        st.compact(&small_compact_cfg()).await.expect("compact");
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
 
         let reader_after = st.reader();
 
@@ -1072,7 +1078,9 @@ mod tests {
         commit_titles(&st, &["juliet first", "juliet second"]);
 
         let before_manifest_id = st.manifest_id();
-        st.compact(&small_compact_cfg()).await.expect("compact");
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
 
         assert!(
             st.manifest_id() == before_manifest_id + 1,
@@ -1119,7 +1127,9 @@ mod tests {
         commit_titles(&st, &["juliet first", "juliet second"]);
 
         let before_manifest_id = st.manifest_id();
-        st.compact(&small_compact_cfg()).await.expect("compact");
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
 
         assert!(
             st.manifest_id() == before_manifest_id + 1,
@@ -1172,7 +1182,7 @@ mod tests {
 
         // First compact: merges all 10 tiny superfiles into one.
         let before_first_compact = st.manifest_id();
-        st.compact(&small_compact_cfg())
+        st.compact_async(&small_compact_cfg())
             .await
             .expect("first compact");
         assert!(
@@ -1186,7 +1196,7 @@ mod tests {
 
         // Second compact on the same data: the merged superfile is the only
         // file in its partition, so pack_partition emits no job (needs ≥ 2 inputs).
-        st.compact(&small_compact_cfg())
+        st.compact_async(&small_compact_cfg())
             .await
             .expect("second compact");
 
@@ -1218,7 +1228,7 @@ mod tests {
 
         // First compact: merges the ten batch-A superfiles into one.
         let before_first_compact = st.manifest_id();
-        st.compact(&small_compact_cfg())
+        st.compact_async(&small_compact_cfg())
             .await
             .expect("first compact");
 
@@ -1245,7 +1255,7 @@ mod tests {
         // Second compact: runs a job on the new batch-B superfiles.
         // The merged-A superfile is above min_output_bytes so it is not a
         // candidate; the ten batch-B files combine to exceed the floor.
-        st.compact(&small_compact_cfg())
+        st.compact_async(&small_compact_cfg())
             .await
             .expect("second compact");
 
@@ -1325,7 +1335,7 @@ mod tests {
         }
 
         let manifest_id_before_first_compact = st.manifest_id();
-        st.compact(&small_compact_cfg())
+        st.compact_async(&small_compact_cfg())
             .await
             .expect("second compact");
 
