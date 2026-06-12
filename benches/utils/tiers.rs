@@ -487,10 +487,6 @@ fn supertable_search_cache_gib() -> Option<u64> {
 /// `ceil(256 / concurrency)` waves). Background memory scales as
 /// `concurrency × cold_fetch_streams × cold_fetch_chunk_bytes`, so e.g.
 /// 64 × 8 × 8 MiB ≈ 4 GiB of in-flight fill buffers.
-///
-/// Unset, it falls back to the library default sourced from
-/// `DiskCacheConfig::default()` rather than a duplicated literal, so the
-/// bench tracks the library if that default ever changes.
 fn bench_prefetch_concurrency() -> usize {
     std::env::var("INFINO_BENCH_PREFETCH_CONCURRENCY")
         .ok()
