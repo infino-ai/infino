@@ -1314,9 +1314,9 @@ pub(crate) struct PreparedSuperfile {
     /// the in-memory-only path and the storage-without-cache
     /// path; `None` on the cache-attached path (the disk cache
     /// hydrates lazily from storage).
-    bytes_for_store: Option<(SuperfileUri, Bytes)>,
-    bytes_for_storage: Option<(SuperfileUri, Bytes)>,
-    bytes_for_cache: Option<(SuperfileUri, Bytes)>,
+    pub(crate) bytes_for_store: Option<(SuperfileUri, Bytes)>,
+    pub(crate) bytes_for_storage: Option<(SuperfileUri, Bytes)>,
+    pub(crate) bytes_for_cache: Option<(SuperfileUri, Bytes)>,
 }
 
 impl PreparedSuperfile {
@@ -1671,6 +1671,7 @@ pub(in crate::supertable) fn persist_commit(
                 Arc::clone(&opts),
                 Arc::clone(&old),
                 &new_entries,
+                &[],
                 new_superfile_list.manifest_id,
                 pending_writes,
             )
@@ -1810,11 +1811,12 @@ pub async fn write_superfile_list(
 /// regardless of how many other partitions exist — the
 /// load-bearing property the part-reuse optimization relies
 /// on.
-async fn try_commit_attempt(
+pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn crate::storage::StorageProvider>,
     opts: Arc<SupertableOptions>,
     old: Arc<crate::supertable::Manifest>,
     new_entries: &[Arc<SuperfileEntry>],
+    entries_to_remove: &[Arc<SuperfileEntry>],
     new_manifest_id: u64,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<ManifestList, SupertableCommitError> {
@@ -1823,7 +1825,7 @@ async fn try_commit_attempt(
 
     // 2. Rebalance the manifest for the commit.
     let (out_list_entries, parts_to_write) =
-        commit_mod::rebalance_for_commit(&opts, &old, new_entries, &[]).await?;
+        commit_mod::rebalance_for_commit(&opts, &old, new_entries, entries_to_remove).await?;
 
     // 3. Build the new manifest list. The options_hash
     //    digest covers (schema, id_column, fts/vector

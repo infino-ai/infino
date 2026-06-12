@@ -267,6 +267,9 @@ pub enum CompactionError {
     #[error("superfile {0} not found in manifest snapshot")]
     SuperfileNotFound(uuid::Uuid),
 
+    #[error("empty merged superfile")]
+    EmptyMergedSuperfile,
+
     /// The tombstone sidecar for `superfile_id` is already sealed by
     /// a different compaction run. Caller must drive the abandoned
     /// compaction to completion (or unwind it) before retrying.
@@ -281,6 +284,17 @@ pub enum CompactionError {
     /// A WAL-store I/O error occurred while sealing a sidecar.
     #[error("seal failed: {0}")]
     Seal(String),
+
+    /// Error when building the compacted superfile
+    #[error("failed to build superfile: {0}")]
+    Build(#[from] BuildError),
+
+    #[error("failed to commit compaction: {0}")]
+    Commit(#[from] CommitError),
+
+    /// Refreshing the in-memory manifest after a successful commit failed.
+    #[error("post-commit manifest refresh failed: {0}")]
+    Refresh(String),
 }
 
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]

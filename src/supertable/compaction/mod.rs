@@ -16,8 +16,11 @@ use crate::{
         BuildError, SuperfileEntry,
         error::CompactionError,
         query::dispatch::open_reader,
-        wal::{WalStore, tombstones_admin, tombstones_admin::TombstonesAdminError},
-        writer::{PreparedSuperfile, ShardOutput, prepare_superfile},
+        wal::{
+            WalStore,
+            tombstones_admin::{self, TombstonesAdminError},
+        },
+        writer::{PreparedSuperfile, ShardOutput, prepare_superfile, try_commit_attempt},
     },
 };
 use bytes::Bytes;
@@ -161,7 +164,7 @@ impl Supertable {
             .as_ref()
             .ok_or(CompactionError::NoStorage)?
             .clone();
-        let wal_store = WalStore::new(storage);
+        let wal_store = WalStore::new(storage.clone());
 
         // One LIST to find which superfiles have a tombstone sidecar.
         let tombstone_ids: std::collections::HashSet<Uuid> = wal_store
@@ -218,63 +221,10 @@ impl Supertable {
         let jobs = select(&stats, cfg);
 
         for job in jobs {
-            // Resolve input Arc<SuperfileEntry> from the snapshot.
-            let inputs: Vec<Arc<SuperfileEntry>> = job
-                .inputs
-                .iter()
-                .map(|id| {
-                    manifest
-                        .superfile_list
-                        .superfiles
-                        .iter()
-                        .find(|e| e.superfile_id == *id)
-                        .cloned()
-                        .ok_or(CompactionError::SuperfileNotFound(*id))
-                })
-                .collect::<Result<_, _>>()?;
-
-            // Seal every input sidecar.
-            // once sealed, further incoming updates are rejected
-            // and this seal flag helps to prevent overlapping compactions
-            // on same files
-            let compaction_id = Uuid::new_v4();
-            let sealed_at = chrono::Utc::now();
-            for entry in &inputs {
-                loop {
-                    match tombstones_admin::seal(
-                        &wal_store,
-                        entry.superfile_id,
-                        compaction_id,
-                        sealed_at,
-                    )
-                    .await
-                    {
-                        Ok(_) => break,
-                        Err(TombstonesAdminError::CasLost { .. }) => {
-                            // A writer landed a tombstone bit between our
-                            // GET and our PUT. Re-read and retry — the
-                            // seal will succeed on the next attempt unless
-                            // another compactor raced us.
-                            continue;
-                        }
-                        Err(TombstonesAdminError::AlreadySealed {
-                            superfile_id,
-                            existing_compaction_id,
-                        }) => {
-                            return Err(CompactionError::SidecarConflict {
-                                superfile_id,
-                                existing_compaction_id,
-                            });
-                        }
-                        Err(TombstonesAdminError::WalStore(e)) => {
-                            return Err(CompactionError::Seal(e.to_string()));
-                        }
-                    }
-                }
-            }
-
-            // TODO(pranav): merge_superfiles(&inputs) + try_commit_attempt
-            let _ = inputs;
+            self.run_compaction_job(job).await?;
+            self.refresh()
+                .await
+                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
         }
 
         Ok(())
@@ -339,14 +289,114 @@ impl Supertable {
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
+
+    pub(crate) async fn run_compaction_job(
+        &self,
+        job: CompactionJob,
+    ) -> Result<(), CompactionError> {
+        let inner = self.inner();
+        let manifest = inner.manifest.load_full();
+        let storage = manifest
+            .options
+            .storage
+            .as_ref()
+            .ok_or(CompactionError::NoStorage)?
+            .clone();
+        let wal_store = WalStore::new(storage.clone());
+
+        // Resolve input Arc<SuperfileEntry> from the snapshot.
+        let inputs: Vec<Arc<SuperfileEntry>> = job
+            .inputs
+            .iter()
+            .map(|id| {
+                manifest
+                    .superfile_list
+                    .superfiles
+                    .iter()
+                    .find(|e| e.superfile_id == *id)
+                    .cloned()
+                    .ok_or(CompactionError::SuperfileNotFound(*id))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Seal every input sidecar.
+        // once sealed, further incoming updates are rejected
+        // and this seal flag helps to prevent overlapping compactions
+        // on same files
+        let compaction_id = Uuid::new_v4();
+        let sealed_at = chrono::Utc::now();
+        for entry in &inputs {
+            loop {
+                match tombstones_admin::seal(
+                    &wal_store,
+                    entry.superfile_id,
+                    compaction_id,
+                    sealed_at,
+                )
+                .await
+                {
+                    Ok(_) => break,
+                    Err(TombstonesAdminError::CasLost { .. }) => {
+                        // A writer landed a tombstone bit between our
+                        // GET and our PUT. Re-read and retry — the
+                        // seal will succeed on the next attempt unless
+                        // another compactor raced us.
+                        continue;
+                    }
+                    Err(TombstonesAdminError::AlreadySealed {
+                        superfile_id,
+                        existing_compaction_id,
+                    }) => {
+                        return Err(CompactionError::SidecarConflict {
+                            superfile_id,
+                            existing_compaction_id,
+                        });
+                    }
+                    Err(TombstonesAdminError::WalStore(e)) => {
+                        return Err(CompactionError::Seal(e.to_string()));
+                    }
+                }
+            }
+        }
+
+        let merged_segment = self
+            .merge_superfiles(&inputs)
+            .await
+            .map_err(CompactionError::Build)?;
+
+        let new_entries = vec![merged_segment.entry];
+        let mut pending_storage_writes = vec![
+            merged_segment
+                .bytes_for_storage
+                .ok_or(CompactionError::EmptyMergedSuperfile)?,
+        ];
+
+        let opts = Arc::clone(&inner.options);
+        let new_manifest_id = manifest.manifest_id + 1;
+        try_commit_attempt(
+            storage.clone(),
+            opts,
+            manifest.clone(),
+            &new_entries,
+            &inputs,
+            new_manifest_id,
+            &mut pending_storage_writes,
+        )
+        .await
+        .map_err(CompactionError::Commit)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BoolMode;
     use crate::Supertable;
     use crate::supertable::storage::LocalFsStorageProvider;
     use crate::test_helpers::{build_title_batch, default_supertable_options};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -766,5 +816,547 @@ mod tests {
             1,
             "should find exactly 1 doc matching 'second'"
         );
+    }
+
+    // ─── Helpers shared by the end-to-end compact() tests ─────────────────
+
+    fn make_st(dir: &TempDir) -> Supertable {
+        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("create supertable")
+    }
+
+    /// Compact config designed to trigger on tiny test superfiles.
+    /// target = 1 MiB, fill floor = 1 % → min_output_bytes ≈ 10 KiB.
+    /// Individual files must be < 10 KiB to be candidates; their
+    /// combined live_bytes must reach 10 KiB for a job to be emitted.
+    fn small_compact_cfg() -> CompactionSettings {
+        CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        }
+    }
+
+    fn commit_titles(st: &Supertable, titles: &[&str]) {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(titles)).expect("append");
+        w.commit().expect("commit");
+    }
+
+    // ─── End-to-end compact() tests ────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_reduces_superfile_count() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Ten commits, each with a unique first word so the merged bloom is verifiable.
+        // 10 × ~1217 bytes ≈ 12 170 bytes > min_output_bytes (~10 485) → job emitted.
+        commit_titles(&st, &["alpha cherry", "alpha mango"]);
+        commit_titles(&st, &["bravo cherry", "bravo mango"]);
+        commit_titles(&st, &["charlie delta", "charlie echo"]);
+        commit_titles(&st, &["foxtrot golf", "foxtrot hotel"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["lima first", "lima second"]);
+        commit_titles(&st, &["november first", "november second"]);
+        commit_titles(&st, &["quebec first", "quebec second"]);
+        commit_titles(&st, &["romeo first", "romeo second"]);
+        commit_titles(&st, &["sierra first", "sierra second"]);
+
+        let before = st.reader();
+        let before_manifest_id = before.manifest_id();
+        let before_n_superfiles = before.n_superfiles();
+        let input_ids: HashSet<Uuid> = before
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.superfile_id)
+            .collect();
+        let expected_docs = before.n_docs_total();
+        let expected_id_min = before
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.id_min)
+            .min()
+            .expect("at least one superfile before compaction");
+        let expected_id_max = before
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.id_max)
+            .max()
+            .expect("at least one superfile before compaction");
+
+        st.compact(&small_compact_cfg()).await.expect("compact");
+
+        let after = st.reader();
+        let sfs = &after.manifest().superfiles;
+
+        assert!(
+            after.manifest_id() == before_manifest_id + 1,
+            "no compaction jobs ran; adjust small_compact_cfg() if superfiles exceed \
+             min_output_bytes"
+        );
+        assert!(
+            sfs.len() < before_n_superfiles,
+            "superfile count should decrease after compaction"
+        );
+        assert!(
+            !sfs.iter().any(|s| input_ids.contains(&s.superfile_id)),
+            "original superfile IDs must not appear after compaction"
+        );
+
+        // Doc count preserved across the merge
+        assert_eq!(after.n_docs_total(), expected_docs);
+
+        // Merged entry ID range spans all original inputs
+        let merged_min = sfs
+            .iter()
+            .map(|s| s.id_min)
+            .min()
+            .expect("at least one superfile after compaction");
+        let merged_max = sfs
+            .iter()
+            .map(|s| s.id_max)
+            .max()
+            .expect("at least one superfile after compaction");
+        assert!(merged_min == expected_id_min);
+        assert!(merged_max == expected_id_max);
+
+        // Partition key consistent across all remaining superfiles
+        assert!(sfs.iter().all(|s| s.partition_key == sfs[0].partition_key));
+
+        // FTS bloom covers the unique first word from each of the 10 input batches
+        let fts = sfs[0]
+            .fts_summary
+            .get("title")
+            .expect("fts summary present");
+        for term in &[
+            b"alpha" as &[u8],
+            b"bravo",
+            b"charlie",
+            b"foxtrot",
+            b"india",
+            b"lima",
+            b"november",
+            b"quebec",
+            b"romeo",
+            b"sierra",
+        ] {
+            assert!(
+                fts.term_bloom.contains(term),
+                "bloom missing term '{}'",
+                std::str::from_utf8(term).expect("term literal is valid utf-8")
+            );
+        }
+
+        // Box::leak(dir);
+        std::mem::forget(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_no_op_when_single_superfile() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["only doc", "second doc"]);
+
+        let before_manifest_id = st.manifest_id();
+        let before_n = st.reader().n_superfiles();
+
+        st.compact(&small_compact_cfg()).await.expect("compact");
+
+        assert_eq!(
+            st.manifest_id(),
+            before_manifest_id,
+            "manifest_id must not change: a single superfile cannot form a merge job"
+        );
+        assert_eq!(st.reader().n_superfiles(), before_n);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_no_op_when_below_fill_floor() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["beta first", "beta second"]);
+
+        let before_manifest_id = st.manifest_id();
+
+        // fill floor = 100% of 1 GiB → min_output_bytes = 1 GiB.
+        // Both tiny superfiles are candidates (each < 1 GiB) but their
+        // combined live_bytes is far below 1 GiB, so no job is emitted.
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 1024,
+            min_fill_percent: 100,
+            ..CompactionSettings::default()
+        };
+        st.compact(&cfg).await.expect("compact");
+
+        assert_eq!(
+            st.manifest_id(),
+            before_manifest_id,
+            "manifest must not change when combined size is below the fill floor"
+        );
+        assert_eq!(st.reader().n_superfiles(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reader_pinned_before_compact_sees_old_state() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        // Pin a snapshot before compaction.
+        let reader_before = st.reader();
+        let before_n = reader_before.n_superfiles();
+        let before_manifest_id = reader_before.manifest_id();
+
+        st.compact(&small_compact_cfg()).await.expect("compact");
+
+        let reader_after = st.reader();
+
+        // The pinned snapshot must be frozen — it still sees the original superfiles.
+        assert_eq!(reader_before.n_superfiles(), before_n);
+        assert_eq!(reader_before.manifest_id(), before_manifest_id);
+
+        // A freshly-opened reader must reflect the post-compact manifest.
+        assert!(
+            reader_after.manifest_id() > before_manifest_id,
+            "compact must have run for snapshot isolation to be observable; \
+             adjust small_compact_cfg() if needed"
+        );
+        assert!(reader_after.n_superfiles() < before_n);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fts_search_returns_correct_results_after_compact() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Ten commits so combined size exceeds min_output_bytes.
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        let before_manifest_id = st.manifest_id();
+        st.compact(&small_compact_cfg()).await.expect("compact");
+
+        assert!(
+            st.manifest_id() == before_manifest_id + 1,
+            "compact must have run; adjust small_compact_cfg() if needed"
+        );
+
+        // Each batch-unique term should match exactly 2 docs.
+        for term in &["alpha", "bravo", "charlie"] {
+            let n: usize = st
+                .token_match("title", term, BoolMode::And, None)
+                .unwrap_or_else(|e| panic!("token_match for '{term}': {e}"))
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(n, 2, "term '{term}' should match 2 docs after compact");
+        }
+
+        // The shared token 'first' appears once per batch: 10 batches → 10 docs.
+        let n_first: usize = st
+            .token_match("title", "first", BoolMode::And, None)
+            .expect("token_match for 'first'")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n_first, 10, "'first' should match 10 docs");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fts_bloom_filter_covers_all_terms_after_compact() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Ten commits (2 docs each) so combined size exceeds min_output_bytes.
+        // Each commit has a unique first word; all must survive in the merged bloom.
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        let before_manifest_id = st.manifest_id();
+        st.compact(&small_compact_cfg()).await.expect("compact");
+
+        assert!(
+            st.manifest_id() == before_manifest_id + 1,
+            "compact must have run; adjust small_compact_cfg() if needed"
+        );
+
+        let r = st.reader();
+        let sfs = &r.manifest().superfiles;
+        assert!(sfs.len() < 10, "superfile count should have decreased");
+
+        let fts = sfs[0]
+            .fts_summary
+            .get("title")
+            .expect("fts summary present");
+        for term in &[
+            b"alpha" as &[u8],
+            b"bravo",
+            b"charlie",
+            b"delta",
+            b"echo",
+            b"foxtrot",
+            b"golf",
+            b"hotel",
+            b"india",
+            b"juliet",
+        ] {
+            assert!(
+                fts.term_bloom.contains(term),
+                "bloom missing term '{}'",
+                std::str::from_utf8(term).expect("term literal is valid utf-8")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_compact_is_no_op_after_full_merge() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        // First compact: merges all 10 tiny superfiles into one.
+        let before_first_compact = st.manifest_id();
+        st.compact(&small_compact_cfg())
+            .await
+            .expect("first compact");
+        assert!(
+            st.manifest_id() == before_first_compact + 1,
+            "first compact must have run; adjust small_compact_cfg() if needed"
+        );
+        assert_eq!(st.inner().manifest.load_full().superfiles.len(), 1);
+
+        let after_first_manifest_id = st.manifest_id();
+        let after_first_n = st.reader().n_superfiles();
+
+        // Second compact on the same data: the merged superfile is the only
+        // file in its partition, so pack_partition emits no job (needs ≥ 2 inputs).
+        st.compact(&small_compact_cfg())
+            .await
+            .expect("second compact");
+
+        assert_eq!(
+            st.manifest_id(),
+            after_first_manifest_id,
+            "second compact should produce no jobs"
+        );
+        assert_eq!(st.reader().n_superfiles(), after_first_n);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_runs_multiple_compactions_on_separate_file_sets() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Batch A: ten superfiles with group-A terms (2 docs each = 20 docs total).
+        // 10 × ~1217 bytes ≈ 12 170 bytes > min_output_bytes → job emitted.
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        // First compact: merges the ten batch-A superfiles into one.
+        let before_first_compact = st.manifest_id();
+        st.compact(&small_compact_cfg())
+            .await
+            .expect("first compact");
+
+        let manifest_id_after_first_compact = st.manifest_id();
+        assert_eq!(manifest_id_after_first_compact, before_first_compact + 1);
+        assert_eq!(
+            st.reader().n_docs_total(),
+            20,
+            "batch A should have 20 docs"
+        );
+
+        // Batch B: ten more superfiles with group-B terms (2 docs each = 20 docs).
+        commit_titles(&st, &["kilo first", "kilo second"]);
+        commit_titles(&st, &["lima first", "lima second"]);
+        commit_titles(&st, &["mike first", "mike second"]);
+        commit_titles(&st, &["november first", "november second"]);
+        commit_titles(&st, &["oscar first", "oscar second"]);
+        commit_titles(&st, &["papa first", "papa second"]);
+        commit_titles(&st, &["quebec first", "quebec second"]);
+        commit_titles(&st, &["romeo first", "romeo second"]);
+        commit_titles(&st, &["sierra first", "sierra second"]);
+        commit_titles(&st, &["tango first", "tango second"]);
+
+        // Second compact: runs a job on the new batch-B superfiles.
+        // The merged-A superfile is above min_output_bytes so it is not a
+        // candidate; the ten batch-B files combine to exceed the floor.
+        st.compact(&small_compact_cfg())
+            .await
+            .expect("second compact");
+
+        // The manifest must have advanced past the ten batch-B commits.
+        assert!(
+            st.manifest_id() == manifest_id_after_first_compact + 10 + 1,
+            "second compact must have run a job on the batch-B superfiles"
+        );
+
+        // All 40 docs must be visible after both compaction rounds.
+        let r = st.reader();
+        assert_eq!(r.n_docs_total(), 40, "all docs must be preserved");
+        assert!(
+            r.n_superfiles() < 8,
+            "overall superfile count must have decreased from original 20"
+        );
+
+        // Manifest consistency: per-entry doc counts sum to 40.
+        let sfs = &r.manifest().superfiles;
+        let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
+        assert_eq!(total_from_manifest, 40);
+
+        // ID range is monotonically ordered within each remaining superfile.
+        for sf in sfs.iter() {
+            assert!(sf.id_min <= sf.id_max);
+        }
+
+        drop(r);
+
+        // FTS: every batch-unique term must be searchable and return exactly 2 docs.
+        for term in &[
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango",
+        ] {
+            let n: usize = st
+                .token_match("title", term, BoolMode::And, None)
+                .unwrap_or_else(|e| panic!("token_match for '{term}': {e}"))
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(n, 2, "term '{term}' should match exactly 2 docs");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn compact_runs_multiple_compactions_on_separate_file_sets_in_same_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Batch A: ten superfiles with group-A terms (2 docs each = 20 docs total).
+        // 10 × ~1217 bytes ≈ 12 170 bytes > min_output_bytes → job emitted.
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        // Batch B: ten more superfiles with group-B terms (2 docs each = 20 docs).
+        for _ in 0..4 {
+            commit_titles(&st, &["kilo first", "kilo second"]);
+            commit_titles(&st, &["lima first", "lima second"]);
+            commit_titles(&st, &["mike first", "mike second"]);
+            commit_titles(&st, &["november first", "november second"]);
+            commit_titles(&st, &["oscar first", "oscar second"]);
+            commit_titles(&st, &["papa first", "papa second"]);
+            commit_titles(&st, &["quebec first", "quebec second"]);
+            commit_titles(&st, &["romeo first", "romeo second"]);
+            commit_titles(&st, &["sierra first", "sierra second"]);
+            commit_titles(&st, &["tango first", "tango second"]);
+        }
+
+        let manifest_id_before_first_compact = st.manifest_id();
+        st.compact(&small_compact_cfg())
+            .await
+            .expect("second compact");
+
+        // The manifest must have advanced past the ten batch-B commits.
+        assert!(
+            st.manifest_id() == manifest_id_before_first_compact + 2,
+            "second compact must have run a job on the batch-B superfiles"
+        );
+
+        // All 40 docs must be visible after both compaction rounds.
+        let r = st.reader();
+        assert_eq!(r.n_docs_total(), 40, "all docs must be preserved");
+        assert!(
+            r.n_superfiles() == 2,
+            "overall superfile count must have decreased from original 20"
+        );
+
+        // Manifest consistency: per-entry doc counts sum to 40.
+        let sfs = &r.manifest().superfiles;
+        let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
+        assert_eq!(total_from_manifest, 40);
+
+        // ID range is monotonically ordered within each remaining superfile.
+        for sf in sfs.iter() {
+            assert!(sf.id_min <= sf.id_max);
+        }
+
+        drop(r);
+
+        // FTS: every batch-unique term must be searchable and return exactly 2 docs.
+        for term in &[
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango",
+        ] {
+            let n: usize = st
+                .token_match("title", term, BoolMode::And, None)
+                .unwrap_or_else(|e| panic!("token_match for '{term}': {e}"))
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(n, 2, "term '{term}' should match exactly 2 docs");
+        }
     }
 }
