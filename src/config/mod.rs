@@ -134,7 +134,7 @@ const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
 const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
-/// Compaction subsection of [`Config`].
+/// Compaction settings: target size, fill floor, and memory budget.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CompactionSettings {
