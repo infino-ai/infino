@@ -237,6 +237,13 @@ hashbrown = "0.17.1"
 # lands; the public surface itself is guarded by `cargo-public-api`.
 infino-bench-utils = { path = "benches/utils" }
 
+# `test-util` adds tokio's paused-clock test surface
+# (`start_paused`), which lets concurrency regression tests drive
+# sleep-based polling loops deterministically instead of racing real
+# timers (see `reader_cache::disk::tests`). Dev-only feature union on
+# the existing tokio dependency — no new crate.
+tokio = { version = "1", features = ["test-util"] }
+
 proptest = "1"
 hdrhistogram = "7"
 # s3s + s3s-fs power the "real S3 wire protocol" smoke test.

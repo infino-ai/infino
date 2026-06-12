@@ -1575,7 +1575,17 @@ async fn wait_for_lazy_foreground_release(
             // fresh cache per iteration) a scheduling turn to drop the
             // cache before we start a full-superfile background fill.
             tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-            return store.upgrade();
+            // Re-check after the grace sleep: `strong_count == 1` is
+            // also what acquisition looks like from outside — between
+            // `cold_fetch_lazy` dropping its local Arc and the caller
+            // cloning out of the cache entry, the entry briefly holds
+            // the only reference. A poll landing in that window (or a
+            // caller re-acquiring during the sleep) must NOT start the
+            // fill while the reader is held; keep waiting instead.
+            if reader.strong_count() <= 1 {
+                return store.upgrade();
+            }
+            continue;
         }
         tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
     }
@@ -1817,4 +1827,98 @@ fn open_readonly_mmap(path: &std::path::Path) -> std::io::Result<memmap2::Mmap> 
     // unmaps cleanly under POSIX even if the file's already
     // unlinked).
     unsafe { memmap2::Mmap::map(&file) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::LocalFsStorageProvider;
+    use crate::superfile::SuperfileReader;
+    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder};
+    use crate::test_helpers::{decimal128_id_field, decimal128_ids};
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use tempfile::TempDir;
+
+    /// Poll turns the test lets elapse while the reader is held — the
+    /// pre-fix code returned after a single grace sleep, so anything
+    /// > 1 distinguishes "kept waiting" from "barreled ahead".
+    const HELD_POLL_TURNS: u32 = 5;
+
+    /// Minimal eager superfile reader (one scalar batch, no indexes).
+    fn tiny_reader() -> Arc<SuperfileReader> {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids(vec![1u64]);
+        let titles = LargeStringArray::from(vec!["alpha"]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        Arc::new(SuperfileReader::open(bytes).expect("open"))
+    }
+
+    fn test_store() -> (TempDir, Arc<DiskCacheStore>) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let cfg = DiskCacheConfig {
+            cache_root: dir.path().join("cache"),
+            ..Default::default()
+        };
+        let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
+        (dir, store)
+    }
+
+    /// Regression: `strong_count == 1` is also what *acquisition*
+    /// looks like — between `cold_fetch_lazy` dropping its local Arc
+    /// and the caller cloning out of the cache entry, the entry
+    /// briefly holds the only reference. The pre-fix wait returned
+    /// unconditionally after its grace sleep, so a poll landing in
+    /// that window started the full-segment fill while the foreground
+    /// reader was held (the CI flake in
+    /// `lazy_background_fill_waits_for_foreground_reader_drop`).
+    /// The wait must re-check after the grace sleep and keep waiting.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_release_rechecks_reader_after_grace_sleep() {
+        let (_dir, store) = test_store();
+        let reader = tiny_reader();
+
+        let weak_store = Arc::downgrade(&store);
+        let weak_reader = Arc::downgrade(&reader);
+        // At spawn the only strong ref is `reader` itself — the exact
+        // shape of the acquisition window (the entry's ref, caller's
+        // clone not yet taken).
+        let waiter = tokio::spawn(async move {
+            wait_for_lazy_foreground_release(&weak_store, &weak_reader).await
+        });
+
+        // Let the waiter observe count == 1 and enter its grace sleep.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The caller's clone lands while the waiter is mid-grace: the
+        // reader is now genuinely held.
+        let held = Arc::clone(&reader);
+
+        // Let several poll intervals elapse (paused time auto-advances
+        // through every sleep). The buggy wait returned after ONE.
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL * HELD_POLL_TURNS).await;
+        assert!(
+            !waiter.is_finished(),
+            "background fill must keep waiting while the foreground reader is held"
+        );
+
+        // Release the hold (one strong ref — the entry's — remains):
+        // the wait must now complete and hand back the store.
+        drop(held);
+        let got = waiter.await.expect("waiter join");
+        assert!(
+            got.is_some(),
+            "wait must yield the store once the foreground hold releases"
+        );
+        drop(reader);
+    }
 }
