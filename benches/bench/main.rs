@@ -19,6 +19,11 @@
 //! cargo bench -- diagnostic              # all five
 //! cargo bench -- diagnostic scale        # a subset, grouped
 //! cargo bench -- tombstone               # bare names also work
+//!
+//! # Prepared datasets (supertable, real object store only):
+//! cargo bench -- dataset prepare datasets/bench-10m          # ingest + sidecar
+//! cargo bench -- dataset bench   datasets/bench-10m vector   # read phases only
+//! cargo bench -- dataset run     datasets/bench-10m          # prepare if absent, then bench
 //! ```
 //!
 //! Token vocabulary:
@@ -109,9 +114,130 @@ fn run_cell(tier: Tier, modality: Modality, phases: Phases) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DatasetVerb {
+    Prepare,
+    Bench,
+    Run,
+}
+
+fn dataset_usage_and_exit(code: i32) -> ! {
+    eprintln!(
+        "Usage:\n  cargo bench -- dataset <prepare|bench|run> <prefix> [fts|vector|sql ...] [warm|cold|search]\n\
+         \n\
+         prepare : ingest the corpus to <prefix> and write the sidecar (fails if already there)\n\
+         bench   : open the dataset at <prefix> and run the read phases (fails if absent)\n\
+         run     : prepare if absent, then bench\n\
+         \n\
+         Modality defaults to all three; phase (bench/run only) defaults to search (warm+cold).\n\
+         Doc count: INFINO_BENCH_SUPERTABLE_DOCS. Store: INFINO_BENCH_STORE (s3 | azure).\n"
+    );
+    std::process::exit(code);
+}
+
+fn ingest_modality(m: Modality) -> infino_bench_utils::ingest::supertable::Modality {
+    use infino_bench_utils::ingest::supertable::Modality as M;
+    match m {
+        Modality::Fts => M::Fts,
+        Modality::Vector => M::Vector,
+        Modality::Sql => M::Sql,
+    }
+}
+
+/// `dataset <verb> <prefix> [modality ...] [phase ...]` — prepare a reusable
+/// dataset on object storage, benchmark an existing one, or both.
+fn run_dataset_command(tokens: &[String]) {
+    use infino_bench_utils::{dataset, ingest::supertable as ingest, tiers};
+
+    let verb = match tokens.first().map(String::as_str) {
+        Some("prepare") => DatasetVerb::Prepare,
+        Some("bench") => DatasetVerb::Bench,
+        Some("run") => DatasetVerb::Run,
+        _ => dataset_usage_and_exit(2),
+    };
+    let mut prefix: Option<&str> = None;
+    let mut modalities: Vec<Modality> = Vec::new();
+    let (mut warm, mut cold) = (false, false);
+    for tok in &tokens[1..] {
+        match tok.as_str() {
+            "fts" if !modalities.contains(&Modality::Fts) => modalities.push(Modality::Fts),
+            "vector" if !modalities.contains(&Modality::Vector) => {
+                modalities.push(Modality::Vector)
+            }
+            "sql" if !modalities.contains(&Modality::Sql) => modalities.push(Modality::Sql),
+            "fts" | "vector" | "sql" => {}
+            "warm" => warm = true,
+            "cold" => cold = true,
+            "search" => {
+                warm = true;
+                cold = true;
+            }
+            other if prefix.is_none() => prefix = Some(other),
+            other => {
+                eprintln!("[dataset] unexpected token {other:?}");
+                dataset_usage_and_exit(2);
+            }
+        }
+    }
+    let Some(prefix) = prefix else {
+        dataset_usage_and_exit(2)
+    };
+    if let Err(reason) = tiers::supertable_backend_check() {
+        eprintln!("[dataset] {reason}");
+        std::process::exit(2);
+    }
+    dataset::set_prefix(prefix);
+    if modalities.is_empty() {
+        modalities = vec![Modality::Fts, Modality::Vector, Modality::Sql];
+    }
+    if !(warm || cold) {
+        warm = true;
+        cold = true;
+    }
+
+    for &m in &modalities {
+        let dir = ingest_modality(m).dataset_dir();
+        let exists = ingest::dataset_exists(ingest_modality(m));
+        let phases = match (verb, exists) {
+            (DatasetVerb::Prepare, true) => {
+                eprintln!(
+                    "[dataset] {prefix}/{dir} already exists — bench it or pick a new prefix"
+                );
+                std::process::exit(1);
+            }
+            (DatasetVerb::Bench, false) => {
+                eprintln!("[dataset] {prefix}/{dir} not found — prepare it first");
+                std::process::exit(1);
+            }
+            (DatasetVerb::Prepare, false) => Phases {
+                build: true,
+                warm: false,
+                cold: false,
+            },
+            (DatasetVerb::Bench, true) => Phases {
+                build: false,
+                warm,
+                cold,
+            },
+            (DatasetVerb::Run, exists) => {
+                if exists {
+                    eprintln!("[dataset] {prefix}/{dir} exists — skipping prepare");
+                }
+                Phases {
+                    build: !exists,
+                    warm,
+                    cold,
+                }
+            }
+        };
+        run_cell(Tier::Supertable, m, phases);
+    }
+}
+
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "Usage:\n  cargo bench -- [tier] [modality] [phase ...]\n  cargo bench -- <diagnostic>\n\
+         \x20 cargo bench -- dataset <prepare|bench|run> <prefix> [modality ...] [phase]\n\
          \n\
          Tier      : superfile | supertable        (omitted => both)\n\
          Modality  : fts | vector | sql            (omitted => all three)\n\
@@ -249,6 +375,16 @@ fn parse_args() -> Selection {
 fn main() {
     // Isolated per-shape supertable ingest child (`INFINO_BENCH_SUPERTABLE_SHAPE`).
     if infino_bench_utils::supertable::handle_shape_child_from_env() {
+        return;
+    }
+
+    // `dataset <verb> ...` is its own grammar, separate from the matrix.
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if args.first().map(String::as_str) == Some("dataset") {
+        run_dataset_command(&args[1..]);
         return;
     }
 
