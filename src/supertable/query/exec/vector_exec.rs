@@ -459,7 +459,7 @@ mod tests {
         )
     }
 
-    fn options_one_segment_per_commit(dim: usize) -> SupertableOptions {
+    fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -509,9 +509,9 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)]).expect("batch")
     }
 
-    /// Single-segment supertable with `n` one-hot docs.
-    fn supertable_one_segment(dim: usize, n: usize) -> Supertable {
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+    /// Single-superfile supertable with `n` one-hot docs.
+    fn supertable_one_superfile(dim: usize, n: usize) -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, n, dim, schema))
@@ -574,14 +574,14 @@ mod tests {
     #[test]
     fn vector_search_tvf_emits_id_and_score_in_distance_order() {
         let dim = 16;
-        let st = supertable_one_segment(dim, 8);
+        let st = supertable_one_superfile(dim, 8);
         let sql = format!(
             "SELECT _id, title, score FROM vector_search('emb', '{}', 8)",
             csv_one_hot(dim, 0)
         );
         let batches = st.reader().query_sql(&sql).expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 8, "single segment, k=8 → all 8 docs resolved");
+        assert_eq!(total, 8, "single superfile, k=8 → all 8 docs resolved");
 
         let b = &batches[0];
         assert_eq!(b.num_columns(), 3);
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn vector_search_tvf_star_projection_appends_score_column() {
         let dim = 16;
-        let st = supertable_one_segment(dim, 8);
+        let st = supertable_one_superfile(dim, 8);
         let sql = format!(
             "SELECT * FROM vector_search('emb', '{}', 3)",
             csv_one_hot(dim, 0)
@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn vector_search_tvf_score_only_projection() {
         let dim = 16;
-        let st = supertable_one_segment(dim, 8);
+        let st = supertable_one_superfile(dim, 8);
         let sql = format!(
             "SELECT score FROM vector_search('emb', '{}', 2)",
             csv_one_hot(dim, 0)
@@ -642,10 +642,10 @@ mod tests {
     #[test]
     fn vector_search_tvf_score_only_matches_full_projection_scores() {
         // The `score`-only projection decodes no scalar columns (opens
-        // no segment readers); it must still produce the exact scores
+        // no superfile readers); it must still produce the exact scores
         // and row count of the fully-resolved projection.
         let dim = 16;
-        let st = supertable_one_segment(dim, 8);
+        let st = supertable_one_superfile(dim, 8);
         let q = csv_one_hot(dim, 0);
         let full = st
             .reader()
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn vector_search_tvf_accepts_sql_array_literal() {
         let dim = 16;
-        let st = supertable_one_segment(dim, 8);
+        let st = supertable_one_superfile(dim, 8);
         let arr = (0..dim)
             .map(|d| if d == 0 { "1.0" } else { "0.0" })
             .collect::<Vec<_>>()
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn vector_search_tvf_empty_supertable_returns_no_rows() {
         let dim = 16;
-        let st = Supertable::create(options_one_segment_per_commit(dim)).expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let sql = format!(
             "SELECT _id, score FROM vector_search('emb', '{}', 5)",
             csv_one_hot(dim, 0)

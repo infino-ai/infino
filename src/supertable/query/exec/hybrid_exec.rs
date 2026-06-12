@@ -40,7 +40,7 @@
 //! contributions from the two lists are summed. The emitted `score`
 //! column is the fused RRF score — **higher is better**, so `ORDER BY
 //! score DESC` lists the best blended matches first. Identity is
-//! `(segment, local_doc_id)`, so a document surfaced by *both*
+//! `(superfile, local_doc_id)`, so a document surfaced by *both*
 //! retrievers is boosted above one surfaced by a single retriever.
 
 use std::any::Any;
@@ -434,9 +434,9 @@ impl ExecutionPlan for HybridSearchExec {
 /// fusion.
 ///
 /// Each list is assumed best-first. A hit at 0-based position `r`
-/// contributes `1 / (RRF_K + r + 1)` to its `(segment, local_doc_id)`
+/// contributes `1 / (RRF_K + r + 1)` to its `(superfile, local_doc_id)`
 /// identity; contributions from the two lists are summed. The result
-/// is sorted by fused score descending — `(segment, local_doc_id)` as
+/// is sorted by fused score descending — `(superfile, local_doc_id)` as
 /// a total tie-break so the order is deterministic regardless of the
 /// `HashMap`'s iteration order — and truncated to `k`. The returned
 /// hits carry the fused RRF score (higher is better).
@@ -446,14 +446,14 @@ fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<Sup
     for list in [bm25, vector] {
         for (rank, hit) in list.iter().enumerate() {
             let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            *acc.entry((hit.segment, hit.local_doc_id)).or_insert(0.0) += contribution;
+            *acc.entry((hit.superfile, hit.local_doc_id)).or_insert(0.0) += contribution;
         }
     }
 
     let mut fused: Vec<SuperfileHit> = acc
         .into_iter()
-        .map(|((segment, local_doc_id), score)| SuperfileHit {
-            segment,
+        .map(|((superfile, local_doc_id), score)| SuperfileHit {
+            superfile,
             local_doc_id,
             score,
         })
@@ -462,7 +462,7 @@ fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<Sup
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.segment.cmp(&b.segment))
+            .then_with(|| a.superfile.cmp(&b.superfile))
             .then_with(|| a.local_doc_id.cmp(&b.local_doc_id))
     });
     fused.truncate(k);
@@ -546,7 +546,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(title_arr), Arc::new(fsl)]).expect("batch")
     }
 
-    /// Demo corpus (single segment). `async` is unique to doc 0;
+    /// Demo corpus (single superfile). `async` is unique to doc 0;
     /// `rust` is in docs 0 + 4. Doc `i`'s vector is one-hot at dim `i`.
     fn demo(dim: usize) -> Supertable {
         let st = Supertable::create(options_title_emb(dim)).expect("create");
@@ -629,7 +629,7 @@ mod tests {
     fn rrf_fuse_boosts_shared_hits_and_orders_by_fused_score() {
         let seg = SuperfileUri::new_v4();
         let h = |doc: u32, score: f32| SuperfileHit {
-            segment: seg,
+            superfile: seg,
             local_doc_id: doc,
             score,
         };
@@ -653,7 +653,7 @@ mod tests {
     fn rrf_fuse_truncates_to_k() {
         let seg = SuperfileUri::new_v4();
         let h = |doc: u32| SuperfileHit {
-            segment: seg,
+            superfile: seg,
             local_doc_id: doc,
             score: 0.0,
         };
@@ -664,23 +664,23 @@ mod tests {
     }
 
     #[test]
-    fn rrf_fuse_distinguishes_same_doc_id_across_segments() {
+    fn rrf_fuse_distinguishes_same_doc_id_across_superfiles() {
         // local_doc_id alone is not a global identity: the same
-        // doc id in two segments are *different* hits.
+        // doc id in two superfiles are *different* hits.
         let seg_a = SuperfileUri::new_v4();
         let seg_b = SuperfileUri::new_v4();
         let bm25 = vec![SuperfileHit {
-            segment: seg_a,
+            superfile: seg_a,
             local_doc_id: 0,
             score: 1.0,
         }];
         let vector = vec![SuperfileHit {
-            segment: seg_b,
+            superfile: seg_b,
             local_doc_id: 0,
             score: 0.1,
         }];
         let fused = rrf_fuse(&bm25, &vector, 10);
-        assert_eq!(fused.len(), 2, "distinct segments → distinct hits");
+        assert_eq!(fused.len(), 2, "distinct superfiles → distinct hits");
     }
 
     // ---- end-to-end through query_sql ----
@@ -825,7 +825,7 @@ mod tests {
     // but nothing else covered: a single SQL statement that JOINs an
     // FTS retriever (`bm25_search`) and a vector retriever
     // (`vector_search`) on the durable `_id` and post-filters with a
-    // scalar `WHERE` — across two segments.
+    // scalar `WHERE` — across two superfiles.
 
     /// Schema `[category (scalar), title (FTS), emb (vector)]`. Unlike
     /// `options_title_emb`, `category` is a plain scalar column (not in
@@ -894,7 +894,7 @@ mod tests {
         .expect("batch")
     }
 
-    /// Two-segment corpus (docs 0–3, then 4–7) engineered so the three
+    /// Two-superfile corpus (docs 0–3, then 4–7) engineered so the three
     /// retrievers each drop a *different* doc. With dim = 8 and a graded
     /// query vector `[8,7,…,1]`, the cosine distance to one-hot doc `i`
     /// is strictly increasing in `i`, so `vector_search(k=5)` is exactly
@@ -905,7 +905,7 @@ mod tests {
     ///   - three-way intersection    = {0,3}
     /// Sole-reason witnesses: doc1 dropped only by FTS, doc2 only by the
     /// scalar filter, doc5 only by the vector cutoff.
-    fn demo_cat_two_segments(dim: usize) -> Supertable {
+    fn demo_cat_two_superfiles(dim: usize) -> Supertable {
         let st = Supertable::create(options_cat_title_emb(dim)).expect("create");
         let schema = st.options().schema.clone();
         // Each writer holds the single-writer lock until dropped, so
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn sql_join_of_bm25_and_vector_with_scalar_filter_matches_three_way_intersection() {
         let dim = 16;
-        let st = demo_cat_two_segments(dim);
+        let st = demo_cat_two_superfiles(dim);
         // Graded query vector [dim, dim-1, …, 1] → cosine distance to
         // one-hot doc `i` is strictly increasing in `i`, so the vector
         // distance rank equals the doc id (no ties among the 8 docs).
@@ -973,7 +973,7 @@ mod tests {
 
         // THE query under test: FTS ⋈ vector on the durable _id, then a
         // scalar SQL predicate — sql + vector + fts in one statement,
-        // spanning two segments.
+        // spanning two superfiles.
         let combined_batches = st
             .reader()
             .query_sql(&format!(

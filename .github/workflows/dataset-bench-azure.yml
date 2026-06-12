@@ -1,0 +1,315 @@
+name: Dataset bench (Azure)
+
+# Prepare and/or benchmark a reusable dataset in Azure Blob, via the bench
+# binary's `dataset` verbs:
+#   prepare — generate the corpus, ingest it to the prefix, write the sidecar
+#   bench   — open the existing dataset and run the read phases (no ingest)
+#   run     — prepare if absent, then bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset prefix in the blob container (e.g. datasets/bench-10m)."
+        required: true
+        type: string
+      mode:
+        description: "prepare the dataset, bench an existing one, or run end-to-end."
+        required: false
+        default: bench
+        type: choice
+        options: [bench, prepare, run]
+      modality:
+        description: "Which index to prepare/query."
+        required: false
+        default: vector
+        type: choice
+        options: [fts, vector, sql]
+      docs:
+        description: "Doc count the dataset was prepared with (must match; plain integer)."
+        required: true
+        type: string
+      phase:
+        description: "search = warm + cold; warm or cold to run one tier."
+        required: false
+        default: search
+        type: choice
+        options: [search, warm, cold]
+      cache_gib:
+        description: "Force the read disk-cache budget (GiB). Empty = auto-size from the index."
+        required: false
+        default: ""
+        type: string
+      vm_size:
+        description: "Azure VM size."
+        required: false
+        default: "Standard_D8s_v7"
+        type: string
+      location:
+        description: "VM region."
+        required: false
+        default: "eastus"
+        type: string
+      ref:
+        description: "Git ref / SHA to build the bench from."
+        required: false
+        default: "main"
+        type: string
+      timeout_minutes:
+        description: "Hard auto-stop; VM is torn down when hit."
+        required: false
+        default: "30"
+        type: string
+
+permissions:
+  id-token: write   # Azure OIDC federated login
+  contents: read    # clone the repo on the VM via the job token
+
+env:
+  RG: rg-infino-bench
+  VM: dataset-bench-vm-${{ github.run_id }}
+  ADMIN: azureuser
+  SCCACHE_VERSION: v0.8.2
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    environment: ci
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    steps:
+      # Fail before spending a VM when the mode can't succeed: bench needs
+      # the dataset (its sidecar) present, prepare needs the prefix free.
+      # `modality` is also the dataset's sub-prefix (see Modality::dataset_dir).
+      - name: Pre-flight — dataset state vs mode
+        env:
+          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+        run: |
+          set -euo pipefail
+          sidecar="${{ inputs.dataset }}/${{ inputs.modality }}/dataset.json"
+          exists="$(az storage blob exists --account-name "$ACC" --account-key "$KEY" \
+                     -c "$CONTAINER" -n "$sidecar" --query exists -o tsv)"
+          case "${{ inputs.mode }}" in
+            bench)
+              [ "$exists" = "true" ] \
+                || { echo "::error::dataset not found: $sidecar — prepare it first."; exit 1; } ;;
+            prepare)
+              [ "$exists" != "true" ] \
+                || { echo "::error::dataset already exists: $sidecar — bench it or pick a new prefix."; exit 1; } ;;
+            run)
+              echo "dataset exists=$exists — run will $([ "$exists" = "true" ] && echo 'skip prepare' || echo 'prepare first')" ;;
+          esac
+          echo "pre-flight OK: mode=${{ inputs.mode }} sidecar=$sidecar"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision ephemeral VM
+        id: provision
+        run: |
+          set -euo pipefail
+          SIZE="${{ inputs.vm_size }}"
+          TAGS=(purpose=dataset-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}")
+          az vm create \
+            -g "$RG" -n "$VM" \
+            --image Ubuntu2204 \
+            --size "$SIZE" \
+            --admin-username "$ADMIN" \
+            --generate-ssh-keys \
+            --public-ip-sku Standard \
+            --os-disk-size-gb 128 \
+            --nsg-rule NONE \
+            --nsg "${VM}-nsg" \
+            --public-ip-address "${VM}-pip" \
+            --vnet-name "${VM}-vnet" \
+            --subnet "${VM}-subnet" \
+            --os-disk-name "${VM}-osdisk" \
+            --tags "${TAGS[@]}" \
+            -o none
+          RUNNER_IP="$(curl -s https://api.ipify.org)"
+          az network nsg rule create \
+            -g "$RG" --nsg-name "${VM}-nsg" -n allow-ssh-runner --priority 300 \
+            --access Allow --protocol Tcp --direction Inbound \
+            --destination-port-ranges 22 \
+            --source-address-prefixes "${RUNNER_IP}/32" -o none
+          VM_IP="$(az vm show -d -g "$RG" -n "$VM" --query publicIps -o tsv)"
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+          echo "Provisioned $VM ($SIZE) at $VM_IP"
+
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 "${ADMIN}@${VM_IP}" true 2>/dev/null; then
+              echo "SSH up after ${i} tries"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSH never came up"; exit 1
+
+      - name: Clone repo + toolchain + sccache (on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "GH_TOKEN='${{ github.token }}' \
+             REPO='${{ github.repository }}' \
+             REF='${{ inputs.ref }}' \
+             SCCACHE_VERSION='${{ env.SCCACHE_VERSION }}' \
+             bash -s" <<'REMOTE'
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkg-config cmake clang protobuf-compiler git
+          if ! command -v sccache >/dev/null 2>&1; then
+            TARBALL="sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+            curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}.tar.gz" \
+              | tar -xz
+            sudo install "${TARBALL}/sccache" /usr/local/bin/sccache
+          fi
+          rm -rf "$HOME/infino-src"
+          git clone --filter=blob:none \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$HOME/infino-src"
+          cd "$HOME/infino-src"
+          git checkout "$REF" 2>/dev/null \
+            || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
+          echo "Checked out: $(git rev-parse --short HEAD)"
+          REMOTE
+
+      - name: Build (sccache, on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
+             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cd "$HOME/infino-src"
+          export RUSTC_WRAPPER=sccache
+          export CARGO_INCREMENTAL=0
+          export SCCACHE_AZURE_BLOB_CONTAINER="$INFINO_REAL_AZURE_CONTAINER"
+          export SCCACHE_AZURE_KEY_PREFIX=sccache
+          export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+          sccache --start-server || true
+          cargo bench --no-run
+          BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name 'bench-*' \
+                   -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+          test -n "$BIN" && test -x "$BIN" || { echo "::error::bench binary not found"; exit 1; }
+          printf '%s\n' "$BIN" > "$HOME/bench-bin"
+          echo "built bench: $BIN"
+          sccache --show-stats || true
+          REMOTE
+
+      - name: Run benchmark (on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
+             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             CACHE_GIB='${{ inputs.cache_gib }}' \
+             MODE='${{ inputs.mode }}' \
+             DATASET='${{ inputs.dataset }}' \
+             MODALITY='${{ inputs.modality }}' \
+             PHASE='${{ inputs.phase }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
+          set -euo pipefail
+          cd "$HOME/infino-src"
+          export INFINO_BENCH_STORE=azure
+          [ -n "$CACHE_GIB" ] && export INFINO_SUPERTABLE_SEARCH_CACHE_GIB="$CACHE_GIB"
+          ulimit -n "$(ulimit -Hn)"
+          BIN="$(cat "$HOME/bench-bin")"
+          echo "===== DATASET ${MODE} ${DATASET} ${MODALITY} ${PHASE} START ====="
+          "$BIN" dataset "$MODE" "$DATASET" "$MODALITY" "$PHASE" 2>&1
+          echo "===== DATASET ${MODE} ${DATASET} ${MODALITY} ${PHASE} END ====="
+          REMOTE
+
+      - name: Summarize results
+        if: always()
+        run: |
+          set +e -u -o pipefail
+          SUMMARY="$GITHUB_STEP_SUMMARY"
+          LOG=/tmp/bench.clean
+          {
+            echo "## Dataset \`${{ inputs.mode }}\` — \`${{ inputs.modality }}\` on \`${{ inputs.dataset }}\`"
+            echo ""
+            echo "- docs: \`${{ inputs.docs }}\` · phase: \`${{ inputs.phase }}\` · vm: \`${{ inputs.vm_size }}\` · ref: \`${{ inputs.ref }}\`"
+            echo ""
+          } >> "$SUMMARY"
+          : > "$LOG"
+          for f in /tmp/build.log /tmp/bench.log; do
+            [ -s "$f" ] && sed -r 's/\x1b\[[0-9;]*m//g' "$f" >> "$LOG"
+          done
+          if [ ! -s "$LOG" ]; then
+            echo "::error::No output produced — provisioning or SSH failed (see job logs)."
+            echo "_No output produced._" >> "$SUMMARY"
+            exit 1
+          fi
+          if grep -q '══' "$LOG"; then
+            REPORT_OK=1
+            {
+              echo "### Results"
+              echo '```'
+              awk '/══/{f=1} f' "$LOG" | grep -vE '^=====|^\[[a-z][a-z_]*\]'
+              echo '```'
+            } >> "$SUMMARY"
+          else
+            REPORT_OK=0
+            echo "**❌ No report table — the run failed.**" >> "$SUMMARY"
+          fi
+          ERRORS="$(grep -nE 'panicked|error\[|knob mismatch|UnsupportedVersion|HTTP error|storage error|skipped:' "$LOG" || true)"
+          if [ -n "$ERRORS" ]; then
+            {
+              echo "### 🛑 Errors & panics"
+              echo '```'
+              printf '%s\n' "$ERRORS"
+              echo '```'
+            } >> "$SUMMARY"
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::${line}"
+            done <<< "$(grep -E 'panicked at|knob mismatch|storage error|HTTP error' "$LOG" | head -n 8)"
+          fi
+          echo "" >> "$SUMMARY"
+          echo "_Full output attached as the \`dataset-bench-log\` artifact._" >> "$SUMMARY"
+          if [ "$REPORT_OK" -ne 1 ]; then
+            echo "::error::Dataset bench produced no results."
+            exit 1
+          fi
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-bench-log
+          path: |
+            /tmp/build.log
+            /tmp/bench.log
+          if-no-files-found: warn
+
+      - name: Teardown (always)
+        if: always()
+        env:
+          NIC: ${{ env.VM }}VMNic
+        run: |
+          az vm delete            -g "$RG" -n "$VM"          --yes        || true
+          az network nic delete   -g "$RG" -n "$NIC"                      || true
+          az disk delete          -g "$RG" -n "${VM}-osdisk" --yes        || true
+          az network public-ip delete -g "$RG" -n "${VM}-pip"             || true
+          az network nsg delete   -g "$RG" -n "${VM}-nsg"                 || true
+          az network vnet delete  -g "$RG" -n "${VM}-vnet"                || true

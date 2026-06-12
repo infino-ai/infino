@@ -9,9 +9,11 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use infino::superfile::builder::{FtsConfig, VectorConfig};
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::superfile::vector::distance::Metric;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::storage::StorageProvider;
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
@@ -57,7 +59,11 @@ const CORPUS_TEXT_SEED: u64 = 1;
 
 /// Random-rotation RNG seed for the bench vector index.
 const ROT_SEED: u64 = 7;
-/// Writer auto-flush threshold (MiB) per segment roll.
+/// Distance metric for the bench vector index.
+const BENCH_METRIC: Metric = Metric::Cosine;
+/// Rerank residual codec for the bench vector index.
+const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
+/// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget (8 GiB) capping resident RSS during ingest.
 const WRITER_MEMORY_BUDGET_BYTES: u64 = 8 * (1u64 << 30);
@@ -106,6 +112,15 @@ impl Modality {
     }
     pub fn has_sql(self) -> bool {
         matches!(self, Modality::Sql)
+    }
+    /// Path token namespacing a prepared dataset by modality.
+    pub fn dataset_dir(self) -> &'static str {
+        match self {
+            Modality::Fts => "fts",
+            Modality::Vector => "vector",
+            Modality::Sql => "sql",
+            Modality::Combined => "combined",
+        }
     }
 }
 
@@ -161,7 +176,7 @@ pub fn options_for(
         return opts;
     }
     let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_segment = (n_cent_total / n_commits()).max(1);
+    let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus::get().max(1))
@@ -180,10 +195,10 @@ pub fn options_for(
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim: DIM,
-            n_cent: n_cent_per_segment,
+            n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
-            metric: Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+            metric: BENCH_METRIC,
+            rerank_codec: BENCH_RERANK,
         }]
     } else {
         vec![]
@@ -201,6 +216,21 @@ pub fn options_for(
 
 pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> SupertableOptions {
     options_for(Modality::Combined, storage)
+}
+
+/// The corpus + index knobs this bench config builds with.
+pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
+    crate::dataset::Knobs {
+        doc_count: n_docs(),
+        dim: DIM,
+        n_cent_total: corpus::n_cent(n_docs()),
+        vec_seed: CORPUS_VEC_SEED,
+        text_seed: CORPUS_TEXT_SEED,
+        rot_seed: ROT_SEED,
+        metric: format!("{BENCH_METRIC:?}"),
+        rerank_codec: format!("{BENCH_RERANK:?}"),
+        modality: format!("{modality:?}"),
+    }
 }
 
 /// Corpus artifacts for one supertable build, generated to disk and
@@ -260,9 +290,15 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         fmt_count(n_docs),
         modality_label(modality),
     );
-    let storage_backend = tiers::block_on(tiers::supertable_storage_fixture());
+    let storage_backend = tiers::block_on(async {
+        if crate::dataset::dataset_mode() {
+            tiers::dataset_storage_fixture(modality.dataset_dir()).await
+        } else {
+            tiers::supertable_storage_fixture().await
+        }
+    });
     let cleanup = storage_backend.cleanup.clone();
-    // Disk cache attached only to keep segment bytes out of the unbounded
+    // Disk cache attached only to keep superfile bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
     let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));
@@ -343,6 +379,16 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
     } else {
         (None, None)
     };
+    if crate::dataset::dataset_mode() {
+        write_sidecar(
+            &storage_backend.storage,
+            modality,
+            n_superfiles,
+            total_index_bytes,
+            sql_sample_title.clone(),
+            sql_sample_key.clone(),
+        );
+    }
     IngestResult {
         storage: storage_backend.storage,
         storage_label: storage_backend.storage_label,
@@ -352,6 +398,74 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         sql_sample_title,
         sql_sample_key,
     }
+}
+
+/// Write the dataset sidecar next to a freshly prepared dataset. Atomic
+/// create: a pre-existing sidecar means the prefix already holds a dataset, so
+/// this fails rather than clobbering it — re-prepare into a fresh prefix.
+fn write_sidecar(
+    storage: &Arc<dyn StorageProvider>,
+    modality: Modality,
+    n_superfiles: usize,
+    total_index_bytes: u64,
+    sql_sample_title: Option<String>,
+    sql_sample_key: Option<String>,
+) {
+    let meta = crate::dataset::DatasetMeta {
+        knobs: current_knobs(modality),
+        n_superfiles,
+        total_index_bytes,
+        builder_id: infino::BUILDER_ID.to_string(),
+        sql_sample_title,
+        sql_sample_key,
+    };
+    let json = serde_json::to_vec_pretty(&meta).expect("serialize dataset sidecar");
+    tiers::block_on(storage.put_atomic(crate::dataset::SIDECAR, Bytes::from(json)))
+        .expect("write dataset sidecar");
+    eprintln!(
+        "[supertable_ingest] wrote {} for the {} dataset",
+        crate::dataset::SIDECAR,
+        modality.dataset_dir(),
+    );
+}
+
+/// Open a pre-uploaded dataset for the read phases: resolve storage at the
+/// fixed prefix, load and verify the sidecar, and return an [`IngestResult`]
+/// the warm/cold runners consume exactly like a freshly built one — no corpus
+/// generation, no ingest.
+pub fn open_dataset(modality: Modality) -> IngestResult {
+    let storage_backend = tiers::block_on(tiers::dataset_storage_fixture(modality.dataset_dir()));
+    let meta = read_sidecar(&storage_backend.storage);
+    crate::dataset::verify(&meta, &current_knobs(modality));
+    eprintln!(
+        "[supertable_dataset] opened {} dataset: {} superfiles, {:.2} GiB index bytes on {}",
+        modality.dataset_dir(),
+        meta.n_superfiles,
+        meta.total_index_bytes as f64 / (1u64 << 30) as f64,
+        storage_backend.storage_label,
+    );
+    IngestResult {
+        storage: storage_backend.storage,
+        storage_label: storage_backend.storage_label,
+        n_superfiles: meta.n_superfiles,
+        total_index_bytes: meta.total_index_bytes,
+        cleanup: None,
+        sql_sample_title: meta.sql_sample_title,
+        sql_sample_key: meta.sql_sample_key,
+    }
+}
+
+/// Whether a prepared dataset (its sidecar) exists for `modality` at the
+/// configured prefix.
+pub fn dataset_exists(modality: Modality) -> bool {
+    let fixture = tiers::block_on(tiers::dataset_storage_fixture(modality.dataset_dir()));
+    tiers::block_on(fixture.storage.head(crate::dataset::SIDECAR)).is_ok()
+}
+
+fn read_sidecar(storage: &Arc<dyn StorageProvider>) -> crate::dataset::DatasetMeta {
+    let (bytes, _) = tiers::block_on(storage.get(crate::dataset::SIDECAR))
+        .expect("read dataset sidecar — is the dataset prepared at this prefix?");
+    serde_json::from_slice(&bytes).expect("parse dataset sidecar")
 }
 
 /// One commit chunk's `RecordBatch` for `modality`, borrowing the text

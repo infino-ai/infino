@@ -7,17 +7,17 @@
 //! DataFusion's `ParquetSource` reads its input through an
 //! [`object_store::ObjectStore`]. This is that store — and *only* that.
 //! It owns no storage policy: it serves byte ranges straight out of the
-//! [`LazyByteSource`] each segment's [`SuperfileReader::byte_source`]
+//! [`LazyByteSource`] each superfile's [`SuperfileReader::byte_source`]
 //! already exposes. The provider calls `superfile_reader(...)`, takes
 //! the byte source, registers it here, and DataFusion reads.
 //!
 //! There is exactly one read path and no branch on storage mode:
 //!
-//! - warm / mmap-backed segments resolve every range as a zero-copy
+//! - warm / mmap-backed superfiles resolve every range as a zero-copy
 //!   `Bytes::slice` (the resident-bytes [`LazyByteSource`]); nothing is
 //!   copied into a DataFusion `InMemory` store, so warm SQL is as cheap
 //!   as the FTS/vector resolve path (slice = refcount bump).
-//! - cold / lazy segments range-fetch straight from object storage
+//! - cold / lazy superfiles range-fetch straight from object storage
 //!   through the same source.
 //!
 //! Only the read methods are real; this store is never written to,
@@ -44,41 +44,41 @@ use object_store::{
 
 use crate::superfile::LazyByteSource;
 
-/// Fixed `last_modified` reported for every registered segment.
+/// Fixed `last_modified` reported for every registered superfile.
 /// Superfiles are immutable once committed, so a wall-clock timestamp
 /// carries no signal here — and a value that changed on every call
 /// would defeat any downstream cache keyed on `(path, last_modified)`
 /// and make responses non-deterministic.
-const SEGMENT_LAST_MODIFIED: chrono::DateTime<chrono::Utc> = chrono::DateTime::UNIX_EPOCH;
+const SUPERFILE_LAST_MODIFIED: chrono::DateTime<chrono::Utc> = chrono::DateTime::UNIX_EPOCH;
 
-/// Read-only [`ObjectStore`] backed by per-segment [`LazyByteSource`]s.
+/// Read-only [`ObjectStore`] backed by per-superfile [`LazyByteSource`]s.
 ///
 /// Construct via [`from_sources`](Self::from_sources) with the byte
 /// sources the provider pulled from `superfile_reader`, register it on
 /// the DataFusion session, and point each `PartitionedFile` at the
 /// matching path. See the module docs.
 pub(crate) struct SuperfileObjectStore {
-    /// One byte source per surviving segment, keyed by the same path
-    /// used to build the segment's `PartitionedFile`.
+    /// One byte source per surviving superfile, keyed by the same path
+    /// used to build the superfile's `PartitionedFile`.
     sources: HashMap<ObjPath, Arc<dyn LazyByteSource>>,
 }
 
 impl fmt::Debug for SuperfileObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SuperfileObjectStore")
-            .field("n_segments", &self.sources.len())
+            .field("n_superfiles", &self.sources.len())
             .finish()
     }
 }
 
 impl fmt::Display for SuperfileObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SuperfileObjectStore({} segments)", self.sources.len())
+        write!(f, "SuperfileObjectStore({} superfiles)", self.sources.len())
     }
 }
 
 impl SuperfileObjectStore {
-    /// Build the store from the segment byte sources gathered during a
+    /// Build the store from the superfile byte sources gathered during a
     /// scan. Each key is the path the matching `PartitionedFile` is
     /// created with.
     pub(crate) fn from_sources(sources: HashMap<ObjPath, Arc<dyn LazyByteSource>>) -> Self {
@@ -88,7 +88,7 @@ impl SuperfileObjectStore {
     fn source(&self, location: &ObjPath) -> OsResult<&Arc<dyn LazyByteSource>> {
         self.sources.get(location).ok_or_else(|| OsError::NotFound {
             path: location.to_string(),
-            source: format!("segment {location} not registered in SuperfileObjectStore").into(),
+            source: format!("superfile {location} not registered in SuperfileObjectStore").into(),
         })
     }
 }
@@ -118,7 +118,7 @@ impl ObjectStore for SuperfileObjectStore {
         let size = source.size();
         let meta = ObjectMeta {
             location: location.clone(),
-            last_modified: SEGMENT_LAST_MODIFIED,
+            last_modified: SUPERFILE_LAST_MODIFIED,
             size,
             e_tag: None,
             version: None,

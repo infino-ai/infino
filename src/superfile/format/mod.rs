@@ -185,7 +185,7 @@ pub mod vec {
     ///   `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`,
     ///   block size `count[c] * (code_bytes + 4)`.
     ///
-    /// Only this version is accepted on read; a segment stamped
+    /// Only this version is accepted on read; a superfile stamped
     /// with any other value at this slot is rejected as malformed
     /// rather than carrying an alternate parse path.
     pub const SUBSECTION_VERSION: u32 = 2;
@@ -285,7 +285,7 @@ pub mod kv {
     /// Required: name of the schema column serving the `id` role.
     pub const ID_COLUMN: &str = "inf.id_column";
 
-    /// Required: total document count in this segment (string-encoded u64).
+    /// Required: total document count in this superfile (string-encoded u64).
     pub const N_DOCS: &str = "inf.n_docs";
 
     /// Required: writer library + version + git commit (auto-populated at
@@ -373,7 +373,7 @@ impl Version {
         })
     }
 
-    /// Reader policy: accept this segment if its format-version's major
+    /// Reader policy: accept this superfile if its format-version's major
     /// matches our `FORMAT_VERSION`'s major. Minor/patch differences are
     /// forward-compatible by design (unknown KV keys ignored, unknown JSON
     /// fields ignored).

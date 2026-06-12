@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Binary encodings for the per-segment skip-summary types
+//! Binary encodings for the per-superfile skip-summary types
 //! that ride inside the manifest-part Avro schema as opaque
 //! `bytes` fields.
 //!
 //! The Avro layer doesn't need to introspect these — the
 //! aggregate skip pruning at the manifest-list level uses
-//! the parent-level aggregates, not the per-segment bytes;
-//! the per-segment summaries are loaded into memory by the
-//! manifest-part decoder and consumed by the segment-level
+//! the parent-level aggregates, not the per-superfile bytes;
+//! the per-superfile summaries are loaded into memory by the
+//! manifest-part decoder and consumed by the superfile-level
 //! prune path.
 //!
 //! Three encodings, all little-endian, all designed for
@@ -253,7 +253,7 @@ pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     }
     out.extend_from_slice(&s.radius.to_le_bytes());
     // Per-cluster centroid block: n_cent, dim, then counts / mins /
-    // scales / Sq8 codes. `n_cent == 0` encodes a segment with no
+    // scales / Sq8 codes. `n_cent == 0` encodes a superfile with no
     // vector index for the column (empty trailer).
     out.extend_from_slice(&cl.n_cent.to_le_bytes());
     out.extend_from_slice(&cl.dim.to_le_bytes());
@@ -291,7 +291,7 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
     let radius = f32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
 
     // Per-cluster centroid block (new-engine format). `n_cent == 0` is
-    // a segment with no vector index for the column.
+    // a superfile with no vector index for the column.
     let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
     let cdim = read_u32(&mut c, "cluster_dim")? as usize;
 

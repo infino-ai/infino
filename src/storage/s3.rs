@@ -227,8 +227,8 @@ const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// Tuned HTTP client options for the object-store-native fan-out.
 ///
 /// The supertable vector/FTS query path fans out one cold-open +
-/// cold-search batch per segment concurrently. With the default
-/// idle-connection pool, a wide fan-out (hundreds of segments ×
+/// cold-search batch per superfile concurrently. With the default
+/// idle-connection pool, a wide fan-out (hundreds of superfiles ×
 /// several range GETs each) churns TCP/TLS connections — each new
 /// connection pays a TLS handshake RTT on top of the request RTT,
 /// inflating the p99 tail under load. Keeping a large warm idle

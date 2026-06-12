@@ -42,7 +42,7 @@ pub struct Supertable {
 /// single-writer slot enforcement.
 pub(super) struct SupertableInner {
     /// Schema, FTS columns, vector columns, tokenizer, thread
-    /// pools, segment store, commit threshold. Immutable for
+    /// pools, superfile store, commit threshold. Immutable for
     /// the supertable's lifetime; shared via Arc so readers,
     /// the writer, and rayon shard workers all see the same
     /// instances without copying.
@@ -368,7 +368,7 @@ impl Supertable {
         let eager = n_parts <= threshold;
 
         let parts_map = dashmap::DashMap::new();
-        let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
+        let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
         if eager {
             // Eager path: parallel-fetch every part + populate
             // the flat superfile_list.superfiles view so the
@@ -390,7 +390,7 @@ impl Supertable {
                     part_id: pid.0.to_string(),
                     source: Box::new(e),
                 })?;
-                all_segments.extend(part.superfiles.iter().cloned());
+                all_superfiles.extend(part.superfiles.iter().cloned());
                 let cell = tokio::sync::OnceCell::new();
                 cell.set(part).expect("fresh OnceCell");
                 parts_map.insert(*pid, Arc::new(cell));
@@ -417,7 +417,7 @@ impl Supertable {
         let options_arc = Arc::new(options);
         let mut superfile_list = SuperfileList::empty(options_arc.clone());
         superfile_list.manifest_id = pointer.manifest_id;
-        superfile_list.superfiles = all_segments;
+        superfile_list.superfiles = all_superfiles;
 
         let manifest = Manifest {
             superfile_list,
@@ -575,7 +575,7 @@ impl Supertable {
         // 4. Rebuild the flat superfile_list from all parts in
         //    the new manifest — eager mode only. In lazy
         //    mode the flat view stays empty until the hierarchical query path lands.
-        let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
+        let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
         if eager {
             for entry in &new_list.parts {
                 let cell = new_parts.get(&entry.part_id).expect("part inserted above");
@@ -583,16 +583,16 @@ impl Supertable {
                     .value()
                     .get()
                     .expect("eager-fetched or inherited; must be set");
-                all_segments.extend(part.superfiles.iter().cloned());
+                all_superfiles.extend(part.superfiles.iter().cloned());
             }
         }
 
         // 5. Build + ArcSwap the new Manifest.
-        let mut new_segment_list = SuperfileList::empty(self.inner.options.clone());
-        new_segment_list.manifest_id = pointer.manifest_id;
-        new_segment_list.superfiles = all_segments;
+        let mut new_superfile_list = SuperfileList::empty(self.inner.options.clone());
+        new_superfile_list.manifest_id = pointer.manifest_id;
+        new_superfile_list.superfiles = all_superfiles;
         let new_manifest = Manifest {
-            superfile_list: new_segment_list,
+            superfile_list: new_superfile_list,
             list: Some(new_list),
             parts: new_parts,
             loader: Some(new_loader),
@@ -712,7 +712,7 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Block until the on-disk cache has fully promoted every segment
+    /// Block until the on-disk cache has fully promoted every superfile
     /// in the current manifest to an mmap-backed reader, or `timeout`
     /// elapses for one of them. This is the public "warm-readiness"
     /// primitive: once it returns `Ok(())`, subsequent searches read
@@ -730,10 +730,10 @@ impl Supertable {
     ///
     /// Crucially, requesting promotion here is also what *drives* it to
     /// completion: registering a promotion waiter releases the
-    /// background full-segment fill that otherwise idles behind
+    /// background full-superfile fill that otherwise idles behind
     /// foreground lazy readers under steady query load. Warming purely
     /// by replaying queries does not register that waiter, so the
-    /// segments can stay lazy/S3-backed indefinitely.
+    /// superfiles can stay lazy/S3-backed indefinitely.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn wait_until_warm(
         &self,
@@ -926,7 +926,7 @@ impl Supertable {
 /// concurrent user.
 ///
 /// Policy: **pin nothing.** The cache is a bounded LRU and must
-/// be free to evict any segment to stay under its budget — an
+/// be free to evict any superfile to stay under its budget — an
 /// index larger than the cache budget has to be able to
 /// stream/evict through it. (Previously this pinned the entire
 /// live manifest, which made the index *required* to fit inside
@@ -1033,7 +1033,7 @@ impl SupertableReader {
     }
 
     /// Pinned manifest. Exposed for query-side machinery
-    /// (skip helpers, fan-out, etc.) to read the segment list
+    /// (skip helpers, fan-out, etc.) to read the superfile list
     /// + summaries directly.
     pub fn manifest(&self) -> &Arc<Manifest> {
         &self.manifest
@@ -1201,7 +1201,7 @@ mod tests {
         assert_eq!(r2.manifest_id(), 2);
         assert_eq!(r3.manifest_id(), 3);
 
-        // Segment counts are monotonic across capture times.
+        // Superfile counts are monotonic across capture times.
         assert_eq!(r0.n_superfiles(), 0);
         assert_eq!(r1.n_superfiles(), 1);
         assert_eq!(r2.n_superfiles(), 2);

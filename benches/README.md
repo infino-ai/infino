@@ -107,6 +107,56 @@ A real-backend run writes under a unique prefix and deletes it on exit; set
 `INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
 emulator self-cleans and reproduces request/byte volume, not network latency.
 
+## Vector search tuning
+
+The vector benches calibrate each recall target by sweeping a probe/refine
+grid, then report a user-facing `default` row. Three knobs control that row
+and let you skip the sweep:
+
+- `INFINO_BENCH_VECTOR_NPROBE` — probe count for the `default` row (default 8).
+- `INFINO_BENCH_VECTOR_RERANK` — rerank multiplier for the `default` row
+  (default 20).
+- `INFINO_BENCH_SKIP_CALIBRATION=1` — measure **only** the fixed
+  `(nprobe, rerank)` `default` row: skips the correctness gate, the
+  recall-target calibration sweep, and brute-force ground-truth generation.
+  This is the fast path for a fixed-config **cold-only** latency number on a
+  many-segment supertable, where sweeping the full grid over a cold table is
+  prohibitively slow.
+- `INFINO_BENCH_PREFETCH_CONCURRENCY` — disk-cache prefetch fan-out for the
+  cold-fill / promotion path on many-segment tables (default 8).
+
+```sh
+# Fast fixed-config cold vector latency (no calibration sweep):
+INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SKIP_CALIBRATION=1 \
+  INFINO_BENCH_VECTOR_NPROBE=8 INFINO_BENCH_VECTOR_RERANK=4 cargo bench -- supertable vector cold
+```
+
+## Prepared datasets
+
+The supertable corpus is fully seeded, so an ingested table is reusable.
+`dataset` verbs split the run: **prepare** once (ingest to a fixed prefix and
+write a `dataset.json` sidecar), then **bench** the read phases against it as
+many times as needed — no corpus generation, no ingest. Real object store
+only.
+
+```sh
+# Prepare a dataset (one sub-prefix per modality: <prefix>/{fts,vector,sql}).
+INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
+  cargo bench -- dataset prepare datasets/bench-10m
+
+# Benchmark an existing dataset (fails fast if it is not there).
+cargo bench -- dataset bench datasets/bench-10m vector warm
+
+# End-to-end: prepare if absent, then bench.
+cargo bench -- dataset run datasets/bench-10m fts
+```
+
+The sidecar records the corpus/index knobs the dataset was built with; the
+bench refuses to open a dataset whose knobs don't match its own config
+(re-prepare instead). `INFINO_BENCH_SUPERTABLE_DOCS` must therefore match the
+prepare-time count. The `Dataset bench (Azure)` workflow drives the same
+verbs from CI.
+
 ## Test Matrix
 
 The matrix is tier × modality — six cells:
@@ -157,10 +207,10 @@ existed yet.
 Current numbers: 1M docs per tier, real AWS S3 (us-east-1), recorded
 2026-06-09. Supertable tables are 256 superfiles across 16 commits.
 
-### FTS — superfile (single-segment, 1M docs)
+### FTS — superfile (single-superfile, 1M docs)
 
 <!-- BEGIN: bench/fts/superfile/ingest -->
-### Superfile FTS — ingest, single-segment / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
+### Superfile FTS — ingest, single-superfile / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -173,7 +223,7 @@ Build path: `SuperfileBuilder` → unified `.parquet` (same as production supert
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
-### Superfile FTS — search, single-segment / in-memory (1M docs)
+### Superfile FTS — search, single-superfile / in-memory (1M docs)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -229,10 +279,10 @@ Through the string `bm25_hits_async` path (parses the `-` sigil); a correctness 
 | two_mid_and_common_neg | 5.15 ms (+3.2% worse) |
 <!-- END: bench/fts/superfile/negation -->
 
-### FTS — supertable (multi-segment, 1M docs, real S3)
+### FTS — supertable (multi-superfile, 1M docs, real S3)
 
 <!-- BEGIN: bench/fts/supertable/ingest -->
-### Supertable FTS — ingest, multi-segment / object-store (1M docs, 16 commits)
+### Supertable FTS — ingest, multi-superfile / object-store (1M docs, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -244,7 +294,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 <!-- END: bench/fts/supertable/ingest -->
 
 <!-- BEGIN: bench/fts/supertable/search -->
-### Supertable FTS — search, multi-segment / object-store (1M docs)
+### Supertable FTS — search, multi-superfile / object-store (1M docs)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -274,10 +324,10 @@ Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per
 | ten_term_and | 2.43 ms (-3.9% better) | 11.29 ms (-3.1% better) | 1.14 GiB (+1.4% ~) | 1.06 GiB (+6.1% worse) | 1.14 GiB (+1.4% ~) | 392.86 ms (+2.0% ~) | 304.12 ms (+4.3% worse) |
 <!-- END: bench/fts/supertable/search -->
 
-### Vector — superfile (single-segment, 1M × 384)
+### Vector — superfile (single-superfile, 1M × 384)
 
 <!-- BEGIN: bench/vector/superfile/ingest -->
-### Superfile vector — ingest, single-segment / in-memory (1M docs × dim=384)
+### Superfile vector — ingest, single-superfile / in-memory (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -290,7 +340,7 @@ Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. R
 <!-- END: bench/vector/superfile/ingest -->
 
 <!-- BEGIN: bench/vector/superfile/search -->
-### Superfile vector — search, single-segment / in-memory (1M docs × dim=384)
+### Superfile vector — search, single-superfile / in-memory (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -304,10 +354,10 @@ Correctness, warm search, and cold upload reuse the measured 1-writer artifact. 
 | default | p=8, r=20 | — | 947.29 µs (+871.6% worse) | 4.13 GiB (+1786.9% worse) | 4.13 GiB (+1786.0% worse) | 4.13 GiB (+1786.9% worse) | 353.10 ms (+481996.7% worse) | 372.97 ms (-22.4% better) |
 <!-- END: bench/vector/superfile/search -->
 
-### Vector — supertable (multi-segment, 1M × 384, real S3)
+### Vector — supertable (multi-superfile, 1M × 384, real S3)
 
 <!-- BEGIN: bench/vector/supertable/ingest -->
-### Supertable vector — ingest, multi-segment / object-store (1M docs × dim=384, 16 commits)
+### Supertable vector — ingest, multi-superfile / object-store (1M docs × dim=384, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -319,7 +369,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 <!-- END: bench/vector/supertable/ingest -->
 
 <!-- BEGIN: bench/vector/supertable/search -->
-### Supertable vector — search, multi-segment / object-store (1M docs × dim=384)
+### Supertable vector — search, multi-superfile / object-store (1M docs × dim=384)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -336,7 +386,7 @@ Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs
 ### Supertable — ingest summary (all shapes, real S3)
 
 <!-- BEGIN: bench/supertable/ingest -->
-### Supertable — ingest, multi-segment / object-store (1M docs, 16 commits)
+### Supertable — ingest, multi-superfile / object-store (1M docs, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
@@ -441,10 +491,10 @@ Cold p50 over `reader().query_sql` after reopening the same SQL table shape from
 | group_by_category | 245.43 ms (-36.1% better) | 174.96 ms (+20.3% worse) |
 <!-- END: bench/sql/superfile/cold -->
 
-### SQL — supertable (multi-segment, 1M rows, real S3)
+### SQL — supertable (multi-superfile, 1M rows, real S3)
 
 <!-- BEGIN: bench/sql/supertable/ingest -->
-### Supertable SQL — ingest, multi-segment / object-store (1M rows, 16 commits)
+### Supertable SQL — ingest, multi-superfile / object-store (1M rows, 16 commits)
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 

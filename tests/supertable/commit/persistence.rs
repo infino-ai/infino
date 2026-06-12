@@ -7,7 +7,7 @@
 //! `SupertableOptions::with_storage(...)` is attached:
 //!
 //! - A commit on a storage-backed supertable writes:
-//!   - each new segment's bytes to `data/seg-<uuid>.sf.parquet`
+//!   - each new superfile's bytes to `data/seg-<uuid>.sf.parquet`
 //!   - one manifest part to `manifests/part-<hash>.avro.zst`
 //!   - the manifest list to `manifest-lists/list-NNNNNN.json`
 //!   - the pointer to `_supertable/current`
@@ -38,7 +38,7 @@ use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
 #[test]
-fn commit_persists_pointer_list_part_and_segment() {
+fn commit_persists_pointer_list_part_and_superfile() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -78,7 +78,7 @@ fn commit_persists_pointer_list_part_and_segment() {
         "single-partition mode: exactly one manifest part on disk; got {parts:?}"
     );
 
-    // Segment file exists in data/.
+    // Superfile file exists in data/.
     let data_dir = dir.path().join("data");
     let superfiles: Vec<_> = std::fs::read_dir(&data_dir)
         .expect("readdir")
@@ -87,7 +87,7 @@ fn commit_persists_pointer_list_part_and_segment() {
     assert_eq!(
         superfiles.len(),
         1,
-        "one shard committed → one segment file on disk; got {superfiles:?}"
+        "one shard committed → one superfile file on disk; got {superfiles:?}"
     );
 
     // In-memory manifest reflects the commit.
@@ -152,17 +152,17 @@ fn two_successive_commits_both_publish() {
 }
 
 #[test]
-fn multipart_threshold_forces_segment_through_put_multipart() {
+fn multipart_threshold_forces_superfile_through_put_multipart() {
     // Setting `put_multipart_threshold_bytes = 1` routes
-    // every segment through `put_multipart` instead of
+    // every superfile through `put_multipart` instead of
     // `put_atomic`. Verifies the end-to-end shape:
     //   - commit succeeds (no panic, no error)
-    //   - segment file lands on disk
+    //   - superfile file lands on disk
     //   - manifest pointer + list + part written
     //   - cross-process open recovers the data
     // The actual `put_atomic` vs `put_multipart` distinction
     // is invisible to readers — the test passes through
-    // `Supertable::open` to assert the segment bytes were
+    // `Supertable::open` to assert the superfile bytes were
     // correctly assembled by the multipart path.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -182,7 +182,7 @@ fn multipart_threshold_forces_segment_through_put_multipart() {
     }
     drop(producer);
 
-    // Segment file landed on disk.
+    // Superfile file landed on disk.
     let data_dir = dir.path().join("data");
     let superfiles: Vec<_> = std::fs::read_dir(&data_dir)
         .expect("readdir data")
@@ -191,11 +191,11 @@ fn multipart_threshold_forces_segment_through_put_multipart() {
     assert_eq!(
         superfiles.len(),
         1,
-        "one segment file should land on disk after a multipart commit"
+        "one superfile file should land on disk after a multipart commit"
     );
 
     // Cross-process open recovers correctly — proof the
-    // multipart-uploaded segment is byte-identical to what
+    // multipart-uploaded superfile is byte-identical to what
     // the writer produced.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -237,7 +237,7 @@ fn no_storage_attached_takes_in_memory_path() {
 #[test]
 fn committed_supertable_remains_in_memory_queryable_for_now() {
     // Storage write-through is additive — the
-    // in-memory store still holds segment bytes, so existing
+    // in-memory store still holds superfile bytes, so existing
     // in-memory query paths keep working unchanged. Verifies no
     // regression to the FTS read path.
     let dir = TempDir::new().expect("tempdir");

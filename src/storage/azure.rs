@@ -143,7 +143,7 @@ const AZURE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const AZURE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whole-request timeout (incl. body). The 30s default is too tight for
-/// a multi-MB segment PUT on a modest uplink — it aborts mid-upload.
+/// a multi-MB superfile PUT on a modest uplink — it aborts mid-upload.
 const AZURE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// HTTP client options: deep warm idle pool + bounded connect/request.

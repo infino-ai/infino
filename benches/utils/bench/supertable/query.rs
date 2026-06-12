@@ -31,7 +31,7 @@ pub fn vector_topk_global(
             let seg_idx = manifest
                 .superfiles
                 .iter()
-                .position(|e| e.uri == h.segment)
+                .position(|e| e.uri == h.superfile)
                 .expect("superfile in manifest");
             offsets[seg_idx] + h.local_doc_id
         })

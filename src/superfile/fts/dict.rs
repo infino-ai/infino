@@ -516,7 +516,7 @@ mod tests {
     fn serialization_is_deterministic() {
         // Same inputs (regardless of insertion order) produce
         // byte-identical FST output. Important for reproducible builds
-        // and for content-addressed segment hashing.
+        // and for content-addressed superfile hashing.
         let mut b1 = DictBuilder::new();
         b1.insert(&make_key("a", "x"), 1);
         b1.insert(&make_key("b", "y"), 2);

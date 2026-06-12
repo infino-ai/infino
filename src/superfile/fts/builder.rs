@@ -171,13 +171,13 @@ impl FinishProfile {
 /// start of this struct.
 ///
 /// Layout:
-///   off  0 ..  4 : df (u32) — bounded by n_docs per segment
+///   off  0 ..  4 : df (u32) — bounded by n_docs per superfile
 ///   off  4 .. 12 : postings_offset (u64) — equals the term's metadata_offset;
-///                  self-describing. u64 supports segments past 4 GiB
+///                  self-describing. u64 supports superfiles past 4 GiB
 ///                  (e.g. the 16 GB target).
 ///   off 12 .. 16 : postings_length (u32) — single term's bytes, well under
 ///                  4 G even at high df (≤ ~1 MB for the most common term in
-///                  a 16 GB segment).
+///                  a 16 GB superfile).
 ///   off 16 .. 20 : num_blocks (u32)
 ///
 /// `df`, `postings_length`, and `num_blocks` stay u32; only the absolute
@@ -192,7 +192,7 @@ pub(crate) const SKIP_ENTRY_SIZE: usize = 16;
 /// Layout:
 ///   off  0 ..  4 : column_id (u32)
 ///   off  4 .. 12 : doc_lengths_offset (u64) — absolute offset of this column's
-///                  doc-lengths array in the FTS blob. u64 supports segments
+///                  doc-lengths array in the FTS blob. u64 supports superfiles
 ///                  past 4 GiB.
 ///   off 12 .. 16 : avgdl_x1000 (u32) — avgdl × 1000, as an integer
 ///

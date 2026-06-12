@@ -190,7 +190,7 @@ async fn storage_range_source_drives_open_lazy_against_localfs() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
     let bytes = build_test_bytes();
 
-    // Seed the segment at a stable URI.
+    // Seed the superfile at a stable URI.
     let uri = "data/seg-test.sf.parquet";
     local.put_atomic(uri, bytes.clone()).await.expect("seed");
 
@@ -276,7 +276,7 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
 //      `FtsReader::open_lazy` exists; the FTS sub-blob is
 //      bounded — typically << vector subsection).
 // Total cold-open budget: ≤ 6 GETs / ≲ 2-3 MiB on a typical
-// 1.5 GiB segment.
+// 1.5 GiB superfile.
 // ============================================================
 
 use infino::superfile::vector::distance::normalize;
@@ -285,7 +285,7 @@ use infino::test_helpers::default_vector_config;
 /// Build a small superfile that exercises both the vector and
 /// FTS sub-blobs so the cold-open test can observe both
 /// sub-source paths in `open_lazy`. 4 docs × 16-dim vectors
-/// keeps the segment small but representative of the actual
+/// keeps the superfile small but representative of the actual
 /// layout produced by `SuperfileBuilder`.
 fn build_vec_plus_fts_bytes() -> Bytes {
     let dim = LAZY_VEC_DIM;
@@ -382,17 +382,17 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
     // Exact lazy open:
     //   1 footer tail
     //   3 vector metadata ranges (outer header, directory+crc, subheader;
-    //     +1 more for Sq8 codec_meta on Sq8 segments)
+    //     +1 more for Sq8 codec_meta on Sq8 superfiles)
     //   3 FTS metadata ranges (header, FST directory, doc-length tail)
     //
-    // This tiny fixture uses a non-Sq8 vector segment, so the expected
+    // This tiny fixture uses a non-Sq8 vector superfile, so the expected
     // combined budget is 7. The production latency target is governed by
     // serial batches and bytes; this assertion pins that open does not
     // drift back to whole-subsection/speculative reads.
     let documented_max = LAZY_COLD_OPEN_MAX_GETS;
     assert!(
         n_get <= documented_max,
-        "cold-open issued {n_get} GETs against a {total}-byte segment; \
+        "cold-open issued {n_get} GETs against a {total}-byte superfile; \
          documented superfile cold-open budget is ≤ {documented_max} GETs",
     );
 
@@ -413,7 +413,7 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
         "BM25 must return matches for 'special'"
     );
 
-    // The lazy reader never materializes the full segment, so
+    // The lazy reader never materializes the full superfile, so
     // `parquet_bytes()` must be `None`.
     assert!(reader.parquet_bytes().is_none());
 }

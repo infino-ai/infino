@@ -169,9 +169,9 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     // the only assertion that actually checks the property we care
     // about (no duplicate ids) — and at 400 ids the cost is
     // microseconds.
-    // Attach a disk cache so the consumer can pull segment bytes
+    // Attach a disk cache so the consumer can pull superfile bytes
     // back from storage on demand — the consumer didn't write any
-    // of the segments, so its in-memory reader cache is empty.
+    // of the superfiles, so its in-memory reader cache is empty.
     let cache_dir = TempDir::new().expect("cache tempdir");
     let cfg = DiskCacheConfig {
         cache_root: cache_dir.path().to_path_buf(),
@@ -198,7 +198,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     assert_eq!(
         segs.len(),
         N_HANDLES,
-        "expected one segment per handle; got {}",
+        "expected one superfile per handle; got {}",
         segs.len()
     );
 
@@ -226,7 +226,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
         all.len()
     );
 
-    // Sanity: manifest's per-segment doc count totals match the
+    // Sanity: manifest's per-superfile doc count totals match the
     // ids actually persisted, so we know we read them all.
     let total_rows: u64 = segs.iter().map(|s| s.n_docs).sum();
     assert_eq!(total_rows, N_HANDLES as u64 * ROWS_PER_HANDLE);
