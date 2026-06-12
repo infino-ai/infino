@@ -421,6 +421,13 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
     }
 }
 
+/// Whether a prepared dataset (its sidecar) exists for `modality` at the
+/// configured prefix.
+pub fn dataset_exists(modality: Modality) -> bool {
+    let fixture = tiers::block_on(tiers::dataset_storage_fixture(modality.dataset_dir()));
+    tiers::block_on(fixture.storage.head(crate::dataset::SIDECAR)).is_ok()
+}
+
 fn read_sidecar(storage: &Arc<dyn StorageProvider>) -> crate::dataset::DatasetMeta {
     let (bytes, _) = tiers::block_on(storage.get(crate::dataset::SIDECAR))
         .expect("read dataset sidecar — is the dataset prepared at this prefix?");

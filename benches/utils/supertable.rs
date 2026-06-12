@@ -182,8 +182,13 @@ fn run_child_shape(key: &str) {
 fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
     eprintln!("[supertable] spawning isolated subprocess for shape {key:?}...");
     let exe = std::env::current_exe().expect("current_exe for supertable child");
-    let output = Command::new(exe)
-        .env(SHAPE_ENV, key)
+    let mut cmd = Command::new(exe);
+    cmd.env(SHAPE_ENV, key);
+    // Forward a CLI-set dataset prefix; the child only inherits the env.
+    if let Some(prefix) = crate::dataset::dataset_prefix() {
+        cmd.env(crate::dataset::PREFIX_ENV, prefix);
+    }
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
