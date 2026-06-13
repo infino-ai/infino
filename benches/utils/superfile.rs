@@ -3,6 +3,49 @@
 
 //! Superfile-layer benchmark runners grouped by modality.
 
+use crate::report::{Better, Cell, metric, text};
+use crate::rss;
+
+/// Shared headers for the single-superfile ingest tables (fts / vector /
+/// sql), so the three modalities can't drift. `Corpus` is the raw input
+/// payload fed to the build; `Stored` is the built superfile's size on
+/// disk (full Parquet data pages + embedded BM25/vector indexes) and its
+/// share of the corpus.
+fn ingest_headers() -> Vec<String> {
+    [
+        "Build",
+        "Time",
+        "Throughput",
+        "Bandwidth",
+        "Corpus",
+        "Stored",
+        "Peak RSS",
+        "Median RSS",
+        "P90 RSS",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The `(Corpus, Stored)` cell pair shared by every single-superfile
+/// ingest row; `Stored` carries its percentage of `Corpus` inline.
+fn corpus_stored_cells(corpus_bytes: u64, stored_bytes: u64) -> [Cell; 2] {
+    let stored_pct = if corpus_bytes > 0 {
+        100.0 * stored_bytes as f64 / corpus_bytes as f64
+    } else {
+        0.0
+    };
+    [
+        text(rss::fmt_bytes(corpus_bytes)),
+        metric(
+            stored_bytes as f64,
+            format!("{} ({stored_pct:.0}%)", rss::fmt_bytes(stored_bytes)),
+            Better::Lower,
+        ),
+    ]
+}
+
 pub mod fts {
     // SPDX-License-Identifier: Apache-2.0
     // SPDX-FileCopyrightText: Copyright The Infino Authors
@@ -341,7 +384,7 @@ pub mod fts {
         let mut report = Report::load("superfile_fts");
 
         if phases.build {
-            emit_build(&mut report, n_docs, &corpus, &result);
+            emit_build(&mut report, n_docs, &corpus, &result, index.bytes().len() as u64);
         }
 
         if phases.warm || phases.cold {
@@ -553,26 +596,26 @@ pub mod fts {
 
     // ─── Result rendering (run-to-run deltas via report.rs) ───────────────
 
-    fn headers(cols: &[&str]) -> Vec<String> {
-        cols.iter().map(|s| s.to_string()).collect()
-    }
-
     fn ingest_row(
         label: &str,
         n_docs: usize,
         wall: Duration,
         stats: RssStats,
-        input_bytes: f64,
+        corpus_bytes: u64,
+        stored_bytes: u64,
     ) -> Vec<Cell> {
         let secs = wall.as_secs_f64();
         let ns = secs * NS_PER_SEC;
         let thr = n_docs as f64 / secs;
-        let bw = input_bytes / secs;
+        let bw = corpus_bytes as f64 / secs;
+        let [corpus_cell, stored_cell] = super::corpus_stored_cells(corpus_bytes, stored_bytes);
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
             metric(thr, fmt_throughput(thr), Better::Higher),
             metric(bw, fmt_bandwidth(bw), Better::Higher),
+            corpus_cell,
+            stored_cell,
             metric(
                 stats.peak_rss_bytes as f64,
                 rss::fmt_bytes(stats.peak_rss_bytes),
@@ -604,10 +647,11 @@ pub mod fts {
         n_docs: usize,
         corpus: &MmapTextCorpus,
         result: &EngineFtsResult,
+        stored_bytes: u64,
     ) {
         // Logical input payload: total corpus text bytes, identical across
         // every writer count (the parallel build shards the same corpus).
-        let input_bytes = corpus.total_bytes() as f64;
+        let corpus_bytes = corpus.total_bytes();
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
@@ -617,21 +661,14 @@ pub mod fts {
                     n_docs,
                     b.phase.wall,
                     b.phase.rss,
-                    input_bytes,
+                    corpus_bytes,
+                    stored_bytes,
                 )
             })
             .collect();
         let block = Block {
             subtitle: String::new(),
-            headers: headers(&[
-                "Build",
-                "Time",
-                "Throughput",
-                "Bandwidth",
-                "Peak RSS",
-                "Median RSS",
-                "P90 RSS",
-            ]),
+            headers: super::ingest_headers(),
             rows,
         };
         report.emit(&Section {
@@ -786,17 +823,26 @@ pub mod vector {
         }
     }
 
-    fn build_row(label: &str, n_docs: usize, wall: Duration, stats: rss::RssStats) -> Vec<Cell> {
+    fn build_row(
+        label: &str,
+        n_docs: usize,
+        wall: Duration,
+        stats: rss::RssStats,
+        corpus_bytes: u64,
+        stored_bytes: u64,
+    ) -> Vec<Cell> {
         let secs = wall.as_secs_f64();
         let ns = secs * NS_PER_SEC;
-        let input_bytes = (n_docs * DIM * size_of::<f32>()) as f64;
         let thr = n_docs as f64 / secs;
-        let bw = input_bytes / secs;
+        let bw = corpus_bytes as f64 / secs;
+        let [corpus_cell, stored_cell] = super::corpus_stored_cells(corpus_bytes, stored_bytes);
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
             metric(thr, fmt_throughput(thr), Better::Higher),
             metric(bw, fmt_bandwidth(bw), Better::Higher),
+            corpus_cell,
+            stored_cell,
             metric(
                 stats.peak_rss_bytes as f64,
                 rss::fmt_bytes(stats.peak_rss_bytes),
@@ -826,7 +872,7 @@ pub mod vector {
         );
         let (build_result, index) = build_warm_artifact(n_docs);
 
-        let build_rows = build_rows(n_docs, &build_result);
+        let build_rows = build_rows(n_docs, &build_result, index.bytes().len() as u64);
         let mut report = Report::load("superfile_vector");
         if phases.build {
             emit_build(&mut report, n_docs, build_rows);
@@ -954,10 +1000,24 @@ pub mod vector {
         )))
     }
 
-    fn build_rows(n_docs: usize, build_result: &EngineVectorResult) -> Vec<Vec<Cell>> {
+    fn build_rows(
+        n_docs: usize,
+        build_result: &EngineVectorResult,
+        stored_bytes: u64,
+    ) -> Vec<Vec<Cell>> {
+        // Logical input payload: the raw f32 embeddings, identical across
+        // every writer count (the parallel build shards the same corpus).
+        let corpus_bytes = (n_docs * DIM * size_of::<f32>()) as u64;
         let mut rows = Vec::new();
         for b in &build_result.builds {
-            rows.push(build_row(&writer_label(b.writers), n_docs, b.wall, b.rss));
+            rows.push(build_row(
+                &writer_label(b.writers),
+                n_docs,
+                b.wall,
+                b.rss,
+                corpus_bytes,
+                stored_bytes,
+            ));
         }
         rows
     }
@@ -972,15 +1032,7 @@ pub mod vector {
             note: "Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. Rows are by writer count; `1 writer` is the canonical artifact used by correctness/search/cold upload. Δ is vs the previous run.".into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec![
-                    "Build".into(),
-                    "Time".into(),
-                    "Throughput".into(),
-                    "Bandwidth".into(),
-                    "Peak RSS".into(),
-                    "Median RSS".into(),
-                    "P90 RSS".into(),
-                ],
+                headers: super::ingest_headers(),
                 rows: build_rows,
             }],
         });
@@ -1020,7 +1072,7 @@ pub mod sql {
         build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
         sql_options,
     };
-    use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
+    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
     use crate::rss::{self, RssStats};
     use crate::supertable::Phases;
@@ -1060,7 +1112,8 @@ pub mod sql {
 
         let mut report = Report::load("sql");
         if phases.build {
-            emit_build(&mut report, n_docs, &corpus, &result);
+            let stored = stored_bytes(&index);
+            emit_build(&mut report, n_docs, &corpus, &result, stored);
         }
         if phases.warm {
             exec_sql::assert_correct(&index, n_docs, "superfile_sql");
@@ -1267,13 +1320,29 @@ pub mod sql {
         ]
     }
 
+    /// Total on-storage footprint of the built superfile(s): full Parquet
+    /// (data pages + embedded indexes), summed from the manifest. Same
+    /// derivation as the cold artifact's `total_index_bytes`.
+    fn stored_bytes(index: &InfinoSqlIndex) -> u64 {
+        index
+            .table()
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter_map(|entry| entry.subsection_offsets.as_ref())
+            .map(|offsets| offsets.total_size)
+            .sum()
+    }
+
     fn emit_build(
         report: &mut Report,
         n_docs: usize,
         corpus: &MmapTextCorpus,
         result: &EngineSqlResult,
+        stored_bytes: u64,
     ) {
-        let input_bytes = corpus.total_bytes() as f64;
+        let corpus_bytes = corpus.total_bytes();
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
@@ -1281,12 +1350,16 @@ pub mod sql {
                 let secs = b.wall.as_secs_f64();
                 let ns = secs * 1e9;
                 let thr = n_docs as f64 / secs;
-                let mbps = input_bytes / secs / 1e6;
+                let bw = corpus_bytes as f64 / secs;
+                let [corpus_cell, stored_cell] =
+                    super::corpus_stored_cells(corpus_bytes, stored_bytes);
                 let mut cells = vec![
                     text(writer_label(b.writers)),
                     metric(ns, fmt_time(ns), Better::Lower),
                     metric(thr, fmt_throughput(thr), Better::Higher),
-                    metric(mbps, format!("{mbps:.1} MB/s"), Better::Higher),
+                    metric(bw, fmt_bandwidth(bw), Better::Higher),
+                    corpus_cell,
+                    stored_cell,
                 ];
                 cells.extend(rss_cells(b.rss));
                 cells
@@ -1305,15 +1378,7 @@ pub mod sql {
                 .into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec![
-                    "Build".into(),
-                    "Time".into(),
-                    "Throughput".into(),
-                    "Bandwidth".into(),
-                    "Peak RSS".into(),
-                    "Median RSS".into(),
-                    "P90 RSS".into(),
-                ],
+                headers: super::ingest_headers(),
                 rows,
             }],
         });
