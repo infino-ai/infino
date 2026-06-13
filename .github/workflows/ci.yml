@@ -139,8 +139,8 @@ jobs:
           name: wheel-${{ matrix.os }}
           path: infino-python/dist
 
-  # Informational benchmark — supertable_all + sql, one in-region Azure VM
-  # each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
+  # Informational benchmark — superfile + supertable tiers, one in-region
+  # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
   # On merge to main: publish the run as that baseline + a per-commit history
   # point. Same-repo only (fork PRs can't use the Azure OIDC secrets).
   bench:
@@ -153,8 +153,8 @@ jobs:
         # `suffix` makes each leg's Azure resources unique — both legs
         # share one run_id, so without it they'd collide / cross-delete.
         include:
-          - { bench: supertable_all, docs: "1000000", suffix: st }
-          - { bench: sql, docs: "1000000", suffix: sql }
+          - { bench: superfile, docs: "1000000", suffix: sf }
+          - { bench: supertable, docs: "1000000", suffix: st }
     # PR: a new push cancels the in-flight run. main: serialize per bench so
     # concurrent merges don't race the baseline blob (never cancel).
     concurrency:

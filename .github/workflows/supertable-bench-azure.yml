@@ -14,7 +14,7 @@ on:
         required: false
         default: supertable_all
         type: choice
-        options: [supertable_all, fts, vector, combined, sql, all]
+        options: [superfile, supertable, supertable_all, fts, vector, combined, sql, all]
       docs:
         description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
         required: false
@@ -106,6 +106,8 @@ jobs:
           # args and (b) the report JSONs (target/infino-bench/<name>.json)
           # used for baseline restore / publish.
           case "${{ inputs.bench }}" in
+            superfile)      args="superfile";             reports="superfile_fts superfile_vector sql" ;;
+            supertable)     args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
             supertable_all) args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
             fts)            args="supertable fts";        reports="supertable supertable_fts" ;;
             vector)         args="supertable vector";     reports="supertable supertable_vector" ;;
