@@ -82,6 +82,8 @@ use crate::superfile::LazyByteSource;
 use crate::superfile::fts::reader::BoolMode;
 use crate::supertable::SuperfileEntry;
 use crate::supertable::manifest::Manifest;
+use crate::supertable::manifest::hll::HllSketch;
+use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::query::df_object_store::SuperfileObjectStore;
 use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
@@ -423,7 +425,6 @@ impl SupertableProvider {
 /// Min/max of the supertable-injected `_id` column across `entries`,
 /// from the manifest's dedicated id range fields.
 fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarValue)> {
-    use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
     let min = entries.iter().map(|e| e.id_min).min()?;
     let max = entries.iter().map(|e| e.id_max).max()?;
     Some((
@@ -432,11 +433,6 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
     ))
 }
 
-/// Min/max of scalar column `name` across `entries`, folded from the
-/// per-segment skip stats. `None` (no statistics) if any entry lacks
-/// the column's stats, holds a null bound, or the bounds don't order —
-/// conservative: stats are only reported when every segment
-/// contributes a real value.
 /// Total null count of column `name` across `entries`; `None` unless
 /// every entry carries the stat (a missing side makes the total
 /// unknowable).
@@ -464,7 +460,6 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue
 /// `None` unless every entry carries a sketch. Sketch unions are
 /// exact, so the merged estimate has single-sketch accuracy.
 fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize> {
-    use crate::supertable::manifest::hll::HllSketch;
     let mut merged: Option<HllSketch> = None;
     for entry in entries {
         let sketch = HllSketch::from_bytes(entry.scalar_stats.hll.get(name)?)?;

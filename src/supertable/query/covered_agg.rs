@@ -47,6 +47,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::Transformed;
 use datafusion::datasource::DefaultTableSource;
@@ -59,8 +60,10 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
+use datafusion::prelude::cast;
 
 use crate::supertable::manifest::{SuperfileEntry, add_sum_arrays};
+use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::query::provider::SupertableProvider;
 
 /// The covered/residual aggregate rewrite. Registered on the
@@ -279,8 +282,6 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
                     lit(zero),
                 ]) + lit(sum.clone());
                 let total_cnt = datafusion::prelude::col(format!("__resid_{i}_cnt")) + lit(*count);
-                use arrow_schema::DataType;
-                use datafusion::prelude::cast;
                 (cast(total_sum, DataType::Float64) / cast(total_cnt, DataType::Float64))
                     .alias(name)
             }
@@ -569,7 +570,6 @@ fn collect_range_leaves(expr: &Expr, out: &mut Vec<(String, Operator, ScalarValu
 /// Classify one segment's `[seg_min, seg_max]` for `range.column`
 /// against the range. Missing bounds → `Boundary` (conservative).
 fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Class {
-    use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
     let bounds = if range.column == id_column {
         Some((
             ScalarValue::Decimal128(Some(entry.id_min), DECIMAL128_PRECISION, DECIMAL128_SCALE),

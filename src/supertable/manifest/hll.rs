@@ -15,6 +15,8 @@
 //! ~±3.25% standard error). Merging is register-wise max, so part
 //! rollups and cross-segment folds are exact unions of the sketches.
 
+/// Width of the hash the sketch indexes over (`xxh3_64`).
+const HASH_BITS: u32 = 64;
 /// log2 of the register count.
 const HLL_P: u32 = 10;
 /// Register count `m = 2^P`.
@@ -57,9 +59,12 @@ impl HllSketch {
         // High P bits pick the register; the rank is the position of
         // the first set bit in the remaining 64-P bits (capped so an
         // all-zero remainder still yields a valid rank).
-        let idx = (hash >> (64 - HLL_P)) as usize;
+        let idx = (hash >> (HASH_BITS - HLL_P)) as usize;
         let rest = hash << HLL_P;
-        let rank = (rest.leading_zeros().min(64 - HLL_P) + 1) as u8;
+        // Rank = leading-zero run of the remainder bits + 1, capped so
+        // an all-zero remainder still yields a valid value (max
+        // `HASH_BITS - HLL_P + 1`).
+        let rank = (rest.leading_zeros().min(HASH_BITS - HLL_P) + 1) as u8;
         if rank > self.registers[idx] {
             self.registers[idx] = rank;
         }
@@ -69,10 +74,13 @@ impl HllSketch {
     /// linear-counting correction).
     pub fn estimate(&self) -> f64 {
         let m = HLL_REGISTERS as f64;
+        // Harmonic-mean term per register: 2^-rank. `powi` avoids the
+        // `1 << rank` integer-shift overflow (rank reaches MAX_RANK,
+        // far past a u32/u64 shift's valid range).
         let sum: f64 = self
             .registers
             .iter()
-            .map(|&r| 1.0 / f64::from(1u32 << u32::from(r.min(63))))
+            .map(|&r| 2.0_f64.powi(-i32::from(r)))
             .sum();
         let raw = HLL_ALPHA * m * m / sum;
         if raw <= SMALL_RANGE_FACTOR * m {
