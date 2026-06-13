@@ -40,6 +40,30 @@ impl core::marker::Unpin for infino::ColdFetchMode
 impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
+pub enum infino::CompactionError
+pub infino::CompactionError::Build(infino::supertable::error::BuildError)
+pub infino::CompactionError::Commit(infino::supertable::error::CommitError)
+pub infino::CompactionError::EmptyMergedSuperfile
+pub infino::CompactionError::NoStorage
+pub infino::CompactionError::Refresh(alloc::string::String)
+pub infino::CompactionError::Seal(alloc::string::String)
+pub infino::CompactionError::SidecarConflict
+pub infino::CompactionError::SidecarConflict::existing_compaction_id: uuid::Uuid
+pub infino::CompactionError::SidecarConflict::superfile_id: uuid::Uuid
+pub infino::CompactionError::SuperfileNotFound(uuid::Uuid)
+impl core::error::Error for infino::CompactionError
+pub fn infino::CompactionError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for infino::CompactionError
+pub fn infino::CompactionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::CompactionError
+pub fn infino::CompactionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::CompactionError
+impl core::marker::Send for infino::CompactionError
+impl core::marker::Sync for infino::CompactionError
+impl core::marker::Unpin for infino::CompactionError
+impl core::marker::UnsafeUnpin for infino::CompactionError
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::CompactionError
+impl !core::panic::unwind_safe::UnwindSafe for infino::CompactionError
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
@@ -80,6 +104,31 @@ impl core::marker::Unpin for infino::Metric
 impl core::marker::UnsafeUnpin for infino::Metric
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Metric
 impl core::panic::unwind_safe::UnwindSafe for infino::Metric
+pub struct infino::CompactionSettings
+pub infino::CompactionSettings::max_memory_mb: u64
+pub infino::CompactionSettings::min_fill_percent: u8
+pub infino::CompactionSettings::target_superfile_size_mb: u64
+impl core::clone::Clone for infino::CompactionSettings
+pub fn infino::CompactionSettings::clone(&self) -> infino::CompactionSettings
+impl core::cmp::Eq for infino::CompactionSettings
+impl core::cmp::PartialEq for infino::CompactionSettings
+pub fn infino::CompactionSettings::eq(&self, &infino::CompactionSettings) -> bool
+impl core::default::Default for infino::CompactionSettings
+pub fn infino::CompactionSettings::default() -> Self
+impl core::fmt::Debug for infino::CompactionSettings
+pub fn infino::CompactionSettings::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::CompactionSettings
+impl serde_core::ser::Serialize for infino::CompactionSettings
+pub fn infino::CompactionSettings::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::CompactionSettings where infino::CompactionSettings: core::default::Default
+pub fn infino::CompactionSettings::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::CompactionSettings
+impl core::marker::Send for infino::CompactionSettings
+impl core::marker::Sync for infino::CompactionSettings
+impl core::marker::Unpin for infino::CompactionSettings
+impl core::marker::UnsafeUnpin for infino::CompactionSettings
+impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionSettings
+impl core::panic::unwind_safe::UnwindSafe for infino::CompactionSettings
 pub struct infino::ConnectOptions
 impl infino::ConnectOptions
 pub fn infino::ConnectOptions::new() -> Self
@@ -163,6 +212,8 @@ impl infino::Supertable
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+impl infino::Supertable
+pub fn infino::Supertable::compact(&self, &infino::CompactionSettings) -> core::result::Result<(), infino::CompactionError>
 impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 impl infino::Supertable

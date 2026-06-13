@@ -5,7 +5,7 @@
 //!
 //! Given a `SuperfileEntry`'s per-column min/max summaries +
 //! the supertable's configured `PartitionStrategy`, decide
-//! which partition the segment belongs to. Drives the
+//! which partition the superfile belongs to. Drives the
 //! writer's "rewrite latest part" policy: superfiles in the
 //! same partition share a `ManifestPart`; superfiles in
 //! different partitions go into separate parts so a
@@ -88,7 +88,7 @@ pub fn decode_partition_key(
 
 /// Decide which partition `seg` belongs to under `strategy`.
 ///
-/// - **TimeRange**: segment's `(min, max)` on the partition
+/// - **TimeRange**: superfile's `(min, max)` on the partition
 ///   column must fall within a single bucket
 ///   (`min / granularity_secs == max / granularity_secs`).
 ///   Spans → `SuperfileSpansPartition`.
@@ -98,7 +98,7 @@ pub fn decode_partition_key(
 ///   bucket 0; pre-shard is trivial). Without the hint,
 ///   surfaces `SuperfileSpansPartition` with a "hash strategy
 ///   requires pre-sharded superfiles" message.
-/// - **ColumnRange**: segment's `(min, max)` must fall within
+/// - **ColumnRange**: superfile's `(min, max)` must fall within
 ///   one boundary interval. Spans → `SuperfileSpansPartition`.
 ///
 /// The `n_buckets == 1` Hash short-circuit is critical for
@@ -132,7 +132,7 @@ pub fn assign_partition(
             if min_bucket != max_bucket {
                 return Err(CommitError::SuperfileSpansPartition {
                     detail: format!(
-                        "segment {} column {column:?} [{min}, {max}] spans buckets \
+                        "superfile {} column {column:?} [{min}, {max}] spans buckets \
                          {min_bucket}..={max_bucket}; reduce commit_threshold_size_mb \
                          or flush at granularity boundaries",
                         seg.uri.0
@@ -159,7 +159,7 @@ pub fn assign_partition(
                         detail: format!(
                             "Hash{{n_buckets:{n_buckets}}} strategy requires pre-sharded \
                          superfiles; SuperfileEntry.partition_hint must be Some(bucket) \
-                         (segment {})",
+                         (superfile {})",
                             seg.uri.0
                         ),
                     })?;
@@ -185,7 +185,7 @@ pub fn assign_partition(
     }
 }
 
-/// Extract the segment's `(min, max)` for `column` as `i64`.
+/// Extract the superfile's `(min, max)` for `column` as `i64`.
 /// `ScalarStatsTable.cols[column]` carries Arrow length-1
 /// `ArrayRef`s; this helper downcasts against the column's
 /// actual Arrow type and returns the value at index 0.
@@ -207,7 +207,7 @@ fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), C
             .get(column)
             .ok_or_else(|| CommitError::SuperfileSpansPartition {
                 detail: format!(
-                    "TimeRange strategy: segment {} has no scalar_stats \
+                    "TimeRange strategy: superfile {} has no scalar_stats \
                      for column {column:?}",
                     seg.uri.0
                 ),
@@ -227,7 +227,7 @@ fn downcast_i64(
     if arr.is_empty() || arr.is_null(0) {
         return Err(CommitError::SuperfileSpansPartition {
             detail: format!(
-                "TimeRange strategy: segment {} column {column:?} stats array \
+                "TimeRange strategy: superfile {} column {column:?} stats array \
                  is empty or null at index 0",
                 seg.uri.0
             ),
@@ -257,7 +257,7 @@ fn downcast_i64(
         other => {
             return Err(CommitError::SuperfileSpansPartition {
                 detail: format!(
-                    "TimeRange strategy: segment {} column {column:?} has \
+                    "TimeRange strategy: superfile {} column {column:?} has \
                      unsupported type {other:?}; expected Int64 or Timestamp*",
                     seg.uri.0
                 ),
@@ -266,7 +266,7 @@ fn downcast_i64(
     };
     v.ok_or_else(|| CommitError::SuperfileSpansPartition {
         detail: format!(
-            "TimeRange strategy: segment {} column {column:?} downcast failed",
+            "TimeRange strategy: superfile {} column {column:?} downcast failed",
             seg.uri.0
         ),
     })
@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn assign_partition_time_range_rejects_segment_spanning_buckets() {
+    fn assign_partition_time_range_rejects_superfile_spanning_buckets() {
         // min in bucket 0, max in bucket 1 → SuperfileSpansPartition.
         let strategy = PartitionStrategy::TimeRange {
             column: "ts".into(),

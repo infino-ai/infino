@@ -166,7 +166,7 @@ async fn three_handles_concurrent_commits_all_succeed() {
     assert_eq!(consumer.reader().n_superfiles(), 3);
 
     // Verify all three writers' superfiles are present by
-    // counting distinct segment URIs — the supertable injects
+    // counting distinct superfile URIs — the supertable injects
     // `_id` values via its monotonic generator, so we can't
     // assert specific id values across writer processes (each
     // gets its own random worker_id).
@@ -176,7 +176,7 @@ async fn three_handles_concurrent_commits_all_succeed() {
     assert_eq!(
         uris.len(),
         segs.len(),
-        "every segment carries a distinct URI"
+        "every superfile carries a distinct URI"
     );
     assert!(
         segs.len() >= 3,
@@ -193,7 +193,7 @@ async fn three_handles_concurrent_commits_all_succeed() {
 /// before the next attempt's `with_appended` chains the
 /// loser's superfiles on top.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn retry_winner_sees_loser_segments_in_final_manifest() {
+async fn retry_winner_sees_loser_superfiles_in_final_manifest() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -225,7 +225,7 @@ async fn retry_winner_sees_loser_segments_in_final_manifest() {
 
     // Whichever handle ended at manifest_id = 2 should also
     // see 2 superfiles — its own plus the winner's. The handle
-    // at manifest_id = 1 only sees its own segment (pre-retry
+    // at manifest_id = 1 only sees its own superfile (pre-retry
     // state, never refreshed).
     for st in [&st_a, &st_b] {
         let r = st.reader();
@@ -239,7 +239,7 @@ async fn retry_winner_sees_loser_segments_in_final_manifest() {
             assert_eq!(
                 r.n_superfiles(),
                 1,
-                "v1 handle (winner) sees only its own segment"
+                "v1 handle (winner) sees only its own superfile"
             );
         } else {
             panic!("unexpected manifest_id: {}", r.manifest_id());

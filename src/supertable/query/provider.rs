@@ -2,25 +2,25 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! `SupertableProvider` — a DataFusion [`TableProvider`] that owns
-//! segment selection and hands the rest to DataFusion.
+//! superfile selection and hands the rest to DataFusion.
 //!
 //! ## Two-tier pruning
 //!
 //! This is the SQL counterpart to the dedicated BM25 / vector
-//! entry points: **infino decides which segments are relevant;
+//! entry points: **infino decides which superfiles are relevant;
 //! DataFusion executes over them.** Concretely, [`scan`] performs
 //! two tiers of skipping:
 //!
-//!   1. **Segment skip (infino).** The `WHERE` clause's simple
+//!   1. **Superfile skip (infino).** The `WHERE` clause's simple
 //!      `column <op> literal` conjuncts are lowered to
 //!      [`ScalarPredicate`]s and run through
-//!      [`scalar_skip`] against each segment's persisted
-//!      `ScalarStatsTable` min/max. Definitely-irrelevant segments
+//!      [`scalar_skip`] against each superfile's persisted
+//!      `ScalarStatsTable` min/max. Definitely-irrelevant superfiles
 //!      are dropped before any bytes are decoded. This is the same
 //!      manifest-level skip philosophy as `fts_bloom_skip` /
 //!      `vector_centroid_skip`.
 //!   2. **Row-group / page skip (DataFusion).** The surviving
-//!      segments' Parquet bytes are exposed to a DataFusion
+//!      superfiles' Parquet bytes are exposed to a DataFusion
 //!      `ParquetSource` via an in-memory object store. The same
 //!      predicate is handed to DataFusion as a physical expression
 //!      so `PruningPredicate` prunes row groups and pages, then
@@ -32,11 +32,11 @@
 //! DataFusion always re-applies the full predicate in a
 //! `FilterExec` above the scan. Both skip tiers are pure
 //! *conservative* optimizations — they may keep a non-matching
-//! segment/row group, never drop a matching one.
+//! superfile/row group, never drop a matching one.
 //!
 //! ## Why an in-memory object store
 //!
-//! The reader cache already holds warm segments as resident Parquet bytes
+//! The reader cache already holds warm superfiles as resident Parquet bytes
 //! (`SuperfileReader::parquet_bytes`, an `Arc`-backed `Bytes` — cloning is
 //! a refcount bump, not a copy). Registering those bytes into a DataFusion
 //! [`InMemory`] object store lets us reuse DataFusion's full `ParquetSource`
@@ -94,12 +94,12 @@ use datafusion::scalar::ScalarValue;
 /// resolving filter columns to a physical pruning predicate.
 pub(crate) const TABLE_NAME: &str = "supertable";
 
-/// Object-store URL *prefix* the surviving segments are registered under
+/// Object-store URL *prefix* the surviving superfiles are registered under
 /// for a scan. The authority is arbitrary — only a key into the session's
 /// object-store registry — but it must be **unique per provider**: a
 /// multi-table catalog query (`Connection::query_sql`) registers several
 /// providers into one DataFusion session, and a shared key would let one
-/// table's store overwrite another's, so the shadowed table's segments
+/// table's store overwrite another's, so the shadowed table's superfiles
 /// would read "not found". A process-global counter makes each provider's
 /// URL distinct while staying stable across that provider's own scans (so
 /// the cached single-table session re-registers the same key, no growth).
@@ -110,12 +110,12 @@ static STORE_URL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 /// Selectivity gate for the FTS `WHERE` pushdown: only push an index
 /// candidate set into the scan when the estimated match count is at
-/// most this fraction of the segment's rows. Above it, matches saturate
+/// most this fraction of the superfile's rows. Above it, matches saturate
 /// the Parquet data pages so an index `RowSelection` can't skip any —
 /// a plain scan is cheaper than the posting walk + selection overhead.
 const PUSHDOWN_MAX_FRACTION: f64 = 0.01;
 
-/// Floor for the gate so the pushdown stays active on small segments
+/// Floor for the gate so the pushdown stays active on small superfiles
 /// (where `n_docs * fraction` rounds to ~0 but there's no page-skip
 /// tradeoff to lose anyway).
 const PUSHDOWN_MIN_ROWS: u64 = 4096;
@@ -127,18 +127,18 @@ const PUSHDOWN_MIN_ROWS: u64 = 4096;
 /// plan. See the module docs for the two-tier pruning model.
 pub(crate) struct SupertableProvider {
     /// User-visible scalar schema (`_id` + scalar + FTS columns).
-    /// Matches the Parquet body each segment was written with.
+    /// Matches the Parquet body each superfile was written with.
     schema: SchemaRef,
     /// Pinned manifest snapshot for this query.
     manifest: Arc<Manifest>,
-    /// In-memory segment-bytes tier.
+    /// In-memory superfile-bytes tier.
     store: Arc<dyn SuperfileReaderCache>,
     /// Optional disk cache (storage-backed supertables).
     disk_cache: Option<Arc<DiskCacheStore>>,
     /// Per-superfile soft-delete (tombstone) overlay. `None` for
     /// in-memory tables with no WAL/mutation surface. When present,
     /// [`scan`](TableProvider::scan) pushes the tombstoned rows into
-    /// each segment's Parquet read as a [`ParquetAccessPlan`] row
+    /// each superfile's Parquet read as a [`ParquetAccessPlan`] row
     /// selection — the *lazy* delete path: deleted rows are skipped
     /// during decode rather than materialized then dropped. This
     /// keeps the analytical SELECT path's projection/limit/row-group
@@ -237,11 +237,11 @@ impl SupertableProvider {
 
     /// Lower scalar predicates to prune leaves. Each predicate yields a
     /// `Scalar` leaf; additionally, an equality on an FTS-indexed text
-    /// column also yields a `TermPresence` leaf so the segment's term
+    /// column also yields a `TermPresence` leaf so the superfile's term
     /// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
     /// whose tokens include every token of the literal, so requiring all
     /// of them possibly-present (`BoolMode::And`) never drops a match —
-    /// bloom false positives can only keep a segment, never drop one.
+    /// bloom false positives can only keep a superfile, never drop one.
     fn predicates_to_prune_leaves(
         &self,
         predicates: Vec<ScalarPredicate>,
@@ -269,18 +269,18 @@ impl SupertableProvider {
         leaves
     }
 
-    /// Lower `filters` to prune leaves and return the segments that
+    /// Lower `filters` to prune leaves and return the superfiles that
     /// survive the two-tier prune — exactly the inputs the scan hands to
     /// DataFusion.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
         let leaves = self.predicates_to_prune_leaves(predicates);
         let mut survivors =
-            crate::supertable::query::prune::select_segments(self.manifest.as_ref(), &leaves)
+            crate::supertable::query::prune::select_superfiles(self.manifest.as_ref(), &leaves)
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         // Covered/residual residual scans read only their boundary
-        // segments; everything else was answered from statistics.
+        // superfiles; everything else was answered from statistics.
         if let Some(allowed) = self.segment_filter.as_ref() {
             survivors.retain(|entry| allowed.contains(&entry.superfile_id));
         }
@@ -299,10 +299,10 @@ impl SupertableProvider {
             .collect()
     }
 
-    /// Test hook: how many segments survive pruning for `filters` — the
+    /// Test hook: how many superfiles survive pruning for `filters` — the
     /// observable behind "did the index prune more than min/max?".
     #[cfg(test)]
-    pub(crate) async fn surviving_segment_count(&self, filters: &[Expr]) -> usize {
+    pub(crate) async fn surviving_superfile_count(&self, filters: &[Expr]) -> usize {
         self.select_survivors(filters)
             .await
             .expect("select survivors")
@@ -531,7 +531,7 @@ impl TableProvider for SupertableProvider {
     /// projection (one decode), which a self-verifying `exact_match`
     /// candidate would split into an extra pass — measured slower.
     /// Returning `Unsupported` (the default) would withhold the filters
-    /// from [`scan`] entirely, disabling segment + row-group skip.
+    /// from [`scan`] entirely, disabling superfile + row-group skip.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -561,13 +561,13 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // Segment selection via the shared two-tier prune (the same
+        // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
         // DataFusion.
         let survivor_entries = self.select_survivors(filters).await?;
         let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
-        // Nothing survived (empty table, or every segment pruned):
+        // Nothing survived (empty table, or every superfile pruned):
         // a schema-correct empty scan. EmptyExec yields one
         // partition / zero rows, so `COUNT(*)` is 0 and `SELECT *`
         // returns the right empty shape. The projection must be
@@ -582,13 +582,13 @@ impl TableProvider for SupertableProvider {
             return Ok(Arc::new(EmptyExec::new(projected)));
         }
 
-        // One `Instant::now()` for the whole scan so every per-segment
+        // One `Instant::now()` for the whole scan so every per-superfile
         // tombstone lookup shares the same `SidecarCache` TTL
         // reference.
         let now = std::time::Instant::now();
 
-        // Warm every surviving segment's tombstone bitmap in one
-        // batched fetch before the per-segment sweep below, mirroring
+        // Warm every surviving superfile's tombstone bitmap in one
+        // batched fetch before the per-superfile sweep below, mirroring
         // the bm25 / vector fan-out (see `SidecarCache::prefetch`);
         // each `bitmap_for` in the loop then resolves from cache.
         if let Some(cache) = self.tombstone_cache.as_ref() {
@@ -598,28 +598,28 @@ impl TableProvider for SupertableProvider {
 
         // Pass 1 — build the index candidate plan once for this scan. It
         // lowers the FTS-resolvable part of the `WHERE` clause to a
-        // boolean tree over `token_match`; evaluated per segment below
+        // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
-        // the segment). See `crate::supertable::query::candidate`.
+        // the superfile). See `crate::supertable::query::candidate`.
         let candidate_plan = crate::supertable::query::candidate::CandidatePlan::from_filters(
             filters,
             &self.fts_cols_set(),
             self.manifest.options.tokenizer.as_ref(),
         );
 
-        // Every surviving segment is read through the one byte path the
+        // Every surviving superfile is read through the one byte path the
         // FTS/vector resolve path uses: `superfile_reader(...)` ->
-        // `SuperfileReader::byte_source()`. Warm / mmap segments slice
-        // their resident bytes zero-copy; cold segments range-fetch from
+        // `SuperfileReader::byte_source()`. Warm / mmap superfiles slice
+        // their resident bytes zero-copy; cold superfiles range-fetch from
         // object storage through the same source. The provider never
         // branches on which — that distinction lives entirely inside the
         // byte source.
         let mut sources: HashMap<ObjPath, Arc<dyn LazyByteSource>> = HashMap::new();
 
-        // Per-segment scan inputs, resolved into PartitionedFiles once the
-        // store is built (row-group counts are read from each segment's
+        // Per-superfile scan inputs, resolved into PartitionedFiles once the
+        // store is built (row-group counts are read from each superfile's
         // footer through the same byte source).
-        struct SegmentScan {
+        struct SuperfileScan {
             path: ObjPath,
             size: u64,
             candidates: Option<RoaringBitmap>,
@@ -629,7 +629,7 @@ impl TableProvider for SupertableProvider {
             /// this; the scan never re-parses a footer.
             parquet_meta: Arc<ParquetMetaData>,
         }
-        let mut segments: Vec<SegmentScan> = Vec::with_capacity(survivors.len());
+        let mut superfiles: Vec<SuperfileScan> = Vec::with_capacity(survivors.len());
 
         for entry in &survivors {
             let reader = crate::supertable::query::superfile_reader::superfile_reader(
@@ -642,17 +642,17 @@ impl TableProvider for SupertableProvider {
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-            // Pass 1 (per segment): resolve candidate rows from the
-            // index. `None` => no usable bound, scan the segment.
+            // Pass 1 (per superfile): resolve candidate rows from the
+            // index. `None` => no usable bound, scan the superfile.
             //
             // Selectivity gate: estimate the match count from per-term
             // `df` first (cheap, header-only). If a predicate would match
-            // more than `PUSHDOWN_MAX_FRACTION` of this segment, skip the
+            // more than `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
             // index path and let DataFusion scan: at that match density
             // the rows saturate the data pages, so an index `RowSelection`
             // can't skip any page and only adds posting-walk + selection
             // overhead. The floor keeps the pushdown active on small
-            // segments.
+            // superfiles.
             let est = candidate_plan
                 .estimate(reader.as_ref())
                 .await
@@ -668,7 +668,7 @@ impl TableProvider for SupertableProvider {
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
             };
 
-            // This segment's tombstoned rows (empty when no overlay).
+            // This superfile's tombstoned rows (empty when no overlay).
             let tombstones = match self.tombstone_cache.as_ref() {
                 Some(cache) => cache
                     .bitmap_for(entry.superfile_id, now)
@@ -680,7 +680,7 @@ impl TableProvider for SupertableProvider {
             let size = source.size();
             let path = ObjPath::from(entry.uri.storage_path());
             sources.insert(path.clone(), source);
-            segments.push(SegmentScan {
+            superfiles.push(SuperfileScan {
                 path,
                 size,
                 candidates,
@@ -692,13 +692,13 @@ impl TableProvider for SupertableProvider {
         // The single object store DataFusion reads every survivor through.
         let store: Arc<dyn OsObjectStore> = Arc::new(SuperfileObjectStore::from_sources(sources));
 
-        // Build each segment's PartitionedFile + access plan. An access
+        // Build each superfile's PartitionedFile + access plan. An access
         // plan exists only when the index bounded the rows or tombstones
         // must be skipped; a plain full scan needs no row-group map at
         // all. Row-group counts come from the footer metadata the
         // reader parsed at open — never re-read per query.
-        let mut files: Vec<PartitionedFile> = Vec::with_capacity(segments.len());
-        for seg in &segments {
+        let mut files: Vec<PartitionedFile> = Vec::with_capacity(superfiles.len());
+        for seg in &superfiles {
             let access_plan = if seg.candidates.is_some() || !seg.tombstones.is_empty() {
                 let row_counts: Vec<u32> = seg
                     .parquet_meta
@@ -724,7 +724,7 @@ impl TableProvider for SupertableProvider {
         // so the predicate columns are decoded first and only surviving
         // rows materialize.
         //
-        // When the index *did* bound the rows, the per-segment access plan
+        // When the index *did* bound the rows, the per-superfile access plan
         // already selects exactly the candidate rows and the `FilterExec`
         // above (filters are `Inexact`) verifies the exact predicate over
         // that tiny set. So we attach the pushdown predicate only on the
@@ -754,9 +754,9 @@ impl TableProvider for SupertableProvider {
         }
         // Serve DataFusion's opener the footers the readers already
         // parsed — without this the opener re-reads + re-parses every
-        // segment's footer on every query (~half the warm flat cost at
-        // 256 segments).
-        let metas: HashMap<ObjPath, Arc<ParquetMetaData>> = segments
+        // superfile's footer on every query (~half the warm flat cost
+        // at 256 superfiles).
+        let metas: HashMap<ObjPath, Arc<ParquetMetaData>> = superfiles
             .iter()
             .map(|s| (s.path.clone(), Arc::clone(&s.parquet_meta)))
             .collect();
@@ -797,13 +797,13 @@ impl TableProvider for SupertableProvider {
     }
 }
 
-/// Build a [`ParquetAccessPlan`] that skips this segment's
+/// Build a [`ParquetAccessPlan`] that skips this superfile's
 /// tombstoned rows during decode, or `None` if none of the deleted
 /// `local_doc_id`s fall inside the file (so a plain full scan is
 /// correct and cheaper than attaching an all-`Scan` plan).
 ///
 /// `bitmap` holds the tombstoned `local_doc_id`s, where a row's
-/// `local_doc_id` is its 0-based global position within the segment's
+/// `local_doc_id` is its 0-based global position within the superfile's
 /// Parquet body (row groups are laid out in append order, so global
 /// position partitions contiguously across them). For each row group
 /// we translate the deleted positions into a [`RowSelection`] of
@@ -812,7 +812,7 @@ impl TableProvider for SupertableProvider {
 ///
 /// Parsing the footer via [`ParquetRecordBatchReaderBuilder`] only
 /// touches metadata, not column data, and only happens when the
-/// segment actually has tombstones — clean tables pay nothing.
+/// superfile actually has tombstones — clean tables pay nothing.
 /// Byte-sourced wrapper over [`tombstone_access_plan_from_counts`]. The
 /// scan paths call the counts core directly via [`build_access_plan`];
 /// this wrapper serves callers that hold the raw Parquet bytes — the
@@ -831,7 +831,7 @@ pub(crate) fn tombstone_access_plan(
 
 /// Counts-based core of [`tombstone_access_plan`]: `row_counts[i]` is the
 /// row count of row group `i`. Lets the object-store scan path build the
-/// plan from a lazily-fetched footer (no whole-segment bytes).
+/// plan from a lazily-fetched footer (no whole-superfile bytes).
 fn tombstone_access_plan_from_counts(
     row_counts: &[u32],
     bitmap: &RoaringBitmap,
@@ -920,7 +920,7 @@ struct CachedMetadataReaderFactory {
 impl std::fmt::Debug for CachedMetadataReaderFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedMetadataReaderFactory")
-            .field("segments", &self.metas.len())
+            .field("superfiles", &self.metas.len())
             .finish()
     }
 }
@@ -982,7 +982,7 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
     }
 }
 
-/// Assemble the per-segment [`ParquetAccessPlan`] from row-group counts:
+/// Assemble the per-superfile [`ParquetAccessPlan`] from row-group counts:
 /// index candidates (minus tombstones) drive a selection plan; otherwise
 /// tombstones alone drive a delete-skip plan; a clean full scan is `None`.
 fn build_access_plan(
@@ -1011,14 +1011,14 @@ fn build_access_plan(
 /// plan. Used for index-driven row selection: the candidate planner
 /// yields a small set of `local_doc_id`s (already minus tombstones),
 /// and we want the Parquet reader to materialize the payload columns
-/// for just those rows rather than scanning the segment.
+/// for just those rows rather than scanning the superfile.
 ///
 /// `keep`'s ids are `local_doc_id`s - global row positions in the
 /// Parquet body - which partition contiguously across row groups laid
 /// out in append order. An empty `keep` produces an all-skip plan (zero
-/// rows decoded), the correct result for a segment with no candidate.
+/// rows decoded), the correct result for a superfile with no candidate.
 /// `row_counts[i]` is the row count of row group `i`, read from the
-/// segment footer through the unified store via [`build_access_plan`].
+/// superfile footer through the unified store via [`build_access_plan`].
 fn selection_access_plan_from_counts(
     row_counts: &[u32],
     keep: &RoaringBitmap,
@@ -1075,7 +1075,7 @@ fn selection_access_plan_from_counts(
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's
-/// [`ScalarPredicate`]s for segment skip.
+/// [`ScalarPredicate`]s for superfile skip.
 ///
 /// Each top-level filter is treated as a conjunct; nested `AND`s
 /// are flattened. Only `column <op> literal` (and the mirrored
@@ -1368,10 +1368,10 @@ mod tests {
         assert!(preds.is_empty());
     }
 
-    // ---- Segment-prune contrast: index helps vs. doesn't ----------
+    // ---- Superfile-prune contrast: index helps vs. doesn't ----------
     //
-    // End-to-end through a real multi-segment supertable: count how many
-    // segments survive the scan's prune for different predicates. This
+    // End-to-end through a real multi-superfile supertable: count how many
+    // superfiles survive the scan's prune for different predicates. This
     // is the observable proof that the embedded FTS index prunes more
     // than the scalar min/max a plain Parquet scan relies on — and,
     // honestly, where it doesn't (full scans, non-FTS predicates).
@@ -1384,8 +1384,8 @@ mod tests {
     }
 
     fn cat_title_opts() -> SupertableOptions {
-        // One writer thread → one segment per commit (deterministic
-        // segment counts).
+        // One writer thread → one superfile per commit (deterministic
+        // superfile counts).
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -1416,12 +1416,12 @@ mod tests {
     }
 
     #[test]
-    fn segment_prune_index_helps_vs_does_not() {
+    fn superfile_prune_index_helps_vs_does_not() {
         let st = Supertable::create(cat_title_opts()).expect("create");
         let mut w = st.writer().expect("writer");
-        // Three segments. Every segment's `title` lexicographic range
+        // Three superfiles. Every superfile's `title` lexicographic range
         // spans "mango", so scalar min/max can prune none of them — but
-        // only the middle segment actually holds the token.
+        // only the middle superfile actually holds the token.
         w.append(&cat_title_batch(&["lang", "lang"], &["aardvark", "zebra"]))
             .expect("a1");
         w.commit().expect("c1");
@@ -1446,28 +1446,28 @@ mod tests {
             .build()
             .expect("rt");
 
-        // Index HELPS: the term bloom prunes the two wide-range segments
+        // Index HELPS: the term bloom prunes the two wide-range superfiles
         // that min/max could not, leaving only the real holder.
         assert_eq!(
-            rt.block_on(provider.surviving_segment_count(&[col("title").eq(lit("mango"))])),
+            rt.block_on(provider.surviving_superfile_count(&[col("title").eq(lit("mango"))])),
             1,
             "FTS bloom prunes to the single token holder"
         );
 
-        // Index can't help a full scan — every segment is read.
+        // Index can't help a full scan — every superfile is read.
         assert_eq!(
-            rt.block_on(provider.surviving_segment_count(&[])),
+            rt.block_on(provider.surviving_superfile_count(&[])),
             3,
             "no predicate → full scan, nothing pruned"
         );
 
-        // Non-FTS predicate present in every segment: no bloom to use,
+        // Non-FTS predicate present in every superfile: no bloom to use,
         // and min/max can't prune (all categories equal) → nothing
         // pruned. This is the honest "index doesn't help" case.
         assert_eq!(
-            rt.block_on(provider.surviving_segment_count(&[col("category").eq(lit("lang"))])),
+            rt.block_on(provider.surviving_superfile_count(&[col("category").eq(lit("lang"))])),
             3,
-            "non-FTS predicate matching all segments prunes nothing"
+            "non-FTS predicate matching all superfiles prunes nothing"
         );
     }
 }

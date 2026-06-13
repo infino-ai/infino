@@ -10,6 +10,7 @@
 // - `tiers`, `markdown`, `rss` — storage backends + reporting
 
 pub mod corpus;
+pub mod dataset;
 pub mod executors;
 pub mod fixture;
 pub mod harness;

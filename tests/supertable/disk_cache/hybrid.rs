@@ -13,7 +13,7 @@
 //! - The foreground returns when all range-fetches finish;
 //!   pwrites + fsync + rename + mmap + cache registration
 //!   finalize in a separate task that outlives this method.
-//! - Bandwidth per cold miss = 1× segment size (one set of
+//! - Bandwidth per cold miss = 1× superfile size (one set of
 //!   `get_range` calls serves both foreground and cache fill).
 //! - Concurrent cold readers on the same URI coalesce to a
 //!   single coordinator (single fetch fan-out).
@@ -203,7 +203,7 @@ async fn hybrid_reader_returns_working_superfile_reader() {
 }
 
 #[tokio::test]
-async fn hybrid_bandwidth_per_cold_miss_equals_segment_size() {
+async fn hybrid_bandwidth_per_cold_miss_equals_superfile_size() {
     // The plan's "1× bandwidth per cold miss" invariant —
     // the same range responses serve both foreground and
     // cache fill; no re-fetching.
@@ -211,7 +211,7 @@ async fn hybrid_bandwidth_per_cold_miss_equals_segment_size() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
-    let segment_size = bytes.len();
+    let superfile_size = bytes.len();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
 
@@ -232,10 +232,10 @@ async fn hybrid_bandwidth_per_cold_miss_equals_segment_size() {
 
     let bytes_fetched = proxy.bytes();
     assert_eq!(
-        bytes_fetched, segment_size,
-        "1× bandwidth invariant: total get_range bytes ({}) must equal segment size ({}); \
+        bytes_fetched, superfile_size,
+        "1× bandwidth invariant: total get_range bytes ({}) must equal superfile size ({}); \
          any excess indicates re-fetching between foreground and cache fill",
-        bytes_fetched, segment_size
+        bytes_fetched, superfile_size
     );
 }
 
@@ -276,7 +276,7 @@ async fn hybrid_concurrent_readers_coalesce_to_one_fetch_fan_out() {
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
     let bytes = build_test_bytes();
-    let segment_size = bytes.len();
+    let superfile_size = bytes.len();
     let uri = SuperfileUri::new_v4();
     seed(&*local, uri, bytes).await;
 
@@ -294,7 +294,7 @@ async fn hybrid_concurrent_readers_coalesce_to_one_fetch_fan_out() {
     for h in joins {
         let _ = h.await.expect("join").expect("reader");
     }
-    // Bandwidth still equals one segment size — coalescing
+    // Bandwidth still equals one superfile size — coalescing
     // ensured exactly one fetch fan-out served all 50.
     tokio::time::sleep(std::time::Duration::from_millis(
         BACKGROUND_FINALIZER_SLEEP_MS,
@@ -302,7 +302,7 @@ async fn hybrid_concurrent_readers_coalesce_to_one_fetch_fan_out() {
     .await;
     assert_eq!(
         proxy.bytes(),
-        segment_size,
+        superfile_size,
         "50 concurrent cold readers must trigger exactly one fan-out"
     );
     let stats = cache.stats();

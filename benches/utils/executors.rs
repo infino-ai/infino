@@ -5,7 +5,7 @@
 //!
 //! One implementation of each benchmark's query battery, query
 //! execution, warm/cold measurement, and report rendering. Both the
-//! superfile (single-segment, in-memory) and supertable (multi-segment,
+//! superfile (single-superfile, in-memory) and supertable (multi-superfile,
 //! object-store) runners call these functions; the only thing each tier
 //! supplies is a *reader* (and, for cold, a way to open a fresh one).
 //! The reader type is an implementation detail hidden behind the
@@ -26,7 +26,7 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
 
 /// Cold timings for one query, split at the open/search boundary:
 /// `open` is the fresh-consumer open (consumer + manifest + every
-/// segment reader), `search` is the first query over the opened but
+/// superfile reader), `search` is the first query over the opened but
 /// data-cold table. Timed separately so cold search latency never
 /// bills the one-time open bookkeeping — the same cold-open vs
 /// cold-first-search split the quick-iter object-store harness uses.
@@ -36,29 +36,51 @@ pub struct ColdTiming {
     pub search: Duration,
 }
 
-/// Force-open every segment reader on the consumer's pinned snapshot —
-/// the "cold open" phase of a cold iteration. Runs the same per-segment
+/// Force-open every superfile reader on the consumer's pinned snapshot —
+/// the "cold open" phase of a cold iteration. Runs the same per-superfile
 /// open the query fan-out would lazily trigger (in-memory tier → disk
 /// cache admit → lazy range-GET fallback), concurrently like the query
 /// path, so the subsequent timed search pays only the search work.
-pub fn open_all_segments(consumer: &infino::supertable::Supertable) {
+pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
     let reader = consumer.reader();
     let manifest = reader.manifest();
-    let store = &manifest.options.store;
-    let disk_cache = manifest.options.disk_cache.as_ref();
-    let storage = manifest.options.storage.as_ref();
-    crate::tiers::block_on(async {
-        futures::future::try_join_all(manifest.superfiles.iter().map(|e| {
-            infino::supertable::query::superfile_reader::superfile_reader(
-                store,
-                disk_cache,
-                storage,
-                &e.uri,
-                e.subsection_offsets.as_ref(),
-            )
-        }))
-        .await
-        .expect("cold open: open segment readers");
+    let store = manifest.options.store.clone();
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    // Snapshot the per-superfile open inputs up front so each spawned task
+    // owns its data ('static). `tokio::spawn` per superfile distributes the
+    // per-open CPU parse across the runtime's worker threads — matching the
+    // production vector fan-out (`tokio::spawn` per superfile) instead of
+    // serializing all the parses on a single `try_join_all` poller.
+    let superfiles: Vec<_> = manifest
+        .superfiles
+        .iter()
+        .map(|e| (e.uri, e.subsection_offsets.clone()))
+        .collect();
+    crate::tiers::block_on(async move {
+        let handles: Vec<_> = superfiles
+            .into_iter()
+            .map(|(uri, offsets)| {
+                let store = store.clone();
+                let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    infino::supertable::query::superfile_reader::superfile_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        storage.as_ref(),
+                        &uri,
+                        offsets.as_ref(),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await
+                .expect("cold open: join superfile open task")
+                .expect("cold open: open superfile readers");
+        }
     });
 }
 
@@ -390,7 +412,7 @@ pub mod fts {
     /// [`ColdTiming`]). `open_fresh` returns a guard that both
     /// implements [`FtsRead`] and owns the cache/consumer resources it
     /// must drop after the timed read; the guard's constructor performs
-    /// the full open (consumer + segment readers).
+    /// the full open (consumer + superfile readers).
     pub fn measure_cold<G: FtsRead>(
         open_fresh: impl Fn() -> G,
         battery: &[FtsQuery],
@@ -602,7 +624,7 @@ pub mod vector {
 
     /// A reader the vector executor runs kNN against, returning **global**
     /// `(doc_id, score)` hits so recall can be graded against brute-force
-    /// ground truth regardless of how many segments back the reader.
+    /// ground truth regardless of how many superfiles back the reader.
     pub trait VectorRead {
         fn topk_global(
             &self,
@@ -623,7 +645,7 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            // Single segment: local_doc_id == global id.
+            // Single superfile: local_doc_id == global id.
             crate::tiers::block_on(self.vector_hits_async(
                 column,
                 query,
@@ -648,7 +670,7 @@ pub mod vector {
                 .vector_hits(column, query, k, search_opts(nprobe, rerank))
                 .expect("supertable vector_hits");
             let manifest = reader.manifest();
-            // Per-segment global-id base offsets in manifest order.
+            // Per-superfile global-id base offsets in manifest order.
             let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
             let mut acc: u32 = 0;
             for entry in manifest.superfiles.iter() {
@@ -660,8 +682,8 @@ pub mod vector {
                     let seg_idx = manifest
                         .superfiles
                         .iter()
-                        .position(|e| e.uri == h.segment)
-                        .expect("hit segment present in manifest");
+                        .position(|e| e.uri == h.superfile)
+                        .expect("hit superfile present in manifest");
                     (offsets[seg_idx] + h.local_doc_id, h.score)
                 })
                 .collect()
@@ -1082,74 +1104,86 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
         cold_iters: usize,
+        skip_calibration: bool,
         log_prefix: &str,
         anchor: &str,
         title: String,
         note: &str,
     ) {
-        eprintln!(
-            "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
-            q_correct.len(),
-        );
-        let recall = mean_recall(
-            warm_reader,
-            column,
-            q_correct,
-            gt_correct,
-            k,
-            CORRECTNESS_NPROBE,
-            CORRECTNESS_RERANK_MULT,
-        );
-        assert!(
-            recall >= CORRECTNESS_RECALL_FLOOR,
-            "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
-        );
-        eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
-
-        // Small corpora afford the exhaustive grid; past the cap the
-        // staircase walk gets the same answers from O(P + R)
-        // evaluations (see `calibrate_staircase`).
-        let cal: Vec<Option<Calibrated>> = if n_docs <= FULL_CALIBRATION_MAX_DOCS {
-            RECALL_TARGETS
-                .iter()
-                .map(|&target| {
-                    eprintln!(
-                        "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
-                        q_cal.len(),
-                    );
-                    calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
-                })
-                .collect()
-        } else {
-            eprintln!(
-                "[{log_prefix}] calibrating {} targets: staircase walk over the (probe, refine) grid ({} queries)...",
-                RECALL_TARGETS.len(),
-                q_cal.len(),
-            );
-            calibrate_staircase(warm_reader, column, q_cal, gt_cal, k, log_prefix)
-        };
-
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();
-        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            match cal[i] {
-                Some(c) => rows.push(RecallRow {
-                    target: format!("{target:.2}"),
-                    params: format!("p={}, r={}", c.probe, c.refine),
-                    recall: format!("{:.3}", c.recall),
-                    warm: include_warm
-                        .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
-                    cold: include_cold.then(|| {
-                        measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
+        if skip_calibration {
+            // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
+            // correctness gate, no recall-target grid — just the fixed
+            // `(default_nprobe, default_rerank)` row below. Needs no ground
+            // truth and no warmed reader, so a cold-only run is fast and
+            // prod-shaped.
+            eprintln!(
+                "[{log_prefix}] skip-calibration: measuring only fixed (p={default_nprobe}, r={default_rerank})",
+            );
+        } else {
+            eprintln!(
+                "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
+                q_correct.len(),
+            );
+            let recall = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                CORRECTNESS_NPROBE,
+                CORRECTNESS_RERANK_MULT,
+            );
+            assert!(
+                recall >= CORRECTNESS_RECALL_FLOOR,
+                "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            );
+            eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+
+            // Small corpora afford the exhaustive grid; past the cap the
+            // staircase walk gets the same answers from O(P + R)
+            // evaluations (see `calibrate_staircase`).
+            let cal: Vec<Option<Calibrated>> = if n_docs <= FULL_CALIBRATION_MAX_DOCS {
+                RECALL_TARGETS
+                    .iter()
+                    .map(|&target| {
+                        eprintln!(
+                            "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
+                            q_cal.len(),
+                        );
+                        calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
+                    })
+                    .collect()
+            } else {
+                eprintln!(
+                    "[{log_prefix}] calibrating {} targets: staircase walk over the (probe, refine) grid ({} queries)...",
+                    RECALL_TARGETS.len(),
+                    q_cal.len(),
+                );
+                calibrate_staircase(warm_reader, column, q_cal, gt_cal, k, log_prefix)
+            };
+
+            for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+                match cal[i] {
+                    Some(c) => rows.push(RecallRow {
+                        target: format!("{target:.2}"),
+                        params: format!("p={}, r={}", c.probe, c.refine),
+                        recall: format!("{:.3}", c.recall),
+                        warm: include_warm
+                            .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
+                        cold: include_cold.then(|| {
+                            measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
+                        }),
                     }),
-                }),
-                None => rows.push(RecallRow {
-                    target: format!("{target:.2}"),
-                    params: "—".into(),
-                    recall: "—".into(),
-                    warm: None,
-                    cold: None,
-                }),
+                    None => rows.push(RecallRow {
+                        target: format!("{target:.2}"),
+                        params: "—".into(),
+                        recall: "—".into(),
+                        warm: None,
+                        cold: None,
+                    }),
+                }
             }
         }
         rows.push(RecallRow {

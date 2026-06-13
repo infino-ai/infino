@@ -7,8 +7,8 @@
 //!      against the indexes embedded in the same bytes.
 //!   B. open-format — those same bytes are a valid Parquet file;
 //!      vanilla DataFusion reads them as a plain table.
-//!   C. supertable — the cross-segment layer that auto-injects a
-//!      real `_id`, queried across two committed segments.
+//!   C. supertable — the cross-superfile layer that auto-injects a
+//!      real `_id`, queried across two committed superfiles.
 //!
 //! Run with:
 //! ```text
@@ -42,7 +42,7 @@ const EMB_DIM: usize = 16;
 const DOC_ID_DECIMAL_PRECISION: u8 = 38;
 /// Decimal128 scale for `doc_id` — integer ids, no fractional part.
 const DOC_ID_DECIMAL_SCALE: i8 = 0;
-/// IVF centroids for a one-document superfile segment (one cluster).
+/// IVF centroids for a one-document superfile superfile (one cluster).
 const DEMO_N_CENT: usize = 1;
 /// Rotation-matrix RNG seed (matches the test/bench convention).
 const DEMO_ROT_SEED: u64 = 7;
@@ -114,7 +114,7 @@ fn demo_superfile() -> Bytes {
 
     let reader = SuperfileReader::open(bytes.clone()).expect("open SuperfileReader");
 
-    // The per-segment `SuperfileReader` query kernels are async; drive
+    // The per-superfile `SuperfileReader` query kernels are async; drive
     // them on a throwaway runtime here (the supertable layer below
     // exposes the sync public API instead).
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -176,17 +176,17 @@ fn demo_datafusion(bytes: &Bytes) {
 
 /// C — the supertable layer. It auto-injects a snowflake `_id`, so
 /// the user schema carries only payload columns. Two commits produce
-/// two segments; BM25 fans out across both, and SQL surfaces the
+/// two superfiles; BM25 fans out across both, and SQL surfaces the
 /// real `_id` values.
 fn demo_supertable() {
-    println!("== C. supertable: cross-segment, auto-injected _id ==");
+    println!("== C. supertable: cross-superfile, auto-injected _id ==");
 
     // default_supertable_options(): schema is `title: LargeUtf8`,
     // FTS on title, no vectors, in-memory store. The `_id` column is
     // added by the supertable, not declared here.
     let st = Supertable::create(default_supertable_options()).expect("create supertable");
 
-    // Each commit seals one segment. The writer holds an exclusive
+    // Each commit seals one superfile. The writer holds an exclusive
     // slot on the supertable, so we scope it so it drops before the
     // next one is taken.
     for title in [DOCSTRING_1, DOCSTRING_2] {
@@ -195,14 +195,14 @@ fn demo_supertable() {
         w.commit().expect("commit");
     }
 
-    // BM25 across both segments. The low-level reader `bm25_hits` returns
-    // `SuperfileHit`s carrying the source segment + local_doc_id + score;
+    // BM25 across both superfiles. The low-level reader `bm25_hits` returns
+    // `SuperfileHit`s carrying the source superfile + local_doc_id + score;
     // the public, row-returning path is `Supertable::bm25_search`.
     let hits = st
         .reader()
         .bm25_hits("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");
-    println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());
+    println!("  bm25 \"fox\" across superfiles -> {} hit(s)", hits.len());
     for h in &hits {
         println!("    local_doc_id={} score={:.4}", h.local_doc_id, h.score);
     }

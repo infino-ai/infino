@@ -124,16 +124,17 @@ mod runtime_bridge;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};
+pub use config::CompactionSettings;
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
 pub use superfile::fts::reader::BoolMode;
 pub use superfile::vector::distance::Metric;
-pub use supertable::MutationStats;
 /// Single-table handle: `append` / `update` / `delete` / `bm25_search`
 /// / `vector_search` / `schema`.
 pub use supertable::Supertable;
+pub use supertable::{CompactionError, MutationStats};
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)

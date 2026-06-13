@@ -33,11 +33,11 @@
 //!    serves both the vector and FTS readers.
 //! 2. **Cold first vector search after S3 open** — `vec.search`
 //!    at the default `(nprobe, rerank_mult)` against a freshly
-//!    opened reader and empty segment-data cache; pays the
+//!    opened reader and empty superfile-data cache; pays the
 //!    cold-search budget (~nprobe + 1 cluster GETs), excluding
 //!    file open.
 //! 3. **Cold first BM25 search after S3 open** — `bm25_search`
-//!    against a freshly opened reader and empty segment-data cache;
+//!    against a freshly opened reader and empty superfile-data cache;
 //!    pays the FTS lazy open-time fetch (header + doc-lengths) plus
 //!    per-term dict/postings range GETs (`FtsReader::open_lazy`
 //!    mirroring the vector path), excluding file open.
@@ -2218,7 +2218,7 @@ pub(crate) mod diag {
             format!("SELECT _id FROM bm25_search('{FTS_COLUMN}', '{FTS_QUERY_TERM}', {TOP_K})");
         let vec_sql = format!("SELECT _id FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
         // Score-only projection skips `resolve_hits` -> `resolve_columns`
-        // (no scalar decode, no per-segment superfile_reader open).
+        // (no scalar decode, no per-superfile superfile_reader open).
         // Difference vs `_id` projection isolates resolve_hits cost.
         let bm25_score_sql =
             format!("SELECT score FROM bm25_search('{FTS_COLUMN}', '{FTS_QUERY_TERM}', {TOP_K})");

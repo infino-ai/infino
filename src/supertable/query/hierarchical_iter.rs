@@ -5,7 +5,7 @@
 //!
 //! The bridge between the list-level prune helpers
 //! (`list_prune::prune_parts_for_*`) and the per-part
-//! segment iteration the query paths need:
+//! superfile iteration the query paths need:
 //!
 //!   1. Caller computes a `kept_part_ids: Vec<PartId>` via
 //!      the appropriate `prune_parts_for_*` for its query
@@ -14,9 +14,9 @@
 //!      `Manifest::part(id).await`, in parallel. Already-
 //!      loaded parts (eager mode, or warm OnceCells) cost
 //!      nothing.
-//!   3. [`flatten_segments`] concatenates the loaded parts'
+//!   3. [`flatten_superfiles`] concatenates the loaded parts'
 //!      superfiles into a single `Vec<Arc<SuperfileEntry>>`
-//!      that the existing segment-level skip + fan-out
+//!      that the existing superfile-level skip + fan-out
 //!      code consumes.
 //!
 //! `async` end-to-end: the query paths that call these helpers
@@ -67,10 +67,10 @@ pub async fn load_kept_parts(
 }
 
 /// Concatenate the loaded parts' superfiles into a flat
-/// `Vec<Arc<SuperfileEntry>>` for downstream segment-level
+/// `Vec<Arc<SuperfileEntry>>` for downstream superfile-level
 /// skip + fan-out. Cheap: every entry is `Arc::clone` of an
 /// already-allocated `SuperfileEntry`.
-pub fn flatten_segments(parts: &[Arc<ManifestPart>]) -> Vec<Arc<SuperfileEntry>> {
+pub fn flatten_superfiles(parts: &[Arc<ManifestPart>]) -> Vec<Arc<SuperfileEntry>> {
     let total: usize = parts.iter().map(|p| p.superfiles.len()).sum();
     let mut out = Vec::with_capacity(total);
     for p in parts {
@@ -86,7 +86,7 @@ pub async fn load_and_flatten(
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
     let parts = load_kept_parts(manifest, kept_part_ids).await?;
-    Ok(flatten_segments(&parts))
+    Ok(flatten_superfiles(&parts))
 }
 
 /// **Fallback shape** for query callers operating on
@@ -95,6 +95,6 @@ pub async fn load_and_flatten(
 /// the flat `manifest.superfiles`. The eager-mode + lazy-mode hierarchical
 /// path through `load_and_flatten` requires a `ManifestList`; this branch
 /// covers the no-list case so the query paths remain uniformly callable.
-pub fn fallback_to_flat_segments(manifest: &Manifest) -> Vec<Arc<SuperfileEntry>> {
+pub fn fallback_to_flat_superfiles(manifest: &Manifest) -> Vec<Arc<SuperfileEntry>> {
     manifest.superfiles.to_vec()
 }

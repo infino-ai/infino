@@ -136,7 +136,7 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
         mid_stats.current_bytes
     );
 
-    // Second query against the same segment — warm hit.
+    // Second query against the same superfile — warm hit.
     let _batches = consumer
         .reader()
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
@@ -153,7 +153,7 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
 fn producer_with_cache_reads_through_cache_path() {
     // The producer commits with both storage AND cache
     // attached. The writer extracts
-    // summaries directly from the segment bytes (no
+    // summaries directly from the superfile bytes (no
     // round-trip through options.store.put), so the
     // in-memory tier is NOT populated. The
     // writer additionally pre-populates the cache after
@@ -177,7 +177,7 @@ fn producer_with_cache_reads_through_cache_path() {
     drop(w);
 
     // Post-commit the cache holds the warmed
-    // segment. n_cold_fetches stays 0; n_entries == 1.
+    // superfile. n_cold_fetches stays 0; n_entries == 1.
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
     assert_eq!(pre.n_entries, 1, "writer should have warmed the cache");
@@ -229,7 +229,7 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
     let post_commit = cache.stats();
     assert_eq!(
         post_commit.n_entries, 1,
-        "writer must have warmed the cache with the just-committed segment"
+        "writer must have warmed the cache with the just-committed superfile"
     );
     assert_eq!(
         post_commit.n_cold_fetches, 0,
@@ -237,7 +237,7 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
     );
     assert!(
         post_commit.current_bytes > 0,
-        "cache must hold the warmed segment's bytes; got current_bytes={}",
+        "cache must hold the warmed superfile's bytes; got current_bytes={}",
         post_commit.current_bytes
     );
 
@@ -290,13 +290,13 @@ fn writer_warm_cache_is_idempotent_under_writer_retry() {
 }
 
 #[test]
-fn manifest_segments_are_not_pinned_by_supertable_create() {
-    // The cache must be free to evict any segment to stay under
+fn manifest_superfiles_are_not_pinned_by_supertable_create() {
+    // The cache must be free to evict any superfile to stay under
     // budget. Pinning the live manifest makes the whole index
     // required to fit in cache: once all resident entries are pinned,
     // the next admit can fail with BudgetExceeded. Supertable::create
     // therefore installs a pin callback that does not pin manifest
-    // segments.
+    // superfiles.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -314,7 +314,7 @@ fn manifest_segments_are_not_pinned_by_supertable_create() {
     let pre = cache.current_pinned_uris();
     assert!(pre.is_empty(), "expected empty pinned set; got {pre:?}");
 
-    // Commit one segment.
+    // Commit one superfile.
     {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(&["pinned alpha"]))
@@ -322,7 +322,7 @@ fn manifest_segments_are_not_pinned_by_supertable_create() {
         w.commit().expect("commit");
     }
 
-    // Post-commit: the manifest has one segment, but the cache still
+    // Post-commit: the manifest has one superfile, but the cache still
     // pins nothing. Eviction protection is not based on the live
     // manifest set.
     let post = cache.current_pinned_uris();
@@ -332,11 +332,11 @@ fn manifest_segments_are_not_pinned_by_supertable_create() {
 }
 
 #[test]
-fn manifest_segments_are_not_pinned_by_supertable_open() {
+fn manifest_superfiles_are_not_pinned_by_supertable_open() {
     // Supertable::open follows the same cache policy as create: the
-    // live manifest does not pin segment files. A cross-process
+    // live manifest does not pin superfile files. A cross-process
     // consumer can stream an index larger than cache budget instead
-    // of making every manifest segment ineligible for eviction.
+    // of making every manifest superfile ineligible for eviction.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
@@ -367,15 +367,15 @@ fn manifest_segments_are_not_pinned_by_supertable_open() {
         pinned.is_empty(),
         "expected empty pinned set; got {pinned:?}"
     );
-    let n_segments = consumer.reader().manifest().superfile_list.superfiles.len();
-    assert_eq!(n_segments, 1);
+    let n_superfiles = consumer.reader().manifest().superfile_list.superfiles.len();
+    assert_eq!(n_superfiles, 1);
 }
 
 #[test]
 fn pinned_fn_does_not_hold_supertable_alive() {
     // Cache outliving its supertable is supported: the installed
     // callback must not keep the supertable alive. The current policy
-    // pins no manifest segments, so the observable set is empty both
+    // pins no manifest superfiles, so the observable set is empty both
     // before and after drop.
     let storage_dir = TempDir::new().expect("storage tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");

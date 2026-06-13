@@ -107,4 +107,4 @@ references in [`docs/architecture/`](docs/architecture/) —
 [`superfile.md`](docs/architecture/superfile.md) (the on-disk format
 and single-file reader/builder) and
 [`supertable.md`](docs/architecture/supertable.md) (the in-memory
-cross-segment query and manifest layer).
+cross-superfile query and manifest layer).

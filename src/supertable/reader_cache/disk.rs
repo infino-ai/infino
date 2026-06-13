@@ -42,14 +42,14 @@ const VECTOR_OPEN_HEADER_FALLBACK_BYTES: u64 = 32;
 const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
 
 /// Poll cadence while waiting for another task to mmap-promote a
-/// segment. Short so the waiter picks up the promotion promptly
+/// superfile. Short so the waiter picks up the promotion promptly
 /// without busy-spinning.
 const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Yield cadence in the background-fill upgrade loop. Gives a
 /// short-lived caller (e.g. a cold benchmark with a fresh cache per
 /// iteration) a scheduling turn to drop the cache before a
-/// full-segment fill starts.
+/// full-superfile fill starts.
 const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
@@ -69,7 +69,7 @@ pub enum DiskCacheError {
     SuperfileOpenRead(#[from] crate::superfile::ReadError),
     /// Eviction couldn't free enough space because every
     /// cached entry was pinned (or there were no cached
-    /// entries and the incoming segment alone exceeds the
+    /// entries and the incoming superfile alone exceeds the
     /// disk budget). The query layer can fall back to a
     /// `RangeOnly` path on this error; the cache itself just
     /// surfaces it as a typed error.
@@ -130,7 +130,7 @@ pub struct CacheStats {
     pub n_madvise_calls: u64,
 }
 
-/// Pulls segment bytes through a [`StorageProvider`] and
+/// Pulls superfile bytes through a [`StorageProvider`] and
 /// caches them locally as mmap-backed `SuperfileReader`s.
 ///
 /// Construction is sync; `reader()` is async (cold fetches
@@ -166,7 +166,7 @@ pub struct DiskCacheStore {
     /// mutex and invoke it lock-free, so the mutex is held
     /// only for the Arc bump.
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
-    /// Global cap on concurrent background segment fills. Each
+    /// Global cap on concurrent background superfile fills. Each
     /// background fill acquires one permit for its whole
     /// duration; foreground per-query range reads don't. Sized
     /// `config.prefetch_concurrency` at construction.
@@ -387,7 +387,7 @@ impl DiskCacheStore {
     /// `cached`.
     ///
     /// Used as the [`DiskCacheError::BudgetExceeded`] fallback —
-    /// e.g. a single segment larger than the whole cache budget.
+    /// e.g. a single superfile larger than the whole cache budget.
     /// The query still succeeds by issuing range GETs for only the
     /// bytes the reader touches; nothing is admitted, so there's
     /// nothing to evict.
@@ -412,7 +412,7 @@ impl DiskCacheStore {
         };
         // Range-only is also a lazy reader over object storage. A full CRC
         // scan here would turn a fallback path meant to issue targeted
-        // ranges into a whole-segment read.
+        // ranges into a whole-superfile read.
         let reader =
             SuperfileReader::open_lazy_with(range_src, OpenOptions { verify_crc: false }).await?;
         Ok(Arc::new(reader))
@@ -522,7 +522,7 @@ impl DiskCacheStore {
             tokio::time::sleep(MMAP_PROMOTION_POLL_INTERVAL).await;
         }
         Err(DiskCacheError::SuperfileOpen(format!(
-            "segment {uri:?} not mmap-promoted within {timeout:?}"
+            "superfile {uri:?} not mmap-promoted within {timeout:?}"
         )))
     }
 
@@ -660,7 +660,7 @@ impl DiskCacheStore {
     /// pre-populate the cache with the superfiles it just
     /// published, so the producer's next query on its own
     /// superfiles skips the cold-fetch wall-time hit (parallel
-    /// range-fetch + pwrite + mmap, ~50-150 ms per segment on
+    /// range-fetch + pwrite + mmap, ~50-150 ms per superfile on
     /// the laptop bench).
     ///
     /// Idempotent: if `uri` is already in the cache,
@@ -686,7 +686,7 @@ impl DiskCacheStore {
         // Idempotent: already-cached URIs are a no-op. The
         // writer may call this for superfiles a prior commit
         // already published (e.g., an OCC retry where the
-        // same UUID segment got re-inserted into the cache).
+        // same UUID superfile got re-inserted into the cache).
         if self.cached.contains_key(uri) {
             return Ok(());
         }
@@ -793,7 +793,7 @@ impl DiskCacheStore {
         self.config.cache_root.join(uri.cache_tmp_filename())
     }
 
-    /// The storage-side URI for a segment, mirroring the
+    /// The storage-side URI for a superfile, mirroring the
     /// writer's persist layout.
     fn storage_path(uri: &SuperfileUri) -> String {
         uri.storage_path()
@@ -963,7 +963,7 @@ impl DiskCacheStore {
     /// [`SuperfileReader::open_lazy`]-built reader over a
     /// [`crate::supertable::StorageRangeSource`]; spawns a
     /// background task that waits for foreground lazy readers
-    /// to release before fetching the full segment, mmap'ing
+    /// to release before fetching the full superfile, mmap'ing
     /// it, and replacing the cached entry. Subsequent
     /// `reader(uri)` calls return the mmap-backed reader (zero
     /// S3 GETs for any subsequent search).
@@ -1006,12 +1006,12 @@ impl DiskCacheStore {
     /// Lazy cold-fetch path. Foreground builds a reader via
     /// `SuperfileReader::open_lazy_with(StorageRangeSource)`;
     /// background task waits for foreground lazy readers to release,
-    /// then downloads the full segment to NVMe, mmaps it, and replaces
+    /// then downloads the full superfile to NVMe, mmaps it, and replaces
     /// the cache entry.
     ///
     /// If `offsets` is present, the lazy source starts with a known
-    /// segment size and an optional open-batch overlay:
-    ///   - with `open_blob`: zero segment-object GETs at open time,
+    /// superfile size and an optional open-batch overlay:
+    ///   - with `open_blob`: zero superfile-object GETs at open time,
     ///     because manifest-part fetch already carried the bytes.
     ///   - without `open_blob`: parquet tail + vector + FTS open ranges
     ///     are fetched in one parallel batch.
@@ -1073,7 +1073,7 @@ impl DiskCacheStore {
                 // The open-batch bytes (parquet tail + vector + FTS open
                 // ranges) already rode in with the manifest part GET that
                 // `cold_open` performed. Install them straight into the
-                // overlay: ZERO open-time GETs against the segment object.
+                // overlay: ZERO open-time GETs against the superfile object.
                 for (off, bytes) in &offsets.open_blob {
                     overlay.install(*off, Bytes::copy_from_slice(bytes));
                 }
@@ -1121,9 +1121,9 @@ impl DiskCacheStore {
             // vec subsection head, fts subsection) hits the overlay sync
             // when the open batch is present. Lazy opens intentionally
             // skip full CRC scans: verifying every subsection would force
-            // whole-segment range reads, defeating the lazy/open-batch
+            // whole-superfile range reads, defeating the lazy/open-batch
             // path. Eager cache promotion can still verify when it
-            // materializes the full segment.
+            // materializes the full superfile.
             let lazy_reader = SuperfileReader::open_lazy_with(
                 Arc::clone(&source),
                 OpenOptions { verify_crc: false },
@@ -1163,7 +1163,7 @@ impl DiskCacheStore {
         self.cached.insert(*uri, Arc::clone(&entry));
 
         // Background promotion waits until foreground lazy readers
-        // release before starting full-segment fetch, so cache fill
+        // release before starting full-superfile fetch, so cache fill
         // does not compete with query-critical range GETs.
         if !skip_background_fill() {
             let store = Arc::downgrade(self);
@@ -1345,7 +1345,7 @@ impl DiskCacheStore {
         let n_streams = self.config.cold_fetch_streams.max(1);
         // Fixed chunk size — do NOT scale with `size`. Peak
         // in-flight memory is `n_streams × chunk_size`
-        // regardless of segment size, because the per-fill
+        // regardless of superfile size, because the per-fill
         // semaphore below caps concurrent chunks at `n_streams`.
         let chunk_size = self.config.cold_fetch_chunk_bytes.max(1);
 
@@ -1573,9 +1573,19 @@ async fn wait_for_lazy_foreground_release(
         if reader.strong_count() <= 1 {
             // Give short-lived callers (notably cold benchmarks with a
             // fresh cache per iteration) a scheduling turn to drop the
-            // cache before we start a full-segment background fill.
+            // cache before we start a full-superfile background fill.
             tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-            return store.upgrade();
+            // Re-check after the grace sleep: `strong_count == 1` is
+            // also what acquisition looks like from outside — between
+            // `cold_fetch_lazy` dropping its local Arc and the caller
+            // cloning out of the cache entry, the entry briefly holds
+            // the only reference. A poll landing in that window (or a
+            // caller re-acquiring during the sleep) must NOT start the
+            // fill while the reader is held; keep waiting instead.
+            if reader.strong_count() <= 1 {
+                return store.upgrade();
+            }
+            continue;
         }
         tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
     }
@@ -1607,8 +1617,8 @@ async fn cold_fetch_to_disk_cancelable(
     let mut next_chunk = 0u64;
     let mut in_flight = FuturesUnordered::new();
 
-    // Fetch the full segment in bounded chunks instead of a whole-object
-    // `get()`: large segments can be hundreds of MiB to many GiB, and
+    // Fetch the full superfile in bounded chunks instead of a whole-object
+    // `get()`: large superfiles can be hundreds of MiB to many GiB, and
     // materializing them as one `Bytes` would reintroduce the RSS spike
     // this disk-cache path is meant to avoid.
     loop {
@@ -1671,18 +1681,18 @@ fn rollback_lazy_background_fill(
 /// background promotion path for the
 /// `LazyForegroundWithBackgroundFill` cold-fetch mode.
 /// Waits for foreground lazy readers to release, downloads the
-/// full segment via cancelable parallel range-GETs to NVMe,
+/// full superfile via cancelable parallel range-GETs to NVMe,
 /// mmaps the resulting file, and atomically replaces the lazy
 /// cache entry with a mmap-backed reader. Subsequent
 /// `reader(uri)` calls hit the promoted entry — every query
 /// resolves from mmap (zero S3 GETs).
 /// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
-/// full-segment promotion. When `INFINO_DISABLE_BG_FILL=1` (or
+/// full-superfile promotion. When `INFINO_DISABLE_BG_FILL=1` (or
 /// `true`), the cold-fetch path installs the open-blob overlay
 /// and serves the foreground query over range GETs, but never
-/// spawns the full-segment background download. Lets us measure
+/// spawns the full-superfile background download. Lets us measure
 /// the cold fan-out cost in isolation from the competing
-/// full-segment fills.
+/// full-superfile fills.
 pub(crate) fn skip_background_fill() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| {
@@ -1817,4 +1827,98 @@ fn open_readonly_mmap(path: &std::path::Path) -> std::io::Result<memmap2::Mmap> 
     // unmaps cleanly under POSIX even if the file's already
     // unlinked).
     unsafe { memmap2::Mmap::map(&file) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::LocalFsStorageProvider;
+    use crate::superfile::SuperfileReader;
+    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder};
+    use crate::test_helpers::{decimal128_id_field, decimal128_ids};
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use tempfile::TempDir;
+
+    /// Poll turns the test lets elapse while the reader is held — the
+    /// pre-fix code returned after a single grace sleep, so anything
+    /// > 1 distinguishes "kept waiting" from "barreled ahead".
+    const HELD_POLL_TURNS: u32 = 5;
+
+    /// Minimal eager superfile reader (one scalar batch, no indexes).
+    fn tiny_reader() -> Arc<SuperfileReader> {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids(vec![1u64]);
+        let titles = LargeStringArray::from(vec!["alpha"]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        Arc::new(SuperfileReader::open(bytes).expect("open"))
+    }
+
+    fn test_store() -> (TempDir, Arc<DiskCacheStore>) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let cfg = DiskCacheConfig {
+            cache_root: dir.path().join("cache"),
+            ..Default::default()
+        };
+        let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
+        (dir, store)
+    }
+
+    /// Regression: `strong_count == 1` is also what *acquisition*
+    /// looks like — between `cold_fetch_lazy` dropping its local Arc
+    /// and the caller cloning out of the cache entry, the entry
+    /// briefly holds the only reference. The pre-fix wait returned
+    /// unconditionally after its grace sleep, so a poll landing in
+    /// that window started the full-segment fill while the foreground
+    /// reader was held (the CI flake in
+    /// `lazy_background_fill_waits_for_foreground_reader_drop`).
+    /// The wait must re-check after the grace sleep and keep waiting.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_release_rechecks_reader_after_grace_sleep() {
+        let (_dir, store) = test_store();
+        let reader = tiny_reader();
+
+        let weak_store = Arc::downgrade(&store);
+        let weak_reader = Arc::downgrade(&reader);
+        // At spawn the only strong ref is `reader` itself — the exact
+        // shape of the acquisition window (the entry's ref, caller's
+        // clone not yet taken).
+        let waiter = tokio::spawn(async move {
+            wait_for_lazy_foreground_release(&weak_store, &weak_reader).await
+        });
+
+        // Let the waiter observe count == 1 and enter its grace sleep.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The caller's clone lands while the waiter is mid-grace: the
+        // reader is now genuinely held.
+        let held = Arc::clone(&reader);
+
+        // Let several poll intervals elapse (paused time auto-advances
+        // through every sleep). The buggy wait returned after ONE.
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL * HELD_POLL_TURNS).await;
+        assert!(
+            !waiter.is_finished(),
+            "background fill must keep waiting while the foreground reader is held"
+        );
+
+        // Release the hold (one strong ref — the entry's — remains):
+        // the wait must now complete and hand back the store.
+        drop(held);
+        let got = waiter.await.expect("waiter join");
+        assert!(
+            got.is_some(),
+            "wait must yield the store once the foreground hold releases"
+        );
+        drop(reader);
+    }
 }

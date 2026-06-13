@@ -24,7 +24,7 @@
 //! Why low-bit flag (not high-bit): the `fst` crate VLQ-encodes
 //! values, so encoded length grows with magnitude. Putting the flag
 //! in the low bit keeps PFOR-form values small (~5–6 bytes VLQ at
-//! 16 GB segment scale); only inline values pay the larger encoding
+//! 16 GB superfile scale); only inline values pay the larger encoding
 //! (~7–8 bytes VLQ for the composite). High-bit flag would force
 //! *every* value to a full ~9-byte encoding.
 

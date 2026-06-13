@@ -62,12 +62,12 @@ pub fn idf(n_docs: u64, df: u64) -> f32 {
 ///
 /// `tf`    — term frequency in this document, this column.
 /// `dl`    — this document's length in this column (in tokens).
-/// `avgdl` — average document length across the segment, this column.
+/// `avgdl` — average document length across the superfile, this column.
 #[inline(always)]
 pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32) -> f32 {
     let tf = tf as f32;
     // avgdl is precomputed at build time and stored in the doc-lengths
-    // directory; if a segment has zero docs we wouldn't be calling this
+    // directory; if a superfile has zero docs we wouldn't be calling this
     // function, but guard anyway against a divide-by-zero on degenerate
     // input.
     let norm = if avgdl > 0.0 {
