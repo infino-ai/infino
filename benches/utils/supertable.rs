@@ -47,7 +47,7 @@ use tempfile::TempDir;
 
 use crate::corpus::DIM;
 use crate::ingest::supertable::{self, Modality, modality_label};
-use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
+use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 use crate::rss::{self, PeakSampler};
 use crate::tiers;
@@ -74,6 +74,14 @@ pub struct ShapeMetrics {
     pub peak_rss_bytes: u64,
     pub median_rss_bytes: u64,
     pub p90_rss_bytes: u64,
+    /// Index bytes written to object storage during ingest. The
+    /// supertable's "upload bandwidth" is this over the wall time —
+    /// the bytes-to-object-store rate, the analogue of the superfile
+    /// build's input-payload bandwidth.
+    pub index_bytes: u64,
+    /// Raw input corpus size (text + vector bytes) — the source data
+    /// fed to ingest, distinct from `index_bytes` (what's written out).
+    pub corpus_bytes: u64,
 }
 
 pub struct SupertableShapeResult {
@@ -86,12 +94,14 @@ impl ShapeMetrics {
     /// Render as the single stdout line the parent parses.
     fn to_result_line(&self) -> String {
         format!(
-            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={}",
+            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={}",
             self.wall_ns,
             self.n_superfiles,
             self.peak_rss_bytes,
             self.median_rss_bytes,
             self.p90_rss_bytes,
+            self.index_bytes,
+            self.corpus_bytes,
         )
     }
 
@@ -104,6 +114,8 @@ impl ShapeMetrics {
         let mut peak = None;
         let mut median = None;
         let mut p90 = None;
+        let mut index_bytes = None;
+        let mut corpus_bytes = None;
         for tok in body.split_whitespace() {
             let (k, v) = tok.split_once('=')?;
             match k {
@@ -112,6 +124,8 @@ impl ShapeMetrics {
                 "peak" => peak = v.parse().ok(),
                 "median" => median = v.parse().ok(),
                 "p90" => p90 = v.parse().ok(),
+                "index_bytes" => index_bytes = v.parse().ok(),
+                "corpus_bytes" => corpus_bytes = v.parse().ok(),
                 _ => {}
             }
         }
@@ -121,6 +135,8 @@ impl ShapeMetrics {
             peak_rss_bytes: peak?,
             median_rss_bytes: median?,
             p90_rss_bytes: p90?,
+            index_bytes: index_bytes?,
+            corpus_bytes: corpus_bytes?,
         })
     }
 }
@@ -172,6 +188,8 @@ fn run_child_shape(key: &str) {
         peak_rss_bytes: rss.peak_rss_bytes,
         median_rss_bytes: rss.median_rss_bytes,
         p90_rss_bytes: rss.p90_rss_bytes,
+        index_bytes: built.total_index_bytes,
+        corpus_bytes: corpus.byte_size(),
     };
     println!("{}", metrics.to_result_line());
 }
@@ -239,10 +257,19 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     } else {
         0.0
     };
+    // Upload bandwidth: index bytes written to object storage per
+    // second over the ingest wall time.
+    let bw = if secs > 0.0 {
+        m.index_bytes as f64 / secs
+    } else {
+        0.0
+    };
     vec![
         text(label),
         metric(m.wall_ns, fmt_time(m.wall_ns), Better::Lower),
         metric(thr, fmt_throughput(thr), Better::Higher),
+        metric(bw, fmt_bandwidth(bw), Better::Higher),
+        text(rss::fmt_bytes(m.corpus_bytes)),
         text(fmt_count(m.n_superfiles)),
         metric(
             m.peak_rss_bytes as f64,
@@ -281,10 +308,11 @@ pub fn run() {
     // per-shape RSS numbers are independent (see the module docs).
     let n_docs = supertable::n_docs();
     eprintln!(
-        "[supertable] ingesting {} docs ({} commits) per shape to object storage, \
+        "[supertable] ingesting {} docs ({} commits, {} writers) per shape to object storage, \
          one isolated process per shape...",
         fmt_count(n_docs),
-        supertable::n_commits()
+        supertable::n_commits(),
+        supertable::n_writers()
     );
 
     let shape_results = run_ingest_shapes_isolated();
@@ -302,10 +330,11 @@ pub fn run() {
     report.emit(&Section {
         anchor: "bench/supertable/ingest".into(),
         title: format!(
-            "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits)",
+            "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
             fmt_count(n_docs),
             crate::corpus::DIM,
-            supertable::n_commits()
+            supertable::n_commits(),
+            supertable::n_writers()
         ),
         note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). \
                Each shape is built in its own subprocess, so Peak/Median/P90 RSS are measured from a \
@@ -320,6 +349,8 @@ pub fn run() {
                 "Shape".into(),
                 "Time".into(),
                 "Throughput".into(),
+                "Bandwidth".into(),
+                "Corpus".into(),
                 "Superfiles".into(),
                 "Peak RSS".into(),
                 "Median RSS".into(),
@@ -377,6 +408,8 @@ fn build_measured(
         peak_rss_bytes: rss.peak_rss_bytes,
         median_rss_bytes: rss.median_rss_bytes,
         p90_rss_bytes: rss.p90_rss_bytes,
+        index_bytes: built.total_index_bytes,
+        corpus_bytes: corpus.byte_size(),
     });
     (built, metrics)
 }
@@ -487,9 +520,10 @@ pub mod fts {
         report.emit(&Section {
             anchor: "bench/fts/supertable/ingest".into(),
             title: format!(
-                "Supertable FTS — ingest, multi-superfile / object-store ({} docs, {} commits)",
+                "Supertable FTS — ingest, multi-superfile / object-store ({} docs, {} commits, {} writers)",
                 fmt_count(n_docs),
-                supertable::n_commits()
+                supertable::n_commits(),
+                supertable::n_writers()
             ),
             note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
             blocks: vec![Block {
@@ -498,6 +532,8 @@ pub mod fts {
                     "Shape".into(),
                     "Time".into(),
                     "Throughput".into(),
+                    "Bandwidth".into(),
+                    "Corpus".into(),
                     "Superfiles".into(),
                     "Peak RSS".into(),
                     "Median RSS".into(),
@@ -686,10 +722,11 @@ pub mod vector {
             report.emit(&Section {
                 anchor: "bench/vector/supertable/ingest".into(),
                 title: format!(
-                    "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits)",
+                    "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
                     fmt_count(n_docs),
                     DIM,
-                    supertable::n_commits()
+                    supertable::n_commits(),
+                    supertable::n_writers()
                 ),
                 note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
@@ -698,6 +735,8 @@ pub mod vector {
                         "Shape".into(),
                         "Time".into(),
                         "Throughput".into(),
+                        "Bandwidth".into(),
+                        "Corpus".into(),
                         "Superfiles".into(),
                         "Peak RSS".into(),
                         "Median RSS".into(),
@@ -873,9 +912,10 @@ pub mod sql {
             report.emit(&Section {
                 anchor: "bench/sql/supertable/ingest".into(),
                 title: format!(
-                    "Supertable SQL — ingest, multi-superfile / object-store ({} rows, {} commits)",
+                    "Supertable SQL — ingest, multi-superfile / object-store ({} rows, {} commits, {} writers)",
                     fmt_count(n_docs),
-                    supertable::n_commits()
+                    supertable::n_commits(),
+                    supertable::n_writers()
                 ),
                 note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
@@ -884,6 +924,8 @@ pub mod sql {
                         "Shape".into(),
                         "Time".into(),
                         "Throughput".into(),
+                        "Bandwidth".into(),
+                        "Corpus".into(),
                         "Superfiles".into(),
                         "Peak RSS".into(),
                         "Median RSS".into(),

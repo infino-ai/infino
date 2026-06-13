@@ -49,6 +49,14 @@ pub fn n_commits() -> usize {
         .div_ceil(MAX_DOCS_PER_COMMIT)
         .max(MIN_COMMIT_CHUNKS)
 }
+
+/// Writer-pool thread count for ingest — the machine's logical core
+/// count by default, overridable with `INFINO_BENCH_WRITERS` (same
+/// knob the superfile build honors). Each commit's per-shard build
+/// fans out across this pool.
+pub fn n_writers() -> usize {
+    corpus::parallel_writers()
+}
 pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
@@ -162,7 +170,7 @@ pub fn options_for(
     if modality == Modality::Sql {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
-                .num_threads(num_cpus::get().max(1))
+                .num_threads(n_writers().max(1))
                 .build()
                 .expect("pool"),
         );
@@ -179,7 +187,7 @@ pub fn options_for(
     let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(num_cpus::get().max(1))
+            .num_threads(n_writers().max(1))
             .build()
             .expect("pool"),
     );
@@ -251,6 +259,19 @@ impl PreparedCorpus {
     /// phase doesn't regenerate 10M×384 floats.
     pub fn vectors(&self) -> Option<&MmapVectorCorpus> {
         self.vectors.as_ref()
+    }
+
+    /// Logical size of the raw input corpus fed to ingest — text bytes
+    /// plus vector f32 bytes. This is the *source* data size, distinct
+    /// from the index bytes the supertable writes to object storage.
+    pub fn byte_size(&self) -> u64 {
+        let text = self.text.as_ref().map(|t| t.total_bytes()).unwrap_or(0);
+        let vec = self
+            .vectors
+            .as_ref()
+            .map(|v| (v.as_slice().len() * std::mem::size_of::<f32>()) as u64)
+            .unwrap_or(0);
+        text + vec
     }
 }
 
