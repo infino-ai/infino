@@ -250,6 +250,27 @@ pub fn run_ingest_shapes_isolated() -> Vec<SupertableShapeResult> {
     results
 }
 
+/// Shared column headers for every supertable ingest table (the
+/// combined `run()` table and the per-modality fts/vector/sql tables),
+/// so the four call sites can't drift apart. `Stored` is the total
+/// on-storage footprint of the committed superfiles — full Parquet
+/// (data pages + embedded BM25/vector indexes), not just the index
+/// subsections — printed next to the raw `Corpus` it was built from.
+pub fn ingest_headers() -> Vec<String> {
+    vec![
+        "Shape".into(),
+        "Time".into(),
+        "Throughput".into(),
+        "Bandwidth".into(),
+        "Corpus".into(),
+        "Stored".into(),
+        "Superfiles".into(),
+        "Peak RSS".into(),
+        "Median RSS".into(),
+        "P90 RSS".into(),
+    ]
+}
+
 pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     let secs = m.wall_ns / 1e9;
     let thr = if secs > 0.0 {
@@ -257,10 +278,17 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     } else {
         0.0
     };
-    // Upload bandwidth: index bytes written to object storage per
+    // Upload bandwidth: stored bytes written to object storage per
     // second over the ingest wall time.
     let bw = if secs > 0.0 {
         m.index_bytes as f64 / secs
+    } else {
+        0.0
+    };
+    // Stored footprint as a fraction of the raw corpus it was built
+    // from — the headline compression/expansion ratio per modality.
+    let stored_pct = if m.corpus_bytes > 0 {
+        100.0 * m.index_bytes as f64 / m.corpus_bytes as f64
     } else {
         0.0
     };
@@ -270,6 +298,11 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
         metric(thr, fmt_throughput(thr), Better::Higher),
         metric(bw, fmt_bandwidth(bw), Better::Higher),
         text(rss::fmt_bytes(m.corpus_bytes)),
+        metric(
+            m.index_bytes as f64,
+            format!("{} ({stored_pct:.0}%)", rss::fmt_bytes(m.index_bytes)),
+            Better::Lower,
+        ),
         text(fmt_count(m.n_superfiles)),
         metric(
             m.peak_rss_bytes as f64,
@@ -340,22 +373,13 @@ pub fn run() {
                Each shape is built in its own subprocess, so Peak/Median/P90 RSS are measured from a \
                clean address space and are comparable across shapes. Rows are the three index shapes \
                built from the same seeded corpus, so each is directly comparable to its single-modality \
-               peer. Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the \
-               previous run."
+               peer. Throughput is rows/s; `Stored` is the total on-storage footprint of the committed \
+               superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; \
+               `Superfiles` is the committed superfile count. Δ is vs the previous run."
             .into(),
         blocks: vec![Block {
             subtitle: String::new(),
-            headers: vec![
-                "Shape".into(),
-                "Time".into(),
-                "Throughput".into(),
-                "Bandwidth".into(),
-                "Corpus".into(),
-                "Superfiles".into(),
-                "Peak RSS".into(),
-                "Median RSS".into(),
-                "P90 RSS".into(),
-            ],
+            headers: ingest_headers(),
             rows,
         }],
     });
@@ -525,20 +549,10 @@ pub mod fts {
                 supertable::n_commits(),
                 supertable::n_writers()
             ),
-            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
+            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Stored` is the total on-storage footprint of the committed superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec![
-                    "Shape".into(),
-                    "Time".into(),
-                    "Throughput".into(),
-                    "Bandwidth".into(),
-                    "Corpus".into(),
-                    "Superfiles".into(),
-                    "Peak RSS".into(),
-                    "Median RSS".into(),
-                    "P90 RSS".into(),
-                ],
+                headers: ingest_headers(),
                 rows: vec![ingest_row(n_docs, "FTS-only", metrics)],
             }],
         });
@@ -728,20 +742,10 @@ pub mod vector {
                     supertable::n_commits(),
                     supertable::n_writers()
                 ),
-                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Stored` is the total on-storage footprint of the committed superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
                     subtitle: String::new(),
-                    headers: vec![
-                        "Shape".into(),
-                        "Time".into(),
-                        "Throughput".into(),
-                        "Bandwidth".into(),
-                        "Corpus".into(),
-                        "Superfiles".into(),
-                        "Peak RSS".into(),
-                        "Median RSS".into(),
-                        "P90 RSS".into(),
-                    ],
+                    headers: ingest_headers(),
                     rows: vec![ingest_row(n_docs, "vector-only", metrics)],
                 }],
             });
@@ -917,20 +921,10 @@ pub mod sql {
                     supertable::n_commits(),
                     supertable::n_writers()
                 ),
-                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Stored` is the total on-storage footprint of the committed superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
                     subtitle: String::new(),
-                    headers: vec![
-                        "Shape".into(),
-                        "Time".into(),
-                        "Throughput".into(),
-                        "Bandwidth".into(),
-                        "Corpus".into(),
-                        "Superfiles".into(),
-                        "Peak RSS".into(),
-                        "Median RSS".into(),
-                        "P90 RSS".into(),
-                    ],
+                    headers: ingest_headers(),
                     rows: vec![ingest_row(n_docs, "SQL", metrics)],
                 }],
             });
