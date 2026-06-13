@@ -269,7 +269,7 @@ impl PreparedCorpus {
         let vec = self
             .vectors
             .as_ref()
-            .map(|v| (v.as_slice().len() * std::mem::size_of::<f32>()) as u64)
+            .map(|v| std::mem::size_of_val(v.as_slice()) as u64)
             .unwrap_or(0);
         text + vec
     }
