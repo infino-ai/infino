@@ -18,8 +18,7 @@ use futures::TryStreamExt;
 use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    PutPayload, UpdateVersion,
+    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, retry};

@@ -5,8 +5,8 @@
 //! Used by the cost model to price cold-query S3 requests.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -70,10 +70,8 @@ pub fn wrap(storage: Arc<dyn StorageProvider>) -> MeteredStorage {
         get_count: AtomicU64::new(0),
         get_bytes: AtomicU64::new(0),
     });
-    let provider: Arc<dyn StorageProvider> = Arc::new(CountingStorage::new(
-        storage,
-        Arc::clone(&counters),
-    ));
+    let provider: Arc<dyn StorageProvider> =
+        Arc::new(CountingStorage::new(storage, Arc::clone(&counters)));
     MeteredStorage { provider, counters }
 }
 

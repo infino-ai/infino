@@ -14,11 +14,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use infino::superfile::SuperfileReader;
 use infino::supertable::manifest::SubsectionOffsets;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{AzureStorageProvider, S3StorageProvider, StorageProvider};
 use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
-use infino::superfile::SuperfileReader;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;

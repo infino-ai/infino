@@ -47,11 +47,11 @@ use tempfile::TempDir;
 
 use crate::corpus::DIM;
 use crate::cost;
-use crate::storage_meter;
 use crate::ingest::supertable::{self, Modality, modality_label};
 use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 use crate::rss::{self, PeakSampler};
+use crate::storage_meter;
 use crate::tiers;
 
 /// Env var the parent sets to make a child build exactly one shape and
@@ -583,10 +583,7 @@ pub mod fts {
                 .as_ref()
                 .map(|c| cost::cold_from_fts(c))
                 .unwrap_or_default();
-            let cold_store = phases
-                .cold
-                .then(|| measure_cold_store(&built))
-                .flatten();
+            let cold_store = phases.cold.then(|| measure_cold_store(&built)).flatten();
             if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
                     &mut report,
@@ -699,10 +696,8 @@ pub mod fts {
         }
         let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
         let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
-        let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
-            meter.provider(),
-            Some(built.total_index_bytes),
-        );
+        let (cache_dir, cache) =
+            tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
         let opts = tiers::consumer_options(
             supertable::options_for(Modality::Fts, None),
             meter.provider(),
@@ -714,13 +709,7 @@ pub mod fts {
         let terms = query.terms.join(" ");
         let mode = exec_fts::to_infino_mode(query.mode);
         let _ = reader
-            .bm25_search(
-                supertable::TEXT_COLUMN,
-                &terms,
-                TOP_K,
-                mode,
-                None,
-            )
+            .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
             .expect("metered cold bm25_search");
         drop(consumer);
         drop(cache_dir);

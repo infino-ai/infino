@@ -1558,10 +1558,22 @@ pub mod sql {
             title,
             note: note.into(),
             blocks: vec![
-                block("Aggregations & count-filters (read + compute, return few rows)", &sets.scalar),
-                block("WHERE equality, FTS-pushdown — selective, 1 row (sorted vs unsorted col)", &sets.fts_pushdown),
-                block("Aggregate over FTS candidates — FTS-pushdown (token_match)", &sets.agg_idx),
-                block("Search table functions (bm25 / vector / hybrid / token / exact)", &sets.tvf),
+                block(
+                    "Aggregations & count-filters (read + compute, return few rows)",
+                    &sets.scalar,
+                ),
+                block(
+                    "WHERE equality, FTS-pushdown — selective, 1 row (sorted vs unsorted col)",
+                    &sets.fts_pushdown,
+                ),
+                block(
+                    "Aggregate over FTS candidates — FTS-pushdown (token_match)",
+                    &sets.agg_idx,
+                ),
+                block(
+                    "Search table functions (bm25 / vector / hybrid / token / exact)",
+                    &sets.tvf,
+                ),
             ],
         });
     }

@@ -235,12 +235,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         (0.0, 0.0, String::new(), 0.0)
     } else {
         warm_costs.iter().fold(
-            (
-                f64::INFINITY,
-                0.0_f64,
-                String::new(),
-                f64::INFINITY,
-            ),
+            (f64::INFINITY, 0.0_f64, String::new(), f64::INFINITY),
             |(min_c, max_c, fast_name, fast_p50), (cost, p50, name)| {
                 let (fast_name, fast_p50) = if *p50 < fast_p50 {
                     (name.clone(), *p50)
@@ -354,11 +349,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
 
     let writers_used = c.writers.min(inst.vcpu);
     let ingest_cpu_row = vec![
-        text(format!(
-            "Ingest CPU ({}w on {} vCPU)",
-            c.writers,
-            inst.vcpu
-        )),
+        text(format!("Ingest CPU ({}w on {} vCPU)", c.writers, inst.vcpu)),
         text(format!(
             "{} = {} × {}",
             fmt_vcpu_seconds(ingest_vcpu_s),
@@ -409,7 +400,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 fmt_wall_seconds(q.open_s),
                 fmt_vcpu_seconds(open_vcpu),
             )),
-            text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(open_usd))),
+            text(format!(
+                "@ ${:.4}/hr → {}",
+                inst.usd_per_hour,
+                usd(open_usd)
+            )),
             metric(open_usd, usd(open_usd), Better::Lower),
         ]);
         meter_rows.push(vec![
@@ -419,7 +414,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 fmt_wall_seconds(q.search_s),
                 fmt_vcpu_seconds(search_vcpu),
             )),
-            text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(search_usd))),
+            text(format!(
+                "@ ${:.4}/hr → {}",
+                inst.usd_per_hour,
+                usd(search_usd)
+            )),
             metric(search_usd, usd(search_usd), Better::Lower),
         ]);
     }
@@ -465,7 +464,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
     }
 
-    if let Some((name, p50_s)) = c.warm.iter().find(|(n, _)| n == "ten_term_or").or_else(|| c.warm.first())
+    if let Some((name, p50_s)) = c
+        .warm
+        .iter()
+        .find(|(n, _)| n == "ten_term_or")
+        .or_else(|| c.warm.first())
     {
         let vcpu_s = inst.per_query_vcpu_seconds(*p50_s, c.resident_anon_bytes);
         let q_usd = vcpu_s * inst.usd_per_sec();
@@ -500,11 +503,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             "Ingest & storage — priced on {} ({} vCPU / {:.0} GiB / {:.0} GB NVMe @ ${:.4}/hr)",
             inst.name, inst.vcpu, inst.ram_gib, inst.nvme_gb, inst.usd_per_hour,
         ),
-        headers: vec![
-            "Component".into(),
-            "Cost".into(),
-            "Per-unit".into(),
-        ],
+        headers: vec!["Component".into(), "Cost".into(), "Per-unit".into()],
         rows: vec![
             vec![
                 text(format!(
@@ -529,7 +528,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     format!("{}/mo", usd(storage_month)),
                     Better::Lower,
                 ),
-                text(format!("{}/1M docs·mo", usd(storage_per_million_docs_month))),
+                text(format!(
+                    "{}/1M docs·mo",
+                    usd(storage_per_million_docs_month)
+                )),
             ],
         ],
     };

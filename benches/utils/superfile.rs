@@ -3,8 +3,8 @@
 
 //! Superfile-layer benchmark runners grouped by modality.
 
-use crate::report::{Better, Cell, Report, metric, text};
 use crate::cost;
+use crate::report::{Better, Cell, Report, metric, text};
 use crate::rss;
 
 /// Shared headers for the single-superfile ingest tables (fts / vector /
@@ -422,7 +422,13 @@ pub mod fts {
         let mut report = Report::load("superfile_fts");
 
         if phases.build {
-            emit_build(&mut report, n_docs, &corpus, &result, index.bytes().len() as u64);
+            emit_build(
+                &mut report,
+                n_docs,
+                &corpus,
+                &result,
+                index.bytes().len() as u64,
+            );
         }
 
         if phases.warm || phases.cold {
