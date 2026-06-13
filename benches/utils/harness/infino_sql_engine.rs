@@ -28,29 +28,15 @@ use rayon::prelude::*;
 use super::{Capabilities, SqlEngine, SqlOutput, SqlRow};
 
 const TITLE_COLUMN: &str = "title";
-// Byte-for-byte copy of `title` that is **not** FTS-indexed. Running the
-// same selective equality against `title` (FTS index → pushdown) vs
-// `title_noidx` (no index → DataFusion scan) is the apples-to-apples
-// control: same predicate, same 1-row result, only the index differs.
-const TITLE_NOIDX_COLUMN: &str = "title_noidx";
 // Low-cardinality bucket label (`b0`..`b9` by `doc_id % 10`), so an
-// equality like `bucket = 'b0'` selects exactly 10% of rows. Two copies:
-// `bucket` is FTS-indexed (the WHERE pushdown resolves it through
-// `token_match` — a positive "which rows contain b0" check), `bucket_noidx`
-// is not indexed (DataFusion full-scans it: every row group holds all ten
-// labels, so min/max pruning — a negative check — never fires). Same
-// predicate, same 10% candidate set, only the access path differs.
+// equality like `bucket = 'b0'` selects exactly 10% of rows. FTS-indexed,
+// so the WHERE pushdown resolves it through `token_match`.
 const BUCKET_COLUMN: &str = "bucket";
-const BUCKET_NOIDX_COLUMN: &str = "bucket_noidx";
 // High-cardinality key whose value is **uncorrelated with row (doc_id)
-// order** — a multiplicative hash — so consecutive rows get values
-// spread across the whole domain. Each Parquet data page then spans ~the
-// full key range, so min/max page stats can't exclude any page for a
-// `key = 'k…'` lookup (every page "might" contain it): DataFusion is
-// forced to scan all pages, while the FTS index resolves the one row's
-// page directly. Two copies: `key` is FTS-indexed, `key_noidx` is not.
+// order** — a multiplicative hash — so consecutive rows get values spread
+// across the whole domain, defeating min/max page pruning. FTS-indexed, so
+// the lookup resolves the one row's page directly.
 const KEY_COLUMN: &str = "key";
-const KEY_NOIDX_COLUMN: &str = "key_noidx";
 const CATEGORY_COLUMN: &str = "category";
 // Named `rating` (not `score`) so it never collides with the `score`
 // column the bm25 / vector / hybrid TVFs append to their output schema.
@@ -87,11 +73,8 @@ pub fn sql_schema() -> Arc<Schema> {
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new(TITLE_COLUMN, DataType::LargeUtf8, false),
-        Field::new(TITLE_NOIDX_COLUMN, DataType::LargeUtf8, false),
         Field::new(BUCKET_COLUMN, DataType::LargeUtf8, false),
-        Field::new(BUCKET_NOIDX_COLUMN, DataType::LargeUtf8, false),
         Field::new(KEY_COLUMN, DataType::LargeUtf8, false),
-        Field::new(KEY_NOIDX_COLUMN, DataType::LargeUtf8, false),
         Field::new(CATEGORY_COLUMN, DataType::LargeUtf8, false),
         Field::new(SCORE_COLUMN, DataType::Int64, false),
         Field::new(VECTOR_COLUMN, fixed_list_f32(SQL_DIM), false),
@@ -178,25 +161,16 @@ pub fn build_supertable_with_options(
     let mut writer = st.writer().expect("writer");
     for chunk in rows.chunks(write_chunk.max(1)) {
         let titles = LargeStringArray::from(chunk.iter().map(|r| r.title).collect::<Vec<_>>());
-        // Identical values to `title`, but this column has no FTS index.
-        let titles_noidx =
-            LargeStringArray::from(chunk.iter().map(|r| r.title).collect::<Vec<_>>());
-        // 10-bucket label by `doc_id % 10`; identical values in the
-        // indexed and non-indexed copies.
+        // 10-bucket label by `doc_id % 10`.
         let bucket_vals: Vec<String> = chunk
             .iter()
             .map(|r| format!("b{}", r.doc_id % 10))
             .collect();
         let buckets =
             LargeStringArray::from(bucket_vals.iter().map(String::as_str).collect::<Vec<_>>());
-        let buckets_noidx =
-            LargeStringArray::from(bucket_vals.iter().map(String::as_str).collect::<Vec<_>>());
-        // High-cardinality, order-uncorrelated key; identical values in
-        // the indexed and non-indexed copies.
+        // High-cardinality, order-uncorrelated key.
         let key_vals: Vec<String> = chunk.iter().map(|r| scatter_key(r.doc_id)).collect();
         let keys = LargeStringArray::from(key_vals.iter().map(String::as_str).collect::<Vec<_>>());
-        let keys_noidx =
-            LargeStringArray::from(key_vals.iter().map(String::as_str).collect::<Vec<_>>());
         let categories =
             LargeStringArray::from(chunk.iter().map(|r| r.category).collect::<Vec<_>>());
         let scores = Int64Array::from(chunk.iter().map(|r| r.score).collect::<Vec<_>>());
@@ -215,11 +189,8 @@ pub fn build_supertable_with_options(
             schema.clone(),
             vec![
                 Arc::new(titles),
-                Arc::new(titles_noidx),
                 Arc::new(buckets),
-                Arc::new(buckets_noidx),
                 Arc::new(keys),
-                Arc::new(keys_noidx),
                 Arc::new(categories),
                 Arc::new(scores),
                 Arc::new(emb),

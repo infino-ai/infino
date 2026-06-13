@@ -1343,13 +1343,14 @@ pub mod sql {
         pub rss: RssStats,
     }
 
-    /// The full set of measured warm SQL query shapes.
+    /// The full set of measured warm SQL query shapes. Infino-only: the
+    /// DataFusion-only control arms (plain scan, full-scan aggregates) were
+    /// dropped — that comparison is recorded in the design notes, and the
+    /// bench now tracks the engine's own FTS-pushdown path.
     pub struct QuerySets {
         pub scalar: Vec<SqlQueryStat>,
         pub tvf: Vec<SqlQueryStat>,
-        pub plain_scan: Vec<SqlQueryStat>,
         pub fts_pushdown: Vec<SqlQueryStat>,
-        pub agg_scan: Vec<SqlQueryStat>,
         pub agg_idx: Vec<SqlQueryStat>,
     }
 
@@ -1435,23 +1436,7 @@ pub mod sql {
             ),
         ];
 
-        eprintln!(
-            "[{log_prefix}] no-index vs FTS-index equality (sorted title vs unsorted key)..."
-        );
-        let plain_scan = vec![
-            timed(
-                reader,
-                "WHERE title = ?  (sorted col, min/max prunes)",
-                &format!("SELECT title FROM supertable WHERE title_noidx = '{sample_title}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                "WHERE key   = ?  (unsorted col, min/max defeated)",
-                &format!("SELECT key FROM supertable WHERE key_noidx = '{sample_key}'"),
-                iters,
-            ),
-        ];
+        eprintln!("[{log_prefix}] FTS-pushdown equality (sorted title vs unsorted key)...");
         let fts_pushdown = vec![
             timed(
                 reader,
@@ -1467,49 +1452,7 @@ pub mod sql {
             ),
         ];
 
-        eprintln!(
-            "[{log_prefix}] aggregate shapes over a candidate set: DataFusion only vs token_match..."
-        );
-        let agg_scan = vec![
-            timed(
-                reader,
-                "COUNT(*)            key=? (1 row)",
-                &format!("SELECT COUNT(*) AS a FROM supertable WHERE key_noidx = '{sample_key}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                "SUM(rating)         key=? (1 row)",
-                &format!(
-                    "SELECT SUM(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"
-                ),
-                iters,
-            ),
-            timed(
-                reader,
-                "MAX(rating)         key=? (1 row)",
-                &format!(
-                    "SELECT MAX(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"
-                ),
-                iters,
-            ),
-            timed(
-                reader,
-                "AVG(rating)         key=? (1 row)",
-                &format!(
-                    "SELECT AVG(rating) AS a FROM supertable WHERE key_noidx = '{sample_key}'"
-                ),
-                iters,
-            ),
-            timed(
-                reader,
-                "SUM(rating) bucket IN all (1M rows)",
-                &format!(
-                    "SELECT SUM(rating) AS a FROM supertable WHERE bucket_noidx IN {BUCKET_IN_ALL}"
-                ),
-                iters,
-            ),
-        ];
+        eprintln!("[{log_prefix}] aggregate shapes over a token_match candidate set...");
         let agg_idx = vec![
             timed(
                 reader,
@@ -1546,9 +1489,7 @@ pub mod sql {
         QuerySets {
             scalar,
             tvf,
-            plain_scan,
             fts_pushdown,
-            agg_scan,
             agg_idx,
         }
     }
@@ -1616,11 +1557,9 @@ pub mod sql {
             title,
             note: note.into(),
             blocks: vec![
-                block("Aggregations & count-filters (read + compute, return few rows — not the index A/B)", &sets.scalar),
-                block("Plain Scan (DataFusion only) — selective equality, 1 row (sorted vs unsorted col)", &sets.plain_scan),
-                block("FTS-pushdown (DataFusion + Infino) — SAME equality, 1 row (sorted vs unsorted col)", &sets.fts_pushdown),
-                block("Aggregate over FTS candidates — Full Scan (DataFusion only)", &sets.agg_scan),
-                block("Aggregate over FTS candidates — FTS-pushdown (DataFusion + Infino token_match)", &sets.agg_idx),
+                block("Aggregations & count-filters (read + compute, return few rows)", &sets.scalar),
+                block("WHERE equality, FTS-pushdown — selective, 1 row (sorted vs unsorted col)", &sets.fts_pushdown),
+                block("Aggregate over FTS candidates — FTS-pushdown (token_match)", &sets.agg_idx),
                 block("Search table functions (bm25 / vector / hybrid / token / exact)", &sets.tvf),
             ],
         });

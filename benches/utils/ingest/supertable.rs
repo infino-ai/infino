@@ -512,16 +512,14 @@ fn chunk_batch(
         columns.push(Arc::new(LargeStringArray::from(titles.clone())));
     }
     if modality.has_sql() {
-        let titles = titles.as_ref().expect("sql modality has text");
-        // title_noidx — same payload, unindexed twin column.
-        columns.push(Arc::new(LargeStringArray::from(titles.clone())));
+        let _ = titles.as_ref().expect("sql modality has text");
         let bucket_vals: Vec<String> = (start..end)
             .map(|doc_id| format!("b{}", doc_id % 10))
             .collect();
         let key_vals: Vec<String> = (start..end)
             .map(|doc_id| scatter_key(doc_id as u64))
             .collect();
-        for vals in [&bucket_vals, &bucket_vals, &key_vals, &key_vals] {
+        for vals in [&bucket_vals, &key_vals] {
             columns.push(Arc::new(LargeStringArray::from(
                 vals.iter().map(String::as_str).collect::<Vec<_>>(),
             )));
