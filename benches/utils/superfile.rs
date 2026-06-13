@@ -498,7 +498,9 @@ pub mod fts {
                     }],
                 });
             }
-            if phases.warm && let Some(ref warm_stats) = warm {
+            if phases.warm
+                && let Some(ref warm_stats) = warm
+            {
                 let b = result
                     .builds
                     .last()
