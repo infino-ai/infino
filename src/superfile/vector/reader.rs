@@ -24,7 +24,6 @@ use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::{ReadError, error::VectorError};
 use bytes::Bytes;
-use rayon::prelude::*;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -68,7 +67,7 @@ pub(super) enum Sq8ColumnMeta {
     Eager {
         scale: Vec<f32>,
         offset: Vec<f32>,
-        per_doc_norms: Option<Vec<f32>>,
+        per_doc_norms: Option<Arc<[f32]>>,
     },
     Lazy {
         scale_abs_off: usize,
@@ -81,7 +80,7 @@ pub(super) enum Sq8ColumnMeta {
 struct Sq8ParsedMeta {
     scale: Vec<f32>,
     offset: Vec<f32>,
-    per_doc_norms: Option<Vec<f32>>,
+    per_doc_norms: Option<Arc<[f32]>>,
 }
 
 /// Per-column reader state; cached at open time.
@@ -683,7 +682,10 @@ impl VectorReader {
                 });
             }
 
-            let mismatch = jobs.par_iter().find_map_any(|job| {
+            // Serial CRC verify over the (handful of) subsections — a
+            // one-time open cost, not query-hot, so it stays off the
+            // tokio blocking pool and out of rayon.
+            let mismatch = jobs.iter().find_map(|job| {
                 if crc32c(&job.bytes) != job.expected {
                     Some(job.idx)
                 } else {
@@ -989,13 +991,16 @@ impl VectorReader {
                 if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
                     let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                     let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                    let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
-                        let norms_end = offset_end + (col_n_docs as usize) * 4;
-                        debug_assert_eq!(norms_end, actual_codec_meta_size);
-                        Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
-                    } else {
-                        None
-                    };
+                    let per_doc_norms: Option<Arc<[f32]>> =
+                        if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                            let norms_end = offset_end + (col_n_docs as usize) * 4;
+                            debug_assert_eq!(norms_end, actual_codec_meta_size);
+                            Some(Arc::from(parse_f32_le_vec(
+                                &meta_bytes[offset_end..norms_end],
+                            )))
+                        } else {
+                            None
+                        };
                     Some(Sq8ColumnMeta::Eager {
                         scale,
                         offset,
@@ -1189,7 +1194,7 @@ impl VectorReader {
     /// in-cluster index), so there is no `doc_to_pos` lookup
     /// table at all — that 4 MB / 1M-doc allocation was deleted
     /// once an audit confirmed zero external readers.
-    pub fn search(
+    pub async fn search(
         &self,
         column: &str,
         query: &[f32],
@@ -1326,7 +1331,9 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             k,
             rerank_mult,
-        ) {
+        )
+        .await
+        {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
                 candidates,
@@ -1360,6 +1367,7 @@ impl VectorReader {
             query,
             k,
         )
+        .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
@@ -1535,7 +1543,9 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             k,
             rerank_mult,
-        ) {
+        )
+        .await
+        {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
                 candidates,
@@ -1563,6 +1573,7 @@ impl VectorReader {
             query,
             k,
         )
+        .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
@@ -1744,7 +1755,7 @@ enum ShortlistOutcome {
 /// keeps `search` / `search_async` down to their fetch waves around a
 /// single shared kernel, so the two can't drift in scoring/recall.
 #[allow(clippy::too_many_arguments)]
-fn build_shortlist(
+async fn build_shortlist(
     col: &ColumnReader,
     q_rot: &[f32],
     cb: usize,
@@ -1790,23 +1801,43 @@ fn build_shortlist(
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-        cluster_meta
-            .par_iter()
-            .zip(cluster_blocks.par_iter())
-            .fold(
-                || BoundedCoarseHeap::new(coarse_limit),
-                |mut heap, item| {
-                    score_block(&mut heap, item);
-                    heap
-                },
-            )
-            .reduce(
-                || BoundedCoarseHeap::new(coarse_limit),
-                |mut left, right| {
-                    left.merge(right);
-                    left
-                },
-            )
+        // Parallelize the coarse 1-bit scan across tokio's blocking pool
+        // (one task per chunk). Cluster scoring is order-independent —
+        // every survivor is re-sorted below — so chunked-parallel and
+        // serial shortlists rank identically. Each task owns a quantizer
+        // clone, a shared rotated-query, and its chunk's zero-copy
+        // `Bytes` views; partial heaps merge after.
+        let n_tasks = parallel_chunks(cluster_meta.len());
+        let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
+        let quant = col.quant.clone();
+        let q_rot: Arc<Vec<f32>> = Arc::new(q_rot.to_vec());
+        let mut handles = Vec::with_capacity(n_tasks);
+        for (meta_chunk, block_chunk) in
+            cluster_meta.chunks(chunk).zip(cluster_blocks.chunks(chunk))
+        {
+            let meta_chunk: Vec<(usize, u32, u32)> = meta_chunk.to_vec();
+            let block_chunk: Vec<Bytes> = block_chunk.to_vec();
+            let quant = quant.clone();
+            let q_rot = Arc::clone(&q_rot);
+            handles.push(tokio::task::spawn_blocking(move || {
+                let mut heap = BoundedCoarseHeap::new(coarse_limit);
+                for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
+                    let codes_len = (cnt as usize) * cb;
+                    let doc_ids_len = (cnt as usize) * 4;
+                    let codes = block.slice(0..codes_len);
+                    let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+                    score_cluster_codes_into_heap(
+                        &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot, &mut heap,
+                    );
+                }
+                heap
+            }));
+        }
+        let mut acc = BoundedCoarseHeap::new(coarse_limit);
+        for h in handles {
+            acc.merge(h.await.expect("vector shortlist scan task panicked"));
+        }
+        acc
     } else {
         let mut heap = BoundedCoarseHeap::new(coarse_limit);
         for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
@@ -1924,6 +1955,53 @@ fn score_centroids(
 /// superfile nprobe=1 hot path — stay serial, while the 10M
 /// supertable's `nprobe × superfiles` fan-out goes parallel.
 const PARALLEL_SCAN_MIN: usize = 2048;
+
+/// Number of `spawn_blocking` tasks to split a parallel scan into —
+/// the machine's logical parallelism, capped by the item count so we
+/// never spawn more tasks than there is work.
+fn parallel_chunks(n_items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n_items)
+        .max(1)
+}
+
+/// Map `f` over `items` across tokio's blocking pool, preserving input
+/// order. The order-independent vector scans (rerank) use this now
+/// that the search kernels are async — the tokio analogue of a rayon
+/// `par_iter().map().collect()`, with no rayon dependency. `f` and the
+/// items must be `'static` so each chunk can move onto a blocking task.
+async fn par_map_blocking<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+where
+    T: Send + Sync + 'static,
+    R: Send + 'static,
+    F: Fn(&T) -> R + Send + Sync + 'static,
+{
+    let n = parallel_chunks(items.len());
+    if n <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let items = Arc::new(items);
+    let f = Arc::new(f);
+    let chunk = items.len().div_ceil(n);
+    let mut handles = Vec::with_capacity(n);
+    let mut start = 0;
+    while start < items.len() {
+        let end = (start + chunk).min(items.len());
+        let items = Arc::clone(&items);
+        let f = Arc::clone(&f);
+        handles.push(tokio::task::spawn_blocking(move || {
+            items[start..end].iter().map(|t| f(t)).collect::<Vec<R>>()
+        }));
+        start = end;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for h in handles {
+        out.extend(h.await.expect("rerank scan task panicked"));
+    }
+    out
+}
 
 #[inline]
 fn score_cluster_codes_into_heap(
@@ -2111,8 +2189,7 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 ///   per-doc inner step is a plain u8→f32 widen + SIMD dot;
 ///   per-doc decoded-norm cached at encode time short-circuits
 ///   `Σx²` for L2Sq).
-#[inline]
-fn rerank_candidates_from_blocks(
+async fn rerank_candidates_from_blocks(
     source: &Source,
     lazy_sq8_meta_bytes: Option<&Bytes>,
     cluster_blocks: &[Bytes],
@@ -2126,22 +2203,39 @@ fn rerank_candidates_from_blocks(
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
             // Exact fp32 rerank — every survivor is independent, so the
-            // gather + SIMD distance runs in parallel once the shortlist
-            // is large enough to amortize the rayon hand-off (high
-            // rerank_mult on the supertable fan-out). The output is
-            // sorted by distance below, so parallel and serial rank
-            // identically.
-            let rerank_one = |cand: &RerankCandidate| {
-                let bytes = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
-                (
-                    cand.did,
-                    distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
-                )
-            };
+            // gather + SIMD distance runs in parallel across tokio's
+            // blocking pool once the shortlist is large enough to
+            // amortize the hand-off. The output is sorted by distance
+            // below, so parallel and serial rank identically.
             if candidates.len() >= PARALLEL_SCAN_MIN {
-                candidates.par_iter().map(rerank_one).collect()
+                let metric = col.metric;
+                let codec = col.rerank_codec;
+                let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
+                let survivors: Option<Arc<Vec<Bytes>>> =
+                    survivor_full_rows.map(|s| Arc::new(s.to_vec()));
+                let query: Arc<Vec<f32>> = Arc::new(query.to_vec());
+                par_map_blocking(candidates.to_vec(), move |cand: &RerankCandidate| {
+                    let bytes = candidate_full_bytes(
+                        &blocks,
+                        survivors.as_deref().map(|s| s.as_slice()),
+                        cand,
+                        stride,
+                    );
+                    (cand.did, distance_bytes_codec(metric, codec, &query, bytes))
+                })
+                .await
             } else {
-                candidates.iter().map(rerank_one).collect()
+                candidates
+                    .iter()
+                    .map(|cand| {
+                        let bytes =
+                            candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+                        (
+                            cand.did,
+                            distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
+                        )
+                    })
+                    .collect()
             }
         }
         RerankCodec::Sq8Residual => {
@@ -2158,18 +2252,21 @@ fn rerank_candidates_from_blocks(
                     scale,
                     offset,
                     per_doc_norms,
-                } => sq8_score_and_refine(
-                    candidates,
-                    cluster_blocks,
-                    survivor_full_rows,
-                    col,
-                    query,
-                    scale,
-                    offset,
-                    per_doc_norms.as_deref(),
-                    k,
-                    stride,
-                ),
+                } => {
+                    sq8_score_and_refine(
+                        candidates,
+                        cluster_blocks,
+                        survivor_full_rows,
+                        col,
+                        query,
+                        scale,
+                        offset,
+                        per_doc_norms.clone(),
+                        k,
+                        stride,
+                    )
+                    .await
+                }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
                     offset_abs_off,
@@ -2193,10 +2290,11 @@ fn rerank_candidates_from_blocks(
                             query,
                             parsed.scale.as_slice(),
                             parsed.offset.as_slice(),
-                            parsed.per_doc_norms.as_deref(),
+                            parsed.per_doc_norms.clone(),
                             k,
                             stride,
-                        ));
+                        )
+                        .await);
                     }
                     let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
                     clusters.sort_unstable();
@@ -2350,7 +2448,7 @@ fn rerank_candidates_from_blocks(
 ///
 /// Both code paths keep their own data-access strategy (eager mmap vs
 /// lazy range GETs); only the scoring math is shared here.
-fn sq8_score_and_refine(
+async fn sq8_score_and_refine(
     candidates: &[RerankCandidate],
     cluster_blocks: &[Bytes],
     survivor_full_rows: Option<&[Bytes]>,
@@ -2358,7 +2456,7 @@ fn sq8_score_and_refine(
     query: &[f32],
     scale: &[f32],
     offset: &[f32],
-    per_doc_norms: Option<&[f32]>,
+    per_doc_norms: Option<Arc<[f32]>>,
     k: usize,
     stride: usize,
 ) -> Vec<(u32, f32)> {
@@ -2374,7 +2472,7 @@ fn sq8_score_and_refine(
             let offset_c = &offset[c * dim..(c + 1) * dim];
             (
                 cid,
-                Sq8Kernel::new(col.metric, query, scale_c, offset_c, per_doc_norms),
+                Sq8Kernel::new(col.metric, query, scale_c, offset_c, per_doc_norms.clone()),
             )
         })
         .collect();
@@ -2393,7 +2491,34 @@ fn sq8_score_and_refine(
         )
     };
     let scored: Vec<(u32, f32, usize, u32, u32)> = if candidates.len() >= PARALLEL_SCAN_MIN {
-        candidates.par_iter().enumerate().map(score_one).collect()
+        // Order-independent first-pass Sq8 scoring across tokio's
+        // blocking pool. Kernels are `'static` (norms shared by `Arc`),
+        // so each chunk moves onto a blocking task with no copy.
+        let kernels = Arc::new(kernels);
+        let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
+        let survivors: Option<Arc<Vec<Bytes>>> = survivor_full_rows.map(|s| Arc::new(s.to_vec()));
+        let items: Vec<(usize, RerankCandidate)> = candidates.iter().cloned().enumerate().collect();
+        par_map_blocking(items, move |item: &(usize, RerankCandidate)| {
+            let (i, cand) = (item.0, &item.1);
+            let row = candidate_full_bytes(
+                &blocks,
+                survivors.as_deref().map(|s| s.as_slice()),
+                cand,
+                stride,
+            );
+            let code = &row[..dim];
+            let kernel = kernels
+                .get(&cand.cluster_id)
+                .expect("kernel prebuilt for every probed cluster");
+            (
+                cand.did,
+                kernel.distance_at(cand.pos, code),
+                i,
+                cand.pos,
+                cand.cluster_id,
+            )
+        })
+        .await
     } else {
         candidates.iter().enumerate().map(score_one).collect()
     };
@@ -2413,7 +2538,7 @@ fn sq8_score_and_refine(
                 &scale[c * dim..(c + 1) * dim],
                 &offset[c * dim..(c + 1) * dim],
                 SQ8_RESIDUAL_DIVISOR,
-                per_doc_norms,
+                per_doc_norms.as_deref(),
             )
         },
     )
@@ -2471,7 +2596,7 @@ fn parse_sq8_meta_bytes(
     let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
     let per_doc_norms = has_norms.then(|| {
         let norms_end = offset_end + n_docs * 4;
-        parse_f32_le_vec(&bytes[offset_end..norms_end])
+        Arc::from(parse_f32_le_vec(&bytes[offset_end..norms_end]))
     });
     Sq8ParsedMeta {
         scale,
@@ -2840,6 +2965,7 @@ mod tests {
         let target = 17;
         let hits = r
             .search("embedding", &all_vecs[target], 5, 4, 5)
+            .await
             .expect("FTS search");
         assert!(!hits.is_empty(), "search should return hits");
         assert_eq!(hits[0].0, target as u32, "self should be nearest");
@@ -2856,6 +2982,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
             .search("nonexistent", &[0.0; 16], 5, 4, 5)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, VectorError::UnknownColumn(_)));
     }
@@ -2866,6 +2993,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
             .search("embedding", &[0.0; 8], 5, 4, 5)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, VectorError::DimensionMismatch { .. }));
     }
@@ -2876,6 +3004,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let hits = r
             .search("embedding", &[0.0; 16], 0, 4, 5)
+            .await
             .expect("FTS search");
         assert!(hits.is_empty());
     }
@@ -2885,7 +3014,10 @@ mod tests {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let q = vec![0.5; 16];
-        let hits = r.search("embedding", &q, 10, 4, 5).expect("FTS search");
+        let hits = r
+            .search("embedding", &q, 10, 4, 5)
+            .await
+            .expect("FTS search");
         for w in hits.windows(2) {
             assert!(w[0].1 <= w[1].1, "distances should be ascending");
         }
@@ -3260,6 +3392,7 @@ mod tests {
         assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
         let hits = r
             .search("v", &all[42], 5, n_cent, 20)
+            .await
             .expect("search must succeed on Sq8Residual cosine column");
         assert_eq!(
             hits[0].0, 42,
@@ -3443,6 +3576,7 @@ mod tests {
             // norms-indexing bug, not a Hamming-recall artifact.
             let hits = r
                 .search("v", &planted[i as usize], 1, 4, 64)
+                .await
                 .expect("self-query");
             assert_eq!(hits[0].0, i, "self-query top-1 doc_id for doc {i}");
             // Quantization noise bound: per-dim error ≤ scale/2
@@ -3500,6 +3634,7 @@ mod tests {
         // the 1-bit shortlist's recall ceiling.
         let hits = r
             .search("v", &all[17], 5, 4, 20)
+            .await
             .expect("search must succeed on Sq8 column");
         assert_eq!(hits[0].0, 17, "Sq8 self-query must recover self at top-1");
         // Sq8 round-trip error: per-dim quantization step is
@@ -3575,6 +3710,7 @@ mod tests {
         // 1-bit shortlist recall.
         let hits = r
             .search("v", &all[42], 5, 4, 20)
+            .await
             .expect("search must succeed on Sq8 cosine column");
         assert_eq!(hits[0].0, 42, "Sq8 cosine self-query must recover self");
     }
@@ -3701,6 +3837,7 @@ mod tests {
         // here by passing a value that would otherwise oversample).
         let hits = r
             .search("v", &all[17], 5, n_cent, 5)
+            .await
             .expect("None-codec search must succeed");
         assert!(
             !hits.is_empty(),
@@ -3776,7 +3913,7 @@ mod tests {
         async_calls.store(0, AtomicOrdering::Relaxed);
         sync_calls.store(0, AtomicOrdering::Relaxed);
         let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
-        let _ = r.search("v", &query, 5, n_cent, 5).expect("search");
+        let _ = r.search("v", &query, 5, n_cent, 5).await.expect("search");
 
         // Upper-bound sync fetches for None / nprobe = n_cent:
         //   centroids (1) + cluster_idx (1)
@@ -4039,6 +4176,7 @@ mod tests {
             for qi in 0..n_queries {
                 let hits = reader
                     .search("v", &all[qi], k, nprobe, rerank_mult)
+                    .await
                     .expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
@@ -4061,7 +4199,10 @@ mod tests {
         for &rm in &[20usize, 50, 100, 200, 400] {
             let mut tm = 0usize;
             for qi in 0..n_queries {
-                let hits = r_sq8.search("v", &all[qi], k, nprobe, rm).expect("search");
+                let hits = r_sq8
+                    .search("v", &all[qi], k, nprobe, rm)
+                    .await
+                    .expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
                 tm += ground_truth[qi]
@@ -4145,6 +4286,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("embedding", &all[17], 5, 4, 5)
+            .await
             .expect("search must succeed on lazy InMemory");
         assert_eq!(hits[0].0, 17, "self-query must recover self");
     }
@@ -4343,9 +4485,11 @@ mod tests {
         for &q_idx in &[0usize, 17, 31, 63] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("Lazy(warm) search");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -4386,9 +4530,11 @@ mod tests {
         for &q_idx in &[0usize, 17, 31, 63] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("sync search must succeed via block_on bridge");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -4455,6 +4601,7 @@ mod tests {
         counting.disable_sync();
         let hits = r
             .search("embedding", &all[7], 5, 4, 5)
+            .await
             .expect("sync search via block_on bridge");
         assert!(!hits.is_empty(), "search should return hits");
 
@@ -4488,9 +4635,11 @@ mod tests {
         for &q_idx in &[3usize, 19, 47] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("BytesLazyByteSource sync search");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -5173,9 +5322,11 @@ mod tests {
             for &q_idx in &[0usize, 7, 17, 31] {
                 let hits_eager = r_eager
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
                 let hits_lazy = r_lazy
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
                 assert_eq!(
                     hits_eager, hits_lazy,
@@ -5233,6 +5384,7 @@ mod tests {
         let nprobe = 4usize;
         let _hits = r_lazy
             .search("v", &all[0], 5, nprobe, 5)
+            .await
             .expect("cold first search");
 
         let after_search = async_counter.load(AtomicOrdering::Relaxed);
@@ -5298,6 +5450,7 @@ mod tests {
         let q = all[0].clone();
         let hits = r_lazy
             .search("v", &q, 5, nprobe, 5)
+            .await
             .expect("cold first search");
         assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
 
@@ -5351,9 +5504,11 @@ mod tests {
             for &q_idx in &[0usize, 7, 17, 31] {
                 let hits_eager = r_eager
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
                 let hits_lazy = r_lazy
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
                 assert_eq!(
                     hits_eager, hits_lazy,

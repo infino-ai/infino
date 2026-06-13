@@ -1198,6 +1198,7 @@ pub(crate) mod diag {
                         let reader = cache.reader(uri).await.expect("cold reader");
                         let vec = reader.vec().expect("vector reader present");
                         vec.search("v", query, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                            .await
                             .expect("cold vector_search")
                     });
                     std::hint::black_box(h);
@@ -1349,6 +1350,7 @@ pub(crate) mod diag {
                 let reader = cache.reader(&uri).await.expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1379,6 +1381,7 @@ pub(crate) mod diag {
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
                 vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                    .await
                     .expect("cold vector_search")
             });
             let wall = t0.elapsed();
@@ -1597,6 +1600,7 @@ pub(crate) mod diag {
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
                     vec.search("v", &q, TOP_K, nprobe, DEFAULT_RERANK_MULT)
+                        .await
                         .expect("real S3 cold vector_search")
                 });
                 let wall = t0.elapsed();

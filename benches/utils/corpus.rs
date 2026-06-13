@@ -55,18 +55,24 @@ use infino::test_helpers::default_tokenizer;
 /// Drive an in-memory (no object-store I/O) async search to
 /// completion from sync bench code.
 ///
-/// The query/search API is `async` (Option A). Bench helpers that
-/// operate on in-memory `VectorReader` / `FtsReader` / in-process
-/// `Supertable` readers never touch the object store, so their
-/// futures resolve `Ready` without a tokio reactor — a plain
-/// `futures::executor::block_on` drives them with no runtime setup
-/// and, unlike `tokio::runtime::block_on`, never panics when nested
-/// inside another runtime. Real-object-store benches (see
-/// `unified_object_store`) drive their futures on an explicit
-/// multi-thread tokio runtime instead, because object_store needs
-/// the tokio reactor.
+/// The query/search API is `async`. In-memory `VectorReader` /
+/// `FtsReader` / `Supertable` readers never touch the object store, so
+/// their futures resolve without object-store I/O — but the search
+/// kernels now offload CPU scans to `tokio::task::spawn_blocking`,
+/// which requires an ambient tokio runtime. So bench helpers drive
+/// them on one shared multi-thread runtime (built once, reused across
+/// every call — never a throwaway per-call runtime), which also gives
+/// the blocking pool the threads the parallel scans fan out across.
 pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
-    futures::executor::block_on(fut)
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let rt = RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("bench in-memory tokio runtime")
+    });
+    rt.block_on(fut)
 }
 
 // ─── Scale constants ──────────────────────────────────────────────────
@@ -82,23 +88,26 @@ pub const TOKENS_PER_DOC: usize = 200;
 /// FST + skip-table cold path).
 pub const VOCAB_SIZE: usize = 10_000;
 
-/// Vector dimension — matches modern sentence-embedding models
-/// (all-MiniLM-L6-v2 = 384, BGE-small = 384).
-pub const DIM: usize = 384;
+/// Vector dimension — matches modern large embedding models
+/// (OpenAI text-embedding-3-small = 1536 truncates to 1024,
+/// BGE-large = 1024, E5-large = 1024).
+pub const DIM: usize = 1024;
 
 /// One `(local_doc_id, distance)` hit — same shape `VectorReader::search`
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
 pub type Hit = (u32, f32);
 
 /// Doc count for superfile-shape benches (one-superfile scale). 1M ×
-/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the warm tier and
-/// is the single-superfile cold-open unit for the warm/cold tiers.
+/// 1024 (f32) ≈ 4 GB — mmap-backed corpus streams from disk, so only
+/// the engine's resident footprint (not the corpus) bounds RAM. It is
+/// the single-superfile cold-open unit for the warm/cold tiers.
 pub const SUPERFILE_DOCS: usize = 1_000_000;
 
 /// Doc count for supertable-shape benches (scale-out / sharding
-/// scale). 10M × 384 (f32) ≈ 14.6 GB resident — needs a 32 GB+ box.
-/// This is the headline supertable scale that the warm/cold tiers run
-/// over the object store.
+/// scale). 10M × 1024 (f32) ≈ 40 GB on disk — the mmap-backed corpus
+/// streams from disk (never fully resident), so disk space, not RAM,
+/// is the constraint at this dim. This is the headline supertable
+/// scale that the warm/cold tiers run over the object store.
 pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
 /// Document count for the **superfile** test — a single-superfile index
@@ -735,9 +744,8 @@ pub fn mean_recall_infino(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = reader
-            .search("v", q, k, nprobe, rerank_mult)
-            .expect("vector search");
+        let hits =
+            block_on_inmem(reader.search("v", q, k, nprobe, rerank_mult)).expect("vector search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -820,7 +828,8 @@ pub fn calibrate_infino(
             let q = &queries[0];
             let p50 = p50_micros(
                 || {
-                    let _ = reader.search("v", q, k, probe, refine).expect("search");
+                    let _ =
+                        block_on_inmem(reader.search("v", q, k, probe, refine)).expect("search");
                 },
                 p50_iter,
             );

@@ -12,6 +12,8 @@
 //! IVF cluster scan (probing centroids) and the full-precision rerank
 //! (after the 1-bit shortlist).
 
+use std::sync::Arc;
+
 use wide::f32x8;
 
 use crate::superfile::vector::rerank_codec::RerankCodec;
@@ -383,7 +385,7 @@ pub(crate) fn distance_bytes_codec(
 /// `q · offset`, plus `q · q` for L2Sq), amortized over
 /// `k × rerank_mult` candidates so it costs ≪ 1 % of search time
 /// at typical `rerank_mult = 256`.
-pub(crate) struct Sq8Kernel<'a> {
+pub(crate) struct Sq8Kernel {
     metric: Metric,
     dim: usize,
     /// `q_prime[d] = query[d] * scale[d]`. The per-doc inner
@@ -399,11 +401,13 @@ pub(crate) struct Sq8Kernel<'a> {
     /// Optional per-doc `Σ_d x_decoded²` table, indexed by the
     /// rerank shortlist's `pos` field. `Some` for L2Sq columns,
     /// `None` for NegDot. `Some` for L2Sq (stores `‖x‖²`) and
-    /// Cosine (stores `‖x‖²`; rerank divides by `√norm`).
-    per_doc_norms: Option<&'a [f32]>,
+    /// Cosine (stores `‖x‖²`; rerank divides by `√norm`). Shared by
+    /// refcount (`Arc`) so the kernel is `'static` and can run on a
+    /// `tokio::task::spawn_blocking` worker — no per-query copy.
+    per_doc_norms: Option<Arc<[f32]>>,
 }
 
-impl<'a> Sq8Kernel<'a> {
+impl Sq8Kernel {
     /// Build the per-query kernel. `scale` + `offset` are the
     /// per-dim quantizer arrays from the column's `codec_meta`.
     /// `per_doc_norms` is `Some` for L2Sq and Cosine columns.
@@ -412,7 +416,7 @@ impl<'a> Sq8Kernel<'a> {
         query: &[f32],
         scale: &[f32],
         offset: &[f32],
-        per_doc_norms: Option<&'a [f32]>,
+        per_doc_norms: Option<Arc<[f32]>>,
     ) -> Self {
         let dim = query.len();
         debug_assert_eq!(scale.len(), dim);
@@ -467,7 +471,7 @@ impl<'a> Sq8Kernel<'a> {
     /// metric (matches the [`distance`] dispatch convention).
     #[inline]
     pub fn distance_at(&self, pos: u32, code_bytes: &[u8]) -> f32 {
-        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
+        let norm = self.per_doc_norms.as_ref().map(|norms| norms[pos as usize]);
         self.distance_with_norm(code_bytes, norm)
     }
 
@@ -1203,7 +1207,7 @@ mod tests {
                 Metric::NegDot => distance(m, &query, &decoded),
                 Metric::L2Sq => unreachable!(),
             };
-            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms.as_deref());
+            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms.clone().map(Arc::from));
             let got = kernel.distance_at(0, &codes);
             let err = (want - got).abs();
             assert!(
@@ -1229,7 +1233,13 @@ mod tests {
         let norm1: f32 = decoded1.iter().map(|x| x * x).sum();
         let per_doc_norms = vec![norm0, norm1];
 
-        let kernel = Sq8Kernel::new(Metric::L2Sq, &query, &scale, &offset, Some(&per_doc_norms));
+        let kernel = Sq8Kernel::new(
+            Metric::L2Sq,
+            &query,
+            &scale,
+            &offset,
+            Some(Arc::from(per_doc_norms.clone())),
+        );
 
         let got0 = kernel.distance_at(0, &codes_doc0);
         let want0 = distance(Metric::L2Sq, &query, &decoded0);
@@ -1323,8 +1333,8 @@ mod tests {
             .collect();
 
         for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
-            let norms_arg: Option<&[f32]> = match m {
-                Metric::L2Sq | Metric::Cosine => Some(&per_doc_norms),
+            let norms_arg: Option<Arc<[f32]>> = match m {
+                Metric::L2Sq | Metric::Cosine => Some(Arc::from(per_doc_norms.clone())),
                 Metric::NegDot => None,
             };
             let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms_arg);

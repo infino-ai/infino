@@ -1775,6 +1775,7 @@ mod tests {
                 4,
                 100,
             )
+            .await
             .expect("vector search");
         assert!(
             !search_results.is_empty(),
@@ -2065,8 +2066,8 @@ mod tests {
         assert_eq!(merged_batch.num_rows(), 6);
     }
 
-    #[test]
-    fn build_from_readers_with_only_vectors_and_search() {
+    #[tokio::test]
+    async fn build_from_readers_with_only_vectors_and_search() {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -2136,6 +2137,7 @@ mod tests {
         ];
         let search_results = vec_reader
             .search("emb", &query, 10, 4, 100)
+            .await
             .expect("vector search");
 
         // Should return exactly 4 results (all vectors from both superfiles are returned)

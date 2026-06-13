@@ -17,6 +17,12 @@
 
 use std::sync::Arc;
 
+use crate::superfile::SuperfileReader;
+use crate::superfile::reader::{rank_back_indices, row_selection_for_ids};
+use crate::supertable::handle::SupertableReader;
+use crate::supertable::manifest::SuperfileUri;
+use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
+use crate::supertable::query::SuperfileHit;
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
     ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
@@ -28,12 +34,6 @@ use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use crate::superfile::SuperfileReader;
-use crate::superfile::reader::{rank_back_indices, row_selection_for_ids};
-use crate::supertable::handle::SupertableReader;
-use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
-use crate::supertable::query::SuperfileHit;
 
 /// Resolve `hits` to one `RecordBatch`, with `projection` naming the
 /// output columns (any of `_id`, the visible scalar columns, or the
@@ -360,9 +360,7 @@ async fn resolve_columns(
         for h in handles {
             let (i, batch) = h
                 .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("resolve decode task join: {e}"))
-                })?
+                .map_err(|e| DataFusionError::Execution(format!("resolve decode task join: {e}")))?
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             out.push((i, batch));
         }

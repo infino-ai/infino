@@ -130,6 +130,7 @@ async fn end_to_end_self_query_recovers_self() {
             VECTOR_PIPELINE_NPROBE,
             VECTOR_PIPELINE_RERANK_MULT,
         )
+        .await
         .expect("FTS search");
     assert_eq!(hits[0].0, target, "self should be top-1");
     // Cosine distance to self for unit-norm vector = 1 - 1 = 0.
@@ -159,6 +160,7 @@ async fn end_to_end_l2sq_self_query_distance_is_zero() {
             VECTOR_PIPELINE_NPROBE,
             VECTOR_PIPELINE_RERANK_MULT,
         )
+        .await
         .expect("FTS search");
     assert_eq!(hits[0].0, target);
     // L2² of v with itself is exactly 0.
@@ -176,24 +178,28 @@ async fn end_to_end_multi_column_routing_isolated() {
 
     // text_emb is dim=16; querying with a dim=24 image vector must error.
     let v_img: Vec<f32> = vec![0.5; IMAGE_EMB_DIM];
-    let err = r.search(
-        "text_emb",
-        &v_img,
-        VECTOR_PIPELINE_K,
-        VECTOR_PIPELINE_NPROBE,
-        VECTOR_PIPELINE_RERANK_MULT,
-    );
+    let err = r
+        .search(
+            "text_emb",
+            &v_img,
+            VECTOR_PIPELINE_K,
+            VECTOR_PIPELINE_NPROBE,
+            VECTOR_PIPELINE_RERANK_MULT,
+        )
+        .await;
     assert!(err.is_err(), "dim mismatch must error");
 
     // And vice versa.
     let v_text: Vec<f32> = vec![0.5; TEXT_EMB_DIM];
-    let err = r.search(
-        "image_emb",
-        &v_text,
-        VECTOR_PIPELINE_K,
-        VECTOR_PIPELINE_NPROBE,
-        VECTOR_PIPELINE_RERANK_MULT,
-    );
+    let err = r
+        .search(
+            "image_emb",
+            &v_text,
+            VECTOR_PIPELINE_K,
+            VECTOR_PIPELINE_NPROBE,
+            VECTOR_PIPELINE_RERANK_MULT,
+        )
+        .await;
     assert!(err.is_err());
 }
 
@@ -210,6 +216,7 @@ async fn end_to_end_top_k_limits_results() {
             VECTOR_PIPELINE_NPROBE,
             VECTOR_PIPELINE_RERANK_MULT,
         )
+        .await
         .expect("FTS search");
     assert!(hits.len() <= 3);
 }
@@ -291,6 +298,7 @@ async fn end_to_end_planted_clusters_recovered() {
             CLUSTER_TEST_N_CENT,
             VECTOR_PIPELINE_RERANK_MULT,
         )
+        .await
         .expect("FTS search");
     assert!(!hits.is_empty());
     for (doc, _) in &hits {
@@ -315,6 +323,7 @@ async fn end_to_end_results_sorted_by_distance() {
             VECTOR_PIPELINE_NPROBE,
             VECTOR_PIPELINE_RERANK_MULT,
         )
+        .await
         .expect("FTS search");
     for w in hits.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances ascending");
