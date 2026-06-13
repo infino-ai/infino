@@ -1109,7 +1109,7 @@ pub mod vector {
         anchor: &str,
         title: String,
         note: &str,
-    ) {
+    ) -> Vec<RecallRow> {
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();
         if skip_calibration {
@@ -1214,6 +1214,7 @@ pub mod vector {
             include_warm,
             include_cold,
         );
+        rows
     }
 }
 

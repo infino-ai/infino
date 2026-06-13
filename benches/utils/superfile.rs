@@ -4,6 +4,7 @@
 //! Superfile-layer benchmark runners grouped by modality.
 
 use crate::report::{Better, Cell, metric, text};
+use crate::cost;
 use crate::rss;
 
 /// Shared headers for the single-superfile ingest tables (fts / vector /
@@ -44,6 +45,38 @@ fn corpus_stored_cells(corpus_bytes: u64, stored_bytes: u64) -> [Cell; 2] {
             Better::Lower,
         ),
     ]
+}
+
+fn emit_cost_warm(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    ingest_wall_s: f64,
+    writers: u32,
+    stored_bytes: u64,
+    corpus_bytes: u64,
+    n_docs: usize,
+    warm: &[(String, f64)],
+) {
+    if warm.is_empty() {
+        return;
+    }
+    let resident = rss::current_anon_rss_bytes().unwrap_or(0);
+    cost::emit(
+        report,
+        anchor,
+        title,
+        &cost::CellCost {
+            ingest_wall_s,
+            writers,
+            put_count: 1,
+            stored_bytes,
+            corpus_bytes,
+            n_docs,
+            resident_anon_bytes: resident,
+            warm,
+        },
+    );
 }
 
 pub mod fts {
@@ -94,6 +127,7 @@ pub mod fts {
     use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
 
     use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
+    use crate::cost;
     use crate::executors::ColdTiming;
     use crate::executors::fts as exec_fts;
     use crate::executors::fts::{FTS_BATTERY, FtsRead};
@@ -452,6 +486,25 @@ pub mod fts {
                     }],
                 });
             }
+            if phases.warm {
+                if let Some(ref warm_stats) = warm {
+                    let b = result
+                        .builds
+                        .last()
+                        .expect("harness records at least one build row");
+                    super::emit_cost_warm(
+                        &mut report,
+                        "bench/fts/superfile/cost",
+                        format!("Superfile FTS — cost model ({} docs)", fmt_count(n_docs)),
+                        b.phase.wall.as_secs_f64(),
+                        b.writers as u32,
+                        index.bytes().len() as u64,
+                        corpus.total_bytes(),
+                        n_docs,
+                        &cost::warm_from_fts(warm_stats),
+                    );
+                }
+            }
         }
 
         report.save();
@@ -717,6 +770,7 @@ pub mod vector {
     use std::time::Duration;
 
     use crate::corpus::{self, DIM};
+    use crate::cost;
     use crate::executors::vector as exec_vec;
     use crate::executors::vector::VectorRead;
     use crate::harness::{
@@ -884,7 +938,7 @@ pub mod vector {
                 let committed = committed.as_ref().expect("cold artifact present");
                 SuperfileVecColdGuard::open(Arc::clone(&committed.storage), committed.uri)
             };
-            exec_vec::run_search(
+            let recall_rows = exec_vec::run_search(
                 &mut report,
                 index.reader(),
                 open_cold,
@@ -909,6 +963,27 @@ pub mod vector {
                 ),
                 "Correctness, warm search, and cold upload reuse the measured 1-writer artifact. Recall rows use the lowest-p50 calibrated point meeting each target; `default` is the user-facing option baseline. Δ is vs the previous run.",
             );
+            if phases.warm {
+                let b = build_result
+                    .builds
+                    .last()
+                    .expect("harness records at least one build row");
+                let corpus_bytes = (n_docs * DIM) as u64 * std::mem::size_of::<f32>() as u64;
+                super::emit_cost_warm(
+                    &mut report,
+                    "bench/vector/superfile/cost",
+                    format!(
+                        "Superfile vector — cost model ({} docs × dim={DIM})",
+                        fmt_count(n_docs)
+                    ),
+                    b.wall.as_secs_f64(),
+                    b.writers as u32,
+                    index.bytes().len() as u64,
+                    corpus_bytes,
+                    n_docs,
+                    &cost::warm_from_vector(&recall_rows),
+                );
+            }
 
             struct SuperfileVecColdGuard {
                 _cache_dir: tempfile::TempDir,
@@ -1065,6 +1140,7 @@ pub mod sql {
     use infino::supertable::Supertable;
 
     use crate::corpus::{self, MmapTextCorpus};
+    use crate::cost;
     use crate::executors::sql as exec_sql;
     use crate::executors::sql::SqlRead;
     use crate::harness::{
@@ -1132,6 +1208,21 @@ pub mod sql {
                 ),
                 "Warm p50 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are recorded in the design notes, not run here). Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
                 &sets,
+            );
+            let b = result
+                .builds
+                .last()
+                .expect("harness records at least one build row");
+            super::emit_cost_warm(
+                &mut report,
+                "bench/sql/superfile/cost",
+                format!("Superfile SQL — cost model ({} rows)", fmt_count(n_docs)),
+                b.wall.as_secs_f64(),
+                b.writers as u32,
+                stored_bytes(&index),
+                corpus.total_bytes(),
+                n_docs,
+                &cost::warm_from_sql(&sets),
             );
         }
         if phases.cold {

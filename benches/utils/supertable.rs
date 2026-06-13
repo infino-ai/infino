@@ -46,6 +46,7 @@ use infino::supertable::Supertable;
 use tempfile::TempDir;
 
 use crate::corpus::DIM;
+use crate::cost;
 use crate::ingest::supertable::{self, Modality, modality_label};
 use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
@@ -322,6 +323,40 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     ]
 }
 
+fn emit_cost_warm(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    built: &supertable::IngestResult,
+    metrics: Option<&ShapeMetrics>,
+    n_docs: usize,
+    warm: &[(String, f64)],
+) {
+    if warm.is_empty() {
+        return;
+    }
+    let resident = rss::current_anon_rss_bytes().unwrap_or(0);
+    let (wall_s, corpus_bytes) = match metrics {
+        Some(m) => (m.wall_ns / 1e9, m.corpus_bytes),
+        None => (0.0, 0),
+    };
+    cost::emit(
+        report,
+        anchor,
+        title,
+        &cost::CellCost {
+            ingest_wall_s: wall_s,
+            writers: supertable::n_writers() as u32,
+            put_count: cost::supertable_ingest_puts(built.n_superfiles),
+            stored_bytes: built.total_index_bytes,
+            corpus_bytes,
+            n_docs,
+            resident_anon_bytes: resident,
+            warm,
+        },
+    );
+}
+
 pub fn run() {
     // Pre-flight: this bench only runs against a real object store (S3 or
     // Azure; see `tiers::supertable_storage_fixture`). Fail fast with a clear
@@ -530,6 +565,20 @@ pub mod fts {
                 cold.as_ref(),
                 None,
             );
+        }
+
+        if phases.warm {
+            if let Some(ref warm_stats) = warm {
+                emit_cost_warm(
+                    &mut report,
+                    "bench/fts/supertable/cost",
+                    format!("Supertable FTS — cost model ({} docs)", fmt_count(n_docs)),
+                    &built,
+                    ingest_metrics.as_ref(),
+                    n_docs,
+                    &cost::warm_from_fts(warm_stats),
+                );
+            }
         }
 
         report.save();
@@ -831,7 +880,7 @@ pub mod vector {
                 fmt_count(n_docs),
                 DIM
             );
-            exec_vec::run_search(
+            let recall_rows = exec_vec::run_search(
                 &mut report,
                 &consumer,
                 || SupertableVecColdGuard::open(&built),
@@ -853,6 +902,21 @@ pub mod vector {
                 title,
                 "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.",
             );
+            if phases.warm {
+                emit_cost_warm(
+                    &mut report,
+                    "bench/vector/supertable/cost",
+                    format!(
+                        "Supertable vector — cost model ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        DIM
+                    ),
+                    &built,
+                    ingest_metrics.as_ref(),
+                    n_docs,
+                    &cost::warm_from_vector(&recall_rows),
+                );
+            }
             drop(consumer);
             drop(cache_dir);
         }
@@ -972,6 +1036,15 @@ pub mod sql {
                 ),
                 "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are recorded in the design notes, not run here). Δ is vs the previous run.",
                 &sets,
+            );
+            emit_cost_warm(
+                &mut report,
+                "bench/sql/supertable/cost",
+                format!("Supertable SQL — cost model ({} rows)", fmt_count(n_docs)),
+                &built,
+                ingest_metrics.as_ref(),
+                n_docs,
+                &cost::warm_from_sql(&sets),
             );
         }
 

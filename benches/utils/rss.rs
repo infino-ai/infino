@@ -85,6 +85,20 @@ pub fn current_rss_bytes() -> Option<u64> {
     None
 }
 
+/// One-shot read of the calling process's **anonymous** resident set
+/// (private heap) in bytes, from `/proc/self/smaps_rollup`. File-backed
+/// pages (the disk-cache mmap on free local NVMe) are excluded.
+pub fn current_anon_rss_bytes() -> Option<u64> {
+    purge_allocator();
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    rollup
+        .lines()
+        .find(|l| l.starts_with("Anonymous:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kb| kb * KIB_TO_BYTES)
+}
+
 /// Background-thread peak-RSS sampler. Start it before the
 /// work you want to bound and stop it after; the returned
 /// peak is the max VmRSS observed across the sampler's
