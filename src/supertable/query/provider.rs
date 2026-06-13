@@ -120,6 +120,15 @@ const PUSHDOWN_MAX_FRACTION: f64 = 0.01;
 /// tradeoff to lose anyway).
 const PUSHDOWN_MIN_ROWS: u64 = 4096;
 
+/// Density ceiling that binds even under [`PUSHDOWN_MIN_ROWS`]: when
+/// the estimate covers at least this fraction of a superfile's rows, a
+/// selection can't skip anything no matter how small the superfile is,
+/// so the posting walk + selection build is pure overhead. Measured at
+/// 1M docs × 256 superfiles (each under the floor), an all-matching
+/// `IN` aggregate ran 2.5× slower through the index path than the
+/// plain scan.
+const PUSHDOWN_MAX_DENSITY: f64 = 0.5;
+
 /// A [`TableProvider`] over a pinned supertable snapshot.
 ///
 /// Cheap to build (just `Arc` clones); all real work happens in
@@ -652,14 +661,16 @@ impl TableProvider for SupertableProvider {
             // the rows saturate the data pages, so an index `RowSelection`
             // can't skip any page and only adds posting-walk + selection
             // overhead. The floor keeps the pushdown active on small
-            // superfiles.
+            // superfiles; the density cap binds even under the floor so
+            // an all-matching predicate never takes the index path.
             let est = candidate_plan
                 .estimate(reader.as_ref())
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let gate =
                 ((reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64).max(PUSHDOWN_MIN_ROWS);
-            let candidates = if est > gate {
+            let density_cap = (reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+            let candidates = if est > gate || est >= density_cap {
                 None
             } else {
                 candidate_plan
