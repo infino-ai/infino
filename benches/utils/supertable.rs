@@ -324,6 +324,7 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_cost_warm(
     report: &mut Report,
     anchor: &str,
@@ -575,14 +576,8 @@ pub mod fts {
         }
 
         if phases.warm || phases.cold {
-            let warm_vec = warm
-                .as_ref()
-                .map(|w| cost::warm_from_fts(w))
-                .unwrap_or_default();
-            let cold_vec = cold
-                .as_ref()
-                .map(|c| cost::cold_from_fts(c))
-                .unwrap_or_default();
+            let warm_vec = warm.as_deref().map(cost::warm_from_fts).unwrap_or_default();
+            let cold_vec = cold.as_ref().map(cost::cold_from_fts).unwrap_or_default();
             let cold_store = phases.cold.then(|| measure_cold_store(&built)).flatten();
             if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
@@ -691,9 +686,7 @@ pub mod fts {
     fn measure_cold_store(
         built: &supertable::IngestResult,
     ) -> Option<storage_meter::ObjectStoreMeter> {
-        if built.cleanup.is_none() {
-            return None;
-        }
+        built.cleanup.as_ref()?;
         let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
         let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
         let (cache_dir, cache) =

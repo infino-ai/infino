@@ -47,6 +47,7 @@ fn corpus_stored_cells(corpus_bytes: u64, stored_bytes: u64) -> [Cell; 2] {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_cost_warm(
     report: &mut Report,
     anchor: &str,
@@ -497,24 +498,22 @@ pub mod fts {
                     }],
                 });
             }
-            if phases.warm {
-                if let Some(ref warm_stats) = warm {
-                    let b = result
-                        .builds
-                        .last()
-                        .expect("harness records at least one build row");
-                    super::emit_cost_warm(
-                        &mut report,
-                        "bench/fts/superfile/cost",
-                        format!("Superfile FTS — cost model ({} docs)", fmt_count(n_docs)),
-                        b.phase.wall.as_secs_f64(),
-                        b.writers as u32,
-                        index.bytes().len() as u64,
-                        corpus.total_bytes(),
-                        n_docs,
-                        &cost::warm_from_fts(warm_stats),
-                    );
-                }
+            if phases.warm && let Some(ref warm_stats) = warm {
+                let b = result
+                    .builds
+                    .last()
+                    .expect("harness records at least one build row");
+                super::emit_cost_warm(
+                    &mut report,
+                    "bench/fts/superfile/cost",
+                    format!("Superfile FTS — cost model ({} docs)", fmt_count(n_docs)),
+                    b.phase.wall.as_secs_f64(),
+                    b.writers as u32,
+                    index.bytes().len() as u64,
+                    corpus.total_bytes(),
+                    n_docs,
+                    &cost::warm_from_fts(warm_stats),
+                );
             }
             if phases.cold {
                 let cold = measure_cold_queries(&index);

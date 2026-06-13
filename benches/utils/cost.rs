@@ -348,13 +348,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     };
 
     let writers_used = c.writers.min(inst.vcpu);
+    let vcpu_share = format!("{writers_used}/{}/vCPU share", inst.vcpu);
     let ingest_cpu_row = vec![
         text(format!("Ingest CPU ({}w on {} vCPU)", c.writers, inst.vcpu)),
         text(format!(
-            "{} = {} × {}",
+            "{} = {} × {vcpu_share}",
             fmt_vcpu_seconds(ingest_vcpu_s),
             fmt_wall_seconds(c.ingest_wall_s),
-            format!("{writers_used}/{}/vCPU share", inst.vcpu),
         )),
         text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(compute))),
         metric(compute, usd(compute), Better::Lower),
