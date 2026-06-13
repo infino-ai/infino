@@ -28,8 +28,6 @@ use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use rayon::prelude::*;
-
 use crate::superfile::SuperfileReader;
 use crate::superfile::reader::{rank_back_indices, row_selection_for_ids};
 use crate::supertable::handle::SupertableReader;
@@ -314,10 +312,9 @@ async fn resolve_columns(
     //
     //   - **Resident readers** (in-memory tier / freshly written):
     //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode
-    //     over already-resident bytes, so the whole wave runs on
-    //     `options.reader_pool` (rayon) — the same pool the search
-    //     kernels and the writer's shard builds use — bridged back via
-    //     a oneshot so no tokio worker blocks under the compute.
+    //     over already-resident bytes, so each superfile's decode runs
+    //     on tokio's blocking pool via `spawn_blocking` — off the async
+    //     workers, and the per-superfile decodes parallelize across it.
     //   - **Lazy readers** stream ONLY the projected hit rows through
     //     parquet's async `ParquetObjectReader` (footer + projected
     //     column pages via range GETs) — async I/O that belongs on the
@@ -345,27 +342,31 @@ async fn resolve_columns(
         if warm_inputs.is_empty() {
             return Ok::<Vec<(usize, RecordBatch)>, DataFusionError>(Vec::new());
         }
-        // Owned inputs so the rayon closure is `'static`.
+        // One blocking task per warm superfile: each decode is CPU-bound
+        // over already-resident bytes, so it runs on tokio's blocking
+        // pool (off the async workers) and the per-superfile decodes
+        // parallelize across it.
         let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
-        let pool = Arc::clone(&manifest.options.reader_pool);
-        let inputs = warm_inputs;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        pool.spawn(move || {
-            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-            let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
-                .into_par_iter()
-                .map(|(i, sf, locals)| {
-                    sf.take_by_local_doc_ids(&locals, &name_refs)
-                        .map(|batch| (i, batch))
-                })
-                .collect();
-            let _ = tx.send(result);
-        });
-        rx.await
-            .map_err(|_| {
-                DataFusionError::Execution("resolve decode: reader pool dropped result".into())
-            })?
-            .map_err(|e| DataFusionError::Execution(e.to_string()))
+        let mut handles = Vec::with_capacity(warm_inputs.len());
+        for (i, sf, locals) in warm_inputs {
+            let names = owned_names.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                sf.take_by_local_doc_ids(&locals, &name_refs)
+                    .map(|batch| (i, batch))
+            }));
+        }
+        let mut out: Vec<(usize, RecordBatch)> = Vec::with_capacity(handles.len());
+        for h in handles {
+            let (i, batch) = h
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("resolve decode task join: {e}"))
+                })?
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            out.push((i, batch));
+        }
+        Ok(out)
     };
 
     let cold_wave = futures::future::try_join_all(cold_units.into_iter().map(

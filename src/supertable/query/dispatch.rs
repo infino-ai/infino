@@ -15,15 +15,18 @@
 //! orchestrator instead of each re-implementing the fan-out. The
 //! division of labor is the project-wide model:
 //!
-//!   * **tokio owns the I/O waves.** Superfile opens and the kernel's
-//!     cold object-store range GETs are `await`ed on the shared
-//!     multi-thread query runtime, so reqwest connections pool and
-//!     hundreds of superfiles' fetches are in flight at once.
-//!   * **rayon owns the CPU waves.** The per-superfile compute (centroid
-//!     / 1-bit-code scoring + rerank for vector; BMW/MaxScore scoring
-//!     for FTS) runs on the global rayon pool via the kernel's internal
-//!     `par_iter` — never on the tokio workers that must stay free to
-//!     drive the I/O.
+//!   * **tokio owns the fan-out and I/O.** One `tokio::spawn` task per
+//!     work unit: each opens its superfile reader and runs the kernel,
+//!     so superfile opens and cold object-store range GETs across
+//!     hundreds of superfiles are all in flight at once on the shared
+//!     multi-thread query runtime.
+//!   * **CPU model is per-kernel, not uniform.** The vector kernel
+//!     parallelizes its own scoring + rerank with `par_iter` (see
+//!     `superfile/vector/reader.rs`). The FTS BMW/MaxScore kernel
+//!     scores **serially inside its tokio task** — there is no rayon in
+//!     the FTS scoring path. Intra-superfile FTS parallelism is instead
+//!     expressed as additional tokio work units (doc-id sub-ranges; see
+//!     `query/fts.rs`).
 //!
 //! The per-superfile merge (top-k ascending for vector distance,
 //! descending for BM25 relevance) stays with each caller; this layer
@@ -113,9 +116,10 @@ pub(crate) fn apply_tombstone_filter(
 ///      whole fan-out.
 ///   3. Tags + tombstone-filters each unit's hits.
 ///
-/// The kernel returns `(local_doc_id, score)` pairs; it is responsible
-/// for keeping its own CPU on the global rayon pool (internal
-/// `par_iter`).
+/// The kernel returns `(local_doc_id, score)` pairs. CPU policy is the
+/// kernel's own: the vector kernel parallelizes with `par_iter`, while
+/// the FTS kernel scores serially within this task (FTS parallelism is
+/// expressed as extra work units, not rayon).
 pub(crate) async fn fanout<P, K, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
