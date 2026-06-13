@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod markdown;
 pub mod report;
 pub mod rss;
+pub mod storage_meter;
 pub mod tiers;
 
 pub mod superfile;

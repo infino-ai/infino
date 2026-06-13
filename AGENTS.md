@@ -45,30 +45,6 @@ cargo bench --bench bench -- tombstone
 
 ## Code style beyond CONTRIBUTING.md
 
-- **Rayon for CPU, tokio for I/O — bridged, never mixed.** This split
-  was A/B-tested (all-tokio, all-rayon, and the hybrid; the hybrid won —
-  rayon saturates cores better, tokio drives I/O better) and is the
-  standing concurrency contract for the query and build paths:
-  - **tokio owns the I/O waves**: superfile opens, object-store range
-    GETs, sidecar prefetches — `tokio::spawn` / `try_join_all` on the
-    shared multi-thread query runtime so connections pool and fetches
-    overlap. Never build a throwaway per-call runtime on a worker
-    thread (that exact anti-pattern once regressed cold vector search
-    from ~1.1 s to ~3.7–11 s).
-  - **rayon owns the CPU waves**: Parquet page decode, BM25 / vector
-    scoring, rerank, encode. Run them on `options.reader_pool` (the
-    configurable pool — not the global rayon pool) via
-    `pool.install(|| … par_iter …)`.
-  - **Bridge with a oneshot**: when an async task needs a CPU wave,
-    hand the work to the rayon pool and `await` a
-    `tokio::sync::oneshot` for the result, so tokio workers keep
-    driving I/O instead of blocking under the compute. Don't call
-    `par_iter` (or any long compute) inline in an async fn.
-  - If you change where work runs, benchmark before and after
-    (`cargo bench --bench bench -- supertable search` plus the
-    `INFINO_DIAG_QUERY_SQL_OVERHEAD` diagnostic for the SQL resolve
-    path) — a prior change silently moved warm decodes back onto
-    tokio and cost ~5× on `resolve_hits`.
 - **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
 - **Imports at the top of the file.** All `use` statements live at the top of the file (or, for an inline `#[cfg(test)]` module, at the top of that module) — never function-local, block-scoped, or otherwise inline. A file's full dependency surface should be readable in one place. If you find yourself reaching for a fully-qualified path mid-expression only to avoid an import, add the `use` at the top instead.
 - **No code duplication.** Read the surrounding modules *before* writing new code — there is usually an existing helper that already does what you need. Refactor shared logic into one helper rather than copy-pasting; duplicated logic drifts out of sync and is a correctness hazard.
@@ -84,7 +60,7 @@ Three lanes beyond `cargo test`:
 
 - **Brute-force oracles** under `tests/` — BM25 top-K is compared against the textbook BM25 formula on planted corpora; full-nprobe IVF is compared against brute-force exact-nearest for L2Sq / Cosine / NegDot. These are the correctness gates; if you touch scoring math or vector distance kernels, the oracles run first.
 - **Recall measurement — the acceptance bar is recall@10 ≥ 0.99, full stop.** No change is accepted that drops vector recall@10 below 0.99 on the standard vector bench (10M-row supertable, default config); demonstrate it and report the number in the PR body. The lower floors currently hard-coded in the bench suite (recall@10 ≥ 0.90 / 0.95 in `benches/utils/scale.rs`, and the 0.80 / 0.85 correctness floors) are loose regression tripwires only — **passing them is necessary but not sufficient.** The bar is 0.99.
-- `**make miri` + `make asan`** — the memory-safety oracles. Run them when you touch FTS or format code (`src/superfile/fts/` or `src/superfile/format/`), not just when you touch `unsafe` directly. Cost: miri ~100-1000× slower than native; asan 2-3×.
+- `**make miri` + `make asan`** — the memory-safety oracles. Run them. Cost: miri ~100-1000× slower than native; asan 2-3×.
 - **Property tests** — `proptest` is in dev-deps; used for round-trip invariants like PFOR encode/decode.
 
 Test deletions require explicit justification.
@@ -97,8 +73,8 @@ Performance *and* cost are first-class acceptance criteria for every change. A P
 
 One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench --bench bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
 
-- **`superfile` tier** — single-superfile, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
-- **`supertable` tier** — multi-superfile table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
+- `**superfile` tier** — single-superfile, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
+- `**supertable` tier** — multi-superfile table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
 
 Diagnostics are standalone programs sharing the same binary (tokens, not separate targets): `scale` (release-profile recall gates), `tombstone`, `update`, `sql-diag`, `object-store`. Scale knobs: `INFINO_BENCH_SUPERFILE_DOCS` / `INFINO_BENCH_SUPERTABLE_DOCS` (plain integers, per tier) and `INFINO_BENCH_WRITERS`.
 
@@ -235,7 +211,7 @@ storage/superfile/supertable layers, which are themselves internal.
 
 - **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
 - `**Connection`** — `create_table`, `open_table`, `drop_table` (logical by default; `purge = true` also deletes the table's storage subtree), `list_tables`, `query_sql`.
-- `**Supertable**` (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All four search methods (`bm25_search`, `vector_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the engine-native `_id` + `score` pair (no scalar decode — `_id` reads from its dedicated id pages), and materializing row data is an explicit opt-in by naming the columns to decode. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
+- `**Supertable`** (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All four search methods (`bm25_search`, `vector_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the engine-native `_id` + `score` pair (no scalar decode — `_id` reads from its dedicated id pages), and materializing row data is an explicit opt-in by naming the columns to decode. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
 - **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
 
 Everything else — `SupertableReader`/`SupertableWriter`, the manifest
@@ -259,7 +235,7 @@ surface.
 When this file and a config file disagree, the config file wins. Authoritative sources:
 
 - `**Cargo.toml`** — dependencies, lint config (`#![deny(clippy::unwrap_used)]` lives in `lib.rs`), test/bench target declarations (`[[test]]` / `[[bench]]` stanzas), feature flags.
-- `**Makefile**` — canonical command set (`check`, `test`, `ci`, `coverage`, `miri`, `asan`, `bench`, `bench-quick`, `clean`).
+- `**Makefile`** — canonical command set (`check`, `test`, `ci`, `coverage`, `miri`, `asan`, `bench`, `bench-quick`, `clean`).
 - `**rust-toolchain.toml**` — the exact stable Rust version pinned for this crate.
 - `**.github/workflows/**` — what CI actually runs and fails on.
 - `**docs/architecture/superfile.md**` + `**docs/architecture/supertable.md**` — design-level invariants and the rationale behind major choices.

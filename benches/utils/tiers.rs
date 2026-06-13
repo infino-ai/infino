@@ -14,9 +14,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use infino::supertable::manifest::SubsectionOffsets;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{AzureStorageProvider, S3StorageProvider, StorageProvider};
 use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
+use infino::superfile::SuperfileReader;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
@@ -589,6 +591,43 @@ pub fn fresh_superfile_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc
         SUPERFILE_CACHE_GIB * GIB_BYTES,
         ColdFetchMode::LazyForegroundWithBackgroundFill,
     )
+}
+
+/// Size-only hint for a bench-uploaded superfile (no manifest subsection map).
+///
+/// Production supertable reads carry full offsets in the manifest; standalone
+/// superfile cold opens only know the committed byte length. Seeding
+/// `total_size` makes the disk cache prefetch the parquet footer with bounded
+/// `get_range` calls instead of a sizeless `storage.tail()` suffix fetch.
+/// Azure rejects suffix ranges; commit `5901707` fixed `AzureStorageProvider::tail`,
+/// but the size-hint path matches the supertable production shape and avoids
+/// the suffix round-trip entirely on S3 too.
+pub fn superfile_cold_size_hint(known_size: u64) -> SubsectionOffsets {
+    SubsectionOffsets {
+        total_size: known_size,
+        vec: None,
+        fts: None,
+        vec_open_ranges: vec![],
+        fts_open_ranges: vec![],
+        open_blob: vec![],
+    }
+}
+
+/// Open one superfile through a fresh disk cache using a known object size.
+pub fn open_superfile_cold_reader(
+    storage: Arc<dyn StorageProvider>,
+    uri: &SuperfileUri,
+    known_size: u64,
+) -> (TempDir, Arc<SuperfileReader>) {
+    let (cache_dir, cache) = fresh_superfile_cache(storage);
+    let offsets = superfile_cold_size_hint(known_size);
+    let reader = block_on(async move {
+        cache
+            .reader_with_hints(uri, Some(&offsets))
+            .await
+            .expect("cold reader")
+    });
+    (cache_dir, reader)
 }
 
 fn fresh_disk_cache_with_mode(

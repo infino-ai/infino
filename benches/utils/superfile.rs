@@ -3,7 +3,7 @@
 
 //! Superfile-layer benchmark runners grouped by modality.
 
-use crate::report::{Better, Cell, metric, text};
+use crate::report::{Better, Cell, Report, metric, text};
 use crate::cost;
 use crate::rss;
 
@@ -75,6 +75,10 @@ fn emit_cost_warm(
             n_docs,
             resident_anon_bytes: resident,
             warm,
+            cold: None,
+            cold_store: None,
+            storage_months: None,
+            cold_open_amortized: false,
         },
     );
 }
@@ -447,21 +451,22 @@ pub mod fts {
                     .map(|(name, query, mode)| (*name, negation_p50(index.reader(), query, *mode)))
                     .collect::<Vec<(&'static str, Duration)>>()
             });
-            let cold = phases.cold.then(|| measure_cold_queries(&index));
-            exec_fts::emit_search(
-                &mut report,
-                "bench/fts/superfile/search",
-                format!(
-                    "Superfile FTS — search, single-superfile / in-memory ({} docs)",
-                    fmt_count(n_docs)
-                ),
-                "Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on \
-                 object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). \
-                 Δ is vs the previous run.",
-                warm.as_deref(),
-                cold.as_ref(),
-                probes.as_deref(),
-            );
+            if phases.warm || probes.is_some() {
+                exec_fts::emit_search(
+                    &mut report,
+                    "bench/fts/superfile/search",
+                    format!(
+                        "Superfile FTS — search, single-superfile / in-memory ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on \
+                     object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). \
+                     Δ is vs the previous run.",
+                    warm.as_deref(),
+                    None,
+                    probes.as_deref(),
+                );
+            }
             if let Some(rows) = negations {
                 report.emit(&Section {
                     anchor: "bench/fts/superfile/negation".into(),
@@ -504,6 +509,22 @@ pub mod fts {
                         &cost::warm_from_fts(warm_stats),
                     );
                 }
+            }
+            if phases.cold {
+                let cold = measure_cold_queries(&index);
+                exec_fts::emit_search(
+                    &mut report,
+                    "bench/fts/superfile/cold",
+                    format!(
+                        "Superfile FTS — cold search, object-store ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Cold = same `.parquet` committed to object storage, read through \
+                     `DiskCacheStore::reader` with a fresh cache per iteration. Δ is vs the previous run.",
+                    None,
+                    Some(&cold),
+                    None,
+                );
             }
         }
 
@@ -593,7 +614,7 @@ pub mod fts {
         let storage = Arc::clone(&committed.storage);
         let uri = committed.uri;
         exec_fts::measure_cold(
-            || SuperfileColdGuard::open(Arc::clone(&storage), uri),
+            || SuperfileColdGuard::open(Arc::clone(&storage), uri, committed.object_size),
             FTS_BATTERY,
             FTS_COLUMN,
             K,
@@ -615,9 +636,9 @@ pub mod fts {
         fn open(
             storage: Arc<dyn infino::supertable::storage::StorageProvider>,
             uri: infino::supertable::manifest::SuperfileUri,
+            known_size: u64,
         ) -> Self {
-            let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
-            let reader = tiers::block_on(async { cache.reader(&uri).await.expect("cold reader") });
+            let (cache_dir, reader) = tiers::open_superfile_cold_reader(storage, &uri, known_size);
             Self {
                 _cache_dir: cache_dir,
                 reader,
@@ -936,7 +957,11 @@ pub mod vector {
             let committed = phases.cold.then(|| commit_cold_artifact(&index));
             let open_cold = || {
                 let committed = committed.as_ref().expect("cold artifact present");
-                SuperfileVecColdGuard::open(Arc::clone(&committed.storage), committed.uri)
+                SuperfileVecColdGuard::open(
+                    Arc::clone(&committed.storage),
+                    committed.uri,
+                    committed.object_size,
+                )
             };
             let recall_rows = exec_vec::run_search(
                 &mut report,
@@ -999,10 +1024,10 @@ pub mod vector {
                 fn open(
                     storage: Arc<dyn infino::supertable::storage::StorageProvider>,
                     uri: infino::supertable::manifest::SuperfileUri,
+                    known_size: u64,
                 ) -> Self {
-                    let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
-                    let reader =
-                        tiers::block_on(async { cache.reader(&uri).await.expect("cold reader") });
+                    let (cache_dir, reader) =
+                        tiers::open_superfile_cold_reader(storage, &uri, known_size);
                     Self {
                         _cache_dir: cache_dir,
                         reader,

@@ -47,6 +47,7 @@ use tempfile::TempDir;
 
 use crate::corpus::DIM;
 use crate::cost;
+use crate::storage_meter;
 use crate::ingest::supertable::{self, Modality, modality_label};
 use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
@@ -331,8 +332,10 @@ fn emit_cost_warm(
     metrics: Option<&ShapeMetrics>,
     n_docs: usize,
     warm: &[(String, f64)],
+    cold: Option<&[cost::ColdQuery]>,
+    cold_store: Option<storage_meter::ObjectStoreMeter>,
 ) {
-    if warm.is_empty() {
+    if warm.is_empty() && cold.is_none() {
         return;
     }
     let resident = rss::current_anon_rss_bytes().unwrap_or(0);
@@ -353,6 +356,10 @@ fn emit_cost_warm(
             n_docs,
             resident_anon_bytes: resident,
             warm,
+            cold,
+            cold_store,
+            storage_months: None,
+            cold_open_amortized: true,
         },
     );
 }
@@ -567,8 +574,20 @@ pub mod fts {
             );
         }
 
-        if phases.warm {
-            if let Some(ref warm_stats) = warm {
+        if phases.warm || phases.cold {
+            let warm_vec = warm
+                .as_ref()
+                .map(|w| cost::warm_from_fts(w))
+                .unwrap_or_default();
+            let cold_vec = cold
+                .as_ref()
+                .map(|c| cost::cold_from_fts(c))
+                .unwrap_or_default();
+            let cold_store = phases
+                .cold
+                .then(|| measure_cold_store(&built))
+                .flatten();
+            if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
                     &mut report,
                     "bench/fts/supertable/cost",
@@ -576,7 +595,13 @@ pub mod fts {
                     &built,
                     ingest_metrics.as_ref(),
                     n_docs,
-                    &cost::warm_from_fts(warm_stats),
+                    &warm_vec,
+                    if cold_vec.is_empty() {
+                        None
+                    } else {
+                        Some(&cold_vec)
+                    },
+                    cold_store,
                 );
             }
         }
@@ -663,6 +688,43 @@ pub mod fts {
             COLD_ITERS,
             "supertable_fts",
         )
+    }
+
+    /// One metered cold iteration (`ten_term_or`) on a real object-store backend.
+    fn measure_cold_store(
+        built: &supertable::IngestResult,
+    ) -> Option<storage_meter::ObjectStoreMeter> {
+        if built.cleanup.is_none() {
+            return None;
+        }
+        let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
+        let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
+        let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+            meter.provider(),
+            Some(built.total_index_bytes),
+        );
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Fts, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        crate::executors::open_all_superfiles(&consumer);
+        let reader = consumer.reader();
+        let terms = query.terms.join(" ");
+        let mode = exec_fts::to_infino_mode(query.mode);
+        let _ = reader
+            .bm25_search(
+                supertable::TEXT_COLUMN,
+                &terms,
+                TOP_K,
+                mode,
+                None,
+            )
+            .expect("metered cold bm25_search");
+        drop(consumer);
+        drop(cache_dir);
+        Some(meter.snapshot())
     }
 
     /// Cold-tier guard: a fresh disk cache + consumer per open. The
@@ -915,6 +977,8 @@ pub mod vector {
                     ingest_metrics.as_ref(),
                     n_docs,
                     &cost::warm_from_vector(&recall_rows),
+                    None,
+                    None,
                 );
             }
             drop(consumer);
@@ -1045,6 +1109,8 @@ pub mod sql {
                 ingest_metrics.as_ref(),
                 n_docs,
                 &cost::warm_from_sql(&sets),
+                None,
+                None,
             );
         }
 
