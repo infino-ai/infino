@@ -85,6 +85,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::superfile::BuildError;
 use crate::superfile::format::checksum::{crc32c, crc32c_append};
+use crate::superfile::format::fts::HEADER_SIZE as FTS_HEADER_SIZE;
 use crate::superfile::format::{self, FST_SEPARATOR};
 use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
 use crate::superfile::fts::fst_value::FstValue;
@@ -2359,7 +2360,7 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => bytes.len() as u64,
         FstSource::Streamed { len, .. } => *len,
     };
-    let header_size: u64 = 48;
+    let header_size: u64 = FTS_HEADER_SIZE as u64;
     let fst_offset: u64 = header_size;
     let postings_offset: u64 = fst_offset + fst_total_len;
     let doc_lengths_table_offset: u64 = postings_offset + postings_len;

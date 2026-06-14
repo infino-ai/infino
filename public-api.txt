@@ -41,8 +41,8 @@ impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 pub enum infino::CompactionError
-pub infino::CompactionError::Build(infino::supertable::error::BuildError)
-pub infino::CompactionError::Commit(infino::supertable::error::CommitError)
+pub infino::CompactionError::Build(alloc::string::String)
+pub infino::CompactionError::Commit(alloc::string::String)
 pub infino::CompactionError::EmptyMergedSuperfile
 pub infino::CompactionError::NoStorage
 pub infino::CompactionError::Refresh(alloc::string::String)

@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::io::SeekFrom;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -1383,10 +1385,7 @@ impl DiskCacheStore {
                     DiskCacheError::SuperfileOpen(format!("stream semaphore closed: {e}"))
                 })?;
                 let bytes = storage.get_range(&uri, start..end).await?;
-                tokio::task::spawn_blocking(move || {
-                    use std::os::unix::fs::FileExt;
-                    file.write_all_at(&bytes, start)
-                })
+                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
                 .await
                 .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
@@ -1497,7 +1496,6 @@ async fn finalize_to_mmap(
         // via fetch_sub) and don't re-insert. Without this
         // check, the finalizer would silently violate the
         // budget invariant by reinstating an evicted entry.
-        use dashmap::mapref::entry::Entry;
         match store.cached.entry(uri) {
             Entry::Occupied(mut occ) => {
                 *occ.get_mut() = Arc::new(CachedEntry {
@@ -1632,10 +1630,7 @@ async fn cold_fetch_to_disk_cancelable(
             let uri = storage_uri.to_string();
             in_flight.push(async move {
                 let bytes = storage.get_range(&uri, start..end).await?;
-                tokio::task::spawn_blocking(move || {
-                    use std::os::unix::fs::FileExt;
-                    file.write_all_at(&bytes, start)
-                })
+                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
                 .await
                 .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
@@ -1771,7 +1766,6 @@ async fn lazy_background_fill(
         //    mmap-backed one — but only if it's still
         //    present (a racing eviction may have removed it
         //    + released the reservation in the meantime).
-        use dashmap::mapref::entry::Entry;
         match store.cached.entry(uri) {
             Entry::Occupied(mut occ) => {
                 *occ.get_mut() = Arc::new(CachedEntry {

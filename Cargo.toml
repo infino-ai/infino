@@ -345,9 +345,15 @@ name = "bench"
 path = "benches/bench/main.rs"
 harness = false
 
-# Both current examples exercise the format-layer internals (superfile
-# builder / reader, `test_helpers` fixtures), so they declare the
-# `test-helpers` feature they semantically need. (In practice that
+# `quickstart` is the out-of-the-box entry point: it uses only the
+# shipped `infino::*` surface, so `cargo run --example quickstart` works
+# from a fresh clone with no extra features.
+[[example]]
+name = "quickstart"
+
+# `demo` and `profile_fts_build` exercise the format-layer internals
+# (superfile builder / reader, `test_helpers` fixtures), so they declare
+# the `test-helpers` feature they semantically need. (In practice that
 # feature is already forced on across the dev graph by the
 # `infino-bench-utils` dev-dependency — see its note above — so this is
 # documentation of intent, not an independent gate.)
