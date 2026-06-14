@@ -52,22 +52,22 @@ use crate::supertable::wal::WalStore;
 /// extra storage GET across enough queries that the steady-
 /// state per-query cost stays inside the hot-path budget.
 ///
-/// Applies only to *present* sidecars (a segment that actually
+/// Applies only to *present* sidecars (a superfile that actually
 /// has tombstones); absent/empty sidecars use
 /// [`DEFAULT_NEGATIVE_TTL`].
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(1);
 
 /// Negative/empty-view refresh interval — much longer than the
-/// positive TTL. The overwhelmingly common case is a segment
+/// positive TTL. The overwhelmingly common case is a superfile
 /// with **no** tombstones at all (no sidecar on storage → a 404,
 /// cached as an empty bitmap). Re-GETting that 404 on the 1 s
 /// positive TTL turns every steady-state query into one
-/// object-store round trip *per segment*, which at high segment
+/// object-store round trip *per superfile*, which at high superfile
 /// counts (a wide supertable fan-out) dominates the hot path —
 /// the serial post-search tombstone sweep becomes seconds.
 ///
 /// A sidecar only appears when some process deletes a row in that
-/// segment. This process invalidates its own deletes synchronously
+/// superfile. This process invalidates its own deletes synchronously
 /// (see [`SidecarCache::invalidate`]), so the only staleness this
 /// TTL governs is a *cross-process* delete — already an
 /// eventual-consistency concern, not a correctness one. Holding
@@ -156,11 +156,11 @@ impl SidecarCache {
     }
 
     /// Concurrently refresh every id whose cached view is missing or
-    /// stale, so a subsequent per-segment [`Self::bitmap_for`] sweep
+    /// stale, so a subsequent per-superfile [`Self::bitmap_for`] sweep
     /// is all cache hits.
     ///
     /// This is the hot-path entry point for a wide fan-out: it
-    /// replaces N *serial* blocking storage GETs (one per segment,
+    /// replaces N *serial* blocking storage GETs (one per superfile,
     /// each a sync→async bridge) with a single *concurrent* batch
     /// whose wall cost is ≈ one round trip rather than N. Ids that
     /// are already fresh are skipped, so in the no-deletes steady

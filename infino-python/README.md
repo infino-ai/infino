@@ -41,9 +41,9 @@ pytest tests/
 - `Table`: `append(...)`, `schema`, and the search surface —
   `bm25_search` / `vector_search` / `token_match` / `exact_match` all
   return a pyarrow `Table`. `projection` names the output columns
-  (`_id`, any scalar column, or `score`); omitting it returns the whole
-  row, and only the projected scalar columns are decoded —
-  `projection=["_id", "score"]` skips scalar decode entirely. The
+  (`_id`, any scalar column, or `score`); omitting it returns the
+  engine-native `_id` + `score` pair with no scalar decode —
+  materializing row data is an explicit opt-in by naming columns. The
   unranked `token_match` / `exact_match` rows carry `score == 0.0`.
   `append` accepts a pyarrow `RecordBatch` or `Table`, a pandas
   `DataFrame`, or a `list[dict]` — coerced to Arrow against the table's

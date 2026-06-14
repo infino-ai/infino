@@ -12,13 +12,13 @@
 //! over the **same** data, so the cost can be attributed to a layer:
 //!
 //!   * `infino query_sql`        — the full path we want to speed up
-//!     (segment prune → in-memory object store → DataFusion
+//!     (superfile prune → in-memory object store → DataFusion
 //!     `ParquetSource` → `FilterExec` → collect).
 //!   * `  ├ parse+plan`          — `ctx.sql(...)` on the cached
 //!     `SessionContext` (planning only, no execution).
 //!   * `  └ execute`             — `DataFrame::collect()` (the scan).
 //!   * `DataFusion / parquet`    — vanilla DataFusion reading the same
-//!     segment Parquet files from a temp dir via `register_parquet`.
+//!     superfile Parquet files from a temp dir via `register_parquet`.
 //!     Isolates infino's provider/object-store wrapper: if this
 //!     matches `query_sql`, the wrapper is free and the cost is
 //!     DataFusion's Parquet scan itself.
@@ -27,7 +27,7 @@
 //!     floor for DataFusion's executor + output materialization.
 //!   * `raw parquet-rs decode`   — `ParquetRecordBatchReaderBuilder`
 //!     decoding only the projected column(s) straight from the
-//!     segment bytes, predicate applied by hand. The floor a custom
+//!     superfile bytes, predicate applied by hand. The floor a custom
 //!     `ExecutionPlan` that decodes our layout directly would
 //!     approach.
 //!
@@ -68,7 +68,7 @@ use crate::corpus::{self, MmapTextCorpus};
 use crate::markdown::fmt_count;
 
 /// Rows per commit — mirrors `InfinoSqlEngine`'s `WRITE_CHUNK`, so the
-/// segment count matches the headline SQL bench.
+/// superfile count matches the headline SQL bench.
 const WRITE_CHUNK: usize = 65_536;
 
 /// Round-robin category labels (matches `superfile::sql::CATEGORIES`).
@@ -196,14 +196,14 @@ fn time_path(iters: usize, mut f: impl FnMut() -> usize) -> (Duration, Duration,
     (percentile(&mut samples, 50), mean, rows)
 }
 
-/// Raw parquet-rs decode of `cols` from every segment, applying `keep`
+/// Raw parquet-rs decode of `cols` from every superfile, applying `keep`
 /// to each row by hand and counting survivors — the direct-decode
 /// floor a custom `ExecutionPlan` would approach. When only `title`
 /// is projected (no filter columns) the per-row predicate is skipped
 /// entirely, matching a filterless scan.
-fn raw_decode(segments: &[Bytes], cols: &[usize], keep: fn(&str, i64) -> bool) -> usize {
+fn raw_decode(superfiles: &[Bytes], cols: &[usize], keep: fn(&str, i64) -> bool) -> usize {
     let mut kept = 0usize;
-    for bytes in segments {
+    for bytes in superfiles {
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).expect("parquet builder");
         let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
@@ -267,16 +267,16 @@ pub fn run() {
         fmt_count(n)
     );
 
-    // ── Shared corpus + per-chunk batches (the "segments"). ──────────
+    // ── Shared corpus + per-chunk batches (the "superfiles"). ──────────
     eprintln!("[sql-diag] generating {}-row corpus...", fmt_count(n));
     let corpus = MmapTextCorpus::generate(n, 1);
     let corpus_rows = corpus.rows();
     let batches: Vec<RecordBatch> = corpus_rows.chunks(WRITE_CHUNK).map(chunk_batch).collect();
-    let segments: Vec<Bytes> = batches.iter().map(batch_to_parquet).collect();
+    let superfiles: Vec<Bytes> = batches.iter().map(batch_to_parquet).collect();
     eprintln!(
-        "[sql-diag] {} segment(s), {:.1} MiB parquet total",
+        "[sql-diag] {} superfile(s), {:.1} MiB parquet total",
         batches.len(),
-        segments.iter().map(|b| b.len()).sum::<usize>() as f64 / (1024.0 * 1024.0)
+        superfiles.iter().map(|b| b.len()).sum::<usize>() as f64 / (1024.0 * 1024.0)
     );
 
     // ── infino Supertable (scalar + FTS), committed per chunk. ───────
@@ -295,11 +295,11 @@ pub fn run() {
         build_t0.elapsed().as_secs_f64()
     );
 
-    // Spill segments to a temp dir for the vanilla-DataFusion baseline.
+    // Spill superfiles to a temp dir for the vanilla-DataFusion baseline.
     let dir = tempfile::TempDir::new().expect("tempdir");
-    for (i, bytes) in segments.iter().enumerate() {
+    for (i, bytes) in superfiles.iter().enumerate() {
         let path = dir.path().join(format!("seg_{i:05}.parquet"));
-        std::fs::write(&path, bytes).expect("write segment parquet");
+        std::fs::write(&path, bytes).expect("write superfile parquet");
     }
 
     let rt = Runtime::new().expect("tokio runtime");
@@ -421,8 +421,9 @@ pub fn run() {
         };
 
         // 4. raw parquet-rs decode floor.
-        let (raw_p50, raw_mean, raw_rows) =
-            time_path(iters, || raw_decode(&segments, shape.raw_cols, shape.keep));
+        let (raw_p50, raw_mean, raw_rows) = time_path(iters, || {
+            raw_decode(&superfiles, shape.raw_cols, shape.keep)
+        });
 
         // Sanity: every path must agree on the result-set size.
         assert_eq!(

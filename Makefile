@@ -46,7 +46,7 @@ bench:
 	cargo bench --features test-helpers
 
 bench-quick:
-	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --features test-helpers --bench bench -- superfile fts warm
+	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --features test-helpers -- superfile fts warm
 
 # Memory safety oracles for the FTS / format `unsafe` surface.
 # The remaining `unsafe` surface is one bumpalo lifetime
@@ -106,7 +106,7 @@ python-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip
 	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas
-	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop -m infino-python/Cargo.toml
+	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
 	infino-python/.venv/bin/python -m pytest infino-python/tests/ -v
 
 # Build a release abi3 wheel for the current platform into
@@ -114,7 +114,7 @@ python-test:
 python-wheel:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
-	infino-python/.venv/bin/maturin build --release --out infino-python/dist -m infino-python/Cargo.toml
+	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
 
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded
 # from the cargo workspace, so the core crate never needs a Node

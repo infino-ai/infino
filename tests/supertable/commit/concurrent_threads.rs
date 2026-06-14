@@ -107,7 +107,7 @@ fn reader_pinned_before_writer_starts_never_sees_commits() {
         drop(w);
     });
 
-    // Repeatedly probe the pinned reader; manifest_id and segment
+    // Repeatedly probe the pinned reader; manifest_id and superfile
     // count must NOT advance regardless of writer progress.
     let deadline = Instant::now() + Duration::from_millis(200);
     while Instant::now() < deadline {
@@ -119,7 +119,7 @@ fn reader_pinned_before_writer_starts_never_sees_commits() {
         assert_eq!(
             pinned.n_superfiles(),
             0,
-            "pinned reader's segment count grew while writer ran",
+            "pinned reader's superfile count grew while writer ran",
         );
     }
     writer_handle.join().expect("writer thread joined");

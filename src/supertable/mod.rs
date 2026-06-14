@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Supertable layer — the in-memory cross-segment query + manifest
+//! Supertable layer — the in-memory cross-superfile query + manifest
 //! layer over [`SuperfileBuilder`] / [`SuperfileReader`].
 //!
 //! A supertable is to superfile what an Iceberg / Delta table is
@@ -24,6 +24,7 @@
 //!   `SupertableReader` (snapshot-pinned reader).
 
 pub(crate) mod build;
+pub(crate) mod compaction;
 pub mod error;
 pub mod handle;
 pub mod lazy_source;
@@ -57,7 +58,7 @@ pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
     StorageProvider,
 };
-pub use error::{BuildError, CommitError, OpenError, QueryError};
+pub use error::{BuildError, CommitError, CompactionError, OpenError, QueryError};
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;
 pub use manifest::{

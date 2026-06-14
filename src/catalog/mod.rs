@@ -188,7 +188,7 @@ impl Connection {
                         .expect("non-memory backend yields a storage provider");
                 // Disk cache is keyed on the stable name (not the unique
                 // location) so the producer and a later reopener share one
-                // cache directory; segment keys carry the location, so a
+                // cache directory; superfile keys carry the location, so a
                 // re-created table never reads a dropped generation's bytes.
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
                 let mut opts =

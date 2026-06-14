@@ -4,13 +4,13 @@
 //! In-process cache of parsed `SuperfileReader`s keyed by
 //! [`SuperfileUri`].
 //!
-//! The supertable's manifest carries metadata only — segment id,
+//! The supertable's manifest carries metadata only — superfile id,
 //! summary stats, FTS bloom, etc. The actual parsed superfile
 //! readers live here, behind the [`SuperfileReaderCache`] trait,
 //! owned by the supertable inner state and shared across reader
 //! threads via `Arc<dyn SuperfileReaderCache>`. This split keeps
 //! manifest snapshots cheap (a few KB each) while letting hot
-//! queries reuse one parsed reader per segment across threads.
+//! queries reuse one parsed reader per superfile across threads.
 //!
 //! ## Implementations
 //!
@@ -69,8 +69,8 @@ pub trait SuperfileReaderCache: Send + Sync {
     /// never registered with [`SuperfileReaderCache::insert`].
     fn reader(&self, uri: &SuperfileUri) -> Result<Arc<SuperfileReader>, ReaderCacheError>;
 
-    /// Insert a new segment's bytes under `uri`. Called once per
-    /// segment by the writer, at commit time.
+    /// Insert a new superfile's bytes under `uri`. Called once per
+    /// superfile by the writer, at commit time.
     ///
     /// Idempotent: re-inserting the same `uri` is a no-op (the
     /// caller's contract is that a `SuperfileUri` always names the
@@ -82,7 +82,7 @@ pub trait SuperfileReaderCache: Send + Sync {
     fn insert(&self, uri: SuperfileUri, bytes: Bytes) -> Result<(), ReaderCacheError>;
 
     /// Approximate resident byte count, summed across every
-    /// cached segment. Used by tests + observability that need to
+    /// cached superfile. Used by tests + observability that need to
     /// confirm RAM bounds match expectations.
     fn resident_bytes(&self) -> usize;
 }
@@ -90,7 +90,7 @@ pub trait SuperfileReaderCache: Send + Sync {
 /// Error type for [`SuperfileReaderCache`] operations.
 #[derive(Debug, Error)]
 pub enum ReaderCacheError {
-    #[error("segment uri {uri:?} not found in cache")]
+    #[error("superfile uri {uri:?} not found in cache")]
     NotFound { uri: SuperfileUri },
 
     #[error("failed to open superfile bytes: {source}")]

@@ -208,7 +208,7 @@ impl Table {
     /// Append data. Accepts a pyarrow `RecordBatch` or `Table`, a pandas
     /// `DataFrame`, or a `list[dict]` (coerced to Arrow with the table's
     /// declared schema). Durable when this returns — one `append` == one
-    /// commit == one sealed segment, so batch rows per call.
+    /// commit == one sealed superfile, so batch rows per call.
     fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let declared = self.inner.schema();
         let py_schema = declared.as_ref().to_pyarrow(py)?;
@@ -220,7 +220,7 @@ impl Table {
                 // accepts them. A genuine type or null mismatch still errors.
                 let aligned = RecordBatch::try_new(declared, batch.columns().to_vec())
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                // Append commits a segment to storage — release the GIL.
+                // Append commits a superfile to storage — release the GIL.
                 py.detach(|| self.inner.append(&aligned)).map_err(py_err)
             }
             // Empty input — nothing to append (no empty commit).
@@ -231,8 +231,8 @@ impl Table {
     /// BM25 search over one FTS column. Returns a pyarrow `Table`.
     /// `projection` names the output columns (`_id`, any scalar column,
     /// or the trailing `score` — higher is better); omitting it returns
-    /// the whole row. Only projected scalar columns are decoded, so
-    /// `projection=["_id", "score"]` skips scalar decode entirely.
+    /// the engine-native `_id` + `score` pair with no scalar decode.
+    /// Materializing row data is an explicit opt-in by naming columns.
     /// `mode` is `"or"` (default) or `"and"`.
     #[pyo3(signature = (column, query, k, mode=None, projection=None))]
     fn bm25_search<'py>(
@@ -257,8 +257,9 @@ impl Table {
     /// Vector kNN over one vector column. `query` is a `list[float]`.
     /// Returns a pyarrow `Table`. `projection` names the output columns
     /// (`_id`, any scalar column, or the trailing `score` — distance,
-    /// smaller is nearer); omitting it returns the whole row.
-    /// `projection=["_id", "score"]` skips scalar decode entirely.
+    /// smaller is nearer); omitting it returns the engine-native
+    /// `_id` + `score` pair with no scalar decode. Materializing row
+    /// data is an explicit opt-in by naming columns.
     #[pyo3(signature = (column, query, k, nprobe=None, projection=None))]
     fn vector_search<'py>(
         &self,
@@ -400,7 +401,7 @@ fn coerce_to_record_batch(
     };
 
     // Collapse the Table's chunks into a single RecordBatch — one append
-    // is one commit / one sealed segment.
+    // is one commit / one sealed superfile.
     let batches = table
         .call_method0("combine_chunks")?
         .call_method0("to_batches")?;

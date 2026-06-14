@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Shared fan-out/dispatch for the segment-parallel query paths.
+//! Shared fan-out/dispatch for the superfile-parallel query paths.
 //!
 //! Vector kNN and BM25/prefix FTS both face the identical shape: a
-//! pinned manifest snapshot, a kept set of segments (after manifest
-//! pruning), and a per-segment search kernel whose result is a list of
+//! pinned manifest snapshot, a kept set of superfiles (after manifest
+//! pruning), and a per-superfile search kernel whose result is a list of
 //! `(local_doc_id, score)` pairs. The plumbing around that kernel —
-//! open every segment reader concurrently, warm the tombstone sidecar
-//! cache in one batch, run each segment's kernel, tag the hits with
-//! their segment URI, and drop tombstoned rows — is the same for both.
+//! open every superfile reader concurrently, warm the tombstone sidecar
+//! cache in one batch, run each superfile's kernel, tag the hits with
+//! their superfile URI, and drop tombstoned rows — is the same for both.
 //!
 //! This module owns that plumbing so the two query paths share one
 //! orchestrator instead of each re-implementing the fan-out. The
 //! division of labor is the project-wide model:
 //!
-//!   * **tokio owns the I/O waves.** Segment opens and the kernel's
-//!     cold object-store range GETs are `await`ed on the shared
-//!     multi-thread query runtime, so reqwest connections pool and
-//!     hundreds of segments' fetches are in flight at once.
-//!   * **rayon owns the CPU waves.** The per-segment compute (centroid
-//!     / 1-bit-code scoring + rerank for vector; BMW/MaxScore scoring
-//!     for FTS) runs on the global rayon pool via the kernel's internal
-//!     `par_iter` — never on the tokio workers that must stay free to
-//!     drive the I/O.
+//!   * **tokio owns the fan-out and I/O.** One `tokio::spawn` task per
+//!     work unit: each opens its superfile reader and runs the kernel,
+//!     so superfile opens and cold object-store range GETs across
+//!     hundreds of superfiles are all in flight at once on the shared
+//!     multi-thread query runtime.
+//!   * **CPU model is per-kernel, not uniform.** The vector kernel
+//!     parallelizes its own scoring + rerank with `par_iter` (see
+//!     `superfile/vector/reader.rs`). The FTS BMW/MaxScore kernel
+//!     scores **serially inside its tokio task** — there is no rayon in
+//!     the FTS scoring path. Intra-superfile FTS parallelism is instead
+//!     expressed as additional tokio work units (doc-id sub-ranges; see
+//!     `query/fts.rs`).
 //!
-//! The per-segment merge (top-k ascending for vector distance,
+//! The per-superfile merge (top-k ascending for vector distance,
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
@@ -42,9 +45,9 @@ use crate::supertable::tombstones::SidecarCache;
 
 use super::SuperfileHit;
 
-/// Open one segment's `SuperfileReader` through the reader cache.
+/// Open one superfile's `SuperfileReader` through the reader cache.
 /// Warm opens are in-memory cache hits (microseconds); cold opens
-/// fetch the segment header/footer from object storage. Always
+/// fetch the superfile header/footer from object storage. Always
 /// `await`ed so the open I/O overlaps across the fan-out.
 pub(crate) async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
@@ -64,18 +67,18 @@ pub(crate) async fn open_reader(
 }
 
 /// Tag a kernel's `(local_doc_id, score)` results with their source
-/// segment URI.
+/// superfile URI.
 pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
     hits.into_iter()
         .map(|(local_doc_id, score)| SuperfileHit {
-            segment: entry.uri,
+            superfile: entry.uri,
             local_doc_id,
             score,
         })
         .collect()
 }
 
-/// Drop tombstoned `local_doc_id`s from one segment's hits. After the
+/// Drop tombstoned `local_doc_id`s from one superfile's hits. After the
 /// orchestrator's batched [`SidecarCache::prefetch`] every lookup here
 /// is an in-memory cache hit, so this is a cheap retain pass.
 pub(crate) fn apply_tombstone_filter(
@@ -97,14 +100,14 @@ pub(crate) fn apply_tombstone_filter(
     Ok(())
 }
 
-/// Fan a per-segment async kernel out across `units`, returning each
+/// Fan a per-superfile async kernel out across `units`, returning each
 /// unit's tagged + tombstone-filtered hits in input order.
 ///
-/// Each unit is `(segment_entry, params)`; `params` carries any
+/// Each unit is `(superfile_entry, params)`; `params` carries any
 /// per-unit kernel input (e.g. an FTS doc-id sub-range — `()` for
 /// vector). The orchestrator:
 ///
-///   1. Warms the tombstone sidecar cache for every distinct segment
+///   1. Warms the tombstone sidecar cache for every distinct superfile
 ///      in one concurrent batch (so the post-search filter is all
 ///      cache hits).
 ///   2. `tokio::spawn`s one task per unit on the shared query runtime;
@@ -113,9 +116,10 @@ pub(crate) fn apply_tombstone_filter(
 ///      whole fan-out.
 ///   3. Tags + tombstone-filters each unit's hits.
 ///
-/// The kernel returns `(local_doc_id, score)` pairs; it is responsible
-/// for keeping its own CPU on the global rayon pool (internal
-/// `par_iter`).
+/// The kernel returns `(local_doc_id, score)` pairs. CPU policy is the
+/// kernel's own: the vector kernel parallelizes with `par_iter`, while
+/// the FTS kernel scores serially within this task (FTS parallelism is
+/// expressed as extra work units, not rayon).
 pub(crate) async fn fanout<P, K, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
@@ -136,8 +140,8 @@ where
     let tombstone_cache = reader.tombstone_cache.clone();
     let now = std::time::Instant::now();
 
-    // Warm the tombstone sidecars for every distinct segment in one
-    // concurrent batch before the per-segment fan-out.
+    // Warm the tombstone sidecars for every distinct superfile in one
+    // concurrent batch before the per-superfile fan-out.
     if let Some(cache) = tombstone_cache.as_ref() {
         let mut ids: Vec<uuid::Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
         ids.sort_unstable();

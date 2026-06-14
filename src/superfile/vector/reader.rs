@@ -68,7 +68,7 @@ pub(super) enum Sq8ColumnMeta {
     Eager {
         scale: Vec<f32>,
         offset: Vec<f32>,
-        per_doc_norms: Option<Vec<f32>>,
+        per_doc_norms: Option<Arc<[f32]>>,
     },
     Lazy {
         scale_abs_off: usize,
@@ -81,7 +81,7 @@ pub(super) enum Sq8ColumnMeta {
 struct Sq8ParsedMeta {
     scale: Vec<f32>,
     offset: Vec<f32>,
-    per_doc_norms: Option<Vec<f32>>,
+    per_doc_norms: Option<Arc<[f32]>>,
 }
 
 /// Per-column reader state; cached at open time.
@@ -683,7 +683,10 @@ impl VectorReader {
                 });
             }
 
-            let mismatch = jobs.par_iter().find_map_any(|job| {
+            // Serial CRC verify over the (handful of) subsections — a
+            // one-time open cost, not query-hot, so it stays serial,
+            // off the rayon scan path.
+            let mismatch = jobs.iter().find_map(|job| {
                 if crc32c(&job.bytes) != job.expected {
                     Some(job.idx)
                 } else {
@@ -934,7 +937,7 @@ impl VectorReader {
                 let off = cluster_idx_off + cluster_idx_size;
                 // codec_meta must immediately precede the
                 // per-cluster blocks region by exactly its
-                // declared size. Any gap is a malformed segment.
+                // declared size. Any gap is a malformed superfile.
                 if off + codec_meta_size != per_cluster_blocks_off {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "column '{}' codec_meta region [{off}..{}) does not abut \
@@ -989,13 +992,16 @@ impl VectorReader {
                 if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
                     let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                     let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                    let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
-                        let norms_end = offset_end + (col_n_docs as usize) * 4;
-                        debug_assert_eq!(norms_end, actual_codec_meta_size);
-                        Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
-                    } else {
-                        None
-                    };
+                    let per_doc_norms: Option<Arc<[f32]>> =
+                        if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                            let norms_end = offset_end + (col_n_docs as usize) * 4;
+                            debug_assert_eq!(norms_end, actual_codec_meta_size);
+                            Some(Arc::from(parse_f32_le_vec(
+                                &meta_bytes[offset_end..norms_end],
+                            )))
+                        } else {
+                            None
+                        };
                     Some(Sq8ColumnMeta::Eager {
                         scale,
                         offset,
@@ -1090,7 +1096,7 @@ impl VectorReader {
     }
 
     /// Per-column summary centroid + radius, used by the storage plan
-    /// for cross-segment skip pruning.
+    /// for cross-superfile skip pruning.
     pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
@@ -1113,7 +1119,7 @@ impl VectorReader {
     /// The column's per-cluster IVF centroids (fp32, cluster-major,
     /// `n_cent * dim`) plus each cluster's indexed doc count. Returns
     /// `(n_cent, dim, centroids, counts)`. Used by the writer to stage
-    /// quantized cluster centroids into the manifest for cross-segment
+    /// quantized cluster centroids into the manifest for cross-superfile
     /// global cluster selection. `None` if the column is unknown or the
     /// centroid/cluster_idx bytes aren't resident.
     pub fn cluster_centroids(&self, column: &str) -> Option<(u32, u32, Vec<f32>, Vec<u32>)> {
@@ -1167,7 +1173,7 @@ impl VectorReader {
     /// sync and bridges to the underlying async
     /// `LazyByteSource::range` only on a cold `Source::Lazy`
     /// miss (via `block_in_place + Handle::block_on`, same
-    /// pattern as `supertable::query::segment_reader`). On
+    /// pattern as `supertable::query::superfile_reader`). On
     /// `Source::InMemory` and on `Source::Lazy` warm caches
     /// (`BytesLazyByteSource`, mmap-backed) every fetch resolves
     /// zero-copy on the sync fast path.
@@ -1189,7 +1195,7 @@ impl VectorReader {
     /// in-cluster index), so there is no `doc_to_pos` lookup
     /// table at all — that 4 MB / 1M-doc allocation was deleted
     /// once an audit confirmed zero external readers.
-    pub fn search(
+    pub async fn search(
         &self,
         column: &str,
         query: &[f32],
@@ -1275,11 +1281,11 @@ impl VectorReader {
         // pull the full rerank vectors ONLY for the survivors:
         //   * warm — the prefix is already resident (the sync probe
         //     above hits), and survivor rows are sliced from the
-        //     resident segment; zero GETs either wave.
+        //     resident superfile; zero GETs either wave.
         //   * cold — fetch the prefixes over the wire in one coalesced
         //     RTT batch, score, then fetch the survivor rows in a
         //     second small batch. The dominant per-candidate `full[]`
-        //     bytes (~3.4 MiB/segment — the volume that saturates S3
+        //     bytes (~3.4 MiB/superfile — the volume that saturates S3
         //     read throughput on a 256-way cold fan-out) are never
         //     moved for non-survivors.
         // The scoring math is identical to the old full-block path —
@@ -1326,7 +1332,9 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             k,
             rerank_mult,
-        ) {
+        )
+        .await
+        {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
                 candidates,
@@ -1360,6 +1368,7 @@ impl VectorReader {
             query,
             k,
         )
+        .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
@@ -1370,7 +1379,7 @@ impl VectorReader {
     /// region, per-cluster code prefixes + Sq8 meta, survivor rerank
     /// rows) are `await`ed on the caller's runtime instead of bridged
     /// through a per-call throwaway runtime. This is what lets the
-    /// supertable vector fan-out drive every segment concurrently on
+    /// supertable vector fan-out drive every superfile concurrently on
     /// the shared query runtime — mirroring the FTS
     /// `bm25_search_pretokenized` path — rather than serializing cold
     /// object-store GETs. The CPU steps (centroid/code scoring,
@@ -1424,8 +1433,8 @@ impl VectorReader {
     }
 
     /// Async IVF probe over an **externally chosen** set of cluster ids.
-    /// The cross-segment global selector picks these from the manifest's
-    /// per-cluster centroids, so this skips the segment's own centroid
+    /// The cross-superfile global selector picks these from the manifest's
+    /// per-cluster centroids, so this skips the superfile's own centroid
     /// scoring entirely — it fetches just the cluster index, then probes
     /// exactly `clusters` (ids ≥ `n_cent` and empty clusters are
     /// ignored). The shortlist + rerank are byte-for-byte the same as
@@ -1460,9 +1469,9 @@ impl VectorReader {
     /// Shared async tail of the IVF probe: given a chosen set of cluster
     /// ids plus the already-fetched cluster index, fetch each non-empty
     /// cluster's block, build the 1-bit shortlist, and rerank to top-k.
-    /// Used by [`Self::search_async`] (clusters from this segment's
+    /// Used by [`Self::search_async`] (clusters from this superfile's
     /// centroid scoring) and [`Self::search_clusters_async`] (clusters
-    /// from the global cross-segment selector).
+    /// from the global cross-superfile selector).
     async fn probe_clusters_async(
         &self,
         col: &ColumnReader,
@@ -1535,7 +1544,9 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             k,
             rerank_mult,
-        ) {
+        )
+        .await
+        {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
                 candidates,
@@ -1563,6 +1574,7 @@ impl VectorReader {
             query,
             k,
         )
+        .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
@@ -1744,7 +1756,7 @@ enum ShortlistOutcome {
 /// keeps `search` / `search_async` down to their fetch waves around a
 /// single shared kernel, so the two can't drift in scoring/recall.
 #[allow(clippy::too_many_arguments)]
-fn build_shortlist(
+async fn build_shortlist(
     col: &ColumnReader,
     q_rot: &[f32],
     cb: usize,
@@ -1790,23 +1802,46 @@ fn build_shortlist(
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-        cluster_meta
-            .par_iter()
-            .zip(cluster_blocks.par_iter())
-            .fold(
-                || BoundedCoarseHeap::new(coarse_limit),
-                |mut heap, item| {
-                    score_block(&mut heap, item);
+        // Parallelize the coarse 1-bit scan across the global rayon pool,
+        // bridged back via a oneshot so no tokio worker blocks under the
+        // compute. Cluster scoring is order-independent — every survivor
+        // is re-sorted below — so chunked-parallel and serial shortlists
+        // rank identically. Partial heaps merge after.
+        let n_tasks = parallel_chunks(cluster_meta.len());
+        let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
+        let quant = col.quant.clone();
+        let q_rot_v: Vec<f32> = q_rot.to_vec();
+        let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
+        let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rayon::spawn(move || {
+            let acc = meta_owned
+                .par_chunks(chunk)
+                .zip(blocks_owned.par_chunks(chunk))
+                .map(|(meta_chunk, block_chunk)| {
+                    let mut heap = BoundedCoarseHeap::new(coarse_limit);
+                    for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
+                        let codes_len = (cnt as usize) * cb;
+                        let doc_ids_len = (cnt as usize) * 4;
+                        let codes = block.slice(0..codes_len);
+                        let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+                        score_cluster_codes_into_heap(
+                            &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot_v, &mut heap,
+                        );
+                    }
                     heap
-                },
-            )
-            .reduce(
-                || BoundedCoarseHeap::new(coarse_limit),
-                |mut left, right| {
-                    left.merge(right);
-                    left
-                },
-            )
+                })
+                .reduce(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut a, b| {
+                        a.merge(b);
+                        a
+                    },
+                );
+            let _ = tx.send(acc);
+        });
+        rx.await
+            .expect("vector shortlist rayon task dropped result")
     } else {
         let mut heap = BoundedCoarseHeap::new(coarse_limit);
         for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
@@ -1922,8 +1957,41 @@ fn score_centroids(
 /// scan. Below this the fixed rayon dispatch cost outweighs the
 /// multicore speedup, so small queries — notably the 1M single-
 /// superfile nprobe=1 hot path — stay serial, while the 10M
-/// supertable's `nprobe × segments` fan-out goes parallel.
+/// supertable's `nprobe × superfiles` fan-out goes parallel.
 const PARALLEL_SCAN_MIN: usize = 2048;
+
+/// Number of chunks to split a parallel rayon scan into — the machine's
+/// logical parallelism, capped by the item count so we never make more
+/// chunks than there is work.
+fn parallel_chunks(n_items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n_items)
+        .max(1)
+}
+
+/// Map `f` over `items` on the global rayon pool, preserving input
+/// order. The order-independent vector scans (rerank) use this; the
+/// compute runs on rayon (`par_iter().map().collect()`) bridged back to
+/// the async caller via a oneshot, so no tokio worker blocks under it.
+/// `f` and the items must be `'static` so the work can move onto rayon.
+async fn par_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+where
+    T: Send + Sync + 'static,
+    R: Send + 'static,
+    F: Fn(&T) -> R + Send + Sync + 'static,
+{
+    if parallel_chunks(items.len()) <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rayon::spawn(move || {
+        let out: Vec<R> = items.par_iter().map(f).collect();
+        let _ = tx.send(out);
+    });
+    rx.await.expect("rerank rayon task dropped result")
+}
 
 #[inline]
 fn score_cluster_codes_into_heap(
@@ -2111,8 +2179,7 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 ///   per-doc inner step is a plain u8→f32 widen + SIMD dot;
 ///   per-doc decoded-norm cached at encode time short-circuits
 ///   `Σx²` for L2Sq).
-#[inline]
-fn rerank_candidates_from_blocks(
+async fn rerank_candidates_from_blocks(
     source: &Source,
     lazy_sq8_meta_bytes: Option<&Bytes>,
     cluster_blocks: &[Bytes],
@@ -2126,22 +2193,39 @@ fn rerank_candidates_from_blocks(
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
             // Exact fp32 rerank — every survivor is independent, so the
-            // gather + SIMD distance runs in parallel once the shortlist
-            // is large enough to amortize the rayon hand-off (high
-            // rerank_mult on the supertable fan-out). The output is
-            // sorted by distance below, so parallel and serial rank
-            // identically.
-            let rerank_one = |cand: &RerankCandidate| {
-                let bytes = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
-                (
-                    cand.did,
-                    distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
-                )
-            };
+            // gather + SIMD distance runs in parallel across the rayon
+            // pool once the shortlist is large enough to amortize the
+            // hand-off. The output is sorted by distance below, so
+            // parallel and serial rank identically.
             if candidates.len() >= PARALLEL_SCAN_MIN {
-                candidates.par_iter().map(rerank_one).collect()
+                let metric = col.metric;
+                let codec = col.rerank_codec;
+                let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
+                let survivors: Option<Arc<Vec<Bytes>>> =
+                    survivor_full_rows.map(|s| Arc::new(s.to_vec()));
+                let query: Arc<Vec<f32>> = Arc::new(query.to_vec());
+                par_map(candidates.to_vec(), move |cand: &RerankCandidate| {
+                    let bytes = candidate_full_bytes(
+                        &blocks,
+                        survivors.as_deref().map(|s| s.as_slice()),
+                        cand,
+                        stride,
+                    );
+                    (cand.did, distance_bytes_codec(metric, codec, &query, bytes))
+                })
+                .await
             } else {
-                candidates.iter().map(rerank_one).collect()
+                candidates
+                    .iter()
+                    .map(|cand| {
+                        let bytes =
+                            candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+                        (
+                            cand.did,
+                            distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
+                        )
+                    })
+                    .collect()
             }
         }
         RerankCodec::Sq8Residual => {
@@ -2158,18 +2242,21 @@ fn rerank_candidates_from_blocks(
                     scale,
                     offset,
                     per_doc_norms,
-                } => sq8_score_and_refine(
-                    candidates,
-                    cluster_blocks,
-                    survivor_full_rows,
-                    col,
-                    query,
-                    scale,
-                    offset,
-                    per_doc_norms.as_deref(),
-                    k,
-                    stride,
-                ),
+                } => {
+                    sq8_score_and_refine(
+                        candidates,
+                        cluster_blocks,
+                        survivor_full_rows,
+                        col,
+                        query,
+                        scale,
+                        offset,
+                        per_doc_norms.clone(),
+                        k,
+                        stride,
+                    )
+                    .await
+                }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
                     offset_abs_off,
@@ -2193,10 +2280,11 @@ fn rerank_candidates_from_blocks(
                             query,
                             parsed.scale.as_slice(),
                             parsed.offset.as_slice(),
-                            parsed.per_doc_norms.as_deref(),
+                            parsed.per_doc_norms.clone(),
                             k,
                             stride,
-                        ));
+                        )
+                        .await);
                     }
                     let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
                     clusters.sort_unstable();
@@ -2350,7 +2438,7 @@ fn rerank_candidates_from_blocks(
 ///
 /// Both code paths keep their own data-access strategy (eager mmap vs
 /// lazy range GETs); only the scoring math is shared here.
-fn sq8_score_and_refine(
+async fn sq8_score_and_refine(
     candidates: &[RerankCandidate],
     cluster_blocks: &[Bytes],
     survivor_full_rows: Option<&[Bytes]>,
@@ -2358,7 +2446,7 @@ fn sq8_score_and_refine(
     query: &[f32],
     scale: &[f32],
     offset: &[f32],
-    per_doc_norms: Option<&[f32]>,
+    per_doc_norms: Option<Arc<[f32]>>,
     k: usize,
     stride: usize,
 ) -> Vec<(u32, f32)> {
@@ -2374,7 +2462,7 @@ fn sq8_score_and_refine(
             let offset_c = &offset[c * dim..(c + 1) * dim];
             (
                 cid,
-                Sq8Kernel::new(col.metric, query, scale_c, offset_c, per_doc_norms),
+                Sq8Kernel::new(col.metric, query, scale_c, offset_c, per_doc_norms.clone()),
             )
         })
         .collect();
@@ -2393,7 +2481,34 @@ fn sq8_score_and_refine(
         )
     };
     let scored: Vec<(u32, f32, usize, u32, u32)> = if candidates.len() >= PARALLEL_SCAN_MIN {
-        candidates.par_iter().enumerate().map(score_one).collect()
+        // Order-independent first-pass Sq8 scoring across the rayon
+        // pool. Kernels are `'static` (norms shared by `Arc`), so each
+        // chunk runs on a rayon worker with no copy.
+        let kernels = Arc::new(kernels);
+        let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
+        let survivors: Option<Arc<Vec<Bytes>>> = survivor_full_rows.map(|s| Arc::new(s.to_vec()));
+        let items: Vec<(usize, RerankCandidate)> = candidates.iter().cloned().enumerate().collect();
+        par_map(items, move |item: &(usize, RerankCandidate)| {
+            let (i, cand) = (item.0, &item.1);
+            let row = candidate_full_bytes(
+                &blocks,
+                survivors.as_deref().map(|s| s.as_slice()),
+                cand,
+                stride,
+            );
+            let code = &row[..dim];
+            let kernel = kernels
+                .get(&cand.cluster_id)
+                .expect("kernel prebuilt for every probed cluster");
+            (
+                cand.did,
+                kernel.distance_at(cand.pos, code),
+                i,
+                cand.pos,
+                cand.cluster_id,
+            )
+        })
+        .await
     } else {
         candidates.iter().enumerate().map(score_one).collect()
     };
@@ -2413,7 +2528,7 @@ fn sq8_score_and_refine(
                 &scale[c * dim..(c + 1) * dim],
                 &offset[c * dim..(c + 1) * dim],
                 SQ8_RESIDUAL_DIVISOR,
-                per_doc_norms,
+                per_doc_norms.as_deref(),
             )
         },
     )
@@ -2471,7 +2586,7 @@ fn parse_sq8_meta_bytes(
     let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
     let per_doc_norms = has_norms.then(|| {
         let norms_end = offset_end + n_docs * 4;
-        parse_f32_le_vec(&bytes[offset_end..norms_end])
+        Arc::from(parse_f32_le_vec(&bytes[offset_end..norms_end]))
     });
     Sq8ParsedMeta {
         scale,
@@ -2840,6 +2955,7 @@ mod tests {
         let target = 17;
         let hits = r
             .search("embedding", &all_vecs[target], 5, 4, 5)
+            .await
             .expect("FTS search");
         assert!(!hits.is_empty(), "search should return hits");
         assert_eq!(hits[0].0, target as u32, "self should be nearest");
@@ -2856,6 +2972,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
             .search("nonexistent", &[0.0; 16], 5, 4, 5)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, VectorError::UnknownColumn(_)));
     }
@@ -2866,6 +2983,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
             .search("embedding", &[0.0; 8], 5, 4, 5)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, VectorError::DimensionMismatch { .. }));
     }
@@ -2876,6 +2994,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let hits = r
             .search("embedding", &[0.0; 16], 0, 4, 5)
+            .await
             .expect("FTS search");
         assert!(hits.is_empty());
     }
@@ -2885,7 +3004,10 @@ mod tests {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let q = vec![0.5; 16];
-        let hits = r.search("embedding", &q, 10, 4, 5).expect("FTS search");
+        let hits = r
+            .search("embedding", &q, 10, 4, 5)
+            .await
+            .expect("FTS search");
         for w in hits.windows(2) {
             assert!(w[0].1 <= w[1].1, "distances should be ascending");
         }
@@ -2910,7 +3032,7 @@ mod tests {
         // orders.)
         use std::collections::HashSet;
         let (blob, json, all) =
-            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let q = &all[0];
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
@@ -3047,9 +3169,9 @@ mod tests {
     // The codec discriminator rides as byte 52 of the per-column
     // directory entry; the codec_meta region offset rides as bytes
     // 12..16 of the sub-header. Both are zero on older fp32
-    // segments. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
+    // superfiles. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
     // must still round-trip as a typed `MalformedVersion` at open
-    // time so a future segment built by a newer binary fails loud
+    // time so a future superfile built by a newer binary fails loud
     // against an older binary rather than mis-decoding.
 
     use crate::superfile::format::checksum::crc32c;
@@ -3071,7 +3193,7 @@ mod tests {
         );
         assert_eq!(
             r.columns[0].codec_meta_off, 0,
-            "Fp32 segments must write codec_meta_off = 0 (zero-size region)"
+            "Fp32 superfiles must write codec_meta_off = 0 (zero-size region)"
         );
     }
 
@@ -3260,6 +3382,7 @@ mod tests {
         assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
         let hits = r
             .search("v", &all[42], 5, n_cent, 20)
+            .await
             .expect("search must succeed on Sq8Residual cosine column");
         assert_eq!(
             hits[0].0, 42,
@@ -3443,6 +3566,7 @@ mod tests {
             // norms-indexing bug, not a Hamming-recall artifact.
             let hits = r
                 .search("v", &planted[i as usize], 1, 4, 64)
+                .await
                 .expect("self-query");
             assert_eq!(hits[0].0, i, "self-query top-1 doc_id for doc {i}");
             // Quantization noise bound: per-dim error ≤ scale/2
@@ -3500,6 +3624,7 @@ mod tests {
         // the 1-bit shortlist's recall ceiling.
         let hits = r
             .search("v", &all[17], 5, 4, 20)
+            .await
             .expect("search must succeed on Sq8 column");
         assert_eq!(hits[0].0, 17, "Sq8 self-query must recover self at top-1");
         // Sq8 round-trip error: per-dim quantization step is
@@ -3575,6 +3700,7 @@ mod tests {
         // 1-bit shortlist recall.
         let hits = r
             .search("v", &all[42], 5, 4, 20)
+            .await
             .expect("search must succeed on Sq8 cosine column");
         assert_eq!(hits[0].0, 42, "Sq8 cosine self-query must recover self");
     }
@@ -3585,13 +3711,13 @@ mod tests {
     //
     // The `None` codec drops the `full[]` region entirely. The
     // 1-bit shortlist *is* the final ranking; the on-disk
-    // segment shrinks by ~30× at 1M × 384. Distance values
+    // superfile shrinks by ~30× at 1M × 384. Distance values
     // returned from `search()` are `-estimate` (1-bit dot
     // estimate, sign-flipped so smaller = closer holds) — not a
     // true metric distance.
 
     /// building with `RerankCodec::RabitqOnly` succeeds
-    /// and the on-disk segment carries a zero-length `full[]`
+    /// and the on-disk superfile carries a zero-length `full[]`
     /// region. Also pins the directory-entry discriminator
     /// (`codec_id = 3`) and the zero-byte codec_meta invariant
     /// (`codec_meta_off = 0`).
@@ -3628,9 +3754,9 @@ mod tests {
         );
         assert_eq!(
             col.codec_meta_off, 0,
-            "None segments must write codec_meta_off = 0 (zero-byte meta region)"
+            "None superfiles must write codec_meta_off = 0 (zero-byte meta region)"
         );
-        // `None` segments have zero-length full[] (per_vec_bytes
+        // `None` superfiles have zero-length full[] (per_vec_bytes
         // = 0), so each per-cluster block is just
         // `[codes][doc_ids]` — the blocks region is exactly
         // `n_docs × (code_bytes + 4)` with no full bytes.
@@ -3639,7 +3765,7 @@ mod tests {
         assert_eq!(
             region_size,
             (n_docs as usize) * (cb + 4),
-            "None segments interleave no full[] bytes — blocks region is \
+            "None superfiles interleave no full[] bytes — blocks region is \
              exactly n_docs × (code_bytes + 4)"
         );
         assert_eq!(col.n_docs, n_docs);
@@ -3701,6 +3827,7 @@ mod tests {
         // here by passing a value that would otherwise oversample).
         let hits = r
             .search("v", &all[17], 5, n_cent, 5)
+            .await
             .expect("None-codec search must succeed");
         assert!(
             !hits.is_empty(),
@@ -3776,7 +3903,7 @@ mod tests {
         async_calls.store(0, AtomicOrdering::Relaxed);
         sync_calls.store(0, AtomicOrdering::Relaxed);
         let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
-        let _ = r.search("v", &query, 5, n_cent, 5).expect("search");
+        let _ = r.search("v", &query, 5, n_cent, 5).await.expect("search");
 
         // Upper-bound sync fetches for None / nprobe = n_cent:
         //   centroids (1) + cluster_idx (1)
@@ -3817,11 +3944,11 @@ mod tests {
 
     /// a directory entry carrying an unknown codec id
     /// (anything outside `0..=3` — e.g. `255` from a corrupted /
-    /// future-format segment) errors as `MalformedVersion`. The
+    /// future-format superfile) errors as `MalformedVersion`. The
     /// safety net catches both forward-compat reads (future codec
     /// ids land in the gap) and on-disk corruption.
     #[test]
-    fn open_rejects_segment_with_unknown_codec_id() {
+    fn open_rejects_superfile_with_unknown_codec_id() {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
         let mut bytes = blob.to_vec();
 
@@ -3974,7 +4101,7 @@ mod tests {
             (255.0 * mean_intra / mean_g_range).round() as i32
         );
 
-        // 3. Build Fp32 + Sq8 segments from the same corpus.
+        // 3. Build Fp32 + Sq8 superfiles from the same corpus.
         let build = |codec: RerankCodec| -> Bytes {
             let mut b = VectorBuilder::new();
             b.register_column(VectorConfig {
@@ -3994,7 +4121,7 @@ mod tests {
         let fp32_blob = build(RerankCodec::Fp32);
         let sq8_blob = build(RerankCodec::Sq8Residual);
         eprintln!(
-            "--- segment sizes ---\n\
+            "--- superfile sizes ---\n\
              fp32: {:.2} MiB (1.00x)\n\
              sq8:  {:.2} MiB ({:.2}x)",
             fp32_blob.len() as f64 / 1024.0 / 1024.0,
@@ -4039,6 +4166,7 @@ mod tests {
             for qi in 0..n_queries {
                 let hits = reader
                     .search("v", &all[qi], k, nprobe, rerank_mult)
+                    .await
                     .expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
@@ -4061,7 +4189,10 @@ mod tests {
         for &rm in &[20usize, 50, 100, 200, 400] {
             let mut tm = 0usize;
             for qi in 0..n_queries {
-                let hits = r_sq8.search("v", &all[qi], k, nprobe, rm).expect("search");
+                let hits = r_sq8
+                    .search("v", &all[qi], k, nprobe, rm)
+                    .await
+                    .expect("search");
                 let hit_ids: std::collections::HashSet<u32> =
                     hits.into_iter().map(|(id, _)| id).collect();
                 tm += ground_truth[qi]
@@ -4145,6 +4276,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("embedding", &all[17], 5, 4, 5)
+            .await
             .expect("search must succeed on lazy InMemory");
         assert_eq!(hits[0].0, 17, "self-query must recover self");
     }
@@ -4161,7 +4293,7 @@ mod tests {
     // bridges to the source's async `range()` via
     // `block_in_place + Handle::block_on` / one-shot
     // `current_thread` `Runtime`, the same pattern
-    // `supertable::query::segment_reader` uses for the disk-cache
+    // `supertable::query::superfile_reader` uses for the disk-cache
     // fetch path. No `search_async` is exposed at the public
     // surface; the cold-path async bridging is hidden inside
     // `Source::get_range`.
@@ -4343,9 +4475,11 @@ mod tests {
         for &q_idx in &[0usize, 17, 31, 63] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("Lazy(warm) search");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -4386,9 +4520,11 @@ mod tests {
         for &q_idx in &[0usize, 17, 31, 63] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("sync search must succeed via block_on bridge");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -4455,6 +4591,7 @@ mod tests {
         counting.disable_sync();
         let hits = r
             .search("embedding", &all[7], 5, 4, 5)
+            .await
             .expect("sync search via block_on bridge");
         assert!(!hits.is_empty(), "search should return hits");
 
@@ -4488,9 +4625,11 @@ mod tests {
         for &q_idx in &[3usize, 19, 47] {
             let hits_mem = r_mem
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("InMemory search");
             let hits_lazy = r_lazy
                 .search("embedding", &all[q_idx], 5, 4, 5)
+                .await
                 .expect("BytesLazyByteSource sync search");
             assert_eq!(
                 hits_mem, hits_lazy,
@@ -4504,7 +4643,7 @@ mod tests {
     // -----------------------------------------------------------------
     //
     // The headline guarantee is "resident set per open
-    // vector segment is bounded by O(n_cent × dim × 4 + small)",
+    // vector superfile is bounded by O(n_cent × dim × 4 + small)",
     // independent of `n_docs`. Acceptance criterion #2 spells it
     // out: opening a `Source::Lazy` over a mmap-backed
     // `BytesLazyByteSource` at 1M × 384 with
@@ -4738,21 +4877,21 @@ mod tests {
     // — supertable-scale memory ceiling
     // -----------------------------------------------------------------
     //
-    // The single-segment `mem_ceiling_lazy_open_*` tests above pin the
-    // per-reader bound. These multi-segment variants pin the
-    // *supertable-shaped* bound: open N segments concurrently — same
-    // shape `Supertable::commit` produces (N = N_SEGMENTS_BENCH × num_cpus
+    // The single-superfile `mem_ceiling_lazy_open_*` tests above pin the
+    // per-reader bound. These multi-superfile variants pin the
+    // *supertable-shaped* bound: open N superfiles concurrently — same
+    // shape `Supertable::commit` produces (N = N_SUPERFILES_BENCH × num_cpus
     // because `split_buffer_into_row_shards` shards each commit's
-    // buffer into one segment per writer-pool thread) — and assert the
+    // buffer into one superfile per writer-pool thread) — and assert the
     // total anon RSS delta scales as `N × O(centroids + rotation +
     // small)`, not as `N × subsection_size`.
     //
     // What this proves (and what it doesn't):
     //
     // - PROVES: a supertable opened with the production disk-cache
-    //   path (`Source::InMemory(Bytes::from_owner(mmap))` per segment —
+    //   path (`Source::InMemory(Bytes::from_owner(mmap))` per superfile —
     //   see `supertable::reader_cache::disk::insert`) keeps anon
-    //   RSS bounded across an arbitrary number of segments, with no
+    //   RSS bounded across an arbitrary number of superfiles, with no
     //   per-doc anon term. Equivalent here because
     //   `Bytes::from_owner` is zero-copy over the mmap, and the
     //   lazy-open path doesn't touch `doc_ids[]` / `full[]` at
@@ -4760,9 +4899,9 @@ mod tests {
     //   open ever touched `doc_ids[]`).
     //
     // - DOES NOT PROVE: the in-process `InMemoryReaderCache` path
-    //   (`Bytes::from(Vec)` per segment — see
+    //   (`Bytes::from(Vec)` per superfile — see
     //   `supertable::reader_cache::in_memory::insert`) has the same
-    //   bound. That path holds each segment's bytes in anon by
+    //   bound. That path holds each superfile's bytes in anon by
     //   construction (no mmap involved). The in-memory cache is the
     //   test/bench path; production attaches a `StorageProvider` and
     //   routes through the disk cache. A separate test for the
@@ -4771,29 +4910,29 @@ mod tests {
     //
     // The bench's 10M × 4-commit × num_cpus-thread shape produces
     // exactly the topology these tests exercise. The smoke variant
-    // mirrors the bench's *layout* at a tiny corpus size (4 segments
+    // mirrors the bench's *layout* at a tiny corpus size (4 superfiles
     // × 50 k docs × 64 dim) so every PR catches regressions
     // (~5 s build). The `#[ignore]`'d plan-spec variant uses the
-    // bench's actual per-segment shape (16 segments × 625 k docs ×
-    // 384 dim × n_cent_per_segment matching the bench's
+    // bench's actual per-superfile shape (16 superfiles × 625 k docs ×
+    // 384 dim × n_cent_per_superfile matching the bench's
     // `n_cent_total / 4`) and runs only when called out.
 
-    /// Open `N` segment files (built by `build_corpus_to_file`) via
+    /// Open `N` superfile files (built by `build_corpus_to_file`) via
     /// `Source::Lazy(BytesLazyByteSource over Arc<Mmap>)` and return
     /// the total RSS delta attributable to those opens. Anchors
     /// `(readers, mmaps)` past the after-RSS read.
-    fn measure_lazy_multi_segment_open_rss_delta(
+    fn measure_lazy_multi_superfile_open_rss_delta(
         corpus_paths: &[std::path::PathBuf],
         jsons: &[String],
     ) -> (usize, usize, usize) {
         assert_eq!(corpus_paths.len(), jsons.len(), "paths/jsons must align");
-        let n_segments = corpus_paths.len();
+        let n_superfiles = corpus_paths.len();
 
         // Pre-build (mmap, lazy source) pairs *before* the `before`
         // snapshot so the syscalls don't contaminate the delta — we
         // only want the open path's allocations in the measurement.
         let mut lazies: Vec<(StdArc<memmap2::Mmap>, StdArc<dyn LazyByteSource>)> =
-            Vec::with_capacity(n_segments);
+            Vec::with_capacity(n_superfiles);
         for path in corpus_paths {
             let file = std::fs::File::open(path).expect("reopen corpus readonly");
             let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
@@ -4807,7 +4946,7 @@ mod tests {
             .expect("memory_stats supported")
             .physical_mem;
 
-        let mut readers: Vec<VectorReader> = Vec::with_capacity(n_segments);
+        let mut readers: Vec<VectorReader> = Vec::with_capacity(n_superfiles);
         let mut n_cols_total = 0usize;
         for ((_, lazy), json) in lazies.iter().zip(jsons.iter()) {
             let reader = VectorReader::open_with_source(
@@ -4833,35 +4972,35 @@ mod tests {
         drop(readers);
         drop(lazies);
 
-        (delta, n_cols_total, n_segments)
+        (delta, n_cols_total, n_superfiles)
     }
 
     /// **supertable-scale memory ceiling (smoke).**
     ///
     /// Mirrors the bench's 4-commit × num_cpus-thread shape at a
-    /// tiny corpus size. Builds 4 segment files (each 50 k × 64
+    /// tiny corpus size. Builds 4 superfile files (each 50 k × 64
     /// dim × n_cent=64 — same shape as
     /// `mem_ceiling_lazy_open_smoke`), opens all 4 lazy, and
     /// asserts the total anon RSS delta is ≤ 10 MiB. With
-    /// per-segment ceiling of 10 MiB / column from the single-
-    /// segment smoke and a 4× multiplier in the worst case
-    /// (centroids + rotation matrix per segment), 10 MiB total
+    /// per-superfile ceiling of 10 MiB / column from the single-
+    /// superfile smoke and a 4× multiplier in the worst case
+    /// (centroids + rotation matrix per superfile), 10 MiB total
     /// gives plenty of headroom while still failing loud if a
-    /// regression makes per-segment opens allocate per-doc.
+    /// regression makes per-superfile opens allocate per-doc.
     ///
     /// Runs in the default `cargo test --lib` suite (~3–5 s
     /// total) so every PR validates the supertable-shape bound.
     #[test]
-    fn mem_ceiling_lazy_multi_segment_open_smoke() {
-        const N_SEGMENTS: usize = 4;
+    fn mem_ceiling_lazy_multi_superfile_open_smoke() {
+        const N_SUPERFILES: usize = 4;
         const N_DOCS_PER_SEG: u32 = 50_000;
         const DIM: usize = 64;
         const N_CENT: usize = 64;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
-        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
-        for _ in 0..N_SEGMENTS {
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
+        for _ in 0..N_SUPERFILES {
             let tmp = tempfile::NamedTempFile::new().expect("tempfile");
             let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT);
             paths.push(tmp.path().to_path_buf());
@@ -4869,21 +5008,21 @@ mod tests {
             tmps.push(tmp); // keep the tempfile alive until end
         }
 
-        let (delta_bytes, n_cols_total, n_segments) =
-            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let (delta_bytes, n_cols_total, n_superfiles) =
+            measure_lazy_multi_superfile_open_rss_delta(&paths, &jsons);
         let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
-        let per_seg_mib = delta_mib / n_segments as f64;
+        let per_seg_mib = delta_mib / n_superfiles as f64;
 
         eprintln!(
-            "mem_ceiling_lazy_multi_segment_open_smoke ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
-             {DIM}, n_cent={N_CENT}): RSS delta = {delta_mib:.3} MiB over {n_segments} \
-             segment(s) ({n_cols_total} column(s) total) = {per_seg_mib:.3} MiB/segment"
+            "mem_ceiling_lazy_multi_superfile_open_smoke ({N_SUPERFILES} × {N_DOCS_PER_SEG} × \
+             {DIM}, n_cent={N_CENT}): RSS delta = {delta_mib:.3} MiB over {n_superfiles} \
+             superfile(s) ({n_cols_total} column(s) total) = {per_seg_mib:.3} MiB/superfile"
         );
 
         assert!(
             delta_mib <= 10.0,
             "supertable-shape lazy open RSS delta {delta_mib:.3} MiB exceeds 10 MiB ceiling \
-             at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM} — regression hint: each segment may \
+             at {N_SUPERFILES} × {N_DOCS_PER_SEG} × {DIM} — regression hint: each superfile may \
              be touching its doc_ids/full[]/codes region at open"
         );
 
@@ -4893,10 +5032,10 @@ mod tests {
     /// **supertable-scale memory ceiling (plan-spec).**
     ///
     /// Mirrors the bench's actual 10M × 4-commit ×
-    /// 4-thread-writer-pool topology: 16 segments × 625 k docs ×
-    /// 384 dim × `n_cent_per_segment = n_cent(10M) / 4` (the
+    /// 4-thread-writer-pool topology: 16 superfiles × 625 k docs ×
+    /// 384 dim × `n_cent_per_superfile = n_cent(10M) / 4` (the
     /// bench's `corpus::n_cent(10M)` returns 1024, so this is
-    /// 256). Each segment file is ~960 MiB on disk; the test
+    /// 256). Each superfile file is ~960 MiB on disk; the test
     /// writes ~15 GiB total to the tempdir. Build time is
     /// dominated by the 16 sequential streaming builds at
     /// ~10 s each in release ≈ 3 min total.
@@ -4908,15 +5047,15 @@ mod tests {
     ///     mem_ceiling_lazy_supertable_scale_under_50mib -- --ignored --nocapture
     /// ```
     ///
-    /// Bound: 50 MiB total anon over the 16 segments. The
-    /// per-segment open materialises:
+    /// Bound: 50 MiB total anon over the 16 superfiles. The
+    /// per-superfile open materialises:
     /// - rotation matrix: `dim² × 4 = 576 KiB` at dim=384
     /// - centroids buffer (in lazy source page cache, not anon):
     ///   `n_cent × dim × 4 = 384 KiB` at the smoke shape
     /// - per-column header / cluster_idx slices (KiB-range)
     ///
     /// Add a 2× safety margin for allocator overhead +
-    /// reader-struct fields, multiply by 16 segments → ~20 MiB
+    /// reader-struct fields, multiply by 16 superfiles → ~20 MiB
     /// theoretical, 50 MiB ceiling for headroom. A regression
     /// that re-introduces eager subsection materialisation
     /// would blow this to ~15 GiB (the full corpus) and fail
@@ -4924,18 +5063,18 @@ mod tests {
     #[test]
     #[ignore]
     fn mem_ceiling_lazy_supertable_scale_under_50mib() {
-        const N_SEGMENTS: usize = 16;
+        const N_SUPERFILES: usize = 16;
         const N_DOCS_PER_SEG: u32 = 625_000;
         const DIM: usize = 384;
         const N_CENT_PER_SEG: usize = 256;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
-        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
-        for i in 0..N_SEGMENTS {
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
+        for i in 0..N_SUPERFILES {
             let tmp = tempfile::NamedTempFile::new().expect("tempfile");
             eprintln!(
-                "  building segment {i:2}/{N_SEGMENTS} \
+                "  building superfile {i:2}/{N_SUPERFILES} \
                  ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
             );
             let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT_PER_SEG);
@@ -4944,58 +5083,58 @@ mod tests {
             tmps.push(tmp);
         }
 
-        let (delta_bytes, n_cols_total, n_segments) =
-            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let (delta_bytes, n_cols_total, n_superfiles) =
+            measure_lazy_multi_superfile_open_rss_delta(&paths, &jsons);
         let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
-        let per_seg_mib = delta_mib / n_segments as f64;
+        let per_seg_mib = delta_mib / n_superfiles as f64;
 
         eprintln!(
-            "mem_ceiling_lazy_supertable_scale_under_50mib ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+            "mem_ceiling_lazy_supertable_scale_under_50mib ({N_SUPERFILES} × {N_DOCS_PER_SEG} × \
              {DIM}, n_cent={N_CENT_PER_SEG}): RSS delta = {delta_mib:.3} MiB over \
-             {n_segments} segment(s) ({n_cols_total} column(s) total) = \
-             {per_seg_mib:.3} MiB/segment"
+             {n_superfiles} superfile(s) ({n_cols_total} column(s) total) = \
+             {per_seg_mib:.3} MiB/superfile"
         );
 
         assert!(
             delta_mib <= 50.0,
             "supertable-scale (10M-bench shape) lazy open RSS delta {delta_mib:.3} MiB \
-             exceeds 50 MiB ceiling at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. \
+             exceeds 50 MiB ceiling at {N_SUPERFILES} × {N_DOCS_PER_SEG} × {DIM}. \
              Eager re-introduction would push this past 15 GiB."
         );
 
         drop(tmps);
     }
 
-    /// **many-segments stress test (100M
+    /// **many-superfiles stress test (100M
     /// aspiration shape).**
     ///
     /// The honest scale test for "100M docs across a supertable"
-    /// can't materialise 100M production-shape segments on a
-    /// developer box (the per-segment 625k × 384 shape used in
-    /// the bench produces ~960 MiB on disk × 160 segments = 150
+    /// can't materialise 100M production-shape superfiles on a
+    /// developer box (the per-superfile 625k × 384 shape used in
+    /// the bench produces ~960 MiB on disk × 160 superfiles = 150
     /// GiB of corpus). Instead, this test pins the *structural*
-    /// memory bound by varying the high-cardinality axis (segment
-    /// count) at a thin per-segment shape: **100 segments × 50 k
+    /// memory bound by varying the high-cardinality axis (superfile
+    /// count) at a thin per-superfile shape: **100 superfiles × 50 k
     /// docs × 128 dim × 128 n_cent**.
     ///
     /// What this proves:
     ///
-    /// - Per-segment open allocation is `O(n_cent × dim × 4 +
+    /// - Per-superfile open allocation is `O(n_cent × dim × 4 +
     ///   rotation + small)` — no `n_docs` term. At this shape:
     ///   centroids 64 KiB + rotation matrix 64 KiB + column
-    ///   metadata ≪ 1 MiB per segment. Total expected RSS delta
-    ///   ≪ 200 MiB across 100 segments; 400 MiB ceiling for
+    ///   metadata ≪ 1 MiB per superfile. Total expected RSS delta
+    ///   ≪ 200 MiB across 100 superfiles; 400 MiB ceiling for
     ///   allocator overhead + reader-struct fields.
     ///
-    /// - The deletion of `doc_to_pos` made segment-count
+    /// - The deletion of `doc_to_pos` made superfile-count
     ///   the only scaling dimension. A regression that reintroduced
     ///   any per-doc resident state — e.g. a returning lookup
     ///   table at `n_docs × 4` bytes per column — would here
     ///   allocate 100 × 50 k × 4 = 20 MiB anon just for tables
-    ///   (small but growing); at the bench's 100 segments × 625 k
+    ///   (small but growing); at the bench's 100 superfiles × 625 k
     ///   the same regression is 250 MiB.
     ///
-    /// Each segment file is ~25 MiB on disk; the test writes
+    /// Each superfile file is ~25 MiB on disk; the test writes
     /// ~2.5 GiB total to the tempdir. Build time is dominated by
     /// the 100 sequential streaming builds (~1.5 s each in
     /// release ≈ 2.5 min total).
@@ -5004,24 +5143,24 @@ mod tests {
     ///
     /// ```bash
     /// cargo test --release -p infino --lib \
-    ///     mem_ceiling_lazy_many_segments_under_400mib -- --ignored --nocapture
+    ///     mem_ceiling_lazy_many_superfiles_under_400mib -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore]
-    fn mem_ceiling_lazy_many_segments_under_400mib() {
-        const N_SEGMENTS: usize = 100;
+    fn mem_ceiling_lazy_many_superfiles_under_400mib() {
+        const N_SUPERFILES: usize = 100;
         const N_DOCS_PER_SEG: u32 = 50_000;
         const DIM: usize = 128;
         const N_CENT_PER_SEG: usize = 128;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SEGMENTS);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SEGMENTS);
-        let mut jsons: Vec<String> = Vec::with_capacity(N_SEGMENTS);
-        for i in 0..N_SEGMENTS {
+        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
+        for i in 0..N_SUPERFILES {
             let tmp = tempfile::NamedTempFile::new().expect("tempfile");
             if i % 10 == 0 {
                 eprintln!(
-                    "  building segment {i:3}/{N_SEGMENTS} \
+                    "  building superfile {i:3}/{N_SUPERFILES} \
                      ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
                 );
             }
@@ -5031,22 +5170,22 @@ mod tests {
             tmps.push(tmp);
         }
 
-        let (delta_bytes, n_cols_total, n_segments) =
-            measure_lazy_multi_segment_open_rss_delta(&paths, &jsons);
+        let (delta_bytes, n_cols_total, n_superfiles) =
+            measure_lazy_multi_superfile_open_rss_delta(&paths, &jsons);
         let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
-        let per_seg_mib = delta_mib / n_segments as f64;
+        let per_seg_mib = delta_mib / n_superfiles as f64;
 
         eprintln!(
-            "mem_ceiling_lazy_many_segments_under_400mib ({N_SEGMENTS} × {N_DOCS_PER_SEG} × \
+            "mem_ceiling_lazy_many_superfiles_under_400mib ({N_SUPERFILES} × {N_DOCS_PER_SEG} × \
              {DIM}, n_cent={N_CENT_PER_SEG}): RSS delta = {delta_mib:.3} MiB over \
-             {n_segments} segment(s) ({n_cols_total} column(s) total) = \
-             {per_seg_mib:.3} MiB/segment"
+             {n_superfiles} superfile(s) ({n_cols_total} column(s) total) = \
+             {per_seg_mib:.3} MiB/superfile"
         );
 
         assert!(
             delta_mib <= 400.0,
-            "many-segments lazy open RSS delta {delta_mib:.3} MiB exceeds 400 MiB ceiling \
-             at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. A regression that reintroduced \
+            "many-superfiles lazy open RSS delta {delta_mib:.3} MiB exceeds 400 MiB ceiling \
+             at {N_SUPERFILES} × {N_DOCS_PER_SEG} × {DIM}. A regression that reintroduced \
              any per-doc resident state would push this much higher; the deletion of \
              doc_to_pos is what keeps the bound structural."
         );
@@ -5062,7 +5201,7 @@ mod tests {
     // per-cluster blocks; those are search-time data.
     // -----------------------------------------------------------------
 
-    fn build_small_segment(
+    fn build_small_superfile(
         dim: usize,
         n_cent: usize,
         n_docs: u32,
@@ -5098,9 +5237,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_lazy_small_sq8_segment_fetches_exact_metadata_ranges() {
+    async fn open_lazy_small_sq8_superfile_fetches_exact_metadata_ranges() {
         let (blob, json, _) =
-            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
 
@@ -5122,9 +5261,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_lazy_small_segment_fetches_no_codec_meta_for_non_sq8() {
+    async fn open_lazy_small_superfile_fetches_no_codec_meta_for_non_sq8() {
         for codec in [RerankCodec::Fp32, RerankCodec::RabitqOnly] {
-            let (blob, json, _) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
+            let (blob, json, _) = build_small_superfile(32, 4, 64, codec, Metric::L2Sq);
             let counting = StdArc::new(CountingLazyByteSource::new(blob));
             let async_counter = counting.async_counter();
 
@@ -5158,7 +5297,7 @@ mod tests {
             RerankCodec::Sq8Residual,
             RerankCodec::RabitqOnly,
         ] {
-            let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
+            let (blob, json, all) = build_small_superfile(32, 4, 64, codec, Metric::L2Sq);
             let r_eager = VectorReader::open(blob.clone(), &json)
                 .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
             let counting = StdArc::new(CountingLazyByteSource::new(blob));
@@ -5173,9 +5312,11 @@ mod tests {
             for &q_idx in &[0usize, 7, 17, 31] {
                 let hits_eager = r_eager
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
                 let hits_lazy = r_lazy
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
                 assert_eq!(
                     hits_eager, hits_lazy,
@@ -5194,7 +5335,7 @@ mod tests {
     ///
     /// Headline budget for the cold first-search phase
     /// (≤ 12 ranges, ≤ 5 MB at 1M × 384 sq8, nprobe = 8). The
-    /// small-segment test here pins the structural shape; the
+    /// small-superfile test here pins the structural shape; the
     /// s3s-fs bench measures the real wall-clock against AWS-
     /// shape RTTs.
     ///
@@ -5204,7 +5345,7 @@ mod tests {
     #[tokio::test]
     async fn cold_first_search_after_open_lazy_within_nprobe_plus_one_ranges() {
         let (blob, json, all) =
-            build_small_segment(32, 8, 128, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 8, 128, RerankCodec::Sq8Residual, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -5233,6 +5374,7 @@ mod tests {
         let nprobe = 4usize;
         let _hits = r_lazy
             .search("v", &all[0], 5, nprobe, 5)
+            .await
             .expect("cold first search");
 
         let after_search = async_counter.load(AtomicOrdering::Relaxed);
@@ -5272,7 +5414,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cold_first_search_dispatches_cluster_gets_concurrently() {
         let (blob, json, all) =
-            build_small_segment(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -5298,6 +5440,7 @@ mod tests {
         let q = all[0].clone();
         let hits = r_lazy
             .search("v", &q, 5, nprobe, 5)
+            .await
             .expect("cold first search");
         assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
 
@@ -5336,7 +5479,7 @@ mod tests {
             RerankCodec::Sq8Residual,
             RerankCodec::RabitqOnly,
         ] {
-            let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
+            let (blob, json, all) = build_small_superfile(32, 4, 64, codec, Metric::L2Sq);
             let r_eager = VectorReader::open(blob.clone(), &json)
                 .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
             let counting = StdArc::new(CountingLazyByteSource::new(blob));
@@ -5351,9 +5494,11 @@ mod tests {
             for &q_idx in &[0usize, 7, 17, 31] {
                 let hits_eager = r_eager
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
                 let hits_lazy = r_lazy
                     .search("v", &all[q_idx], 5, 4, 5)
+                    .await
                     .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
                 assert_eq!(
                     hits_eager, hits_lazy,
@@ -5375,7 +5520,7 @@ mod tests {
     #[test]
     fn cluster_block_range_matches_v1_layout_invariant() {
         let (blob, json, _) =
-            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let col = &r.columns[0];
         let cb = col.quant.code_bytes();
@@ -5446,7 +5591,7 @@ mod tests {
     #[tokio::test]
     async fn open_lazy_column_metadata_matches_eager_open() {
         let (blob, json, _) =
-            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         // Simulate the object-store path: with no zero-copy sync read

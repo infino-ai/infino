@@ -41,6 +41,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+/// Force the global allocator (mimalloc, default-on in the crate) to
+/// return freed-but-retained arenas to the OS. Every sampler start
+/// calls this so a phase's reported RSS is the engine's working set,
+/// not heap history from earlier bench phases — e.g. ingest scratch
+/// and brute-force ground-truth buffers were inflating the vector
+/// warm-search rows by the (freed) corpus-scale residual mimalloc had
+/// kept around (measured: ~1 GiB at 1M docs, ~10 GiB at 10M).
+pub fn purge_allocator() {
+    // SAFETY: `mi_collect` is documented safe to call from any thread
+    // at any time; `true` forces a synchronous collection that
+    // releases deferred pages back to the OS.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bytes per kibibyte — `/proc/self/status` reports `VmRSS` in kB
@@ -69,6 +83,20 @@ pub fn current_rss_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+/// One-shot read of the calling process's **anonymous** resident set
+/// (private heap) in bytes, from `/proc/self/smaps_rollup`. File-backed
+/// pages (the disk-cache mmap on free local NVMe) are excluded.
+pub fn current_anon_rss_bytes() -> Option<u64> {
+    purge_allocator();
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    rollup
+        .lines()
+        .find(|l| l.starts_with("Anonymous:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kb| kb * KIB_TO_BYTES)
 }
 
 /// Background-thread peak-RSS sampler. Start it before the
@@ -122,6 +150,9 @@ impl PeakSampler {
     /// who stop the sampler before any background sample
     /// lands still see at least the start-time RSS.
     pub fn start(interval: Duration) -> Self {
+        // Drop allocator-retained pages first so the measurement
+        // window opens on the process's true working set.
+        purge_allocator();
         let stop = Arc::new(AtomicBool::new(false));
         let initial = current_rss_bytes().unwrap_or(0);
 
@@ -172,6 +203,41 @@ impl PeakSampler {
 /// Format a byte count as a right-justified human string —
 /// `"12.34 GiB"` / `"456.78 MiB"` / `"123.4 KiB"` — for the
 /// bench markdown tables.
+/// Log the anonymous-vs-file-backed RSS split from
+/// `/proc/self/smaps_rollup` with a phase label. The split is the
+/// discriminator for RSS investigations: anonymous = heap (allocator
+/// slack, retained `Bytes`, builder state); file-backed = mmap'd
+/// cache files (disk-cache segments, corpus files). Purges the
+/// allocator first so retained-but-free heap doesn't masquerade as a
+/// live working set.
+pub fn log_rss_breakdown(label: &str) {
+    purge_allocator();
+    let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
+        return;
+    };
+    let kb = |key: &str| -> u64 {
+        rollup
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let rss = kb("Rss:");
+    let anon = kb("Anonymous:");
+    let shmem = kb("Shmem:");
+    // Everything resident that is neither anonymous heap nor shmem is
+    // file-backed: mmap'd disk-cache segments, corpus files, binaries.
+    let file_backed = rss.saturating_sub(anon).saturating_sub(shmem);
+    eprintln!(
+        "[rss-breakdown] {label}: rss={} anonymous={} file_backed={} shmem={}",
+        fmt_bytes(rss * KIB_TO_BYTES),
+        fmt_bytes(anon * KIB_TO_BYTES),
+        fmt_bytes(file_backed * KIB_TO_BYTES),
+        fmt_bytes(shmem * KIB_TO_BYTES),
+    );
+}
+
 pub fn fmt_bytes(b: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;

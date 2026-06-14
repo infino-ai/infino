@@ -2,7 +2,7 @@
 
 A plain-language tour of what Infino is, how it's built, and how it
 differs from the database, search engine, and vector database alternatives. 
-For more technical detail, see [superfile](./superfile.md) (the segment format) and
+For more technical detail, see [superfile](./superfile.md) (the superfile format) and
 [supertable](./supertable.md) (the table layer).
 
 ## What is Infino?
@@ -92,7 +92,7 @@ To minimize latency and cost, infino tries to optimize data layout and data acce
    the catalog, never file contents. The same summaries back every
    modality through one shared pruning layer, so a hybrid query prunes
    on scalar, keyword, *and* vector signals together before touching a
-   single byte of a segment.
+   single byte of a superfile.
 3. **Fetches only what it needs** — for surviving files it pulls just
   the relevant byte ranges from object storage (a posting list, a
    handful of vector clusters), not the whole file. This holds for SQL
@@ -203,16 +203,16 @@ bill each independently; spin compute down without losing data.
 
 Where **Infino is distinctive even within this camp**:
 
-- **The segment is a valid Parquet file.** Data isn't trapped in a
+- **The superfile is a valid Parquet file.** Data isn't trapped in a
 proprietary index format — the *same bytes* are readable by the open
 analytics ecosystem (DuckDB, DataFusion, pyarrow) with no export step,
 while infino uses embedded index regions for search. Lower lock-in,
 easy interop with existing data tooling.
-- **Scalar + full-text + vector together in one immutable segment** —
+- **Scalar + full-text + vector together in one immutable superfile** —
 SQL, BM25, and IVF + RaBitQ vectors share one copy of the data and
 one consistency model, instead of syncing a DB + a search engine + a
 vector DB.
-- **Hybrid search is a first-class citizen — and an access path, not just an API.** In most systems, hybrid search ends at top-k: two retrievals (BM25, ANN) plus rank fusion. Here every modality shares one copy and one query path, so you fuse keyword and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. And because the retrievers are *relations* (table functions) and indexed text predicates resolve to candidate row sets inside the engine, search can be the first stage of a larger SQL plan — feeding joins, filters, and aggregates — rather than its result. The same index machinery prunes segments across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
+- **Hybrid search is a first-class citizen — and an access path, not just an API.** In most systems, hybrid search ends at top-k: two retrievals (BM25, ANN) plus rank fusion. Here every modality shares one copy and one query path, so you fuse keyword and vector relevance — with SQL filters — in a single query against a single snapshot, with no second system to keep in sync and no client-side result stitching. And because the retrievers are *relations* (table functions) and indexed text predicates resolve to candidate row sets inside the engine, search can be the first stage of a larger SQL plan — feeding joins, filters, and aggregates — rather than its result. The same index machinery prunes superfiles across SQL, full-text, and vector together, so the hybrid query is also the well-pruned, cheap one.
 
 ### At a glance
 
@@ -243,7 +243,7 @@ transition automatically.
 - **Operational simplicity.** Immutable files + an atomic manifest swap
 give clean snapshots, safe concurrent writers, and stateless,
 disposable compute.
-- **Openness / no lock-in.** Segments are Parquet; data stays usable by
+- **Openness / no lock-in.** Superfiles are Parquet; data stays usable by
 the broader ecosystem.
 
 ## Where it fits best
@@ -278,7 +278,7 @@ run one system that comfortably handles your scale and modalities, then where In
 opened with `connect(uri)`. Create / open / list / drop tables and run
 SQL across them. (The table catalog; not to be confused with a single
 table's manifest.)
-- **Superfile** — one immutable segment file (columns + keyword index +
+- **Superfile** — one immutable superfile file (columns + keyword index +
 vector index), also a valid Parquet file.
 - **Supertable** — the table: a manifest over many superfiles,
 presenting them as one queryable table. Obtained from a `Connection`.

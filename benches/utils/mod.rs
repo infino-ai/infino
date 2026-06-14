@@ -10,6 +10,8 @@
 // - `tiers`, `markdown`, `rss` — storage backends + reporting
 
 pub mod corpus;
+pub mod cost;
+pub mod dataset;
 pub mod executors;
 pub mod fixture;
 pub mod harness;
@@ -17,6 +19,7 @@ pub mod ingest;
 pub mod markdown;
 pub mod report;
 pub mod rss;
+pub mod storage_meter;
 pub mod tiers;
 
 pub mod superfile;

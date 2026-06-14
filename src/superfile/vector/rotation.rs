@@ -9,91 +9,231 @@
 //! orthogonal `R` turns each bit into an LSH-style hyperplane, spreading
 //! the data's variance so sign-encoding becomes informative.
 //!
-//! Construction: sample a `dim × dim` Gaussian matrix from a seeded RNG,
-//! Gram-Schmidt-orthonormalize the rows, store row-major. `apply(x)` is
-//! the matrix-vector product `R · x`.
+//! Construction — **fast structured rotation**, not a dense matrix. A
+//! dense `dim × dim` matrix-vector product is `O(dim²)` per vector,
+//! which dominates build *and* search as the embedding dimension grows
+//! (e.g. 384 → 1024 is a 7.1× blow-up in this step alone). Instead we
+//! use the standard fast-Johnson–Lindenstrauss / "structured spinner"
+//! construction RaBitQ and FAISS use:
 //!
-//! Determinism: `RandomRotation::new(dim, seed)` returns the same matrix
-//! for the same `(dim, seed)` pair on any platform. The reader needs to
-//! reconstruct the exact rotation the builder used (we store
-//! `(dim, rot_seed)` in the per-column subsection header), so this
-//! guarantee is load-bearing.
+//! ```text
+//!   R · x  =  (HD)_3 (HD)_2 (HD)_1 · x
+//! ```
+//!
+//! where each stage is a random sign-flip diagonal `D_s` (±1, seeded)
+//! followed by a normalized Walsh–Hadamard transform `H`. The WHT is
+//! `O(dim·log dim)` via the butterfly, and both `D` and the normalized
+//! `H` are orthonormal, so the composition is an orthonormal rotation —
+//! it preserves L2 norm and inner products exactly when `dim` is a power
+//! of two. Three stages give the variance-mixing the 1-bit codes need.
+//!
+//! Non-power-of-two `dim` is zero-padded up to the next power of two for
+//! the transform, then the leading `dim` components are returned; that
+//! is a fast random projection (approximately norm-preserving), which is
+//! all the LSH sign-encoding requires. Power-of-two dims (the common
+//! case — 1024, 512, 256) take the exact-isometry path with no padding.
+//!
+//! Determinism: `RandomRotation::new(dim, seed)` derives the same sign
+//! diagonals for the same `(dim, seed)` pair on any platform. The reader
+//! reconstructs the exact rotation the builder used from the stored
+//! `(dim, rot_seed)` in the per-column subsection header, so nothing
+//! about the rotation is persisted — swapping the construction is not an
+//! on-disk format change.
 
-use crate::superfile::vector::distance::dot;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
+use wide::f32x8;
 
-/// Minimum row magnitude before Gram-Schmidt normalization divides by
-/// it. A row whose magnitude falls at or below this is treated as
-/// numerically zero (a near-degenerate Gaussian draw) and left
-/// unnormalized rather than blown up by division.
-const GRAM_SCHMIDT_MIN_ROW_MAGNITUDE: f32 = 1e-12;
+/// Number of (sign-flip, Walsh–Hadamard) stages composed into the
+/// rotation. Three is the standard "structured spinner" depth: it mixes
+/// variance across coordinates well enough for the 1-bit RaBitQ codes
+/// while staying `O(dim·log dim)`.
+const ROTATION_STAGES: usize = 3;
 
-/// Row-major `dim × dim` orthonormal matrix.
+/// `wide::f32x8` lane width (butterfly + sign/scale loops).
+///
+/// The butterfly stays on `wide` (256-bit / AVX2) deliberately: a
+/// 16-lane AVX-512 variant was measured **~8% slower** across the dim
+/// sweep (memory-bound load×2/store×2 with near-zero compute, so the
+/// wider lane buys nothing and the AVX-512 downclock costs).
+const F32X8_LANES: usize = 8;
+
+/// Fast structured random rotation (sign-flip + Walsh–Hadamard,
+/// `O(dim·log dim)` per `apply`). See the module docs.
 #[derive(Debug)]
 pub struct RandomRotation {
     pub dim: usize,
-    /// Row-major: row `i` lives at `rows[i*dim .. (i+1)*dim]`.
-    rows: Vec<f32>,
+    /// Transform working size: `dim` rounded up to a power of two.
+    padded_dim: usize,
+    /// One `±1` sign-flip diagonal per stage, each length `padded_dim`.
+    signs: Vec<Vec<f32>>,
 }
 
 impl RandomRotation {
-    /// Build the rotation. Cost is `O(dim³)` for Gram-Schmidt — fine
-    /// at column-build time, but cache the result if called repeatedly.
+    /// Build the rotation. Only the seeded `±1` sign diagonals are
+    /// materialized (`O(stages · dim)` memory); the Walsh–Hadamard part
+    /// is implicit in [`apply`](Self::apply).
     pub fn new(dim: usize, seed: u64) -> Self {
+        let padded_dim = dim.max(1).next_power_of_two();
         let mut rng = StdRng::seed_from_u64(seed);
+        // Rademacher `±1` draws via the sign of a standard normal
+        // (`P(<0) = P(≥0) = 0.5`), reusing the same seeded RNG +
+        // distribution the dense rotation used so determinism is
+        // identical in shape.
         let normal = Normal::new(0.0f32, 1.0).expect("valid stddev");
-        let mut rows = vec![0.0f32; dim * dim];
-        for x in rows.iter_mut() {
-            *x = normal.sample(&mut rng);
+        let signs = (0..ROTATION_STAGES)
+            .map(|_| {
+                (0..padded_dim)
+                    .map(|_| {
+                        if normal.sample(&mut rng) >= 0.0 {
+                            1.0f32
+                        } else {
+                            -1.0f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        RandomRotation {
+            dim,
+            padded_dim,
+            signs,
         }
-        // Gram-Schmidt: subtract projections of all earlier rows from
-        // each new row, then unit-normalize.
-        for i in 0..dim {
-            for j in 0..i {
-                let (hi_row, lo_row) = rows.split_at_mut(i * dim);
-                let row_j = &hi_row[j * dim..(j + 1) * dim];
-                let row_i = &mut lo_row[..dim];
-                let proj = dot(row_j, row_i);
-                for (xi, xj) in row_i.iter_mut().zip(row_j) {
-                    *xi -= proj * xj;
-                }
-            }
-            let row_i = &mut rows[i * dim..(i + 1) * dim];
-            let mag: f32 = row_i.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if mag > GRAM_SCHMIDT_MIN_ROW_MAGNITUDE {
-                let inv = 1.0 / mag;
-                for x in row_i.iter_mut() {
-                    *x *= inv;
-                }
-            }
-        }
-        RandomRotation { dim, rows }
     }
 
     /// Compute `out = R · x`. Both slices must have length `dim`.
+    ///
+    /// Runs the staged sign-flip + Walsh–Hadamard transform in a
+    /// thread-local scratch buffer (one allocation per thread, reused),
+    /// then copies the leading `dim` components into `out`.
     #[inline]
     pub fn apply(&self, x: &[f32], out: &mut [f32]) {
         debug_assert_eq!(x.len(), self.dim);
         debug_assert_eq!(out.len(), self.dim);
-        for (i, slot) in out.iter_mut().enumerate() {
-            let row = &self.rows[i * self.dim..(i + 1) * self.dim];
-            *slot = dot(row, x);
+        let m = self.padded_dim;
+        // Normalized WHT scales each transform by 1/sqrt(m); applied once
+        // per stage keeps the whole composition orthonormal.
+        let scale = 1.0 / (m as f32).sqrt();
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.resize(m, 0.0);
+            buf[..self.dim].copy_from_slice(x);
+            for stage_signs in &self.signs {
+                apply_signs(&mut buf, stage_signs);
+                walsh_hadamard(&mut buf);
+                scale_in_place(&mut buf, scale);
+            }
+            out.copy_from_slice(&buf[..self.dim]);
+        });
+    }
+}
+
+thread_local! {
+    /// Per-thread reusable transform buffer (length = `padded_dim`).
+    /// Avoids an allocation on every `apply` (the per-vector hot path
+    /// at build and per-query at search).
+    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `buf[i] *= signs[i]` (`±1` flip), 8 lanes at a time.
+#[inline]
+fn apply_signs(buf: &mut [f32], signs: &[f32]) {
+    debug_assert_eq!(buf.len(), signs.len());
+    let n = buf.len();
+    let mut i = 0;
+    while i + F32X8_LANES <= n {
+        let b =
+            f32x8::from(<[f32; F32X8_LANES]>::try_from(&buf[i..i + F32X8_LANES]).expect("len-8"));
+        let s =
+            f32x8::from(<[f32; F32X8_LANES]>::try_from(&signs[i..i + F32X8_LANES]).expect("len-8"));
+        buf[i..i + F32X8_LANES].copy_from_slice(&(b * s).to_array());
+        i += F32X8_LANES;
+    }
+    while i < n {
+        buf[i] *= signs[i];
+        i += 1;
+    }
+}
+
+/// `buf[i] *= scale`, 8 lanes at a time.
+#[inline]
+fn scale_in_place(buf: &mut [f32], scale: f32) {
+    let v = f32x8::splat(scale);
+    let n = buf.len();
+    let mut i = 0;
+    while i + F32X8_LANES <= n {
+        let b =
+            f32x8::from(<[f32; F32X8_LANES]>::try_from(&buf[i..i + F32X8_LANES]).expect("len-8"));
+        buf[i..i + F32X8_LANES].copy_from_slice(&(b * v).to_array());
+        i += F32X8_LANES;
+    }
+    while i < n {
+        buf[i] *= scale;
+        i += 1;
+    }
+}
+
+/// In-place (unnormalized) Walsh–Hadamard transform. `a.len()` must be a
+/// power of two. Strides `h ≥ 8` run 8 lanes at a time on `wide::f32x8`
+/// (256-bit / AVX2); `h ∈ {1,2,4}` fall back to scalar. A 16-lane
+/// AVX-512 variant was tried and measured slower (memory-bound; see the
+/// note on [`F32X8_LANES`]), so this is the only butterfly.
+#[inline]
+fn walsh_hadamard(a: &mut [f32]) {
+    let n = a.len();
+    debug_assert!(n.is_power_of_two());
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            if h >= F32X8_LANES {
+                let mut j = i;
+                while j < i + h {
+                    let x = f32x8::from(
+                        <[f32; F32X8_LANES]>::try_from(&a[j..j + F32X8_LANES]).expect("len-8"),
+                    );
+                    let y = f32x8::from(
+                        <[f32; F32X8_LANES]>::try_from(&a[j + h..j + h + F32X8_LANES])
+                            .expect("len-8"),
+                    );
+                    a[j..j + F32X8_LANES].copy_from_slice(&(x + y).to_array());
+                    a[j + h..j + h + F32X8_LANES].copy_from_slice(&(x - y).to_array());
+                    j += F32X8_LANES;
+                }
+            } else {
+                for j in i..i + h {
+                    let x = a[j];
+                    let y = a[j + h];
+                    a[j] = x + y;
+                    a[j + h] = x - y;
+                }
+            }
+            i += 2 * h;
         }
+        h *= 2;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::superfile::vector::distance::dot;
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() < eps
     }
 
-    fn row(rot: &RandomRotation, i: usize) -> &[f32] {
-        &rot.rows[i * rot.dim..(i + 1) * rot.dim]
+    /// Column `i` of `R`: the image of the `i`-th standard basis
+    /// vector, `R · e_i`. For an orthonormal `R` the columns are unit
+    /// vectors, pairwise orthogonal.
+    fn column(rot: &RandomRotation, i: usize) -> Vec<f32> {
+        let mut e = vec![0.0f32; rot.dim];
+        e[i] = 1.0;
+        let mut out = vec![0.0f32; rot.dim];
+        rot.apply(&e, &mut out);
+        out
     }
 
     // --- structural ----------------------------------------------------
@@ -102,36 +242,40 @@ mod tests {
     fn new_with_dim_8_succeeds() {
         let r = RandomRotation::new(8, 42);
         assert_eq!(r.dim, 8);
-        assert_eq!(r.rows.len(), 64);
+        assert_eq!(r.padded_dim, 8);
+        assert_eq!(r.signs.len(), ROTATION_STAGES);
     }
 
     #[test]
     fn new_with_realistic_dim_succeeds() {
-        for &dim in &[16, 64, 128, 384] {
+        for &dim in &[16, 64, 128, 384, 768, 1024] {
             let r = RandomRotation::new(dim, 7);
             assert_eq!(r.dim, dim);
-            assert_eq!(r.rows.len(), dim * dim);
+            assert!(r.padded_dim >= dim && r.padded_dim.is_power_of_two());
         }
     }
 
-    // --- orthonormality ------------------------------------------------
+    // --- orthonormality (power-of-two dims are exact isometries) -------
 
     #[test]
-    fn rows_are_unit_vectors() {
+    fn columns_are_unit_vectors() {
         let r = RandomRotation::new(64, 7);
         for i in 0..r.dim {
-            let mag_sq = dot(row(&r, i), row(&r, i));
-            assert!(approx(mag_sq, 1.0, 1e-4), "row {i} mag² = {mag_sq}");
+            let c = column(&r, i);
+            let mag_sq = dot(&c, &c);
+            assert!(approx(mag_sq, 1.0, 1e-4), "column {i} mag² = {mag_sq}");
         }
     }
 
     #[test]
-    fn rows_are_pairwise_orthogonal() {
+    fn columns_are_pairwise_orthogonal() {
         let r = RandomRotation::new(32, 11);
         for i in 0..r.dim {
+            let ci = column(&r, i);
             for j in (i + 1)..r.dim {
-                let p = dot(row(&r, i), row(&r, j));
-                assert!(approx(p, 0.0, 1e-4), "rows {i}, {j} dot = {p}");
+                let cj = column(&r, j);
+                let p = dot(&ci, &cj);
+                assert!(approx(p, 0.0, 1e-4), "columns {i}, {j} dot = {p}");
             }
         }
     }
@@ -139,17 +283,27 @@ mod tests {
     // --- determinism ---------------------------------------------------
 
     #[test]
-    fn same_seed_yields_same_matrix() {
+    fn same_seed_yields_same_rotation() {
         let r1 = RandomRotation::new(64, 12345);
         let r2 = RandomRotation::new(64, 12345);
-        assert_eq!(r1.rows, r2.rows);
+        assert_eq!(r1.signs, r2.signs);
+        // And the same output on the same input.
+        let x: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
+        let (mut a, mut b) = (vec![0.0; 64], vec![0.0; 64]);
+        r1.apply(&x, &mut a);
+        r2.apply(&x, &mut b);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn different_seed_yields_different_matrix() {
+    fn different_seed_yields_different_rotation() {
         let r1 = RandomRotation::new(64, 1);
         let r2 = RandomRotation::new(64, 2);
-        assert_ne!(r1.rows, r2.rows);
+        let x: Vec<f32> = (0..64).map(|i| i as f32 * 0.1 + 1.0).collect();
+        let (mut a, mut b) = (vec![0.0; 64], vec![0.0; 64]);
+        r1.apply(&x, &mut a);
+        r2.apply(&x, &mut b);
+        assert_ne!(a, b);
     }
 
     // --- apply ---------------------------------------------------------

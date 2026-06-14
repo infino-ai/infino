@@ -10,10 +10,10 @@
 //!
 //! The only in-tree caller of `SuperfileBuilder` /
 //! `SuperfileReader` is the `supertable` layer. The
-//! supertable owns the multi-segment + manifest + storage
+//! supertable owns the multi-superfile + manifest + storage
 //! policy; each rayon shard worker uses `SuperfileBuilder`
 //! one-shot (one `add_batch` loop → one `finish()`), and
-//! each cached / opened segment runs through
+//! each cached / opened superfile runs through
 //! `SuperfileReader::open` once per cache hydration. The
 //! builder is consume-on-`finish()`; a session that wants N
 //! superfiles instantiates N builders.
@@ -24,6 +24,7 @@ pub mod format;
 pub mod fts;
 pub mod lazy_source;
 pub mod reader;
+pub mod stats;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};

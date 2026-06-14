@@ -4,13 +4,13 @@
 //! Manifest-level skip pruning helpers.
 //!
 //! Each helper takes a pinned [`Manifest`] snapshot plus a query
-//! shape and returns a `Vec<bool>` mask — one slot per segment, in
+//! shape and returns a `Vec<bool>` mask — one slot per superfile, in
 //! manifest order — where `true` means "keep" and `false` means
 //! "prune".  The masks are pure functions of manifest metadata
 //! ([`SuperfileEntry::scalar_stats`], [`SuperfileEntry::fts_summary`],
 //! [`SuperfileEntry::vector_summary`]) — **no store calls**.
 //! Pruned superfiles are dropped before the query layer issues any
-//! per-segment work, so an irrelevant segment never causes a
+//! per-superfile work, so an irrelevant superfile never causes a
 //! `SuperfileReaderCache::reader` call (the load-bearing perf claim of
 //! the skip layer).
 //!
@@ -21,15 +21,15 @@
 //!
 //! ## Conservatism
 //!
-//! All helpers err on the side of keeping a segment when in
+//! All helpers err on the side of keeping a superfile when in
 //! doubt:
 //!
-//! - Unknown column → keep all (per-segment search will surface
+//! - Unknown column → keep all (per-superfile search will surface
 //!   the column-missing error to the caller).
 //! - All-zero or absent summary → keep (treat as "may match").
 //! - Empty query (no terms / `prefix == ""`) → keep all.
 //!
-//! False-positive keeps cost a per-segment search call but never
+//! False-positive keeps cost a per-superfile search call but never
 //! a wrong answer. False-negative prunes would silently drop
 //! relevant docs and are forbidden.
 //!
@@ -37,7 +37,7 @@
 //!
 //! Conservative pre-cutoff pruning is hard for IVF vectors
 //! because we don't know the global top-k cutoff distance until
-//! at least one segment has been searched. v1
+//! at least one superfile has been searched. v1
 //! [`vector_centroid_skip`] returns all-keep and exposes
 //! [`superfiles_sorted_by_centroid_distance`] so a future
 //! incremental top-k pruning layer has the ordering it needs
@@ -56,14 +56,14 @@ use crate::supertable::manifest::{Manifest, SuperfileEntry, term_range::prefix_o
 
 /// Bloom-skip mask for an exact-term BM25 search.
 ///
-/// For each segment, look up every tokenized query term in the
-/// segment's per-column term-presence bloom:
+/// For each superfile, look up every tokenized query term in the
+/// superfile's per-column term-presence bloom:
 ///
 /// - `BoolMode::Or`  — keep if **any** term is possibly-present
 ///   (a doc containing any term contributes a positive score).
 /// - `BoolMode::And` — keep if **all** terms are possibly-present
 ///   (a relevant doc must contain every term, so a single
-///   definitely-absent term prunes the whole segment).
+///   definitely-absent term prunes the whole superfile).
 ///
 /// `query_terms` are the terms after the same tokenizer used at
 /// index time. Per the v1 tokenizer (`AsciiLowerTokenizer`) that
@@ -100,10 +100,10 @@ pub fn fts_bloom_skip(
 
 /// Term-range skip mask for a prefix BM25 search.
 ///
-/// For each segment, check whether `[prefix, prefix_upper_bound)`
-/// overlaps the segment's lex term range
+/// For each superfile, check whether `[prefix, prefix_upper_bound)`
+/// overlaps the superfile's lex term range
 /// `[fts_summary.term_range.0, fts_summary.term_range.1]`. A
-/// non-overlapping segment cannot contain any term beginning with
+/// non-overlapping superfile cannot contain any term beginning with
 /// `prefix` and is pruned.
 ///
 /// `prefix` is the same lowercased byte sequence the prefix
@@ -127,7 +127,7 @@ pub fn fts_prefix_skip(
             Some(summary) => {
                 let (min_term, max_term) = &summary.term_range;
                 if min_term.is_empty() && max_term.is_empty() {
-                    // 0-term segment — bloom build also flags
+                    // 0-term superfile — bloom build also flags
                     // this; nothing matches. Prune.
                     return false;
                 }
@@ -156,9 +156,9 @@ pub fn vector_centroid_skip(manifest: &Manifest, _column: &str, _query: &[f32]) 
 }
 
 /// Indices into `manifest.superfiles` sorted ascending by the
-/// per-segment centroid's distance to `query` under `metric`.
+/// per-superfile centroid's distance to `query` under `metric`.
 ///
-/// Segments without a vector summary for `column` are sorted to
+/// Superfiles without a vector summary for `column` are sorted to
 /// the end (treated as worst-case). Used as a fan-out hint for
 /// vector search: searching closer-centroid superfiles first means
 /// later superfiles are likelier to be skippable once the running
@@ -184,8 +184,8 @@ pub fn superfiles_sorted_by_centroid_distance(
             _ => (i, f32::INFINITY),
         })
         .collect();
-    // pdqsort: per-query segment skip ordering. (segment_idx, dist)
-    // tuples are unique by segment_idx, so any tie-break is fine.
+    // pdqsort: per-query superfile skip ordering. (superfile_idx, dist)
+    // tuples are unique by superfile_idx, so any tie-break is fine.
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.into_iter().map(|(i, _)| i).collect()
 }
@@ -195,7 +195,7 @@ pub fn superfiles_sorted_by_centroid_distance(
 /// These mirror the SQL comparison operators the
 /// `SupertableProvider` lowers from a DataFusion `Expr` into
 /// infino's own predicate form. Any operator we can't normalize is
-/// simply never handed to [`scalar_skip`] — the segment is kept and
+/// simply never handed to [`scalar_skip`] — the superfile is kept and
 /// DataFusion's `FilterExec` still applies the predicate to rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarOp {
@@ -225,13 +225,13 @@ pub struct ScalarPredicate {
 /// Scalar-skip mask for a conjunction of `column <op> literal`
 /// predicates (a SQL `WHERE` of `AND`-ed simple comparisons).
 ///
-/// For each segment, consult the per-column min/max persisted in
-/// [`SuperfileEntry::scalar_stats`] and keep the segment unless
-/// some predicate *proves* no row in the segment can satisfy it.
+/// For each superfile, consult the per-column min/max persisted in
+/// [`SuperfileEntry::scalar_stats`] and keep the superfile unless
+/// some predicate *proves* no row in the superfile can satisfy it.
 /// Because the predicates are conjunctive, a single
-/// definitely-false predicate prunes the whole segment.
+/// definitely-false predicate prunes the whole superfile.
 ///
-/// Conservatism (never a false prune): a segment is kept when
+/// Conservatism (never a false prune): a superfile is kept when
 ///
 /// - the column has no persisted stats (the writer skips types
 ///   whose ordering isn't well-defined, and all-null columns),
@@ -239,12 +239,12 @@ pub struct ScalarPredicate {
 /// - the literal can't be coerced to the column's stat type, or
 /// - the values are otherwise incomparable.
 ///
-/// An empty predicate slice keeps every segment.
+/// An empty predicate slice keeps every superfile.
 ///
 /// This is the SQL-side sibling of [`fts_bloom_skip`] /
-/// [`fts_prefix_skip`]: **infino owns segment selection.**
-/// DataFusion only executes over the surviving segments (and does
-/// its own row-group/page pruning inside each Parquet segment).
+/// [`fts_prefix_skip`]: **infino owns superfile selection.**
+/// DataFusion only executes over the surviving superfiles (and does
+/// its own row-group/page pruning inside each Parquet superfile).
 pub fn scalar_skip(
     superfiles: &[Arc<SuperfileEntry>],
     predicates: &[ScalarPredicate],
@@ -254,14 +254,14 @@ pub fn scalar_skip(
     }
     superfiles
         .iter()
-        .map(|entry| predicates.iter().all(|p| segment_may_match(entry, p)))
+        .map(|entry| predicates.iter().all(|p| superfile_may_match(entry, p)))
         .collect()
 }
 
 /// Whether `entry` *could* contain a row satisfying `pred`, judged
-/// only from the segment's persisted min/max. Conservative: any
+/// only from the superfile's persisted min/max. Conservative: any
 /// uncertainty returns `true` (keep).
-fn segment_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
+fn superfile_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
     let Some((min_arr, max_arr)) = entry.scalar_stats.cols.get(&pred.column) else {
         // No stats for this column — can't prove irrelevance.
         return true;
@@ -276,7 +276,7 @@ fn segment_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
 }
 
 /// Conservative `min`/`max`-vs-`value` comparison core, shared by the
-/// segment tier ([`segment_may_match`]) and the part tier (the scalar
+/// superfile tier ([`superfile_may_match`]) and the part tier (the scalar
 /// part prune in [`crate::supertable::query::prune`]). Returns `true`
 /// (keep) on any uncertainty: null bounds, an un-coercible literal, or
 /// otherwise-incomparable values. Never a false prune.
@@ -305,7 +305,7 @@ pub(crate) fn scalar_value_may_match(
             (Some(lo), Some(hi)) => lo != Ordering::Less && hi != Ordering::Greater,
             _ => true,
         },
-        // prune only when the segment is a single constant == v
+        // prune only when the superfile is a single constant == v
         ScalarOp::NotEq => {
             let constant = min.partial_cmp(max) == Some(Ordering::Equal);
             let equals_v = cmp_v_min == Some(Ordering::Equal);
@@ -393,7 +393,7 @@ mod tests {
         )
     }
 
-    fn empty_segment() -> SuperfileEntry {
+    fn empty_superfile() -> SuperfileEntry {
         let uri = SuperfileUri::new_v4();
         SuperfileEntry {
             superfile_id: Uuid::new_v4(),
@@ -428,15 +428,19 @@ mod tests {
         (column.to_string(), summary)
     }
 
-    fn segment_with_terms(column: &str, terms: &[&str]) -> Arc<SuperfileEntry> {
-        let mut e = empty_segment();
+    fn superfile_with_terms(column: &str, terms: &[&str]) -> Arc<SuperfileEntry> {
+        let mut e = empty_superfile();
         let (k, v) = fts_summary_with(column, terms);
         e.fts_summary.insert(k, v);
         Arc::new(e)
     }
 
-    fn segment_with_centroid(column: &str, centroid: Vec<f32>, radius: f32) -> Arc<SuperfileEntry> {
-        let mut e = empty_segment();
+    fn superfile_with_centroid(
+        column: &str,
+        centroid: Vec<f32>,
+        radius: f32,
+    ) -> Arc<SuperfileEntry> {
+        let mut e = empty_superfile();
         e.vector_summary.insert(
             column.to_string(),
             VectorSummary {
@@ -462,28 +466,28 @@ mod tests {
     // ---- fts_bloom_skip ----------------------------------------------
 
     #[test]
-    fn bloom_skip_keeps_segments_with_any_query_term_in_or_mode() {
-        let s_a = segment_with_terms("title", &["alpha", "beta"]);
-        let s_b = segment_with_terms("title", &["gamma", "delta"]);
+    fn bloom_skip_keeps_superfiles_with_any_query_term_in_or_mode() {
+        let s_a = superfile_with_terms("title", &["alpha", "beta"]);
+        let s_b = superfile_with_terms("title", &["gamma", "delta"]);
         let m = manifest_with(opts_simple(), vec![s_a, s_b]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha", "missing"], BoolMode::Or);
-        // Segment A has alpha → keep. Segment B has neither → prune.
+        // Superfile A has alpha → keep. Superfile B has neither → prune.
         assert_eq!(mask, vec![true, false]);
     }
 
     #[test]
     fn bloom_skip_requires_all_terms_present_in_and_mode() {
-        let s_a = segment_with_terms("title", &["alpha", "beta"]);
-        let s_b = segment_with_terms("title", &["alpha", "gamma"]);
+        let s_a = superfile_with_terms("title", &["alpha", "beta"]);
+        let s_b = superfile_with_terms("title", &["alpha", "gamma"]);
         let m = manifest_with(opts_simple(), vec![s_a, s_b]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha", "beta"], BoolMode::And);
-        // Segment A has both. Segment B is missing 'beta' → prune.
+        // Superfile A has both. Superfile B is missing 'beta' → prune.
         assert_eq!(mask, vec![true, false]);
     }
 
     #[test]
     fn bloom_skip_unknown_column_keeps_all() {
-        let s = segment_with_terms("title", &["alpha"]);
+        let s = superfile_with_terms("title", &["alpha"]);
         let m = manifest_with(opts_simple(), vec![s]);
         let mask = fts_bloom_skip(&m.superfiles, "no_such_column", &["alpha"], BoolMode::Or);
         assert_eq!(mask, vec![true]);
@@ -491,14 +495,14 @@ mod tests {
 
     #[test]
     fn bloom_skip_empty_terms_keeps_all() {
-        let s = segment_with_terms("title", &["alpha"]);
+        let s = superfile_with_terms("title", &["alpha"]);
         let m = manifest_with(opts_simple(), vec![s]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &[], BoolMode::Or);
         assert_eq!(mask, vec![true]);
     }
 
     #[test]
-    fn bloom_skip_with_no_segments_returns_empty_vec() {
+    fn bloom_skip_with_no_superfiles_returns_empty_vec() {
         let m = manifest_with(opts_simple(), vec![]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha"], BoolMode::Or);
         assert!(mask.is_empty());
@@ -507,22 +511,22 @@ mod tests {
     // ---- fts_prefix_skip ---------------------------------------------
 
     #[test]
-    fn prefix_skip_prunes_segments_outside_prefix_range() {
-        // Segment A: terms in ['apple', 'banana'] → prefix "rust"
+    fn prefix_skip_prunes_superfiles_outside_prefix_range() {
+        // Superfile A: terms in ['apple', 'banana'] → prefix "rust"
         //            doesn't overlap.
-        // Segment B: terms in ['python', 'rust']  → prefix "rust"
+        // Superfile B: terms in ['python', 'rust']  → prefix "rust"
         //            overlaps the upper end.
-        let s_a = segment_with_terms("title", &["apple", "banana"]);
-        let s_b = segment_with_terms("title", &["python", "rust"]);
+        let s_a = superfile_with_terms("title", &["apple", "banana"]);
+        let s_b = superfile_with_terms("title", &["python", "rust"]);
         let m = manifest_with(opts_simple(), vec![s_a, s_b]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         assert_eq!(mask, vec![false, true]);
     }
 
     #[test]
-    fn prefix_skip_keeps_segments_with_matching_prefix_inside_range() {
+    fn prefix_skip_keeps_superfiles_with_matching_prefix_inside_range() {
         // Terms ['rusting', 'rusty'] → prefix "rust" overlaps.
-        let s = segment_with_terms("title", &["rusting", "rusty"]);
+        let s = superfile_with_terms("title", &["rusting", "rusty"]);
         let m = manifest_with(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         assert_eq!(mask, vec![true]);
@@ -530,7 +534,7 @@ mod tests {
 
     #[test]
     fn prefix_skip_empty_prefix_keeps_all() {
-        let s = segment_with_terms("title", &["alpha"]);
+        let s = superfile_with_terms("title", &["alpha"]);
         let m = manifest_with(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"");
         assert_eq!(mask, vec![true]);
@@ -538,19 +542,19 @@ mod tests {
 
     #[test]
     fn prefix_skip_unknown_column_keeps_all() {
-        let s = segment_with_terms("title", &["alpha"]);
+        let s = superfile_with_terms("title", &["alpha"]);
         let m = manifest_with(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "no_such_column", b"alp");
         assert_eq!(mask, vec![true]);
     }
 
     #[test]
-    fn prefix_skip_zero_term_segment_pruned() {
+    fn prefix_skip_zero_term_superfile_pruned() {
         // Empty term_range = no terms indexed. Prefix can't match.
-        let s = Arc::new(empty_segment());
+        let s = Arc::new(empty_superfile());
         let m = manifest_with(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
-        // No FTS summary on the segment → keep (column-missing
+        // No FTS summary on the superfile → keep (column-missing
         // path). Sanity: this is the "unknown column" path, not
         // the "0-term FTS column" path.
         assert_eq!(mask, vec![true]);
@@ -559,9 +563,9 @@ mod tests {
     // ---- vector_centroid_skip + ordering ------------------------------
 
     #[test]
-    fn vector_centroid_skip_v1_keeps_all_segments() {
-        let s_a = segment_with_centroid("emb", vec![0.0; 16], 0.5);
-        let s_b = segment_with_centroid("emb", vec![10.0; 16], 0.5);
+    fn vector_centroid_skip_v1_keeps_all_superfiles() {
+        let s_a = superfile_with_centroid("emb", vec![0.0; 16], 0.5);
+        let s_b = superfile_with_centroid("emb", vec![10.0; 16], 0.5);
         let m = manifest_with(opts_with_vector(), vec![s_a, s_b]);
         let q = vec![0.0f32; 16];
         let mask = vector_centroid_skip(&m, "emb", &q);
@@ -572,7 +576,7 @@ mod tests {
     fn superfiles_sorted_by_centroid_distance_orders_by_metric() {
         // L2-sq metric on simple 1-hot centroids.
         let opts = opts_with_vector();
-        let near = segment_with_centroid(
+        let near = superfile_with_centroid(
             "emb",
             {
                 let mut v = vec![0.0f32; 16];
@@ -581,7 +585,7 @@ mod tests {
             },
             0.0,
         );
-        let far = segment_with_centroid(
+        let far = superfile_with_centroid(
             "emb",
             {
                 let mut v = vec![0.0f32; 16];
@@ -603,8 +607,8 @@ mod tests {
 
     #[test]
     fn superfiles_sorted_by_centroid_distance_pushes_missing_summary_to_end() {
-        let with_v = segment_with_centroid("emb", vec![1.0f32; 16], 0.0);
-        let without_v = Arc::new(empty_segment());
+        let with_v = superfile_with_centroid("emb", vec![1.0f32; 16], 0.0);
+        let without_v = Arc::new(empty_superfile());
         let m = manifest_with(opts_with_vector(), vec![without_v, with_v]);
         let q = vec![1.0f32; 16];
         let order = superfiles_sorted_by_centroid_distance(&m, "emb", &q, Metric::L2Sq);
@@ -615,7 +619,7 @@ mod tests {
     // ---- scalar_skip -------------------------------------------------
 
     fn seg_with_int_stats(col: &str, min: i64, max: i64) -> Arc<SuperfileEntry> {
-        let mut e = empty_segment();
+        let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![min]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
         e.scalar_stats.cols.insert(col.to_string(), (mn, mx));
@@ -623,7 +627,7 @@ mod tests {
     }
 
     fn seg_with_str_stats(col: &str, min: &str, max: &str) -> Arc<SuperfileEntry> {
-        let mut e = empty_segment();
+        let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
         let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
         e.scalar_stats.cols.insert(col.to_string(), (mn, mx));
@@ -648,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_skip_eq_prunes_segments_whose_range_excludes_value() {
+    fn scalar_skip_eq_prunes_superfiles_whose_range_excludes_value() {
         let segs = vec![
             seg_with_int_stats("x", 0, 10),
             seg_with_int_stats("x", 100, 110),
@@ -755,8 +759,8 @@ mod tests {
     }
 
     #[test]
-    fn scalar_skip_null_stats_keeps_segment() {
-        let mut e = empty_segment();
+    fn scalar_skip_null_stats_keeps_superfile() {
+        let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
         e.scalar_stats.cols.insert("x".to_string(), (mn, mx));
@@ -769,10 +773,10 @@ mod tests {
     }
 
     #[test]
-    fn scalar_skip_not_eq_prunes_only_constant_segment() {
+    fn scalar_skip_not_eq_prunes_only_constant_superfile() {
         let segs = vec![seg_with_int_stats("x", 5, 5), seg_with_int_stats("x", 5, 9)];
-        // x != 5 → constant all-5 segment matches nothing → prune;
-        // the ranged segment is kept.
+        // x != 5 → constant all-5 superfile matches nothing → prune;
+        // the ranged superfile is kept.
         let mask = scalar_skip(
             &segs,
             &[pred("x", ScalarOp::NotEq, ScalarValue::Int64(Some(5)))],

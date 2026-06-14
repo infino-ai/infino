@@ -176,6 +176,7 @@ async fn recall_under_undersized_reservoir_matches_brute_force() {
             let query = &flat[q_idx * dim..(q_idx + 1) * dim];
             let approx: Vec<u32> = reader
                 .search("v", query, top_k, nprobe, rerank_mult)
+                .await
                 .expect("search")
                 .into_iter()
                 .map(|(d, _)| d)
@@ -256,6 +257,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         let query = &flat[q_idx * dim..(q_idx + 1) * dim];
         let approx: Vec<u32> = reader
             .search("v", query, top_k, n_cent, DEFAULT_RESERVOIR_RERANK_MULT)
+            .await
             .expect("search")
             .into_iter()
             .map(|(d, _)| d)

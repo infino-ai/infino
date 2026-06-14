@@ -479,7 +479,7 @@ impl VectorBuilder {
     /// push the floor lower still.
     ///
     /// Object-storage callers can pass a multipart upload
-    /// writer here so segment build never owns the full blob in
+    /// writer here so superfile build never owns the full blob in
     /// RAM.
     pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let VectorBuilder {
@@ -490,7 +490,7 @@ impl VectorBuilder {
 
         let n_columns = columns.len() as u32;
         // n_docs in the outer header is the max across columns
-        // (per-segment doc count; spec: same across all columns).
+        // (per-superfile doc count; spec: same across all columns).
         let n_docs: u64 = columns.iter().map(|c| c.n_docs as u64).max().unwrap_or(0);
 
         // Snapshot config + n_docs first so the directory loop
@@ -1309,7 +1309,7 @@ fn run_pass2(
         //
         // for `RerankCodec::RabitqOnly` we skip the per-row
         // fp32 vector write entirely — pass 3 doesn't materialise
-        // `full_layout` for that codec, and the on-disk segment
+        // `full_layout` for that codec, and the on-disk superfile
         // has no `full[]` region, so spilling the vectors to a
         // bucket file would be pure wasted I/O. At dim=384 this
         // drops the per-row bucket write from 1 588 B to 52 B
@@ -1619,9 +1619,11 @@ mod tests {
             let query = &corpus[q * dim..(q + 1) * dim];
             let top_ram = r_ram
                 .search("v", query, 1, nprobe, rerank_mult)
+                .await
                 .expect("search ram");
             let top_spill = r_spill
                 .search("v", query, 1, nprobe, rerank_mult)
+                .await
                 .expect("search spill");
             // Both paths must return self as top-1 — that's the
             // strict recall invariant, independent of the
@@ -1755,6 +1757,7 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.13).sin()).collect();
         let hits = reader
             .search("v", &query, 5, n_cent, n_docs + 1)
+            .await
             .expect("kNN search");
         assert!(!hits.is_empty(), "search returned no hits");
     }

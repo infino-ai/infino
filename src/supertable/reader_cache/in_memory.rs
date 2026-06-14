@@ -3,9 +3,9 @@
 
 //! In-memory reader cache.
 //!
-//! Holds every inserted segment's bytes in RAM for the
+//! Holds every inserted superfile's bytes in RAM for the
 //! supertable's lifetime. No eviction — total RAM is the sum of
-//! every published segment's bytes. Suitable for the in-memory
+//! every published superfile's bytes. Suitable for the in-memory
 //! supertable shape; not for corpora that exceed the host's RAM
 //! budget.
 //!
@@ -45,7 +45,7 @@ struct Entry {
     reader: Arc<SuperfileReader>,
 }
 
-/// `RwLock<HashMap<SuperfileUri, Entry>>`-backed segment store.
+/// `RwLock<HashMap<SuperfileUri, Entry>>`-backed superfile store.
 ///
 /// Cheap to clone *as `Arc<dyn SuperfileReaderCache>`* — but `Clone` is
 /// not implemented directly because cloning the inner map (vs the
@@ -236,7 +236,7 @@ mod tests {
         store.insert(uri, bytes.clone()).expect("idempotent insert");
         let r2 = store.reader(&uri).expect("second reader");
 
-        assert_eq!(store.n_superfiles(), 1, "still one segment");
+        assert_eq!(store.n_superfiles(), 1, "still one superfile");
         assert_eq!(
             store.resident_bytes(),
             bytes_after_first,
@@ -247,10 +247,10 @@ mod tests {
         assert!(Arc::ptr_eq(&r1, &r2));
     }
 
-    // ---- multi-segment accounting --------------------------------------
+    // ---- multi-superfile accounting --------------------------------------
 
     #[test]
-    fn resident_bytes_sums_across_segments() {
+    fn resident_bytes_sums_across_superfiles() {
         let store = InMemoryReaderCache::new();
         let bytes_a = minimal_superfile_bytes();
         let bytes_b = minimal_superfile_bytes();
@@ -360,7 +360,7 @@ mod tests {
         // proportionally.
         let resident = store.resident_bytes();
         assert!(resident > 0);
-        // Each segment is the same size (minimal_superfile_bytes
+        // Each superfile is the same size (minimal_superfile_bytes
         // is deterministic).
         let expected_per_seg = minimal_superfile_bytes().len();
         assert_eq!(resident, expected_per_seg * n);
@@ -389,7 +389,7 @@ mod tests {
             h.join().expect("thread panicked");
         }
 
-        // Exactly one segment in the store.
+        // Exactly one superfile in the store.
         assert_eq!(store.resident_bytes(), minimal_superfile_bytes().len());
         // All reads return the same Arc.
         let r1 = store.reader(&uri).expect("r1");

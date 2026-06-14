@@ -167,6 +167,7 @@ async fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
         // nprobe = n_cent ⇒ scan everything; rerank_mult plenty.
         let approx = reader
             .search("v", query, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
+            .await
             .expect("FTS search");
         // Exact should fully match approx: same doc set, top-1 must
         // be the query itself (distance 0).
@@ -194,6 +195,7 @@ async fn oracle_cosine_full_nprobe_recovers_exact_topk() {
         let exact = brute_force_top_k(&corpus, query, Metric::Cosine, ORACLE_TOP_K);
         let approx = reader
             .search("v", query, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
+            .await
             .expect("FTS search");
         assert_eq!(approx[0].0 as usize, q_idx);
         let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
@@ -218,6 +220,7 @@ async fn oracle_negdot_full_nprobe_recovers_exact_topk() {
         let exact = brute_force_top_k(&corpus, query, Metric::NegDot, ORACLE_TOP_K);
         let approx = reader
             .search("v", query, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
+            .await
             .expect("FTS search");
         // For NegDot, self-NN is *most negative dot* — for non-unit
         // vectors that's not necessarily the query itself. So we
@@ -253,6 +256,7 @@ async fn oracle_partial_nprobe_top1_preserved() {
                 PARTIAL_NPROBE,
                 PARTIAL_RERANK_MULT,
             )
+            .await
             .expect("FTS search");
         assert_eq!(
             approx[0].0 as usize, q_idx,
@@ -274,6 +278,7 @@ async fn oracle_distances_match_brute_force_within_tolerance() {
     let exact = brute_force_top_k(&corpus, query, Metric::L2Sq, ORACLE_TOP_K);
     let approx = reader
         .search("v", query, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
+        .await
         .expect("FTS search");
     // Build doc_id → exact_distance map.
     let exact_map: std::collections::HashMap<u32, f32> = exact.iter().copied().collect();
@@ -312,6 +317,7 @@ async fn oracle_nonself_query_topk_recovered() {
     // oracle checks).
     let approx = reader
         .search("v", &q, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
+        .await
         .expect("FTS search");
     let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
     let approx_set: std::collections::HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
@@ -340,6 +346,7 @@ async fn oracle_topk_distance_ordering_matches_exact() {
             ORACLE_N_CENT,
             ORDERING_RERANK_MULT,
         )
+        .await
         .expect("FTS search");
     for w in approx.windows(2) {
         assert!(w[0].1 <= w[1].1, "distances must be non-decreasing");

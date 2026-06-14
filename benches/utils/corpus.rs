@@ -14,7 +14,7 @@
 //! ## Scale policy
 //!
 //! Scale is fixed by *shape*, not by an environment variable:
-//! superfile-shape benches use [`SUPERFILE_DOCS`] (1M, one-segment
+//! superfile-shape benches use [`SUPERFILE_DOCS`] (1M, one-superfile
 //! scale), supertable-shape benches use [`SUPERTABLE_DOCS`] (10M,
 //! sharding scale). Vector at 10M × 384 (f32) = 14.6 GB resident —
 //! needs a 32 GB+ machine. There is deliberately no `INFINO_BENCH_FULL`
@@ -55,18 +55,24 @@ use infino::test_helpers::default_tokenizer;
 /// Drive an in-memory (no object-store I/O) async search to
 /// completion from sync bench code.
 ///
-/// The query/search API is `async` (Option A). Bench helpers that
-/// operate on in-memory `VectorReader` / `FtsReader` / in-process
-/// `Supertable` readers never touch the object store, so their
-/// futures resolve `Ready` without a tokio reactor — a plain
-/// `futures::executor::block_on` drives them with no runtime setup
-/// and, unlike `tokio::runtime::block_on`, never panics when nested
-/// inside another runtime. Real-object-store benches (see
-/// `unified_object_store`) drive their futures on an explicit
-/// multi-thread tokio runtime instead, because object_store needs
-/// the tokio reactor.
+/// The query/search API is `async`. In-memory `VectorReader` /
+/// `FtsReader` / `Supertable` readers never touch the object store, so
+/// their futures resolve without object-store I/O — but the search
+/// kernels bridge their CPU scans onto the rayon pool and `await` a
+/// oneshot for the result, which requires an ambient tokio runtime. So
+/// bench helpers drive them on one shared multi-thread runtime (built
+/// once, reused across every call — never a throwaway per-call
+/// runtime).
 pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
-    futures::executor::block_on(fut)
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let rt = RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("bench in-memory tokio runtime")
+    });
+    rt.block_on(fut)
 }
 
 // ─── Scale constants ──────────────────────────────────────────────────
@@ -82,26 +88,29 @@ pub const TOKENS_PER_DOC: usize = 200;
 /// FST + skip-table cold path).
 pub const VOCAB_SIZE: usize = 10_000;
 
-/// Vector dimension — matches modern sentence-embedding models
-/// (all-MiniLM-L6-v2 = 384, BGE-small = 384).
-pub const DIM: usize = 384;
+/// Vector dimension — matches modern large embedding models
+/// (OpenAI text-embedding-3-small = 1536 truncates to 1024,
+/// BGE-large = 1024, E5-large = 1024).
+pub const DIM: usize = 1024;
 
 /// One `(local_doc_id, distance)` hit — same shape `VectorReader::search`
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
 pub type Hit = (u32, f32);
 
-/// Doc count for superfile-shape benches (one-segment scale). 1M ×
-/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the warm tier and
-/// is the single-superfile cold-open unit for the warm/cold tiers.
+/// Doc count for superfile-shape benches (one-superfile scale). 1M ×
+/// 1024 (f32) ≈ 4 GB — mmap-backed corpus streams from disk, so only
+/// the engine's resident footprint (not the corpus) bounds RAM. It is
+/// the single-superfile cold-open unit for the warm/cold tiers.
 pub const SUPERFILE_DOCS: usize = 1_000_000;
 
 /// Doc count for supertable-shape benches (scale-out / sharding
-/// scale). 10M × 384 (f32) ≈ 14.6 GB resident — needs a 32 GB+ box.
-/// This is the headline supertable scale that the warm/cold tiers run
-/// over the object store.
+/// scale). 10M × 1024 (f32) ≈ 40 GB on disk — the mmap-backed corpus
+/// streams from disk (never fully resident), so disk space, not RAM,
+/// is the constraint at this dim. This is the headline supertable
+/// scale that the warm/cold tiers run over the object store.
 pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
-/// Document count for the **superfile** test — a single-segment index
+/// Document count for the **superfile** test — a single-superfile index
 /// built and queried entirely **in memory**. Defaults to
 /// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
 /// for a quicker local loop or a larger stress run.
@@ -109,7 +118,7 @@ pub fn superfile_docs() -> usize {
     docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
 }
 
-/// Document count for the **supertable** test — a multi-segment table
+/// Document count for the **supertable** test — a multi-superfile table
 /// committed to and queried from **object storage**. Defaults to
 /// [`SUPERTABLE_DOCS`] (10M); override with
 /// `INFINO_BENCH_SUPERTABLE_DOCS`.
@@ -322,6 +331,31 @@ impl MmapTextCorpus {
         (start..end).map(|idx| self.doc(idx)).collect()
     }
 
+    /// Drop the resident pages backing docs `[start, start + len)`
+    /// from this process's RSS (`MADV_DONTNEED`, best-effort). The
+    /// streamed build loop calls this after committing each chunk so
+    /// the whole-process RSS sampler measures the engine, not the
+    /// harness's already-consumed corpus pages. Page-rounding may also
+    /// drop a neighbouring chunk's boundary page — harmless; clean
+    /// file-backed pages transparently re-fault from the file.
+    pub fn advise_consumed(&self, start: usize, len: usize) {
+        let end = (start + len).min(self.n_docs());
+        if start >= end {
+            return;
+        }
+        let lo = page_floor(self.offsets[start] as usize);
+        let hi = self.offsets[end] as usize;
+        // SAFETY: read-only shared file mapping — `MADV_DONTNEED` can
+        // only discard clean pages, which re-fault from the backing
+        // file on the next touch; no data is mutated or lost. The
+        // byte range lies within the map by construction of `offsets`.
+        unsafe {
+            let _ =
+                self.map
+                    .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo);
+        }
+    }
+
     /// Materialize the whole corpus as `(doc_id, text)` rows borrowing
     /// from the mmap — the input shape the engine-generic FTS driver
     /// feeds to every engine. `doc_id` is the dense row index, so it
@@ -331,6 +365,17 @@ impl MmapTextCorpus {
             .map(|i| (i as u64, self.doc(i)))
             .collect()
     }
+}
+
+/// Page size assumed for `madvise` range alignment. 4 KiB on every
+/// Linux bench host; a larger real page size only makes the floor
+/// coarser, which is still correct (more bytes advised away).
+const PAGE_BYTES: usize = 4096;
+
+/// Round a byte offset down to the containing page boundary —
+/// `madvise` requires a page-aligned start address.
+fn page_floor(off: usize) -> usize {
+    off & !(PAGE_BYTES - 1)
 }
 
 pub mod combined;
@@ -469,6 +514,27 @@ impl MmapVectorCorpus {
     pub fn dim(&self) -> usize {
         self.dim
     }
+
+    /// Drop the resident pages backing rows `[start, start + len)`
+    /// from this process's RSS — same contract and safety argument as
+    /// [`MmapTextCorpus::advise_consumed`].
+    pub fn advise_consumed(&self, start: usize, len: usize) {
+        let end = (start + len).min(self.n_docs);
+        if start >= end {
+            return;
+        }
+        let row_bytes = self.dim * std::mem::size_of::<f32>();
+        let lo = page_floor(start * row_bytes);
+        let hi = end * row_bytes;
+        // SAFETY: read-only shared file mapping — `MADV_DONTNEED` only
+        // discards clean pages, which re-fault from the backing file;
+        // the range lies within the map (`end <= n_docs`).
+        unsafe {
+            let _ =
+                self.map
+                    .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo);
+        }
+    }
 }
 
 // ─── Query batteries ──────────────────────────────────────────────────
@@ -580,16 +646,77 @@ pub fn brute_force_topk_cosine(
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
-/// Brute-force top-k per query for a whole batch.
+/// Docs per parallel work unit in the transposed ground-truth pass —
+/// big enough to amortize per-chunk heap setup, small enough to
+/// load-balance the tail across the rayon pool.
+const GT_DOC_CHUNK: usize = 8192;
+
+/// Brute-force exact top-k for a whole query batch in ONE streaming
+/// pass over the corpus.
+///
+/// The loop is transposed (doc-major): every doc's vector is scored
+/// against all queries while its bytes are hot, with one bounded
+/// top-k list per query. At bench scale the corpus is an mmap many
+/// times larger than RAM, so the naive per-query loop costs
+/// O(queries × corpus_bytes) of page traffic — 7.7 TB of reads for
+/// 100 queries over a 50M×384 corpus, hours of wall time. The
+/// transpose makes it O(corpus_bytes) total, regardless of batch
+/// size. Ties break toward the lower doc id (the per-query reference
+/// kernel leaves tie order unspecified); equality with the reference
+/// is pinned by `transposed_ground_truth_matches_reference`.
 pub fn ground_truth(
     vectors: &[f32],
     n_docs: usize,
     queries: &[Vec<f32>],
     k: usize,
 ) -> Vec<Vec<u32>> {
-    queries
-        .iter()
-        .map(|q| brute_force_topk_cosine(vectors, n_docs, q, k))
+    use rayon::prelude::*;
+
+    assert_eq!(vectors.len(), n_docs * DIM);
+    if queries.is_empty() || n_docs == 0 || k == 0 {
+        return vec![Vec::new(); queries.len()];
+    }
+
+    // Per-query candidate lists sorted ascending by (neg_dot, id) —
+    // best first, worst last, at most k entries.
+    let better = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+    let merge = |mut acc: Vec<Vec<(f32, u32)>>, part: Vec<Vec<(f32, u32)>>| {
+        for (a, p) in acc.iter_mut().zip(part) {
+            a.extend(p);
+            a.sort_unstable_by(better);
+            a.truncate(k);
+        }
+        acc
+    };
+
+    vectors
+        .par_chunks(GT_DOC_CHUNK * DIM)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let base = (chunk_idx * GT_DOC_CHUNK) as u32;
+            let mut tops: Vec<Vec<(f32, u32)>> = vec![Vec::with_capacity(k + 1); queries.len()];
+            for (j, doc) in chunk.chunks_exact(DIM).enumerate() {
+                let id = base + j as u32;
+                for (top, q) in tops.iter_mut().zip(queries) {
+                    let mut dot = 0f32;
+                    for d in 0..DIM {
+                        dot += doc[d] * q[d];
+                    }
+                    let cand = (-dot, id);
+                    if top.len() == k && better(&cand, top.last().expect("non-empty at k")).is_ge()
+                    {
+                        continue;
+                    }
+                    let pos = top.partition_point(|e| better(e, &cand).is_lt());
+                    top.insert(pos, cand);
+                    top.truncate(k);
+                }
+            }
+            tops
+        })
+        .reduce(|| vec![Vec::new(); queries.len()], merge)
+        .into_iter()
+        .map(|top| top.into_iter().map(|(_, id)| id).collect())
         .collect()
 }
 
@@ -617,9 +744,8 @@ pub fn mean_recall_infino(
 ) -> f32 {
     let mut sum = 0f32;
     for (q, t) in queries.iter().zip(truths) {
-        let hits = reader
-            .search("v", q, k, nprobe, rerank_mult)
-            .expect("vector search");
+        let hits =
+            block_on_inmem(reader.search("v", q, k, nprobe, rerank_mult)).expect("vector search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -702,7 +828,8 @@ pub fn calibrate_infino(
             let q = &queries[0];
             let p50 = p50_micros(
                 || {
-                    let _ = reader.search("v", q, k, probe, refine).expect("search");
+                    let _ =
+                        block_on_inmem(reader.search("v", q, k, probe, refine)).expect("search");
                 },
                 p50_iter,
             );
@@ -799,7 +926,7 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
 /// Build a stand-alone vector index. `vectors` is flat `n_docs * DIM`.
 ///
 /// Bench harness picks `Sq8` by default to match the on-disk
-/// default for production segments. Per-cluster scale/offset
+/// default for production superfiles. Per-cluster scale/offset
 /// quantizer is the active codec (drop ≤ 0.04 on the
 /// pathological planted-cluster synthetic; expected near-zero on
 /// real embeddings). Callers measuring the Fp32 baseline (recall
@@ -937,4 +1064,41 @@ pub fn build_superfile_with_metric(
 /// Open a finished superfile blob.
 pub fn open_superfile(bytes: Vec<u8>) -> SuperfileReader {
     SuperfileReader::open(Bytes::from(bytes)).expect("open superfile")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Corpus size for the oracle-equivalence test — a few parallel
+    /// chunks' worth so the chunked/merged path is exercised.
+    const GT_TEST_DOCS: usize = 3 * GT_DOC_CHUNK + 17;
+    /// Query batch size for the oracle-equivalence test.
+    const GT_TEST_QUERIES: usize = 7;
+    /// Top-k for the oracle-equivalence test.
+    const GT_TEST_K: usize = 10;
+    /// Seed for the test's corpus + queries.
+    const GT_TEST_SEED: u64 = 42;
+
+    #[test]
+    fn transposed_ground_truth_matches_reference() {
+        use rand::prelude::*;
+        let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
+        let mut vectors = vec![0f32; GT_TEST_DOCS * DIM];
+        for v in vectors.iter_mut() {
+            *v = rng.random::<f32>() - 0.5;
+        }
+        let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
+            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+
+        let transposed = ground_truth(&vectors, GT_TEST_DOCS, &queries, GT_TEST_K);
+        for (q, got) in queries.iter().zip(&transposed) {
+            let reference = brute_force_topk_cosine(&vectors, GT_TEST_DOCS, q, GT_TEST_K);
+            assert_eq!(
+                got, &reference,
+                "transposed oracle diverged from the per-query reference"
+            );
+        }
+    }
 }

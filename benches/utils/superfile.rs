@@ -3,6 +3,87 @@
 
 //! Superfile-layer benchmark runners grouped by modality.
 
+use crate::cost;
+use crate::report::{Better, Cell, Report, metric, text};
+use crate::rss;
+
+/// Shared headers for the single-superfile ingest tables (fts / vector /
+/// sql), so the three modalities can't drift. `Corpus` is the raw input
+/// payload fed to the build; `Stored` is the built superfile's size on
+/// disk (full Parquet data pages + embedded BM25/vector indexes) and its
+/// share of the corpus.
+fn ingest_headers() -> Vec<String> {
+    [
+        "Build",
+        "Time",
+        "Throughput",
+        "Bandwidth",
+        "Corpus",
+        "Stored",
+        "Peak RSS",
+        "Median RSS",
+        "P90 RSS",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The `(Corpus, Stored)` cell pair shared by every single-superfile
+/// ingest row; `Stored` carries its percentage of `Corpus` inline.
+fn corpus_stored_cells(corpus_bytes: u64, stored_bytes: u64) -> [Cell; 2] {
+    let stored_pct = if corpus_bytes > 0 {
+        100.0 * stored_bytes as f64 / corpus_bytes as f64
+    } else {
+        0.0
+    };
+    [
+        text(rss::fmt_bytes(corpus_bytes)),
+        metric(
+            stored_bytes as f64,
+            format!("{} ({stored_pct:.0}%)", rss::fmt_bytes(stored_bytes)),
+            Better::Lower,
+        ),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cost_warm(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    ingest_wall_s: f64,
+    writers: u32,
+    stored_bytes: u64,
+    corpus_bytes: u64,
+    n_docs: usize,
+    warm: &[(String, f64)],
+) {
+    if warm.is_empty() {
+        return;
+    }
+    let resident = rss::current_anon_rss_bytes().unwrap_or(0);
+    cost::emit(
+        report,
+        anchor,
+        title,
+        &cost::CellCost {
+            ingest_wall_s,
+            writers,
+            put_count: 1,
+            stored_bytes,
+            corpus_bytes,
+            n_docs,
+            resident_anon_bytes: resident,
+            warm,
+            cold: None,
+            cold_store: None,
+            storage_months: None,
+            cold_open_amortized: false,
+        },
+    );
+}
+
 pub mod fts {
     // SPDX-License-Identifier: Apache-2.0
     // SPDX-FileCopyrightText: Copyright The Infino Authors
@@ -42,6 +123,7 @@ pub mod fts {
     //! ```
 
     use std::collections::HashMap;
+    use std::hint::black_box;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -50,6 +132,7 @@ pub mod fts {
     use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
 
     use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
+    use crate::cost;
     use crate::executors::ColdTiming;
     use crate::executors::fts as exec_fts;
     use crate::executors::fts::{FTS_BATTERY, FtsRead};
@@ -81,6 +164,33 @@ pub mod fts {
     // ─── Query battery (shared by warm search, cold tier, recall id grading) ─
 
     // FTS query battery + OR/AND name lists live in `crate::executors::fts`.
+
+    /// Negation (`-term`) queries, timed through the string `bm25_hits_async`
+    /// path — the shared battery is pretokenized and can't carry the
+    /// sigil. Mid-frequency positives so scores differentiate; the
+    /// negated term is common (long excluded list) or rare.
+    const NEGATION_QUERIES: &[(&str, &str, InfinoBoolMode)] = &[
+        (
+            "mid_pos_common_neg",
+            "term00050 -term00005",
+            InfinoBoolMode::Or,
+        ),
+        (
+            "mid_pos_rare_neg",
+            "term00050 -term09000",
+            InfinoBoolMode::Or,
+        ),
+        (
+            "two_mid_or_common_neg",
+            "term00050 term00100 -term00005",
+            InfinoBoolMode::Or,
+        ),
+        (
+            "two_mid_and_common_neg",
+            "term00050 term00100 -term00005",
+            InfinoBoolMode::And,
+        ),
+    ];
 
     /// Per-algorithm probe shapes (OR-only; WAND+BMW vs MaxScore+BMM). This
     /// is an infino-internal hook with no cross-engine analogue.
@@ -238,22 +348,61 @@ pub mod fts {
         samples[(samples.len() - 1) / 2]
     }
 
+    /// One warmup call, then `WARM_ITERS` timed calls of `run`; returns
+    /// the p50. Shared scaffold for the manual hot-timing paths.
+    fn hot_p50<T>(mut run: impl FnMut() -> T) -> Duration {
+        black_box(run());
+        let mut samples = Vec::with_capacity(WARM_ITERS);
+        for _ in 0..WARM_ITERS {
+            let t = Instant::now();
+            let out = run();
+            samples.push(t.elapsed());
+            black_box(out);
+        }
+        p50(&mut samples)
+    }
+
     /// WAND+BMW vs MaxScore+BMM p50 for one OR shape, via the infino
     /// internal per-algorithm hook.
     fn probe_algo_p50(reader: &SuperfileReader, terms: &[&str], algo: OrAlgo) -> Duration {
         let fts = reader.fts().expect("FTS subsection");
-        // Warmup.
-        let _ = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
-            .expect("probe warmup");
-        let mut samples = Vec::with_capacity(WARM_ITERS);
-        for _ in 0..WARM_ITERS {
-            let t = Instant::now();
-            let hits = block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
-                .expect("probe search");
-            samples.push(t.elapsed());
-            std::hint::black_box(hits);
+        hot_p50(|| {
+            block_on_inmem(fts.search_with_algo_for_bench(FTS_COLUMN, terms, K, algo))
+                .expect("probe search")
+        })
+    }
+
+    /// Hot p50 for one negation query, through the string path (which
+    /// parses the `-` sigil).
+    fn negation_p50(reader: &SuperfileReader, query: &str, mode: InfinoBoolMode) -> Duration {
+        hot_p50(|| {
+            block_on_inmem(reader.bm25_hits_async(FTS_COLUMN, query, K, mode))
+                .expect("negation search")
+        })
+    }
+
+    /// Negation correctness gate: each query must return hits, and no
+    /// hit's doc may contain a negated term (checked against the corpus
+    /// text).
+    fn assert_negation_excludes(reader: &SuperfileReader, docs: &[(u64, &str)]) {
+        for (name, query, mode) in NEGATION_QUERIES {
+            let negated: Vec<&str> = query
+                .split_whitespace()
+                .filter_map(|r| r.strip_prefix('-'))
+                .collect();
+            let hits = block_on_inmem(reader.bm25_hits_async(FTS_COLUMN, query, K, *mode))
+                .expect("negation oracle search");
+            assert!(!hits.is_empty(), "{name}: no hits");
+            for (doc_id, _) in &hits {
+                let text = docs[*doc_id as usize].1;
+                for neg in &negated {
+                    assert!(
+                        !text.split_whitespace().any(|w| w == *neg),
+                        "{name}: doc {doc_id} contains negated term {neg:?}"
+                    );
+                }
+            }
         }
-        p50(&mut samples)
     }
 
     // ─── Entry point ──────────────────────────────────────────────────────
@@ -274,7 +423,13 @@ pub mod fts {
         let mut report = Report::load("superfile_fts");
 
         if phases.build {
-            emit_build(&mut report, n_docs, &corpus, &result);
+            emit_build(
+                &mut report,
+                n_docs,
+                &corpus,
+                &result,
+                index.bytes().len() as u64,
+            );
         }
 
         if phases.warm || phases.cold {
@@ -291,21 +446,93 @@ pub mod fts {
                 )
             });
             let probes = phases.warm.then(|| measure_warm_probes(&index));
-            let cold = phases.cold.then(|| measure_cold_queries(&index));
-            exec_fts::emit_search(
-                &mut report,
-                "bench/fts/superfile/search",
-                format!(
-                    "Superfile FTS — search, single-segment / in-memory ({} docs)",
-                    fmt_count(n_docs)
-                ),
-                "Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on \
-                 object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). \
-                 Δ is vs the previous run.",
-                warm.as_deref(),
-                cold.as_ref(),
-                probes.as_deref(),
-            );
+            let negations = phases.warm.then(|| {
+                let docs = corpus.rows();
+                assert_negation_excludes(index.reader(), &docs);
+                eprintln!(
+                    "[superfile_fts] negation battery: {} queries × {WARM_ITERS} timed iters...",
+                    NEGATION_QUERIES.len(),
+                );
+                NEGATION_QUERIES
+                    .iter()
+                    .map(|(name, query, mode)| (*name, negation_p50(index.reader(), query, *mode)))
+                    .collect::<Vec<(&'static str, Duration)>>()
+            });
+            if phases.warm || probes.is_some() {
+                exec_fts::emit_search(
+                    &mut report,
+                    "bench/fts/superfile/search",
+                    format!(
+                        "Superfile FTS — search, single-superfile / in-memory ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on \
+                     object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). \
+                     Δ is vs the previous run.",
+                    warm.as_deref(),
+                    None,
+                    probes.as_deref(),
+                );
+            }
+            if let Some(rows) = negations {
+                report.emit(&Section {
+                    anchor: "bench/fts/superfile/negation".into(),
+                    title: format!(
+                        "Superfile FTS — negation (`-term`), warm ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    note: "Through the string `bm25_hits_async` path (parses the `-` sigil); \
+                           a correctness gate (no hit contains a negated term) runs before \
+                           timing. Δ is vs the previous run."
+                        .into(),
+                    blocks: vec![Block {
+                        subtitle: "Negation queries".into(),
+                        headers: vec!["Query".into(), "warm".into()],
+                        rows: rows
+                            .iter()
+                            .map(|(name, d)| {
+                                let ns = d.as_secs_f64() * 1e9;
+                                vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+                            })
+                            .collect(),
+                    }],
+                });
+            }
+            if phases.warm
+                && let Some(ref warm_stats) = warm
+            {
+                let b = result
+                    .builds
+                    .last()
+                    .expect("harness records at least one build row");
+                super::emit_cost_warm(
+                    &mut report,
+                    "bench/fts/superfile/cost",
+                    format!("Superfile FTS — cost model ({} docs)", fmt_count(n_docs)),
+                    b.phase.wall.as_secs_f64(),
+                    b.writers as u32,
+                    index.bytes().len() as u64,
+                    corpus.total_bytes(),
+                    n_docs,
+                    &cost::warm_from_fts(warm_stats),
+                );
+            }
+            if phases.cold {
+                let cold = measure_cold_queries(&index);
+                exec_fts::emit_search(
+                    &mut report,
+                    "bench/fts/superfile/cold",
+                    format!(
+                        "Superfile FTS — cold search, object-store ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Cold = same `.parquet` committed to object storage, read through \
+                     `DiskCacheStore::reader` with a fresh cache per iteration. Δ is vs the previous run.",
+                    None,
+                    Some(&cold),
+                    None,
+                );
+            }
         }
 
         report.save();
@@ -394,7 +621,7 @@ pub mod fts {
         let storage = Arc::clone(&committed.storage);
         let uri = committed.uri;
         exec_fts::measure_cold(
-            || SuperfileColdGuard::open(Arc::clone(&storage), uri),
+            || SuperfileColdGuard::open(Arc::clone(&storage), uri, committed.object_size),
             FTS_BATTERY,
             FTS_COLUMN,
             K,
@@ -416,9 +643,9 @@ pub mod fts {
         fn open(
             storage: Arc<dyn infino::supertable::storage::StorageProvider>,
             uri: infino::supertable::manifest::SuperfileUri,
+            known_size: u64,
         ) -> Self {
-            let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
-            let reader = tiers::block_on(async { cache.reader(&uri).await.expect("cold reader") });
+            let (cache_dir, reader) = tiers::open_superfile_cold_reader(storage, &uri, known_size);
             Self {
                 _cache_dir: cache_dir,
                 reader,
@@ -436,30 +663,40 @@ pub mod fts {
                     .len()
             })
         }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize {
+            exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
+        }
     }
 
     // ─── Result rendering (run-to-run deltas via report.rs) ───────────────
-
-    fn headers(cols: &[&str]) -> Vec<String> {
-        cols.iter().map(|s| s.to_string()).collect()
-    }
 
     fn ingest_row(
         label: &str,
         n_docs: usize,
         wall: Duration,
         stats: RssStats,
-        input_bytes: f64,
+        corpus_bytes: u64,
+        stored_bytes: u64,
     ) -> Vec<Cell> {
         let secs = wall.as_secs_f64();
         let ns = secs * NS_PER_SEC;
         let thr = n_docs as f64 / secs;
-        let bw = input_bytes / secs;
+        let bw = corpus_bytes as f64 / secs;
+        let [corpus_cell, stored_cell] = super::corpus_stored_cells(corpus_bytes, stored_bytes);
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
             metric(thr, fmt_throughput(thr), Better::Higher),
             metric(bw, fmt_bandwidth(bw), Better::Higher),
+            corpus_cell,
+            stored_cell,
             metric(
                 stats.peak_rss_bytes as f64,
                 rss::fmt_bytes(stats.peak_rss_bytes),
@@ -491,10 +728,11 @@ pub mod fts {
         n_docs: usize,
         corpus: &MmapTextCorpus,
         result: &EngineFtsResult,
+        stored_bytes: u64,
     ) {
         // Logical input payload: total corpus text bytes, identical across
         // every writer count (the parallel build shards the same corpus).
-        let input_bytes = corpus.total_bytes() as f64;
+        let corpus_bytes = corpus.total_bytes();
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
@@ -504,27 +742,20 @@ pub mod fts {
                     n_docs,
                     b.phase.wall,
                     b.phase.rss,
-                    input_bytes,
+                    corpus_bytes,
+                    stored_bytes,
                 )
             })
             .collect();
         let block = Block {
             subtitle: String::new(),
-            headers: headers(&[
-                "Build",
-                "Time",
-                "Throughput",
-                "Bandwidth",
-                "Peak RSS",
-                "Median RSS",
-                "P90 RSS",
-            ]),
+            headers: super::ingest_headers(),
             rows,
         };
         report.emit(&Section {
             anchor: "bench/fts/superfile/ingest".into(),
             title: format!(
-                "Superfile FTS — ingest, single-segment / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
+                "Superfile FTS — ingest, single-superfile / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
                 fmt_count(n_docs)
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable \
@@ -567,6 +798,7 @@ pub mod vector {
     use std::time::Duration;
 
     use crate::corpus::{self, DIM};
+    use crate::cost;
     use crate::executors::vector as exec_vec;
     use crate::executors::vector::VectorRead;
     use crate::harness::{
@@ -673,17 +905,26 @@ pub mod vector {
         }
     }
 
-    fn build_row(label: &str, n_docs: usize, wall: Duration, stats: rss::RssStats) -> Vec<Cell> {
+    fn build_row(
+        label: &str,
+        n_docs: usize,
+        wall: Duration,
+        stats: rss::RssStats,
+        corpus_bytes: u64,
+        stored_bytes: u64,
+    ) -> Vec<Cell> {
         let secs = wall.as_secs_f64();
         let ns = secs * NS_PER_SEC;
-        let input_bytes = (n_docs * DIM * std::mem::size_of::<f32>()) as f64;
         let thr = n_docs as f64 / secs;
-        let bw = input_bytes / secs;
+        let bw = corpus_bytes as f64 / secs;
+        let [corpus_cell, stored_cell] = super::corpus_stored_cells(corpus_bytes, stored_bytes);
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
             metric(thr, fmt_throughput(thr), Better::Higher),
             metric(bw, fmt_bandwidth(bw), Better::Higher),
+            corpus_cell,
+            stored_cell,
             metric(
                 stats.peak_rss_bytes as f64,
                 rss::fmt_bytes(stats.peak_rss_bytes),
@@ -713,7 +954,7 @@ pub mod vector {
         );
         let (build_result, index) = build_warm_artifact(n_docs);
 
-        let build_rows = build_rows(n_docs, &build_result);
+        let build_rows = build_rows(n_docs, &build_result, index.bytes().len() as u64);
         let mut report = Report::load("superfile_vector");
         if phases.build {
             emit_build(&mut report, n_docs, build_rows);
@@ -723,13 +964,18 @@ pub mod vector {
             let committed = phases.cold.then(|| commit_cold_artifact(&index));
             let open_cold = || {
                 let committed = committed.as_ref().expect("cold artifact present");
-                SuperfileVecColdGuard::open(Arc::clone(&committed.storage), committed.uri)
+                SuperfileVecColdGuard::open(
+                    Arc::clone(&committed.storage),
+                    committed.uri,
+                    committed.object_size,
+                )
             };
-            exec_vec::run_search(
+            let recall_rows = exec_vec::run_search(
                 &mut report,
                 index.reader(),
                 open_cold,
                 VEC_COLUMN,
+                n_docs,
                 TOP_K,
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,
@@ -740,30 +986,58 @@ pub mod vector {
                 phases.warm,
                 phases.cold,
                 3,
+                false,
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(
-                    "Superfile vector — search, single-segment / in-memory ({} docs × dim={DIM})",
+                    "Superfile vector — search, single-superfile / in-memory ({} docs × dim={DIM})",
                     fmt_count(n_docs)
                 ),
                 "Correctness, warm search, and cold upload reuse the measured 1-writer artifact. Recall rows use the lowest-p50 calibrated point meeting each target; `default` is the user-facing option baseline. Δ is vs the previous run.",
             );
+            if phases.warm {
+                let b = build_result
+                    .builds
+                    .last()
+                    .expect("harness records at least one build row");
+                let corpus_bytes = (n_docs * DIM) as u64 * std::mem::size_of::<f32>() as u64;
+                super::emit_cost_warm(
+                    &mut report,
+                    "bench/vector/superfile/cost",
+                    format!(
+                        "Superfile vector — cost model ({} docs × dim={DIM})",
+                        fmt_count(n_docs)
+                    ),
+                    b.wall.as_secs_f64(),
+                    b.writers as u32,
+                    index.bytes().len() as u64,
+                    corpus_bytes,
+                    n_docs,
+                    &cost::warm_from_vector(&recall_rows),
+                );
+            }
 
             struct SuperfileVecColdGuard {
                 _cache_dir: tempfile::TempDir,
-                cache: Arc<infino::supertable::reader_cache::DiskCacheStore>,
-                uri: infino::supertable::manifest::SuperfileUri,
+                reader: Arc<infino::superfile::SuperfileReader>,
             }
             impl SuperfileVecColdGuard {
+                /// The reader open (footer + KV fetch over the object
+                /// store) happens HERE so the cold driver bills it to
+                /// the "cold open" leg — mirroring the FTS guard. A
+                /// constructor that only builds the cache makes the
+                /// open column measure an empty struct while the
+                /// search column silently absorbs the open cost.
                 fn open(
                     storage: Arc<dyn infino::supertable::storage::StorageProvider>,
                     uri: infino::supertable::manifest::SuperfileUri,
+                    known_size: u64,
                 ) -> Self {
-                    let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
+                    let (cache_dir, reader) =
+                        tiers::open_superfile_cold_reader(storage, &uri, known_size);
                     Self {
                         _cache_dir: cache_dir,
-                        cache,
-                        uri,
+                        reader,
                     }
                 }
             }
@@ -777,8 +1051,7 @@ pub mod vector {
                     rerank: usize,
                 ) -> Vec<(u32, f32)> {
                     tiers::block_on(async {
-                        let reader = self.cache.reader(&self.uri).await.expect("cold reader");
-                        reader
+                        self.reader
                             .vector_hits_async(
                                 column,
                                 query,
@@ -834,10 +1107,24 @@ pub mod vector {
         )))
     }
 
-    fn build_rows(n_docs: usize, build_result: &EngineVectorResult) -> Vec<Vec<Cell>> {
+    fn build_rows(
+        n_docs: usize,
+        build_result: &EngineVectorResult,
+        stored_bytes: u64,
+    ) -> Vec<Vec<Cell>> {
+        // Logical input payload: the raw f32 embeddings, identical across
+        // every writer count (the parallel build shards the same corpus).
+        let corpus_bytes = (n_docs * DIM * size_of::<f32>()) as u64;
         let mut rows = Vec::new();
         for b in &build_result.builds {
-            rows.push(build_row(&writer_label(b.writers), n_docs, b.wall, b.rss));
+            rows.push(build_row(
+                &writer_label(b.writers),
+                n_docs,
+                b.wall,
+                b.rss,
+                corpus_bytes,
+                stored_bytes,
+            ));
         }
         rows
     }
@@ -846,21 +1133,13 @@ pub mod vector {
         report.emit(&Section {
             anchor: "bench/vector/superfile/ingest".into(),
             title: format!(
-                "Superfile vector — ingest, single-segment / in-memory ({} docs × dim={DIM})",
+                "Superfile vector — ingest, single-superfile / in-memory ({} docs × dim={DIM})",
                 fmt_count(n_docs)
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. Rows are by writer count; `1 writer` is the canonical artifact used by correctness/search/cold upload. Δ is vs the previous run.".into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec![
-                    "Build".into(),
-                    "Time".into(),
-                    "Throughput".into(),
-                    "Bandwidth".into(),
-                    "Peak RSS".into(),
-                    "Median RSS".into(),
-                    "P90 RSS".into(),
-                ],
+                headers: super::ingest_headers(),
                 rows: build_rows,
             }],
         });
@@ -888,17 +1167,20 @@ pub mod sql {
     //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile sql
     //! ```
 
-    use crate::executors::sql as exec_sql;
-    use crate::executors::sql::SqlRead;
+    use std::sync::Arc;
+
     use infino::supertable::Supertable;
 
     use crate::corpus::{self, MmapTextCorpus};
+    use crate::cost;
+    use crate::executors::sql as exec_sql;
+    use crate::executors::sql::SqlRead;
     use crate::harness::{
         EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
         build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
         sql_options,
     };
-    use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
+    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
     use crate::rss::{self, RssStats};
     use crate::supertable::Phases;
@@ -938,7 +1220,8 @@ pub mod sql {
 
         let mut report = Report::load("sql");
         if phases.build {
-            emit_build(&mut report, n_docs, &corpus, &result);
+            let stored = stored_bytes(&index);
+            emit_build(&mut report, n_docs, &corpus, &result, stored);
         }
         if phases.warm {
             exec_sql::assert_correct(&index, n_docs, "superfile_sql");
@@ -955,8 +1238,23 @@ pub mod sql {
                     "Superfile SQL — query, single superfile / in-memory ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm p50 over `query_sql` against the canonical 1-writer table. The headline comparison is Plain Scan vs FTS-pushdown (same selective equality, 1 row, sorted vs unsorted column). The first block is aggregations & count-filters. `Rows` is the result-set size. Δ is vs the previous run.",
+                "Warm p50 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here). Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
                 &sets,
+            );
+            let b = result
+                .builds
+                .last()
+                .expect("harness records at least one build row");
+            super::emit_cost_warm(
+                &mut report,
+                "bench/sql/superfile/cost",
+                format!("Superfile SQL — cost model ({} rows)", fmt_count(n_docs)),
+                b.wall.as_secs_f64(),
+                b.writers as u32,
+                stored_bytes(&index),
+                corpus.total_bytes(),
+                n_docs,
+                &cost::warm_from_sql(&sets),
             );
         }
         if phases.cold {
@@ -1037,7 +1335,7 @@ pub mod sql {
             fmt_count(rows.len())
         );
         let fixture = tiers::block_on(tiers::superfile_storage_fixture());
-        let (cache_dir, cache) = tiers::fresh_disk_cache(std::sync::Arc::clone(&fixture.storage));
+        let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&fixture.storage));
         let opts = sql_options(rows.len())
             .with_storage(std::sync::Arc::clone(&fixture.storage))
             .with_disk_cache(cache.clone())
@@ -1085,7 +1383,7 @@ pub mod sql {
         let cold = exec_sql::measure_cold(
             || {
                 let (cache_dir, table) = open_cold_consumer(&artifact);
-                crate::executors::open_all_segments(&table);
+                crate::executors::open_all_superfiles(&table);
                 SqlColdGuard {
                     _cache_dir: cache_dir,
                     table,
@@ -1145,13 +1443,29 @@ pub mod sql {
         ]
     }
 
+    /// Total on-storage footprint of the built superfile(s): full Parquet
+    /// (data pages + embedded indexes), summed from the manifest. Same
+    /// derivation as the cold artifact's `total_index_bytes`.
+    fn stored_bytes(index: &InfinoSqlIndex) -> u64 {
+        index
+            .table()
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter_map(|entry| entry.subsection_offsets.as_ref())
+            .map(|offsets| offsets.total_size)
+            .sum()
+    }
+
     fn emit_build(
         report: &mut Report,
         n_docs: usize,
         corpus: &MmapTextCorpus,
         result: &EngineSqlResult,
+        stored_bytes: u64,
     ) {
-        let input_bytes = corpus.total_bytes() as f64;
+        let corpus_bytes = corpus.total_bytes();
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
@@ -1159,12 +1473,16 @@ pub mod sql {
                 let secs = b.wall.as_secs_f64();
                 let ns = secs * 1e9;
                 let thr = n_docs as f64 / secs;
-                let mbps = input_bytes / secs / 1e6;
+                let bw = corpus_bytes as f64 / secs;
+                let [corpus_cell, stored_cell] =
+                    super::corpus_stored_cells(corpus_bytes, stored_bytes);
                 let mut cells = vec![
                     text(writer_label(b.writers)),
                     metric(ns, fmt_time(ns), Better::Lower),
                     metric(thr, fmt_throughput(thr), Better::Higher),
-                    metric(mbps, format!("{mbps:.1} MB/s"), Better::Higher),
+                    metric(bw, fmt_bandwidth(bw), Better::Higher),
+                    corpus_cell,
+                    stored_cell,
                 ];
                 cells.extend(rss_cells(b.rss));
                 cells
@@ -1183,15 +1501,7 @@ pub mod sql {
                 .into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec![
-                    "Build".into(),
-                    "Time".into(),
-                    "Throughput".into(),
-                    "Bandwidth".into(),
-                    "Peak RSS".into(),
-                    "Median RSS".into(),
-                    "P90 RSS".into(),
-                ],
+                headers: super::ingest_headers(),
                 rows,
             }],
         });

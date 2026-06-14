@@ -24,6 +24,7 @@ pub mod aggregates;
 pub mod bloom;
 pub mod commit;
 pub mod encoding;
+pub mod hll;
 pub mod list;
 pub mod list_prune;
 pub mod options_hash;
@@ -38,13 +39,15 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Schema;
 use uuid::Uuid;
 
+use crate::superfile::vector::distance::Metric;
+
 use bloom::Bloom;
 
 use super::options::SupertableOptions;
 
 /// One immutable point-in-time view of the supertable.
 ///
-/// **Construction is copy-on-write.** Adding a segment via
+/// **Construction is copy-on-write.** Adding a superfile via
 /// [`Manifest::with_appended`] returns a new `Manifest` whose
 /// `superfiles` is `Vec::clone()` + new entries appended; the original
 /// `Manifest`'s `superfiles` is unchanged. `Arc<SuperfileEntry>` shares
@@ -74,7 +77,7 @@ pub struct SuperfileList {
     /// Pointer back to the immutable per-supertable configuration.
     /// Same Arc across all manifests of one supertable.
     pub options: Arc<SupertableOptions>,
-    /// Append-only list of segment entries. Each entry's `Arc`-share
+    /// Append-only list of superfile entries. Each entry's `Arc`-share
     /// is what makes the copy-on-write per-commit construction
     /// cheap.
     pub superfiles: Vec<Arc<SuperfileEntry>>,
@@ -309,8 +312,8 @@ pub enum ManifestLoadError {
     Parse(#[from] part::PartParseError),
 }
 
-/// One segment's metadata + skip-pruning summaries. The bytes that
-/// back the segment live in the segment store keyed by `uri` —
+/// One superfile's metadata + skip-pruning summaries. The bytes that
+/// back the superfile live in the superfile store keyed by `uri` —
 /// `superfile_id` is for debugging / observability, `uri` is for
 /// store routing.
 #[derive(Debug)]
@@ -351,7 +354,7 @@ pub struct SuperfileEntry {
     /// from the configured strategy at commit time.
     pub partition_key: Vec<u8>,
     /// Hash partitioning operates per-row, but at commit time we
-    /// only have per-segment summaries. Hash strategy requires
+    /// only have per-superfile summaries. Hash strategy requires
     /// superfiles to be pre-sharded — each builder-shard stamps the
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
@@ -367,7 +370,7 @@ pub struct SuperfileEntry {
     /// the values are by construction consistent with what the
     /// parquet KV metadata would later say).
     ///
-    /// `None` on segments produced by older writers that did not
+    /// `None` on superfiles produced by older writers that did not
     /// stamp this field; the cold open path falls back to the
     /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
@@ -394,10 +397,10 @@ pub struct SubsectionOffsets {
     /// but available without any I/O.
     pub total_size: u64,
     /// Absolute `(offset, length)` of the vector subsection. `None`
-    /// when the segment carries no vector subsection.
+    /// when the superfile carries no vector subsection.
     pub vec: Option<(u64, u64)>,
     /// Absolute `(offset, length)` of the FTS subsection. `None`
-    /// when the segment carries no FTS subsection.
+    /// when the superfile carries no FTS subsection.
     pub fts: Option<(u64, u64)>,
     /// Absolute ranges that fully cover vector open-time metadata.
     /// The hinted cache path prefetches these in the first network
@@ -408,20 +411,20 @@ pub struct SubsectionOffsets {
     /// header+dictionary and doc-length tables. Query-time postings
     /// stay lazy.
     pub fts_open_ranges: Vec<(u64, u64)>,
-    /// the actual bytes covering the segment's
+    /// the actual bytes covering the superfile's
     /// open-time batch (parquet footer tail + the
     /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
     /// in the manifest part.
     ///
     /// When non-empty, the cold-fetch path installs these directly
     /// into the reader's prefetch overlay and issues **zero**
-    /// open-time GETs against the segment object — the bytes
+    /// open-time GETs against the superfile object — the bytes
     /// already arrived in the single part GET that `cold_open`
-    /// performs. The genuine first-touch per-segment cost then
+    /// performs. The genuine first-touch per-superfile cost then
     /// collapses from 2 RTT-batches (open metadata + cluster
     /// postings) to 1 (postings only).
     ///
-    /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
+    /// Each tuple is `(absolute_offset, bytes)`. Empty on superfiles
     /// produced by older writers that did not capture it, or when
     /// blob capture is disabled
     /// — the path then falls back to fetching `vec_open_ranges` /
@@ -429,7 +432,7 @@ pub struct SubsectionOffsets {
     pub open_blob: Vec<(u64, Vec<u8>)>,
 }
 
-/// Opaque store key — wraps a UUID v4. The segment store treats
+/// Opaque store key — wraps a UUID v4. The superfile store treats
 /// this as a hash-eq token and doesn't peek inside. An
 /// object-store-backed variant could swap to a path-shaped URI
 /// without changing any caller, since the trait shape stays the
@@ -439,21 +442,21 @@ pub struct SuperfileUri(pub Uuid);
 
 impl SuperfileUri {
     /// Generate a fresh URI. Called by the writer at commit time
-    /// when assigning a key for a new segment's bytes.
+    /// when assigning a key for a new superfile's bytes.
     pub fn new_v4() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Object-store / LocalFS path for committed segment bytes.
+    /// Object-store / LocalFS path for committed superfile bytes.
     /// `.sf.parquet` double suffix — on disk this is still valid
     /// Parquet (row groups + optional embedded FTS/vector blobs +
     /// footer), while the `.sf` marker flags it as a Superfile
-    /// segment without making the file look non-standard.
+    /// superfile without making the file look non-standard.
     pub fn storage_path(self) -> String {
         format!("data/seg-{}.sf.parquet", self.0)
     }
 
-    /// Disk-cache filename for a promoted segment.
+    /// Disk-cache filename for a promoted superfile.
     pub fn cache_filename(self) -> String {
         format!("seg-{}.sf.parquet", self.0)
     }
@@ -464,7 +467,7 @@ impl SuperfileUri {
     }
 }
 
-/// Per-scalar-column min/max for a segment, used by scalar skip
+/// Per-scalar-column min/max for a superfile, used by scalar skip
 /// pruning. Each column's min/max is a length-1 `ArrayRef` of the
 /// column's data type — the most general shape that doesn't
 /// require pulling DataFusion into this layer. The skip helper
@@ -475,6 +478,18 @@ pub struct ScalarStatsTable {
     /// `cols[col_name] = (min_array, max_array)`. Both arrays are
     /// length-1 with the column's logical Arrow type.
     pub cols: HashMap<String, (ArrayRef, ArrayRef)>,
+    /// Per-column null counts over the segment's rows. Keyed like
+    /// `cols`; a missing entry means "not computed" (older segments),
+    /// never zero.
+    pub null_counts: HashMap<String, u64>,
+    /// Per-column exact sums, as length-1 arrays typed to match SQL
+    /// `SUM`'s result for the column (signed ints → `Int64`, unsigned
+    /// → `UInt64`, floats → `Float64`). Missing for non-summable
+    /// types or when the exact sum overflows the result type.
+    pub sums: HashMap<String, ArrayRef>,
+    /// Per-column HyperLogLog distinct-count sketches (raw register
+    /// bytes, see [`hll::HllSketch`]). Planner estimates only.
+    pub hll: HashMap<String, Vec<u8>>,
 }
 
 impl ScalarStatsTable {
@@ -488,7 +503,7 @@ impl ScalarStatsTable {
     /// integer / float / boolean / utf8).
     ///
     /// Used by [`crate::supertable::writer::SupertableWriter`] at
-    /// commit time to populate per-segment scalar skip stats. The
+    /// commit time to populate per-superfile scalar skip stats. The
     /// resulting table maps `column_name → (min_arr, max_arr)`,
     /// where each entry is a length-1 [`ArrayRef`] of the column's
     /// type — zero-pad isn't needed since the skip planner reads
@@ -500,9 +515,9 @@ impl ScalarStatsTable {
     /// columns, peak overhead is one column's worth (~MB) — far
     /// below the parquet footprint we're already paying.
     pub fn from_batches(scalar_schema: &Schema, batches: &[&RecordBatch]) -> Self {
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut stats = Self::default();
         if batches.is_empty() {
-            return Self { cols };
+            return stats;
         }
         for (idx, field) in scalar_schema.fields().iter().enumerate() {
             let arrays: Vec<&dyn arrow_array::Array> =
@@ -514,11 +529,233 @@ impl ScalarStatsTable {
                 // prune", which is the safe default.
                 Err(_) => continue,
             };
-            if let Some(pair) = column_min_max(&combined) {
-                cols.insert(field.name().clone(), pair);
+            stats.insert_column(field.name(), &combined);
+        }
+        stats
+    }
+
+    pub fn from_batch(scalar_schema: &Schema, batch: &RecordBatch) -> Self {
+        let mut stats = Self::default();
+        for (idx, field) in scalar_schema.fields().iter().enumerate() {
+            stats.insert_column(field.name(), batch.column(idx));
+        }
+        stats
+    }
+
+    /// Compute every per-column stat this table carries from one
+    /// resident column: min/max (skip-pruning), null count, exact sum,
+    /// and the HLL distinct sketch (SQL planner statistics). One pass
+    /// over the values beyond the min/max kernels; cost is linear in
+    /// rows and freed before the next column.
+    fn insert_column(&mut self, name: &str, column: &ArrayRef) {
+        if let Some(pair) = column_min_max(column) {
+            self.cols.insert(name.to_string(), pair);
+            // The companion stats only exist for columns that carry
+            // min/max (same orderable-type set), so consumers can key
+            // everything off `cols`.
+            self.null_counts
+                .insert(name.to_string(), column.null_count() as u64);
+            if let Some(sum) = column_sum(column) {
+                self.sums.insert(name.to_string(), sum);
+            }
+            if let Some(sketch) = column_hll(column) {
+                self.hll
+                    .insert(name.to_string(), sketch.as_bytes().to_vec());
             }
         }
-        Self { cols }
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for (name, (other_min, other_max)) in &other.cols {
+            if let Some(existing) = self.cols.get_mut(name) {
+                // Merge by comparing and keeping the actual min and max across both stats
+                if let Some((merged_min, merged_max)) =
+                    merge_min_max_arrays(&existing.0, other_min, &existing.1, other_max)
+                {
+                    existing.0 = merged_min;
+                    existing.1 = merged_max;
+                }
+            } else {
+                self.cols
+                    .insert(name.clone(), (other_min.clone(), other_max.clone()));
+            }
+        }
+        // Additive stats combine only when BOTH sides know them — a
+        // side without the stat makes the total unknowable, so the
+        // merged entry is dropped (consumers treat missing as
+        // "no statistics", never as zero).
+        merge_known(&mut self.null_counts, &other.null_counts, |a, b| {
+            a.checked_add(*b)
+        });
+        merge_known(&mut self.sums, &other.sums, add_sum_arrays);
+        merge_known(&mut self.hll, &other.hll, |a, b| {
+            let mut merged = hll::HllSketch::from_bytes(a)?;
+            merged.merge(&hll::HllSketch::from_bytes(b)?);
+            Some(merged.as_bytes().to_vec())
+        });
+    }
+}
+
+/// Merge additive stat maps with intersection semantics: entries
+/// present on both sides combine via `combine` (`None` = combination
+/// failed, e.g. overflow → drop); entries present on only one side are
+/// dropped — the other side's contribution is unknown.
+fn merge_known<V: Clone>(
+    ours: &mut HashMap<String, V>,
+    theirs: &HashMap<String, V>,
+    combine: impl Fn(&V, &V) -> Option<V>,
+) {
+    let mut merged: HashMap<String, V> = HashMap::new();
+    for (name, a) in ours.iter() {
+        if let Some(b) = theirs.get(name)
+            && let Some(c) = combine(a, b)
+        {
+            merged.insert(name.clone(), c);
+        }
+    }
+    *ours = merged;
+}
+
+/// Merge min/max arrays by comparing values and keeping the actual min and max.
+///
+/// Takes existing (min, max) and other (min, max) arrays and returns the
+/// merged (min, max) where min is the smaller value and max is the larger.
+/// Both arrays are assumed to be length-1 and of the same type.
+fn merge_min_max_arrays(
+    existing_min: &ArrayRef,
+    other_min: &ArrayRef,
+    existing_max: &ArrayRef,
+    other_max: &ArrayRef,
+) -> Option<(ArrayRef, ArrayRef)> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    macro_rules! prim_merge {
+        ($array_ty:ty) => {{
+            let ex_min_arr = existing_min.as_any().downcast_ref::<$array_ty>()?;
+            let ot_min_arr = other_min.as_any().downcast_ref::<$array_ty>()?;
+            let ex_max_arr = existing_max.as_any().downcast_ref::<$array_ty>()?;
+            let ot_max_arr = other_max.as_any().downcast_ref::<$array_ty>()?;
+
+            let ex_min = ex_min_arr.value(0);
+            let ot_min = ot_min_arr.value(0);
+            let ex_max = ex_max_arr.value(0);
+            let ot_max = ot_max_arr.value(0);
+
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+
+            Some((
+                Arc::new(<$array_ty>::from(vec![merged_min])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merged_max])) as ArrayRef,
+            ))
+        }};
+    }
+
+    match existing_min.data_type() {
+        DataType::UInt8 => prim_merge!(UInt8Array),
+        DataType::UInt16 => prim_merge!(UInt16Array),
+        DataType::UInt32 => prim_merge!(UInt32Array),
+        DataType::UInt64 => prim_merge!(UInt64Array),
+        DataType::Int8 => prim_merge!(Int8Array),
+        DataType::Int16 => prim_merge!(Int16Array),
+        DataType::Int32 => prim_merge!(Int32Array),
+        DataType::Int64 => prim_merge!(Int64Array),
+        DataType::Float32 => prim_merge!(Float32Array),
+        DataType::Float64 => prim_merge!(Float64Array),
+        DataType::Boolean => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(0);
+            let ot_min = other_min.as_any().downcast_ref::<BooleanArray>()?.value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(0);
+            let ot_max = other_max.as_any().downcast_ref::<BooleanArray>()?.value(0);
+            let merged_min = ex_min && ot_min;
+            let merged_max = ex_max || ot_max;
+            Some((
+                Arc::new(BooleanArray::from(vec![merged_min])),
+                Arc::new(BooleanArray::from(vec![merged_max])),
+            ))
+        }
+        DataType::Utf8 => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(0);
+            let ot_min = other_min.as_any().downcast_ref::<StringArray>()?.value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(0);
+            let ot_max = other_max.as_any().downcast_ref::<StringArray>()?.value(0);
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            Some((
+                Arc::new(StringArray::from(vec![merged_min])),
+                Arc::new(StringArray::from(vec![merged_max])),
+            ))
+        }
+        DataType::LargeUtf8 => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let ot_min = other_min
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let ot_max = other_max
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(0);
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            Some((
+                Arc::new(LargeStringArray::from(vec![merged_min])),
+                Arc::new(LargeStringArray::from(vec![merged_max])),
+            ))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let ex_min = existing_min
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let ot_min = other_min
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let ex_max = existing_max
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let ot_max = other_max
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(0);
+            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
+            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            Some((
+                Arc::new(
+                    Decimal128Array::from(vec![merged_min])
+                        .with_precision_and_scale(*precision, *scale)
+                        .ok()?,
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![merged_max])
+                        .with_precision_and_scale(*precision, *scale)
+                        .ok()?,
+                ),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -529,6 +766,136 @@ impl ScalarStatsTable {
 /// (f32, f64), boolean, Utf8, LargeUtf8. The supertable schema
 /// rejects vector columns up at the SupertableOptions layer, so
 /// `FixedSizeList<Float32>` won't appear here in practice.
+/// Exact column sum as a length-1 array typed to match SQL `SUM`'s
+/// result for the column (signed → `Int64`, unsigned → `UInt64`,
+/// floats → `Float64`). `None` for non-summable types (utf8, bool,
+/// decimal) or when the exact total overflows the result type —
+/// consumers treat missing as "no statistics".
+fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    macro_rules! signed {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let total: i128 = a.iter().flatten().map(i128::from).sum();
+            let v = i64::try_from(total).ok()?;
+            Some(Arc::new(Int64Array::from(vec![v])) as ArrayRef)
+        }};
+    }
+    macro_rules! unsigned {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let total: u128 = a.iter().flatten().map(u128::from).sum();
+            let v = u64::try_from(total).ok()?;
+            Some(Arc::new(UInt64Array::from(vec![v])) as ArrayRef)
+        }};
+    }
+    macro_rules! float {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let total: f64 = a.iter().flatten().map(f64::from).sum();
+            Some(Arc::new(Float64Array::from(vec![total])) as ArrayRef)
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Int8 => signed!(Int8Array),
+        DataType::Int16 => signed!(Int16Array),
+        DataType::Int32 => signed!(Int32Array),
+        DataType::Int64 => signed!(Int64Array),
+        DataType::UInt8 => unsigned!(UInt8Array),
+        DataType::UInt16 => unsigned!(UInt16Array),
+        DataType::UInt32 => unsigned!(UInt32Array),
+        DataType::UInt64 => unsigned!(UInt64Array),
+        DataType::Float32 => float!(Float32Array),
+        DataType::Float64 => float!(Float64Array),
+        _ => None,
+    }
+}
+
+/// Add two length-1 sum arrays of the same type (see [`column_sum`]).
+/// `None` on type mismatch or `Int64`/`UInt64` overflow. Shared with
+/// the SQL provider's cross-segment statistics fold.
+pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    match (a.data_type(), b.data_type()) {
+        (DataType::Int64, DataType::Int64) => {
+            let x = a.as_any().downcast_ref::<Int64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<Int64Array>()?.value(0);
+            Some(Arc::new(Int64Array::from(vec![x.checked_add(y)?])) as ArrayRef)
+        }
+        (DataType::UInt64, DataType::UInt64) => {
+            let x = a.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            Some(Arc::new(UInt64Array::from(vec![x.checked_add(y)?])) as ArrayRef)
+        }
+        (DataType::Float64, DataType::Float64) => {
+            let x = a.as_any().downcast_ref::<Float64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<Float64Array>()?.value(0);
+            Some(Arc::new(Float64Array::from(vec![x + y])) as ArrayRef)
+        }
+        _ => None,
+    }
+}
+
+/// HyperLogLog distinct sketch over a column's non-null values.
+/// `None` for types the sketch doesn't cover. Values hash by their
+/// canonical byte representation (little-endian for numerics, raw
+/// bytes for strings, IEEE bits for floats).
+fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    use xxhash_rust::xxh3::xxh3_64;
+
+    let mut sketch = hll::HllSketch::new();
+    macro_rules! ints {
+        ($array_ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(&v.to_le_bytes()));
+            }
+        }};
+    }
+    match col.data_type() {
+        DataType::Int8 => ints!(Int8Array),
+        DataType::Int16 => ints!(Int16Array),
+        DataType::Int32 => ints!(Int32Array),
+        DataType::Int64 => ints!(Int64Array),
+        DataType::UInt8 => ints!(UInt8Array),
+        DataType::UInt16 => ints!(UInt16Array),
+        DataType::UInt32 => ints!(UInt32Array),
+        DataType::UInt64 => ints!(UInt64Array),
+        DataType::Float32 => {
+            let a = col.as_any().downcast_ref::<Float32Array>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(&v.to_bits().to_le_bytes()));
+            }
+        }
+        DataType::Float64 => {
+            let a = col.as_any().downcast_ref::<Float64Array>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(&v.to_bits().to_le_bytes()));
+            }
+        }
+        DataType::Utf8 => {
+            let a = col.as_any().downcast_ref::<StringArray>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(v.as_bytes()));
+            }
+        }
+        DataType::LargeUtf8 => {
+            let a = col.as_any().downcast_ref::<LargeStringArray>()?;
+            for v in a.iter().flatten() {
+                sketch.insert_hash(xxh3_64(v.as_bytes()));
+            }
+        }
+        _ => return None,
+    }
+    Some(sketch)
+}
+
 fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     use arrow::compute::kernels::aggregate as agg;
     use arrow_array::*;
@@ -613,13 +980,13 @@ fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 #[derive(Debug, Clone)]
 pub struct FtsSummary {
     /// Term-presence bloom filter — sized to ~7% FPR at typical
-    /// per-column term cardinalities (64 KiB / column / segment
+    /// per-column term cardinalities (64 KiB / column / superfile
     /// is the default).
     pub term_bloom: Bloom,
     /// Number of distinct terms seen at build time. Useful for
     /// validating the bloom's sizing in tests + for observability.
     pub n_terms_distinct: u32,
-    /// Lex-smallest and lex-largest term in this segment's FST for
+    /// Lex-smallest and lex-largest term in this superfile's FST for
     /// this column. Prefix skip checks
     /// `[prefix, prefix_upper_bound)` overlap with this range.
     pub term_range: (Vec<u8>, Vec<u8>),
@@ -637,11 +1004,11 @@ pub struct VectorSummary {
     /// Cluster centroid; length matches the vector column's `dim`
     /// declared in `SupertableOptions::vector_columns`.
     pub centroid: Vec<f32>,
-    /// Maximum distance from any indexed vector in this segment to
+    /// Maximum distance from any indexed vector in this superfile to
     /// `centroid`, in the same metric the column was built with.
     pub radius: f32,
     /// Per-cluster IVF centroids (Sq8, per-cluster calibration) for
-    /// cross-segment global cluster selection. Empty when the segment
+    /// cross-superfile global cluster selection. Empty when the superfile
     /// has no vector index for this column.
     pub clusters: ClusterCentroids,
 }
@@ -653,9 +1020,9 @@ const SQ8_CODE_MAX: f32 = 255.0;
 
 /// Per-cluster IVF centroids for one vector column, Sq8-quantized with
 /// per-cluster calibration. Carried in the manifest so a query can rank
-/// every segment's clusters globally — without opening the segment —
+/// every superfile's clusters globally — without opening the superfile —
 /// and probe only the globally-closest clusters. The 1-bit shortlist +
-/// rerank still run on the segment's on-disk compressed vectors; these
+/// rerank still run on the superfile's on-disk compressed vectors; these
 /// drive cluster *selection* only.
 ///
 /// Quantization is value-only (no metric); the selector applies the
@@ -673,10 +1040,16 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
+    /// Lazily-computed per-cluster `(Σcode, Σcode²)` — the
+    /// query-independent moments the folded L2 scoring needs to
+    /// reconstruct `‖centroid‖²` without dequantizing. Populated on
+    /// first L2 query (one pass over `codes`), 8 bytes per cluster;
+    /// never serialized (decode starts it empty).
+    pub code_moments: std::sync::OnceLock<Vec<(f32, f32)>>,
 }
 
 impl ClusterCentroids {
-    /// The "no cluster centroids" value — a segment without a vector
+    /// The "no cluster centroids" value — a superfile without a vector
     /// index for the column.
     pub fn empty() -> Self {
         Self::default()
@@ -733,6 +1106,70 @@ impl ClusterCentroids {
             mins,
             scales,
             counts,
+            code_moments: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Score every populated cluster against `query` directly in the
+    /// Sq8 code domain — no per-cluster dequantization, no scratch
+    /// buffer. The affine dequant (`v_j = min + scale·code_j`) folds
+    /// out of every metric:
+    ///
+    /// ```text
+    /// dot(q, centroid) = min·Σq + scale·(q · codes)
+    /// ‖centroid‖²      = d·min² + 2·min·scale·Σcode + scale²·Σcode²
+    /// L2²(q, centroid) = ‖q‖² − 2·dot(q, centroid) + ‖centroid‖²
+    /// ```
+    ///
+    /// so the only O(dim) work per cluster is one Sq8 dot product over
+    /// the already-contiguous `codes` row — the same AVX-512 / AVX2 /
+    /// `wide` kernel the rerank path uses. `sum_q` is `Σ query_j`;
+    /// `norm_q_sq` is `‖query‖²` (read only for L2). Calls
+    /// `emit(cluster_id, score)` for each cluster with a nonzero
+    /// indexed count. Scores equal `dequantize_into` + `distance` up
+    /// to f32 association order (gated by
+    /// `score_clusters_into_matches_dequantized_distance`).
+    pub fn score_clusters_into(
+        &self,
+        metric: Metric,
+        query: &[f32],
+        sum_q: f32,
+        norm_q_sq: f32,
+        mut emit: impl FnMut(u32, f32),
+    ) {
+        use crate::superfile::vector::distance::{
+            COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, sq8_dot, u8_sum_sumsq,
+        };
+        let d = self.dim as usize;
+        debug_assert_eq!(query.len(), d);
+        // L2 needs each cluster's query-independent code moments;
+        // computed once per `ClusterCentroids` (first L2 query) so the
+        // per-query, per-cluster O(dim) work stays a single Sq8 dot.
+        let moments = matches!(metric, Metric::L2Sq).then(|| {
+            self.code_moments.get_or_init(|| {
+                (0..self.n_cent as usize)
+                    .map(|c| u8_sum_sumsq(&self.codes[c * d..(c + 1) * d]))
+                    .collect()
+            })
+        });
+        for c in 0..self.n_cent as usize {
+            if self.counts[c] == 0 {
+                continue;
+            }
+            let codes = &self.codes[c * d..(c + 1) * d];
+            let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
+            let score = match metric {
+                Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
+                Metric::NegDot => -dot_qc,
+                Metric::L2Sq => {
+                    let (sum_c, sumsq_c) = moments.expect("moments built for L2 above")[c];
+                    let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
+                        + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
+                        + self.scales[c] * self.scales[c] * sumsq_c;
+                    norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
+                }
+            };
+            emit(c as u32, score);
         }
     }
 
@@ -757,6 +1194,116 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::FtsConfig;
+    use crate::superfile::vector::distance::distance;
+
+    /// Deterministic synthetic fp32 centroids for the folded-scoring
+    /// tests: distinct per-cluster ranges so per-cluster Sq8
+    /// calibration (min/scale) actually varies.
+    fn synth_clusters(n_cent: u32, dim: u32, seed: u64) -> (ClusterCentroids, Vec<f32>) {
+        let (nc, d) = (n_cent as usize, dim as usize);
+        let mut centroids = vec![0f32; nc * d];
+        for c in 0..nc {
+            for j in 0..d {
+                let v = ((seed + (c * d + j) as u64 * 2_654_435_761) % 1000) as f32 / 250.0 - 2.0
+                    + c as f32 * 0.1;
+                centroids[c * d + j] = v;
+            }
+        }
+        let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
+        let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
+        (cc, centroids)
+    }
+
+    /// Folded Sq8-domain scoring must equal dequantize-then-distance
+    /// (the prior selection path) up to f32 association order, for all
+    /// three metrics, and must skip count-0 clusters.
+    #[test]
+    fn score_clusters_into_matches_dequantized_distance() {
+        let (n_cent, dim) = (17u32, 96u32);
+        let (cc, _) = synth_clusters(n_cent, dim, 7);
+        let query: Vec<f32> = (0..dim)
+            .map(|j| ((j as u64 * 40_503 + 11) % 997) as f32 / 500.0 - 1.0)
+            .collect();
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut folded: Vec<(u32, f32)> = Vec::new();
+            cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |c, s| {
+                folded.push((c, s));
+            });
+
+            // Reference: the old dequantize + distance loop.
+            let mut deq = vec![0f32; dim as usize];
+            let mut reference: Vec<(u32, f32)> = Vec::new();
+            for c in 0..n_cent as usize {
+                if cc.counts[c] == 0 {
+                    continue;
+                }
+                cc.dequantize_into(c, &mut deq);
+                reference.push((c as u32, distance(metric, &query, &deq)));
+            }
+
+            assert_eq!(
+                folded.len(),
+                reference.len(),
+                "{metric:?}: cluster sets differ (count-0 skip)"
+            );
+            for ((fc, fs), (rc, rs)) in folded.iter().zip(&reference) {
+                assert_eq!(fc, rc, "{metric:?}: cluster order");
+                let tol = 1e-3 * (1.0 + rs.abs());
+                assert!(
+                    (fs - rs).abs() <= tol,
+                    "{metric:?} cluster {fc}: folded {fs} vs dequantized {rs} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    /// Microbench: folded Sq8 scoring vs the old dequantize+distance
+    /// loop over a supertable-scale cluster set. Gated `#[ignore]`;
+    /// run via `cargo test --release --lib
+    /// score_clusters_microbench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn score_clusters_microbench() {
+        use std::time::Instant;
+        let (n_cent, dim) = (4096u32, 384u32);
+        let iters = 50usize;
+        let (cc, _) = synth_clusters(n_cent, dim, 99);
+        let query: Vec<f32> = (0..dim).map(|j| (j as f32).sin()).collect();
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+
+        for metric in [Metric::Cosine, Metric::L2Sq] {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut acc = 0f32;
+                cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |_, s| acc += s);
+                std::hint::black_box(acc);
+            }
+            let folded_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            let mut deq = vec![0f32; dim as usize];
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut acc = 0f32;
+                for c in 0..n_cent as usize {
+                    if cc.counts[c] == 0 {
+                        continue;
+                    }
+                    cc.dequantize_into(c, &mut deq);
+                    acc += distance(metric, &query, &deq);
+                }
+                std::hint::black_box(acc);
+            }
+            let dequant_us = t0.elapsed().as_micros() as f64 / iters as f64;
+            println!(
+                "score_clusters {metric:?}: folded {folded_us:.0} µs vs dequantize {dequant_us:.0} µs ({:.1}×)",
+                dequant_us / folded_us
+            );
+        }
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -806,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn with_appended_increments_manifest_id_and_extends_segments() {
+    fn with_appended_increments_manifest_id_and_extends_superfiles() {
         let m0 = Manifest::empty(opts());
         let entry = seg_entry(Uuid::new_v4(), 100);
         let m1 = m0.with_appended(vec![entry.clone()]);
@@ -834,10 +1381,10 @@ mod tests {
     }
 
     #[test]
-    fn with_appended_shares_old_segments_via_arc() {
+    fn with_appended_shares_old_superfiles_via_arc() {
         // The new manifest's superfiles[0] should be the SAME Arc as
         // the original's superfiles[0] — copy-on-write doesn't
-        // re-allocate per-segment. (Verified by Arc::ptr_eq.)
+        // re-allocate per-superfile. (Verified by Arc::ptr_eq.)
         let entry = seg_entry(Uuid::new_v4(), 1);
         let m0 = Manifest::empty(opts()).with_appended(vec![entry.clone()]);
         let m1 = m0.with_appended(vec![seg_entry(Uuid::new_v4(), 2)]);
@@ -858,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_uri_is_distinct_per_call() {
+    fn superfile_uri_is_distinct_per_call() {
         let a = SuperfileUri::new_v4();
         let b = SuperfileUri::new_v4();
         assert_ne!(a, b);
@@ -907,6 +1454,206 @@ mod tests {
         };
         assert_eq!(s.centroid.len(), 3);
         assert!((s.radius - 0.5).abs() < 1e-9);
+    }
+
+    // ============================================================
+    // ScalarStatsTable::merge tests — verify min/max comparison
+    // across different types (integers, floats, strings, decimal128)
+    // ============================================================
+
+    #[test]
+    fn merge_integer_columns_keeps_actual_min_max() {
+        use arrow_array::Int64Array;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "id".to_string(),
+            (
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![50])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "id".to_string(),
+            (
+                Arc::new(Int64Array::from(vec![5])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        let (min_arr, max_arr) = stats1.cols.get("id").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array")
+            .value(0);
+
+        assert_eq!(min_val, 5, "min should be the smaller value");
+        assert_eq!(max_val, 100, "max should be the larger value");
+    }
+
+    #[test]
+    fn merge_string_columns_keeps_lexicographic_min_max() {
+        use arrow_array::LargeStringArray;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "name".to_string(),
+            (
+                Arc::new(LargeStringArray::from(vec!["bob"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["zebra"])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "name".to_string(),
+            (
+                Arc::new(LargeStringArray::from(vec!["alice"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["charlie"])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        let (min_arr, max_arr) = stats1.cols.get("name").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("should be LargeStringArray")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("should be LargeStringArray")
+            .value(0);
+
+        assert_eq!(min_val, "alice", "min should be lexicographically smaller");
+        assert_eq!(max_val, "zebra", "max should be lexicographically larger");
+    }
+
+    #[test]
+    fn merge_float_columns_keeps_numeric_min_max() {
+        use arrow_array::Float64Array;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "value".to_string(),
+            (
+                Arc::new(Float64Array::from(vec![1.5])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![9.9])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "value".to_string(),
+            (
+                Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![10.5])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        let (min_arr, max_arr) = stats1.cols.get("value").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("should be Float64Array")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("should be Float64Array")
+            .value(0);
+
+        assert!((min_val - 0.5).abs() < 1e-9, "min should be 0.5");
+        assert!((max_val - 10.5).abs() < 1e-9, "max should be 10.5");
+    }
+
+    #[test]
+    fn merge_adds_new_columns() {
+        use arrow_array::UInt32Array;
+        let mut stats1 = ScalarStatsTable::new();
+        stats1.cols.insert(
+            "col1".to_string(),
+            (
+                Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![10])) as ArrayRef,
+            ),
+        );
+
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "col2".to_string(),
+            (
+                Arc::new(UInt32Array::from(vec![20])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![30])) as ArrayRef,
+            ),
+        );
+
+        stats1.merge(&stats2);
+
+        assert_eq!(stats1.cols.len(), 2, "should have both columns");
+        assert!(stats1.cols.contains_key("col1"), "col1 should exist");
+        assert!(stats1.cols.contains_key("col2"), "col2 should exist");
+    }
+
+    #[test]
+    fn merge_multiple_times_maintains_correct_min_max() {
+        use arrow_array::Int32Array;
+        let mut stats = ScalarStatsTable::new();
+        stats.cols.insert(
+            "count".to_string(),
+            (
+                Arc::new(Int32Array::from(vec![50])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![150])) as ArrayRef,
+            ),
+        );
+
+        // First merge
+        let mut stats2 = ScalarStatsTable::new();
+        stats2.cols.insert(
+            "count".to_string(),
+            (
+                Arc::new(Int32Array::from(vec![30])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![200])) as ArrayRef,
+            ),
+        );
+        stats.merge(&stats2);
+
+        // Second merge
+        let mut stats3 = ScalarStatsTable::new();
+        stats3.cols.insert(
+            "count".to_string(),
+            (
+                Arc::new(Int32Array::from(vec![10])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![100])) as ArrayRef,
+            ),
+        );
+        stats.merge(&stats3);
+
+        let (min_arr, max_arr) = stats.cols.get("count").expect("column should exist");
+        let min_val = min_arr
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("should be Int32Array")
+            .value(0);
+        let max_val = max_arr
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("should be Int32Array")
+            .value(0);
+
+        assert_eq!(min_val, 10, "min should be 10 after two merges");
+        assert_eq!(max_val, 200, "max should be 200 after two merges");
     }
 
     // ============================================================

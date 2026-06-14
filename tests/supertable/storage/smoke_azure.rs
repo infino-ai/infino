@@ -59,6 +59,9 @@ const EXPECTED_N_DOCS: u64 = 8;
 /// Vector-search top-k and nprobe for the smoke ANN query.
 const VECTOR_SEARCH_K: usize = 3;
 const VECTOR_NPROBE: usize = 4;
+/// Object / tail sizes for the `tail()` suffix-range regression test.
+const TAIL_OBJECT_LEN: usize = 256;
+const TAIL_FETCH_LEN: usize = 64;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -395,6 +398,64 @@ async fn supertable_smoke_via_azure_wire_protocol() {
 
     delete_emulator_container(&container).await;
     eprintln!("[azure] smoke done; container {container} deleted");
+}
+
+/// Regression: `AzureStorageProvider::tail` must not issue a suffix
+/// range (`Range: bytes=-len`). object_store's Azure backend rejects
+/// that with "Operation not supported: Azure does not support suffix
+/// range requests", so `tail` resolves the size with a HEAD and a
+/// bounded `get_range` instead. The standalone-superfile cold open
+/// issues a sizeless tail to read the Parquet footer, which is what
+/// surfaced this on the Azure superfile bench leg (supertable reads
+/// carry `total_size` in the manifest and never reach a sizeless tail).
+/// Before the fix this errored; after, it returns the trailing bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_tail_uses_head_plus_range_not_suffix() {
+    if std::env::var("INFINO_TEST_AZURE").is_err() {
+        eprintln!(
+            "azure_tail_uses_head_plus_range_not_suffix: skipped (set INFINO_TEST_AZURE=1 to enable)"
+        );
+        return;
+    }
+
+    let container = format!("infino-azure-tail-{}", uuid::Uuid::new_v4());
+    ensure_emulator_container(&container).await;
+
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        AzureStorageProvider::new_with_emulator(&container).expect("azure provider for tail test"),
+    );
+
+    // Distinct bytes so the tail slice is unambiguous.
+    let body: Vec<u8> = (0..TAIL_OBJECT_LEN).map(|i| i as u8).collect();
+    storage
+        .put_atomic("tail/obj.bin", bytes::Bytes::from(body.clone()))
+        .await
+        .expect("put tail object");
+
+    let (tail_bytes, size) = storage
+        .tail("tail/obj.bin", TAIL_FETCH_LEN as u64)
+        .await
+        .expect("tail must succeed on Azure (no suffix range)");
+    assert_eq!(
+        size, TAIL_OBJECT_LEN as u64,
+        "tail must report the full object size"
+    );
+    assert_eq!(
+        &tail_bytes[..],
+        &body[TAIL_OBJECT_LEN - TAIL_FETCH_LEN..],
+        "tail must return the trailing bytes"
+    );
+
+    // The `len == 0` path still resolves the size with empty bytes.
+    let (empty, size_zero) = storage
+        .tail("tail/obj.bin", 0)
+        .await
+        .expect("zero-length tail must succeed");
+    assert!(empty.is_empty(), "zero-length tail returns no bytes");
+    assert_eq!(size_zero, TAIL_OBJECT_LEN as u64);
+
+    eprintln!("[azure] tail() HEAD+range OK (no suffix range)");
+    delete_emulator_container(&container).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

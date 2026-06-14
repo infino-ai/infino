@@ -3,7 +3,7 @@
 
 //! Supertable object-store bench (infino-only entry point).
 //!
-//! Multi-segment ingest to object storage at the supertable scale
+//! Multi-superfile ingest to object storage at the supertable scale
 //! (`INFINO_BENCH_SUPERTABLE_DOCS`, default 10M), built through the
 //! production `SupertableWriter::append` + `commit` path. Three index
 //! shapes are measured for apples-to-apples comparison against
@@ -46,10 +46,12 @@ use infino::supertable::Supertable;
 use tempfile::TempDir;
 
 use crate::corpus::DIM;
+use crate::cost;
 use crate::ingest::supertable::{self, Modality, modality_label};
-use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
+use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
 use crate::report::{Better, Block, Cell, Report, Section, metric, text};
 use crate::rss::{self, PeakSampler};
+use crate::storage_meter;
 use crate::tiers;
 
 /// Env var the parent sets to make a child build exactly one shape and
@@ -74,6 +76,14 @@ pub struct ShapeMetrics {
     pub peak_rss_bytes: u64,
     pub median_rss_bytes: u64,
     pub p90_rss_bytes: u64,
+    /// Index bytes written to object storage during ingest. The
+    /// supertable's "upload bandwidth" is this over the wall time —
+    /// the bytes-to-object-store rate, the analogue of the superfile
+    /// build's input-payload bandwidth.
+    pub index_bytes: u64,
+    /// Raw input corpus size (text + vector bytes) — the source data
+    /// fed to ingest, distinct from `index_bytes` (what's written out).
+    pub corpus_bytes: u64,
 }
 
 pub struct SupertableShapeResult {
@@ -86,12 +96,14 @@ impl ShapeMetrics {
     /// Render as the single stdout line the parent parses.
     fn to_result_line(&self) -> String {
         format!(
-            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={}",
+            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={}",
             self.wall_ns,
             self.n_superfiles,
             self.peak_rss_bytes,
             self.median_rss_bytes,
             self.p90_rss_bytes,
+            self.index_bytes,
+            self.corpus_bytes,
         )
     }
 
@@ -104,6 +116,8 @@ impl ShapeMetrics {
         let mut peak = None;
         let mut median = None;
         let mut p90 = None;
+        let mut index_bytes = None;
+        let mut corpus_bytes = None;
         for tok in body.split_whitespace() {
             let (k, v) = tok.split_once('=')?;
             match k {
@@ -112,6 +126,8 @@ impl ShapeMetrics {
                 "peak" => peak = v.parse().ok(),
                 "median" => median = v.parse().ok(),
                 "p90" => p90 = v.parse().ok(),
+                "index_bytes" => index_bytes = v.parse().ok(),
+                "corpus_bytes" => corpus_bytes = v.parse().ok(),
                 _ => {}
             }
         }
@@ -121,6 +137,8 @@ impl ShapeMetrics {
             peak_rss_bytes: peak?,
             median_rss_bytes: median?,
             p90_rss_bytes: p90?,
+            index_bytes: index_bytes?,
+            corpus_bytes: corpus_bytes?,
         })
     }
 }
@@ -172,6 +190,8 @@ fn run_child_shape(key: &str) {
         peak_rss_bytes: rss.peak_rss_bytes,
         median_rss_bytes: rss.median_rss_bytes,
         p90_rss_bytes: rss.p90_rss_bytes,
+        index_bytes: built.total_index_bytes,
+        corpus_bytes: corpus.byte_size(),
     };
     println!("{}", metrics.to_result_line());
 }
@@ -182,8 +202,13 @@ fn run_child_shape(key: &str) {
 fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
     eprintln!("[supertable] spawning isolated subprocess for shape {key:?}...");
     let exe = std::env::current_exe().expect("current_exe for supertable child");
-    let output = Command::new(exe)
-        .env(SHAPE_ENV, key)
+    let mut cmd = Command::new(exe);
+    cmd.env(SHAPE_ENV, key);
+    // Forward a CLI-set dataset prefix; the child only inherits the env.
+    if let Some(prefix) = crate::dataset::dataset_prefix() {
+        cmd.env(crate::dataset::PREFIX_ENV, prefix);
+    }
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
@@ -227,6 +252,27 @@ pub fn run_ingest_shapes_isolated() -> Vec<SupertableShapeResult> {
     results
 }
 
+/// Shared column headers for every supertable ingest table (the
+/// combined `run()` table and the per-modality fts/vector/sql tables),
+/// so the four call sites can't drift apart. `Stored` is the total
+/// on-storage footprint of the committed superfiles — full Parquet
+/// (data pages + embedded BM25/vector indexes), not just the index
+/// subsections — printed next to the raw `Corpus` it was built from.
+pub fn ingest_headers() -> Vec<String> {
+    vec![
+        "Shape".into(),
+        "Time".into(),
+        "Throughput".into(),
+        "Bandwidth".into(),
+        "Corpus".into(),
+        "Stored".into(),
+        "Superfiles".into(),
+        "Peak RSS".into(),
+        "Median RSS".into(),
+        "P90 RSS".into(),
+    ]
+}
+
 pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     let secs = m.wall_ns / 1e9;
     let thr = if secs > 0.0 {
@@ -234,10 +280,31 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     } else {
         0.0
     };
+    // Upload bandwidth: stored bytes written to object storage per
+    // second over the ingest wall time.
+    let bw = if secs > 0.0 {
+        m.index_bytes as f64 / secs
+    } else {
+        0.0
+    };
+    // Stored footprint as a fraction of the raw corpus it was built
+    // from — the headline compression/expansion ratio per modality.
+    let stored_pct = if m.corpus_bytes > 0 {
+        100.0 * m.index_bytes as f64 / m.corpus_bytes as f64
+    } else {
+        0.0
+    };
     vec![
         text(label),
         metric(m.wall_ns, fmt_time(m.wall_ns), Better::Lower),
         metric(thr, fmt_throughput(thr), Better::Higher),
+        metric(bw, fmt_bandwidth(bw), Better::Higher),
+        text(rss::fmt_bytes(m.corpus_bytes)),
+        metric(
+            m.index_bytes as f64,
+            format!("{} ({stored_pct:.0}%)", rss::fmt_bytes(m.index_bytes)),
+            Better::Lower,
+        ),
         text(fmt_count(m.n_superfiles)),
         metric(
             m.peak_rss_bytes as f64,
@@ -255,6 +322,47 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
             Better::Lower,
         ),
     ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cost_warm(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    built: &supertable::IngestResult,
+    metrics: Option<&ShapeMetrics>,
+    n_docs: usize,
+    warm: &[(String, f64)],
+    cold: Option<&[cost::ColdQuery]>,
+    cold_store: Option<storage_meter::ObjectStoreMeter>,
+) {
+    if warm.is_empty() && cold.is_none() {
+        return;
+    }
+    let resident = rss::current_anon_rss_bytes().unwrap_or(0);
+    let (wall_s, corpus_bytes) = match metrics {
+        Some(m) => (m.wall_ns / 1e9, m.corpus_bytes),
+        None => (0.0, 0),
+    };
+    cost::emit(
+        report,
+        anchor,
+        title,
+        &cost::CellCost {
+            ingest_wall_s: wall_s,
+            writers: supertable::n_writers() as u32,
+            put_count: cost::supertable_ingest_puts(built.n_superfiles),
+            stored_bytes: built.total_index_bytes,
+            corpus_bytes,
+            n_docs,
+            resident_anon_bytes: resident,
+            warm,
+            cold,
+            cold_store,
+            storage_months: None,
+            cold_open_amortized: true,
+        },
+    );
 }
 
 pub fn run() {
@@ -276,10 +384,11 @@ pub fn run() {
     // per-shape RSS numbers are independent (see the module docs).
     let n_docs = supertable::n_docs();
     eprintln!(
-        "[supertable] ingesting {} docs ({} commits) per shape to object storage, \
+        "[supertable] ingesting {} docs ({} commits, {} writers) per shape to object storage, \
          one isolated process per shape...",
         fmt_count(n_docs),
-        supertable::N_COMMIT_CHUNKS
+        supertable::n_commits(),
+        supertable::n_writers()
     );
 
     let shape_results = run_ingest_shapes_isolated();
@@ -297,29 +406,23 @@ pub fn run() {
     report.emit(&Section {
         anchor: "bench/supertable/ingest".into(),
         title: format!(
-            "Supertable — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
+            "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
             fmt_count(n_docs),
             crate::corpus::DIM,
-            supertable::N_COMMIT_CHUNKS
+            supertable::n_commits(),
+            supertable::n_writers()
         ),
         note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). \
                Each shape is built in its own subprocess, so Peak/Median/P90 RSS are measured from a \
                clean address space and are comparable across shapes. Rows are the three index shapes \
                built from the same seeded corpus, so each is directly comparable to its single-modality \
-               peer. Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the \
-               previous run."
+               peer. Throughput is rows/s; `Stored` is the total on-storage footprint of the committed \
+               superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; \
+               `Superfiles` is the committed superfile count. Δ is vs the previous run."
             .into(),
         blocks: vec![Block {
             subtitle: String::new(),
-            headers: vec![
-                "Shape".into(),
-                "Time".into(),
-                "Throughput".into(),
-                "Superfiles".into(),
-                "Peak RSS".into(),
-                "Median RSS".into(),
-                "P90 RSS".into(),
-            ],
+            headers: ingest_headers(),
             rows,
         }],
     });
@@ -352,6 +455,49 @@ impl Phases {
         warm: true,
         cold: true,
     };
+}
+
+/// Ingest a prepared corpus, sampling RSS over the build window. Returns the
+/// ingest measurements only for the build phase (it emits them).
+fn build_measured(
+    modality: Modality,
+    corpus: &supertable::PreparedCorpus,
+    phases: Phases,
+) -> (supertable::IngestResult, Option<ShapeMetrics>) {
+    let sampler = PeakSampler::start_default();
+    let t0 = Instant::now();
+    let built = supertable::build_on_storage(modality, corpus);
+    let wall = t0.elapsed();
+    let rss = sampler.stop_stats();
+    let metrics = phases.build.then_some(ShapeMetrics {
+        wall_ns: wall.as_secs_f64() * 1e9,
+        n_superfiles: built.n_superfiles,
+        peak_rss_bytes: rss.peak_rss_bytes,
+        median_rss_bytes: rss.median_rss_bytes,
+        p90_rss_bytes: rss.p90_rss_bytes,
+        index_bytes: built.total_index_bytes,
+        corpus_bytes: corpus.byte_size(),
+    });
+    (built, metrics)
+}
+
+/// Obtain the search artifact for modalities that don't need the corpus after
+/// build (FTS, SQL): in dataset mode open the pre-uploaded dataset (no corpus,
+/// no ingest); otherwise generate the corpus and ingest it. Vector keeps its
+/// corpus for recall ground truth and calls [`build_measured`] directly.
+fn build_or_open(
+    modality: Modality,
+    phases: Phases,
+) -> (supertable::IngestResult, Option<ShapeMetrics>) {
+    // Dataset mode opens the pre-uploaded dataset only for read phases; a
+    // build phase is the prepare step, which still ingests (to the fixed
+    // prefix).
+    if crate::dataset::dataset_mode() && !phases.build {
+        return (supertable::open_dataset(modality), None);
+    }
+    // Corpus to disk + mmap BEFORE the sampler — engine-only window.
+    let corpus = supertable::prepare_corpus(modality);
+    build_measured(modality, &corpus, phases)
 }
 
 fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
@@ -397,33 +543,9 @@ pub mod fts {
             return;
         }
 
-        if phases.build {
-            eprintln!(
-                "[supertable_fts] ingesting {} docs to object storage...",
-                fmt_count(n_docs),
-            );
-        } else {
-            eprintln!(
-                "[supertable_fts] building search artifact ({} docs) for warm/cold phases...",
-                fmt_count(n_docs),
-            );
-        }
-        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-        let corpus = supertable::prepare_corpus(Modality::Fts);
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Fts, &corpus);
-        let wall = t0.elapsed();
-        let rss = sampler.stop_stats();
-        let metrics = ShapeMetrics {
-            wall_ns: wall.as_secs_f64() * 1e9,
-            n_superfiles: built.n_superfiles,
-            peak_rss_bytes: rss.peak_rss_bytes,
-            median_rss_bytes: rss.median_rss_bytes,
-            p90_rss_bytes: rss.p90_rss_bytes,
-        };
-        if phases.build {
-            emit_ingest(&mut report, n_docs, &metrics);
+        let (built, ingest_metrics) = build_or_open(Modality::Fts, phases);
+        if let Some(metrics) = &ingest_metrics {
+            emit_ingest(&mut report, n_docs, metrics);
         }
 
         if phases.warm || phases.cold {
@@ -441,7 +563,7 @@ pub mod fts {
                 &mut report,
                 "bench/fts/supertable/search",
                 format!(
-                    "Supertable FTS — search, multi-segment / object-store ({} docs)",
+                    "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
                 "Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query \
@@ -451,6 +573,29 @@ pub mod fts {
                 cold.as_ref(),
                 None,
             );
+        }
+
+        if phases.warm || phases.cold {
+            let warm_vec = warm.as_deref().map(cost::warm_from_fts).unwrap_or_default();
+            let cold_vec = cold.as_ref().map(cost::cold_from_fts).unwrap_or_default();
+            let cold_store = phases.cold.then(|| measure_cold_store(&built)).flatten();
+            if !warm_vec.is_empty() || !cold_vec.is_empty() {
+                emit_cost_warm(
+                    &mut report,
+                    "bench/fts/supertable/cost",
+                    format!("Supertable FTS — cost model ({} docs)", fmt_count(n_docs)),
+                    &built,
+                    ingest_metrics.as_ref(),
+                    n_docs,
+                    &warm_vec,
+                    if cold_vec.is_empty() {
+                        None
+                    } else {
+                        Some(&cold_vec)
+                    },
+                    cold_store,
+                );
+            }
         }
 
         report.save();
@@ -465,22 +610,15 @@ pub mod fts {
         report.emit(&Section {
             anchor: "bench/fts/supertable/ingest".into(),
             title: format!(
-                "Supertable FTS — ingest, multi-segment / object-store ({} docs, {} commits)",
+                "Supertable FTS — ingest, multi-superfile / object-store ({} docs, {} commits, {} writers)",
                 fmt_count(n_docs),
-                supertable::N_COMMIT_CHUNKS
+                supertable::n_commits(),
+                supertable::n_writers()
             ),
-            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+            note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Stored` is the total on-storage footprint of the committed superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
             blocks: vec![Block {
                 subtitle: String::new(),
-                headers: vec![
-                    "Shape".into(),
-                    "Time".into(),
-                    "Throughput".into(),
-                    "Superfiles".into(),
-                    "Peak RSS".into(),
-                    "Median RSS".into(),
-                    "P90 RSS".into(),
-                ],
+                headers: ingest_headers(),
                 rows: vec![ingest_row(n_docs, "FTS-only", metrics)],
             }],
         });
@@ -490,6 +628,12 @@ pub mod fts {
         eprintln!(
             "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
         );
+        // Phase-boundary RSS splits (anonymous heap vs mmap'd files):
+        // the discriminator for "where do the warm-phase GiBs live" —
+        // ingest leftovers show up as anonymous bloat already present
+        // before the consumer opens; promotion double-residency shows
+        // up as anonymous ≈ file_backed after warm-up.
+        crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
         let first = &FTS_BATTERY[0];
@@ -506,6 +650,7 @@ pub mod fts {
         consumer
             .wait_until_warm(Duration::from_secs(600))
             .expect("supertable warm promotion");
+        crate::rss::log_rss_breakdown("supertable_fts after wait_until_warm");
         eprintln!(
             "[supertable_fts] warm: cache hot — timing {} queries × {WARM_ITERS} iters via bm25_search...",
             FTS_BATTERY.len(),
@@ -518,6 +663,7 @@ pub mod fts {
             WARM_ITERS,
             "supertable_fts",
         );
+        crate::rss::log_rss_breakdown("supertable_fts after warm battery");
         drop(consumer);
         drop(cache_dir);
         out
@@ -536,9 +682,36 @@ pub mod fts {
         )
     }
 
+    /// One metered cold iteration (`ten_term_or`) on a real object-store backend.
+    fn measure_cold_store(
+        built: &supertable::IngestResult,
+    ) -> Option<storage_meter::ObjectStoreMeter> {
+        built.cleanup.as_ref()?;
+        let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
+        let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
+        let (cache_dir, cache) =
+            tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Fts, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        crate::executors::open_all_superfiles(&consumer);
+        let reader = consumer.reader();
+        let terms = query.terms.join(" ");
+        let mode = exec_fts::to_infino_mode(query.mode);
+        let _ = reader
+            .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+            .expect("metered cold bm25_search");
+        drop(consumer);
+        drop(cache_dir);
+        Some(meter.snapshot())
+    }
+
     /// Cold-tier guard: a fresh disk cache + consumer per open. The
     /// constructor performs the full cold open (consumer + manifest +
-    /// every segment reader), so the timed `bm25_rows` pays only the
+    /// every superfile reader), so the timed `bm25_rows` pays only the
     /// cold search work — open and search are reported separately.
     struct SupertableColdGuard {
         _cache_dir: TempDir,
@@ -548,7 +721,7 @@ pub mod fts {
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-            crate::executors::open_all_segments(&consumer);
+            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -572,6 +745,22 @@ pub mod fts {
                 .map(|b| b.num_rows())
                 .sum()
         }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> usize {
+            self.consumer
+                .reader()
+                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("cold bm25_search fetched")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
+        }
     }
 }
 
@@ -591,10 +780,34 @@ pub mod vector {
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
 
+    /// `INFINO_BENCH_SKIP_CALIBRATION=1` measures only the fixed
+    /// `(nprobe, rerank)` config — no correctness gate, no recall-target
+    /// grid, no brute-force ground truth. Gives a fast, prod-shaped
+    /// cold-only run without the 54-config calibration sweep.
+    fn skip_calibration() -> bool {
+        std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
+    }
+    /// Fixed probe count for the `default` row, overridable with
+    /// `INFINO_BENCH_VECTOR_NPROBE` (defaults to [`DEFAULT_NPROBE`]).
+    fn fixed_nprobe() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_NPROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_NPROBE)
+    }
+    /// Fixed rerank multiplier for the `default` row, overridable with
+    /// `INFINO_BENCH_VECTOR_RERANK` (defaults to [`DEFAULT_RERANK_MULT`]).
+    fn fixed_rerank_mult() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_RERANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_RERANK_MULT)
+    }
+
     /// Build a vector-only supertable, then measure warm + cold kNN search
     /// at calibrated recall targets (and a default config), with a
     /// correctness recall gate — the same measurement the superfile vector
-    /// runner produces, over the multi-segment object-store consumer.
+    /// runner produces, over the multi-superfile object-store consumer.
     pub fn run(phases: Phases) {
         if let Err(reason) = tiers::supertable_backend_check() {
             eprintln!("[supertable_vector] skipped: {reason}");
@@ -602,68 +815,47 @@ pub mod vector {
         }
 
         let n_docs = supertable::n_docs();
-        if phases.build {
-            eprintln!(
-                "[supertable_vector] ingesting {} docs × dim={DIM} to object storage...",
-                fmt_count(n_docs),
-            );
-        } else {
-            eprintln!(
-                "[supertable_vector] building search artifact ({} docs) for warm/cold phases...",
-                fmt_count(n_docs),
-            );
-        }
-        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-        // Kept alive for the search phase: the same mmap backs the
-        // ground-truth recall measurement instead of a regeneration.
+        // Corpus to disk + mmap (engine-only window). Kept alive for the
+        // search phase: the same vectors back the brute-force ground truth,
+        // so dataset mode regenerates it too (skipping only the ingest).
         let corpus = supertable::prepare_corpus(Modality::Vector);
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Vector, &corpus);
-        let wall = t0.elapsed();
-        let rss = sampler.stop_stats();
-
         let mut report = Report::load("supertable_vector");
-        let metrics = ShapeMetrics {
-            wall_ns: wall.as_secs_f64() * 1e9,
-            n_superfiles: built.n_superfiles,
-            peak_rss_bytes: rss.peak_rss_bytes,
-            median_rss_bytes: rss.median_rss_bytes,
-            p90_rss_bytes: rss.p90_rss_bytes,
+        let (built, ingest_metrics) = if crate::dataset::dataset_mode() && !phases.build {
+            (supertable::open_dataset(Modality::Vector), None)
+        } else {
+            build_measured(Modality::Vector, &corpus, phases)
         };
-        if phases.build {
+        if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/vector/supertable/ingest".into(),
                 title: format!(
-                    "Supertable vector — ingest, multi-segment / object-store ({} docs × dim={}, {} commits)",
+                    "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
                     fmt_count(n_docs),
                     DIM,
-                    supertable::N_COMMIT_CHUNKS
+                    supertable::n_commits(),
+                    supertable::n_writers()
                 ),
-                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Stored` is the total on-storage footprint of the committed superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
                     subtitle: String::new(),
-                    headers: vec![
-                        "Shape".into(),
-                        "Time".into(),
-                        "Throughput".into(),
-                        "Superfiles".into(),
-                        "Peak RSS".into(),
-                        "Median RSS".into(),
-                        "P90 RSS".into(),
-                    ],
-                    rows: vec![ingest_row(n_docs, "vector-only", &metrics)],
+                    headers: ingest_headers(),
+                    rows: vec![ingest_row(n_docs, "vector-only", metrics)],
                 }],
             });
         }
 
         if phases.warm || phases.cold {
+            let skip_cal = skip_calibration();
+            let nprobe = fixed_nprobe();
+            let rerank = fixed_rerank_mult();
+
             // The ingested vectors are still mmapped from the prepared
-            // corpus — reuse them for brute-force ground truth instead
-            // of regenerating 10M×384 floats.
-            eprintln!(
-                "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
-            );
+            // corpus — queries and ground truth come from them instead
+            // of a regeneration. Skip-calibration needs no ground truth
+            // (no recall gate / grid), so the brute-force pass is elided
+            // there; otherwise both query batches share ONE streamed
+            // oracle pass: the pass is I/O-bound over a corpus several
+            // times RAM, so its cost is corpus bytes, not query count.
             let vslice = corpus
                 .vectors()
                 .expect("vector modality prepared a vector corpus")
@@ -676,7 +868,6 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_correct = corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K);
             let q_cal = corpus::generate_realistic_queries(
                 vslice,
                 n_docs,
@@ -685,12 +876,28 @@ pub mod vector {
                 true,
                 QUERY_SIGMA,
             );
-            let gt_cal = corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K);
+            let (gt_correct, gt_cal): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if skip_cal {
+                (Vec::new(), Vec::new())
+            } else {
+                eprintln!(
+                    "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
+                    q_correct.len() + q_cal.len(),
+                );
+                let all_queries: Vec<Vec<f32>> =
+                    q_correct.iter().chain(q_cal.iter()).cloned().collect();
+                let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
+                let gt_cal = gt_all.split_off(q_correct.len());
+                (gt_all, gt_cal)
+            };
+            // Queries + ground truth extracted; free the corpus pages
+            // + temp file so the warm/cold samplers measure the engine
+            // only.
+            drop(corpus);
 
             // One consumer drives correctness + calibration. Full cache
             // promotion (prewarm + wait_until_warm) only matters for the
             // warm timing rows — a cold-only run skips it (fts/sql gate
-            // the same way) so it doesn't pull every segment into the
+            // the same way) so it doesn't pull every superfile into the
             // cache just to throw it away.
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
             if phases.warm {
@@ -703,7 +910,7 @@ pub mod vector {
                         supertable::VEC_COLUMN,
                         &q_cal[0],
                         TOP_K,
-                        exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
+                        exec_vec::search_opts(nprobe, rerank),
                         None,
                     )
                     .expect("warm prewarm vector_search");
@@ -713,18 +920,19 @@ pub mod vector {
             }
 
             let title = format!(
-                "Supertable vector — search, multi-segment / object-store ({} docs × dim={})",
+                "Supertable vector — search, multi-superfile / object-store ({} docs × dim={})",
                 fmt_count(n_docs),
                 DIM
             );
-            exec_vec::run_search(
+            let recall_rows = exec_vec::run_search(
                 &mut report,
                 &consumer,
                 || SupertableVecColdGuard::open(&built),
                 supertable::VEC_COLUMN,
+                n_docs,
                 TOP_K,
-                DEFAULT_NPROBE,
-                DEFAULT_RERANK_MULT,
+                nprobe,
+                rerank,
                 &q_correct,
                 &gt_correct,
                 &q_cal,
@@ -732,11 +940,29 @@ pub mod vector {
                 phases.warm,
                 phases.cold,
                 COLD_ITERS,
+                skip_cal,
                 "supertable_vector",
                 "bench/vector/supertable/search",
                 title,
                 "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.",
             );
+            if phases.warm {
+                emit_cost_warm(
+                    &mut report,
+                    "bench/vector/supertable/cost",
+                    format!(
+                        "Supertable vector — cost model ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        DIM
+                    ),
+                    &built,
+                    ingest_metrics.as_ref(),
+                    n_docs,
+                    &cost::warm_from_vector(&recall_rows),
+                    None,
+                    None,
+                );
+            }
             drop(consumer);
             drop(cache_dir);
         }
@@ -757,7 +983,7 @@ pub mod vector {
     impl SupertableVecColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
-            crate::executors::open_all_segments(&consumer);
+            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -794,54 +1020,22 @@ pub mod sql {
         }
 
         let n_docs = supertable::n_docs();
-        if phases.build {
-            eprintln!(
-                "[supertable_sql] ingesting {} rows to object storage...",
-                fmt_count(n_docs)
-            );
-        } else {
-            eprintln!(
-                "[supertable_sql] building query artifact ({} rows) for warm/cold phases...",
-                fmt_count(n_docs),
-            );
-        }
-        // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-        let corpus = supertable::prepare_corpus(Modality::Sql);
-        let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        let built = supertable::build_on_storage(Modality::Sql, &corpus);
-        let wall = t0.elapsed();
-        let rss = sampler.stop_stats();
-
         let mut report = Report::load("supertable_sql");
-        let metrics = ShapeMetrics {
-            wall_ns: wall.as_secs_f64() * 1e9,
-            n_superfiles: built.n_superfiles,
-            peak_rss_bytes: rss.peak_rss_bytes,
-            median_rss_bytes: rss.median_rss_bytes,
-            p90_rss_bytes: rss.p90_rss_bytes,
-        };
-        if phases.build {
+        let (built, ingest_metrics) = build_or_open(Modality::Sql, phases);
+        if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/sql/supertable/ingest".into(),
                 title: format!(
-                    "Supertable SQL — ingest, multi-segment / object-store ({} rows, {} commits)",
+                    "Supertable SQL — ingest, multi-superfile / object-store ({} rows, {} commits, {} writers)",
                     fmt_count(n_docs),
-                    supertable::N_COMMIT_CHUNKS
+                    supertable::n_commits(),
+                    supertable::n_writers()
                 ),
-                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed segment count. Δ is vs the previous run.".into(),
+                note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Stored` is the total on-storage footprint of the committed superfiles (full Parquet + embedded indexes) and its share of the raw `Corpus`; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
                     subtitle: String::new(),
-                    headers: vec![
-                        "Shape".into(),
-                        "Time".into(),
-                        "Throughput".into(),
-                        "Superfiles".into(),
-                        "Peak RSS".into(),
-                        "Median RSS".into(),
-                        "P90 RSS".into(),
-                    ],
-                    rows: vec![ingest_row(n_docs, "SQL", &metrics)],
+                    headers: ingest_headers(),
+                    rows: vec![ingest_row(n_docs, "SQL", metrics)],
                 }],
             });
         }
@@ -886,8 +1080,19 @@ pub mod sql {
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls. The headline comparison is Plain Scan vs FTS-pushdown (same selective equality). Δ is vs the previous run.",
+                "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
+            );
+            emit_cost_warm(
+                &mut report,
+                "bench/sql/supertable/cost",
+                format!("Supertable SQL — cost model ({} rows)", fmt_count(n_docs)),
+                &built,
+                ingest_metrics.as_ref(),
+                n_docs,
+                &cost::warm_from_sql(&sets),
+                None,
+                None,
             );
         }
 
@@ -926,7 +1131,7 @@ pub mod sql {
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
-            crate::executors::open_all_segments(&consumer);
+            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,

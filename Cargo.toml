@@ -93,9 +93,9 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Supertable: lock-free manifest swap + segment ids + FTS bloom hash.
+# Supertable: lock-free manifest swap + superfile ids + FTS bloom hash.
 # Manifest is held in ArcSwap<Manifest> for reader-writer isolation;
-# SegmentEntry.segment_id is a v4 UUID; the FTS term-presence bloom
+# SuperfileEntry.superfile_id is a v4 UUID; the FTS term-presence bloom
 # uses XXH3-64 — terms come from a closed corpus (no HashDoS risk),
 # and XXH3 is significantly faster than SipHash on the miss path
 # where hash cost dominates.
@@ -141,7 +141,7 @@ object_store = { version = "0.13", features = ["aws", "azure"] }
 # requires boxed futures.
 async-trait = "0.1"
 
-# Manifest-part serde. Avro for the dense per-segment
+# Manifest-part serde. Avro for the dense per-superfile
 # tier (matches Iceberg's manifest-file choice at scale); zstd
 # for compression; blake3 for content-addressing.
 #
@@ -237,6 +237,13 @@ hashbrown = "0.17.1"
 # depends on `infino` WITHOUT `test-helpers`) when the catalog API
 # lands; the public surface itself is guarded by `cargo-public-api`.
 infino-bench-utils = { path = "benches/utils" }
+
+# `test-util` adds tokio's paused-clock test surface
+# (`start_paused`), which lets concurrency regression tests drive
+# sleep-based polling loops deterministically instead of racing real
+# timers (see `reader_cache::disk::tests`). Dev-only feature union on
+# the existing tokio dependency — no new crate.
+tokio = { version = "1", features = ["test-util"] }
 
 proptest = "1"
 hdrhistogram = "7"

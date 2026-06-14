@@ -24,6 +24,9 @@ use crate::superfile::error::BuildError as SuperfileBuildError;
 /// `SupertableOptions` / `SupertableWriter`.
 #[derive(Debug, Error)]
 pub enum BuildError {
+    #[error("no documents to build")]
+    NoDocsToBuild,
+
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
 
@@ -100,7 +103,7 @@ pub enum BuildError {
     )]
     SupertableInUse,
 
-    #[error("segment store: {0}")]
+    #[error("superfile store: {0}")]
     Store(String),
 
     #[error("rayon thread pool creation failed: {0}")]
@@ -166,17 +169,17 @@ pub enum CommitError {
     #[error("write contention exhausted retries")]
     WriteContentionExhausted,
 
-    /// A segment's column range spans multiple
+    /// A superfile's column range spans multiple
     /// partitions under the configured `PartitionStrategy`.
-    /// For `TimeRange` / `ColumnRange`, the segment's
+    /// For `TimeRange` / `ColumnRange`, the superfile's
     /// `(min, max)` straddles a bucket boundary. For `Hash`,
-    /// the segment's `partition_hint` is unset — the writer
+    /// the superfile's `partition_hint` is unset — the writer
     /// didn't pre-shard.
     ///
     /// Single-bucket Hash strategies (`n_buckets == 1`) are
     /// special-cased to bypass this check, since every
     /// possible value hashes to bucket 0.
-    #[error("segment spans partition boundary: {detail}")]
+    #[error("superfile spans partition boundary: {detail}")]
     SuperfileSpansPartition { detail: String },
 }
 
@@ -240,7 +243,7 @@ pub enum OpenError {
     /// inconsistent with the on-disk supertable (schema /
     /// partition strategy / id column changed) or the
     /// manifest was written by a different supertable.
-    /// Surfaced ahead of any per-segment decode so callers
+    /// Surfaced ahead of any per-superfile decode so callers
     /// see a typed mismatch instead of a downstream parquet
     /// or arrow error.
     ///
@@ -249,6 +252,49 @@ pub enum OpenError {
     /// path) skips the check entirely.
     #[error("options_hash mismatch: caller={expected} list={actual}")]
     OptionsHashMismatch { expected: String, actual: String },
+}
+
+/// Errors raised by [`crate::supertable::Supertable::compact`].
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionError {
+    /// Compaction requires durable storage
+    /// (needs to seal sidecars and publish the merged superfile).
+    #[error("compaction requires a storage backend")]
+    NoStorage,
+
+    /// A superfile listed in a `CompactionJob` is not present in the
+    /// current manifest snapshot.
+    #[error("superfile {0} not found in manifest snapshot")]
+    SuperfileNotFound(uuid::Uuid),
+
+    #[error("empty merged superfile")]
+    EmptyMergedSuperfile,
+
+    /// The tombstone sidecar for `superfile_id` is already sealed by
+    /// a different compaction run. Caller must drive the abandoned
+    /// compaction to completion (or unwind it) before retrying.
+    #[error(
+        "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
+    )]
+    SidecarConflict {
+        superfile_id: uuid::Uuid,
+        existing_compaction_id: uuid::Uuid,
+    },
+
+    /// A WAL-store I/O error occurred while sealing a sidecar.
+    #[error("seal failed: {0}")]
+    Seal(String),
+
+    /// Error when building the compacted superfile
+    #[error("failed to build superfile: {0}")]
+    Build(#[from] BuildError),
+
+    #[error("failed to commit compaction: {0}")]
+    Commit(#[from] CommitError),
+
+    /// Refreshing the in-memory manifest after a successful commit failed.
+    #[error("post-commit manifest refresh failed: {0}")]
+    Refresh(String),
 }
 
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]
@@ -263,7 +309,7 @@ pub enum OpenError {
 /// failed mid-scan".
 #[derive(Debug, Error)]
 pub enum QueryError {
-    #[error("segment store error during query: {0}")]
+    #[error("superfile store error during query: {0}")]
     Store(String),
 
     #[error("error reading parquet bytes during scan: {0}")]

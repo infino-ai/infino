@@ -18,8 +18,7 @@ use futures::TryStreamExt;
 use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    PutPayload, UpdateVersion,
+    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, retry};
@@ -143,7 +142,7 @@ const AZURE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const AZURE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whole-request timeout (incl. body). The 30s default is too tight for
-/// a multi-MB segment PUT on a modest uplink — it aborts mid-upload.
+/// a multi-MB superfile PUT on a modest uplink — it aborts mid-upload.
 const AZURE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// HTTP client options: deep warm idle pool + bounded connect/request.
@@ -217,32 +216,23 @@ impl StorageProvider for AzureStorageProvider {
         .await
     }
 
-    /// Single-RTT tail fetch via Azure's native `Range: bytes=-len`
-    /// suffix form. The response carries the total object size in
-    /// `GetResult::meta.size`, so the caller skips a separate HEAD.
+    /// Tail fetch on Azure. Unlike S3, object_store's Azure backend
+    /// rejects suffix ranges (`Range: bytes=-len` → "Operation not
+    /// supported"), so the object size is resolved with a HEAD and the
+    /// trailing `len` bytes are pulled with a bounded `get_range`. That
+    /// is two RTTs rather than the single-RTT suffix form, but it is the
+    /// only shape Azure accepts; the size still comes back for parity
+    /// with the default impl. (Production supertable reads carry
+    /// `total_size` in the manifest and never reach this path; the
+    /// sizeless tail open is the standalone-superfile reader's cold open.)
     async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+        let size = self.head(uri).await?.size;
         if len == 0 {
-            // Suffix-range of 0 isn't well-defined in HTTP; HEAD so we
-            // still return the size for parity with the default impl.
-            let meta = self.head(uri).await?;
-            return Ok((Bytes::new(), meta.size));
+            return Ok((Bytes::new(), size));
         }
-        let path = self.path(uri)?;
-        retry::with_reissue(|| async {
-            let opts = GetOptions {
-                range: Some(GetRange::Suffix(len)),
-                ..Default::default()
-            };
-            let result = self
-                .store
-                .get_opts(&path, opts)
-                .await
-                .map_err(|e| translate(uri, e))?;
-            let size = result.meta.size as u64;
-            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-            Ok((bytes, size))
-        })
-        .await
+        let start = size.saturating_sub(len);
+        let bytes = self.get_range(uri, start..size).await?;
+        Ok((bytes, size))
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {

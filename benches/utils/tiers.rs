@@ -14,6 +14,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use infino::superfile::SuperfileReader;
+use infino::supertable::manifest::SubsectionOffsets;
 use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
 use infino::supertable::storage::{AzureStorageProvider, S3StorageProvider, StorageProvider};
 use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
@@ -96,7 +98,7 @@ enum StorageKeepalive {
 
 /// A real-backend prefix a bench run created and must delete on exit so it
 /// accrues no storage cost. The supertable build writes many objects
-/// (segments, manifests, the pointer) under one unique prefix; cleanup lists
+/// (superfiles, manifests, the pointer) under one unique prefix; cleanup lists
 /// every key beneath it and deletes them. `root` is an *un*-prefixed provider
 /// (bucket/container root): `list_with_prefix` takes an absolute key prefix
 /// and `delete` targets the absolute keys it returns verbatim, so both sides
@@ -415,7 +417,7 @@ emulator is not usable here: it does not implement conditional If-Match PUTs, \
 which the supertable's multi-commit OCC requires, so every commit after the \
 first would lose the CAS.";
 
-/// Supertable-shaped backing store (multi-segment, multi-commit benches).
+/// Supertable-shaped backing store (multi-superfile, multi-commit benches).
 ///
 /// **Real object store only** (S3 or Azure). The supertable build commits
 /// many times, so its OCC pointer update rides on the conditional `If-Match`
@@ -428,6 +430,30 @@ pub async fn supertable_storage_fixture() -> StorageFixture {
     match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
         Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
         backend => remote_fixture(backend, "infino-supertable-bench"),
+    }
+}
+
+/// Storage for a prepared dataset at a fixed prefix — no unique suffix, no
+/// cleanup, so the data persists across runs. `subdir` namespaces the modality
+/// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. Real backend only,
+/// same as [`supertable_storage_fixture`].
+pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
+    let backend = match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
+        Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
+        backend => backend,
+    };
+    let base = crate::dataset::dataset_prefix()
+        .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
+    let prefix = format!("{}/{subdir}", base.trim_matches('/'));
+    let label = backend.label();
+    let storage = backend.provider(&prefix).expect("dataset provider");
+    eprintln!("[tiers] dataset {label} prefix={prefix}");
+    StorageFixture {
+        storage,
+        storage_label: label,
+        remote: true,
+        cleanup: None,
+        _keepalive: StorageKeepalive::Remote,
     }
 }
 
@@ -481,9 +507,23 @@ fn supertable_search_cache_gib() -> Option<u64> {
         .filter(|&v| v > 0)
 }
 
+/// Concurrent background-fill permits for the bench disk cache. Raising
+/// `INFINO_BENCH_PREFETCH_CONCURRENCY` lets a many-segment supertable
+/// finish `wait_until_warm` within the timeout (256 segments promote in
+/// `ceil(256 / concurrency)` waves). Background memory scales as
+/// `concurrency × cold_fetch_streams × cold_fetch_chunk_bytes`, so e.g.
+/// 64 × 8 × 8 MiB ≈ 4 GiB of in-flight fill buffers.
+fn bench_prefetch_concurrency() -> usize {
+    std::env::var("INFINO_BENCH_PREFETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| DiskCacheConfig::default().prefetch_concurrency)
+}
+
 /// Fresh disk cache for ingest producers (8 GiB budget).
 ///
-/// Ingest attaches this cache only to keep segment bytes out of the
+/// Ingest attaches this cache only to keep superfile bytes out of the
 /// unbounded in-memory tier; commit-time cache prepopulation is disabled,
 /// so this budget is not meant to hold the searchable working set.
 pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
@@ -553,6 +593,43 @@ pub fn fresh_superfile_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc
     )
 }
 
+/// Size-only hint for a bench-uploaded superfile (no manifest subsection map).
+///
+/// Production supertable reads carry full offsets in the manifest; standalone
+/// superfile cold opens only know the committed byte length. Seeding
+/// `total_size` makes the disk cache prefetch the parquet footer with bounded
+/// `get_range` calls instead of a sizeless `storage.tail()` suffix fetch.
+/// Azure rejects suffix ranges; commit `5901707` fixed `AzureStorageProvider::tail`,
+/// but the size-hint path matches the supertable production shape and avoids
+/// the suffix round-trip entirely on S3 too.
+pub fn superfile_cold_size_hint(known_size: u64) -> SubsectionOffsets {
+    SubsectionOffsets {
+        total_size: known_size,
+        vec: None,
+        fts: None,
+        vec_open_ranges: vec![],
+        fts_open_ranges: vec![],
+        open_blob: vec![],
+    }
+}
+
+/// Open one superfile through a fresh disk cache using a known object size.
+pub fn open_superfile_cold_reader(
+    storage: Arc<dyn StorageProvider>,
+    uri: &SuperfileUri,
+    known_size: u64,
+) -> (TempDir, Arc<SuperfileReader>) {
+    let (cache_dir, cache) = fresh_superfile_cache(storage);
+    let offsets = superfile_cold_size_hint(known_size);
+    let reader = block_on(async move {
+        cache
+            .reader_with_hints(uri, Some(&offsets))
+            .await
+            .expect("cold reader")
+    });
+    (cache_dir, reader)
+}
+
 fn fresh_disk_cache_with_mode(
     storage: Arc<dyn StorageProvider>,
     disk_budget_bytes: u64,
@@ -565,11 +642,11 @@ fn fresh_disk_cache_with_mode(
         cold_fetch_mode,
         cold_fetch_streams: BENCH_COLD_FETCH_STREAMS,
         cold_fetch_chunk_bytes: BENCH_COLD_FETCH_CHUNK_BYTES,
+        prefetch_concurrency: bench_prefetch_concurrency(),
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: false,
-        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
     (dir, cache)

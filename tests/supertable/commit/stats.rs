@@ -15,7 +15,7 @@
 //!     path doesn't currently hydrate the part it just wrote
 //!     — `Supertable::open` is what populates the parts
 //!     cache; the writer just rebuilds the in-memory state
-//!     from `new_segment_list`).
+//!     from `new_superfile_list`).
 //!   - `Supertable::open`'s eager-fetch populates
 //!     `n_manifest_parts_loaded == n_manifest_parts`.
 //!   - `process_rss_bytes` is non-zero and falls within a
@@ -103,7 +103,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
 
     // Producer's in-memory state after commit: list is set,
     // parts cache is empty (writer rebuilds state via
-    // new_segment_list, doesn't hydrate the freshly-written
+    // new_superfile_list, doesn't hydrate the freshly-written
     // part). Contract: report what's actually in memory.
     let producer_stats = producer.stats();
     assert_eq!(producer_stats.manifest_id, 1);
