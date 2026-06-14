@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Covered/residual evaluation for filter-aligned aggregates —
-//! the manifest-statistics "aggregation tree" (claude-plans 022,
-//! phase 5).
+//! Covered/residual evaluation for filter-aligned aggregates over the
+//! manifest-statistics "aggregation tree".
 //!
 //! For an ungrouped aggregate whose `WHERE` clause is a single-column
 //! range, the manifest already knows each segment's bounds for that

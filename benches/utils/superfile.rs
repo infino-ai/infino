@@ -1238,7 +1238,7 @@ pub mod sql {
                     "Superfile SQL — query, single superfile / in-memory ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm p50 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are recorded in the design notes, not run here). Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
+                "Warm p50 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here). Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
                 &sets,
             );
             let b = result

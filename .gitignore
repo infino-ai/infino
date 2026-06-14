@@ -4,8 +4,9 @@ lcov.info
 .DS_Store
 
 # Python bindings (built standalone with maturin; not a workspace member).
+# Cargo.lock IS committed: the bindings are a built artifact (wheel) and
+# CI builds them with `--locked` for deterministic, drift-proof deps.
 infino-python/target/
-infino-python/Cargo.lock
 infino-python/.venv/
 infino-python/dist/
 **/__pycache__/

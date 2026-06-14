@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+//
+// End-to-end smoke tests for the infino Node.js bindings (friendly API).
+// Run after `npm run build`:
+//
+//     cd infino-node
+//     npm install && npm run build && npm test
+//
+// Mirrors infino-python/tests/test_smoke.py. The wrapper takes arrays of
+// objects in and returns plain records out — Arrow only appears when
+// building the create-table schema.
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { connect, IndexSpec } from "../infino/index.js";
+import { Schema, Field, LargeUtf8, Float32, FixedSizeList, Table, vectorFromArray } from "apache-arrow";
+
+// FTS columns must be LargeUtf8; non-null to match the appended data.
+const titleSchema = () => new Schema([new Field("title", new LargeUtf8(), false)]);
+
+const embSchema = (dim) =>
+  new Schema([new Field("emb", new FixedSizeList(dim, new Field("item", new Float32(), true)), false)]);
+
+const onehot = (i, dim) => {
+  const v = new Array(dim).fill(0);
+  v[i] = 1.0;
+  return v;
+};
+
+test("memory roundtrip: create, append, search, drop", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+
+  // append takes plain objects (also an apache-arrow Table / RecordBatch).
+  docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
+
+  assert.deepEqual(db.listTables(), ["docs"]);
+
+  const reopened = db.openTable("docs");
+
+  // bm25Search returns matching rows as plain records; `_id` is a bigint.
+  const ranked = reopened.bm25Search("title", "fox", 10);
+  assert.equal(ranked.length, 1);
+  assert.equal(typeof ranked[0]._id, "bigint");
+
+  // tokenMatch returns matching rows (unranked, score 0); `_id` is a bigint.
+  const hits = reopened.tokenMatch("title", "fox");
+  assert.equal(hits.length, 1);
+  assert.equal(typeof hits[0]._id, "bigint");
+  assert.equal(hits[0].score, 0);
+
+  db.dropTable("docs");
+  assert.deepEqual(db.listTables(), []);
+});
+
+test("append accepts an apache-arrow RecordBatch", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  // A RecordBatch (or a Table) can be appended directly, not just objects.
+  const batch = new Table({ title: vectorFromArray(["the quick brown fox"], new LargeUtf8()) }).batches[0];
+  docs.append(batch);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
+});
+
+test("createTable accepts a plain { column: type } descriptor", () => {
+  const db = connect("memory://");
+  // No apache-arrow needed to define the schema.
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }]);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
+});
+
+test("querySql returns records", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }, { title: "beta" }, { title: "gamma" }]);
+
+  const rows = db.querySql("SELECT COUNT(*) AS n FROM docs");
+  assert.equal(Number(rows[0].n), 3);
+});
+
+test("querySql can return an Arrow table with { arrow: true }", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
+
+  const tbl = db.querySql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)", { arrow: true });
+  assert.equal(tbl.numRows, 1);
+});
+
+test("tokenMatch and exactMatch return unranked rows", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
+
+  // Project to just _id + score (score is 0 for unranked matches).
+  const tok = docs.tokenMatch("title", "fox", { projection: ["_id", "score"] });
+  assert.equal(tok.length, 1);
+  assert.equal(typeof tok[0]._id, "bigint");
+  assert.equal(tok[0].score, 0);
+
+  const ex = docs.exactMatch("title", "a lazy dog");
+  assert.equal(ex.length, 1);
+});
+
+test("unknown table throws", () => {
+  const db = connect("memory://");
+  assert.throws(() => db.openTable("nope"));
+});
+
+test("localfs persists across reconnect", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-smoke-"));
+  const db = connect(dir);
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  docs.append([{ title: "a lazy sleeping fox" }]);
+
+  const db2 = connect(dir);
+  assert.deepEqual(db2.listTables(), ["docs"]);
+  assert.equal(db2.openTable("docs").tokenMatch("title", "fox").length, 1);
+});
+
+test("vector search end-to-end", () => {
+  const db = connect("memory://");
+  const dim = 16; // infino requires vector dim in [16, 4096]
+  const docs = db.createTable("vecs", embSchema(dim), new IndexSpec().vector("emb", dim, 1, "cosine"));
+
+  // append objects with the vector as a plain number[] — the wrapper
+  // builds the FixedSizeList<float32> column from the declared schema.
+  docs.append([{ emb: onehot(0, dim) }, { emb: onehot(1, dim) }, { emb: onehot(2, dim) }]);
+
+  // query vector as a plain array (wrapper coerces to Float32Array).
+  const rows = docs.vectorSearch("emb", onehot(0, dim), 10);
+  assert.ok(rows.length >= 1);
+});

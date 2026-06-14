@@ -56,8 +56,7 @@ const ROTATION_STAGES: usize = 3;
 /// The butterfly stays on `wide` (256-bit / AVX2) deliberately: a
 /// 16-lane AVX-512 variant was measured **~8% slower** across the dim
 /// sweep (memory-bound load×2/store×2 with near-zero compute, so the
-/// wider lane buys nothing and the AVX-512 downclock costs). See
-/// `claude-plans` 014 (SIMD perf) for the supporting numbers.
+/// wider lane buys nothing and the AVX-512 downclock costs).
 const F32X8_LANES: usize = 8;
 
 /// Fast structured random rotation (sign-flip + Walsh–Hadamard,

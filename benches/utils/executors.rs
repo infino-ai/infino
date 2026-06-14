@@ -1346,8 +1346,7 @@ pub mod sql {
 
     /// The full set of measured warm SQL query shapes. Infino-only: the
     /// DataFusion-only control arms (plain scan, full-scan aggregates) were
-    /// dropped — that comparison is recorded in the design notes, and the
-    /// bench now tracks the engine's own FTS-pushdown path.
+    /// dropped so the bench tracks the engine's own FTS-pushdown path.
     pub struct QuerySets {
         pub scalar: Vec<SqlQueryStat>,
         pub tvf: Vec<SqlQueryStat>,

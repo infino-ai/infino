@@ -403,7 +403,7 @@ pub(crate) struct Sq8Kernel {
     /// `None` for NegDot. `Some` for L2Sq (stores `‖x‖²`) and
     /// Cosine (stores `‖x‖²`; rerank divides by `√norm`). Shared by
     /// refcount (`Arc`) so the kernel is `'static` and can run on a
-    /// `tokio::task::spawn_blocking` worker — no per-query copy.
+    /// rayon worker — no per-query copy.
     per_doc_norms: Option<Arc<[f32]>>,
 }
 
@@ -1709,9 +1709,8 @@ mod tests {
 
     // --- AVX2 microbench (run by hand) ---------------------------------
     //
-    // Measures the AVX2 widen-FMA paths added in Phase 2 against the
-    // portable scalar-widen kernels they replace on AVX2 hosts. Run
-    // with:
+    // Measures the AVX2 widen-FMA paths against the portable
+    // scalar-widen kernels they replace on AVX2 hosts. Run with:
     //
     // ```text
     // cargo test --release --lib superfile::vector::distance::tests::\
@@ -1925,9 +1924,9 @@ mod tests {
 
     /// AVX2 fp32-equivalent Sq8 widen path vs the portable
     /// scalar-widen `_wide` kernel. Captures the "lift the AVX2
-    /// fallback path" half of the Phase 2 win (the other half is
-    /// the Sq8Kernel rerank cache, which is a data-structure
-    /// change exercised by the IVF rerank benches end-to-end).
+    /// fallback path" win; the complementary Sq8Kernel rerank cache
+    /// is a data-structure change exercised by the IVF rerank benches
+    /// end-to-end.
     #[test]
     #[ignore]
     #[cfg(target_arch = "x86_64")]

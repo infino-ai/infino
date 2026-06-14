@@ -21,10 +21,11 @@ autobenches = false
 # can be checked/built/tested directly.
 [workspace]
 members = ["benches/utils"]
-# The Python bindings are built standalone with maturin, not as part of
-# this workspace — so the core Rust crate never requires a Python /
-# pyo3 toolchain to build. See `infino-python/README.md`.
-exclude = ["infino-python"]
+# The language bindings are built standalone (maturin / napi-rs), not as
+# part of this workspace — so the core Rust crate never requires a Python
+# or Node toolchain to build. See `infino-python/README.md` and
+# `infino-node/README.md`.
+exclude = ["infino-python", "infino-node"]
 
 [lib]
 path = "src/lib.rs"
