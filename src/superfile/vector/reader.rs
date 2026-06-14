@@ -24,6 +24,7 @@ use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::{ReadError, error::VectorError};
 use bytes::Bytes;
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -1801,43 +1802,45 @@ async fn build_shortlist(
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-        // Parallelize the coarse 1-bit scan across tokio's blocking pool
-        // (one task per chunk). Cluster scoring is order-independent —
-        // every survivor is re-sorted below — so chunked-parallel and
-        // serial shortlists rank identically. Each task owns a quantizer
-        // clone, a shared rotated-query, and its chunk's zero-copy
-        // `Bytes` views; partial heaps merge after.
+        // Parallelize the coarse 1-bit scan across the global rayon pool,
+        // bridged back via a oneshot so no tokio worker blocks under the
+        // compute. Cluster scoring is order-independent — every survivor
+        // is re-sorted below — so chunked-parallel and serial shortlists
+        // rank identically. Partial heaps merge after.
         let n_tasks = parallel_chunks(cluster_meta.len());
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
-        let q_rot: Arc<Vec<f32>> = Arc::new(q_rot.to_vec());
-        let mut handles = Vec::with_capacity(n_tasks);
-        for (meta_chunk, block_chunk) in
-            cluster_meta.chunks(chunk).zip(cluster_blocks.chunks(chunk))
-        {
-            let meta_chunk: Vec<(usize, u32, u32)> = meta_chunk.to_vec();
-            let block_chunk: Vec<Bytes> = block_chunk.to_vec();
-            let quant = quant.clone();
-            let q_rot = Arc::clone(&q_rot);
-            handles.push(tokio::task::spawn_blocking(move || {
-                let mut heap = BoundedCoarseHeap::new(coarse_limit);
-                for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
-                    let codes_len = (cnt as usize) * cb;
-                    let doc_ids_len = (cnt as usize) * 4;
-                    let codes = block.slice(0..codes_len);
-                    let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-                    score_cluster_codes_into_heap(
-                        &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot, &mut heap,
-                    );
-                }
-                heap
-            }));
-        }
-        let mut acc = BoundedCoarseHeap::new(coarse_limit);
-        for h in handles {
-            acc.merge(h.await.expect("vector shortlist scan task panicked"));
-        }
-        acc
+        let q_rot_v: Vec<f32> = q_rot.to_vec();
+        let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
+        let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rayon::spawn(move || {
+            let acc = meta_owned
+                .par_chunks(chunk)
+                .zip(blocks_owned.par_chunks(chunk))
+                .map(|(meta_chunk, block_chunk)| {
+                    let mut heap = BoundedCoarseHeap::new(coarse_limit);
+                    for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
+                        let codes_len = (cnt as usize) * cb;
+                        let doc_ids_len = (cnt as usize) * 4;
+                        let codes = block.slice(0..codes_len);
+                        let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+                        score_cluster_codes_into_heap(
+                            &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot_v, &mut heap,
+                        );
+                    }
+                    heap
+                })
+                .reduce(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut a, b| {
+                        a.merge(b);
+                        a
+                    },
+                );
+            let _ = tx.send(acc);
+        });
+        rx.await.expect("vector shortlist rayon task dropped result")
     } else {
         let mut heap = BoundedCoarseHeap::new(coarse_limit);
         for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
@@ -1967,40 +1970,26 @@ fn parallel_chunks(n_items: usize) -> usize {
         .max(1)
 }
 
-/// Map `f` over `items` across tokio's blocking pool, preserving input
-/// order. The order-independent vector scans (rerank) use this now
-/// that the search kernels are async — the tokio analogue of a rayon
-/// `par_iter().map().collect()`, with no rayon dependency. `f` and the
-/// items must be `'static` so each chunk can move onto a blocking task.
+/// Map `f` over `items` on the global rayon pool, preserving input
+/// order. The order-independent vector scans (rerank) use this; the
+/// compute runs on rayon (`par_iter().map().collect()`) bridged back to
+/// the async caller via a oneshot, so no tokio worker blocks under it.
+/// `f` and the items must be `'static` so the work can move onto rayon.
 async fn par_map_blocking<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
 where
     T: Send + Sync + 'static,
     R: Send + 'static,
     F: Fn(&T) -> R + Send + Sync + 'static,
 {
-    let n = parallel_chunks(items.len());
-    if n <= 1 {
+    if parallel_chunks(items.len()) <= 1 {
         return items.iter().map(&f).collect();
     }
-    let items = Arc::new(items);
-    let f = Arc::new(f);
-    let chunk = items.len().div_ceil(n);
-    let mut handles = Vec::with_capacity(n);
-    let mut start = 0;
-    while start < items.len() {
-        let end = (start + chunk).min(items.len());
-        let items = Arc::clone(&items);
-        let f = Arc::clone(&f);
-        handles.push(tokio::task::spawn_blocking(move || {
-            items[start..end].iter().map(|t| f(t)).collect::<Vec<R>>()
-        }));
-        start = end;
-    }
-    let mut out = Vec::with_capacity(items.len());
-    for h in handles {
-        out.extend(h.await.expect("rerank scan task panicked"));
-    }
-    out
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rayon::spawn(move || {
+        let out: Vec<R> = items.par_iter().map(|t| f(t)).collect();
+        let _ = tx.send(out);
+    });
+    rx.await.expect("rerank rayon task dropped result")
 }
 
 #[inline]
