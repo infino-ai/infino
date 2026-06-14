@@ -36,6 +36,29 @@ rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
 The Python bindings (PyO3 + maturin) live in
 [`infino-python/`](infino-python/) — see its README to build and test.
 
+## Quick example in Node.js
+
+```javascript
+const { connect, IndexSpec } = require("infino");
+
+const db = connect("memory://");                   // or "./data", "s3://bucket/prefix"
+
+// A plain { column: type } schema — no apache-arrow needed.
+const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+
+// append plain objects; results come back as plain records.
+docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
+
+const rows = docs.bm25Search("title", "fox", 10);        // ranked rows as records
+const hits = docs.tokenMatch("title", "fox");            // unranked matching rows (score 0)
+const sql  = db.querySql("SELECT _id, title FROM docs"); // records (or { arrow: true })
+```
+
+The Node.js bindings live in
+[`infino-node/`](infino-node/) — see its README to build and test. The
+API is synchronous: objects in, plain records out; `_id` comes back as a
+JavaScript `bigint`.
+
 ## Quick example in Rust
 
 Open a connection, create a table with a full-text index, append rows,
@@ -202,6 +225,7 @@ reviewed as a contract change in the same pull request.
 - **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
   least one minor release first.
 - **Python.** The wheel tracks the crate version 1:1.
+- **Node.** The npm package tracks the crate version 1:1.
 
 ## Development
 

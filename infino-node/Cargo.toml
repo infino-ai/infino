@@ -1,0 +1,38 @@
+[package]
+name = "infino-node"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# `require('infino')` loads the cdylib (renamed to `*.node` by the napi
+# CLI). The npm package name is set in `package.json`.
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# The core crate, consumed through its CURATED PUBLIC API only — no
+# `test-helpers`. Building these bindings therefore also validates that
+# the public surface is sufficient to drive a real consumer.
+# `default-features = false` drops infino's mimalloc `#[global_allocator]`:
+# a Node native addon must not install a second global allocator into the
+# Node process, so the module uses the system allocator (same reasoning as
+# the Python bindings).
+infino = { path = "..", default-features = false }
+
+# napi-rs — the Node-API bridge. `napi8` selects the Node-API version
+# floor (>= 8 gives `BigInt`, `TypedArray`, etc., which the surface needs).
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+
+# Arrow is the logical interchange, same as the Python bindings — but
+# JS↔Rust has no zero-copy C-Data bridge (that is a pyarrow↔arrow-rs
+# luxury), so data crosses as Arrow IPC bytes (`Buffer`). `ipc` pulls the
+# stream reader/writer; `concat_batches` lives in `arrow::compute`.
+arrow = { version = "58", features = ["ipc"] }
+arrow-array = "58"
+arrow-schema = "58"
+
+[build-dependencies]
+napi-build = "2"

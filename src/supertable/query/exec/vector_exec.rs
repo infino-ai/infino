@@ -58,7 +58,7 @@ use datafusion::scalar::ScalarValue;
 
 use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
 use crate::superfile::reader::VectorSearchOptions;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{SupertableReader, WeakReader};
 
 /// SQL name the TVF is registered under.
 pub(crate) const VECTOR_SEARCH_UDTF: &str = "vector_search";
@@ -85,7 +85,7 @@ pub(crate) fn register_vector_search(
 /// per-invocation [`VectorSearchTable`].
 #[derive(Debug)]
 pub(crate) struct VectorSearchFunc {
-    reader: Arc<SupertableReader>,
+    reader: WeakReader,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
 }
@@ -94,7 +94,7 @@ impl VectorSearchFunc {
     pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
-            reader,
+            reader: WeakReader::from_reader(&reader),
             scalar_schema,
             output_schema,
         }
@@ -113,8 +113,13 @@ impl TableFunctionImpl for VectorSearchFunc {
         let column = arg_to_string(&args[0], "column")?;
         let query = arg_to_query_vector(&args[1])?;
         let k = arg_to_usize(&args[2], "k")?;
+        let reader = self.reader.upgrade().ok_or_else(|| {
+            DataFusionError::Execution(
+                "vector_search: supertable consumer dropped before execution".into(),
+            )
+        })?;
         Ok(Arc::new(VectorSearchTable {
-            reader: Arc::clone(&self.reader),
+            reader,
             column,
             query,
             k,

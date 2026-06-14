@@ -2,7 +2,8 @@
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
-        python-test python-wheel
+        python-test python-wheel \
+        node-test node-build
 
 check:
 	cargo fmt --check
@@ -114,6 +115,18 @@ python-wheel:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
+
+# Node bindings (napi-rs). Built standalone — `infino-node` is excluded
+# from the cargo workspace, so the core crate never needs a Node
+# toolchain. These targets require npm + a Rust toolchain on PATH.
+
+# Build the addon (debug) + run the node:test smoke suite.
+node-test:
+	cd infino-node && npm install && npm run build:debug && npm test
+
+# Build a release addon for the current platform.
+node-build:
+	cd infino-node && npm install && npm run build
 
 # Local "pre-PR" check — same gates CI runs
 ci: check doctest coverage

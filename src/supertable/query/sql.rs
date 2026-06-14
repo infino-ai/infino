@@ -388,6 +388,41 @@ mod tests {
         assert_eq!(n, 3);
     }
 
+    /// Regression test for the cold-reopen consumer leak. Running
+    /// `query_sql` builds and caches a `SessionContext` on the
+    /// `SupertableInner`, and that context registers the search TVFs.
+    /// When the TVFs held a strong `Arc<SupertableReader>` (which holds
+    /// the `Arc<SupertableInner>`), the chain
+    /// `inner -> cached SessionContext -> TVF -> reader -> inner` formed a
+    /// reference cycle that pinned the whole consumer — every fresh
+    /// consumer reopen (the cold query path) leaked one, OOMing at scale.
+    /// With the TVFs holding a `WeakReader`, dropping the last external
+    /// handle releases the inner; a `Weak` to it must fail to upgrade.
+    #[test]
+    fn query_sql_session_cache_does_not_leak_consumer() {
+        let weak = {
+            let st = Supertable::create(options_id_cat_title()).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&build_cat_batch(0, &["rust"], &["a"]))
+                .expect("append");
+            w.commit().expect("commit");
+
+            // Populate the cached SessionContext (registers the TVFs).
+            assert_eq!(run_count(&st, "SELECT COUNT(*) FROM supertable"), 1);
+
+            let weak = Arc::downgrade(st.inner());
+            drop(w);
+            drop(st);
+            weak
+        };
+
+        assert!(
+            weak.upgrade().is_none(),
+            "SQL session cache leaked the consumer — the \
+             inner -> SessionContext -> TVF -> reader -> inner cycle was not broken",
+        );
+    }
+
     #[test]
     fn query_sql_filter_predicate_applied_above_mem_table() {
         let st = Supertable::create(options_id_cat_title()).expect("create");

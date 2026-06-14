@@ -139,6 +139,77 @@ jobs:
           name: wheel-${{ matrix.os }}
           path: infino-python/dist
 
+  node:
+    name: Node bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Same rationale as the Python job: the bindings build `infino` as a
+    # normal dependency, so don't fail on a transitive deprecation warning.
+    env:
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-node
+      # Builds the addon (debug) + runs the node:test smoke suite.
+      - run: make node-test
+
+  node-addons:
+    name: Addon (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      # Native runner per platform — `make node-build` builds for the host,
+      # no cross-compilation. One `*.node` artifact each.
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-13]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-node
+      - run: make node-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: addon-${{ matrix.os }}
+          path: infino-node/*.node
+
   # Informational benchmark — superfile + supertable tiers, one in-region
   # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
   # On merge to main: publish the run as that baseline + a per-commit history
