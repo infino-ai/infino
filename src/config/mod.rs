@@ -480,7 +480,7 @@ supertable:
         let yaml = r#"
 storage:
   backend: s3
-  bucket: cold-test-381491836522
+  bucket: example-bucket
   prefix: infino-real-s3-integration/example
   disk_cache_root: /tmp/infino-cache
   cold_fetch_mode: lazy_foreground_with_background_fill
@@ -492,10 +492,7 @@ storage:
             .merge(Yaml::string(yaml));
         let cfg = Config::from_figment(fig).expect("parse config");
         assert_eq!(cfg.storage.backend, StorageBackend::S3);
-        assert_eq!(
-            cfg.storage.bucket.as_deref(),
-            Some("cold-test-381491836522")
-        );
+        assert_eq!(cfg.storage.bucket.as_deref(), Some("example-bucket"));
         assert_eq!(cfg.storage.prefix, "infino-real-s3-integration/example");
         assert_eq!(
             cfg.storage.disk_cache_root.as_deref(),

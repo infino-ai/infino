@@ -539,9 +539,21 @@ fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
         for i in 0..n {
             let off = i * TRIPLE_BYTES;
             let t = [
-                u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()),
-                u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()),
-                u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()),
+                u32::from_le_bytes(
+                    bytes[off..off + 4]
+                        .try_into()
+                        .expect("invariant: 4-byte triple field"),
+                ),
+                u32::from_le_bytes(
+                    bytes[off + 4..off + 8]
+                        .try_into()
+                        .expect("invariant: 4-byte triple field"),
+                ),
+                u32::from_le_bytes(
+                    bytes[off + 8..off + 12]
+                        .try_into()
+                        .expect("invariant: 4-byte triple field"),
+                ),
             ];
             out.push(t);
         }

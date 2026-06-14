@@ -1,7 +1,7 @@
 # infino benches
 
 Infino's in-tree benchmarks measure Infino itself. Cross-engine comparison
-benches live in `retrievalbench`; these tables are the Infino reference numbers
+benches live in a separate cross-engine comparison harness; these tables are the Infino reference numbers
 those comparisons are checked against.
 
 All benchmarks run on Infino's custom bench harness (one binary, no external

@@ -2104,10 +2104,11 @@ fn warm_cache_after_commit(
     let drive = async move {
         for (uri, bytes) in pending {
             if let Err(e) = cache.insert_warm(&uri, bytes).await {
-                eprintln!(
+                tracing::warn!(
                     "supertable: warm cache pre-population failed for {}: {} \
                      (superfile is durable in storage; first query will cold-fetch)",
-                    uri.0, e
+                    uri.0,
+                    e
                 );
             }
         }

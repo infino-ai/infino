@@ -2,7 +2,18 @@
 name = "infino"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
+description = "A fast retrieval engine that stores data on object storage and runs SQL, full-text search, and vector search over it from a single system — search-on-Parquet."
+repository = "https://github.com/infino-ai/infino"
+homepage = "https://github.com/infino-ai/infino"
+readme = "README.md"
+keywords = ["search", "vector", "full-text", "parquet", "object-storage"]
+categories = ["database", "database-implementations"]
+# `cargo publish` packages the package directory; the workspace `exclude`
+# below does NOT keep the standalone Python bindings out of the crate
+# tarball, so exclude them from the package explicitly.
+exclude = ["infino-python/"]
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via
 # `[[bench]]` below. Without this, shared helper files like

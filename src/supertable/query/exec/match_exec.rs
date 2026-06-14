@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Unranked token / exact match as DataFusion table-valued functions.
 //!
 //! `token_match(column, query [, mode])` and `exact_match(column,
