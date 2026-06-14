@@ -1008,7 +1008,7 @@ impl FtsReader {
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
         let mut heap: BinaryHeap<TopKEntry> =
-            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * 128).max(1));
+            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
@@ -2258,7 +2258,7 @@ impl FtsReader {
 
     /// Multi-term OR dispatch. Routes everything to MaxScore+BMM.
     ///
-    /// **Routing decision (1M docs, M4 Max — head-to-head WAND+BMW vs MaxScore+BMM):**
+    /// **Routing decision (1M docs — head-to-head WAND+BMW vs MaxScore+BMM):**
     ///
     /// | Query shape                                 | WAND+BMW | MaxScore+BMM |
     /// |---|---|---|

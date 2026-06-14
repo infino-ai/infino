@@ -5,7 +5,7 @@
 //!
 //! Builds a small multi-column FTS index, opens it through `FtsReader`,
 //! exercises the search API. Mirrors the planted-ground-truth
-//! correctness pattern from the plan's integration-test discipline.
+//! correctness pattern used across the integration tests.
 
 use bytes::Bytes;
 use infino::superfile::fts::builder::FtsBuilder;

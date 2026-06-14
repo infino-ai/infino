@@ -313,8 +313,8 @@ impl VectorReader {
     /// underlying storage is untrusted and CRC verification is
     /// load-bearing. The convenience constructor
     /// [`OpenOptions::for_object_store`] sets it to `false`
-    /// (the load-bearing default discussed in the plan's
-    /// "verify_crc trade-off" section).
+    /// (the load-bearing default; see the `verify_crc` trade-off
+    /// documented on `OpenOptions`).
     pub async fn open_lazy(
         source: Arc<dyn LazyByteSource>,
         columns_json: &str,
@@ -4140,7 +4140,7 @@ mod tests {
         let n_queries = 100usize;
         let k = 10usize;
         let nprobe = n_cent_ivf / 4;
-        let rerank_mult = 50usize; // plan-doc Sq8 floor at dim ≤ 384
+        let rerank_mult = 50usize; // Sq8 rerank floor at dim ≤ 384
         let ground_truth: Vec<std::collections::HashSet<u32>> = (0..n_queries)
             .map(|qi| {
                 let q = &all[qi];
@@ -4181,7 +4181,7 @@ mod tests {
         let r_sq = recalls[1];
         eprintln!("drop (fp32 - sq8 ): {:.4}", r_fp - r_sq);
         eprintln!(
-            "(plan acceptance #2: drop must be \u{2264} 0.01; bench measured 0.10 drop at 1M scale)"
+            "(acceptance: recall drop must be \u{2264} 0.01; bench measured 0.10 drop at 1M scale)"
         );
 
         // -- Probe: vary rerank_mult to isolate shortlist depth vs rerank noise --
@@ -4666,7 +4666,7 @@ mod tests {
     // Companion smoke test below (`mem_ceiling_lazy_open_smoke`)
     // runs in default `cargo test --lib` at a smaller scale so
     // every PR gets continuous feedback on this guarantee
-    // without paying for a 1M-doc build. The 1M × 384 plan-spec
+    // without paying for a 1M-doc build. The 1M × 384 reference-scale
     // version is `#[ignore]`'d because
     // `VectorBuilder.finish_to(...)` at that scale takes ~35 s in
     // release / several minutes in debug. Run explicitly:
@@ -4786,7 +4786,7 @@ mod tests {
         (delta, n_cols)
     }
 
-    /// **acceptance criterion #2 (plan-spec scale).**
+    /// **memory-ceiling acceptance criterion (reference scale).**
     ///
     /// 1 M × 384, `n_cent = 1024`. `#[ignore]`-gated because
     /// the `VectorBuilder.finish_to(...)` call takes ~35 s in
@@ -4838,7 +4838,7 @@ mod tests {
     /// continuous feedback on the structural property: lazy
     /// open touches only the structural-decode pages, never
     /// the bulk codes/full/doc_ids regions. The 10 MiB ceiling
-    /// at the plan's headline 1M × 384 scale is asserted at
+    /// at the headline 1M × 384 scale is asserted at
     /// the same value here because the resident allocation
     /// (mostly the rotation matrix at `dim²·4` = 16 KB for
     /// dim=64) is *smaller* at smoke scale, not larger — if
@@ -4912,7 +4912,7 @@ mod tests {
     // exactly the topology these tests exercise. The smoke variant
     // mirrors the bench's *layout* at a tiny corpus size (4 superfiles
     // × 50 k docs × 64 dim) so every PR catches regressions
-    // (~5 s build). The `#[ignore]`'d plan-spec variant uses the
+    // (~5 s build). The `#[ignore]`'d reference-scale variant uses the
     // bench's actual per-superfile shape (16 superfiles × 625 k docs ×
     // 384 dim × n_cent_per_superfile matching the bench's
     // `n_cent_total / 4`) and runs only when called out.
@@ -5029,7 +5029,7 @@ mod tests {
         drop(tmps);
     }
 
-    /// **supertable-scale memory ceiling (plan-spec).**
+    /// **supertable-scale memory ceiling (reference scale).**
     ///
     /// Mirrors the bench's actual 10M × 4-commit ×
     /// 4-thread-writer-pool topology: 16 superfiles × 625 k docs ×

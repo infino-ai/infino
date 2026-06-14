@@ -204,7 +204,7 @@ async fn hybrid_reader_returns_working_superfile_reader() {
 
 #[tokio::test]
 async fn hybrid_bandwidth_per_cold_miss_equals_superfile_size() {
-    // The plan's "1× bandwidth per cold miss" invariant —
+    // The "1× bandwidth per cold miss" invariant —
     // the same range responses serve both foreground and
     // cache fill; no re-fetching.
     let store_dir = TempDir::new().expect("storage");
