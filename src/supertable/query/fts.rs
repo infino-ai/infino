@@ -78,7 +78,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::{Manifest, SuperfileEntry};
+use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::query::SuperfileHit;
 use crate::supertable::query::exec::common::resolve_hits_named;
 use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
@@ -755,15 +755,6 @@ fn top_k_descending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Supe
     let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
     result.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     result
-}
-
-/// Helper used by [`Manifest`] consumers in tests and downstream
-/// skip-layer code. Exposed at module scope (not `pub`) for the
-/// same reason the writer's helpers stay private: this is internal
-/// plumbing, not API surface.
-#[allow(dead_code)]
-fn _manifest_doc_total(manifest: &Manifest) -> u64 {
-    manifest.n_docs_total()
 }
 
 impl Supertable {

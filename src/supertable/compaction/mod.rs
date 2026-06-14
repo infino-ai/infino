@@ -241,7 +241,6 @@ impl Supertable {
     }
 
     /// Merges the given superfiles into one
-    #[allow(dead_code)]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],

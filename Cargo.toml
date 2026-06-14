@@ -2,7 +2,10 @@
 name = "infino"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
+# uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
+# the real floor is well above the 2024-edition minimum.
+rust-version = "1.95"
 license = "Apache-2.0"
 description = "A fast retrieval engine that stores data on object storage and runs SQL, full-text search, and vector search over it from a single system — search-on-Parquet."
 repository = "https://github.com/infino-ai/infino"

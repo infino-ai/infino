@@ -1413,7 +1413,6 @@ struct Reservation<'a> {
 }
 
 impl<'a> Reservation<'a> {
-    #[allow(dead_code)]
     fn commit(mut self) {
         self.committed = true;
     }
