@@ -45,30 +45,11 @@ cargo bench --bench bench -- tombstone
 
 ## Code style beyond CONTRIBUTING.md
 
-- **Rayon for CPU, tokio for I/O — bridged, never mixed.** This split
-  was A/B-tested (all-tokio, all-rayon, and the hybrid; the hybrid won —
-  rayon saturates cores better, tokio drives I/O better) and is the
-  standing concurrency contract for the query and build paths:
-  - **tokio owns the I/O waves**: superfile opens, object-store range
-    GETs, sidecar prefetches — `tokio::spawn` / `try_join_all` on the
-    shared multi-thread query runtime so connections pool and fetches
-    overlap. Never build a throwaway per-call runtime on a worker
-    thread (that exact anti-pattern once regressed cold vector search
-    from ~1.1 s to ~3.7–11 s).
-  - **rayon owns the CPU waves**: Parquet page decode, BM25 / vector
-    scoring, rerank, encode. Run them on `options.reader_pool` (the
-    configurable pool — not the global rayon pool) via
-    `pool.install(|| … par_iter …)`.
-  - **Bridge with a oneshot**: when an async task needs a CPU wave,
-    hand the work to the rayon pool and `await` a
-    `tokio::sync::oneshot` for the result, so tokio workers keep
-    driving I/O instead of blocking under the compute. Don't call
-    `par_iter` (or any long compute) inline in an async fn.
-  - If you change where work runs, benchmark before and after
-    (`cargo bench --bench bench -- supertable search` plus the
-    `INFINO_DIAG_QUERY_SQL_OVERHEAD` diagnostic for the SQL resolve
-    path) — a prior change silently moved warm decodes back onto
-    tokio and cost ~5× on `resolve_hits`.
+- **Rayon for CPU, tokio for I/O.** In general this split is the standing concurrency contract for the query and build paths:
+  - **tokio owns the I/O waves**: superfile opens, object-store range GETs, sidecar prefetches — `tokio::spawn` / `try_join_all` on the shared multi-thread query runtime so connections pool and fetches overlap. Never build a throwaway per-call runtime on a worker thread (that exact anti-pattern once regressed cold vector search from ~1.1 s to ~3.7–11 s).
+  - **rayon owns the CPU waves**: Parquet page decode, BM25 / vector scoring, rerank, encode. Run them on `options.reader_pool` (the configurable pool — not the global rayon pool) via `pool.install(|| … par_iter …)`.
+  - **Bridge with a oneshot**: when an async task needs a CPU wave, hand the work to the rayon pool and `await` a `tokio::sync::oneshot` for the result, so tokio workers keep driving I/O instead of blocking under the compute. Don't call `par_iter` (or any long compute) inline in an async fn.
+  - If you change where work runs, benchmark before and after (`cargo bench --bench bench -- supertable search` plus the `INFINO_DIAG_QUERY_SQL_OVERHEAD` diagnostic for the SQL resolve path) — a prior change silently moved warm decodes back onto tokio and cost ~5× on `resolve_hits`.
 - **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
 - **Imports at the top of the file.** All `use` statements live at the top of the file (or, for an inline `#[cfg(test)]` module, at the top of that module) — never function-local, block-scoped, or otherwise inline. A file's full dependency surface should be readable in one place. If you find yourself reaching for a fully-qualified path mid-expression only to avoid an import, add the `use` at the top instead.
 - **No code duplication.** Read the surrounding modules *before* writing new code — there is usually an existing helper that already does what you need. Refactor shared logic into one helper rather than copy-pasting; duplicated logic drifts out of sync and is a correctness hazard.
