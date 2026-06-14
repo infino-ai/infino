@@ -1987,7 +1987,7 @@ where
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     rayon::spawn(move || {
-        let out: Vec<R> = items.par_iter().map(|t| f(t)).collect();
+        let out: Vec<R> = items.par_iter().map(f).collect();
         let _ = tx.send(out);
     });
     rx.await.expect("rerank rayon task dropped result")
