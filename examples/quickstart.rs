@@ -88,7 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Arrow type for an `EMB_DIM`-wide vector column.
 fn vector_field(dim: usize) -> DataType {
-    DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim as i32)
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+    )
 }
 
 /// A one-hot unit embedding with its single non-zero at `row % EMB_DIM`,

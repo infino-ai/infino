@@ -254,10 +254,7 @@ impl SupertableProvider {
     /// whose tokens include every token of the literal, so requiring all
     /// of them possibly-present (`BoolMode::And`) never drops a match —
     /// bloom false positives can only keep a superfile, never drop one.
-    fn predicates_to_prune_leaves(
-        &self,
-        predicates: Vec<ScalarPredicate>,
-    ) -> Vec<PruneLeaf> {
+    fn predicates_to_prune_leaves(&self, predicates: Vec<ScalarPredicate>) -> Vec<PruneLeaf> {
         let opts = &self.manifest.options;
         let mut leaves = Vec::with_capacity(predicates.len());
         for pred in predicates {

@@ -587,5 +587,4 @@ mod tests {
         // 8-byte LE length prefix + 2 ASCII bytes.
         assert_eq!(buf, vec![2u8, 0, 0, 0, 0, 0, 0, 0, b'o', b'k']);
     }
-
 }

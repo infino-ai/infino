@@ -1386,8 +1386,8 @@ impl DiskCacheStore {
                 })?;
                 let bytes = storage.get_range(&uri, start..end).await?;
                 tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
-                .await
-                .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
+                    .await
+                    .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
             }));
         }
@@ -1631,8 +1631,8 @@ async fn cold_fetch_to_disk_cancelable(
             in_flight.push(async move {
                 let bytes = storage.get_range(&uri, start..end).await?;
                 tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
-                .await
-                .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
+                    .await
+                    .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
             });
             next_chunk += 1;
