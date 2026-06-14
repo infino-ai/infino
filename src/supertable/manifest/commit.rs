@@ -515,7 +515,7 @@ pub async fn rebalance_for_commit(
 
     // 3. Walk the existing list entries, classify each by
     //    whether it's the *latest* entry for its partition.
-    //    The plan's "rewrite latest part" policy: only the
+    //    The "rewrite latest part" policy: only the
     //    most recent entry per partition is a candidate for
     //    rewrite; older entries for the same partition (from
     //    a prior part-split) carry over unchanged.

@@ -38,7 +38,6 @@
 //!   cardinality, cap exceeded, storage).
 
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::storage::StorageError;
 use crate::supertable::QueryError;
@@ -235,15 +234,4 @@ pub enum CommitError {
         total: usize,
         cause: Box<MutationError>,
     },
-}
-
-/// One target reservation by the writer's update path: a fresh
-/// superfile UUID + minted `_id` spans. Carried into the WAL
-/// state doc so the recovery sweep can re-build the same
-/// superfile on replay.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct UpdateReservation {
-    pub preallocated_superfile_id: Uuid,
-    pub minted_id_spans: Vec<crate::supertable::wal::state_doc::IdSpan>,
 }

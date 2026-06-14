@@ -431,7 +431,7 @@ async fn reservation_race_preserves_budget_invariant() {
     // 8 distinct URIs, some readers may legitimately hit
     // BudgetExceeded (their reservation arrives when
     // in-flight reservations have eaten the budget and
-    // nothing's yet committed to evict). The plan's stated
+    // nothing's yet committed to evict). The stated
     // invariant is `current_bytes ≤ budget` at every
     // observation — NOT that all readers succeed. We assert
     // only the invariant.

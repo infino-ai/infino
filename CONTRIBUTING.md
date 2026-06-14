@@ -41,9 +41,9 @@ cargo run --example demo
 ## Test
 
 ```bash
-cargo test --workspace        # full suite
-cargo test <name_substring>   # a single test or module
-cargo test bm25_oracle -- --nocapture   # ...with stdout
+cargo test --features test-helpers          # full suite (integration tests need this feature)
+cargo test --features test-helpers <name_substring>   # a single test or module
+cargo test --features test-helpers bm25_oracle -- --nocapture   # ...with stdout
 ```
 
 ## Pre-commit hooks (optional but recommended)

@@ -826,7 +826,7 @@ mod tests {
     // ---- sql × vector × fts composed in ONE query ----
     //
     // The TVFs above each test one retriever in isolation. This block
-    // exercises the composition the plan's *Pushdown contract* promises
+    // exercises the composition the *pushdown contract* promises
     // but nothing else covered: a single SQL statement that JOINs an
     // FTS retriever (`bm25_search`) and a vector retriever
     // (`vector_search`) on the durable `_id` and post-filters with a

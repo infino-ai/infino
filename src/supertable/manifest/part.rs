@@ -12,7 +12,7 @@
 //! re-PUT.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value as AvroValue;
@@ -21,7 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::supertable::manifest::encoding::{
-    self, DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
+    DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
     encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
 };
 use crate::supertable::manifest::{SubsectionOffsets, SuperfileEntry};
@@ -193,7 +193,6 @@ pub enum PartParseError {
 /// schema is parsed once on first use and cached via
 /// `std::sync::OnceLock`.
 fn schema() -> &'static AvroSchema {
-    use std::sync::OnceLock;
     static SCHEMA: OnceLock<AvroSchema> = OnceLock::new();
     SCHEMA.get_or_init(|| {
         let schema_str = r#"
@@ -682,18 +681,6 @@ fn decode_range_list(
         ranges.push((read_u64(cur)?, read_u64(cur)?));
     }
     Ok(ranges)
-}
-
-// Silence "unused" if Schema isn't consumed yet on its
-// type-only path during cfg(test) gates.
-#[allow(dead_code)]
-fn _schema_handle() -> &'static AvroSchema {
-    schema()
-}
-
-#[allow(dead_code)]
-fn _encoding_used() {
-    let _ = encoding::encode_scalar_stats;
 }
 
 #[cfg(test)]

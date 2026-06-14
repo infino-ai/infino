@@ -91,7 +91,7 @@ pub mod fts {
     //! Superfile-layer FTS bench.
     //!
     //! The comparable build + search numbers — the ones the cross-engine
-    //! comparison (`retrievalbench`) also produces — are measured through
+    //! comparison harness also produces — are measured through
     //! the engine-generic harness ([`run_fts::<InfinoFtsEngine>`]), so
     //! infino's own headline numbers and its head-to-head numbers come from
     //! one measurement path, not two.
@@ -868,7 +868,7 @@ pub mod vector {
     }
 
     // Calibration fixtures are `pub` so the cross-engine comparison
-    // harness (retrievalbench) can run the identical recall-calibrated
+    // the external comparison harness can run the identical recall-calibrated
     // protocol against the same queries and ground truth.
     pub fn queries_calibration() -> &'static [Vec<f32>] {
         QUERIES_CALIBRATION.get_or_init(|| {

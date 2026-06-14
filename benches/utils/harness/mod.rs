@@ -6,7 +6,7 @@
 //! Defines the [`FtsEngine`] trait so one driver ([`run_fts`]) can
 //! measure infino and other retrieval engines through identical code.
 //! infino ships the reference implementation ([`InfinoFtsEngine`]); the
-//! external comparison crate (`retrievalbench`) implements the trait for
+//! external comparison crate implements the trait for
 //! other engines (Tantivy, DuckDB, LanceDB, CoreDB) and drives them all
 //! the same way, against a byte-identical [`crate::corpus::MmapTextCorpus`].
 //!

@@ -2,7 +2,21 @@
 name = "infino"
 version = "0.1.0"
 edition = "2024"
+# Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
+# uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
+# the real floor is well above the 2024-edition minimum.
+rust-version = "1.95"
 license = "Apache-2.0"
+description = "A fast retrieval engine that stores data on object storage and runs SQL, full-text search, and vector search over it from a single system — search-on-Parquet."
+repository = "https://github.com/infino-ai/infino"
+homepage = "https://github.com/infino-ai/infino"
+readme = "README.md"
+keywords = ["search", "vector", "full-text", "parquet", "object-storage"]
+categories = ["database", "database-implementations"]
+# `cargo publish` packages the package directory; the workspace `exclude`
+# below does NOT keep the standalone Python bindings out of the crate
+# tarball, so exclude them from the package explicitly.
+exclude = ["infino-python/"]
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via
 # `[[bench]]` below. Without this, shared helper files like
@@ -332,9 +346,15 @@ name = "bench"
 path = "benches/bench/main.rs"
 harness = false
 
-# Both current examples exercise the format-layer internals (superfile
-# builder / reader, `test_helpers` fixtures), so they declare the
-# `test-helpers` feature they semantically need. (In practice that
+# `quickstart` is the out-of-the-box entry point: it uses only the
+# shipped `infino::*` surface, so `cargo run --example quickstart` works
+# from a fresh clone with no extra features.
+[[example]]
+name = "quickstart"
+
+# `demo` and `profile_fts_build` exercise the format-layer internals
+# (superfile builder / reader, `test_helpers` fixtures), so they declare
+# the `test-helpers` feature they semantically need. (In practice that
 # feature is already forced on across the dev graph by the
 # `infino-bench-utils` dev-dependency — see its note above — so this is
 # documentation of intent, not an independent gate.)

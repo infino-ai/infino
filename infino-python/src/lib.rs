@@ -54,7 +54,7 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
 }
 
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments (Q14 — no separate
+/// can't carry is passed as keyword arguments (no separate
 /// `connect_with` in Python). Today that is the explicit S3-compatible
 /// endpoint + static credentials; omit them for local / `memory://` /
 /// ambient-credential S3.

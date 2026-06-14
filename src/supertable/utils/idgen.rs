@@ -52,7 +52,7 @@ const WORKER_MASK: u64 = (1u64 << WORKER_BITS) - 1;
 /// Construction is cheap: one `rand::random::<u64>()` call for
 /// [`Self::new`], zero for [`Self::with_worker_id`].
 /// [`Self::next_id`] is `&self` (interior-mutable) and runs
-/// at ~2 ns/id single-threaded on Apple M4 Max.
+/// at ~2 ns/id single-threaded.
 pub struct IdGenerator {
     worker_id: u64,
     inner: BasicSnowflakeGenerator<InfinoId128, MonotonicClock>,

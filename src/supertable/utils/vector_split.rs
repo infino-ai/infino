@@ -46,7 +46,6 @@ const MAX_NULL_OFFSETS_IN_ERROR: usize = 5;
 /// per declared vector column, in declaration order.
 ///
 /// See module docs for what's validated here vs at options time.
-#[allow(dead_code)] // The writer is the only consumer.
 pub(crate) fn split_vectors<'a>(
     batch: &'a RecordBatch,
     options: &SupertableOptions,

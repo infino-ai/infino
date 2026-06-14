@@ -3,6 +3,12 @@ lcov.info
 *.profraw
 .DS_Store
 
+# Never commit secrets / local credentials.
+.env
+.env.*
+*.pem
+*.key
+
 # Python bindings (built standalone with maturin; not a workspace member).
 # Cargo.lock IS committed: the bindings are a built artifact (wheel) and
 # CI builds them with `--locked` for deterministic, drift-proof deps.

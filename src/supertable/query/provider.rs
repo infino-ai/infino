@@ -85,6 +85,7 @@ use crate::supertable::manifest::Manifest;
 use crate::supertable::manifest::hll::HllSketch;
 use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::query::df_object_store::SuperfileObjectStore;
+use crate::supertable::query::prune::PruneLeaf;
 use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
 use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
 use crate::supertable::tombstones::SidecarCache;
@@ -253,11 +254,7 @@ impl SupertableProvider {
     /// whose tokens include every token of the literal, so requiring all
     /// of them possibly-present (`BoolMode::And`) never drops a match —
     /// bloom false positives can only keep a superfile, never drop one.
-    fn predicates_to_prune_leaves(
-        &self,
-        predicates: Vec<ScalarPredicate>,
-    ) -> Vec<crate::supertable::query::prune::PruneLeaf> {
-        use crate::supertable::query::prune::PruneLeaf;
+    fn predicates_to_prune_leaves(&self, predicates: Vec<ScalarPredicate>) -> Vec<PruneLeaf> {
         let opts = &self.manifest.options;
         let mut leaves = Vec::with_capacity(predicates.len());
         for pred in predicates {

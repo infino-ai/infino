@@ -15,7 +15,7 @@
 //!
 //! [`ManifestPart`]: super::part::ManifestPart
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -664,13 +664,6 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
         });
     }
     Ok(())
-}
-
-// Silence dead-code warnings on HashMap re-export — used by
-// downstream work.
-#[allow(dead_code)]
-fn _hashmap_used() -> HashMap<String, FtsSummaryAgg> {
-    HashMap::new()
 }
 
 #[cfg(test)]

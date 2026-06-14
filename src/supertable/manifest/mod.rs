@@ -35,11 +35,15 @@ pub mod term_range;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::Schema;
+use arrow::compute::kernels::aggregate as agg;
+use arrow_array::*;
+use arrow_schema::{DataType, Schema};
 use uuid::Uuid;
+use xxhash_rust::xxh3::xxh3_64;
 
-use crate::superfile::vector::distance::Metric;
+use crate::superfile::vector::distance::{
+    COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq,
+};
 
 use bloom::Bloom;
 
@@ -627,9 +631,6 @@ fn merge_min_max_arrays(
     existing_max: &ArrayRef,
     other_max: &ArrayRef,
 ) -> Option<(ArrayRef, ArrayRef)> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
     macro_rules! prim_merge {
         ($array_ty:ty) => {{
             let ex_min_arr = existing_min.as_any().downcast_ref::<$array_ty>()?;
@@ -772,9 +773,6 @@ fn merge_min_max_arrays(
 /// decimal) or when the exact total overflows the result type —
 /// consumers treat missing as "no statistics".
 fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
     macro_rules! signed {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
@@ -818,8 +816,6 @@ fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
 /// `None` on type mismatch or `Int64`/`UInt64` overflow. Shared with
 /// the SQL provider's cross-segment statistics fold.
 pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
     match (a.data_type(), b.data_type()) {
         (DataType::Int64, DataType::Int64) => {
             let x = a.as_any().downcast_ref::<Int64Array>()?.value(0);
@@ -845,10 +841,6 @@ pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
 /// canonical byte representation (little-endian for numerics, raw
 /// bytes for strings, IEEE bits for floats).
 fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-    use xxhash_rust::xxh3::xxh3_64;
-
     let mut sketch = hll::HllSketch::new();
     macro_rules! ints {
         ($array_ty:ty) => {{
@@ -897,10 +889,6 @@ fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
 }
 
 fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
-    use arrow::compute::kernels::aggregate as agg;
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
     macro_rules! prim {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
@@ -1137,9 +1125,6 @@ impl ClusterCentroids {
         norm_q_sq: f32,
         mut emit: impl FnMut(u32, f32),
     ) {
-        use crate::superfile::vector::distance::{
-            COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, sq8_dot, u8_sum_sumsq,
-        };
         let d = self.dim as usize;
         debug_assert_eq!(query.len(), d);
         // L2 needs each cluster's query-independent code moments;

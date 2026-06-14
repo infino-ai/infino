@@ -237,8 +237,9 @@ cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read 
 ```
 
 The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
-the right stable Rust on first build. Run `cargo test --workspace` for
-the suite and `make ci` before opening a pull request.
+the right stable Rust on first build. Run `cargo test --features test-helpers`
+for the suite (integration tests use `infino::test_helpers`) and `make ci`
+before opening a pull request.
 
 For an enhanced local development experience, install and configure
 [pre-commit](https://pre-commit.com/#install) hooks with `pre-commit install`
