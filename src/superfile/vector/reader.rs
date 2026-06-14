@@ -1840,7 +1840,8 @@ async fn build_shortlist(
                 );
             let _ = tx.send(acc);
         });
-        rx.await.expect("vector shortlist rayon task dropped result")
+        rx.await
+            .expect("vector shortlist rayon task dropped result")
     } else {
         let mut heap = BoundedCoarseHeap::new(coarse_limit);
         for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
