@@ -68,6 +68,8 @@
 //! deferred (see those modules' headers).
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::slice;
 use std::sync::Arc;
 
@@ -720,9 +722,6 @@ fn build_work_units(
 /// score (highest BM25 = most relevant). Uses a min-heap of size k
 /// so we never sort more than k elements.
 fn top_k_descending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
-
     #[derive(PartialEq)]
     struct MinByScore(SuperfileHit);
     impl Eq for MinByScore {}

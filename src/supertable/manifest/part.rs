@@ -12,7 +12,7 @@
 //! re-PUT.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value as AvroValue;
@@ -193,7 +193,6 @@ pub enum PartParseError {
 /// schema is parsed once on first use and cached via
 /// `std::sync::OnceLock`.
 fn schema() -> &'static AvroSchema {
-    use std::sync::OnceLock;
     static SCHEMA: OnceLock<AvroSchema> = OnceLock::new();
     SCHEMA.get_or_init(|| {
         let schema_str = r#"

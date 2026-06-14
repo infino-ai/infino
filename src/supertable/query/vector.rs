@@ -61,7 +61,7 @@
 //! this is the difference between seconds and milliseconds.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
@@ -291,9 +291,6 @@ impl SupertableReader {
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
-
     #[derive(PartialEq)]
     struct MaxByScore(SuperfileHit);
     impl Eq for MaxByScore {}
