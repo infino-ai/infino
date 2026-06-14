@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Gates for the covered/residual aggregate rewrite (claude-plans
-//! 022, phase 5): filter-aligned range aggregates answer covered
-//! segments from manifest statistics and scan only boundary segments.
+//! Gates for the covered/residual aggregate rewrite: filter-aligned
+//! range aggregates answer covered segments from manifest statistics
+//! and scan only boundary segments.
 //!
 //! Observable: the rewritten plan aggregates `__resid_*` partials.
 //! Correctness gates compare every supported aggregate against closed

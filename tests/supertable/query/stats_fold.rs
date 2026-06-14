@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Plan-shape and correctness gates for manifest-statistics aggregate
-//! folding (claude-plans 022).
+//! folding.
 //!
 //! On a tombstone-free table, `COUNT(*)` / `MIN` / `MAX` must be
 //! answered from manifest statistics — the physical plan contains no
