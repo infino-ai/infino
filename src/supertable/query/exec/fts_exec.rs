@@ -47,7 +47,7 @@ use datafusion::physical_plan::{
 
 use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
 use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{SupertableReader, WeakReader};
 
 /// SQL name for the term-based BM25 TVF.
 pub(crate) const BM25_SEARCH_UDTF: &str = "bm25_search";
@@ -96,7 +96,7 @@ enum Bm25Query {
 /// `TableFunctionImpl` for `bm25_search`.
 #[derive(Debug)]
 pub(crate) struct Bm25SearchFunc {
-    reader: Arc<SupertableReader>,
+    reader: WeakReader,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
 }
@@ -105,7 +105,7 @@ impl Bm25SearchFunc {
     pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
-            reader,
+            reader: WeakReader::from_reader(&reader),
             scalar_schema,
             output_schema,
         }
@@ -128,8 +128,13 @@ impl TableFunctionImpl for Bm25SearchFunc {
             Some(expr) => arg_to_bool_mode(expr)?,
             None => BoolMode::Or,
         };
+        let reader = self.reader.upgrade().ok_or_else(|| {
+            DataFusionError::Execution(
+                "bm25_search: supertable consumer dropped before execution".into(),
+            )
+        })?;
         Ok(Arc::new(Bm25Table {
-            reader: Arc::clone(&self.reader),
+            reader,
             column,
             query: Bm25Query::Terms { query, mode },
             k,
@@ -142,7 +147,7 @@ impl TableFunctionImpl for Bm25SearchFunc {
 /// `TableFunctionImpl` for `bm25_search_prefix`.
 #[derive(Debug)]
 pub(crate) struct Bm25PrefixFunc {
-    reader: Arc<SupertableReader>,
+    reader: WeakReader,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
 }
@@ -151,7 +156,7 @@ impl Bm25PrefixFunc {
     pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
-            reader,
+            reader: WeakReader::from_reader(&reader),
             scalar_schema,
             output_schema,
         }
@@ -170,8 +175,13 @@ impl TableFunctionImpl for Bm25PrefixFunc {
         let column = arg_to_string(&args[0], "bm25_search_prefix column")?;
         let prefix = arg_to_string(&args[1], "bm25_search_prefix prefix")?;
         let k = arg_to_usize(&args[2], "bm25_search_prefix k")?;
+        let reader = self.reader.upgrade().ok_or_else(|| {
+            DataFusionError::Execution(
+                "bm25_search_prefix: supertable consumer dropped before execution".into(),
+            )
+        })?;
         Ok(Arc::new(Bm25Table {
-            reader: Arc::clone(&self.reader),
+            reader,
             column,
             query: Bm25Query::Prefix { prefix },
             k,

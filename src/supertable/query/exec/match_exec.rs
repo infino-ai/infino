@@ -46,7 +46,7 @@ use datafusion::physical_plan::{
 use super::common::{arg_to_string, output_schema_with_score, resolve_hits};
 use super::fts_exec::arg_to_bool_mode;
 use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{SupertableReader, WeakReader};
 
 /// SQL name for the unranked token-match TVF.
 pub(crate) const TOKEN_MATCH_UDTF: &str = "token_match";
@@ -86,7 +86,7 @@ enum MatchQuery {
 /// `TableFunctionImpl` for `token_match`.
 #[derive(Debug)]
 pub(crate) struct TokenMatchFunc {
-    reader: Arc<SupertableReader>,
+    reader: WeakReader,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
 }
@@ -95,7 +95,7 @@ impl TokenMatchFunc {
     pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
-            reader,
+            reader: WeakReader::from_reader(&reader),
             scalar_schema,
             output_schema,
         }
@@ -116,8 +116,13 @@ impl TableFunctionImpl for TokenMatchFunc {
             Some(expr) => arg_to_bool_mode(expr)?,
             None => BoolMode::Or,
         };
+        let reader = self.reader.upgrade().ok_or_else(|| {
+            DataFusionError::Execution(
+                "token_match: supertable consumer dropped before execution".into(),
+            )
+        })?;
         Ok(Arc::new(MatchTable {
-            reader: Arc::clone(&self.reader),
+            reader,
             column,
             query: MatchQuery::Token { query, mode },
             scalar_schema: Arc::clone(&self.scalar_schema),
@@ -129,7 +134,7 @@ impl TableFunctionImpl for TokenMatchFunc {
 /// `TableFunctionImpl` for `exact_match`.
 #[derive(Debug)]
 pub(crate) struct ExactMatchFunc {
-    reader: Arc<SupertableReader>,
+    reader: WeakReader,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
 }
@@ -138,7 +143,7 @@ impl ExactMatchFunc {
     pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
-            reader,
+            reader: WeakReader::from_reader(&reader),
             scalar_schema,
             output_schema,
         }
@@ -155,8 +160,13 @@ impl TableFunctionImpl for ExactMatchFunc {
         }
         let column = arg_to_string(&args[0], "exact_match column")?;
         let value = arg_to_string(&args[1], "exact_match value")?;
+        let reader = self.reader.upgrade().ok_or_else(|| {
+            DataFusionError::Execution(
+                "exact_match: supertable consumer dropped before execution".into(),
+            )
+        })?;
         Ok(Arc::new(MatchTable {
-            reader: Arc::clone(&self.reader),
+            reader,
             column,
             query: MatchQuery::Exact { value },
             scalar_schema: Arc::clone(&self.scalar_schema),
