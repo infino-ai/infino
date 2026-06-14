@@ -91,6 +91,39 @@ pub const TOKENS_PER_DOC: usize = 200;
 /// FST + skip-table cold path).
 pub const VOCAB_SIZE: usize = 10_000;
 
+// ─── Parallel corpus-generation constants ─────────────────────────────
+//
+// The text corpus has a deterministic, RNG-independent byte layout, which
+// lets the offset table be computed up front and each chunk write to its
+// own disjoint byte range in parallel. These name the pieces of that
+// layout so the offset math carries no bare literals.
+
+/// Bytes in the per-doc `"doc"` prefix of `"doc{doc_id:07}"`.
+const DOC_ID_PREFIX_BYTES: usize = 3;
+/// Minimum digit width the doc id is zero-padded to (`"{:07}"`). A doc id
+/// with more digits than this widens the doc token by exactly that many
+/// bytes; fewer digits still occupy this width.
+const DOC_ID_PAD_WIDTH: usize = 7;
+/// Bytes in one body token `" term{:05}"` — 5 for `" term"` plus 5 digits.
+/// Fixed because `VOCAB_SIZE = 10_000 ≤ 100_000` keeps the index ≤ 5 digits.
+const TERM_BYTES: usize = 10;
+/// Docs generated per parallel chunk for the text corpus (~2 GiB buffer at
+/// ~2 KiB/doc). One chunk per core-wave; rayon fans them across all cores.
+const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
+/// Docs generated per parallel chunk for the vector corpus (~2 GiB buffer
+/// at `DIM * 4` bytes/row).
+const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
+/// Odd 64-bit multiplier (fractional golden ratio) used to derive a
+/// distinct, deterministic RNG seed per chunk from `(seed, chunk_index)`,
+/// so a parallelized corpus is still reproducible for a given `seed`.
+const CHUNK_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Deterministic per-chunk RNG seed: mixes the base `seed` with the chunk
+/// index so independent chunks draw disjoint, reproducible streams.
+fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
+    seed.wrapping_add((chunk_index as u64).wrapping_add(1).wrapping_mul(CHUNK_SEED_MIX))
+}
+
 /// Vector dimension — matches modern large embedding models
 /// (OpenAI text-embedding-3-small = 1536 truncates to 1024,
 /// BGE-large = 1024, E5-large = 1024).
@@ -284,18 +317,13 @@ impl MmapTextCorpus {
         // (RNG-driven) token *content* in parallel via positioned writes.
         #[inline]
         fn doc_len(doc_id: usize) -> u64 {
-            let token = if doc_id < 10_000_000 {
-                7
-            } else if doc_id < 100_000_000 {
-                8
-            } else if doc_id < 1_000_000_000 {
-                9
-            } else if doc_id < 10_000_000_000 {
-                10
+            let digits = if doc_id == 0 {
+                1
             } else {
-                11
+                doc_id.ilog10() as usize + 1
             };
-            (3 + token + TOKENS_PER_DOC * 10) as u64
+            let doc_token = DOC_ID_PREFIX_BYTES + digits.max(DOC_ID_PAD_WIDTH);
+            (doc_token + TOKENS_PER_DOC * TERM_BYTES) as u64
         }
 
         let mut offsets = Vec::with_capacity(n_docs + 1);
@@ -310,25 +338,21 @@ impl MmapTextCorpus {
         let file = File::create(&path).expect("create text corpus file");
         file.set_len(total).expect("set_len text corpus");
 
-        // One chunk per ~1M docs (~2 GiB buffer); rayon fans these across
-        // all cores. Each chunk seeds its own RNG deterministically from
-        // (seed, chunk) so the corpus is reproducible for a given seed,
-        // and pwrites to its known offset.
-        const CHUNK_DOCS: usize = 1 << 20;
-        let n_chunks = n_docs.div_ceil(CHUNK_DOCS).max(1);
+        // rayon fans the chunks across all cores; each pwrites to its own
+        // disjoint byte range (offsets are RNG-independent, computed above)
+        // and draws from its own deterministic per-chunk RNG.
+        let n_chunks = n_docs.div_ceil(TEXT_CORPUS_CHUNK_DOCS).max(1);
         let offsets_ref = &offsets;
         let file_ref = &file;
         (0..n_chunks).into_par_iter().for_each(|c| {
-            let start = c * CHUNK_DOCS;
+            let start = c * TEXT_CORPUS_CHUNK_DOCS;
             if start >= n_docs {
                 return;
             }
-            let end = ((c + 1) * CHUNK_DOCS).min(n_docs);
+            let end = ((c + 1) * TEXT_CORPUS_CHUNK_DOCS).min(n_docs);
             let base = offsets_ref[start];
             let cap = (offsets_ref[end] - base) as usize;
-            let mut rng = StdRng::seed_from_u64(
-                seed.wrapping_add((c as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-            );
+            let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let zipf = ZipfDistribution::new(VOCAB_SIZE);
             let mut buf: Vec<u8> = Vec::with_capacity(cap);
             for doc_id in start..end {
@@ -533,20 +557,19 @@ impl MmapVectorCorpus {
         let file = File::create(&path).expect("create corpus file");
         file.set_len(total).expect("set_len vector corpus");
 
-        // ~512K rows/chunk (~2 GiB at DIM=1024), fanned across all cores.
-        const CHUNK_DOCS: usize = 1 << 19;
-        let n_chunks = n_docs.div_ceil(CHUNK_DOCS).max(1);
+        // rayon fans the chunks across all cores; each writes a fixed-stride
+        // row range via a positioned write and draws noise from its own
+        // deterministic per-chunk RNG (shared centers keep clusters intact).
+        let n_chunks = n_docs.div_ceil(VECTOR_CORPUS_CHUNK_DOCS).max(1);
         let centers_ref = &centers;
         let file_ref = &file;
         (0..n_chunks).into_par_iter().for_each(|c| {
-            let start = c * CHUNK_DOCS;
+            let start = c * VECTOR_CORPUS_CHUNK_DOCS;
             if start >= n_docs {
                 return;
             }
-            let end = ((c + 1) * CHUNK_DOCS).min(n_docs);
-            let mut rng = StdRng::seed_from_u64(
-                seed.wrapping_add((c as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-            );
+            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(n_docs);
+            let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let dist = StandardNormal;
             let mut buf: Vec<u8> = Vec::with_capacity((end - start) * row_bytes);
             let mut row = vec![0.0f32; DIM];
