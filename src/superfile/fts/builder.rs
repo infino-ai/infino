@@ -921,6 +921,13 @@ fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
     // dependency that prevents auto-vectorisation, but the loop
     // body is short enough that out-of-order issue absorbs the
     // latency.
+    //
+    // SAFETY (every `get_unchecked` in this function): term ids are
+    // dense in `[0, vocab_size)` and `lex_rank` has `vocab_size`
+    // entries, so `t[0] < lex_rank.len()`. `rank < vocab_size` indexes
+    // `offsets` (length `vocab_size + 1`); the prefix sum keeps every
+    // scatter `dst < n` (`out.len()`), and each `offsets[rank]` is
+    // bumped at most its histogram count, so all accesses are in bounds.
     for t in triples.iter() {
         let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
         offsets[rank] = offsets[rank].wrapping_add(1);
@@ -1484,6 +1491,10 @@ impl FtsBuilder {
                     // this call — well before `self.bump` is
                     // reset on the next call.
                     let bumped: &str = bump.alloc_str(tok);
+                    // SAFETY: the `'static` tag is a lie — the real
+                    // lifetime is `self.bump`, which is reset only on the
+                    // next call, after this HashMap (and `extended`) has
+                    // been dropped at the end of the current call.
                     let extended: &'static str = unsafe { std::mem::transmute(bumped) };
                     e.insert_hashed_nocheck(hash, extended, 1);
                 }
