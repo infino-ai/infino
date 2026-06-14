@@ -58,11 +58,11 @@ use infino::test_helpers::default_tokenizer;
 /// The query/search API is `async`. In-memory `VectorReader` /
 /// `FtsReader` / `Supertable` readers never touch the object store, so
 /// their futures resolve without object-store I/O — but the search
-/// kernels now offload CPU scans to `tokio::task::spawn_blocking`,
-/// which requires an ambient tokio runtime. So bench helpers drive
-/// them on one shared multi-thread runtime (built once, reused across
-/// every call — never a throwaway per-call runtime), which also gives
-/// the blocking pool the threads the parallel scans fan out across.
+/// kernels bridge their CPU scans onto the rayon pool and `await` a
+/// oneshot for the result, which requires an ambient tokio runtime. So
+/// bench helpers drive them on one shared multi-thread runtime (built
+/// once, reused across every call — never a throwaway per-call
+/// runtime).
 pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
     use std::sync::OnceLock;
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
