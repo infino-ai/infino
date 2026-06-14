@@ -684,8 +684,8 @@ impl VectorReader {
             }
 
             // Serial CRC verify over the (handful of) subsections — a
-            // one-time open cost, not query-hot, so it stays off the
-            // tokio blocking pool and out of rayon.
+            // one-time open cost, not query-hot, so it stays serial,
+            // off the rayon scan path.
             let mismatch = jobs.iter().find_map(|job| {
                 if crc32c(&job.bytes) != job.expected {
                     Some(job.idx)
@@ -1960,9 +1960,9 @@ fn score_centroids(
 /// supertable's `nprobe × superfiles` fan-out goes parallel.
 const PARALLEL_SCAN_MIN: usize = 2048;
 
-/// Number of `spawn_blocking` tasks to split a parallel scan into —
-/// the machine's logical parallelism, capped by the item count so we
-/// never spawn more tasks than there is work.
+/// Number of chunks to split a parallel rayon scan into — the machine's
+/// logical parallelism, capped by the item count so we never make more
+/// chunks than there is work.
 fn parallel_chunks(n_items: usize) -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
@@ -1976,7 +1976,7 @@ fn parallel_chunks(n_items: usize) -> usize {
 /// compute runs on rayon (`par_iter().map().collect()`) bridged back to
 /// the async caller via a oneshot, so no tokio worker blocks under it.
 /// `f` and the items must be `'static` so the work can move onto rayon.
-async fn par_map_blocking<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+async fn par_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
 where
     T: Send + Sync + 'static,
     R: Send + 'static,
@@ -2193,10 +2193,10 @@ async fn rerank_candidates_from_blocks(
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
             // Exact fp32 rerank — every survivor is independent, so the
-            // gather + SIMD distance runs in parallel across tokio's
-            // blocking pool once the shortlist is large enough to
-            // amortize the hand-off. The output is sorted by distance
-            // below, so parallel and serial rank identically.
+            // gather + SIMD distance runs in parallel across the rayon
+            // pool once the shortlist is large enough to amortize the
+            // hand-off. The output is sorted by distance below, so
+            // parallel and serial rank identically.
             if candidates.len() >= PARALLEL_SCAN_MIN {
                 let metric = col.metric;
                 let codec = col.rerank_codec;
@@ -2204,7 +2204,7 @@ async fn rerank_candidates_from_blocks(
                 let survivors: Option<Arc<Vec<Bytes>>> =
                     survivor_full_rows.map(|s| Arc::new(s.to_vec()));
                 let query: Arc<Vec<f32>> = Arc::new(query.to_vec());
-                par_map_blocking(candidates.to_vec(), move |cand: &RerankCandidate| {
+                par_map(candidates.to_vec(), move |cand: &RerankCandidate| {
                     let bytes = candidate_full_bytes(
                         &blocks,
                         survivors.as_deref().map(|s| s.as_slice()),
@@ -2481,14 +2481,14 @@ async fn sq8_score_and_refine(
         )
     };
     let scored: Vec<(u32, f32, usize, u32, u32)> = if candidates.len() >= PARALLEL_SCAN_MIN {
-        // Order-independent first-pass Sq8 scoring across tokio's
-        // blocking pool. Kernels are `'static` (norms shared by `Arc`),
-        // so each chunk moves onto a blocking task with no copy.
+        // Order-independent first-pass Sq8 scoring across the rayon
+        // pool. Kernels are `'static` (norms shared by `Arc`), so each
+        // chunk runs on a rayon worker with no copy.
         let kernels = Arc::new(kernels);
         let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
         let survivors: Option<Arc<Vec<Bytes>>> = survivor_full_rows.map(|s| Arc::new(s.to_vec()));
         let items: Vec<(usize, RerankCandidate)> = candidates.iter().cloned().enumerate().collect();
-        par_map_blocking(items, move |item: &(usize, RerankCandidate)| {
+        par_map(items, move |item: &(usize, RerankCandidate)| {
             let (i, cand) = (item.0, &item.1);
             let row = candidate_full_bytes(
                 &blocks,

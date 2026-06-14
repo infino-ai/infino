@@ -403,7 +403,7 @@ pub(crate) struct Sq8Kernel {
     /// `None` for NegDot. `Some` for L2Sq (stores `‖x‖²`) and
     /// Cosine (stores `‖x‖²`; rerank divides by `√norm`). Shared by
     /// refcount (`Arc`) so the kernel is `'static` and can run on a
-    /// `tokio::task::spawn_blocking` worker — no per-query copy.
+    /// rayon worker — no per-query copy.
     per_doc_norms: Option<Arc<[f32]>>,
 }
 
