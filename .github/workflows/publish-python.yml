@@ -97,6 +97,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Restore the dep graph (datafusion etc.) so only infino-python rebuilds.
+      # Order matters: rust-cache keys on Cargo.lock, which the stamp step
+      # bumps — cache before stamp to keep the key stable across releases.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-python
+
       # Version is dynamic (pyproject `dynamic = ["version"]`) → maturin reads
       # it from Cargo.toml. Stamp it into Cargo.toml *and* Cargo.lock so the
       # build stays --locked. python3 over sed: one script, every runner,
