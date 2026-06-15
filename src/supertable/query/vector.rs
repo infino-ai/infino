@@ -213,9 +213,11 @@ impl SupertableReader {
         }
 
         // Fan out through the shared [`query::dispatch::fanout`] (also
-        // used by FTS): one tokio task per probed superfile opens the
-        // reader and runs the kNN kernel — cold GETs across superfiles are
-        // concurrent (tokio owns I/O), shortlist + rerank stay on rayon.
+        // used by FTS), but in waves capped by the configured reader
+        // pool width. A cold vector kernel can hold large selected-cluster
+        // `[codes][doc_ids]` prefix blocks while it builds its shortlist;
+        // capping the number of concurrent superfiles keeps that transient
+        // memory bounded by instance configuration instead of table size.
         // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
@@ -234,7 +236,15 @@ impl SupertableReader {
                 res.map_err(|e| QueryError::Parquet(e.to_string()))
             }
         };
-        let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+        let mut per_superfile = Vec::new();
+        while !units.is_empty() {
+            let n = fanout_width.min(units.len());
+            let wave: Vec<_> = units.drain(..n).collect();
+            per_superfile.extend(
+                crate::supertable::query::dispatch::fanout(self, wave, kernel.clone()).await?,
+            );
+        }
 
         Ok(top_k_ascending(per_superfile, k))
     }
