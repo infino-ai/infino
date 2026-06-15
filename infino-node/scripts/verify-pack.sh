@@ -21,6 +21,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Read names from package.json so this works for any package name
+# (e.g. infino, infino-node): PKG_NAME is the npm package, BIN_NAME the
+# napi binary prefix.
+PKG_NAME="$(node -p "require('./package.json').name")"
+BIN_NAME="$(node -p "require('./package.json').napi.name")"
+
 # Host platform in napi's node-platform naming (glibc Linux only).
 PLATFORM="$(node -p 'process.platform')"
 ARCH="$(node -p 'process.arch')"
@@ -30,7 +36,7 @@ case "$PLATFORM" in
   *) echo "verify-pack: unsupported host platform '$PLATFORM'" >&2; exit 1 ;;
 esac
 PKG_DIR="npm/${TRIPLE}"
-NODE_FILE="infino.${TRIPLE}.node"
+NODE_FILE="${BIN_NAME}.${TRIPLE}.node"
 
 # Clean up the staged binary and the throwaway project on any exit.
 WORK=""
@@ -82,9 +88,9 @@ echo "==> [5/5] installing into a throwaway project + running a roundtrip"
 cd "$WORK"
 npm init -y >/dev/null
 npm install "$WORK/$MAIN_TGZ" "$WORK/$PLAT_TGZ" 'apache-arrow@^17' >/dev/null
-node --input-type=module <<'JS'
-import { connect, IndexSpec } from "infino";
-import { Schema, Field, LargeUtf8 } from "apache-arrow";
+INFINO_PKG="$PKG_NAME" node --input-type=module <<'JS'
+const { connect, IndexSpec } = await import(process.env.INFINO_PKG);
+const { Schema, Field, LargeUtf8 } = await import("apache-arrow");
 
 const db = connect("memory://");
 const docs = db.createTable(
