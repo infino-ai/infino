@@ -241,7 +241,6 @@ impl Supertable {
     }
 
     /// Merges the given superfiles into one
-    #[allow(dead_code)]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -373,7 +372,7 @@ impl Supertable {
         let merged_segment = self
             .merge_superfiles(&inputs)
             .await
-            .map_err(CompactionError::Build)?;
+            .map_err(|e| CompactionError::Build(e.to_string()))?;
 
         let new_entries = vec![merged_segment.entry];
         let mut pending_storage_writes = vec![
@@ -394,7 +393,7 @@ impl Supertable {
             &mut pending_storage_writes,
         )
         .await
-        .map_err(CompactionError::Commit)?;
+        .map_err(|e| CompactionError::Commit(e.to_string()))?;
 
         Ok(())
     }

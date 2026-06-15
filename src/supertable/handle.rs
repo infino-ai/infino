@@ -16,7 +16,7 @@
 
 use std::future::Future;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
 use datafusion::execution::context::SessionContext;
@@ -1007,6 +1007,53 @@ pub struct SupertableReader {
     inner: Arc<SupertableInner>,
 }
 
+/// A non-owning handle to a pinned reader snapshot, held by the SQL
+/// search TVFs that live inside a cached `SessionContext`.
+///
+/// Caching the `SessionContext` on `SupertableInner` while its TVFs
+/// held a strong `Arc<SupertableReader>` formed a reference cycle
+/// (`SupertableInner` → cached `SessionContext` → TVF →
+/// `Arc<SupertableReader>` → `SupertableInner`), which leaked the
+/// entire consumer on every reopen. `WeakReader` breaks it: it holds a
+/// `Weak<SupertableInner>` plus the pinned `Arc<Manifest>` (a manifest
+/// never points back at the inner, so it adds no cycle) and rebuilds
+/// the strong reader on demand. The upgrade always succeeds while a
+/// query is executing, because the live consumer keeps the inner alive.
+#[derive(Clone)]
+pub(crate) struct WeakReader {
+    inner: Weak<SupertableInner>,
+    manifest: Arc<Manifest>,
+    tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+}
+
+impl std::fmt::Debug for WeakReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakReader").finish_non_exhaustive()
+    }
+}
+
+impl WeakReader {
+    /// Capture a reader's snapshot without keeping its inner alive.
+    pub(crate) fn from_reader(reader: &SupertableReader) -> Self {
+        Self {
+            inner: Arc::downgrade(reader.inner_arc()),
+            manifest: Arc::clone(reader.manifest()),
+            tombstone_cache: reader.tombstone_cache.clone(),
+        }
+    }
+
+    /// Reconstruct the strong pinned reader, or `None` if the owning
+    /// consumer has already been dropped.
+    pub(crate) fn upgrade(&self) -> Option<Arc<SupertableReader>> {
+        let inner = self.inner.upgrade()?;
+        Some(Arc::new(SupertableReader::from_inner_pinned(
+            inner,
+            Arc::clone(&self.manifest),
+            self.tombstone_cache.clone(),
+        )))
+    }
+}
+
 impl SupertableReader {
     /// Manifest id pinned at construction. Useful for asserting
     /// reader-vs-writer visibility ordering in tests.
@@ -1037,6 +1084,33 @@ impl SupertableReader {
     /// + summaries directly.
     pub fn manifest(&self) -> &Arc<Manifest> {
         &self.manifest
+    }
+
+    /// The shared `Arc<SupertableInner>` backing this reader. Used to
+    /// build a [`WeakReader`] that retains the snapshot without an
+    /// owning cycle through a cached `SessionContext`. Module-private:
+    /// `SupertableInner` is module-private, and the only caller is
+    /// [`WeakReader::from_reader`] in this file.
+    fn inner_arc(&self) -> &Arc<SupertableInner> {
+        &self.inner
+    }
+
+    /// Rebuild a pinned reader from its parts. Pairs with
+    /// [`WeakReader::upgrade`]: the SQL search TVFs cache a weak inner
+    /// plus the pinned manifest, then reconstruct the strong reader at
+    /// `call()` time (the consumer is always alive while a query runs).
+    /// Module-private (takes the module-private `SupertableInner`); the
+    /// only caller is [`WeakReader::upgrade`] in this file.
+    fn from_inner_pinned(
+        inner: Arc<SupertableInner>,
+        manifest: Arc<Manifest>,
+        tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+    ) -> Self {
+        Self {
+            manifest,
+            tombstone_cache,
+            inner,
+        }
     }
 
     /// Per-supertable configuration for this reader's snapshot.

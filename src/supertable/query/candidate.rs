@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Two-pass candidate planning for SQL `WHERE` predicates over
 //! FTS-indexed columns.
 //!

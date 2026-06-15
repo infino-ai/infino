@@ -41,8 +41,8 @@ impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 pub enum infino::CompactionError
-pub infino::CompactionError::Build(infino::supertable::error::BuildError)
-pub infino::CompactionError::Commit(infino::supertable::error::CommitError)
+pub infino::CompactionError::Build(alloc::string::String)
+pub infino::CompactionError::Commit(alloc::string::String)
 pub infino::CompactionError::EmptyMergedSuperfile
 pub infino::CompactionError::NoStorage
 pub infino::CompactionError::Refresh(alloc::string::String)
@@ -52,7 +52,6 @@ pub infino::CompactionError::SidecarConflict::existing_compaction_id: uuid::Uuid
 pub infino::CompactionError::SidecarConflict::superfile_id: uuid::Uuid
 pub infino::CompactionError::SuperfileNotFound(uuid::Uuid)
 impl core::error::Error for infino::CompactionError
-pub fn infino::CompactionError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for infino::CompactionError
 pub fn infino::CompactionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for infino::CompactionError
@@ -62,8 +61,8 @@ impl core::marker::Send for infino::CompactionError
 impl core::marker::Sync for infino::CompactionError
 impl core::marker::Unpin for infino::CompactionError
 impl core::marker::UnsafeUnpin for infino::CompactionError
-impl !core::panic::unwind_safe::RefUnwindSafe for infino::CompactionError
-impl !core::panic::unwind_safe::UnwindSafe for infino::CompactionError
+impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionError
+impl core::panic::unwind_safe::UnwindSafe for infino::CompactionError
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)

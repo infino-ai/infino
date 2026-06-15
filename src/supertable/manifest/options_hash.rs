@@ -197,7 +197,6 @@ mod tests {
     use crate::supertable::manifest::part::ContentHash;
     use crate::supertable::options::SupertableOptions;
     use crate::test_helpers::default_tokenizer;
-    use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -588,11 +587,4 @@ mod tests {
         // 8-byte LE length prefix + 2 ASCII bytes.
         assert_eq!(buf, vec![2u8, 0, 0, 0, 0, 0, 0, 0, b'o', b'k']);
     }
-
-    // Compiler-only smoke that the FixedSizeListArray import
-    // is exercised (the schema-builder uses it via DataType,
-    // not the array itself). Keeps the import non-dead even if
-    // some future test removes its only use.
-    #[allow(dead_code)]
-    fn _silence_fixed_size_list_array(_arr: FixedSizeListArray) {}
 }

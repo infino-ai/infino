@@ -68,7 +68,7 @@ use super::vector_exec::arg_to_query_vector;
 use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{SupertableReader, WeakReader};
 use crate::supertable::manifest::SuperfileUri;
 use crate::supertable::query::SuperfileHit;
 
@@ -154,7 +154,7 @@ impl SupertableReader {
 /// per-invocation [`HybridSearchTable`].
 #[derive(Debug)]
 pub(crate) struct HybridSearchFunc {
-    reader: Arc<SupertableReader>,
+    reader: WeakReader,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
 }
@@ -163,7 +163,7 @@ impl HybridSearchFunc {
     pub(crate) fn new(reader: Arc<SupertableReader>, scalar_schema: SchemaRef) -> Self {
         let output_schema = output_schema_with_score(&scalar_schema);
         Self {
-            reader,
+            reader: WeakReader::from_reader(&reader),
             scalar_schema,
             output_schema,
         }
@@ -184,8 +184,13 @@ impl TableFunctionImpl for HybridSearchFunc {
         let vec_col = arg_to_string(&args[2], "hybrid_search vec_col")?;
         let q_vec = arg_to_query_vector(&args[3])?;
         let k = arg_to_usize(&args[4], "hybrid_search k")?;
+        let reader = self.reader.upgrade().ok_or_else(|| {
+            DataFusionError::Execution(
+                "hybrid_search: supertable consumer dropped before execution".into(),
+            )
+        })?;
         Ok(Arc::new(HybridSearchTable {
-            reader: Arc::clone(&self.reader),
+            reader,
             text_col,
             q_text,
             mode: BoolMode::Or,
@@ -821,7 +826,7 @@ mod tests {
     // ---- sql × vector × fts composed in ONE query ----
     //
     // The TVFs above each test one retriever in isolation. This block
-    // exercises the composition the plan's *Pushdown contract* promises
+    // exercises the composition the *pushdown contract* promises
     // but nothing else covered: a single SQL statement that JOINs an
     // FTS retriever (`bm25_search`) and a vector retriever
     // (`vector_search`) on the durable `_id` and post-filters with a

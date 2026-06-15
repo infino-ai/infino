@@ -285,12 +285,16 @@ pub enum CompactionError {
     #[error("seal failed: {0}")]
     Seal(String),
 
-    /// Error when building the compacted superfile
+    /// Error when building the compacted superfile. Carries the
+    /// rendered cause as a string so the public error does not leak the
+    /// crate-internal `BuildError` type.
     #[error("failed to build superfile: {0}")]
-    Build(#[from] BuildError),
+    Build(String),
 
+    /// Error when committing the compacted superfile. Carries the
+    /// rendered cause as a string (see `Build`).
     #[error("failed to commit compaction: {0}")]
-    Commit(#[from] CommitError),
+    Commit(String),
 
     /// Refreshing the in-memory manifest after a successful commit failed.
     #[error("post-commit manifest refresh failed: {0}")]

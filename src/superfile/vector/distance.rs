@@ -19,6 +19,8 @@ use wide::f32x8;
 use crate::superfile::vector::rerank_codec::RerankCodec;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
 /// The signed 8-bit residual code at dim `d` carries
@@ -180,7 +182,6 @@ fn l2_sq_wide(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
     let n = a.len();
     // SAFETY: each `_mm512_loadu_ps` reads 16 f32s (= 64 bytes)
     // starting at `a.as_ptr().add(i)` / `b.as_ptr().add(i)`. The
@@ -214,7 +215,6 @@ unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
     let n = a.len();
     // SAFETY: see `dot_avx512` — same bounds reasoning, same
     // unaligned-load contract.
@@ -782,7 +782,6 @@ fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-    use std::arch::x86_64::*;
     debug_assert_eq!(q_prime.len(), dim);
     debug_assert_eq!(code_bytes.len(), dim);
 
@@ -836,7 +835,6 @@ unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-    use std::arch::x86_64::*;
     debug_assert_eq!(q_prime.len(), dim);
     debug_assert_eq!(code_bytes.len(), dim);
 

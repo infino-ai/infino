@@ -85,6 +85,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::superfile::BuildError;
 use crate::superfile::format::checksum::{crc32c, crc32c_append};
+use crate::superfile::format::fts::HEADER_SIZE as FTS_HEADER_SIZE;
 use crate::superfile::format::{self, FST_SEPARATOR};
 use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
 use crate::superfile::fts::fst_value::FstValue;
@@ -539,9 +540,21 @@ fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
         for i in 0..n {
             let off = i * TRIPLE_BYTES;
             let t = [
-                u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()),
-                u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()),
-                u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()),
+                u32::from_le_bytes(
+                    bytes[off..off + 4]
+                        .try_into()
+                        .expect("invariant: 4-byte triple field"),
+                ),
+                u32::from_le_bytes(
+                    bytes[off + 4..off + 8]
+                        .try_into()
+                        .expect("invariant: 4-byte triple field"),
+                ),
+                u32::from_le_bytes(
+                    bytes[off + 8..off + 12]
+                        .try_into()
+                        .expect("invariant: 4-byte triple field"),
+                ),
             ];
             out.push(t);
         }
@@ -909,6 +922,13 @@ fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
     // dependency that prevents auto-vectorisation, but the loop
     // body is short enough that out-of-order issue absorbs the
     // latency.
+    //
+    // SAFETY (every `get_unchecked` in this function): term ids are
+    // dense in `[0, vocab_size)` and `lex_rank` has `vocab_size`
+    // entries, so `t[0] < lex_rank.len()`. `rank < vocab_size` indexes
+    // `offsets` (length `vocab_size + 1`); the prefix sum keeps every
+    // scatter `dst < n` (`out.len()`), and each `offsets[rank]` is
+    // bumped at most its histogram count, so all accesses are in bounds.
     for t in triples.iter() {
         let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
         offsets[rank] = offsets[rank].wrapping_add(1);
@@ -1472,6 +1492,10 @@ impl FtsBuilder {
                     // this call — well before `self.bump` is
                     // reset on the next call.
                     let bumped: &str = bump.alloc_str(tok);
+                    // SAFETY: the `'static` tag is a lie — the real
+                    // lifetime is `self.bump`, which is reset only on the
+                    // next call, after this HashMap (and `extended`) has
+                    // been dropped at the end of the current call.
                     let extended: &'static str = unsafe { std::mem::transmute(bumped) };
                     e.insert_hashed_nocheck(hash, extended, 1);
                 }
@@ -2336,7 +2360,7 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => bytes.len() as u64,
         FstSource::Streamed { len, .. } => *len,
     };
-    let header_size: u64 = 48;
+    let header_size: u64 = FTS_HEADER_SIZE as u64;
     let fst_offset: u64 = header_size;
     let postings_offset: u64 = fst_offset + fst_total_len;
     let doc_lengths_table_offset: u64 = postings_offset + postings_len;

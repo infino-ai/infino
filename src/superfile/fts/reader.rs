@@ -32,6 +32,7 @@ use crate::superfile::fts::builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TE
 use crate::superfile::fts::dict::{DictReader, make_key};
 use crate::superfile::fts::fst_value::FstValue;
 use crate::superfile::fts::posting::{BLOCK_LEN, decode_block};
+use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource, Source};
 use crate::superfile::{ReadError, error::FtsError};
 
@@ -289,7 +290,7 @@ impl FtsReader {
         // short-circuit, the postings region body is zero bytes and
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
-        if fst_offset < 48
+        if fst_offset < FTS_HEADER_SIZE
             || postings_offset < fst_offset + 4
             || doc_lengths_table_offset < postings_offset + 4
             || doc_lengths_table_offset > source_len
@@ -542,7 +543,7 @@ impl FtsReader {
 
         let mut ranges: Vec<Range<usize>> = Vec::with_capacity(terms.len());
         for &(m, postings_length) in terms {
-            if postings_length < 20 || m + postings_length > region_len {
+            if postings_length < TERM_META_SIZE || m + postings_length > region_len {
                 return Err(FtsError::Read(ReadError::MalformedVersion(
                     "term postings range runs past postings region".into(),
                 )));
@@ -911,7 +912,6 @@ impl FtsReader {
         // require splitting this call to use the column's configured
         // tokenizer.
         let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        use crate::superfile::fts::tokenize::Tokenizer as _;
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
 
@@ -1008,7 +1008,7 @@ impl FtsReader {
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
         let mut heap: BinaryHeap<TopKEntry> =
-            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * 128).max(1));
+            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
@@ -2258,7 +2258,7 @@ impl FtsReader {
 
     /// Multi-term OR dispatch. Routes everything to MaxScore+BMM.
     ///
-    /// **Routing decision (1M docs, M4 Max — head-to-head WAND+BMW vs MaxScore+BMM):**
+    /// **Routing decision (1M docs — head-to-head WAND+BMW vs MaxScore+BMM):**
     ///
     /// | Query shape                                 | WAND+BMW | MaxScore+BMM |
     /// |---|---|---|

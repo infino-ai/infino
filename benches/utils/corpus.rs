@@ -25,9 +25,12 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::Instant;
+
+use rayon::prelude::*;
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -87,6 +90,49 @@ pub const TOKENS_PER_DOC: usize = 200;
 /// posting lists); large enough that rare terms exist (exercising the
 /// FST + skip-table cold path).
 pub const VOCAB_SIZE: usize = 10_000;
+
+// ─── Parallel corpus-generation constants ─────────────────────────────
+//
+// The text corpus has a deterministic, RNG-independent byte layout, which
+// lets the offset table be computed up front and each chunk write to its
+// own disjoint byte range in parallel. These name the pieces of that
+// layout so the offset math carries no bare literals.
+
+/// Bytes in the per-doc `"doc"` prefix of `"doc{doc_id:07}"`.
+const DOC_ID_PREFIX_BYTES: usize = 3;
+/// Minimum digit width the doc id is zero-padded to (`"{:07}"`). A doc id
+/// with more digits than this widens the doc token by exactly that many
+/// bytes; fewer digits still occupy this width.
+const DOC_ID_PAD_WIDTH: usize = 7;
+/// Bytes in one body token `" term{:05}"` — 5 for `" term"` plus 5 digits.
+/// Fixed because `VOCAB_SIZE = 10_000 ≤ 100_000` keeps the index ≤ 5 digits.
+const TERM_BYTES: usize = 10;
+/// Docs assigned to one text corpus scheduling chunk. Each worker streams its
+/// chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than buffering
+/// the whole chunk in memory.
+const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
+/// Docs assigned to one vector corpus scheduling chunk. Each worker streams
+/// its chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than
+/// buffering the whole chunk in memory.
+const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
+/// Per-worker output buffer before a positioned write flushes to the corpus
+/// file. This keeps memory bounded by roughly `rayon_threads × 8 MiB` while
+/// still issuing large writes to NVMe.
+const PARALLEL_CORPUS_WRITE_BUF_CAPACITY: usize = 8 << 20;
+/// Odd 64-bit multiplier (fractional golden ratio) used to derive a
+/// distinct, deterministic RNG seed per chunk from `(seed, chunk_index)`,
+/// so a parallelized corpus is still reproducible for a given `seed`.
+const CHUNK_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Deterministic per-chunk RNG seed: mixes the base `seed` with the chunk
+/// index so independent chunks draw disjoint, reproducible streams.
+fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
+    seed.wrapping_add(
+        (chunk_index as u64)
+            .wrapping_add(1)
+            .wrapping_mul(CHUNK_SEED_MIX),
+    )
+}
 
 /// Vector dimension — matches modern large embedding models
 /// (OpenAI text-embedding-3-small = 1536 truncates to 1024,
@@ -172,8 +218,6 @@ const N_CENT_SMALL: usize = 64;
 /// Average bytes-per-token estimate used to pre-size a doc's `String`
 /// (`(TOKENS_PER_DOC + 1) * AVG_BYTES_PER_TOKEN`).
 const AVG_BYTES_PER_TOKEN: usize = 8;
-/// `BufWriter` capacity (8 MiB) for streaming a corpus to a mmap file.
-const CORPUS_WRITER_BUF_CAPACITY: usize = 8 << 20;
 /// Gaussian scale of a planted cluster center (controls cluster signal
 /// strength relative to per-doc noise).
 const CENTER_GAUSSIAN_SCALE: f32 = 3.0;
@@ -273,29 +317,78 @@ impl MmapTextCorpus {
     pub fn generate(n_docs: usize, seed: u64) -> Self {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
-        let file = File::create(&path).expect("create text corpus file");
-        let mut writer = BufWriter::with_capacity(CORPUS_WRITER_BUF_CAPACITY, file);
-        let mut rng = StdRng::seed_from_u64(seed);
-        let zipf = ZipfDistribution::new(VOCAB_SIZE);
+
+        // Each doc's on-disk byte length is RNG-independent: the body is
+        // exactly `TOKENS_PER_DOC` tokens of " term{:05}" (10 bytes each,
+        // since VOCAB_SIZE = 10_000 keeps the index ≤ 5 digits), and the
+        // leading "doc{doc_id:07}" is 3 + max(7, digits(doc_id)) bytes.
+        // So the offset table is deterministic and every chunk can write
+        // to its own disjoint byte range — letting all cores generate the
+        // (RNG-driven) token *content* in parallel via positioned writes.
+        #[inline]
+        fn doc_len(doc_id: usize) -> u64 {
+            let digits = if doc_id == 0 {
+                1
+            } else {
+                doc_id.ilog10() as usize + 1
+            };
+            let doc_token = DOC_ID_PREFIX_BYTES + digits.max(DOC_ID_PAD_WIDTH);
+            (doc_token + TOKENS_PER_DOC * TERM_BYTES) as u64
+        }
+
         let mut offsets = Vec::with_capacity(n_docs + 1);
         let mut pos = 0u64;
         offsets.push(pos);
-
         for doc_id in 0..n_docs {
-            let token = format!("doc{doc_id:07}");
-            writer.write_all(token.as_bytes()).expect("write doc token");
-            pos += token.len() as u64;
-
-            for _ in 0..TOKENS_PER_DOC {
-                let term = format!(" term{:05}", zipf.sample(&mut rng));
-                writer.write_all(term.as_bytes()).expect("write term");
-                pos += term.len() as u64;
-            }
-
+            pos += doc_len(doc_id);
             offsets.push(pos);
         }
+        let total = pos;
 
-        let file = writer.into_inner().expect("flush text corpus writer");
+        let file = File::create(&path).expect("create text corpus file");
+        file.set_len(total).expect("set_len text corpus");
+
+        // rayon fans the chunks across all cores; each pwrites to its own
+        // disjoint byte range (offsets are RNG-independent, computed above)
+        // and draws from its own deterministic per-chunk RNG.
+        let n_chunks = n_docs.div_ceil(TEXT_CORPUS_CHUNK_DOCS).max(1);
+        let offsets_ref = &offsets;
+        let file_ref = &file;
+        (0..n_chunks).into_par_iter().for_each(|c| {
+            let start = c * TEXT_CORPUS_CHUNK_DOCS;
+            if start >= n_docs {
+                return;
+            }
+            let end = ((c + 1) * TEXT_CORPUS_CHUNK_DOCS).min(n_docs);
+            let base = offsets_ref[start];
+            let cap = (offsets_ref[end] - base) as usize;
+            let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
+            let zipf = ZipfDistribution::new(VOCAB_SIZE);
+            let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
+            let mut written = 0usize;
+            let flush = |buf: &mut Vec<u8>, written: &mut usize| {
+                if buf.is_empty() {
+                    return;
+                }
+                file_ref
+                    .write_all_at(buf, base + (*written as u64))
+                    .expect("pwrite text corpus buffer");
+                *written += buf.len();
+                buf.clear();
+            };
+            for doc_id in start..end {
+                write!(buf, "doc{doc_id:07}").expect("fmt doc token");
+                for _ in 0..TOKENS_PER_DOC {
+                    write!(buf, " term{:05}", zipf.sample(&mut rng)).expect("fmt term");
+                }
+                if buf.len() >= PARALLEL_CORPUS_WRITE_BUF_CAPACITY {
+                    flush(&mut buf, &mut written);
+                }
+            }
+            flush(&mut buf, &mut written);
+            assert_eq!(written, cap, "deterministic doc-length mismatch");
+        });
+
         file.sync_all().expect("sync text corpus");
         drop(file);
 
@@ -459,35 +552,80 @@ impl MmapVectorCorpus {
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
-        let file = File::create(&path).expect("create corpus file");
-        let mut writer = BufWriter::with_capacity(CORPUS_WRITER_BUF_CAPACITY, file);
-        let mut rng = StdRng::seed_from_u64(seed);
-        let dist = StandardNormal;
+
+        // Centers are derived from `seed` exactly as the sequential
+        // builder did, so the planted IVF cluster structure — and hence
+        // the brute-force recall ground truth — is unchanged. Each row's
+        // cluster (`i % n_cent`) is a pure function of its index, also
+        // preserved. Only the per-doc Gaussian *noise* stream is drawn
+        // from a per-chunk RNG so generation parallelizes; recall is
+        // recomputed from the actual corpus, so an equivalent (not
+        // identical) noise realization is fine.
+        let mut crng = StdRng::seed_from_u64(seed);
+        let cdist = StandardNormal;
         let centers: Vec<Vec<f32>> = (0..n_cent)
             .map(|_| {
                 (0..DIM)
                     .map(|_| {
-                        let s: f64 = dist.sample(&mut rng);
+                        let s: f64 = cdist.sample(&mut crng);
                         (s as f32) * CENTER_GAUSSIAN_SCALE
                     })
                     .collect()
             })
             .collect();
-        let mut row = vec![0.0f32; DIM];
-        for i in 0..n_docs {
-            let center = &centers[i % n_cent];
-            for (j, slot) in row.iter_mut().enumerate() {
-                let s: f64 = dist.sample(&mut rng);
-                *slot = center[j] + (s as f32) * DOC_NOISE_SIGMA;
+
+        let row_bytes = DIM * std::mem::size_of::<f32>();
+        let total = (n_docs as u64) * (row_bytes as u64);
+        let file = File::create(&path).expect("create corpus file");
+        file.set_len(total).expect("set_len vector corpus");
+
+        // rayon fans the chunks across all cores; each writes a fixed-stride
+        // row range via a positioned write and draws noise from its own
+        // deterministic per-chunk RNG (shared centers keep clusters intact).
+        let n_chunks = n_docs.div_ceil(VECTOR_CORPUS_CHUNK_DOCS).max(1);
+        let centers_ref = &centers;
+        let file_ref = &file;
+        (0..n_chunks).into_par_iter().for_each(|c| {
+            let start = c * VECTOR_CORPUS_CHUNK_DOCS;
+            if start >= n_docs {
+                return;
             }
-            if normalize_each {
-                normalize(&mut row);
+            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(n_docs);
+            let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
+            let dist = StandardNormal;
+            let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
+            let base = (start as u64) * (row_bytes as u64);
+            let expected = (end - start) * row_bytes;
+            let mut written = 0usize;
+            let flush = |buf: &mut Vec<u8>, written: &mut usize| {
+                if buf.is_empty() {
+                    return;
+                }
+                file_ref
+                    .write_all_at(buf, base + (*written as u64))
+                    .expect("pwrite vector corpus buffer");
+                *written += buf.len();
+                buf.clear();
+            };
+            let mut row = vec![0.0f32; DIM];
+            for i in start..end {
+                let center = &centers_ref[i % n_cent];
+                for (j, slot) in row.iter_mut().enumerate() {
+                    let s: f64 = dist.sample(&mut rng);
+                    *slot = center[j] + (s as f32) * DOC_NOISE_SIGMA;
+                }
+                if normalize_each {
+                    normalize(&mut row);
+                }
+                buf.extend_from_slice(bytemuck::cast_slice(&row));
+                if buf.len() >= PARALLEL_CORPUS_WRITE_BUF_CAPACITY {
+                    flush(&mut buf, &mut written);
+                }
             }
-            writer
-                .write_all(bytemuck::cast_slice(&row))
-                .expect("write corpus row");
-        }
-        let file = writer.into_inner().expect("flush corpus writer");
+            flush(&mut buf, &mut written);
+            assert_eq!(written, expected, "vector corpus chunk byte mismatch");
+        });
+
         file.sync_all().expect("sync corpus");
         drop(file);
 

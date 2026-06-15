@@ -1493,7 +1493,7 @@ pub(crate) mod diag {
     ///
     /// ```text
     /// INFINO_DIAG_REAL_S3=1 \
-    /// INFINO_REAL_S3_BUCKET=cold-test-381491836522 \
+    /// INFINO_REAL_S3_BUCKET=my-bucket \
     /// AWS_REGION=us-east-1 \
     /// cargo bench -- object-store
     /// ```

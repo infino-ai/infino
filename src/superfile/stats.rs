@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 use arrow_array::{Decimal128Array, RecordBatch};
 
 use crate::{superfile::BuildError, supertable::ScalarStatsTable};
