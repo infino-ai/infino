@@ -173,52 +173,6 @@ jobs:
       # Builds the addon (debug) + runs the node:test smoke suite.
       - run: make node-test
 
-  node-addons:
-    name: Addon (${{ matrix.os }})
-    # The multi-platform release build is an integration/release check, not a
-    # per-PR gate: the `node` job already covers per-PR functional testing
-    # (build + smoke tests), and the publish workflow's dry-run does the full
-    # multi-platform release build before a release. Run this on merge to main
-    # so every merge verifies all shipped platforms still build. Keep it out
-    # of branch-protection's required checks so a skipped PR run never blocks
-    # merge (same posture as the bench job).
-    if: github.event_name == 'push'
-    runs-on: ${{ matrix.os }}
-    env:
-      RUSTFLAGS: ""
-    strategy:
-      fail-fast: false
-      # Native runner per platform — `make node-build` builds for the host,
-      # no cross-compilation. One `*.node` artifact each. macos-15-intel is
-      # the x86_64 macOS runner (successor to the retired macos-13).
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-15-intel]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: infino-node
-      - run: make node-build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: addon-${{ matrix.os }}
-          path: infino-node/*.node
-
   # Informational benchmark — superfile + supertable tiers, one in-region
   # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
   # On merge to main: publish the run as that baseline + a per-commit history
