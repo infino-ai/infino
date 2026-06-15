@@ -69,17 +69,15 @@ use crate::superfile::format::vec::{
     dir_entry, outer_hdr, sub_hdr,
 };
 use crate::superfile::format::{footer::read_kv_metadata, kv};
-use crate::supertable::CommitError as SupertableCommitError;
+use crate::supertable::manifest::Manifest;
 use crate::supertable::manifest::ManifestPartLoader;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
-use crate::supertable::manifest::commit::read_pointer;
 use crate::supertable::manifest::commit::{self as commit_mod};
-use crate::supertable::manifest::list as list_mod;
 use crate::supertable::manifest::list::{
     FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
 };
 use crate::supertable::manifest::part::{self as part_mod, PartId};
-use crate::supertable::manifest::{Manifest, SuperfileList};
+use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
 
 use super::build::fanout_shards;
 use super::error::BuildError;
@@ -1915,85 +1913,14 @@ async fn refresh_inner_state_async(
     inner: &SupertableInner,
     storage: &Arc<dyn crate::storage::StorageProvider>,
 ) -> Result<(), crate::supertable::CommitError> {
-    let pointer = match read_pointer(storage.as_ref()).await? {
-        Some(p) => p,
-        // No pointer yet means nobody has committed; our next
-        // attempt will write the initial pointer with
-        // expected_prev_etag = None.
-        None => return Ok(()),
-    };
     let current = inner.manifest.load_full();
-    if pointer.manifest_id <= current.superfile_list.manifest_id {
-        // Pointer hasn't advanced past our in-memory state —
-        // our last CAS lost to a writer that has since been
-        // overwritten, or the lost-race writer's manifest_id
-        // is somehow ≤ ours. Either way, the next attempt's
-        // `inner.manifest.load_full()` is already correct.
-        return Ok(());
-    }
-
-    let (list_bytes, _) = storage
-        .get(&pointer.manifest_list_uri)
-        .await
-        .map_err(crate::supertable::CommitError::from)?;
-    let new_list = list_mod::decode(&list_bytes).map_err(|e| {
-        crate::supertable::CommitError::PointerParse(format!(
-            "manifest list decode during retry refresh: {e}"
-        ))
-    })?;
-
-    let new_loader = Arc::new(ManifestPartLoader::new(Arc::clone(storage), &new_list));
-    let new_parts: dashmap::DashMap<_, _> = dashmap::DashMap::new();
-    let mut missing_part_ids = Vec::new();
-    for entry in &new_list.parts {
-        if let Some(existing) = current.parts.get(&entry.part_id) {
-            new_parts.insert(entry.part_id, existing.value().clone());
-        } else {
-            missing_part_ids.push(entry.part_id);
-        }
-    }
-
-    let load_futs = missing_part_ids
-        .iter()
-        .map(|id| {
-            let loader = Arc::clone(&new_loader);
-            let pid = *id;
-            async move { loader.load(pid).await }
-        })
-        .collect::<Vec<_>>();
-    let loaded = futures::future::join_all(load_futs).await;
-    for (pid, result) in missing_part_ids.iter().zip(loaded) {
-        let part = result.map_err(|e| {
-            crate::supertable::CommitError::Encode(format!(
-                "manifest part load during retry refresh: part_id={} err={}",
-                pid.0, e
-            ))
-        })?;
-        let cell = tokio::sync::OnceCell::new();
-        cell.set(part).expect("fresh cell");
-        new_parts.insert(*pid, Arc::new(cell));
-    }
-
-    let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
-    for entry in &new_list.parts {
-        let cell = new_parts.get(&entry.part_id).expect("part inserted above");
-        let part = cell
-            .value()
-            .get()
-            .expect("eager-fetched or inherited; must be set");
-        all_superfiles.extend(part.superfiles.iter().cloned());
-    }
-
-    let mut new_superfile_list = SuperfileList::empty(inner.options.clone());
-    new_superfile_list.manifest_id = pointer.manifest_id;
-    new_superfile_list.superfiles = all_superfiles;
-    let new_manifest = Manifest {
-        superfile_list: new_superfile_list,
-        list: Some(new_list),
-        parts: new_parts,
-        loader: Some(new_loader),
+    let manifest = match Manifest::load(Some(current), storage.clone(), None).await {
+        Ok(manifest) => manifest,
+        Err(ManifestLoadError::PointerNotFound) => return Ok(()),
+        Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),
+        Err(err) => return Err(crate::supertable::CommitError::ManifestLoadError(err)),
     };
-    inner.manifest.store(Arc::new(new_manifest));
+    inner.manifest.store(manifest);
     Ok(())
 }
 

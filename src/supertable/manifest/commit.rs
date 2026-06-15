@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use futures::future;
 
-use crate::storage::{StorageError, StorageProvider};
+use crate::storage::{ObjectMeta, StorageError, StorageProvider};
 use crate::supertable::error::CommitError;
 use crate::supertable::manifest::list::{
     self as list_mod, ManifestList, ManifestListEntry, PartitionStrategy,
@@ -55,7 +55,7 @@ use crate::supertable::manifest::part::{
     self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart, PartId,
 };
 use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
-use crate::supertable::{Manifest, SuperfileEntry, SupertableOptions};
+use crate::supertable::{Manifest, ManifestLoadError, SuperfileEntry, SupertableOptions};
 
 /// Pointer-file location under the supertable root. The only
 /// path that ever gets atomically renamed; everything else is
@@ -121,9 +121,9 @@ impl PointerFile {
     }
 
     /// Parse the on-disk text format.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CommitError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ManifestLoadError> {
         let s = std::str::from_utf8(bytes)
-            .map_err(|e| CommitError::PointerParse(format!("not utf-8: {e}")))?;
+            .map_err(|e| ManifestLoadError::PointerParse(format!("not utf-8: {e}")))?;
 
         let mut manifest_id: Option<u64> = None;
         let mut manifest_list_uri: Option<String> = None;
@@ -133,28 +133,26 @@ impl PointerFile {
             if line.is_empty() {
                 continue;
             }
-            let (key, value) = line
-                .split_once('=')
-                .ok_or_else(|| CommitError::PointerParse(format!("no '=' in line: {line:?}")))?;
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                ManifestLoadError::PointerParse(format!("no '=' in line: {line:?}"))
+            })?;
             match key {
                 "manifest_id" => {
-                    manifest_id = Some(
-                        value
-                            .parse::<u64>()
-                            .map_err(|e| CommitError::PointerParse(format!("manifest_id: {e}")))?,
-                    );
+                    manifest_id = Some(value.parse::<u64>().map_err(|e| {
+                        ManifestLoadError::PointerParse(format!("manifest_id: {e}"))
+                    })?);
                 }
                 "manifest_list_uri" => {
                     manifest_list_uri = Some(value.to_string());
                 }
                 "content_hash" => {
                     let hex = value.strip_prefix("blake3:").ok_or_else(|| {
-                        CommitError::PointerParse(format!(
+                        ManifestLoadError::PointerParse(format!(
                             "content_hash missing 'blake3:' prefix: {value}"
                         ))
                     })?;
                     if hex.len() != BLAKE3_HEX_LEN {
-                        return Err(CommitError::PointerParse(format!(
+                        return Err(ManifestLoadError::PointerParse(format!(
                             "content_hash hex must be {BLAKE3_HEX_LEN} chars; got {}",
                             hex.len()
                         )));
@@ -163,7 +161,7 @@ impl PointerFile {
                     for i in 0..BLAKE3_DIGEST_BYTES {
                         bytes[i] =
                             u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
-                                CommitError::PointerParse(format!("content_hash hex: {hex}"))
+                                ManifestLoadError::PointerParse(format!("content_hash hex: {hex}"))
                             })?;
                     }
                     content_hash = Some(ContentHash(bytes));
@@ -177,11 +175,12 @@ impl PointerFile {
 
         Ok(Self {
             manifest_id: manifest_id
-                .ok_or_else(|| CommitError::PointerParse("missing manifest_id".into()))?,
-            manifest_list_uri: manifest_list_uri
-                .ok_or_else(|| CommitError::PointerParse("missing manifest_list_uri".into()))?,
+                .ok_or_else(|| ManifestLoadError::PointerParse("missing manifest_id".into()))?,
+            manifest_list_uri: manifest_list_uri.ok_or_else(|| {
+                ManifestLoadError::PointerParse("missing manifest_list_uri".into())
+            })?,
             content_hash: content_hash
-                .ok_or_else(|| CommitError::PointerParse("missing content_hash".into()))?,
+                .ok_or_else(|| ManifestLoadError::PointerParse("missing content_hash".into()))?,
         })
     }
 }
@@ -192,11 +191,11 @@ impl PointerFile {
 /// supertable). Returns `Err` on any other failure.
 pub async fn read_pointer(
     storage: &dyn StorageProvider,
-) -> Result<Option<PointerFile>, CommitError> {
+) -> Result<Option<(PointerFile, ObjectMeta)>, ManifestLoadError> {
     match storage.get(POINTER_PATH).await {
-        Ok((bytes, _)) => Ok(Some(PointerFile::from_bytes(&bytes)?)),
+        Ok((bytes, meta)) => Ok(Some((PointerFile::from_bytes(&bytes)?, meta))),
         Err(StorageError::NotFound { .. }) => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(ManifestLoadError::Storage(e)),
     }
 }
 
@@ -434,13 +433,9 @@ pub async fn get_current_manifest_etag(
     storage: &Arc<dyn StorageProvider>,
     current: Arc<Manifest>,
 ) -> Result<Option<String>, CommitError> {
-    let (bytes, meta) = match storage.get(POINTER_PATH).await {
-        Ok((bytes, meta)) => (bytes, meta),
-        Err(StorageError::NotFound { .. }) => return Ok(None),
-        Err(e) => return Err(crate::supertable::CommitError::from(e)),
+    let Some((pointer_file, meta)) = read_pointer(storage.as_ref()).await? else {
+        return Ok(None);
     };
-
-    let pointer_file = PointerFile::from_bytes(&bytes)?;
     let Some(meta_list) = current.list.as_ref() else {
         // no manifest list for in-memory supertables
         return Ok(None);
@@ -805,7 +800,7 @@ mod tests {
     fn assert_parse_err(bytes: &[u8], needle: &str) {
         let err = PointerFile::from_bytes(bytes).expect_err("must error");
         match err {
-            CommitError::PointerParse(msg) => assert!(
+            ManifestLoadError::PointerParse(msg) => assert!(
                 msg.contains(needle),
                 "expected `{needle}` in error; got: {msg}"
             ),
@@ -947,10 +942,10 @@ mod tests {
         write_pointer(storage.as_ref(), &p, None)
             .await
             .expect("write");
-        let read = read_pointer(storage.as_ref())
+        let (read, _) = read_pointer(storage.as_ref())
             .await
             .expect("read")
-            .expect("present");
+            .expect("some");
         assert_eq!(read, p);
     }
 

@@ -51,7 +51,7 @@ fn commit_persists_pointer_list_part_and_superfile() {
     drop(w);
 
     // Pointer file exists on disk, manifest_id=1 (initial was 0).
-    let pointer = futures::executor::block_on(read_pointer(&*storage))
+    let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
         .expect("read")
         .expect("pointer present");
     assert_eq!(pointer.manifest_id, 1);
@@ -115,7 +115,7 @@ fn two_successive_commits_both_publish() {
     w.commit().expect("commit2");
     drop(w);
 
-    let pointer = futures::executor::block_on(read_pointer(&*storage))
+    let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
         .expect("read")
         .expect("pointer");
     assert_eq!(
@@ -292,7 +292,7 @@ fn manifest_id_increments_only_on_non_empty_commits() {
     w.commit().expect("real commit");
     drop(w);
 
-    let pointer = futures::executor::block_on(read_pointer(&*storage))
+    let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
         .expect("read")
         .expect("pointer");
     assert_eq!(pointer.manifest_id, 1);

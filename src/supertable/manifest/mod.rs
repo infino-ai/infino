@@ -38,11 +38,15 @@ use std::sync::Arc;
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::{DataType, Schema};
+use dashmap::DashMap;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::superfile::vector::distance::{
-    COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq,
+use crate::{
+    superfile::vector::distance::{
+        COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq,
+    },
+    supertable::manifest::commit::read_pointer,
 };
 
 use bloom::Bloom;
@@ -182,6 +186,167 @@ impl Manifest {
         }
     }
 
+    pub(crate) async fn load(
+        current_manifest: Option<Arc<Self>>,
+        storage: Arc<dyn crate::storage::StorageProvider>,
+        options: Option<Arc<SupertableOptions>>,
+    ) -> Result<Arc<Self>, ManifestLoadError> {
+        // 1. Read the pointer file.
+        let (pointer, _) = match read_pointer(storage.as_ref()).await? {
+            Some(p) => p,
+            // No pointer yet means nobody has committed; our next
+            // attempt will write the initial pointer with
+            // expected_prev_etag = None.
+            None => return Err(ManifestLoadError::PointerNotFound),
+        };
+
+        if let Some(current_manifest) = &current_manifest
+            && current_manifest.superfile_list.manifest_id >= pointer.manifest_id
+        {
+            // Pointer hasn't advanced past our in-memory state —
+            return Err(ManifestLoadError::AlreadyLoaded);
+        }
+
+        // 2. Load + parse the manifest list.
+        let (list_bytes, _) = storage
+            .get(&pointer.manifest_list_uri)
+            .await
+            .map_err(crate::supertable::ManifestLoadError::Storage)?;
+        let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
+
+        let options = if let Some(options) = options {
+            options
+        } else if let Some(current) = &current_manifest {
+            current.options.clone()
+        } else {
+            return Err(ManifestLoadError::ContentHashMismatch {
+                expected: "valid options".to_string(),
+                actual: "None options".to_string(),
+            });
+        };
+
+        // Verify the caller's options match the
+        // manifest's stamped digest. The all-zero stored
+        // hash bypasses validation (legacy + synthetic
+        // fixtures).
+        let expected_hash = crate::supertable::manifest::options_hash::compute_options_hash(
+            &options,
+            &list.partition_strategy,
+        );
+        if let Err(mismatch) = crate::supertable::manifest::options_hash::verify_options_hash(
+            expected_hash,
+            list.options_hash,
+        ) {
+            return Err(ManifestLoadError::ContentHashMismatch {
+                expected: mismatch.expected,
+                actual: mismatch.actual,
+            });
+        }
+
+        // 3. Build the loader, superfiles & parts
+        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+        let parts: dashmap::DashMap<_, _> = DashMap::new();
+        let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
+        if let Some(current_manifest) = &current_manifest {
+            // If we have an existing manifest, populate `parts` with
+            // existing entries and track missing part IDs for lazy-load.
+            let mut missing_part_ids = Vec::new();
+            for entry in &list.parts {
+                if let Some(existing) = current_manifest.parts.get(&entry.part_id) {
+                    parts.insert(entry.part_id, existing.value().clone());
+                } else {
+                    missing_part_ids.push(entry.part_id);
+                }
+            }
+
+            let threshold = options.eager_load_threshold_parts as usize;
+            let eager = list.parts.len() <= threshold;
+
+            if eager {
+                let load_futs = missing_part_ids
+                    .iter()
+                    .map(|id| {
+                        let loader = Arc::clone(&loader);
+                        let pid = *id;
+                        async move { loader.load(pid).await }
+                    })
+                    .collect::<Vec<_>>();
+                let loaded = futures::future::join_all(load_futs).await;
+                for (pid, result) in missing_part_ids.iter().zip(loaded) {
+                    let part = result?;
+                    let cell = tokio::sync::OnceCell::new();
+                    cell.set(part).expect("fresh cell");
+                    parts.insert(*pid, Arc::new(cell));
+                }
+                for entry in &list.parts {
+                    let cell = parts.get(&entry.part_id).expect("part inserted above");
+                    let part = cell
+                        .value()
+                        .get()
+                        .expect("eager-fetched or inherited; must be set");
+                    all_superfiles.extend(part.superfiles.iter().cloned());
+                }
+            } else {
+                for pid in &missing_part_ids {
+                    parts.insert(*pid, Arc::new(tokio::sync::OnceCell::new()));
+                }
+            }
+        } else {
+            let n_parts = list.parts.len();
+            let threshold = options.eager_load_threshold_parts as usize;
+            let eager = n_parts <= threshold;
+            if eager {
+                // eager-fetching every part (small manifests — fast first query)
+                // parallel-fetch every part + populate
+                // the flat superfile_list.superfiles view so the
+                // iteration-style query paths (`bm25_search`,
+                // `vector_search`, `query_sql`) see all superfiles
+                // without going through the hierarchical iterator.
+                let part_ids: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
+                let load_futs = part_ids
+                    .iter()
+                    .map(|id| {
+                        let loader = Arc::clone(&loader);
+                        let pid = *id;
+                        async move { loader.load(pid).await }
+                    })
+                    .collect::<Vec<_>>();
+                let loaded = futures::future::join_all(load_futs).await;
+                for (pid, result) in part_ids.iter().zip(loaded) {
+                    let part = result?;
+                    all_superfiles.extend(part.superfiles.iter().cloned());
+                    let cell = tokio::sync::OnceCell::new();
+                    cell.set(part).expect("fresh OnceCell");
+                    parts.insert(*pid, Arc::new(cell));
+                }
+            } else {
+                // Lazy path: each part gets an empty
+                // `OnceCell`; first `Manifest::part(id).await`
+                // triggers a single storage GET for that part.
+                // `superfile_list.superfiles` stays empty — legacy
+                // flat-iteration queries return zero results
+                // until the hierarchical query path lands.
+                // Callers in lazy mode today drive
+                // `Manifest::part().await` directly.
+                for entry in &list.parts {
+                    parts.insert(entry.part_id, Arc::new(tokio::sync::OnceCell::new()));
+                }
+            }
+        }
+
+        let mut new_superfile_list = SuperfileList::empty(options.clone());
+        new_superfile_list.manifest_id = pointer.manifest_id;
+        new_superfile_list.superfiles = all_superfiles;
+        let new_manifest = Manifest {
+            superfile_list: new_superfile_list,
+            list: Some(list),
+            parts,
+            loader: Some(loader),
+        };
+
+        Ok(Arc::new(new_manifest))
+    }
+
     /// Build a successor manifest with `new_entries` appended.
     /// Preserves the persistence-side metadata (`list`, `loader`)
     /// from the predecessor; the per-part cache is fresh (an empty
@@ -291,11 +456,22 @@ impl ManifestPartLoader {
 /// testable in isolation.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestLoadError {
+    /// Pointer not found in storage.
+    #[error("pointer not found in storage")]
+    PointerNotFound,
+    #[error("already loaded")]
+    AlreadyLoaded,
+    /// Pointer parse error.
+    #[error("pointer parse error: {0}")]
+    PointerParse(String),
     /// Caller invoked `Manifest::part(...)` on an in-process-only
     /// manifest (no storage attached). The hierarchical manifest
     /// has no on-disk parts to load from.
     #[error("no storage / loader attached to this manifest")]
     NoLoaderAttached,
+
+    #[error("list parse error: {0}")]
+    ListParse(#[source] list::ListParseError),
     /// `part_id` isn't in this manifest's list. Either the caller
     /// passed a stale id (pre-refresh) or the manifest list is
     /// missing an entry.

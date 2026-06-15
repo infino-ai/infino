@@ -284,7 +284,7 @@ fn crash_post_superfile_no_prior_commit_yields_pointer_unreadable() {
     let err = Supertable::open(default_supertable_options().with_storage(storage))
         .expect_err("must reject post-crash state with no pointer");
     assert!(
-        matches!(err, OpenError::PointerUnreadable(_)),
+        matches!(err, OpenError::ManifestLoadError(_)),
         "expected PointerUnreadable, got {err:?}"
     );
 
@@ -316,7 +316,7 @@ fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     let err = Supertable::open(default_supertable_options().with_storage(storage))
         .expect_err("must reject post-crash state with no pointer");
     assert!(
-        matches!(err, OpenError::PointerUnreadable(_)),
+        matches!(err, OpenError::ManifestLoadError(_)),
         "expected PointerUnreadable, got {err:?}"
     );
 

@@ -35,7 +35,6 @@ use bytes::Bytes;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;
 
-use infino::supertable::CommitError;
 use infino::supertable::manifest::commit::{
     self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, list_uri, part_uri,
     read_pointer, write_pointer,
@@ -47,6 +46,7 @@ use infino::supertable::manifest::part::{self as part_mod, ContentHash, Manifest
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
+use infino::supertable::{CommitError, ManifestLoadError};
 use tempfile::TempDir;
 
 /// Manifest id used by the pointer-file round-trip fixture.
@@ -105,7 +105,7 @@ fn pointer_file_text_format_roundtrip() {
 fn pointer_file_rejects_truncated() {
     let bad = b"manifest_id=1\nmanifest_list_uri=foo\n"; // missing content_hash
     let err = PointerFile::from_bytes(bad).expect_err("must reject");
-    assert!(matches!(err, CommitError::PointerParse(_)), "{err:?}");
+    assert!(matches!(err, ManifestLoadError::PointerParse(_)), "{err:?}");
 }
 
 #[test]
@@ -188,7 +188,7 @@ async fn initial_commit_writes_list_part_pointer() {
     assert_eq!(pointer.manifest_list_uri, list_uri(0));
 
     // Pointer is readable.
-    let read = read_pointer(&storage).await.expect("read").expect("some");
+    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
     assert_eq!(read, pointer);
     // List + part are at their expected URIs.
     let (list_bytes, _) = storage.get(&list_uri(0)).await.expect("list bytes");
@@ -235,7 +235,7 @@ async fn second_commit_with_valid_prev_etag_succeeds() {
         .expect("v1");
     assert_eq!(pointer.manifest_id, 1);
 
-    let read = read_pointer(&storage).await.expect("read").expect("some");
+    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
     assert_eq!(read.manifest_id, 1);
 }
 
@@ -312,7 +312,7 @@ async fn part_reuse_writes_zero_new_part_files() {
     );
 
     // But manifest_id 1 is published.
-    let read = read_pointer(&storage).await.expect("read").expect("some");
+    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
     assert_eq!(read.manifest_id, 1);
 }
 
@@ -566,7 +566,7 @@ async fn write_pointer_initial_then_update() {
         .await
         .expect("update");
 
-    let read = read_pointer(&storage).await.expect("read").expect("some");
+    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
     assert_eq!(read, p1);
 }
 
