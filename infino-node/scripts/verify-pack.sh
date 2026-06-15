@@ -54,6 +54,12 @@ NEED_BUILD=0
 for f in "infino/${NODE_FILE}" infino/index.js infino/index.d.ts infino/native.js infino/native.d.ts; do
   [ -f "$f" ] || NEED_BUILD=1
 done
+# A reused loader from a previous package name (after a napi.name change)
+# requires a different platform package and would fail at load — rebuild if
+# native.js doesn't reference the current platform package name.
+if [ "$NEED_BUILD" = "0" ] && ! grep -q "${PKG_NAME}-${TRIPLE}" infino/native.js 2>/dev/null; then
+  NEED_BUILD=1
+fi
 if [ "$NEED_BUILD" = "1" ]; then
   echo "==> [1/5] building addon + wrapper"
   npm install

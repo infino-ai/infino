@@ -7,7 +7,7 @@ a search or query to get an apache-arrow `Table` instead.
 ## Install
 
 ```sh
-npm install infino-node
+npm install infino
 ```
 
 A prebuilt native binary is selected automatically at install time — no Rust
@@ -24,7 +24,7 @@ toolchain needed. Supported platforms:
 ## Usage
 
 ```javascript
-const { connect, IndexSpec } = require("infino-node");
+const { connect, IndexSpec } = require("infino");
 const { Schema, Field, LargeUtf8 } = require("apache-arrow");
 
 const db = connect("memory://"); // or "./data", "s3://bucket/prefix"
@@ -43,7 +43,7 @@ const out  = db.querySql("SELECT COUNT(*) AS n FROM docs"); // records (or { arr
 ES modules work the same way:
 
 ```javascript
-import { connect, IndexSpec } from "infino-node";
+import { connect, IndexSpec } from "infino";
 ```
 
 ## API
