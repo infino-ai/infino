@@ -10,10 +10,10 @@ and as a search index through infino's own reader, so your data stays open and p
 
 **Why infino**
 
+- **Best performance per dollar** — engineered for the strongest speed-per-dollar trade-off, not just raw latency: object-storage economics plus a read path continuously benchmarked on speed *and* cost (bytes fetched, request count, memory footprint).
 - **Three modalities, one engine** — keyword (BM25), vector, and SQL over the same rows; no copying data between systems to combine them.
 - **Object-storage-native** — your data lives on S3, Azure, or local disk, with snapshot-isolated reads and append / update / delete through atomic commits. No cluster to stand up.
 - **Open, no lock-in** — superfiles are spec-compliant Parquet, so anything that reads Parquet can read your data.
-- **Fast and cost-aware** — low-latency search at scale is a first-class, continuously benchmarked goal.
 
 ## Links
 
