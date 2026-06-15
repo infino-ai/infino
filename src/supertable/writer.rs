@@ -2140,7 +2140,9 @@ mod tests {
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::SupertableOptions;
     use crate::supertable::handle::Supertable;
+    use crate::supertable::storage::LocalFsStorageProvider;
     use crate::test_helpers::default_tokenizer as tok;
+    use tempfile::TempDir;
 
     fn schema_id_title() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -2565,6 +2567,47 @@ supertable:
         w.append(&build_simple_batch(0, 50_000)).expect("append");
         assert_eq!(st.manifest_id(), 0, "no auto-flush at threshold=0");
         assert!(w.buffered_batches() > 0);
+    }
+
+    // commit latency O(n) regression with localfs storage provider
+
+    /// Each `Supertable::append` call rewrites the entire manifest part
+    /// (Avro-encode + zstd-compress all N accumulated superfile entries,
+    /// then PUT to storage). Commit K is O(K), so 100 sequential commits
+    /// are O(n²) total and latency grows linearly with superfile count.
+    #[ignore = "known O(n) regression: manifest part rewrite on every commit"]
+    #[test]
+    fn commit_latency_is_constant_with_localfs() {
+        const N: usize = 100;
+        const DOCS_PER_COMMIT: usize = 64;
+        const MAX_GROWTH_FACTOR: f64 = 2.0;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let opts = options_id_title_serial().with_storage(storage);
+        let st = Supertable::create(opts).expect("create");
+
+        let mut latencies_ms: Vec<u128> = Vec::with_capacity(N);
+        for i in 0..N {
+            let batch = build_simple_batch(i as u64, DOCS_PER_COMMIT);
+            let t0 = std::time::Instant::now();
+            st.append(&batch).expect("append");
+            latencies_ms.push(t0.elapsed().as_millis());
+        }
+
+        let avg = |slice: &[u128]| slice.iter().sum::<u128>() as f64 / slice.len() as f64;
+        let first5_avg = avg(&latencies_ms[..5]);
+        let last5_avg = avg(&latencies_ms[N - 5..]);
+        let ratio = last5_avg / first5_avg.max(1.0);
+
+        println!(
+            "first-5 avg: {first5_avg:.1}ms  last-5 avg: {last5_avg:.1}ms  ratio: {ratio:.1}x"
+        );
+        assert!(
+            ratio <= MAX_GROWTH_FACTOR,
+            "commit latency grew {ratio:.1}x from first-5 ({first5_avg:.1}ms) to \
+             last-5 ({last5_avg:.1}ms) — O(n) growth in manifest rewrite path"
+        );
     }
 
     // ---- manifest copy-on-write across multiple commits -------------
