@@ -1,0 +1,189 @@
+name: Publish Python package
+
+# Manually-triggered release of the `infino` Python package: validate the
+# version, build one binary wheel per platform/arch, then upload to TestPyPI
+# (default) or PyPI.
+#
+# Two facts shape the whole pipeline:
+#   - abi3 (pyo3 `abi3-py39`) → a single wheel per platform/arch covers all
+#     CPython >= 3.9, so the matrix is platform × arch only, never × Python.
+#   - The bindings depend on the core crate by path (`infino = { path = ".." }`),
+#     so an sdist can't build outside this repo. Distribution is wheels-only,
+#     and the matrix is kept wide enough that pip never falls back to source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0, 0.1.0rc1)"
+        required: true
+        type: string
+      target:
+        description: "Index to publish to"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+# One release per index at a time; never cancel a publish in flight.
+concurrency:
+  group: publish-python-${{ inputs.target }}
+  cancel-in-progress: false
+
+# Least privilege by default; the publish job widens to `id-token: write`
+# for PyPI Trusted Publishing (OIDC). No long-lived credentials.
+permissions:
+  contents: read
+
+env:
+  # The bindings pull the core crate as an ordinary dependency; a transitive
+  # deprecation warning must not fail a release build.
+  RUSTFLAGS: ""
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      # Reject a malformed version up front, before the build matrix spins up.
+      # Accepts SemVer with an optional PEP 440 / SemVer suffix: 0.1.0,
+      # 0.1.0rc1, 0.1.0-alpha.1, 0.1.0.post2.
+      - id: check
+        run: |
+          version="${{ inputs.version }}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+|[A-Za-z][0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::invalid release version: $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: wheel ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-14,         target: aarch64-apple-darwin }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+
+      # The core dep graph (datafusion + its sub-crates, parquet, arrow) plus
+      # the build target dir overflows the ~14 GB free on a stock Linux runner;
+      # reclaim ~30 GB before compiling.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Version is dynamic (pyproject `dynamic = ["version"]`) → maturin reads
+      # it from Cargo.toml. Stamp it into Cargo.toml *and* Cargo.lock so the
+      # build stays --locked. python3 over sed: one script, every runner,
+      # Windows included.
+      - name: Stamp version
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY'
+          import pathlib, re, sys
+
+          version = sys.argv[1]
+
+          toml = pathlib.Path("infino-python/Cargo.toml")
+          patched, count = re.subn(
+              r'(?m)^version = "[^"]*"', f'version = "{version}"',
+              toml.read_text(), count=1)
+          assert count == 1, "[package] version not found in Cargo.toml"
+          toml.write_text(patched)
+
+          lock = pathlib.Path("infino-python/Cargo.lock")
+          patched, count = re.subn(
+              r'(?ms)(\[\[package\]\]\nname = "infino-python"\nversion = ")[^"]*(")',
+              rf"\g<1>{version}\g<2>", lock.read_text(), count=1)
+          assert count == 1, "infino-python entry not found in Cargo.lock"
+          lock.write_text(patched)
+
+          print(f"stamped infino-python -> {version}")
+          PY
+
+      # `manylinux` is honored only for Linux targets and ignored elsewhere;
+      # musl targets need the musllinux image, every other target builds glibc.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ contains(matrix.target, 'musl') && 'musllinux_1_2' || 'auto' }}
+          args: --release --locked --out dist -m infino-python/Cargo.toml
+
+      # Install the freshly built wheel into a clean interpreter and run the
+      # smoke suite, proving it imports and round-trips before publish. Skipped
+      # for musl wheels, which can't install on the glibc-based runner.
+      - name: Smoke-test wheel
+        if: ${{ !contains(matrix.target, 'musl') }}
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --force-reinstall dist/*.whl pytest
+          python3 -m pytest infino-python/tests -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Publish to ${{ inputs.target }}
+    needs: build
+    runs-on: ubuntu-latest
+    # `environment` is load-bearing, not decoration: the PyPI/TestPyPI trusted
+    # publisher is keyed to it (plus repo + workflow file), and it can gate
+    # `pypi` behind required reviewers. `id-token: write` lets the upload
+    # authenticate over OIDC instead of a stored token.
+    permissions:
+      id-token: write
+      contents: read
+    environment: ${{ inputs.target }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate distributions
+        run: |
+          python3 -m pip install --upgrade twine
+          python3 -m twine check dist/*
+      # Trusted Publishing: no `password` — the action exchanges the OIDC
+      # token with the index. `repository-url` selects PyPI vs TestPyPI.
+      - name: Upload to ${{ inputs.target }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
