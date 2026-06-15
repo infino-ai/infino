@@ -181,9 +181,10 @@ jobs:
     strategy:
       fail-fast: false
       # Native runner per platform — `make node-build` builds for the host,
-      # no cross-compilation. One `*.node` artifact each.
+      # no cross-compilation. One `*.node` artifact each. macos-15-intel is
+      # the x86_64 macOS runner (successor to the retired macos-13).
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
