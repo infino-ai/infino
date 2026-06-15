@@ -53,8 +53,6 @@ infino = "0.1"
 
 ## Quickstart
 
-A knowledge base your agent retrieves over — keyword, vector, and SQL over the same `docs` table, the three ways an agent grounds its next answer. These run as-is on the in-process `memory://` backend; point `connect` at `"./data"` or `"s3://bucket/prefix"` to persist. The embeddings here are a tiny stand-in so the example runs copy-paste — swap in your model.
-
 **Python**
 
 ```python
