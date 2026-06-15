@@ -107,12 +107,18 @@ const DOC_ID_PAD_WIDTH: usize = 7;
 /// Bytes in one body token `" term{:05}"` — 5 for `" term"` plus 5 digits.
 /// Fixed because `VOCAB_SIZE = 10_000 ≤ 100_000` keeps the index ≤ 5 digits.
 const TERM_BYTES: usize = 10;
-/// Docs generated per parallel chunk for the text corpus (~2 GiB buffer at
-/// ~2 KiB/doc). One chunk per core-wave; rayon fans them across all cores.
+/// Docs assigned to one text corpus scheduling chunk. Each worker streams its
+/// chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than buffering
+/// the whole chunk in memory.
 const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
-/// Docs generated per parallel chunk for the vector corpus (~2 GiB buffer
-/// at `DIM * 4` bytes/row).
+/// Docs assigned to one vector corpus scheduling chunk. Each worker streams
+/// its chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than
+/// buffering the whole chunk in memory.
 const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
+/// Per-worker output buffer before a positioned write flushes to the corpus
+/// file. This keeps memory bounded by roughly `rayon_threads × 8 MiB` while
+/// still issuing large writes to NVMe.
+const PARALLEL_CORPUS_WRITE_BUF_CAPACITY: usize = 8 << 20;
 /// Odd 64-bit multiplier (fractional golden ratio) used to derive a
 /// distinct, deterministic RNG seed per chunk from `(seed, chunk_index)`,
 /// so a parallelized corpus is still reproducible for a given `seed`.
@@ -121,7 +127,11 @@ const CHUNK_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Deterministic per-chunk RNG seed: mixes the base `seed` with the chunk
 /// index so independent chunks draw disjoint, reproducible streams.
 fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
-    seed.wrapping_add((chunk_index as u64).wrapping_add(1).wrapping_mul(CHUNK_SEED_MIX))
+    seed.wrapping_add(
+        (chunk_index as u64)
+            .wrapping_add(1)
+            .wrapping_mul(CHUNK_SEED_MIX),
+    )
 }
 
 /// Vector dimension — matches modern large embedding models
@@ -354,17 +364,29 @@ impl MmapTextCorpus {
             let cap = (offsets_ref[end] - base) as usize;
             let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let zipf = ZipfDistribution::new(VOCAB_SIZE);
-            let mut buf: Vec<u8> = Vec::with_capacity(cap);
+            let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
+            let mut written = 0usize;
+            let flush = |buf: &mut Vec<u8>, written: &mut usize| {
+                if buf.is_empty() {
+                    return;
+                }
+                file_ref
+                    .write_all_at(buf, base + (*written as u64))
+                    .expect("pwrite text corpus buffer");
+                *written += buf.len();
+                buf.clear();
+            };
             for doc_id in start..end {
                 write!(buf, "doc{doc_id:07}").expect("fmt doc token");
                 for _ in 0..TOKENS_PER_DOC {
                     write!(buf, " term{:05}", zipf.sample(&mut rng)).expect("fmt term");
                 }
+                if buf.len() >= PARALLEL_CORPUS_WRITE_BUF_CAPACITY {
+                    flush(&mut buf, &mut written);
+                }
             }
-            debug_assert_eq!(buf.len(), cap, "deterministic doc-length mismatch");
-            file_ref
-                .write_all_at(&buf, base)
-                .expect("pwrite text corpus chunk");
+            flush(&mut buf, &mut written);
+            assert_eq!(written, cap, "deterministic doc-length mismatch");
         });
 
         file.sync_all().expect("sync text corpus");
@@ -571,7 +593,20 @@ impl MmapVectorCorpus {
             let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(n_docs);
             let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let dist = StandardNormal;
-            let mut buf: Vec<u8> = Vec::with_capacity((end - start) * row_bytes);
+            let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
+            let base = (start as u64) * (row_bytes as u64);
+            let expected = (end - start) * row_bytes;
+            let mut written = 0usize;
+            let flush = |buf: &mut Vec<u8>, written: &mut usize| {
+                if buf.is_empty() {
+                    return;
+                }
+                file_ref
+                    .write_all_at(buf, base + (*written as u64))
+                    .expect("pwrite vector corpus buffer");
+                *written += buf.len();
+                buf.clear();
+            };
             let mut row = vec![0.0f32; DIM];
             for i in start..end {
                 let center = &centers_ref[i % n_cent];
@@ -583,10 +618,12 @@ impl MmapVectorCorpus {
                     normalize(&mut row);
                 }
                 buf.extend_from_slice(bytemuck::cast_slice(&row));
+                if buf.len() >= PARALLEL_CORPUS_WRITE_BUF_CAPACITY {
+                    flush(&mut buf, &mut written);
+                }
             }
-            file_ref
-                .write_all_at(&buf, (start as u64) * (row_bytes as u64))
-                .expect("pwrite vector corpus chunk");
+            flush(&mut buf, &mut written);
+            assert_eq!(written, expected, "vector corpus chunk byte mismatch");
         });
 
         file.sync_all().expect("sync corpus");
