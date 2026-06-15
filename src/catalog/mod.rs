@@ -907,6 +907,129 @@ mod tests {
     }
 
     #[test]
+    fn connect_with_default_options_yields_empty_memory_catalog() {
+        let db = connect_with("memory://", ConnectOptions::new()).expect("connect_with");
+        assert!(db.list_tables().expect("list").is_empty());
+    }
+
+    #[test]
+    fn connection_clone_shares_one_catalog() {
+        let conn = connect("memory://").expect("connect");
+        let clone = conn.clone();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create on original");
+        // The clone shares the same Arc<ConnectionInner>, so the table
+        // is visible through it.
+        assert_eq!(clone.list_tables().expect("list"), vec!["docs".to_string()]);
+    }
+
+    #[test]
+    fn query_sql_table_free_select_uses_shared_bridge() {
+        // A query naming no catalog relation falls through to the shared
+        // sync->async bridge (the `handles.first()` None arm).
+        let conn = connect("memory://").expect("connect");
+        let batches = conn
+            .query_sql("SELECT 1 AS one")
+            .expect("table-free select");
+        assert_eq!(n_rows(&batches), 1);
+    }
+
+    #[test]
+    fn query_sql_invalid_sql_is_query_error() {
+        let conn = connect("memory://").expect("connect");
+        let err = conn.query_sql("NOT VALID SQL @@@");
+        assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn drop_missing_is_not_found() {
+        let conn = connect("memory://").expect("connect");
+        assert!(matches!(
+            conn.drop_table("nope", false),
+            Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn empty_table_name_rejected() {
+        let conn = connect("memory://").expect("connect");
+        assert!(
+            conn.create_table("", schema_id_title(), IndexSpec::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vector_index_round_trips_metric_through_storage_catalog() {
+        use crate::Metric;
+
+        // Exercises metric_to_str (create) + metric_from_str (open) plus
+        // the VectorEntry catalog encoding across a reconnect. A
+        // storage-backed catalog records the index spec and rebuilds it
+        // on open, so the table's options-hash check must pass.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
+            arrow_schema::Field::new(
+                "embedding",
+                arrow_schema::DataType::FixedSizeList(
+                    std::sync::Arc::new(arrow_schema::Field::new(
+                        "item",
+                        arrow_schema::DataType::Float32,
+                        true,
+                    )),
+                    16,
+                ),
+                false,
+            ),
+        ]));
+
+        // A FixedSizeList<Float32, 16> column of one all-zero vector,
+        // committed so the physical table writes its pointer file (open
+        // requires committed state).
+        let one_vector = || -> arrow::record_batch::RecordBatch {
+            use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray};
+            let values = Float32Array::from(vec![0.0_f32; 16]);
+            let field = std::sync::Arc::new(arrow_schema::Field::new(
+                "item",
+                arrow_schema::DataType::Float32,
+                true,
+            ));
+            let list = FixedSizeListArray::new(field, 16, std::sync::Arc::new(values), None);
+            arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    std::sync::Arc::new(LargeStringArray::from(vec!["hello"])),
+                    std::sync::Arc::new(list),
+                ],
+            )
+            .expect("vector batch")
+        };
+
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "vecs",
+                    schema.clone(),
+                    IndexSpec::new()
+                        .fts("title")
+                        .vector("embedding", 16, 4, Metric::L2Sq),
+                )
+                .expect("create vector table");
+            table.append(&one_vector()).expect("append vector row");
+        }
+
+        // Reopen: open_table rebuilds the spec via metric_from_str and
+        // validates the options hash — a mismatch would error here.
+        let conn = connect(&uri).expect("reconnect");
+        assert_eq!(conn.list_tables().expect("list"), vec!["vecs".to_string()]);
+        conn.open_table("vecs").expect("open vector table");
+    }
+
+    #[test]
     fn localfs_persists_across_reconnect() {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();

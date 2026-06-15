@@ -1057,4 +1057,333 @@ mod tests {
         let decoded = decode(&wrapped).expect("decode from Bytes");
         assert_eq!(decoded.superfiles.len(), 1);
     }
+
+    #[test]
+    fn content_hash_of_is_deterministic_and_to_hex_is_64_chars() {
+        let h = ContentHash::of(b"the quick brown fox");
+        let h2 = ContentHash::of(b"the quick brown fox");
+        assert_eq!(h, h2, "blake3 is deterministic");
+        let hex = h.to_hex();
+        assert_eq!(hex.len(), BLAKE3_HEX_LEN);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "to_hex emits lowercase hex"
+        );
+        // Different input ⇒ different hash.
+        assert_ne!(h, ContentHash::of(b"the quick brown foy"));
+    }
+
+    #[test]
+    fn content_hash_debug_is_truncated_display_is_full() {
+        let h = ContentHash::of(b"payload");
+        let dbg = format!("{h:?}");
+        let disp = format!("{h}");
+        // Debug shows a `blake3:<8hex>…` prefix.
+        assert!(dbg.starts_with("blake3:"), "got {dbg}");
+        assert!(dbg.ends_with('…'), "got {dbg}");
+        // 8 hex chars between prefix and ellipsis.
+        let body = dbg.trim_start_matches("blake3:").trim_end_matches('…');
+        assert_eq!(body.len(), CONTENT_HASH_DEBUG_HEX_PREFIX_LEN);
+        // Display shows the full hash.
+        assert_eq!(disp, format!("blake3:{}", h.to_hex()));
+        assert!(disp.starts_with(&dbg[..dbg.len() - '…'.len_utf8()]));
+    }
+
+    #[test]
+    fn part_id_new_v4_is_unique_and_display_matches_uuid() {
+        let a = PartId::new_v4();
+        let b = PartId::new_v4();
+        assert_ne!(a, b);
+        // Display delegates to the inner UUID.
+        assert_eq!(format!("{a}"), a.0.to_string());
+    }
+
+    #[test]
+    fn subsection_offsets_present_roundtrip_through_part() {
+        // Drive encode/decode of a SuperfileEntry carrying fully-
+        // populated subsection_offsets (version 3 / open_blob path).
+        let id = Uuid::new_v4();
+        let off = SubsectionOffsets {
+            total_size: 9_000,
+            vec: Some((100, 200)),
+            fts: Some((400, 500)),
+            vec_open_ranges: vec![(100, 64), (1000, 128)],
+            fts_open_ranges: vec![(400, 32)],
+            open_blob: vec![(50, vec![1, 2, 3, 4]), (9000, vec![9, 9])],
+        };
+        let seg = Arc::new(SuperfileEntry {
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 3,
+            id_min: -5,
+            id_max: 7,
+            scalar_stats: ScalarStatsTable::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: Some(off.clone()),
+        });
+        let part = fresh_part(vec![seg]);
+        let decoded = decode(&encode(&part, 3)).expect("decode");
+        let got = decoded.superfiles[0]
+            .subsection_offsets
+            .as_ref()
+            .expect("offsets present");
+        assert_eq!(*got, off);
+        // Signed id range survives big-endian fixed encoding.
+        assert_eq!(decoded.superfiles[0].id_min, -5);
+        assert_eq!(decoded.superfiles[0].id_max, 7);
+    }
+
+    #[test]
+    fn subsection_offsets_absent_subsections_roundtrip() {
+        // vec / fts None, empty range lists, empty open_blob — hits
+        // the SUBSECTION_FLAG_ABSENT branches and empty-list decode.
+        let id = Uuid::new_v4();
+        let off = SubsectionOffsets {
+            total_size: 1,
+            vec: None,
+            fts: None,
+            vec_open_ranges: vec![],
+            fts_open_ranges: vec![],
+            open_blob: vec![],
+        };
+        let seg = Arc::new(SuperfileEntry {
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 0,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: ScalarStatsTable::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: Some(off.clone()),
+        });
+        let part = fresh_part(vec![seg]);
+        let decoded = decode(&encode(&part, 3)).expect("decode");
+        assert_eq!(
+            *decoded.superfiles[0]
+                .subsection_offsets
+                .as_ref()
+                .expect("offsets"),
+            off
+        );
+    }
+
+    #[test]
+    fn encode_decode_subsection_offsets_helpers_directly() {
+        // Exercise the free encode/decode helpers without going
+        // through the whole part, covering the current-version path.
+        let off = SubsectionOffsets {
+            total_size: 123,
+            vec: Some((1, 2)),
+            fts: None,
+            vec_open_ranges: vec![(1, 2), (3, 4)],
+            fts_open_ranges: vec![],
+            open_blob: vec![(7, vec![0xde, 0xad])],
+        };
+        let bytes = encode_subsection_offsets(&off);
+        // First byte is the current version tag.
+        assert_eq!(bytes[0], SUBSECTION_OFFSETS_VERSION_CURRENT);
+        let decoded = decode_subsection_offsets(&bytes).expect("decode helper");
+        assert_eq!(decoded, off);
+    }
+
+    #[test]
+    fn decode_subsection_offsets_rejects_unknown_version() {
+        let mut bytes = encode_subsection_offsets(&SubsectionOffsets {
+            total_size: 0,
+            vec: None,
+            fts: None,
+            vec_open_ranges: vec![],
+            fts_open_ranges: vec![],
+            open_blob: vec![],
+        });
+        bytes[0] = 99; // not LEGACY (2) nor CURRENT (3)
+        let err = decode_subsection_offsets(&bytes).expect_err("unknown version");
+        assert!(matches!(err, PartParseError::SchemaMismatch(_)));
+    }
+
+    #[test]
+    fn decode_subsection_offsets_rejects_truncated_buffer() {
+        let bytes = encode_subsection_offsets(&SubsectionOffsets {
+            total_size: 42,
+            vec: Some((1, 2)),
+            fts: None,
+            vec_open_ranges: vec![],
+            fts_open_ranges: vec![],
+            open_blob: vec![],
+        });
+        // Lop off the tail so a length-prefixed read runs past the end.
+        let err = decode_subsection_offsets(&bytes[..3]).expect_err("truncated");
+        assert!(matches!(err, PartParseError::SchemaMismatch(_)));
+    }
+
+    #[test]
+    fn decode_subsection_offsets_rejects_trailing_bytes() {
+        let mut bytes = encode_subsection_offsets(&SubsectionOffsets {
+            total_size: 5,
+            vec: None,
+            fts: None,
+            vec_open_ranges: vec![],
+            fts_open_ranges: vec![],
+            open_blob: vec![],
+        });
+        bytes.push(0xaa); // extra byte after a complete encoding
+        let err = decode_subsection_offsets(&bytes).expect_err("trailing");
+        assert!(matches!(err, PartParseError::SchemaMismatch(_)));
+    }
+
+    #[test]
+    fn legacy_version_two_offsets_decode_without_open_blob() {
+        // Hand-build a version-2 blob (no open-batch blob suffix):
+        // ver, total_size(u64), vec absent, fts absent, two empty
+        // range lists. The decoder must accept it and default
+        // open_blob to empty.
+        let mut bytes = Vec::new();
+        bytes.push(SUBSECTION_OFFSETS_VERSION_LEGACY);
+        bytes.extend_from_slice(&777u64.to_le_bytes());
+        bytes.push(SUBSECTION_FLAG_ABSENT);
+        bytes.push(SUBSECTION_FLAG_ABSENT);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // vec_open_ranges count
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // fts_open_ranges count
+        let decoded = decode_subsection_offsets(&bytes).expect("legacy decode");
+        assert_eq!(decoded.total_size, 777);
+        assert!(decoded.open_blob.is_empty());
+        assert!(decoded.vec.is_none());
+        assert!(decoded.fts.is_none());
+    }
+
+    #[test]
+    fn check_major_accepts_one_and_rejects_other_majors() {
+        assert!(check_major("1.0").is_ok());
+        assert!(check_major("1.42").is_ok());
+        assert!(matches!(
+            check_major("2.0"),
+            Err(PartParseError::IncompatibleMajorVersion { .. })
+        ));
+        assert!(matches!(
+            check_major("0.9"),
+            Err(PartParseError::IncompatibleMajorVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn take_optional_int_handles_raw_and_union_and_null() {
+        // Raw Int (non-union) → Some.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("x".into(), AvroValue::Int(5));
+        assert_eq!(take_optional_int(&mut m, "x").expect("ok"), Some(5));
+        // Raw Null → None.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("x".into(), AvroValue::Null);
+        assert_eq!(take_optional_int(&mut m, "x").expect("ok"), None);
+        // Union(value) → Some.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert(
+            "x".into(),
+            AvroValue::Union(AVRO_UNION_VALUE_INDEX, Box::new(AvroValue::Int(9))),
+        );
+        assert_eq!(take_optional_int(&mut m, "x").expect("ok"), Some(9));
+        // Union(null) → None.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert(
+            "x".into(),
+            AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
+        );
+        assert_eq!(take_optional_int(&mut m, "x").expect("ok"), None);
+        // Wrong type → error.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("x".into(), AvroValue::String("nope".into()));
+        assert!(matches!(
+            take_optional_int(&mut m, "x"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+        // Missing key → error.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        assert!(matches!(
+            take_optional_int(&mut m, "x"),
+            Err(PartParseError::MissingField(_))
+        ));
+    }
+
+    #[test]
+    fn take_optional_bytes_missing_key_defaults_to_none() {
+        // Missing key is backward-compatible None (not an error).
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        assert_eq!(take_optional_bytes(&mut m, "x").expect("ok"), None);
+        // Raw bytes → Some.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("x".into(), AvroValue::Bytes(vec![1, 2, 3]));
+        assert_eq!(
+            take_optional_bytes(&mut m, "x").expect("ok"),
+            Some(vec![1, 2, 3])
+        );
+        // Wrong inner type → error.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("x".into(), AvroValue::Int(1));
+        assert!(matches!(
+            take_optional_bytes(&mut m, "x"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+    }
+
+    #[test]
+    fn take_helpers_surface_typed_errors_on_wrong_or_missing_fields() {
+        // take_string: wrong type + missing.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("s".into(), AvroValue::Long(1));
+        assert!(matches!(
+            take_string(&mut m, "s"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        assert!(matches!(
+            take_string(&mut m, "s"),
+            Err(PartParseError::MissingField(_))
+        ));
+        // take_long: wrong type.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("n".into(), AvroValue::String("x".into()));
+        assert!(matches!(
+            take_long(&mut m, "n"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+        // take_bytes: wrong type.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("b".into(), AvroValue::Long(1));
+        assert!(matches!(
+            take_bytes(&mut m, "b"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+        // take_i128_be: wrong type + wrong fixed width.
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("id".into(), AvroValue::Long(1));
+        assert!(matches!(
+            take_i128_be(&mut m, "id"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert("id".into(), AvroValue::Fixed(8, vec![0u8; 8]));
+        assert!(matches!(
+            take_i128_be(&mut m, "id"),
+            Err(PartParseError::WrongFieldType(_))
+        ));
+    }
+
+    #[test]
+    fn take_i128_be_roundtrips_a_full_width_value() {
+        // 16-byte big-endian fixed → i128, including a negative.
+        let v: i128 = -123_456_789_012_345;
+        let mut m: HashMap<String, AvroValue> = HashMap::new();
+        m.insert(
+            "id".into(),
+            AvroValue::Fixed(ID_COLUMN_FIXED_BYTES, v.to_be_bytes().to_vec()),
+        );
+        assert_eq!(take_i128_be(&mut m, "id").expect("ok"), v);
+    }
 }

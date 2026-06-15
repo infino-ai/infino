@@ -618,4 +618,78 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn bm25_search_prefix_tvf_arity_error() {
+        let st = demo_corpus();
+        // prefix wants exactly 3 args; 2 → planning error.
+        assert!(
+            st.reader()
+                .query_sql("SELECT title FROM bm25_search_prefix('title', 'rus')")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bm25_search_tvf_bad_arg_types_error() {
+        let st = demo_corpus();
+        // Non-integer k.
+        assert!(
+            st.reader()
+                .query_sql("SELECT title FROM bm25_search('title', 'rust', 'ten')")
+                .is_err(),
+            "non-integer k must error"
+        );
+        // Invalid mode literal.
+        assert!(
+            st.reader()
+                .query_sql("SELECT title FROM bm25_search('title', 'rust', 10, 'nand')")
+                .is_err(),
+            "invalid mode must error"
+        );
+    }
+
+    /// Flatten an `EXPLAIN` result into one searchable string — exercises
+    /// `Bm25Exec`'s `DisplayAs`/`describe`.
+    fn explain(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        let mut out = String::new();
+        for batch in &batches {
+            for column in batch.columns() {
+                if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..strings.len() {
+                        if !strings.is_null(i) {
+                            out.push_str(strings.value(i));
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bm25_exec_display_describes_search_and_prefix_branches() {
+        let st = demo_corpus();
+        let terms = explain(
+            &st,
+            "SELECT _id FROM bm25_search('title', 'rust', 10, 'and')",
+        );
+        assert!(
+            terms.contains("Bm25Exec") && terms.contains("kind=search") && terms.contains("And"),
+            "search describe missing: {terms}"
+        );
+        let prefix = explain(
+            &st,
+            "SELECT _id FROM bm25_search_prefix('title', 'rus', 10)",
+        );
+        assert!(
+            prefix.contains("Bm25Exec") && prefix.contains("kind=prefix"),
+            "prefix describe missing: {prefix}"
+        );
+    }
 }

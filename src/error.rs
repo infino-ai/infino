@@ -137,7 +137,10 @@ mod tests {
 
     #[test]
     fn display_messages_are_prefixed() {
-        assert_eq!(InfinoError::NotFound("t".into()).to_string(), "not found: t");
+        assert_eq!(
+            InfinoError::NotFound("t".into()).to_string(),
+            "not found: t"
+        );
         assert_eq!(
             InfinoError::AlreadyExists("t".into()).to_string(),
             "already exists: t"

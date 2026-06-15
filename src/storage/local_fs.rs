@@ -535,7 +535,9 @@ mod tests {
     async fn list_with_prefix_returns_matching_keys() {
         let (_dir, p) = provider();
         for key in ["seg/a.parquet", "seg/b.parquet", "other/c.parquet"] {
-            p.put_atomic(key, Bytes::from_static(b"x")).await.expect("put");
+            p.put_atomic(key, Bytes::from_static(b"x"))
+                .await
+                .expect("put");
         }
         let mut under_seg = p.list_with_prefix("seg").await.expect("list");
         under_seg.sort();
@@ -544,7 +546,10 @@ mod tests {
         let all = p.list_with_prefix("").await.expect("list all");
         assert_eq!(all.len(), 3);
 
-        let none = p.list_with_prefix("does-not-exist").await.expect("list empty");
+        let none = p
+            .list_with_prefix("does-not-exist")
+            .await
+            .expect("list empty");
         assert!(none.is_empty());
     }
 

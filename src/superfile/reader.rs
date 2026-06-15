@@ -1686,4 +1686,336 @@ mod tests {
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&1));
     }
+
+    // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn open_with_verify_crc_off_succeeds() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open_with(bytes, OpenOptions { verify_crc: false })
+            .expect("open with crc off");
+        assert_eq!(r.n_docs(), 4);
+        assert!(r.fts().is_some());
+    }
+
+    #[test]
+    fn default_open_options_verifies_crc() {
+        assert!(OpenOptions::default().verify_crc);
+    }
+
+    #[test]
+    fn parquet_metadata_reports_row_count() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let meta = r.parquet_metadata();
+        let total: i64 = meta.row_groups().iter().map(|rg| rg.num_rows()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn debug_impl_reports_index_presence() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let s = format!("{r:?}");
+        assert!(s.contains("SuperfileReader"));
+        assert!(s.contains("has_fts: true"));
+        assert!(s.contains("has_vec: false"));
+    }
+
+    #[test]
+    fn byte_source_over_eager_bytes_serves_ranges() {
+        let bytes = build_simple_fts_only_superfile();
+        let total_len = bytes.len() as u64;
+        let r = SuperfileReader::open(bytes).expect("open");
+        let src = r.byte_source();
+        assert_eq!(src.size(), total_len);
+    }
+
+    #[test]
+    fn get_record_batch_returns_all_rows() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let batch = r.get_record_batch(None).expect("get_record_batch");
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn get_record_batch_honors_tombstones() {
+        use roaring::RoaringBitmap;
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert(0);
+        deleted.insert(2);
+        let batch = r
+            .get_record_batch(Some(Arc::new(deleted)))
+            .expect("get_record_batch with tombstones");
+        // 4 docs, 2 deleted ⇒ 2 live rows survive.
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn bm25_search_pretokenized_matches_hits_path() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .bm25_search_pretokenized("title", &["rust"], 5, BoolMode::Or)
+            .await
+            .expect("pretokenized search");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn bm25_search_pretokenized_with_floor_prunes() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .bm25_search_pretokenized_with_floor("title", &["rust"], 5, BoolMode::Or, 1e9)
+            .await
+            .expect("floored search");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bm25_hits_async_honors_negation() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        // doc 0 "rust async runtime", doc 2 "rust embedded system":
+        // "rust -embedded" keeps doc 0, drops doc 2.
+        let hits = r
+            .bm25_hits_async("title", "rust -embedded", 5, BoolMode::Or)
+            .await
+            .expect("negated search");
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0));
+        assert!(!ids.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn token_match_intersects_and_unions() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        // "rust" in docs 0,2; "runtime" in doc 0 only.
+        let and = r
+            .token_match("title", &["rust", "runtime"], BoolMode::And)
+            .await
+            .expect("and");
+        assert_eq!(and, vec![0]);
+        let or = r
+            .token_match("title", &["rust", "runtime"], BoolMode::Or)
+            .await
+            .expect("or");
+        assert_eq!(or, vec![0, 2]);
+    }
+
+    #[tokio::test]
+    async fn term_df_counts_documents() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        assert_eq!(r.term_df("title", "rust").await.expect("df"), 2);
+        assert_eq!(r.term_df("title", "absent").await.expect("df"), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_match_verifies_raw_string_equality() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        // A token subset ("rust") prunes candidates but only the exact
+        // stored string matches.
+        let hits = r
+            .exact_match("title", "rust async runtime")
+            .await
+            .expect("exact_match");
+        assert_eq!(hits, vec![0]);
+        // No row stores just "rust", so the exact comparison yields none.
+        let none = r.exact_match("title", "rust").await.expect("exact_match");
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bm25_search_prefix_expands_terms() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
+        let hits = r
+            .bm25_search_prefix("title", "ru", 5)
+            .await
+            .expect("prefix search");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&2));
+        // No indexed term begins with "zz".
+        assert!(
+            r.bm25_search_prefix("title", "zz", 5)
+                .await
+                .expect("prefix")
+                .is_empty()
+        );
+        // k == 0 short-circuits.
+        assert!(
+            r.bm25_search_prefix("title", "ru", 0)
+                .await
+                .expect("zero k")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bm25_search_or_range_restricts_window() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        // docs 0,2 contain "rust"/"embedded"; restrict to [0,2) ⇒ doc 0 only.
+        let hits = r
+            .bm25_search_or_range_pretokenized("title", &["rust", "embedded"], 10, 0, 2)
+            .await
+            .expect("ranged search");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0));
+        assert!(!ids.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn bm25_search_or_range_with_floor_prunes() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .bm25_search_or_range_pretokenized_with_floor(
+                "title",
+                &["rust", "embedded"],
+                10,
+                0,
+                4,
+                1e9,
+            )
+            .await
+            .expect("floored ranged search");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bm25_search_prefix_range_restricts_window() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        // "ru" expands to "rust" (docs 0,2); restrict to [0,2) ⇒ doc 0.
+        let hits = r
+            .bm25_search_prefix_range("title", "ru", 10, 0, 2)
+            .await
+            .expect("prefix range");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0));
+        assert!(!ids.contains(&2));
+        // Degenerate range / k short-circuits.
+        assert!(
+            r.bm25_search_prefix_range("title", "ru", 0, 0, 2)
+                .await
+                .expect("zero k")
+                .is_empty()
+        );
+        assert!(
+            r.bm25_search_prefix_range("title", "ru", 10, 2, 2)
+                .await
+                .expect("empty range")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_clusters_probes_explicit_clusters() {
+        let bytes = build_vector_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let mut q = vec![0.0f32; 16];
+        q[2] = 1.0;
+        q[5] = 0.5;
+        normalize(&mut q);
+        // Probe all 4 clusters explicitly; doc 2 (the query's own vector)
+        // must be reachable.
+        let hits = r
+            .vector_search_clusters("emb", &q, 4, &[0, 1, 2, 3], VectorSearchOptions::default())
+            .await
+            .expect("cluster search");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn vector_search_errors_when_no_vector_index() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let err = r
+            .vector_hits_async("emb", &[0.0f32; 16], 1, VectorSearchOptions::default())
+            .await
+            .expect_err("expected error");
+        assert!(matches!(err, ReadError::MissingKv(_)));
+    }
+
+    #[tokio::test]
+    async fn open_lazy_round_trips_search_and_blocks_eager_only_paths() {
+        // Wrap the whole superfile in a lazy source so the lazy open path
+        // runs; eager-only methods must then report LazyReaderUnsupported.
+        let bytes = build_simple_fts_only_superfile();
+        let src: Arc<dyn crate::superfile::LazyByteSource> =
+            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes));
+        let r = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+        assert_eq!(r.n_docs(), 4);
+        // parquet_bytes is None on the lazy path.
+        assert!(r.parquet_bytes().is_none());
+        // FTS search still works (its source travels with the inner reader).
+        let hits = r
+            .bm25_hits_async("title", "rust", 5, BoolMode::Or)
+            .await
+            .expect("lazy search");
+        assert!(!hits.is_empty());
+        // Eager-only row materialization is rejected.
+        let err = r
+            .take_by_local_doc_ids(&[0], &["doc_id"])
+            .expect_err("lazy take rejected");
+        assert!(matches!(err, ReadError::LazyReaderUnsupported));
+        let err = r.get_record_batch(None).expect_err("lazy batch rejected");
+        assert!(matches!(err, ReadError::LazyReaderUnsupported));
+        // byte_source returns the underlying lazy source (non-empty).
+        assert!(r.byte_source().size() > 0);
+    }
+
+    #[test]
+    fn slice_or_err_rejects_out_of_range() {
+        let bytes = Bytes::from(vec![0u8; 32]);
+        let err = slice_or_err(&bytes, 16, 64, "vector").expect_err("out of range");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+        // In-range slice succeeds and is zero-copy length-correct.
+        let ok = slice_or_err(&bytes, 8, 8, "vector").expect("in range");
+        assert_eq!(ok.len(), 8);
+    }
+
+    #[test]
+    fn helper_present_predicates() {
+        use crate::superfile::format::footer::KvMap;
+        let mut map = KvMap::new();
+        map.insert("a".to_string(), "1".to_string());
+        assert!(all_present(&map, &["a"]));
+        assert!(!all_present(&map, &["a", "b"]));
+        assert!(any_present(&map, &["a", "b"]));
+        assert!(!any_present(&map, &["x", "y"]));
+        // parse_u64 round-trips a numeric value and errors on garbage.
+        map.insert("n".to_string(), "42".to_string());
+        assert_eq!(parse_u64(&map, "n").expect("parse"), 42);
+        map.insert("bad".to_string(), "notnum".to_string());
+        assert!(matches!(
+            parse_u64(&map, "bad").expect_err("not a u64"),
+            ReadError::MalformedKv(_)
+        ));
+        assert!(matches!(
+            parse_u64(&map, "absent").expect_err("missing"),
+            ReadError::MissingKv(_)
+        ));
+    }
+
+    #[test]
+    fn fts_bool_mode_reexport_is_bool_mode() {
+        // The crate re-exports BoolMode as FtsBoolMode for convenience.
+        let m: FtsBoolMode = FtsBoolMode::And;
+        assert_eq!(m, BoolMode::And);
+    }
 }

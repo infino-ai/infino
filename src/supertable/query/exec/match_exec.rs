@@ -378,7 +378,7 @@ impl ExecutionPlan for MatchExec {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_array::{Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::superfile::builder::FtsConfig;
@@ -522,5 +522,65 @@ mod tests {
             .exact_match("title", "go routines")
             .expect("exact_match");
         assert_eq!(exact.len(), 1);
+    }
+
+    /// Flatten an `EXPLAIN` result into one searchable string — exercises
+    /// `MatchExec`'s `DisplayAs`/`describe`.
+    fn explain(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        let mut out = String::new();
+        for batch in &batches {
+            for column in batch.columns() {
+                if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..strings.len() {
+                        if !strings.is_null(i) {
+                            out.push_str(strings.value(i));
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn match_exec_display_describes_token_and_exact_branches() {
+        let st = demo();
+        let token = explain(&st, "SELECT _id FROM token_match('title', 'rust', 'and')");
+        assert!(
+            token.contains("MatchExec") && token.contains("kind=token") && token.contains("And"),
+            "token describe missing: {token}"
+        );
+        let exact = explain(
+            &st,
+            "SELECT _id FROM exact_match('title', 'rust async runtime')",
+        );
+        assert!(
+            exact.contains("MatchExec") && exact.contains("kind=exact"),
+            "exact describe missing: {exact}"
+        );
+    }
+
+    #[test]
+    fn match_tvf_bad_arg_types_error() {
+        let st = demo();
+        // Non-string column literal.
+        assert!(
+            st.reader()
+                .query_sql("SELECT _id FROM token_match(5, 'rust')")
+                .is_err(),
+            "non-string column must error"
+        );
+        // Bad mode value (third arg).
+        assert!(
+            st.reader()
+                .query_sql("SELECT _id FROM token_match('title', 'rust', 'xor')")
+                .is_err(),
+            "invalid bool mode must error"
+        );
     }
 }

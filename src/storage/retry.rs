@@ -191,7 +191,9 @@ mod tests {
     fn is_retryable_only_for_transient() {
         assert!(is_retryable(&transient()));
         assert!(!is_retryable(&not_found()));
-        assert!(!is_retryable(&StorageError::PreconditionFailed { uri: "u".into() }));
+        assert!(!is_retryable(&StorageError::PreconditionFailed {
+            uri: "u".into()
+        }));
     }
 
     #[test]
@@ -219,13 +221,7 @@ mod tests {
         let r: Result<u8, StorageError> = with_reissue(|| {
             let c = calls.get();
             calls.set(c + 1);
-            async move {
-                if c < 2 {
-                    Err(transient())
-                } else {
-                    Ok(7u8)
-                }
-            }
+            async move { if c < 2 { Err(transient()) } else { Ok(7u8) } }
         })
         .await;
         assert_eq!(r.unwrap(), 7);
