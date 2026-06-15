@@ -1,5 +1,8 @@
 # infino
 
+[![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **Infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Point it at a bucket on S3 (or Azure, or local disk) and query the same rows three ways from one system — no separate search cluster, vector database, and warehouse to provision and keep in sync, and no daemon or managed service to operate.
 
 The format is what makes this work: **every file is a valid Apache Parquet file with BM25 and vector indexes spliced in.** The same files read as plain Parquet through the Arrow ecosystem —
@@ -15,106 +18,172 @@ and as a search index through infino's own reader, so your data stays open and p
 - **Object-storage-native** — your data lives on S3, Azure, or local disk, with snapshot-isolated reads and append / update / delete through atomic commits. No cluster to stand up.
 - **Open, no lock-in** — superfiles are spec-compliant Parquet, so anything that reads Parquet can read your data.
 
-## Links
+## Contents
 
-- **[Superfile architecture →](docs/architecture/superfile.md)** —
-  the single-file superfile format: a valid Parquet file with embedded
-  full-text and vector indexes. Covers the layout, Parquet
-  compatibility, and the full-text and vector index design.
-- **[Supertable architecture →](docs/architecture/supertable.md)** —
-  the table layer over superfile superfiles: manifest snapshots, the
-  commit/publish path, pluggable storage, query fan-out with
-  manifest-only skip pruning, and reader/writer concurrency.
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Architecture](#architecture)
+- [SQL joins across tables](#sql-joins-across-tables)
+- [Hybrid search](#hybrid-search)
+- [Stability](#stability)
+- [Development](#development)
+- [Performance](#performance)
+- [Tests](#tests)
 
-## Quick example in Python
+## Install
 
-```python
-import infino
-import pyarrow as pa
+**Python**
 
-db = infino.connect("memory://")              # or "./data", "s3://bucket/prefix"
-schema = pa.schema([("title", pa.large_utf8())])
-docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
-
-docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
-
-hits = docs.bm25_search("title", "fox", 10)         # pyarrow.Table (_id, title, score)
-rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
+```sh
+pip install infino
 ```
 
-The Python bindings (PyO3 + maturin) live in
-[`infino-python/`](infino-python/) — see its README to build and test.
-
-## Quick example in Node.js
+**Node.js**
 
 ```sh
 npm install infino
 ```
 
-```javascript
-const { connect, IndexSpec } = require("infino");
+**Rust**
 
-const db = connect("memory://");                   // or "./data", "s3://bucket/prefix"
-
-// A plain { column: type } schema — no apache-arrow needed.
-const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
-
-// append plain objects; results come back as plain records.
-docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
-
-const rows = docs.bm25Search("title", "fox", 10);        // ranked rows as records
-const hits = docs.tokenMatch("title", "fox");            // unranked matching rows (score 0)
-const sql  = db.querySql("SELECT _id, title FROM docs"); // records (or { arrow: true })
+```sh
+cargo add infino
 ```
 
-The Node.js bindings live in
-[`infino-node/`](infino-node/) — see its README to build and test. The
-API is synchronous: objects in, plain records out; `_id` comes back as a
-JavaScript `bigint`.
+or in `Cargo.toml`:
 
-## Quick example in Rust
+```toml
+[dependencies]
+infino = "0.1"
+```
 
-Open a connection, create a table with a full-text index, append rows,
-then search — by keyword or with SQL across the catalog. The backend is
-chosen by the URI scheme (`memory://`, a local path, `s3://…`, `az://…`).
+## Quickstart
 
-```rust
+A memory store for your agent: persist what it learns on object storage, then recall the most relevant pieces to ground the next model call. One table holds the text and its embedding, indexed for both keyword and vector retrieval, with SQL over the same rows — no second system to sync. The backend is chosen by the connection URI (`memory://`, a local path, `s3://…`, `az://…`).
+
+**Python**
+
+```python
+import infino
+import pyarrow as pa
+
+# Durable agent memory on object storage (or "./data", "memory://").
+db = infino.connect("s3://my-agent/memory")
+
+# A memory = text + its embedding. One table, keyword- and vector-indexed.
+schema = pa.schema([
+    pa.field("text", pa.large_utf8(), nullable=False),
+    pa.field("embedding", pa.list_(pa.float32(), 1536), nullable=False),
+])
+mem = db.create_table(
+    "memory", schema,
+    infino.IndexSpec().fts("text").vector("embedding", 1536, 256, "cosine"),
+)
+
+# Remember. embed() is your embedding model (OpenAI, Cohere, a local model, …).
+notes = ["the user prefers dark mode", "the cancel flow lives under Settings"]
+mem.append([{"text": t, "embedding": embed(t)} for t in notes])
+
+# Recall the most relevant memories for this turn → ground your LLM.
+context = mem.vector_search("embedding", embed("how do I cancel?"), 5)
+
+# Same rows, other lenses:
+#   mem.bm25_search("text", "cancel", 5)                       # keyword
+#   db.query_sql("SELECT text FROM memory")                    # SQL
+```
+
+**Node.js**
+
+```javascript
+import { connect, IndexSpec } from "infino";
+
+// Durable agent memory on object storage (or "./data", "memory://").
+const db = connect("s3://my-agent/memory");
+
+// A memory = text + its embedding; one table, keyword- and vector-indexed.
+const mem = db.createTable(
+  "memory",
+  { text: "large_utf8", embedding: { vector: 1536 } },
+  new IndexSpec().fts("text").vector("embedding", 1536, 256, "cosine"),
+);
+
+// Remember. embed() is your embedding model (OpenAI, Cohere, a local model, …).
+const notes = ["the user prefers dark mode", "the cancel flow lives under Settings"];
+mem.append(notes.map((text) => ({ text, embedding: embed(text) })));
+
+// Recall the most relevant memories for this turn → ground your LLM.
+const context = mem.vectorSearch("embedding", embed("how do I cancel?"), 5);
+
+// Same rows, other lenses: mem.bm25Search("text", "cancel", 5)
+// or db.querySql("SELECT text FROM memory").
+```
+
+**Rust**
+
+```rust,no_run
 use std::sync::Arc;
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{connect, BoolMode, IndexSpec};
+use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
 
-let db = connect("memory://")?; // or "./data", "s3://bucket/prefix"
+// embed(): your embedding model (OpenAI, Cohere, a local model, …).
+fn embed(_text: &str) -> Vec<f32> { vec![0.0; 1536] }
 
-let schema = Arc::new(Schema::new(vec![Field::new("title", DataType::LargeUtf8, false)]));
-let docs = db.create_table("docs", schema.clone(), IndexSpec::new().fts("title"))?;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// Durable agent memory on object storage (or "./data", "memory://").
+let db = connect("s3://my-agent/memory")?;
 
-// One `append` == one commit == one sealed, immutable superfile.
-let batch = RecordBatch::try_new(
-    schema,
-    vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))],
+// A memory = text + its embedding; one table, keyword- and vector-indexed.
+let item = Arc::new(Field::new("item", DataType::Float32, true));
+let schema = Arc::new(Schema::new(vec![
+    Field::new("text", DataType::LargeUtf8, false),
+    Field::new("embedding", DataType::FixedSizeList(item.clone(), 1536), false),
+]));
+let mem = db.create_table(
+    "memory",
+    schema.clone(),
+    IndexSpec::new().fts("text").vector("embedding", 1536, 256, Metric::Cosine),
 )?;
-docs.append(&batch)?;
 
-// Keyword search (BM25): Arrow rows carrying the auto-injected `_id`,
-// the projected columns, and a trailing `score`. Only the projected
-// scalar columns are decoded; project just `_id` + `score` (or pass
-// `None` for the whole row) to control the decode cost.
-let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
-assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+// Remember.
+let notes = ["the user prefers dark mode", "the cancel flow lives under Settings"];
+let flat: Vec<f32> = notes.iter().flat_map(|&t| embed(t)).collect();
+let embeddings = FixedSizeListArray::new(item, 1536, Arc::new(Float32Array::from(flat)), None);
+mem.append(&RecordBatch::try_new(
+    schema,
+    vec![Arc::new(LargeStringArray::from(notes.to_vec())), Arc::new(embeddings)],
+)?)?;
 
-// SQL across the catalog — every superfile is also a valid Parquet file.
-let rows = db.query_sql("SELECT _id, title FROM docs")?;
-assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-# Ok::<(), Box<dyn std::error::Error>>(())
+// Recall the most relevant memories for this turn → ground your LLM.
+let context =
+    mem.vector_search("embedding", &embed("how do I cancel?"), 5, VectorSearchOptions::new(), None)?;
+# let _ = context;
+# Ok(())
+# }
 ```
 
-Vector search is the same shape: declare a vector column with
-`IndexSpec::new().vector("embedding", 384, 256, infino::Metric::Cosine)`
-and call `vector_search`. SQL-native search — the `bm25_search` /
-`vector_search` / `hybrid_search` table functions — composes with joins
-and aggregations across catalog tables.
+Bindings live in [`infino-python/`](infino-python/) (PyO3 + maturin) and
+[`infino-node/`](infino-node/); see their READMEs to build from source.
+The Node API is synchronous — objects in, plain records out, with `_id`
+returned as a JavaScript `bigint`.
+
+## Architecture
+
+Three docs cover the design, from the high-level tour down to the
+on-disk bytes:
+
+- **[Overview →](docs/architecture/overview.md)** — the plain-language
+  tour: what infino is, the mental model, and how it compares to other
+  systems.
+- **[Superfile format →](docs/architecture/superfile.md)** — the
+  single-file superfile format: a valid Parquet file with embedded
+  full-text and vector indexes. Covers the layout, Parquet
+  compatibility, and the full-text and vector index design.
+- **[Supertable layer →](docs/architecture/supertable.md)** — the table
+  layer over many superfiles: manifest snapshots, the commit/publish
+  path, pluggable storage, query fan-out with manifest-only skip
+  pruning, and reader/writer concurrency.
 
 ## SQL joins across tables
 
