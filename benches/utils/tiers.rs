@@ -464,7 +464,7 @@ pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
 const EXISTING_SUPERTABLE_PREFIX_ENV: &str = "INFINO_BENCH_EXISTING_PREFIX";
 
 /// The configured existing-supertable prefix, if any (non-empty).
-pub fn existing_supertable_prefix() -> Option<String> {
+fn existing_supertable_prefix() -> Option<String> {
     std::env::var(EXISTING_SUPERTABLE_PREFIX_ENV)
         .ok()
         .filter(|s| !s.is_empty())
@@ -474,7 +474,7 @@ pub fn existing_supertable_prefix() -> Option<String> {
 /// `INFINO_BENCH_EXISTING_PREFIX`. `None` when the env is unset. No unique
 /// suffix and no cleanup — the data persists across runs. Real backend only,
 /// same guard as [`supertable_storage_fixture`].
-pub async fn existing_supertable_storage_fixture() -> Option<StorageFixture> {
+pub(crate) async fn existing_supertable_storage_fixture() -> Option<StorageFixture> {
     let prefix = existing_supertable_prefix()?;
     let backend = match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
         Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
