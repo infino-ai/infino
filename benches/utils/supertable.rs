@@ -838,7 +838,9 @@ pub mod vector {
         } else {
             build_measured(
                 Modality::Vector,
-                corpus.as_ref().expect("non-existing path prepared a corpus"),
+                corpus
+                    .as_ref()
+                    .expect("non-existing path prepared a corpus"),
                 phases,
             )
         };

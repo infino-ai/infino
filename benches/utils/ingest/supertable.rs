@@ -484,7 +484,8 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
 pub fn open_existing(modality: Modality, fixture: tiers::StorageFixture) -> IngestResult {
     let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&fixture.storage));
     let opts = options_for(modality, Some(Arc::clone(&fixture.storage))).with_disk_cache(cache);
-    let st = Supertable::open(opts).expect("open existing supertable at INFINO_BENCH_EXISTING_PREFIX");
+    let st =
+        Supertable::open(opts).expect("open existing supertable at INFINO_BENCH_EXISTING_PREFIX");
     let reader = st.reader();
     let n_superfiles = reader.n_superfiles();
     let total_index_bytes: u64 = reader
