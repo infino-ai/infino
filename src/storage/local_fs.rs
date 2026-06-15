@@ -530,4 +530,39 @@ mod tests {
             .expect("multipart handle");
         upload.abort().await.expect("abort");
     }
+
+    #[tokio::test]
+    async fn list_with_prefix_returns_matching_keys() {
+        let (_dir, p) = provider();
+        for key in ["seg/a.parquet", "seg/b.parquet", "other/c.parquet"] {
+            p.put_atomic(key, Bytes::from_static(b"x")).await.expect("put");
+        }
+        let mut under_seg = p.list_with_prefix("seg").await.expect("list");
+        under_seg.sort();
+        assert_eq!(under_seg, vec!["seg/a.parquet", "seg/b.parquet"]);
+
+        let all = p.list_with_prefix("").await.expect("list all");
+        assert_eq!(all.len(), 3);
+
+        let none = p.list_with_prefix("does-not-exist").await.expect("list empty");
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_store_handle_exposes_store_and_key() {
+        let (_dir, p) = provider();
+        let (_store, path) = p
+            .object_store_handle("seg/x.parquet")
+            .expect("handle for valid uri");
+        assert_eq!(path.to_string(), "seg/x.parquet");
+    }
+
+    #[test]
+    fn new_records_root_and_creates_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("nested/created/here");
+        let p = LocalFsStorageProvider::new(&root).expect("provider creates root");
+        assert_eq!(p.root(), &root);
+        assert!(root.is_dir());
+    }
 }
