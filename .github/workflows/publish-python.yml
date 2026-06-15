@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 0.1.0, 0.1.0rc1)"
+        description: "Release version, SemVer (e.g. 0.1.0, 0.1.0-rc.1)"
         required: true
         type: string
       target:
@@ -47,14 +47,14 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      # Reject a malformed version up front, before the build matrix spins up.
-      # Accepts SemVer with an optional PEP 440 / SemVer suffix: 0.1.0,
-      # 0.1.0rc1, 0.1.0-alpha.1, 0.1.0.post2.
+      # Reject a non-SemVer version before the matrix spins up: Cargo's
+      # `version` requires SemVer (it rejects PEP 440 like `0.1.0rc1`), and
+      # maturin renders SemVer to the wheel's PEP 440 (`0.1.0-rc.1` → `0.1.0rc1`).
       - id: check
         run: |
           version="${{ inputs.version }}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+|[A-Za-z][0-9A-Za-z.+-]*)?$ ]]; then
-            echo "::error::invalid release version: $version"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::invalid release version (must be SemVer): $version"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -76,14 +76,14 @@ jobs:
           - { os: macos-15-intel,   target: x86_64-apple-darwin }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The core dep graph (datafusion + its sub-crates, parquet, arrow) plus
       # the build target dir overflows the ~14 GB free on a stock Linux runner;
       # reclaim ~30 GB before compiling.
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: false
           android: true
@@ -93,7 +93,7 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -173,7 +173,7 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Validate distributions
