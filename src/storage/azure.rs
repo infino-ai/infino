@@ -454,4 +454,59 @@ mod tests {
         let s = format!("{p:?}");
         assert!(s.contains("AzureStorageProvider"));
     }
+
+    // ---- pure helpers: prefix / key ------------------------------------
+    //
+    // The Azure round-trip paths (head / get / get_range / put_atomic /
+    // put_if_match / delete / list_with_prefix / tail) are exercised
+    // end-to-end against the Azurite emulator in the gated
+    // `supertable_smoke_via_azure_wire_protocol` integration test. Azurite
+    // is an out-of-process Docker emulator (no in-process server crate
+    // exists the way `s3s-fs` does for S3), so it cannot be stood up from
+    // a `#[cfg(test)]` unit test here; these unit tests therefore cover the
+    // pure, server-free surface (constructors, `translate`, path/key
+    // building) directly.
+
+    #[test]
+    fn normalize_prefix_trims_surrounding_slashes() {
+        assert_eq!(normalize_prefix("/tbl/"), "tbl");
+        assert_eq!(normalize_prefix("///a/b///"), "a/b");
+        assert_eq!(normalize_prefix("plain"), "plain");
+        assert_eq!(normalize_prefix(""), "");
+    }
+
+    #[test]
+    fn key_without_prefix_strips_leading_slash() {
+        let p = test_provider();
+        assert_eq!(p.prefix(), "");
+        assert_eq!(p.key("/foo/bar"), "foo/bar");
+        assert_eq!(p.key("foo/bar"), "foo/bar");
+    }
+
+    #[test]
+    fn key_with_prefix_prepends_and_strips_leading_slash() {
+        let mut p = test_provider();
+        p.prefix = "tbl".into();
+        assert_eq!(p.prefix(), "tbl");
+        assert_eq!(p.key("data/seg-1"), "tbl/data/seg-1");
+        assert_eq!(p.key("/data/seg-1"), "tbl/data/seg-1");
+    }
+
+    #[test]
+    fn path_with_prefix_parses_under_prefix() {
+        let mut p = test_provider();
+        p.prefix = "tbl".into();
+        let parsed = p.path("data/seg-1").expect("parse");
+        assert_eq!(parsed.to_string(), "tbl/data/seg-1");
+    }
+
+    #[test]
+    fn object_store_handle_returns_path_under_prefix() {
+        let mut p = test_provider();
+        p.prefix = "tbl".into();
+        let (_, path) = p
+            .object_store_handle("data/seg-1")
+            .expect("handle for valid uri");
+        assert_eq!(path.to_string(), "tbl/data/seg-1");
+    }
 }

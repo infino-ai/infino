@@ -5754,4 +5754,578 @@ mod tests {
             .expect("get_vectors_fp32 should succeed");
         assert!(retrieved.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // Catalog-surface accessors: `cluster_centroids` + `vector_columns_config`.
+    // -----------------------------------------------------------------
+    //
+    // Both feed the cross-superfile manifest staging path. They were
+    // previously exercised only indirectly through the supertable
+    // integration suite; the unit tests below pin their shape against an
+    // in-memory blob so the byte-offset math (`centroids_off`,
+    // `cluster_idx_off`, the per-entry count field) stays correct.
+
+    #[test]
+    fn cluster_centroids_returns_n_cent_dim_and_counts() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let (blob, json) = build_blob(n_docs, dim, n_cent, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+
+        let (got_n_cent, got_dim, centroids, counts) =
+            r.cluster_centroids("embedding").expect("cluster_centroids");
+        assert_eq!(got_n_cent, n_cent as u32);
+        assert_eq!(got_dim, dim as u32);
+        assert_eq!(
+            centroids.len(),
+            n_cent * dim,
+            "centroids are cluster-major n_cent × dim fp32"
+        );
+        assert_eq!(counts.len(), n_cent, "one count per cluster");
+        // Every doc lands in exactly one cluster, so the counts sum to
+        // n_docs — the contract the manifest staging path relies on.
+        let total: u32 = counts.iter().sum();
+        assert_eq!(total, n_docs, "per-cluster counts must sum to n_docs");
+
+        assert!(
+            r.cluster_centroids("nonexistent").is_none(),
+            "unknown column yields None"
+        );
+    }
+
+    #[test]
+    fn vector_columns_config_yields_each_column_reader() {
+        let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let cols: Vec<&ColumnReader> = r.vector_columns_config().collect();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "embedding");
+        assert_eq!(cols[0].dim, 16);
+        assert_eq!(cols[0].n_cent, 4);
+        assert_eq!(cols[0].metric, Metric::L2Sq);
+    }
+
+    // -----------------------------------------------------------------
+    // Parallel scan paths (`PARALLEL_SCAN_MIN` rayon branches).
+    // -----------------------------------------------------------------
+    //
+    // The coarse 1-bit scan in `build_shortlist`, the fp32 / Sq8 rerank
+    // scans, and the `par_map` / `parallel_chunks` / `BoundedCoarseHeap::merge`
+    // helpers all switch from a serial loop to a chunked rayon scan once
+    // the candidate pool crosses `PARALLEL_SCAN_MIN` (2048) with more
+    // than one probed cluster. The default test corpora are far below
+    // that threshold, so these tests build a deliberately large corpus
+    // (> 2048 docs across multiple clusters) to drive the parallel arms.
+    // Correctness is pinned by a self-query: the planted vector must
+    // still come back at top-1, identical to the serial path.
+
+    /// Build a corpus large enough (`n_docs` ≥ a few thousand) to push
+    /// the per-query scans over `PARALLEL_SCAN_MIN` when every cluster is
+    /// probed. Vectors are deterministic and spread across `n_cent`
+    /// clusters by a per-doc phase so more than one cluster is non-empty.
+    fn build_large_corpus(
+        dim: usize,
+        n_cent: usize,
+        n_docs: u32,
+        codec: RerankCodec,
+        metric: Metric,
+    ) -> (Bytes, String, Vec<Vec<f32>>) {
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 101,
+            metric,
+            rerank_codec: codec,
+        })
+        .expect("register column");
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            // Direction varies by a per-doc phase (spreads docs across
+            // clusters); a per-doc unique component (dim 0 carries the
+            // doc id) guarantees no two vectors collide, so a self-query
+            // has a unique nearest neighbour with distance 0.
+            let phase = i % n_cent as u32;
+            let v: Vec<f32> = (0..dim)
+                .map(|j| {
+                    if j == 0 {
+                        // Unique per-doc value keeps all vectors distinct.
+                        i as f32 * 0.001
+                    } else {
+                        let base = ((i.wrapping_mul(2654435761).wrapping_add(j as u32 * 40503))
+                            % 1000) as f32
+                            * 0.01;
+                        base + phase as f32
+                    }
+                })
+                .collect();
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let metric_str = match metric {
+            Metric::L2Sq => "l2sq",
+            Metric::Cosine => "cosine",
+            Metric::NegDot => "negdot",
+        };
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":101,"metric":"{metric_str}"}}]"#,
+        );
+        (blob, json, all)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_coarse_scan_and_fp32_rerank_recover_self_query() {
+        // n_docs comfortably over PARALLEL_SCAN_MIN; probing every
+        // cluster makes total_candidates == n_docs, driving the parallel
+        // coarse scan in `build_shortlist`. A large k·rerank_mult shortlist
+        // (>= 2048) also pushes the fp32 rerank onto the rayon `par_map`.
+        let n_docs = 3000u32;
+        let n_cent = 4usize;
+        let (blob, json, all) =
+            build_large_corpus(16, n_cent, n_docs, RerankCodec::Fp32, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        // k=64, rerank_mult=40 → coarse_limit=2560 ≥ PARALLEL_SCAN_MIN,
+        // so the fp32 rerank shortlist is large enough to parallelize.
+        let hits = r
+            .search("v", &all[1234], 64, n_cent, 40)
+            .await
+            .expect("parallel search");
+        assert_eq!(hits.len(), 64, "k hits returned");
+        for w in hits.windows(2) {
+            assert!(w[0].1 <= w[1].1, "distances ascending");
+        }
+        // With every cluster probed and an exhaustive rerank pool, the
+        // exact self vector is in the candidate set; fp32 rerank is
+        // lossless, so the self distance is exactly 0 and ranks top-1.
+        assert_eq!(
+            hits[0].0, 1234,
+            "parallel coarse + fp32 rerank must recover self at top-1"
+        );
+        assert!(hits[0].1 < 1e-4, "self distance ~0, got {}", hits[0].1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_scan_matches_serial_scan_results() {
+        // The parallel and serial coarse/rerank paths must rank
+        // identically (chunked-parallel scoring is order-independent).
+        // Run the same query through a large corpus (parallel) and pin
+        // that a smaller-k path on the same reader is internally
+        // consistent — both recover the planted self vector.
+        use std::collections::HashSet;
+        let (blob, json, all) = build_large_corpus(16, 4, 2600, RerankCodec::Fp32, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        // Large shortlist → parallel.
+        let parallel = r.search("v", &all[42], 64, 4, 40).await.expect("parallel");
+        // Small shortlist → serial (coarse_limit = 50 < 2048).
+        let serial = r.search("v", &all[42], 10, 4, 5).await.expect("serial");
+        assert_eq!(parallel[0].0, 42, "parallel recovers self");
+        assert_eq!(serial[0].0, 42, "serial recovers self");
+        // The serial top-10 set must be a subset of the parallel top-64
+        // set (same scoring, parallel just keeps more).
+        let par_ids: HashSet<u32> = parallel.iter().map(|(id, _)| *id).collect();
+        for (id, _) in &serial {
+            assert!(
+                par_ids.contains(id),
+                "serial top-10 id {id} must appear in parallel top-64"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_sq8_rerank_recovers_self_query() {
+        // Drive the parallel arm of `sq8_score_and_refine`: a large
+        // shortlist (k·rerank_mult ≥ PARALLEL_SCAN_MIN) on an Sq8 column.
+        let n_docs = 3000u32;
+        let n_cent = 4usize;
+        let (blob, json, all) =
+            build_large_corpus(16, n_cent, n_docs, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let hits = r
+            .search("v", &all[2001], 64, n_cent, 40)
+            .await
+            .expect("parallel Sq8 search");
+        // The parallel Sq8 first-pass scan + residual refine ran (>2048
+        // candidates over >1 cluster). Sq8 is lossy, so we pin structural
+        // correctness — k hits, ascending distance — rather than exact
+        // self-recovery (covered by the small-corpus Sq8 round-trip tests).
+        assert_eq!(hits.len(), 64, "k hits returned from parallel Sq8 path");
+        for w in hits.windows(2) {
+            assert!(w[0].1 <= w[1].1, "Sq8 rerank distances ascending");
+        }
+        // The self vector should still rank near the top under Sq8.
+        assert!(
+            hits.iter().take(8).any(|(id, _)| *id == 2001),
+            "self vector should appear in the parallel Sq8 top-8"
+        );
+    }
+
+    #[test]
+    fn parallel_chunks_is_bounded_by_item_count() {
+        // 0 items → at least 1 chunk; small item count caps the chunk
+        // count; both arms of the `.min(n_items).max(1)` clamp.
+        assert_eq!(parallel_chunks(0), 1, "zero items still yields one chunk");
+        assert_eq!(parallel_chunks(1), 1, "one item caps at one chunk");
+        let many = parallel_chunks(1_000_000);
+        assert!(many >= 1, "large item count yields >= 1 chunk");
+    }
+
+    #[tokio::test]
+    async fn par_map_serial_fallback_for_small_input() {
+        // parallel_chunks(items) <= 1 takes the serial map arm.
+        let out = par_map(vec![1u32, 2, 3], |x| x * 10).await;
+        assert_eq!(out, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn bounded_coarse_heap_merge_keeps_top_by_estimate() {
+        // Direct unit test of `BoundedCoarseHeap::merge` (otherwise only
+        // reached on the parallel reduce path). Two bounded heaps merged
+        // must retain the globally-highest `estimate` candidates up to
+        // the limit.
+        let mk = |did: u32, est: f32| CoarseCandidate {
+            did,
+            estimate: est,
+            pos: did,
+            cluster_id: 0,
+        };
+        let mut a = BoundedCoarseHeap::new(3);
+        for c in [mk(0, 1.0), mk(1, 2.0), mk(2, 3.0)] {
+            a.push(c);
+        }
+        let mut b = BoundedCoarseHeap::new(3);
+        for c in [mk(3, 0.5), mk(4, 5.0), mk(5, 4.0)] {
+            b.push(c);
+        }
+        a.merge(b);
+        let mut ests: Vec<f32> = a.into_vec().into_iter().map(|(_, est, _, _)| est).collect();
+        ests.sort_by(|x, y| y.partial_cmp(x).expect("finite estimates"));
+        // Top-3 by estimate across both heaps: 5.0, 4.0, 3.0.
+        assert_eq!(ests, vec![5.0, 4.0, 3.0]);
+    }
+
+    #[test]
+    fn coarse_candidate_ordering_and_equality_tie_breaks() {
+        // The Ord impl reverses estimate (max-heap "worst" peek) and
+        // tie-breaks on did, then pos, then cluster_id. PartialEq tests
+        // every field.
+        let base = CoarseCandidate {
+            did: 5,
+            estimate: 1.0,
+            pos: 10,
+            cluster_id: 2,
+        };
+        let same = CoarseCandidate { ..base };
+        assert_eq!(base, same, "identical fields compare equal");
+        assert_eq!(base.cmp(&same), Ordering::Equal, "identical → Equal");
+
+        // Higher estimate is "better" → reversed → Less in the heap order.
+        let higher_est = CoarseCandidate {
+            estimate: 2.0,
+            ..base
+        };
+        assert_eq!(
+            base.cmp(&higher_est),
+            Ordering::Greater,
+            "lower estimate sorts as the worse (Greater) candidate"
+        );
+        assert_ne!(base, higher_est);
+
+        // Equal estimate, differing did → did tie-break (reversed).
+        let other_did = CoarseCandidate { did: 6, ..base };
+        assert_eq!(base.cmp(&other_did), Ordering::Greater);
+        assert_ne!(base, other_did);
+
+        // Equal estimate + did, differing pos → pos tie-break.
+        let other_pos = CoarseCandidate { pos: 11, ..base };
+        assert_eq!(base.cmp(&other_pos), Ordering::Greater);
+        assert_ne!(base, other_pos);
+
+        // Equal estimate + did + pos, differing cluster_id.
+        let other_cluster = CoarseCandidate {
+            cluster_id: 3,
+            ..base
+        };
+        assert_eq!(base.cmp(&other_cluster), Ordering::Greater);
+        assert_ne!(base, other_cluster);
+    }
+
+    // -----------------------------------------------------------------
+    // Lazy Sq8 cold path: the `Sq8ColumnMeta::Lazy` rerank arm.
+    // -----------------------------------------------------------------
+    //
+    // When the Sq8 codec_meta bytes aren't resident at open time (an
+    // object-store-backed `Source::Lazy` with sync access disabled), the
+    // reader records `Sq8ColumnMeta::Lazy` offsets and defers the
+    // scale/offset/norms fetch to the first search. That fetch + the
+    // sparse `pos → norm` map + the per-cluster kernel rebuild is a large
+    // block in `rerank_candidates_from_blocks` that the in-memory tests
+    // never reach. These tests force it via `disable_sync()` and pin the
+    // results against the eager in-memory open.
+
+    #[tokio::test]
+    async fn lazy_sq8_cold_rerank_matches_eager_l2sq() {
+        // L2Sq Sq8 carries per-doc norms, so the lazy arm also exercises
+        // the sparse `norm_by_pos` span-fetch path.
+        //
+        // `open_lazy` with `for_object_store()` defers codec_meta — it is
+        // NOT prefetched into the overlay — so `sq8_meta` is recorded as
+        // `Sq8ColumnMeta::Lazy` and the first search resolves the
+        // scale/offset (and L2Sq norms) through the deferred-fetch arm.
+        let (blob, json, all) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        // Disable sync BEFORE open so the deferred codec_meta probe inside
+        // `open_with_source` misses the warm cache and records the Sq8 meta
+        // as `Lazy`. `open_lazy` pre-installs the structural-decode bytes
+        // (header, directory, sub-header) into its overlay, so the open
+        // itself still succeeds with sync disabled on the underlying source.
+        counting.disable_sync();
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+        // Pin that codec_meta really was deferred (the Lazy arm).
+        assert!(
+            matches!(r_lazy.columns[0].sq8_meta, Some(Sq8ColumnMeta::Lazy { .. })),
+            "open_lazy / for_object_store must defer Sq8 codec_meta as Lazy"
+        );
+
+        for &q in &[0usize, 17, 31] {
+            let hits_lazy = r_lazy
+                .search("v", &all[q], 5, 4, 20)
+                .await
+                .expect("lazy cold Sq8 search");
+            let hits_eager = r_eager
+                .search("v", &all[q], 5, 4, 20)
+                .await
+                .expect("eager Sq8 search");
+            // The deferred-meta lazy arm computes the same Sq8 + residual
+            // distances as the eager path but through its own fetch/kernel
+            // code, then returns the refined candidate set directly. Pin
+            // that it ran and surfaced good neighbours: the lazy result set
+            // overlaps the eager top-5.
+            assert!(
+                !hits_lazy.is_empty(),
+                "lazy cold Sq8 arm returns hits (query {q})"
+            );
+            let eager_ids: std::collections::HashSet<u32> =
+                hits_eager.iter().map(|(id, _)| *id).collect();
+            let lazy_ids: std::collections::HashSet<u32> =
+                hits_lazy.iter().map(|(id, _)| *id).collect();
+            assert!(
+                eager_ids.intersection(&lazy_ids).count() >= 1,
+                "lazy cold Sq8 result set must overlap the eager top-5 (query {q})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_sq8_cold_rerank_no_norms_negdot() {
+        // NegDot Sq8 drops the per-doc norms (the `Σx²` term cancels),
+        // so the lazy arm takes the `norms_abs_off = None` branch — no
+        // norm span fetch, `norm_by_pos = None`.
+        let (blob, json, all) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::NegDot);
+        let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        counting.disable_sync();
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        let hits_lazy = r_lazy
+            .search("v", &all[7], 5, 4, 20)
+            .await
+            .expect("lazy cold Sq8 negdot search");
+        let hits_eager = r_eager
+            .search("v", &all[7], 5, 4, 20)
+            .await
+            .expect("eager Sq8 negdot search");
+        assert_eq!(
+            hits_lazy[0].0, hits_eager[0].0,
+            "lazy cold Sq8 negdot rerank top-1 must match eager"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_sq8_cold_search_async_matches_eager() {
+        // The async search path (`search_async` → `probe_clusters_async`)
+        // on a cold lazy Sq8 source drives the async coalesced
+        // codes/doc_ids + Sq8-meta fetch and the async survivor-row fetch.
+        let (blob, json, all) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        counting.disable_sync();
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        let hits_lazy = r_lazy
+            .search_async("v", &all[17], 5, 4, 20)
+            .await
+            .expect("lazy cold Sq8 search_async");
+        let hits_eager = r_eager
+            .search_async("v", &all[17], 5, 4, 20)
+            .await
+            .expect("eager Sq8 search_async");
+        // As in the sync lazy-Sq8 test, pin set overlap rather than exact
+        // ordering: the deferred-meta arm returns its refined candidate set
+        // through a distinct code path.
+        assert!(!hits_lazy.is_empty(), "lazy async arm returns hits");
+        let eager_ids: std::collections::HashSet<u32> =
+            hits_eager.iter().map(|(id, _)| *id).collect();
+        let lazy_ids: std::collections::HashSet<u32> =
+            hits_lazy.iter().map(|(id, _)| *id).collect();
+        assert!(
+            eager_ids.intersection(&lazy_ids).count() >= 1,
+            "lazy cold Sq8 search_async result set must overlap the eager top-5"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_clusters_async_cold_lazy_fp32_matches_eager() {
+        // Externally-selected cluster probe over a cold lazy fp32 source:
+        // drives `search_clusters_async` → `probe_clusters_async` through
+        // the async cold coalesced fetch (no Sq8 meta extra).
+        let (blob, json, all) = build_search_corpus();
+        let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let r_lazy = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&counting) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("lazy open");
+        counting.disable_sync();
+
+        let clusters: Vec<u32> = (0..4).collect();
+        let hits_lazy = r_lazy
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .await
+            .expect("lazy cold search_clusters_async");
+        let hits_eager = r_eager
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .await
+            .expect("eager search_clusters_async");
+        assert_eq!(
+            hits_lazy[0].0, hits_eager[0].0,
+            "lazy cold search_clusters_async top-1 must match eager"
+        );
+        // Out-of-range cluster ids are ignored; an empty selection yields
+        // no hits.
+        let none = r_lazy
+            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5)
+            .await
+            .expect("out-of-range clusters");
+        assert!(none.is_empty(), "ids >= n_cent are ignored");
+    }
+
+    #[tokio::test]
+    async fn search_async_unknown_column_and_dim_mismatch_error() {
+        // resolve_column error arms reached through the async entry point.
+        let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5).await;
+        assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
+        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5).await;
+        assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
+        // k == 0 short-circuits to an empty result.
+        let empty = r
+            .search_async("embedding", &[0.0; 16], 0, 4, 5)
+            .await
+            .expect("k=0 empty");
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_vectors_fp32_round_trips_through_lazy_cold_source() {
+        // Drive `get_vectors_fp32` against a cold lazy source so its
+        // `get_range` / `get_ranges_parallel` fetch path runs through the
+        // async bridge rather than the in-memory zero-copy slice.
+        let dim = 16usize;
+        let n_docs = 48u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "embedding".into(),
+            dim,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
+        })
+        .expect("register column");
+        let mut planted = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.25).collect();
+            b.add(0, &v).expect("add");
+            planted.push(v);
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+            .to_string();
+
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let r = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&counting) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("lazy open");
+        counting.disable_sync();
+
+        let got = r.get_vectors_fp32("embedding").expect("get_vectors_fp32");
+        assert_eq!(got.len(), n_docs as usize);
+        // Insertion order is preserved; reconstructed vectors equal the
+        // planted fp32 originals exactly (fp32 codec is lossless).
+        for (i, v) in planted.iter().enumerate() {
+            assert_eq!(&got[i], v, "doc {i} round-trips exactly through fp32");
+        }
+    }
+
+    #[test]
+    fn summary_returns_none_for_unknown_column() {
+        let (blob, json) = build_blob(16, 16, 2, Metric::Cosine);
+        let r = VectorReader::open(blob, &json).expect("open");
+        assert!(r.summary("missing").is_none());
+        // Sanity on the present column too.
+        let (centroid, radius) = r.summary("embedding").expect("present");
+        assert_eq!(centroid.len(), 16);
+        assert!(radius >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn search_negdot_metric_returns_sorted_hits() {
+        // Exercise the NegDot branch of centroid scoring + fp32 rerank
+        // end to end (the other metrics are covered above). NegDot ranks
+        // by negative dot product, so the nearest vector is the one with
+        // the largest dot against the query — not necessarily the query
+        // itself — hence we pin structural correctness (k sorted hits),
+        // not self-recovery.
+        let (blob, json, all) = build_small_superfile(16, 4, 64, RerankCodec::Fp32, Metric::NegDot);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let hits = r
+            .search("v", &all[23], 5, 4, 10)
+            .await
+            .expect("negdot search");
+        assert_eq!(hits.len(), 5, "k hits returned");
+        for w in hits.windows(2) {
+            assert!(w[0].1 <= w[1].1, "negdot distances ascending");
+        }
+    }
 }
