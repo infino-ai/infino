@@ -121,7 +121,11 @@ const CHUNK_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Deterministic per-chunk RNG seed: mixes the base `seed` with the chunk
 /// index so independent chunks draw disjoint, reproducible streams.
 fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
-    seed.wrapping_add((chunk_index as u64).wrapping_add(1).wrapping_mul(CHUNK_SEED_MIX))
+    seed.wrapping_add(
+        (chunk_index as u64)
+            .wrapping_add(1)
+            .wrapping_mul(CHUNK_SEED_MIX),
+    )
 }
 
 /// Vector dimension — matches modern large embedding models
