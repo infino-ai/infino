@@ -1,162 +1,317 @@
 # infino
 
-Infino stores data in a search-optimized lakehouse format. **One file = a valid Apache Parquet file plus embedded BM25 + vector indexes** — readable as Parquet by
-[DataFusion](https://datafusion.apache.org/) /
-[DuckDB](https://duckdb.org/) /
-[pyarrow](https://arrow.apache.org/docs/python/),
-and as a search index by infino's reader.
+[![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-## Links
+**Infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Point it at a bucket on S3 (or Azure, or local disk) and query the same rows three ways from one system — no separate search cluster, vector database, and warehouse to provision and keep in sync, and no daemon or managed service to operate.
 
-- **[Superfile architecture →](docs/architecture/superfile.md)** —
-  the single-file superfile format: a valid Parquet file with embedded
-  full-text and vector indexes. Covers the layout, Parquet
-  compatibility, and the full-text and vector index design.
-- **[Supertable architecture →](docs/architecture/supertable.md)** —
-  the table layer over superfile superfiles: manifest snapshots, the
-  commit/publish path, pluggable storage, query fan-out with
-  manifest-only skip pruning, and reader/writer concurrency.
+**Why infino**
 
-## Quick example in Python
+- **Best performance per dollar** — engineered for the strongest speed-per-dollar trade-off, not just raw latency: object-storage economics plus a read path continuously benchmarked on speed *and* cost (bytes fetched, request count, memory footprint).
+- **Three modalities, one engine** — keyword (BM25), vector, and SQL over the same rows; no copying data between systems to combine them.
+- **Object-storage-native** — your data lives on S3, Azure, or local disk, with snapshot-isolated reads and append / update / delete through atomic commits. No cluster to stand up.
+- **Open, no lock-in** — superfiles are spec-compliant Parquet, so anything that reads Parquet can read your data.
+
+## Contents
+
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Architecture](#architecture)
+- [SQL joins across tables](#sql-joins-across-tables)
+- [Hybrid search](#hybrid-search)
+- [Stability](#stability)
+- [Development](#development)
+- [Performance](#performance)
+- [Tests](#tests)
+
+## Install
+
+**Python**
+
+```sh
+# Install from TestPyPI.
+pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ infino
+```
+
+**Node.js**
+
+```sh
+npm install infino --registry https://npm-proxy.fury.io/infino/
+```
+
+**Rust**
+
+```sh
+cargo add infino
+```
+
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+infino = "0.1"
+```
+
+## Quickstart
+
+**Python**
 
 ```python
 import infino
 import pyarrow as pa
 
-db = infino.connect("memory://")              # or "./data", "s3://bucket/prefix"
-schema = pa.schema([("title", pa.large_utf8())])
-docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
+# A knowledge base your agent retrieves over. "memory://" is in-process;
+# use "./data" or "s3://bucket/prefix" to persist.
+db = infino.connect("memory://")
 
-docs.append([{"title": "the quick brown fox"}])     # list[dict], pandas, or pyarrow
+# Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+# one-hot by topic. Real embeddings are dense and higher-dimensional.
+def embed(topic):                       # 0 = billing, 1 = appearance
+    v = [0.0] * 16
+    v[topic] = 1.0
+    return v
 
-hits = docs.bm25_search("title", "fox", 10)         # pyarrow.Table (_id, title, score)
-rows = db.query_sql("SELECT _id, title FROM docs")  # pyarrow.Table
+schema = pa.schema([
+    pa.field("source", pa.large_utf8(), nullable=False),
+    pa.field("body", pa.large_utf8(), nullable=False),
+    pa.field("embedding", pa.list_(pa.float32(), 16), nullable=False),
+])
+docs = db.create_table(
+    "docs", schema,
+    infino.IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+)
+
+docs.append([
+    {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing.", "embedding": embed(0)},
+    {"source": "help-center", "body": "Refunds return to the original payment method.",         "embedding": embed(0)},
+    {"source": "blog",        "body": "Enable dark mode under Settings then Appearance.",        "embedding": embed(1)},
+])
+
+# Three ways to retrieve context to ground the agent's next answer:
+keyword  = docs.bm25_search("body", "cancel subscription", 5)               # BM25
+semantic = docs.vector_search("embedding", embed(0), 5)                     # vector kNN
+billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")  # SQL filter
 ```
 
-The Python bindings (PyO3 + maturin) live in
-[`infino-python/`](infino-python/) — see its README to build and test.
-
-## Quick example in Node.js
+**Node.js**
 
 ```javascript
-const { connect, IndexSpec } = require("infino");
+import { connect, IndexSpec } from "infino";
 
-const db = connect("memory://");                   // or "./data", "s3://bucket/prefix"
+// A knowledge base your agent retrieves over. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+const db = connect("memory://");
 
-// A plain { column: type } schema — no apache-arrow needed.
-const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+// Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+// one-hot by topic. Real embeddings are dense and higher-dimensional.
+const embed = (topic) => { const v = Array(16).fill(0.0); v[topic] = 1.0; return v; };
 
-// append plain objects; results come back as plain records.
-docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
+const docs = db.createTable(
+  "docs",
+  { source: "large_utf8", body: "large_utf8", embedding: { vector: 16 } },
+  new IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+);
 
-const rows = docs.bm25Search("title", "fox", 10);        // ranked rows as records
-const hits = docs.tokenMatch("title", "fox");            // unranked matching rows (score 0)
-const sql  = db.querySql("SELECT _id, title FROM docs"); // records (or { arrow: true })
+docs.append([
+  { source: "help-center", body: "To cancel a subscription, open Settings then Billing.", embedding: embed(0) },
+  { source: "help-center", body: "Refunds return to the original payment method.",         embedding: embed(0) },
+  { source: "blog",        body: "Enable dark mode under Settings then Appearance.",        embedding: embed(1) },
+]);
+
+// Three ways to retrieve context to ground the agent's next answer:
+const keyword  = docs.bm25Search("body", "cancel subscription", 5);            // BM25
+const semantic = docs.vectorSearch("embedding", embed(0), 5);                  // vector kNN
+const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'");  // SQL filter
 ```
 
-The Node.js bindings live in
-[`infino-node/`](infino-node/) — see its README to build and test. The
-API is synchronous: objects in, plain records out; `_id` comes back as a
-JavaScript `bigint`.
-
-## Quick example in Rust
-
-Open a connection, create a table with a full-text index, append rows,
-then search — by keyword or with SQL across the catalog. The backend is
-chosen by the URI scheme (`memory://`, a local path, `s3://…`, `az://…`).
+**Rust**
 
 ```rust
 use std::sync::Arc;
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{connect, BoolMode, IndexSpec};
+use infino::{connect, BoolMode, IndexSpec, Metric, VectorSearchOptions};
 
-let db = connect("memory://")?; // or "./data", "s3://bucket/prefix"
+// Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+// one-hot by topic. Real embeddings are dense and higher-dimensional.
+fn embed(topic: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 16];
+    v[topic] = 1.0;
+    v
+}
 
-let schema = Arc::new(Schema::new(vec![Field::new("title", DataType::LargeUtf8, false)]));
-let docs = db.create_table("docs", schema.clone(), IndexSpec::new().fts("title"))?;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// A knowledge base your agent retrieves over. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+let db = connect("memory://")?;
 
-// One `append` == one commit == one sealed, immutable superfile.
-let batch = RecordBatch::try_new(
-    schema,
-    vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))],
+let item = Arc::new(Field::new("item", DataType::Float32, true));
+let schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
+    Field::new("body", DataType::LargeUtf8, false),
+    Field::new("embedding", DataType::FixedSizeList(item.clone(), 16), false),
+]));
+let docs = db.create_table(
+    "docs",
+    schema.clone(),
+    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
 )?;
-docs.append(&batch)?;
 
-// Keyword search (BM25): Arrow rows carrying the auto-injected `_id`,
-// the projected columns, and a trailing `score`. Only the projected
-// scalar columns are decoded; project just `_id` + `score` (or pass
-// `None` for the whole row) to control the decode cost.
-let batches = docs.bm25_search("title", "fox", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
-assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
+docs.append(&RecordBatch::try_new(
+    schema,
+    vec![
+        Arc::new(LargeStringArray::from(vec!["help-center", "help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "To cancel a subscription, open Settings then Billing.",
+            "Refunds return to the original payment method.",
+            "Enable dark mode under Settings then Appearance.",
+        ])),
+        Arc::new(FixedSizeListArray::new(item, 16, Arc::new(Float32Array::from(flat)), None)),
+    ],
+)?)?;
 
-// SQL across the catalog — every superfile is also a valid Parquet file.
-let rows = db.query_sql("SELECT _id, title FROM docs")?;
-assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-# Ok::<(), Box<dyn std::error::Error>>(())
+// Three ways to retrieve context to ground the agent's next answer:
+let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
+let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None)?;
+let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
+assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
+assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
+assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL filter
+# Ok(())
+# }
 ```
 
-Vector search is the same shape: declare a vector column with
-`IndexSpec::new().vector("embedding", 384, 256, infino::Metric::Cosine)`
-and call `vector_search`. SQL-native search — the `bm25_search` /
-`vector_search` / `hybrid_search` table functions — composes with joins
-and aggregations across catalog tables.
+Bindings live in [`infino-python/`](infino-python/) (PyO3 + maturin) and
+[`infino-node/`](infino-node/); see their READMEs to build from source.
+The Node API is synchronous — objects in, plain records out, with `_id`
+returned as a JavaScript `bigint`.
+
+## Architecture
+
+Three docs cover the design, from the high-level tour down to the
+on-disk bytes:
+
+- **[Overview →](docs/architecture/overview.md)** — the plain-language
+  tour: what infino is, the mental model, and how it compares to other
+  systems.
+- **[Superfile format →](docs/architecture/superfile.md)** — the
+  single-file superfile format: a valid Parquet file with embedded
+  full-text and vector indexes. Covers the layout, Parquet
+  compatibility, and the full-text and vector index design.
+- **[Supertable layer →](docs/architecture/supertable.md)** — the table
+  layer over many superfiles: manifest snapshots, the commit/publish
+  path, pluggable storage, query fan-out with manifest-only skip
+  pruning, and reader/writer concurrency.
 
 ## SQL joins across tables
 
-`query_sql` resolves every table the query names through the catalog and
-registers them into one engine, so a join across two tables — or a join
-of a search result against a table — is just SQL:
+`query_sql` resolves every table the query names through the catalog into
+one engine, and the `bm25_search` / `vector_search` / `hybrid_search`
+table functions are relations too — so a single query can fuse keyword
+and vector retrieval and join the result to an ordinary table. This is
+the canonical agent retrieval, end to end: hybrid-search a knowledge
+base, fuse the two rankings (reciprocal-rank fusion), and join provenance
+— one snapshot, no client-side stitching.
 
 ```rust
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+use arrow_array::{FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{connect, IndexSpec};
+use infino::{connect, IndexSpec, Metric};
 
+// Tiny stand-in for your embedding model so this runs as-is; real
+// embeddings are dense and higher-dimensional (e.g. 1536).
+fn embed(topic: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 16];
+    v[topic] = 1.0;
+    v
+}
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let db = connect("memory://")?;
 
-// Two tables sharing an `author_id`.
-let authors_schema = Arc::new(Schema::new(vec![
-    Field::new("author_id", DataType::Int64, false),
-    Field::new("name", DataType::LargeUtf8, false),
-]));
-let authors = db.create_table("authors", authors_schema.clone(), IndexSpec::new())?;
-authors.append(&RecordBatch::try_new(
-    authors_schema,
-    vec![
-        Arc::new(Int64Array::from(vec![1])),
-        Arc::new(LargeStringArray::from(vec!["alice"])),
-    ],
-)?)?;
-
-let posts_schema = Arc::new(Schema::new(vec![
-    Field::new("author_id", DataType::Int64, false),
+// `docs`: text (BM25) + embedding (vector) + the source it came from.
+let item = Arc::new(Field::new("item", DataType::Float32, true));
+let docs_schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
     Field::new("body", DataType::LargeUtf8, false),
+    Field::new("embedding", DataType::FixedSizeList(item.clone(), 16), false),
 ]));
-let posts = db.create_table("posts", posts_schema.clone(), IndexSpec::new().fts("body"))?;
-posts.append(&RecordBatch::try_new(
-    posts_schema,
+let docs = db.create_table(
+    "docs",
+    docs_schema.clone(),
+    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+)?;
+let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
+docs.append(&RecordBatch::try_new(
+    docs_schema,
     vec![
-        Arc::new(Int64Array::from(vec![1])),
-        Arc::new(LargeStringArray::from(vec!["hello from alice"])),
+        Arc::new(LargeStringArray::from(vec!["help-center", "help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "To cancel a subscription, open Settings then Billing.",
+            "Refunds return to the original payment method.",
+            "Enable dark mode under Settings then Appearance.",
+        ])),
+        Arc::new(FixedSizeListArray::new(item, 16, Arc::new(Float32Array::from(flat)), None)),
     ],
 )?)?;
 
-// Join both tables in one query.
-let rows = db.query_sql(
-    "SELECT a.name, p.body \
-     FROM posts p JOIN authors a ON p.author_id = a.author_id",
-)?;
-assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-# Ok::<(), Box<dyn std::error::Error>>(())
+// `sources`: a plain table — where each source came from, and its trust.
+let sources_schema = Arc::new(Schema::new(vec![
+    Field::new("source", DataType::LargeUtf8, false),
+    Field::new("url", DataType::LargeUtf8, false),
+    Field::new("trust", DataType::Int64, false),
+]));
+let sources = db.create_table("sources", sources_schema.clone(), IndexSpec::new())?;
+sources.append(&RecordBatch::try_new(
+    sources_schema,
+    vec![
+        Arc::new(LargeStringArray::from(vec!["help-center", "blog"])),
+        Arc::new(LargeStringArray::from(vec![
+            "https://help.example.com",
+            "https://blog.example.com",
+        ])),
+        Arc::new(Int64Array::from(vec![2, 1])),
+    ],
+)?)?;
+
+// The agent's question, embedded like the corpus. The vector TVF takes
+// the query vector as a comma-separated string, so build the SQL with it.
+let qvec = embed(0).iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+let sql = format!(
+    "WITH lexical AS (                       -- BM25 candidates, ranked
+         SELECT _id, source, body, ROW_NUMBER() OVER (ORDER BY score DESC) AS rank
+         FROM bm25_search('docs', 'body', 'how do I cancel my subscription?', 50)
+     ),
+     semantic AS (                           -- vector candidates (nearer = lower score)
+         SELECT _id, source, body, ROW_NUMBER() OVER (ORDER BY score ASC) AS rank
+         FROM vector_search('docs', 'embedding', '{qvec}', 50)
+     )
+     SELECT s.url,
+            COALESCE(l.body, v.body) AS chunk,
+            COALESCE(1.0/(60+l.rank), 0.0) + COALESCE(1.0/(60+v.rank), 0.0) AS relevance
+     FROM lexical l
+     FULL OUTER JOIN semantic v ON l._id = v._id      -- fuse lexical + semantic
+     JOIN sources s ON s.source = COALESCE(l.source, v.source)   -- + provenance
+     WHERE s.trust >= 1
+     ORDER BY relevance DESC
+     LIMIT 5"
+);
+let context = db.query_sql(&sql)?;
+assert!(context.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
+# Ok(())
+# }
 ```
 
-A search TVF (`bm25_search('posts', 'body', 'alice', 10)`) can stand in
-for either side of the join, so keyword/vector results compose with the
-rest of the catalog the same way.
+**Making it real.** `embed()` here is a 16-dim toy so the example runs as
+written; swap in your embedding model and raise `dim` / `n_cent` to match
+(e.g. 1536 / 256). The vector TVF takes the query vector as a
+comma-separated string — that's the only reason the query is built with
+`format!`. The SQL itself is identical from Python and Node; only table
+creation and embedding differ.
 
 ## Hybrid Search
 

@@ -44,7 +44,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::runtime_bridge::bridge_sync_to_async;
-use crate::supertable::wal::WalStore;
+use crate::supertable::wal::{SealRecord, WalStore};
 
 /// Default refresh interval — 1 second. Bounds how stale the
 /// cache's view can be on a query path that didn't write its
@@ -110,11 +110,14 @@ pub struct SidecarCache {
 ///
 /// `bitmap` is `Arc`-wrapped so the cache can hand out the
 /// shared snapshot without cloning the bytes on every read.
+/// `seal` is cached to enable compaction selection to check
+/// sealed status without a storage roundtrip.
 #[derive(Debug, Clone)]
 struct CachedSidecar {
     #[allow(dead_code)]
     etag: Option<String>,
     bitmap: Arc<RoaringBitmap>,
+    seal: Option<SealRecord>,
     last_checked: Instant,
 }
 
@@ -156,8 +159,8 @@ impl SidecarCache {
     }
 
     /// Concurrently refresh every id whose cached view is missing or
-    /// stale, so a subsequent per-superfile [`Self::bitmap_for`] sweep
-    /// is all cache hits.
+    /// stale, so a subsequent per-superfile [`Self::bitmap_for`] or
+    /// [`Self::seal_for`] sweep is all cache hits.
     ///
     /// This is the hot-path entry point for a wide fan-out: it
     /// replaces N *serial* blocking storage GETs (one per superfile,
@@ -183,9 +186,9 @@ impl SidecarCache {
         });
         let results = futures::future::join_all(fetches).await;
         for (id, result) in results {
-            let (bitmap, etag) = match result {
-                Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), Some(etag)),
-                Ok(None) => (Arc::new(RoaringBitmap::new()), None),
+            let (bitmap, seal, etag) = match result {
+                Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
+                Ok(None) => (Arc::new(RoaringBitmap::new()), None, None),
                 // Leave any prior entry untouched; the serial
                 // bitmap_for fallback re-attempts and surfaces the
                 // error if this id is actually consulted.
@@ -196,10 +199,32 @@ impl SidecarCache {
                 CachedSidecar {
                     etag,
                     bitmap,
+                    seal,
                     last_checked: now,
                 },
             );
         }
+    }
+
+    /// Fetch bitmap and seal for `superfile_id` from cache or storage.
+    /// Hot path: O(1) DashMap lookup + TTL check. Cold path: sync-bridges
+    /// to the async storage GET. `now` is hoisted to the caller so a
+    /// per-query `Instant::now()` is amortized across every per-superfile
+    /// lookup in that query.
+    fn fetch_sidecar(
+        &self,
+        superfile_id: Uuid,
+        now: Instant,
+    ) -> Result<(Arc<RoaringBitmap>, Option<SealRecord>), SidecarCacheError> {
+        if !self.needs_refresh(superfile_id, now) {
+            // Hot path: cached and within the freshness window.
+            if let Some(entry) = self.inner.get(&superfile_id) {
+                return Ok((Arc::clone(&entry.bitmap), entry.seal.clone()));
+            }
+        }
+
+        // Cold path: refresh from storage.
+        self.refresh_and_return_sidecar(superfile_id)
     }
 
     /// Return the current bitmap for `superfile_id`. Hot path:
@@ -218,17 +243,29 @@ impl SidecarCache {
         superfile_id: Uuid,
         now: Instant,
     ) -> Result<Arc<RoaringBitmap>, SidecarCacheError> {
-        // Hot path: cached and within the freshness window (long
-        // for the absent/empty "no tombstones" view, short for a
-        // present sidecar).
-        if let Some(entry) = self.inner.get(&superfile_id)
-            && now.duration_since(entry.last_checked) < self.ttl_for_empty(entry.bitmap.is_empty())
-        {
-            return Ok(Arc::clone(&entry.bitmap));
-        }
+        self.fetch_sidecar(superfile_id, now)
+            .map(|(bitmap, _)| bitmap)
+    }
 
-        // Refresh from storage.
-        self.refresh(superfile_id)
+    /// Return the seal record for `superfile_id` if present. Compaction
+    /// selection uses this to check sealed status without a storage roundtrip.
+    pub fn seal_for(
+        &self,
+        superfile_id: Uuid,
+        now: Instant,
+    ) -> Result<Option<SealRecord>, SidecarCacheError> {
+        self.fetch_sidecar(superfile_id, now).map(|(_, seal)| seal)
+    }
+
+    /// Return both the bitmap and seal for `superfile_id`. Compaction
+    /// merge operations use this to fetch complete sidecar state in one
+    /// cache lookup.
+    pub fn sidecar_for(
+        &self,
+        superfile_id: Uuid,
+        now: Instant,
+    ) -> Result<(Arc<RoaringBitmap>, Option<SealRecord>), SidecarCacheError> {
+        self.fetch_sidecar(superfile_id, now)
     }
 
     /// Drop any cached entry for `superfile_id`. Called by this
@@ -259,17 +296,19 @@ impl SidecarCache {
         self.inner.is_empty()
     }
 
-    /// Refresh `superfile_id` from storage. Caches the new
-    /// bitmap + etag (or the "known 404" sentinel) and returns
-    /// the bitmap.
-    fn refresh(&self, superfile_id: Uuid) -> Result<Arc<RoaringBitmap>, SidecarCacheError> {
+    /// Refresh from storage and return both bitmap and seal.
+    /// Used by [`Self::fetch_sidecar`] to avoid redundant refresh logic.
+    fn refresh_and_return_sidecar(
+        &self,
+        superfile_id: Uuid,
+    ) -> Result<(Arc<RoaringBitmap>, Option<SealRecord>), SidecarCacheError> {
         let wal_store = self.wal_store.clone();
         let result =
             bridge_sync_to_async(async move { wal_store.get_tombstones(superfile_id).await });
 
-        let (bitmap, etag) = match result {
-            Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), Some(etag)),
-            Ok(None) => (Arc::new(RoaringBitmap::new()), None),
+        let (bitmap, seal, etag) = match result {
+            Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
+            Ok(None) => (Arc::new(RoaringBitmap::new()), None, None),
             Err(e) => {
                 return Err(SidecarCacheError::RefreshFailed {
                     superfile_id,
@@ -278,16 +317,16 @@ impl SidecarCache {
             }
         };
 
-        self.inner.insert(
-            superfile_id,
-            CachedSidecar {
-                etag,
-                bitmap: Arc::clone(&bitmap),
-                last_checked: Instant::now(),
-            },
-        );
+        let entry = CachedSidecar {
+            etag,
+            bitmap: Arc::clone(&bitmap),
+            seal: seal.clone(),
+            last_checked: Instant::now(),
+        };
 
-        Ok(bitmap)
+        self.inner.insert(superfile_id, entry);
+
+        Ok((bitmap, seal))
     }
 }
 
@@ -406,6 +445,43 @@ mod tests {
             vec![9u32]
         );
         assert!(cache.bitmap_for(ids[1], now).expect("absent").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seal_for_returns_cached_seal() {
+        let (_dir, ws, cache) = fixture();
+        let sf_id = Uuid::from_u128(0xFFFF);
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(42);
+        ws.put_tombstones(sf_id, None, &TombstonesSidecar { seal: None, bitmap })
+            .await
+            .expect("put");
+
+        let now = Instant::now();
+        let seal = cache.seal_for(sf_id, now).expect("lookup");
+        assert!(seal.is_none(), "initially unsealed");
+
+        // Within the cache window, subsequent calls are GET-free.
+        let seal_2 = cache.seal_for(sf_id, now).expect("cached");
+        assert!(seal_2.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_for_returns_both_bitmap_and_seal() {
+        let (_dir, ws, cache) = fixture();
+        let sf_id = Uuid::from_u128(0xABCD);
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(2);
+        ws.put_tombstones(sf_id, None, &TombstonesSidecar { seal: None, bitmap })
+            .await
+            .expect("put");
+
+        let now = Instant::now();
+        let (cached_bitmap, seal) = cache.sidecar_for(sf_id, now).expect("lookup");
+        let collected: Vec<u32> = cached_bitmap.iter().collect();
+        assert_eq!(collected, vec![1u32, 2]);
+        assert!(seal.is_none());
     }
 
     #[test]

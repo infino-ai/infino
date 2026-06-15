@@ -46,6 +46,25 @@ cargo test --features test-helpers <name_substring>   # a single test or module
 cargo test --features test-helpers bm25_oracle -- --nocapture   # ...with stdout
 ```
 
+## Node.js bindings
+
+The Node.js bindings live in [`infino-node/`](infino-node/). They build
+`infino` as an ordinary dependency and are kept out of the Cargo
+workspace, so the core crate never needs a Node toolchain. Working on
+them additionally requires **Node.js >= 18** and **npm**.
+
+| Target | What it does |
+|---|---|
+| `make node-test` | build the addon (debug) and run the smoke tests |
+| `make node-build` | build a release addon for the current platform |
+| `make node-verify` | pack the package as it ships, install it into a throwaway project, and run a roundtrip — proving an installed package resolves its prebuilt binary |
+
+The smoke tests under `infino-node/__test__/` exercise the same surface
+the Rust API guarantees — create a table, append, search, read records
+back. Run `make node-test` before opening a PR that touches the
+bindings; `make node-verify` reuses the last build by default (set
+`REBUILD=1` to force a fresh one).
+
 ## Pre-commit hooks (optional but recommended)
 
 After running `pre-commit install`, git hooks will automatically run before each commit to catch:

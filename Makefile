@@ -3,7 +3,7 @@
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
         python-test python-wheel \
-        node-test node-build
+        node-test node-build node-verify
 
 check:
 	cargo fmt --check
@@ -127,6 +127,12 @@ node-test:
 # Build a release addon for the current platform.
 node-build:
 	cd infino-node && npm install && npm run build
+
+# Verify the published package shape: pack the thin main package + the
+# host platform package, install them into a throwaway project, and run a
+# roundtrip. Reuses an existing build (REBUILD=1 forces a fresh one).
+node-verify:
+	cd infino-node && ./scripts/verify-pack.sh
 
 # Local "pre-PR" check — same gates CI runs
 ci: check doctest coverage
