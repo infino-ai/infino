@@ -59,7 +59,7 @@ infino = "0.1"
 
 ## Quickstart
 
-A memory store for your agent: persist what it learns on object storage, then recall the most relevant pieces to ground the next model call. One table holds the text and its embedding, indexed for both keyword and vector retrieval, with SQL over the same rows — no second system to sync. The backend is chosen by the connection URI (`memory://`, a local path, `s3://…`, `az://…`).
+A memory store for your agent: keep what it learns in one table, then recall the relevant pieces to ground the next model call — by keyword or with SQL over the same rows. These run as-is on the in-process `memory://` backend; point `connect` at `"./data"` or `"s3://bucket/prefix"` to persist. (Add an `embedding` vector column and call `vector_search` for semantic recall — see [Hybrid search](#hybrid-search).)
 
 **Python**
 
@@ -67,29 +67,26 @@ A memory store for your agent: persist what it learns on object storage, then re
 import infino
 import pyarrow as pa
 
-# Durable agent memory on object storage (or "./data", "memory://").
-db = infino.connect("s3://my-agent/memory")
+# An agent's memory in one table. "memory://" is in-process;
+# use "./data" or "s3://bucket/prefix" to persist.
+db = infino.connect("memory://")
 
-# A memory = text + its embedding. One table, keyword- and vector-indexed.
 schema = pa.schema([
+    pa.field("session", pa.large_utf8(), nullable=False),
     pa.field("text", pa.large_utf8(), nullable=False),
-    pa.field("embedding", pa.list_(pa.float32(), 1536), nullable=False),
 ])
-mem = db.create_table(
-    "memory", schema,
-    infino.IndexSpec().fts("text").vector("embedding", 1536, 256, "cosine"),
-)
+mem = db.create_table("memory", schema, infino.IndexSpec().fts("text"))
 
-# Remember. embed() is your embedding model (OpenAI, Cohere, a local model, …).
-notes = ["the user prefers dark mode", "the cancel flow lives under Settings"]
-mem.append([{"text": t, "embedding": embed(t)} for t in notes])
+# Remember what the agent learns.
+mem.append([
+    {"session": "u1", "text": "the user prefers dark mode"},
+    {"session": "u1", "text": "the cancel flow lives under Settings"},
+    {"session": "u2", "text": "the user is on the enterprise plan"},
+])
 
-# Recall the most relevant memories for this turn → ground your LLM.
-context = mem.vector_search("embedding", embed("how do I cancel?"), 5)
-
-# Same rows, other lenses:
-#   mem.bm25_search("text", "cancel", 5)                       # keyword
-#   db.query_sql("SELECT text FROM memory")                    # SQL
+# Recall by keyword to ground the next turn, or filter a session with SQL.
+hits = mem.bm25_search("text", "cancel", 5)                       # ranked rows
+rows = db.query_sql("SELECT text FROM memory WHERE session = 'u1'")
 ```
 
 **Node.js**
@@ -97,70 +94,68 @@ context = mem.vector_search("embedding", embed("how do I cancel?"), 5)
 ```javascript
 import { connect, IndexSpec } from "infino";
 
-// Durable agent memory on object storage (or "./data", "memory://").
-const db = connect("s3://my-agent/memory");
+// An agent's memory in one table. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+const db = connect("memory://");
 
-// A memory = text + its embedding; one table, keyword- and vector-indexed.
 const mem = db.createTable(
   "memory",
-  { text: "large_utf8", embedding: { vector: 1536 } },
-  new IndexSpec().fts("text").vector("embedding", 1536, 256, "cosine"),
+  { session: "large_utf8", text: "large_utf8" },
+  new IndexSpec().fts("text"),
 );
 
-// Remember. embed() is your embedding model (OpenAI, Cohere, a local model, …).
-const notes = ["the user prefers dark mode", "the cancel flow lives under Settings"];
-mem.append(notes.map((text) => ({ text, embedding: embed(text) })));
+// Remember what the agent learns.
+mem.append([
+  { session: "u1", text: "the user prefers dark mode" },
+  { session: "u1", text: "the cancel flow lives under Settings" },
+  { session: "u2", text: "the user is on the enterprise plan" },
+]);
 
-// Recall the most relevant memories for this turn → ground your LLM.
-const context = mem.vectorSearch("embedding", embed("how do I cancel?"), 5);
-
-// Same rows, other lenses: mem.bm25Search("text", "cancel", 5)
-// or db.querySql("SELECT text FROM memory").
+// Recall by keyword to ground the next turn, or filter a session with SQL.
+const hits = mem.bm25Search("text", "cancel", 5);                 // ranked records
+const rows = db.querySql("SELECT text FROM memory WHERE session = 'u1'");
 ```
 
 **Rust**
 
-```rust,no_run
+```rust
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
+use infino::{connect, BoolMode, IndexSpec};
 
-// embed(): your embedding model (OpenAI, Cohere, a local model, …).
-fn embed(_text: &str) -> Vec<f32> { vec![0.0; 1536] }
+// An agent's memory in one table. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+let db = connect("memory://")?;
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-// Durable agent memory on object storage (or "./data", "memory://").
-let db = connect("s3://my-agent/memory")?;
-
-// A memory = text + its embedding; one table, keyword- and vector-indexed.
-let item = Arc::new(Field::new("item", DataType::Float32, true));
 let schema = Arc::new(Schema::new(vec![
+    Field::new("session", DataType::LargeUtf8, false),
     Field::new("text", DataType::LargeUtf8, false),
-    Field::new("embedding", DataType::FixedSizeList(item.clone(), 1536), false),
 ]));
-let mem = db.create_table(
-    "memory",
-    schema.clone(),
-    IndexSpec::new().fts("text").vector("embedding", 1536, 256, Metric::Cosine),
-)?;
+let mem = db.create_table("memory", schema.clone(), IndexSpec::new().fts("text"))?;
 
-// Remember.
-let notes = ["the user prefers dark mode", "the cancel flow lives under Settings"];
-let flat: Vec<f32> = notes.iter().flat_map(|&t| embed(t)).collect();
-let embeddings = FixedSizeListArray::new(item, 1536, Arc::new(Float32Array::from(flat)), None);
+// Remember what the agent learns.
 mem.append(&RecordBatch::try_new(
     schema,
-    vec![Arc::new(LargeStringArray::from(notes.to_vec())), Arc::new(embeddings)],
+    vec![
+        Arc::new(LargeStringArray::from(vec!["u1", "u1", "u2"])),
+        Arc::new(LargeStringArray::from(vec![
+            "the user prefers dark mode",
+            "the cancel flow lives under Settings",
+            "the user is on the enterprise plan",
+        ])),
+    ],
 )?)?;
 
-// Recall the most relevant memories for this turn → ground your LLM.
-let context =
-    mem.vector_search("embedding", &embed("how do I cancel?"), 5, VectorSearchOptions::new(), None)?;
-# let _ = context;
-# Ok(())
-# }
+// Recall by keyword to ground the next turn ...
+let hits = mem.bm25_search("text", "cancel", 5, BoolMode::Or, Some(&["_id", "text", "score"]))?;
+assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+// ... or filter a session with SQL.
+let rows = db.query_sql("SELECT text FROM memory WHERE session = 'u1'")?;
+assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Bindings live in [`infino-python/`](infino-python/) (PyO3 + maturin) and
