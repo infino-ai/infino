@@ -175,6 +175,14 @@ jobs:
 
   node-addons:
     name: Addon (${{ matrix.os }})
+    # The multi-platform release build is an integration/release check, not a
+    # per-PR gate: the `node` job already covers per-PR functional testing
+    # (build + smoke tests), and the publish workflow's dry-run does the full
+    # multi-platform release build before a release. Run this on merge to main
+    # so every merge verifies all shipped platforms still build. Keep it out
+    # of branch-protection's required checks so a skipped PR run never blocks
+    # merge (same posture as the bench job).
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: ""
