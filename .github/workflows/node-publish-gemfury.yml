@@ -1,28 +1,27 @@
 name: Node publish (Gemfury early access)
 
 # Interim early-access publish: builds the prebuilt addon for every supported
-# platform and publishes the `infino` package (+ its per-platform binary
-# packages) to a Gemfury npm registry instead of the public npm registry.
+# platform and uploads the `infino` package (+ its per-platform binary
+# packages) to the Gemfury account `infino`, instead of the public npm registry.
 #
-# Testers install with just a registry flag, no token (the Gemfury packages are
-# public/unlisted — reachable only via the registry URL, not on npmjs.org or in
-# `npm i infino`):
+# Testers install via Gemfury's smart proxy (blends the Gemfury repo with the
+# public npm index, so public deps like apache-arrow still resolve). For a
+# PUBLIC Gemfury package no token is needed:
 #
-#   npm i infino --registry https://npm.fury.io/<account>/
+#   npm i infino --registry https://npm-proxy.fury.io/infino/
 #
 # The public-launch path lives in node-publish.yml and is left untouched; at
 # launch we publish there (npmjs.org) and testers drop the --registry flag.
 #
-# Triggered manually. Default run is a dry run (pack + validate, publish
-# nothing). A real run needs:
-#   - secret  FURY_PUSH_TOKEN  — a Gemfury push token
-#   - variable FURY_ACCOUNT    — the Gemfury account name (npm.fury.io/<account>/)
+# Triggered manually. Default run is a dry run (pack + validate, upload nothing).
+# A real run needs the secret FURY_PUSH_TOKEN (a Gemfury push token for the
+# `infino` account).
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Validate only — pack everything, publish nothing"
+        description: "Validate only — pack everything, upload nothing"
         type: boolean
         default: true
 
@@ -84,7 +83,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish to Gemfury
+    name: Upload to Gemfury
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -109,27 +108,26 @@ jobs:
         run: cd infino-node && npx napi create-npm-dir -t .
       - name: Stage binaries into platform packages
         run: cd infino-node && npm run artifacts
-      # Point the default registry at Gemfury so napi prepublish + npm publish
-      # push the main package and every per-platform package there. The main
-      # package and all `infino-<triple>` packages must land in the same account
-      # or tokenless install can't resolve the binary.
-      - name: Configure Gemfury registry
+      # Pack the thin main package + each per-platform package into dist/.
+      # The main package's optionalDependencies already pin the per-platform
+      # versions (in package.json), so all five tarballs are self-consistent.
+      - name: Pack tarballs
         working-directory: infino-node
         run: |
-          {
-            echo "registry=https://npm.fury.io/${{ vars.FURY_ACCOUNT }}/"
-            echo "//npm.fury.io/${{ vars.FURY_ACCOUNT }}/:_authToken=${{ secrets.FURY_PUSH_TOKEN }}"
-            echo "always-auth=true"
-          } > .npmrc
-      - name: Validate (dry run)
-        if: ${{ inputs.dry_run }}
-        run: |
-          cd infino-node
-          npx napi prepublish -t npm --skip-gh-release --dry-run
-          npm publish --dry-run
-      - name: Publish to Gemfury
+          mkdir -p dist
+          npm pack --pack-destination dist
+          for d in npm/*/; do npm pack "./$d" --pack-destination dist; done
+          echo "Packed:" && ls -1 dist
+      # Gemfury uploads a ready package via its push endpoint (not `npm publish`):
+      #   curl -F package=@<file> https://<token>@push.fury.io/infino/
+      - name: Upload to Gemfury
         if: ${{ !inputs.dry_run }}
+        working-directory: infino-node
+        env:
+          FURY_PUSH_TOKEN: ${{ secrets.FURY_PUSH_TOKEN }}
         run: |
-          cd infino-node
-          npx napi prepublish -t npm --skip-gh-release
-          npm publish
+          for f in dist/*.tgz; do
+            echo "Uploading $f"
+            curl -fsS -F package=@"$f" "https://${FURY_PUSH_TOKEN}@push.fury.io/infino/"
+            echo
+          done
