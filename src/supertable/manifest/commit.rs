@@ -563,44 +563,36 @@ pub async fn rebalance_for_commit(
             let touched = new_by_partition.contains_key(&entry.partition_key);
 
             if is_latest_for_partition && touched {
-                // Rewrite path: rebuild this part with its
-                // existing superfiles + the new ones for this
-                // partition.
                 let new_for_pk = new_by_partition
                     .remove(&entry.partition_key)
                     .expect("touched implies present");
-                let existing_part = old.part(entry.part_id).await.map_err(|e| {
-                    crate::supertable::CommitError::PointerParse(format!(
-                        "loading existing part {} for partition rewrite: {e}",
-                        entry.part_id.0
-                    ))
-                })?;
-                let combined_n = existing_part.superfiles.len() + new_for_pk.len();
-                let combined_superfiles: Vec<Arc<SuperfileEntry>> = existing_part
-                    .superfiles
-                    .iter()
-                    .cloned()
-                    .chain(new_for_pk)
-                    .collect();
 
+                let combined_n = entry.n_superfiles as usize + new_for_pk.len();
                 if combined_n as u64 > opts.target_superfiles_per_partition {
-                    // Split: keep the existing entry as-is
-                    // (older split entry from now on) and
-                    // emit a fresh part with just the new
-                    // superfiles for this partition.
+                    // Split: keep the existing entry as-is and emit a
+                    // fresh part with just the new superfiles.
                     out_list_entries.push(entry.clone());
-                    let new_superfiles: Vec<Arc<SuperfileEntry>> =
-                        combined_superfiles[existing_part.superfiles.len()..].to_vec();
                     let (fresh_entry, fresh_part, fresh_encoded) =
-                        build_part_and_entry(opts, new_superfiles, entry.partition_key.clone())?;
+                        build_part_and_entry(opts, new_for_pk, entry.partition_key.clone())?;
                     out_list_entries.push(fresh_entry);
                     parts_to_write.push(EncodedPart {
                         part: fresh_part,
                         encoded: fresh_encoded,
                     });
                 } else {
-                    // Rewrite: replace this entry with the
-                    // combined-superfiles part.
+                    // Rewrite: load existing part and combine with new superfiles.
+                    let existing_part = old.part(entry.part_id).await.map_err(|e| {
+                        crate::supertable::CommitError::PointerParse(format!(
+                            "loading existing part {} for partition rewrite: {e}",
+                            entry.part_id.0
+                        ))
+                    })?;
+                    let combined_superfiles: Vec<Arc<SuperfileEntry>> = existing_part
+                        .superfiles
+                        .iter()
+                        .cloned()
+                        .chain(new_for_pk)
+                        .collect();
                     let (rebuilt_entry, rebuilt_part, rebuilt_encoded) = build_part_and_entry(
                         opts,
                         combined_superfiles,
