@@ -921,8 +921,8 @@ pub mod vector {
             } else {
                 // Existing-prefix: no corpus → corpus-free Gaussian queries
                 // and no ground truth. Recall is meaningless here; this path
-                // exercises the cross-superfile search fan-out to measure
-                // cold/warm latency and memory boundedness only.
+                // reuses the normal vector search implementation to measure
+                // cold/warm latency and RSS against a retained large table.
                 eprintln!(
                     "[supertable_vector] existing-prefix: corpus-free queries, calibration + recall gate disabled",
                 );
