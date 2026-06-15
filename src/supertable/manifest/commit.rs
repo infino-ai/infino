@@ -200,6 +200,11 @@ pub async fn read_pointer(
     }
 }
 
+pub struct EncodedPart {
+    pub part: ManifestPart,
+    pub encoded: Vec<u8>,
+}
+
 /// Outcome of writing a manifest part — returned by
 /// [`write_manifest_part`] so the caller can build the list
 /// entry without re-computing.
@@ -235,14 +240,7 @@ pub async fn write_manifest_part(
     let content_hash = ContentHash::of(&compressed);
     let uri = part_uri(&content_hash);
     let size_compressed = compressed.len() as u64;
-
-    // Uncompressed size for the manifest list's size_bytes_uncompressed
-    // field. Cheapest correct path is to decompress and measure;
-    // the zstd frame header encodes the content length but extracting
-    // it is more code than a full decompress is worth at part scale.
-    let size_uncompressed = zstd::stream::decode_all(compressed.as_slice())
-        .map_err(|e| CommitError::Encode(format!("zstd self-decode: {e}")))?
-        .len() as u64;
+    let size_uncompressed = frame_content_size(&compressed, size_compressed);
 
     match storage
         .put_atomic(&uri, bytes::Bytes::from(compressed))
@@ -263,6 +261,30 @@ pub async fn write_manifest_part(
         size_bytes_compressed: size_compressed,
         size_bytes_uncompressed: size_uncompressed,
     })
+}
+
+/// Read the decompressed size from the zstd frame header in O(1), no
+/// actual decompression.
+fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
+    zstd::zstd_safe::get_frame_content_size(compressed)
+        .ok()
+        .flatten()
+        .unwrap_or(fallback)
+}
+
+/// PUT pre-encoded part bytes to storage.
+async fn write_part_bytes(
+    storage: &dyn StorageProvider,
+    encoded: &[u8],
+) -> Result<(), CommitError> {
+    let uri = part_uri(&ContentHash::of(encoded));
+    match storage
+        .put_atomic(&uri, bytes::Bytes::copy_from_slice(encoded))
+        .await
+    {
+        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Encode + write a manifest list. Conditional-create
@@ -335,17 +357,16 @@ pub async fn write_pointer(
 ///    rename is the only thing readers observe).
 ///
 /// `parts_to_write` should contain **only the parts that need
-/// to be persisted** (i.e., new + changed). Reused parts from
-/// the previous manifest version are not in this list — their
-/// URIs are already in `new_list.parts[i].uri`. This is the
-/// "part reuse" optimization: commits that touch zero
-/// partitions write zero new part files.
+/// to be persisted** (i.e., new + changed). Each element is the
+/// pre-encoded (Avro+zstd) bytes produced by [`build_part_and_entry`]
+/// — passing them directly avoids a second encode cycle.
+/// Reused parts from the previous manifest version are not in this
+/// list — their URIs are already in `new_list.parts[i].uri`.
 pub async fn commit_manifest(
     storage: &dyn StorageProvider,
     expected_prev_etag: Option<&str>,
     new_list: &ManifestList,
-    parts_to_write: &[&ManifestPart],
-    zstd_level: i32,
+    parts_to_write: &[&[u8]],
 ) -> Result<PointerFile, CommitError> {
     // Step 1+2: parallel write of (list, parts).
     //
@@ -356,7 +377,7 @@ pub async fn commit_manifest(
     let list_fut = write_manifest_list(storage, new_list);
     let part_futs = parts_to_write
         .iter()
-        .map(|p| write_manifest_part(storage, p, zstd_level));
+        .map(|encoded| write_part_bytes(storage, encoded));
     let part_join = future::join_all(part_futs);
 
     let (list_res, part_results) = tokio::join!(list_fut, part_join);
@@ -366,7 +387,7 @@ pub async fn commit_manifest(
     // regardless of which CAS lost the race — list or pointer.
     let list_res = list_res.map_err(translate_contention)?;
     for part_result in part_results {
-        let _ = part_result.map_err(translate_contention)?;
+        part_result.map_err(translate_contention)?;
     }
 
     // Step 3: build pointer.
@@ -442,6 +463,7 @@ fn build_part_and_entry(
     (
         crate::supertable::manifest::list::ManifestListEntry,
         crate::supertable::manifest::part::ManifestPart,
+        Vec<u8>, // pre-encoded compressed bytes — reused by write path, no second encode
     ),
     crate::supertable::CommitError,
 > {
@@ -455,9 +477,7 @@ fn build_part_and_entry(
     let compressed = part_mod::encode(&part, MANIFEST_ZSTD_LEVEL);
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
-    let size_uncompressed = zstd::stream::decode_all(compressed.as_slice())
-        .map(|v| v.len() as u64)
-        .unwrap_or(size_compressed);
+    let size_uncompressed = frame_content_size(&compressed, size_compressed);
     let aggregates = crate::supertable::manifest::aggregates::compute(&part.superfiles);
     let entry = ManifestListEntry {
         part_id: part.part_id,
@@ -472,7 +492,7 @@ fn build_part_and_entry(
         fts_summary_agg: aggregates.fts_summary_agg,
         vector_summary_agg: aggregates.vector_summary_agg,
     };
-    Ok((entry, part))
+    Ok((entry, part, compressed))
 }
 
 /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
@@ -483,7 +503,7 @@ pub async fn rebalance_for_commit(
     old: &Arc<crate::supertable::Manifest>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
-) -> Result<(Vec<ManifestListEntry>, Vec<ManifestPart>), CommitError> {
+) -> Result<(Vec<ManifestListEntry>, Vec<EncodedPart>), CommitError> {
     // 1. Resolve the effective partition strategy. Locked at
     //    first commit: read from the existing manifest list
     //    if present, else use the options default.
@@ -531,7 +551,7 @@ pub async fn rebalance_for_commit(
     // replaced in place; untouched preserved) followed by
     // entries for cold partitions.
     let mut out_list_entries: Vec<ManifestListEntry> = Vec::new();
-    let mut parts_to_write: Vec<ManifestPart> = Vec::new();
+    let mut parts_to_write: Vec<EncodedPart> = Vec::new();
     let mut handled_partitions: HashSet<Vec<u8>> = HashSet::new();
 
     if let Some(old_list) = old.list.as_ref() {
@@ -571,20 +591,26 @@ pub async fn rebalance_for_commit(
                     out_list_entries.push(entry.clone());
                     let new_superfiles: Vec<Arc<SuperfileEntry>> =
                         combined_superfiles[existing_part.superfiles.len()..].to_vec();
-                    let (fresh_entry, fresh_part) =
+                    let (fresh_entry, fresh_part, fresh_encoded) =
                         build_part_and_entry(opts, new_superfiles, entry.partition_key.clone())?;
                     out_list_entries.push(fresh_entry);
-                    parts_to_write.push(fresh_part);
+                    parts_to_write.push(EncodedPart {
+                        part: fresh_part,
+                        encoded: fresh_encoded,
+                    });
                 } else {
                     // Rewrite: replace this entry with the
                     // combined-superfiles part.
-                    let (rebuilt_entry, rebuilt_part) = build_part_and_entry(
+                    let (rebuilt_entry, rebuilt_part, rebuilt_encoded) = build_part_and_entry(
                         opts,
                         combined_superfiles,
                         entry.partition_key.clone(),
                     )?;
                     out_list_entries.push(rebuilt_entry);
-                    parts_to_write.push(rebuilt_part);
+                    parts_to_write.push(EncodedPart {
+                        part: rebuilt_part,
+                        encoded: rebuilt_encoded,
+                    });
                 }
                 handled_partitions.insert(entry.partition_key.clone());
             } else {
@@ -604,9 +630,12 @@ pub async fn rebalance_for_commit(
         if handled_partitions.contains(&pk) {
             continue;
         }
-        let (fresh_entry, fresh_part) = build_part_and_entry(opts, new_for_pk, pk)?;
+        let (fresh_entry, fresh_part, fresh_encoded) = build_part_and_entry(opts, new_for_pk, pk)?;
         out_list_entries.push(fresh_entry);
-        parts_to_write.push(fresh_part);
+        parts_to_write.push(EncodedPart {
+            part: fresh_part,
+            encoded: fresh_encoded,
+        });
     }
 
     // At this point, out_list_entries contains all new ManifestListEntries that will be written.
@@ -626,19 +655,20 @@ pub async fn rebalance_for_commit(
         // TODO: Handle merging 2 parts into one if their sum is within threshold
 
         // First we fetch the latest superfile entries - either from parts_to_write or the old manifest.
-        let (final_superfile_entries, existing_part_to_update) = if let Some(existing_part) =
+        let (final_superfile_entries, existing_part_to_update) = if let Some(existing) =
             parts_to_write
                 .iter_mut()
-                .find(|p| p.part_id == entry.part_id)
+                .find(|ep| ep.part.part_id == entry.part_id)
         {
             (
-                existing_part
+                existing
+                    .part
                     .superfiles
                     .iter()
                     .filter(|s| !removal_ids.contains(&s.superfile_id))
                     .cloned()
                     .collect::<Vec<_>>(),
-                Some(existing_part),
+                Some(existing),
             )
         } else if let Ok(existing_part) = old.part(entry.part_id).await {
             (
@@ -657,13 +687,19 @@ pub async fn rebalance_for_commit(
         };
 
         // Now we build the fresh part and entry based on the final superfile entries.
-        let (fresh_entry, fresh_part) =
+        let (fresh_entry, fresh_part, fresh_encoded) =
             build_part_and_entry(opts, final_superfile_entries, entry.partition_key)?;
 
-        if let Some(existing_part) = existing_part_to_update {
-            *existing_part = fresh_part;
+        if let Some(existing) = existing_part_to_update {
+            *existing = EncodedPart {
+                part: fresh_part,
+                encoded: fresh_encoded,
+            };
         } else {
-            parts_to_write.push(fresh_part);
+            parts_to_write.push(EncodedPart {
+                part: fresh_part,
+                encoded: fresh_encoded,
+            });
         }
 
         out_list_entries_after_removal.push(fresh_entry);
@@ -1064,8 +1100,8 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 1);
-        assert_eq!(parts[0].superfiles.len(), 1);
-        assert_eq!(parts[0].superfiles[0].n_docs, 100);
+        assert_eq!(parts[0].part.superfiles.len(), 1);
+        assert_eq!(parts[0].part.superfiles[0].n_docs, 100);
     }
 
     #[tokio::test]
@@ -1087,8 +1123,8 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].superfiles.len(), 2);
-        let total_docs: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 300);
     }
 
@@ -1172,8 +1208,8 @@ mod tests {
         assert_eq!(list_entries[0].n_superfiles, 2);
 
         // Part should have combined superfiles
-        assert_eq!(parts[0].superfiles.len(), 2);
-        let total_docs: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 150);
     }
 
@@ -1261,9 +1297,9 @@ mod tests {
 
         // Part should have all 3 superfiles combined
         let part = &parts[0];
-        assert_eq!(part.superfiles.len(), 3);
+        assert_eq!(part.part.superfiles.len(), 3);
         // Verify combined doc count
-        let total_docs: u64 = part.superfiles.iter().map(|s| s.n_docs).sum();
+        let total_docs: u64 = part.part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 325); // 100 + 150 + 75
     }
 
@@ -1358,8 +1394,8 @@ mod tests {
 
         // The one new part should have exactly the 2 new superfiles
         let part = &parts[0];
-        assert_eq!(part.superfiles.len(), 2);
-        let total_docs: u64 = part.superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(part.part.superfiles.len(), 2);
+        let total_docs: u64 = part.part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 155); // 75 + 80
     }
 
@@ -1500,8 +1536,8 @@ mod tests {
         assert_eq!(list_entries[1].n_superfiles, 2);
 
         // New part should have the combined latest + new
-        assert_eq!(parts[0].superfiles.len(), 2);
-        let total_docs: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 225); // 150 + 75
     }
 
@@ -1621,14 +1657,14 @@ mod tests {
 
         // Partition A: 1 existing + 1 new = 2 superfiles, 150 docs
         assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].superfiles.len(), 2);
-        let docs_a: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_a, 150);
 
         // Partition B: 1 existing + 1 new = 2 superfiles, 280 docs
         assert_eq!(list_entries[1].n_superfiles, 2);
-        assert_eq!(parts[1].superfiles.len(), 2);
-        let docs_b: u64 = parts[1].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[1].part.superfiles.len(), 2);
+        let docs_b: u64 = parts[1].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_b, 280);
     }
 
@@ -1742,8 +1778,8 @@ mod tests {
         // Partition A: rewritten with 2 superfiles, 150 docs
         assert_eq!(list_entries[0].partition_key, pk_a);
         assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].superfiles.len(), 2);
-        let docs_a: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_a, 150);
 
         // Partition B: exact carry-over — URI and content_hash unchanged
@@ -1924,8 +1960,8 @@ mod tests {
         // [1] Partition A latest: rewritten with 1 existing + 1 new = 2 superfiles, 225 docs
         assert_eq!(list_entries[1].partition_key, pk_a);
         assert_eq!(list_entries[1].n_superfiles, 2);
-        assert_eq!(parts[0].superfiles.len(), 2);
-        let docs_a: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_a, 225); // 150 + 75
 
         // [2] Partition B old: carried over exactly — URI and content_hash unchanged
@@ -1937,8 +1973,8 @@ mod tests {
         // [3] Partition B latest: rewritten with 1 existing + 1 new = 2 superfiles, 340 docs
         assert_eq!(list_entries[3].partition_key, pk_b);
         assert_eq!(list_entries[3].n_superfiles, 2);
-        assert_eq!(parts[1].superfiles.len(), 2);
-        let docs_b: u64 = parts[1].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[1].part.superfiles.len(), 2);
+        let docs_b: u64 = parts[1].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_b, 340); // 250 + 90
     }
 
@@ -2017,9 +2053,12 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 1);
-        assert_eq!(parts[0].superfiles.len(), 1);
-        assert_eq!(parts[0].superfiles[0].superfile_id, sf_keep.superfile_id);
-        let total_docs: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 1);
+        assert_eq!(
+            parts[0].part.superfiles[0].superfile_id,
+            sf_keep.superfile_id
+        );
+        let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 100);
     }
 
@@ -2108,14 +2147,19 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].superfiles.len(), 2);
+        assert_eq!(parts[0].part.superfiles.len(), 2);
 
-        let ids: Vec<_> = parts[0].superfiles.iter().map(|s| s.superfile_id).collect();
+        let ids: Vec<_> = parts[0]
+            .part
+            .superfiles
+            .iter()
+            .map(|s| s.superfile_id)
+            .collect();
         assert!(ids.contains(&sf_keep.superfile_id));
         assert!(ids.contains(&sf_new.superfile_id));
         assert!(!ids.contains(&sf_remove.superfile_id));
 
-        let total_docs: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 175); // 100 + 75
     }
 
@@ -2228,9 +2272,12 @@ mod tests {
         // Partition A: rewritten with 1 surviving superfile
         assert_eq!(list_entries[0].partition_key, pk_a);
         assert_eq!(list_entries[0].n_superfiles, 1);
-        assert_eq!(parts[0].superfiles.len(), 1);
-        assert_eq!(parts[0].superfiles[0].superfile_id, sf_a_keep.superfile_id);
-        let docs_a: u64 = parts[0].superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(parts[0].part.superfiles.len(), 1);
+        assert_eq!(
+            parts[0].part.superfiles[0].superfile_id,
+            sf_a_keep.superfile_id
+        );
+        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_a, 100);
 
         // Partition B: exact carry-over — URI and content_hash unchanged
@@ -2375,7 +2422,7 @@ mod tests {
         // sf_a_latest_remove is absent from every output part
         let all_ids: Vec<_> = parts
             .iter()
-            .flat_map(|p| p.superfiles.iter())
+            .flat_map(|ep| ep.part.superfiles.iter())
             .map(|s| s.superfile_id)
             .collect();
         assert!(
@@ -2470,7 +2517,7 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 0);
-        assert_eq!(parts[0].superfiles.len(), 0);
+        assert_eq!(parts[0].part.superfiles.len(), 0);
     }
 
     #[tokio::test]
@@ -2550,9 +2597,14 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].superfiles.len(), 2);
+        assert_eq!(parts[0].part.superfiles.len(), 2);
 
-        let ids: Vec<_> = parts[0].superfiles.iter().map(|s| s.superfile_id).collect();
+        let ids: Vec<_> = parts[0]
+            .part
+            .superfiles
+            .iter()
+            .map(|s| s.superfile_id)
+            .collect();
         assert!(ids.contains(&sf1.superfile_id), "sf1 must survive");
         assert!(ids.contains(&sf2.superfile_id), "sf2 must survive");
         assert!(
@@ -2689,7 +2741,7 @@ mod tests {
         // sf_a_old_keep and sf_a_latest survive; sf_a_old_remove is absent
         let all_ids: Vec<_> = parts
             .iter()
-            .flat_map(|p| p.superfiles.iter())
+            .flat_map(|ep| ep.part.superfiles.iter())
             .map(|s| s.superfile_id)
             .collect();
         assert!(
