@@ -73,12 +73,12 @@ use crate::supertable::CommitError as SupertableCommitError;
 use crate::supertable::manifest::ManifestPartLoader;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
 use crate::supertable::manifest::commit::read_pointer;
-use crate::supertable::manifest::commit::{self as commit_mod, MANIFEST_ZSTD_LEVEL};
+use crate::supertable::manifest::commit::{self as commit_mod};
 use crate::supertable::manifest::list as list_mod;
 use crate::supertable::manifest::list::{
     FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
 };
-use crate::supertable::manifest::part::{self as part_mod, ManifestPart, PartId};
+use crate::supertable::manifest::part::{self as part_mod, PartId};
 use crate::supertable::manifest::{Manifest, SuperfileList};
 
 use super::build::fanout_shards;
@@ -1878,13 +1878,15 @@ pub(crate) async fn try_commit_attempt(
     //    conditional pointer PUT (the visibility barrier).
     //    Untouched parts are NOT re-PUT — their URIs (and
     //    content-hashes) are unchanged in the new list.
-    let parts_refs: Vec<&ManifestPart> = parts_to_write.iter().collect();
+    let encoded_refs: Vec<&[u8]> = parts_to_write
+        .iter()
+        .map(|ep| ep.encoded.as_slice())
+        .collect();
     commit_mod::commit_manifest(
         storage.as_ref(),
         prev_etag.as_deref(),
         &new_list,
-        &parts_refs,
-        MANIFEST_ZSTD_LEVEL,
+        &encoded_refs,
     )
     .await?;
     // Silence the unused-import warning when no path uses

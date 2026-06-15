@@ -168,41 +168,39 @@ impl Supertable {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
 
-        let storage = manifest
-            .options
-            .storage
-            .as_ref()
-            .ok_or(CompactionError::NoStorage)?
-            .clone();
-        let wal_store = WalStore::new(storage.clone());
-
-        // One LIST to find which superfiles have a tombstone sidecar.
-        let tombstone_ids: std::collections::HashSet<Uuid> = wal_store
-            .list_tombstone_ids()
-            .await
-            .map_err(|e| CompactionError::Seal(e.to_string()))?
-            .into_iter()
-            .collect();
-
-        // Fetch full sidecars (bitmap + seal record) only for superfiles
-        // that actually have a file.
+        // Prefetch sidecars using the cache to batch storage GETs.
+        // This populates both bitmap and seal information for all superfiles.
+        // The cache returns empty bitmaps for superfiles without tombstones.
         let superfile_ids: Vec<Uuid> = manifest
             .superfile_list
             .superfiles
             .iter()
             .map(|e| e.superfile_id)
-            .filter(|id| tombstone_ids.contains(id))
             .collect();
-        let sidecar_futs = superfile_ids.iter().map(|id| {
-            let ws = wal_store.clone();
-            let id = *id;
-            async move { (id, ws.get_tombstones(id).await) }
-        });
-        let sidecar_results = futures::future::join_all(sidecar_futs).await;
-        let sidecar_map: std::collections::HashMap<Uuid, _> = sidecar_results
-            .into_iter()
-            .filter_map(|(id, result)| result.ok().flatten().map(|(sc, _etag)| (id, sc)))
-            .collect();
+
+        let sidecar_map: std::collections::HashMap<
+            Uuid,
+            (
+                Arc<roaring::RoaringBitmap>,
+                Option<crate::supertable::wal::SealRecord>,
+            ),
+        > = if let Some(cache) = &inner.tombstone_cache {
+            let now = std::time::Instant::now();
+            cache.prefetch(&superfile_ids, now).await;
+
+            // Build a map of superfile_id → (bitmap, seal) by checking the cache.
+            // Cache hits are O(1); any misses are already prefetched above.
+            superfile_ids
+                .iter()
+                .filter_map(|id| match cache.sidecar_for(*id, now) {
+                    Ok((bitmap, seal)) => Some((*id, (bitmap, seal))),
+                    Err(_) => None,
+                })
+                .collect()
+        } else {
+            // Fallback for in-memory-only tables (no storage, no tombstone cache).
+            std::collections::HashMap::new()
+        };
 
         // Build SuperfileStats for every superfile in the snapshot.
         let stats: Vec<SuperfileStats> = manifest
@@ -210,9 +208,12 @@ impl Supertable {
             .superfiles
             .iter()
             .map(|entry| {
-                let sidecar = sidecar_map.get(&entry.superfile_id);
-                let tombstoned_docs = sidecar.map(|sc| sc.bitmap.len()).unwrap_or(0);
-                let sealed_by_other = sidecar.map(|sc| sc.seal.is_some()).unwrap_or(false);
+                let (bitmap, seal) = sidecar_map
+                    .get(&entry.superfile_id)
+                    .cloned()
+                    .unwrap_or_else(|| (Arc::new(roaring::RoaringBitmap::new()), None));
+                let tombstoned_docs = bitmap.len();
+                let sealed_by_other = seal.is_some();
                 SuperfileStats {
                     superfile_id: entry.superfile_id,
                     partition_key: entry.partition_key.clone(),

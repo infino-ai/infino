@@ -37,8 +37,8 @@ use uuid::Uuid;
 
 use infino::supertable::CommitError;
 use infino::supertable::manifest::commit::{
-    self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, commit_manifest,
-    list_uri, part_uri, read_pointer, write_pointer,
+    self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, list_uri, part_uri,
+    read_pointer, write_pointer,
 };
 use infino::supertable::manifest::list::{
     FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
@@ -49,9 +49,6 @@ use infino::supertable::storage::{
 };
 use tempfile::TempDir;
 
-/// Zstd compression level used for manifest parts/lists in tests
-/// (matches the production `MANIFEST_ZSTD_LEVEL`).
-const MANIFEST_ZSTD_LEVEL: i32 = 3;
 /// Manifest id used by the pointer-file round-trip fixture.
 const POINTER_ROUNDTRIP_MANIFEST_ID: u64 = 42;
 /// Manifest id used by the forward-compat parse fixture.
@@ -69,6 +66,17 @@ const EXPECTED_COMMIT_PUT_COUNT: usize = 3;
 const PARALLEL_PUT_POLL_TIMEOUT_SECS: u64 = 5;
 /// Poll interval (ms) for the parallel-PUT loop.
 const PARALLEL_PUT_POLL_INTERVAL_MS: u64 = 10;
+
+async fn commit_manifest(
+    storage: &dyn StorageProvider,
+    expected_prev_etag: Option<&str>,
+    new_list: &ManifestList,
+    parts: &[&ManifestPart],
+) -> Result<PointerFile, CommitError> {
+    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p, 3)).collect();
+    let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
+    commit::commit_manifest(storage, expected_prev_etag, new_list, &encoded_refs).await
+}
 
 // ============================================================
 // Pointer-file format
@@ -142,7 +150,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
 /// Build a manifest list entry referencing an already-encoded
 /// part. Skip-summary aggregates left empty here.
 fn entry_for(part: &ManifestPart) -> ManifestListEntry {
-    let encoded = part_mod::encode(part, MANIFEST_ZSTD_LEVEL);
+    let encoded = part_mod::encode(part, 3);
     let hash = ContentHash::of(&encoded);
     let uri = part_uri(&hash);
     let size_compressed = encoded.len() as u64;
@@ -172,7 +180,7 @@ async fn initial_commit_writes_list_part_pointer() {
     let part = fresh_part(1);
     let list = empty_list(0, vec![entry_for(&part)]);
 
-    let pointer = commit_manifest(&storage, None, &list, &[&part], MANIFEST_ZSTD_LEVEL)
+    let pointer = commit_manifest(&storage, None, &list, &[&part])
         .await
         .expect("initial commit");
 
@@ -207,7 +215,7 @@ async fn second_commit_with_valid_prev_etag_succeeds() {
 
     let part_v0 = fresh_part(2);
     let list_v0 = empty_list(0, vec![entry_for(&part_v0)]);
-    commit_manifest(&storage, None, &list_v0, &[&part_v0], MANIFEST_ZSTD_LEVEL)
+    commit_manifest(&storage, None, &list_v0, &[&part_v0])
         .await
         .expect("v0");
     let etag_v0 = storage
@@ -222,15 +230,9 @@ async fn second_commit_with_valid_prev_etag_succeeds() {
 
     // Part-reuse: parts_to_write contains only the NEW part.
     // The previously-written part is just referenced by URI.
-    let pointer = commit_manifest(
-        &storage,
-        Some(&etag_v0),
-        &list_v1,
-        &[&part_v1],
-        MANIFEST_ZSTD_LEVEL,
-    )
-    .await
-    .expect("v1");
+    let pointer = commit_manifest(&storage, Some(&etag_v0), &list_v1, &[&part_v1])
+        .await
+        .expect("v1");
     assert_eq!(pointer.manifest_id, 1);
 
     let read = read_pointer(&storage).await.expect("read").expect("some");
@@ -244,7 +246,7 @@ async fn stale_prev_etag_surfaces_write_contention_exhausted() {
 
     let part_v0 = fresh_part(4);
     let list_v0 = empty_list(0, vec![entry_for(&part_v0)]);
-    commit_manifest(&storage, None, &list_v0, &[&part_v0], MANIFEST_ZSTD_LEVEL)
+    commit_manifest(&storage, None, &list_v0, &[&part_v0])
         .await
         .expect("v0");
     let etag_v0 = storage
@@ -257,28 +259,16 @@ async fn stale_prev_etag_surfaces_write_contention_exhausted() {
     // Legitimate v1 publishes.
     let part_v1 = fresh_part(5);
     let list_v1 = empty_list(1, vec![entry_for(&part_v0), entry_for(&part_v1)]);
-    commit_manifest(
-        &storage,
-        Some(&etag_v0),
-        &list_v1,
-        &[&part_v1],
-        MANIFEST_ZSTD_LEVEL,
-    )
-    .await
-    .expect("v1");
+    commit_manifest(&storage, Some(&etag_v0), &list_v1, &[&part_v1])
+        .await
+        .expect("v1");
 
     // Stale writer tries to publish with v0's etag — must fail.
     let part_v1_stale = fresh_part(6);
     let list_v1_stale = empty_list(1, vec![entry_for(&part_v1_stale)]);
-    let err = commit_manifest(
-        &storage,
-        Some(&etag_v0),
-        &list_v1_stale,
-        &[&part_v1_stale],
-        3,
-    )
-    .await
-    .expect_err("stale etag must fail");
+    let err = commit_manifest(&storage, Some(&etag_v0), &list_v1_stale, &[&part_v1_stale])
+        .await
+        .expect_err("stale etag must fail");
     assert!(
         matches!(err, CommitError::WriteContentionExhausted),
         "expected WriteContentionExhausted, got {err:?}"
@@ -292,7 +282,7 @@ async fn part_reuse_writes_zero_new_part_files() {
     let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
     let part = fresh_part(7);
     let list_v0 = empty_list(0, vec![entry_for(&part)]);
-    commit_manifest(&storage, None, &list_v0, &[&part], MANIFEST_ZSTD_LEVEL)
+    commit_manifest(&storage, None, &list_v0, &[&part])
         .await
         .expect("v0");
 
@@ -310,7 +300,7 @@ async fn part_reuse_writes_zero_new_part_files() {
         .etag
         .expect("etag");
     let list_v1 = empty_list(1, vec![entry_for(&part)]);
-    commit_manifest(&storage, Some(&etag_v0), &list_v1, &[], MANIFEST_ZSTD_LEVEL)
+    commit_manifest(&storage, Some(&etag_v0), &list_v1, &[])
         .await
         .expect("v1 no new parts");
 
@@ -502,16 +492,9 @@ async fn commit_issues_list_and_part_in_parallel() {
         let storage_dyn = Arc::clone(&storage_dyn);
         let part = part.clone();
         let list = list.clone();
-        tokio::spawn(async move {
-            commit_manifest(
-                storage_dyn.as_ref(),
-                None,
-                &list,
-                &[&part],
-                MANIFEST_ZSTD_LEVEL,
-            )
-            .await
-        })
+        tokio::spawn(
+            async move { commit_manifest(storage_dyn.as_ref(), None, &list, &[&part]).await },
+        )
     };
 
     // Wait for both PUTs (list + part) to arrive at the
