@@ -41,7 +41,7 @@ jobs:
         include:
           - { os: ubuntu-latest, target: linux-x64-gnu }
           - { os: ubuntu-24.04-arm, target: linux-arm64-gnu }
-          - { os: macos-13, target: darwin-x64 }
+          - { os: macos-15-intel, target: darwin-x64 }
           - { os: macos-14, target: darwin-arm64 }
     steps:
       - uses: actions/checkout@v4
