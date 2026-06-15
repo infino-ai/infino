@@ -183,7 +183,7 @@ jobs:
       # Native runner per platform — `make node-build` builds for the host,
       # no cross-compilation. One `*.node` artifact each.
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-13]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space

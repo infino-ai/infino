@@ -3,6 +3,27 @@
   "version": "0.1.0",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/infino-ai/infino#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/infino-ai/infino.git",
+    "directory": "infino-node"
+  },
+  "bugs": {
+    "url": "https://github.com/infino-ai/infino/issues"
+  },
+  "keywords": [
+    "search",
+    "full-text-search",
+    "vector-search",
+    "bm25",
+    "sql",
+    "retrieval",
+    "embeddings",
+    "arrow",
+    "object-storage",
+    "s3"
+  ],
   "main": "infino/index.js",
   "types": "infino/index.d.ts",
   "napi": {
@@ -21,13 +42,20 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "napi build --platform --release --js native.js --dts native.d.ts infino && tsc",
+    "build": "napi build --platform --release --strip --js native.js --dts native.d.ts infino && tsc",
     "build:debug": "napi build --platform --js native.js --dts native.d.ts infino && tsc",
     "tsc": "tsc",
-    "test": "node --test __test__/*.test.mjs"
+    "test": "node --test __test__/*.test.mjs",
+    "artifacts": "napi artifacts -d artifacts"
   },
   "dependencies": {
     "apache-arrow": "^17"
+  },
+  "optionalDependencies": {
+    "infino-darwin-x64": "0.1.0",
+    "infino-darwin-arm64": "0.1.0",
+    "infino-linux-x64-gnu": "0.1.0",
+    "infino-linux-arm64-gnu": "0.1.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
@@ -37,7 +65,6 @@
     "infino/index.js",
     "infino/index.d.ts",
     "infino/native.js",
-    "infino/native.d.ts",
-    "infino/*.node"
+    "infino/native.d.ts"
   ]
 }

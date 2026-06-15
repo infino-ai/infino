@@ -1,0 +1,131 @@
+name: Node publish
+
+# Builds the prebuilt addon for every supported platform, then publishes the
+# thin `infino` package plus its per-platform binary packages (`infino-<triple>`)
+# to npm.
+#
+# Triggered manually. The default run is a dry run: it packs and validates the
+# main package and every platform package without uploading anything. Re-run
+# with dry_run unchecked to publish for real. A real run needs the NPM_TOKEN
+# secret, with publish rights to the packages under the infino-ai org.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate only — pack everything, publish nothing"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The binding builds infino as a normal dependency; don't fail on a
+  # transitive-dependency deprecation warning (same as the CI node jobs).
+  RUSTFLAGS: ""
+
+jobs:
+  build:
+    name: Build addon (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # One native runner per target — `make node-build` builds for the host,
+      # no cross-compilation. These four cover every published platform.
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-x64-gnu }
+          - { os: ubuntu-24.04-arm, target: linux-arm64-gnu }
+          - { os: macos-13, target: darwin-x64 }
+          - { os: macos-14, target: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-node
+      - run: make node-build
+      - name: Upload addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: addon-${{ matrix.target }}
+          path: infino-node/infino/*.node
+          if-no-files-found: error
+      # The JS loader and compiled wrapper are identical across platforms;
+      # upload them once so the publish job needs no Rust build.
+      - name: Upload JS bindings
+        if: matrix.target == 'linux-x64-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-bindings
+          path: |
+            infino-node/infino/native.js
+            infino-node/infino/native.d.ts
+            infino-node/infino/index.js
+            infino-node/infino/index.d.ts
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      # All platform binaries land flattened into infino-node/artifacts/;
+      # `napi artifacts` matches each by the triple in its filename.
+      - name: Download platform addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: addon-*
+          path: infino-node/artifacts
+          merge-multiple: true
+      - name: Download JS bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: js-bindings
+          path: infino-node/infino
+      - name: Install tooling
+        run: cd infino-node && npm install --ignore-scripts
+      # npm/ isn't committed — generate the per-platform package dirs from
+      # package.json (triples, version, description) before staging binaries.
+      - name: Generate platform package dirs
+        run: cd infino-node && npx napi create-npm-dir -t .
+      # Copy each binary into its per-platform package under npm/<triple>/.
+      - name: Stage binaries into platform packages
+        run: cd infino-node && npm run artifacts
+      - name: Validate (dry run)
+        if: ${{ inputs.dry_run }}
+        run: |
+          cd infino-node
+          npx napi prepublish -t npm --skip-gh-release --dry-run
+          npm publish --dry-run --tag latest
+      # Publishes the per-platform packages and pins them in the main
+      # package's optionalDependencies, then publishes the main package.
+      # `--tag latest` is required (not just default): the name's history
+      # includes a higher version, so npm won't move the latest tag onto
+      # 0.1.0 implicitly. Passing it explicitly sets latest to the engine.
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run }}
+        run: |
+          cd infino-node
+          npx napi prepublish -t npm --skip-gh-release
+          npm publish --tag latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

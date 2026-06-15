@@ -4,6 +4,25 @@ Node.js bindings for infino. Synchronous; pass arrays of objects (or
 apache-arrow Tables) in, get plain records out. Pass `{ arrow: true }` to
 a search or query to get an apache-arrow `Table` instead.
 
+## Install
+
+```sh
+npm install infino
+```
+
+A prebuilt native binary is selected automatically at install time — no Rust
+toolchain needed. Supported platforms:
+
+| Platform      | Architectures |
+| ------------- | ------------- |
+| macOS         | x64, arm64    |
+| Linux (glibc) | x64, arm64    |
+
+`apache-arrow` is installed as a dependency and is used at the boundary
+(passing in Tables, or `{ arrow: true }` results). Node.js >= 18.
+
+## Usage
+
 ```javascript
 const { connect, IndexSpec } = require("infino");
 const { Schema, Field, LargeUtf8 } = require("apache-arrow");
@@ -21,15 +40,10 @@ const hits = docs.tokenMatch("title", "fox");      // unranked matching rows (sc
 const out  = db.querySql("SELECT COUNT(*) AS n FROM docs"); // records (or { arrow: true })
 ```
 
-## Build & test
+ES modules work the same way:
 
-Requires a Rust toolchain and crates.io access.
-
-```sh
-cd infino-node
-npm install
-npm run build
-npm test
+```javascript
+import { connect, IndexSpec } from "infino";
 ```
 
 ## API

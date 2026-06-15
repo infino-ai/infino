@@ -38,6 +38,10 @@ The Python bindings (PyO3 + maturin) live in
 
 ## Quick example in Node.js
 
+```sh
+npm install infino
+```
+
 ```javascript
 const { connect, IndexSpec } = require("infino");
 
