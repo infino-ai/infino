@@ -1,10 +1,19 @@
 # infino
 
-Infino stores data in a search-optimized lakehouse format. **One file = a valid Apache Parquet file plus embedded BM25 + vector indexes** — readable as Parquet by
-[DataFusion](https://datafusion.apache.org/) /
-[DuckDB](https://duckdb.org/) /
-[pyarrow](https://arrow.apache.org/docs/python/),
-and as a search index by infino's reader.
+**Infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Point it at a bucket on S3 (or Azure, or local disk) and query the same rows three ways from one system — no separate search cluster, vector database, and warehouse to provision and keep in sync, and no daemon or managed service to operate.
+
+The format is what makes this work: **every file is a valid Apache Parquet file with BM25 and vector indexes spliced in.** The same files read as plain Parquet through the Arrow ecosystem —
+[DataFusion](https://datafusion.apache.org/),
+[DuckDB](https://duckdb.org/),
+[pyarrow](https://arrow.apache.org/docs/python/) —
+and as a search index through infino's own reader, so your data stays open and portable while gaining low-latency search.
+
+**Why infino**
+
+- **Three modalities, one engine** — keyword (BM25), vector, and SQL over the same rows; no copying data between systems to combine them.
+- **Object-storage-native** — your data lives on S3, Azure, or local disk, with snapshot-isolated reads and append / update / delete through atomic commits. No cluster to stand up.
+- **Open, no lock-in** — superfiles are spec-compliant Parquet, so anything that reads Parquet can read your data.
+- **Fast and cost-aware** — low-latency search at scale is a first-class, continuously benchmarked goal.
 
 ## Links
 
