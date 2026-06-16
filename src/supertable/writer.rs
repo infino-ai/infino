@@ -2557,4 +2557,214 @@ supertable:
         assert_eq!(r.n_superfiles(), 3);
         assert_eq!(r.n_docs_total(), 6);
     }
+
+    // ---- merge_ranges helper -----------------------------------------
+
+    #[test]
+    fn merge_ranges_coalesces_overlapping_and_adjacent_drops_empty() {
+        // (off, len) inputs: an empty range (dropped), two
+        // overlapping ranges (coalesced), one adjacent range
+        // (coalesced, since `off <= last_end`), and one disjoint
+        // range (kept separate). Unsorted on input.
+        let input = vec![
+            (100u64, 10u64), // disjoint, far away
+            (0, 0),          // empty — dropped
+            (10, 10),        // [10,20)
+            (15, 10),        // [15,25) overlaps prior → [10,25)
+            (25, 5),         // [25,30) adjacent → [10,30)
+        ];
+        let merged = merge_ranges(input);
+        assert_eq!(merged, vec![(10, 20), (100, 10)]);
+    }
+
+    #[test]
+    fn merge_ranges_empty_input_is_empty() {
+        assert!(merge_ranges(Vec::new()).is_empty());
+    }
+
+    // ---- build_subsection_offsets on real superfile bytes ------------
+
+    #[test]
+    fn build_subsection_offsets_captures_total_size_and_fts_range() {
+        // A freshly-built FTS superfile should produce subsection
+        // offsets: total_size matches the byte length and the FTS
+        // open ranges are non-empty (there's an FTS index).
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 8)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        let store = &st.options().store;
+        // Fetch the bytes back from the in-memory store.
+        let reader = store.reader(&seg.uri).expect("reader");
+        // Confirm the manifest already carries subsection offsets and
+        // that total_size is plausible (> 0).
+        let offsets = seg
+            .subsection_offsets
+            .as_ref()
+            .expect("offsets captured at commit");
+        assert!(offsets.total_size > 0);
+        assert!(
+            offsets.fts.is_some(),
+            "an FTS superfile must record an FTS subsection"
+        );
+        assert!(
+            !offsets.fts_open_ranges.is_empty(),
+            "FTS open ranges should be populated for the cold-open fast path"
+        );
+        // n_docs sanity via the reader, ensuring the bytes parse.
+        assert_eq!(reader.n_docs(), 8);
+    }
+
+    #[test]
+    fn build_subsection_offsets_on_garbage_returns_none() {
+        // Bytes that aren't a valid superfile (no parquet footer)
+        // must fall back to None rather than panic.
+        let garbage = Bytes::from_static(b"not a parquet file at all");
+        assert!(build_subsection_offsets(&garbage).is_none());
+    }
+
+    // ---- vector append path ------------------------------------------
+
+    #[test]
+    fn append_with_vector_column_publishes_superfile() {
+        // Drive the vector branch of `append` (the FixedSizeList
+        // downcast + Arc<Float32Array> buffering).
+        let dim = 16;
+        let st = Supertable::create(options_with_vector(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 8, dim)).expect("append");
+        assert!(
+            w.buffered_bytes() > 0,
+            "buffered_bytes must account for the vector payload"
+        );
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        assert_eq!(r.n_superfiles(), 1);
+        assert_eq!(r.n_docs_total(), 8);
+    }
+
+    // ---- end-to-end update / delete through Supertable ----------------
+
+    /// A storage-backed supertable, required for the WAL-driven
+    /// update/delete pipeline.
+    fn storage_backed_st(dir: &TempDir) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        Supertable::create(options_id_title_serial().with_storage(storage)).expect("create")
+    }
+
+    fn row(title: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            schema_id_title(),
+            vec![Arc::new(LargeStringArray::from(vec![title]))],
+        )
+        .expect("row batch")
+    }
+
+    #[test]
+    fn delete_tombstones_matching_row() {
+        use datafusion::prelude::{col, lit};
+        let dir = TempDir::new().expect("tempdir");
+        let st = storage_backed_st(&dir);
+        st.append(&build_simple_batch(0, 1)).expect("append");
+        // build_simple_batch titles are "doc 0 alpha".
+        let stats = st
+            .delete(col("title").eq(lit("doc 0 alpha")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+        assert_eq!(stats.n_tombstoned(), 1);
+    }
+
+    #[test]
+    fn delete_unmatched_predicate_is_noop() {
+        use datafusion::prelude::{col, lit};
+        let dir = TempDir::new().expect("tempdir");
+        let st = storage_backed_st(&dir);
+        st.append(&build_simple_batch(0, 1)).expect("append");
+        let stats = st
+            .delete(col("title").eq(lit("no such title")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 0);
+        assert_eq!(stats.n_tombstoned(), 0);
+    }
+
+    #[test]
+    fn update_replaces_matching_row() {
+        use datafusion::prelude::{col, lit};
+        let dir = TempDir::new().expect("tempdir");
+        let st = storage_backed_st(&dir);
+        st.append(&row("draft")).expect("append");
+        let stats = st
+            .update(col("title").eq(lit("draft")), &row("published"))
+            .expect("update");
+        assert_eq!(stats.matched(), 1);
+        assert_eq!(stats.n_tombstoned(), 1);
+    }
+
+    #[test]
+    fn update_cardinality_mismatch_is_rejected() {
+        use datafusion::prelude::{col, lit};
+        let dir = TempDir::new().expect("tempdir");
+        let st = storage_backed_st(&dir);
+        st.append(&row("draft")).expect("append");
+        // Predicate matches one row but new_rows has two — cardinality
+        // mismatch surfaces as a typed writer error.
+        let two = RecordBatch::try_new(
+            schema_id_title(),
+            vec![Arc::new(LargeStringArray::from(vec!["a", "b"]))],
+        )
+        .expect("two-row batch");
+        let mut w = st.writer().expect("writer");
+        let err = w
+            .update(col("title").eq(lit("draft")), two)
+            .expect_err("cardinality mismatch");
+        assert!(
+            matches!(
+                err,
+                MutationError::CardinalityMismatch {
+                    matched: 1,
+                    new_rows: 2
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn update_without_storage_is_rejected() {
+        use datafusion::prelude::{col, lit};
+        // No storage attached → the update pre-flight rejects.
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let mut w = st.writer().expect("writer");
+        let err = w
+            .update(col("title").eq(lit("x")), row("y"))
+            .expect_err("no storage");
+        assert!(matches!(err, MutationError::NoStorageAttached), "{err:?}");
+    }
+
+    #[test]
+    fn delete_without_storage_is_rejected() {
+        use datafusion::prelude::{col, lit};
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let mut w = st.writer().expect("writer");
+        let err = w.delete(col("title").eq(lit("x"))).expect_err("no storage");
+        assert!(matches!(err, MutationError::NoStorageAttached), "{err:?}");
+    }
+
+    #[test]
+    fn buffered_bytes_grows_then_resets_on_commit() {
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let mut w = st.writer().expect("writer");
+        assert_eq!(w.buffered_bytes(), 0);
+        w.append(&build_simple_batch(0, 4)).expect("append");
+        assert!(w.buffered_bytes() > 0, "buffer cost recorded");
+        assert_eq!(w.buffered_batches(), 1);
+        w.commit().expect("commit");
+        assert_eq!(w.buffered_bytes(), 0, "buffer drained on commit");
+        assert_eq!(w.buffered_batches(), 0);
+    }
 }

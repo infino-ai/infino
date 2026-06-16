@@ -823,6 +823,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hybrid_search_bad_arg_types_error() {
+        let dim = 16;
+        let st = demo(dim);
+        // Non-integer k (5th arg).
+        assert!(
+            st.reader()
+                .query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', '1,0', 'five')")
+                .is_err(),
+            "non-integer k must error"
+        );
+        // Unparseable query vector (4th arg).
+        assert!(
+            st.reader()
+                .query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', 'a,b', 3)")
+                .is_err(),
+            "bad query vector must error"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_sync_method_fuses_both_retrievers() {
+        // Exercises the public sync `hybrid_search` wrapper (and through
+        // it `hybrid_search_async` + `rrf_fuse`).
+        let dim = 16;
+        let st = demo(dim);
+        let mut qv = vec![0.0_f32; dim];
+        qv[0] = 1.0; // one-hot at dim 0 → doc 0 exact vector match.
+        let hits = st
+            .reader()
+            .hybrid_search(
+                "title",
+                "async",
+                BoolMode::Or,
+                "emb",
+                &qv,
+                VectorSearchOptions::new(),
+                8,
+            )
+            .expect("hybrid_search");
+        assert!(!hits.is_empty(), "fused hits non-empty");
+        // RRF score is higher-is-better → emitted descending.
+        for w in hits.windows(2) {
+            assert!(w[0].score >= w[1].score, "fused scores descending");
+        }
+    }
+
+    /// Flatten an `EXPLAIN` result into one searchable string — exercises
+    /// `HybridSearchExec`'s `DisplayAs`/`describe`.
+    fn explain(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        let mut out = String::new();
+        for batch in &batches {
+            for column in batch.columns() {
+                if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..strings.len() {
+                        if !strings.is_null(i) {
+                            out.push_str(strings.value(i));
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hybrid_exec_display_describes_invocation() {
+        let dim = 16;
+        let st = demo(dim);
+        let text = explain(
+            &st,
+            &format!(
+                "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{}', 5)",
+                csv_one_hot(dim, 0)
+            ),
+        );
+        assert!(
+            text.contains("HybridSearchExec")
+                && text.contains("text_col=title")
+                && text.contains("vec_col=emb")
+                && text.contains("k=5"),
+            "hybrid describe missing: {text}"
+        );
+    }
+
     // ---- sql × vector × fts composed in ONE query ----
     //
     // The TVFs above each test one retriever in isolation. This block

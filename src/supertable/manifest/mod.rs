@@ -2156,4 +2156,380 @@ mod tests {
             );
         }
     }
+
+    // ============================================================
+    // SuperfileUri path helpers, Debug formatters, and the
+    // ScalarStatsTable build/aggregate helpers (from_batch[es],
+    // column_sum / column_hll / column_min_max, additive merge).
+    // ============================================================
+
+    #[test]
+    fn superfile_uri_path_helpers_share_the_same_uuid() {
+        let uri = SuperfileUri(Uuid::from_u128(0x1234_5678));
+        let id = uri.0;
+        assert_eq!(uri.storage_path(), format!("data/seg-{id}.sf.parquet"));
+        assert_eq!(uri.cache_filename(), format!("seg-{id}.sf.parquet"));
+        assert_eq!(uri.cache_tmp_filename(), format!("seg-{id}.sf.parquet.tmp"));
+    }
+
+    #[test]
+    fn manifest_debug_reports_counts() {
+        let m = Manifest::empty(opts()).with_appended(vec![seg_entry(Uuid::new_v4(), 3)]);
+        let dbg = format!("{m:?}");
+        assert!(dbg.contains("Manifest"));
+        assert!(dbg.contains("manifest_id"));
+        assert!(dbg.contains("n_superfiles"));
+        // No storage attached ⇒ has_loader false, has_list false.
+        assert!(dbg.contains("has_loader"));
+    }
+
+    #[test]
+    fn manifest_debug_with_list_reports_part_count() {
+        // A Manifest carrying a `list` exercises the Some-arm of the
+        // `n_parts` closure in Debug (the empty-Manifest test above
+        // only hits the `unwrap_or(0)` None-arm).
+        use list::{ManifestList, PartitionStrategy};
+        let entry = part::PartId::new_v4();
+        let list = ManifestList {
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: part::ContentHash([0u8; 32]),
+            schema: Vec::new(),
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            parts: vec![list::ManifestListEntry {
+                part_id: entry,
+                uri: "manifests/part-x".into(),
+                n_superfiles: 0,
+                size_bytes_compressed: 0,
+                size_bytes_uncompressed: 0,
+                content_hash: part::ContentHash([0u8; 32]),
+                partition_key: Vec::new(),
+                id_range: (0, 0),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+                vector_summary_agg: Default::default(),
+            }],
+        };
+        let m = Manifest {
+            superfile_list: SuperfileList::empty(opts()),
+            list: Some(list),
+            parts: dashmap::DashMap::new(),
+            loader: None,
+        };
+        let dbg = format!("{m:?}");
+        assert!(dbg.contains("n_parts: 1"), "{dbg}");
+        assert!(dbg.contains("has_list: true"), "{dbg}");
+    }
+
+    #[test]
+    fn cluster_centroids_empty_is_empty_and_default_matches() {
+        let cc = ClusterCentroids::empty();
+        assert!(cc.is_empty());
+        assert_eq!(cc.n_cent, 0);
+        // A populated one is not empty.
+        let cc = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        assert!(!cc.is_empty());
+        assert_eq!(cc.n_cent, 2);
+        assert_eq!(cc.dim, 4);
+    }
+
+    fn batch_with_columns(schema: &Arc<Schema>, cols: Vec<ArrayRef>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), cols).expect("batch")
+    }
+
+    #[test]
+    fn scalar_stats_from_batch_computes_min_max_null_sum_hll() {
+        use arrow_array::{Float64Array, Int64Array};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ints", DataType::Int64, true),
+            Field::new("floats", DataType::Float64, false),
+        ]));
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(1), Some(5)]));
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+        let batch = batch_with_columns(&schema, vec![ints, floats]);
+
+        let stats = ScalarStatsTable::from_batch(&schema, &batch);
+
+        // min/max present for both orderable columns.
+        let (mn, mx) = stats.cols.get("ints").expect("ints min/max");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            1
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            5
+        );
+        // null count tracked (one null in `ints`).
+        assert_eq!(*stats.null_counts.get("ints").expect("null count"), 1);
+        assert_eq!(*stats.null_counts.get("floats").expect("null count"), 0);
+        // exact sum: ints = 3+1+5 = 9 (Int64), floats = 10.0 (Float64).
+        let s = stats.sums.get("ints").expect("int sum");
+        assert_eq!(
+            s.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            9
+        );
+        let s = stats.sums.get("floats").expect("float sum");
+        assert!(
+            (s.as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("test")
+                .value(0)
+                - 10.0)
+                .abs()
+                < 1e-9
+        );
+        // HLL sketch recorded for both columns.
+        assert!(stats.hll.contains_key("ints"));
+        assert!(stats.hll.contains_key("floats"));
+    }
+
+    #[test]
+    fn scalar_stats_from_batches_concats_across_batches() {
+        use arrow_array::Int32Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let b1 = batch_with_columns(&schema, vec![Arc::new(Int32Array::from(vec![10, 20]))]);
+        let b2 = batch_with_columns(&schema, vec![Arc::new(Int32Array::from(vec![5, 30]))]);
+        let stats = ScalarStatsTable::from_batches(&schema, &[&b1, &b2]);
+        let (mn, mx) = stats.cols.get("v").expect("min/max");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("test")
+                .value(0),
+            5
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("test")
+                .value(0),
+            30
+        );
+        // sum across both batches = 10+20+5+30 = 65.
+        let s = stats.sums.get("v").expect("sum");
+        assert_eq!(
+            s.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            65
+        );
+    }
+
+    #[test]
+    fn scalar_stats_from_batches_empty_is_empty() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let stats = ScalarStatsTable::from_batches(&schema, &[]);
+        assert!(stats.cols.is_empty());
+    }
+
+    #[test]
+    fn scalar_stats_skips_unorderable_column_types() {
+        // A List column has no well-defined min/max here, so it's
+        // silently skipped (the skip planner treats missing as
+        // "can't prune").
+        let inner = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(inner),
+            true,
+        )]));
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        let mut lb = ListBuilder::new(Int32Builder::new());
+        lb.values().append_value(1);
+        lb.append(true);
+        let arr: ArrayRef = Arc::new(lb.finish());
+        let batch = batch_with_columns(&schema, vec![arr]);
+        let stats = ScalarStatsTable::from_batch(&schema, &batch);
+        assert!(stats.cols.is_empty(), "list type should be skipped");
+    }
+
+    #[test]
+    fn merge_additive_stats_intersect_on_both_sides() {
+        use arrow_array::Int64Array;
+        // Two tables: only the shared column's null_count / sum
+        // survives the merge; a one-sided column's additive stats
+        // are dropped.
+        let mut a = ScalarStatsTable::new();
+        a.cols.insert(
+            "n".into(),
+            (
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+            ),
+        );
+        a.null_counts.insert("n".into(), 2);
+        a.sums.insert(
+            "n".into(),
+            Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+        );
+
+        let mut b = ScalarStatsTable::new();
+        b.cols.insert(
+            "n".into(),
+            (
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![20])) as ArrayRef,
+            ),
+        );
+        b.null_counts.insert("n".into(), 3);
+        b.sums
+            .insert("n".into(), Arc::new(Int64Array::from(vec![50])) as ArrayRef);
+        // One-sided additive entry that must be dropped.
+        b.null_counts.insert("solo".into(), 9);
+
+        a.merge(&b);
+        // null counts add: 2 + 3 = 5.
+        assert_eq!(*a.null_counts.get("n").expect("merged null"), 5);
+        // sums add: 100 + 50 = 150.
+        let s = a.sums.get("n").expect("merged sum");
+        assert_eq!(
+            s.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            150
+        );
+        // The one-sided "solo" entry is gone.
+        assert!(!a.null_counts.contains_key("solo"));
+    }
+
+    #[test]
+    fn add_sum_arrays_handles_each_type_and_overflow() {
+        use arrow_array::{Float64Array, Int64Array, UInt64Array};
+        // Int64 + Int64.
+        let r = add_sum_arrays(
+            &(Arc::new(Int64Array::from(vec![3])) as ArrayRef),
+            &(Arc::new(Int64Array::from(vec![4])) as ArrayRef),
+        )
+        .expect("int sum");
+        assert_eq!(
+            r.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            7
+        );
+        // UInt64 + UInt64.
+        let r = add_sum_arrays(
+            &(Arc::new(UInt64Array::from(vec![3u64])) as ArrayRef),
+            &(Arc::new(UInt64Array::from(vec![4u64])) as ArrayRef),
+        )
+        .expect("uint sum");
+        assert_eq!(
+            r.as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("test")
+                .value(0),
+            7
+        );
+        // Float64 + Float64.
+        let r = add_sum_arrays(
+            &(Arc::new(Float64Array::from(vec![1.5])) as ArrayRef),
+            &(Arc::new(Float64Array::from(vec![2.5])) as ArrayRef),
+        )
+        .expect("float sum");
+        assert!(
+            (r.as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("test")
+                .value(0)
+                - 4.0)
+                .abs()
+                < 1e-9
+        );
+        // Overflow → None.
+        let r = add_sum_arrays(
+            &(Arc::new(Int64Array::from(vec![i64::MAX])) as ArrayRef),
+            &(Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        );
+        assert!(r.is_none(), "i64 overflow drops the stat");
+        // Type mismatch → None.
+        let r = add_sum_arrays(
+            &(Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+            &(Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef),
+        );
+        assert!(r.is_none(), "type mismatch drops the stat");
+    }
+
+    #[test]
+    fn merge_decimal128_and_boolean_min_max() {
+        use arrow_array::{BooleanArray, Decimal128Array};
+        // Decimal128 merge keeps numeric min/max.
+        let dec = |v: i128| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(38, 0)
+                    .expect("decimal"),
+            )
+        };
+        let mut a = ScalarStatsTable::new();
+        a.cols.insert("d".into(), (dec(10), dec(20)));
+        let mut b = ScalarStatsTable::new();
+        b.cols.insert("d".into(), (dec(5), dec(50)));
+        a.merge(&b);
+        let (mn, mx) = a.cols.get("d").expect("decimal col");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("test")
+                .value(0),
+            5
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("test")
+                .value(0),
+            50
+        );
+
+        // Boolean merge: min = AND, max = OR.
+        let mut a = ScalarStatsTable::new();
+        a.cols.insert(
+            "flag".into(),
+            (
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+            ),
+        );
+        let mut b = ScalarStatsTable::new();
+        b.cols.insert(
+            "flag".into(),
+            (
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            ),
+        );
+        a.merge(&b);
+        let (mn, mx) = a.cols.get("flag").expect("bool col");
+        assert!(
+            !mn.as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("test")
+                .value(0)
+        );
+        assert!(
+            mx.as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("test")
+                .value(0)
+        );
+    }
 }

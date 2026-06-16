@@ -3626,4 +3626,389 @@ mod tests {
         let _ = f.admits(1);
         let _ = f.admits(0);
     }
+
+    // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn open_with_verify_crc_off_succeeds() {
+        // The trusted-storage fast path skips the four CRC scans but must
+        // still produce a fully usable reader.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open_with(blob, &json, OpenOptions { verify_crc: false })
+            .expect("open with crc off");
+        assert_eq!(r.n_docs(), 3);
+        assert_eq!(r.fts_columns().collect::<Vec<_>>(), vec!["body"]);
+    }
+
+    #[test]
+    fn open_with_object_store_options_matches_crc_off() {
+        // `for_object_store` is the named constructor for the crc-off
+        // OpenOptions the lazy/object-store path uses.
+        let opts = OpenOptions::for_object_store();
+        assert!(!opts.verify_crc);
+        let (blob, json) = build_blob();
+        FtsReader::open_with(blob, &json, opts).expect("open object-store options");
+    }
+
+    #[test]
+    fn default_open_options_verifies_crc() {
+        assert!(OpenOptions::default().verify_crc);
+    }
+
+    #[test]
+    fn default_tokenizer_helper_is_ascii_lower() {
+        assert_eq!(default_tokenizer(), "ascii_lower");
+    }
+
+    #[test]
+    fn fts_column_config_missing_tokenizer_defaults() {
+        // A column JSON without the optional `tokenizer` field decodes to
+        // the ascii_lower default (round-trips an old file written before
+        // the field existed).
+        let (blob, _) = build_blob();
+        let json = r#"[{"name":"body"}]"#;
+        let r = FtsReader::open(blob, json).expect("open with terse json");
+        let cfg = r.fts_columns_config().next().expect("one column");
+        assert_eq!(cfg.name, "body");
+    }
+
+    #[test]
+    fn fts_columns_config_exposes_per_column_metadata() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let cols: Vec<&ColumnMeta> = r.fts_columns_config().collect();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "body");
+        // Three non-empty docs ⇒ a positive average doc length and a
+        // populated per-doc normalization table.
+        assert!(cols[0].avgdl > 0.0);
+        assert_eq!(cols[0].dl_norm_k1.len(), 3);
+    }
+
+    #[test]
+    fn iter_column_terms_lists_every_term_in_lex_order() {
+        // build_blob plants the union of tokens across the 3 docs.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let terms: Vec<String> = r
+            .iter_column_terms("body")
+            .expect("iter terms")
+            .into_iter()
+            .map(|b| String::from_utf8(b).expect("utf8"))
+            .collect();
+        // FST iteration is lex-ordered.
+        let mut sorted = terms.clone();
+        sorted.sort();
+        assert_eq!(terms, sorted, "terms must be in lex order");
+        for expected in [
+            "rust", "async", "runtime", "tokio", "java", "spring", "boot",
+        ] {
+            assert!(terms.contains(&expected.to_string()), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn iter_column_terms_unknown_column_is_empty() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        assert!(r.iter_column_terms("nope").expect("ok").is_empty());
+    }
+
+    #[test]
+    fn iter_terms_with_prefix_bounds_the_walk() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // "runtime" begins with "run"; nothing else does.
+        let terms: Vec<String> = r
+            .iter_terms_with_prefix("body", b"run")
+            .expect("prefix walk")
+            .into_iter()
+            .map(|b| String::from_utf8(b).expect("utf8"))
+            .collect();
+        assert_eq!(terms, vec!["runtime".to_string()]);
+        // A prefix that matches nothing returns empty.
+        assert!(
+            r.iter_terms_with_prefix("body", b"zzz")
+                .expect("prefix walk")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn term_df_reports_document_frequency() {
+        let (blob, json) = build_mixed_df_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // common → df 3 (PFOR header read), rust → df 2 (PFOR),
+        // uniqzero → df 1 (inline FST value), absent → 0.
+        assert_eq!(r.term_df("body", "common").await.expect("df"), 3);
+        assert_eq!(r.term_df("body", "rust").await.expect("df"), 2);
+        assert_eq!(r.term_df("body", "uniqzero").await.expect("df"), 1);
+        assert_eq!(r.term_df("body", "missing").await.expect("df"), 0);
+    }
+
+    #[tokio::test]
+    async fn term_df_unknown_column_errors() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let err = r.term_df("nope", "rust").await.expect_err("error");
+        assert!(matches!(err, FtsError::UnknownColumn(_)));
+    }
+
+    #[tokio::test]
+    async fn search_excluding_drops_negated_docs() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // "runtime" hits docs 0 and 1; negate "async" (only in doc 0).
+        let hits = r
+            .search_excluding("body", &["runtime"], &["async"], 10, BoolMode::Or)
+            .await
+            .expect("search excluding");
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids, vec![1], "doc 0 excluded by negated 'async'");
+    }
+
+    #[tokio::test]
+    async fn search_excluding_negation_only_errors() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let err = r
+            .search_excluding("body", &[], &["rust"], 10, BoolMode::Or)
+            .await
+            .expect_err("negation-only");
+        assert!(matches!(err, FtsError::NegationOnly));
+    }
+
+    #[tokio::test]
+    async fn search_excluding_no_terms_at_all_is_empty() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let hits = r
+            .search_excluding("body", &[], &[], 10, BoolMode::Or)
+            .await
+            .expect("empty");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_with_floor_prunes_below_floor() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // An impossibly high floor prunes every doc.
+        let hits = r
+            .search_with_floor("body", &["rust"], 10, BoolMode::Or, 1e9)
+            .await
+            .expect("floored search");
+        assert!(hits.is_empty(), "floor above all scores prunes everything");
+    }
+
+    #[tokio::test]
+    async fn search_multi_weights_and_combines_columns() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("title".into()).expect("register");
+        b.register_column("body".into()).expect("register");
+        // doc 0: title "rust"; doc 1: body "rust"; doc 2: neither.
+        b.add_doc(0, 0, "rust").expect("add");
+        b.add_doc(1, 0, "systems").expect("add");
+        b.add_doc(0, 1, "python").expect("add");
+        b.add_doc(1, 1, "rust ml").expect("add");
+        b.add_doc(0, 2, "go").expect("add");
+        b.add_doc(1, 2, "concurrency").expect("add");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower"},{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let hits = r
+            .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
+            .await
+            .expect("multi");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&1));
+        assert!(!ids.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn search_or_range_restricts_to_doc_id_window() {
+        // Larger corpus so an OR query spans several doc ids and the
+        // ranged path actually clips some out.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..8u32 {
+            b.add_doc(0, i, "alpha beta").expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        // Restrict to [2, 5): only docs 2,3,4 are eligible.
+        let hits = r
+            .search_or_range_pretokenized("body", &["alpha", "beta"], 100, 2, 5)
+            .await
+            .expect("ranged search");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert_eq!(
+            ids,
+            [2u32, 3, 4].into_iter().collect(),
+            "only docs in [2,5) returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_or_range_degenerate_inputs_are_empty() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // Empty terms, k == 0, and an inverted range all short-circuit.
+        assert!(
+            r.search_or_range_pretokenized("body", &[], 10, 0, 3)
+                .await
+                .expect("empty terms")
+                .is_empty()
+        );
+        assert!(
+            r.search_or_range_pretokenized("body", &["rust"], 0, 0, 3)
+                .await
+                .expect("zero k")
+                .is_empty()
+        );
+        assert!(
+            r.search_or_range_pretokenized("body", &["rust"], 10, 3, 3)
+                .await
+                .expect("empty range")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_or_range_with_floor_prunes() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..8u32 {
+            b.add_doc(0, i, "alpha beta").expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let hits = r
+            .search_or_range_pretokenized_with_floor("body", &["alpha", "beta"], 100, 0, 8, 1e9)
+            .await
+            .expect("floored ranged search");
+        assert!(hits.is_empty(), "floor above all scores prunes everything");
+    }
+
+    #[tokio::test]
+    async fn search_with_algo_wand_bmw_agrees_with_bmm() {
+        // The historical WAND+BMW baseline must agree with the production
+        // BMM path on the planted corpus.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        let docs = [
+            "alpha beta",
+            "alpha",
+            "beta gamma",
+            "alpha beta gamma",
+            "gamma",
+            "alpha gamma",
+            "beta",
+            "alpha beta gamma",
+        ];
+        for (i, t) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, t).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let terms: &[&str] = &["alpha", "beta", "gamma"];
+        let bmm = r
+            .search_with_algo_for_bench("body", terms, 5, OrAlgo::Bmm)
+            .await
+            .expect("bmm");
+        let wand = r
+            .search_with_algo_for_bench("body", terms, 5, OrAlgo::WandBmw)
+            .await
+            .expect("wand");
+        assert_eq!(bmm.len(), wand.len());
+        for ((db, sb), (dw, sw)) in bmm.iter().zip(wand.iter()) {
+            assert_eq!(db, dw, "doc_id mismatch");
+            assert!((sb - sw).abs() < 1e-4, "score mismatch {sb} vs {sw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_with_algo_empty_and_zero_k_short_circuit() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        assert!(
+            r.search_with_algo_for_bench("body", &[], 5, OrAlgo::Bmm)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert!(
+            r.search_with_algo_for_bench("body", &["rust"], 0, OrAlgo::Exhaustive)
+                .await
+                .expect("zero k")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_u32_le_and_u64_le_decode_little_endian() {
+        let b32 = [0x78, 0x56, 0x34, 0x12];
+        assert_eq!(read_u32_le(&b32), 0x1234_5678);
+        let b64 = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(read_u64_le(&b64), 1);
+    }
+
+    #[test]
+    fn top_k_keeps_highest_scores_with_doc_id_tiebreak() {
+        let mut scores: HashMap<u32, f32> = HashMap::new();
+        scores.insert(0, 1.0);
+        scores.insert(1, 3.0);
+        scores.insert(2, 2.0);
+        scores.insert(3, 3.0); // tie with doc 1 on score 3.0
+        let out = top_k(scores, 2);
+        // Descending score; ties broken by ascending doc_id ⇒ doc 1 before 3.
+        assert_eq!(out, vec![(1, 3.0), (3, 3.0)]);
+    }
+
+    #[test]
+    fn top_k_smaller_than_k_returns_all_sorted() {
+        let mut scores: HashMap<u32, f32> = HashMap::new();
+        scores.insert(5, 2.0);
+        scores.insert(9, 5.0);
+        let out = top_k(scores, 10);
+        assert_eq!(out, vec![(9, 5.0), (5, 2.0)]);
+    }
+
+    #[test]
+    fn drain_top_k_desc_orders_descending_with_tiebreak() {
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        heap.push(TopKEntry(1.0, 4));
+        heap.push(TopKEntry(2.0, 1));
+        heap.push(TopKEntry(2.0, 0)); // tie with doc 1
+        let out = drain_top_k_desc(heap);
+        assert_eq!(out, vec![(0, 2.0), (1, 2.0), (4, 1.0)]);
+    }
+
+    #[tokio::test]
+    async fn open_lazy_round_trips_a_search() {
+        // Wrap the eager blob in a whole-blob lazy source so the lazy
+        // open path (header + FST + doc-length tail prefetch) runs and
+        // serves a real query.
+        let (blob, json) = build_blob();
+        let src: Arc<dyn LazyByteSource> =
+            Arc::new(crate::superfile::BytesLazyByteSource::new(blob));
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        assert_eq!(r.n_docs(), 3);
+        let hits = r
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("search over lazy reader");
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(ids.contains(&0) && ids.contains(&1));
+    }
 }

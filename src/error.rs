@@ -129,3 +129,120 @@ impl From<MutationCommitError> for InfinoError {
         InfinoError::Backend(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::StorageError;
+
+    #[test]
+    fn display_messages_are_prefixed() {
+        assert_eq!(
+            InfinoError::NotFound("t".into()).to_string(),
+            "not found: t"
+        );
+        assert_eq!(
+            InfinoError::AlreadyExists("t".into()).to_string(),
+            "already exists: t"
+        );
+        assert_eq!(InfinoError::Schema("t".into()).to_string(), "schema: t");
+        assert_eq!(
+            InfinoError::Cardinality("t".into()).to_string(),
+            "cardinality: t"
+        );
+        assert_eq!(InfinoError::Io("t".into()).to_string(), "io: t");
+        assert_eq!(InfinoError::Query("t".into()).to_string(), "query: t");
+        assert_eq!(InfinoError::Backend("t".into()).to_string(), "backend: t");
+    }
+
+    #[test]
+    fn from_storage_error_maps_each_variant() {
+        assert!(matches!(
+            InfinoError::from(StorageError::NotFound { uri: "u".into() }),
+            InfinoError::NotFound(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(StorageError::PreconditionFailed { uri: "u".into() }),
+            InfinoError::AlreadyExists(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(StorageError::TransientExhausted {
+                uri: "u".into(),
+                source: "x".into()
+            }),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(StorageError::Permanent {
+                uri: "u".into(),
+                source: "x".into()
+            }),
+            InfinoError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn from_query_read_and_build_errors() {
+        assert!(matches!(
+            InfinoError::from(QueryError::Plan("p".into())),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(SuperfileReadError::MissingKv("k")),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(SuperfileBuildError::MissingIdColumn("c".into())),
+            InfinoError::Schema(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(SupertableBuildError::NoDocsToBuild),
+            InfinoError::Schema(_)
+        ));
+    }
+
+    #[test]
+    fn from_commit_and_open_errors_are_backend() {
+        assert!(matches!(
+            InfinoError::from(SupertableCommitError::Encode("e".into())),
+            InfinoError::Backend(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(OpenError::ManifestListParse("m".into())),
+            InfinoError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn from_mutation_error_maps_each_arm() {
+        assert!(matches!(
+            InfinoError::from(MutationError::PredicateEval(QueryError::Plan("p".into()))),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationError::Storage(StorageError::NotFound {
+                uri: "u".into()
+            })),
+            InfinoError::NotFound(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationError::CardinalityMismatch {
+                matched: 1,
+                new_rows: 2
+            }),
+            InfinoError::Cardinality(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationError::MatchCountExceedsCap { matched: 9, cap: 5 }),
+            InfinoError::Cardinality(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationError::SchemaMismatch("s".into())),
+            InfinoError::Schema(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationError::NoStorageAttached),
+            InfinoError::Backend(_)
+        ));
+    }
+}

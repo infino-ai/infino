@@ -378,10 +378,16 @@ impl ExecutionPlan for MatchExec {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_array::{Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 
+    use super::{ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
     use crate::superfile::builder::FtsConfig;
+    use crate::superfile::fts::reader::BoolMode;
+    use crate::supertable::handle::SupertableReader;
+    use crate::supertable::query::exec::common::output_schema_with_score;
     use crate::supertable::{Supertable, SupertableOptions};
     use crate::test_helpers::default_tokenizer as tok;
 
@@ -522,5 +528,204 @@ mod tests {
             .exact_match("title", "go routines")
             .expect("exact_match");
         assert_eq!(exact.len(), 1);
+    }
+
+    /// Flatten an `EXPLAIN` result into one searchable string — exercises
+    /// `MatchExec`'s `DisplayAs`/`describe`.
+    fn explain(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        let mut out = String::new();
+        for batch in &batches {
+            for column in batch.columns() {
+                if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..strings.len() {
+                        if !strings.is_null(i) {
+                            out.push_str(strings.value(i));
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn match_exec_display_describes_token_and_exact_branches() {
+        let st = demo();
+        let token = explain(&st, "SELECT _id FROM token_match('title', 'rust', 'and')");
+        assert!(
+            token.contains("MatchExec") && token.contains("kind=token") && token.contains("And"),
+            "token describe missing: {token}"
+        );
+        let exact = explain(
+            &st,
+            "SELECT _id FROM exact_match('title', 'rust async runtime')",
+        );
+        assert!(
+            exact.contains("MatchExec") && exact.contains("kind=exact"),
+            "exact describe missing: {exact}"
+        );
+    }
+
+    /// Build an `Arc<SupertableReader>` plus the scalar + output
+    /// schemas a `MatchExec` needs, from a committed demo table.
+    fn reader_and_schemas() -> (Arc<SupertableReader>, Arc<Schema>, Arc<Schema>) {
+        let st = demo();
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+        (reader, scalar_schema, output_schema)
+    }
+
+    #[test]
+    fn match_exec_try_new_rejects_out_of_range_projection() {
+        // An index past the end of the output schema fails the
+        // `output_schema.project(indices)` call inside `try_new`.
+        let (reader, scalar_schema, output_schema) = reader_and_schemas();
+        let n_cols = output_schema.fields().len();
+        let err = MatchExec::try_new(
+            reader,
+            "title".into(),
+            MatchQuery::Exact {
+                value: "rust".into(),
+            },
+            scalar_schema,
+            output_schema,
+            Some(vec![n_cols + 5]),
+        )
+        .expect_err("out-of-range projection must fail");
+        assert!(
+            matches!(err, datafusion::error::DataFusionError::Execution(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn match_exec_plan_metadata_and_children() {
+        let (reader, scalar_schema, output_schema) = reader_and_schemas();
+        let exec = MatchExec::try_new(
+            reader,
+            "title".into(),
+            MatchQuery::Token {
+                query: "rust".into(),
+                mode: BoolMode::Or,
+            },
+            scalar_schema,
+            output_schema,
+            None,
+        )
+        .expect("try_new");
+
+        assert_eq!(exec.name(), "MatchExec");
+        // Single leaf node — no children.
+        assert!(exec.children().is_empty());
+        // PlanProperties is exposed; single partition.
+        let _ = exec.properties();
+        // `as_any` downcasts back to the concrete type.
+        let arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
+        assert!(arc.as_any().downcast_ref::<MatchExec>().is_some());
+
+        // `with_new_children` returns the same node (it has none).
+        let same = Arc::clone(&arc)
+            .with_new_children(vec![])
+            .expect("with_new_children");
+        assert_eq!(same.name(), "MatchExec");
+    }
+
+    #[test]
+    fn match_exec_execute_rejects_nonzero_partition() {
+        let (reader, scalar_schema, output_schema) = reader_and_schemas();
+        let exec = MatchExec::try_new(
+            reader,
+            "title".into(),
+            MatchQuery::Exact {
+                value: "rust".into(),
+            },
+            scalar_schema,
+            output_schema,
+            None,
+        )
+        .expect("try_new");
+        let ctx = Arc::new(TaskContext::default());
+        match exec.execute(1, ctx) {
+            Err(datafusion::error::DataFusionError::Internal(_)) => {}
+            Err(other) => panic!("expected Internal error, got {other:?}"),
+            Ok(_) => panic!("nonzero partition must error"),
+        }
+    }
+
+    #[test]
+    fn match_exec_debug_and_display_render_describe() {
+        let (reader, scalar_schema, output_schema) = reader_and_schemas();
+        let exec = MatchExec::try_new(
+            reader,
+            "title".into(),
+            MatchQuery::Token {
+                query: "rust".into(),
+                mode: BoolMode::And,
+            },
+            scalar_schema,
+            output_schema,
+            None,
+        )
+        .expect("try_new");
+        // `Debug` routes through `describe`.
+        let dbg = format!("{exec:?}");
+        assert!(
+            dbg.contains("MatchExec") && dbg.contains("kind=token") && dbg.contains("And"),
+            "got {dbg}"
+        );
+        // `DisplayAs::fmt_as` also routes through `describe`. Drive it
+        // directly via a tiny `Display` adapter.
+        struct D<'a>(&'a MatchExec);
+        impl std::fmt::Display for D<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                use datafusion::physical_plan::DisplayAs;
+                self.0.fmt_as(DisplayFormatType::Default, f)
+            }
+        }
+        let shown = format!("{}", D(&exec));
+        assert!(
+            shown.contains("MatchExec") && shown.contains("kind=token"),
+            "got {shown}"
+        );
+    }
+
+    #[test]
+    fn token_and_exact_func_call_reject_bad_arity() {
+        // Direct `TableFunctionImpl::call` arity checks, without the
+        // SQL layer. A live reader keeps the WeakReader upgrade-able.
+        use datafusion::catalog::TableFunctionImpl;
+        let st = demo();
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let tf = TokenMatchFunc::new(Arc::clone(&reader), Arc::clone(&scalar_schema));
+        // 1 arg → error; 2 args → ok.
+        assert!(tf.call(&[]).is_err(), "0 args must fail");
+        let ef = ExactMatchFunc::new(reader, scalar_schema);
+        assert!(ef.call(&[]).is_err(), "0 args must fail");
+    }
+
+    #[test]
+    fn match_tvf_bad_arg_types_error() {
+        let st = demo();
+        // Non-string column literal.
+        assert!(
+            st.reader()
+                .query_sql("SELECT _id FROM token_match(5, 'rust')")
+                .is_err(),
+            "non-string column must error"
+        );
+        // Bad mode value (third arg).
+        assert!(
+            st.reader()
+                .query_sql("SELECT _id FROM token_match('title', 'rust', 'xor')")
+                .is_err(),
+            "invalid bool mode must error"
+        );
     }
 }

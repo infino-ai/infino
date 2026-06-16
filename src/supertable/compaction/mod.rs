@@ -505,6 +505,124 @@ mod tests {
         assert!(select(&[seg(1, 200, 1000, 0)], &default_cfg()).is_empty());
     }
 
+    // ---- SuperfileStats live_docs / live_bytes -----------------------
+
+    #[test]
+    fn live_docs_subtracts_tombstones_and_saturates() {
+        let s = seg(1, 100, 1000, 250);
+        assert_eq!(s.live_docs(), 750);
+        // More tombstones than docs saturates to zero rather than
+        // underflowing.
+        let over = seg(2, 100, 100, 200);
+        assert_eq!(over.live_docs(), 0);
+    }
+
+    #[test]
+    fn live_bytes_scales_by_live_fraction() {
+        // 100 MiB, half the docs tombstoned → ~50 MiB live.
+        let s = seg(1, 100, 1000, 500);
+        assert_eq!(s.live_bytes(), mib(100) / 2);
+    }
+
+    #[test]
+    fn live_bytes_zero_docs_is_zero() {
+        // A 0-doc superfile must report 0 live bytes (guards the
+        // division-by-zero branch).
+        let s = seg(1, 100, 0, 0);
+        assert_eq!(s.live_bytes(), 0);
+    }
+
+    // ---- PendingJob fits / push -------------------------------------
+
+    #[test]
+    fn pending_job_fits_until_target_exceeded() {
+        let target = mib(100);
+        let mut p = PendingJob::default();
+        let a = seg(1, 60, 1000, 0); // 60 MiB live
+        assert!(p.fits(&a, target));
+        p.push(&a);
+        assert_eq!(p.live_bytes, mib(60));
+        assert_eq!(p.inputs.len(), 1);
+        // A second 60 MiB superfile would overflow the 100 MiB target.
+        let b = seg(2, 60, 1000, 0);
+        assert!(!p.fits(&b, target));
+        // A 40 MiB superfile fits exactly to the boundary.
+        let c = seg(3, 40, 1000, 0);
+        assert!(p.fits(&c, target));
+    }
+
+    #[test]
+    fn pending_job_emit_requires_two_inputs() {
+        // A single-input pending job never emits even if it reaches
+        // the fill floor.
+        let mut jobs = Vec::new();
+        let mut p = PendingJob::default();
+        p.push(&seg(1, 200, 1000, 0));
+        p.emit(&[], 0, &mut jobs);
+        assert!(jobs.is_empty(), "single-input job must not emit");
+        // Reset to default after emit attempt.
+        assert_eq!(p.inputs.len(), 0);
+        assert_eq!(p.live_bytes, 0);
+    }
+
+    // ---- run_compaction_job error arms ------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_compaction_job_unknown_input_surfaces_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        // A job referencing a superfile id that isn't in the manifest
+        // must surface SuperfileNotFound.
+        let bogus = Uuid::from_u128(0xDEAD_BEEF);
+        let job = CompactionJob {
+            partition_key: Vec::new(),
+            inputs: vec![bogus],
+            estimated_output_bytes: 0,
+        };
+        let err = st
+            .run_compaction_job(job)
+            .await
+            .expect_err("must error on unknown input");
+        assert!(
+            matches!(err, crate::supertable::error::CompactionError::SuperfileNotFound(id) if id == bogus),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_sync_wrapper_runs_jobs() {
+        // Exercise the sync `compact()` entry point (the
+        // runtime-bridge wrapper around `compact_async`). Use
+        // spawn_blocking so we're not inside a tokio runtime when
+        // the bridge tries to block.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for titles in [
+            ["alpha first", "alpha second"],
+            ["bravo first", "bravo second"],
+            ["charlie first", "charlie second"],
+            ["delta first", "delta second"],
+            ["echo first", "echo second"],
+            ["foxtrot first", "foxtrot second"],
+            ["golf first", "golf second"],
+            ["hotel first", "hotel second"],
+            ["india first", "india second"],
+            ["juliet first", "juliet second"],
+        ] {
+            commit_titles(&st, &titles);
+        }
+        let before = st.manifest_id();
+        let cfg = small_compact_cfg();
+        tokio::task::spawn_blocking(move || st.compact(&cfg).map(|_| st.manifest_id()))
+            .await
+            .expect("join")
+            .map(|after| {
+                assert!(after > before, "sync compact must have run a job");
+            })
+            .expect("compact");
+    }
+
     #[test]
     fn partitions_packed_independently() {
         let mut segs = Vec::new();

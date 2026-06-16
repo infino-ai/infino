@@ -152,3 +152,190 @@ where
     }
     Ok(out.freeze())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn transient() -> StorageError {
+        StorageError::TransientExhausted {
+            uri: "u".into(),
+            source: "boom".into(),
+        }
+    }
+
+    fn not_found() -> StorageError {
+        StorageError::NotFound { uri: "u".into() }
+    }
+
+    #[test]
+    fn backoff_grows_then_caps_at_max_shift() {
+        assert_eq!(backoff(0), Duration::from_millis(BACKOFF_BASE_MS));
+        assert_eq!(backoff(1), Duration::from_millis(BACKOFF_BASE_MS * 2));
+        // attempt >= BACKOFF_MAX_SHIFT saturates the shift.
+        let capped = Duration::from_millis(BACKOFF_BASE_MS * (1 << BACKOFF_MAX_SHIFT));
+        assert_eq!(backoff(BACKOFF_MAX_SHIFT), capped);
+        assert_eq!(backoff(100), capped);
+    }
+
+    #[test]
+    fn config_uses_our_budget() {
+        let c = config();
+        assert_eq!(c.max_retries, MAX_RETRIES);
+        assert_eq!(c.retry_timeout, RETRY_TIMEOUT);
+    }
+
+    #[test]
+    fn is_retryable_only_for_transient() {
+        assert!(is_retryable(&transient()));
+        assert!(!is_retryable(&not_found()));
+        assert!(!is_retryable(&StorageError::PreconditionFailed {
+            uri: "u".into()
+        }));
+    }
+
+    #[test]
+    fn short_read_builds_permanent_error() {
+        let e = short_read("u", 0, 100, 10);
+        assert!(matches!(e, StorageError::Permanent { .. }));
+        assert!(e.to_string().contains("short read"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reissue_ok_first_try() {
+        let calls = Cell::new(0u32);
+        let r: Result<u8, StorageError> = with_reissue(|| {
+            calls.set(calls.get() + 1);
+            async { Ok(7u8) }
+        })
+        .await;
+        assert_eq!(r.expect("test"), 7);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reissue_retries_transient_then_succeeds() {
+        let calls = Cell::new(0u32);
+        let r: Result<u8, StorageError> = with_reissue(|| {
+            let c = calls.get();
+            calls.set(c + 1);
+            async move { if c < 2 { Err(transient()) } else { Ok(7u8) } }
+        })
+        .await;
+        assert_eq!(r.expect("test"), 7);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reissue_exhausts_budget_then_errors() {
+        let calls = Cell::new(0u32);
+        let r: Result<u8, StorageError> = with_reissue(|| {
+            calls.set(calls.get() + 1);
+            async { Err(transient()) }
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(calls.get(), MAX_TRANSIENT_RETRIES + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reissue_non_retryable_returns_immediately() {
+        let calls = Cell::new(0u32);
+        let r: Result<u8, StorageError> = with_reissue(|| {
+            calls.set(calls.get() + 1);
+            async { Err(not_found()) }
+        })
+        .await;
+        assert!(matches!(r, Err(StorageError::NotFound { .. })));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_zero_length_is_empty() {
+        let r = complete_range("u", 5..5, |_| async { Ok(Bytes::new()) })
+            .await
+            .expect("test");
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_single_full_chunk() {
+        let r = complete_range("u", 0..3, |_| async { Ok(Bytes::from_static(b"abc")) })
+            .await
+            .expect("test");
+        assert_eq!(&r[..], b"abc");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_truncates_overlong_chunk() {
+        let r = complete_range("u", 0..3, |_| async { Ok(Bytes::from_static(b"abcdef")) })
+            .await
+            .expect("test");
+        assert_eq!(&r[..], b"abc");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_assembles_short_chunks() {
+        let r = complete_range("u", 0..5, |range| async move {
+            let data = b"abcde";
+            let start = range.start as usize;
+            let end = (start + 2).min(data.len());
+            Ok(Bytes::copy_from_slice(&data[start..end]))
+        })
+        .await
+        .expect("test");
+        assert_eq!(&r[..], b"abcde");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_retries_transient_then_completes() {
+        let calls = Cell::new(0u32);
+        let r = complete_range("u", 0..3, |_| {
+            let c = calls.get();
+            calls.set(c + 1);
+            async move {
+                if c == 0 {
+                    Err(transient())
+                } else {
+                    Ok(Bytes::from_static(b"abc"))
+                }
+            }
+        })
+        .await
+        .expect("test");
+        assert_eq!(&r[..], b"abc");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_empty_body_then_full() {
+        let calls = Cell::new(0u32);
+        let r = complete_range("u", 0..3, |_| {
+            let c = calls.get();
+            calls.set(c + 1);
+            async move {
+                if c == 0 {
+                    Ok(Bytes::new())
+                } else {
+                    Ok(Bytes::from_static(b"abc"))
+                }
+            }
+        })
+        .await
+        .expect("test");
+        assert_eq!(&r[..], b"abc");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_persistent_empty_body_is_short_read() {
+        let r = complete_range("u", 0..3, |_| async { Ok(Bytes::new()) }).await;
+        assert!(matches!(r, Err(StorageError::Permanent { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_propagates_non_retryable() {
+        let r = complete_range("u", 0..3, |_| async { Err::<Bytes, _>(not_found()) }).await;
+        assert!(matches!(r, Err(StorageError::NotFound { .. })));
+    }
+}

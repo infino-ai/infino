@@ -1340,4 +1340,321 @@ supertable:
         assert!(s.contains("SupertableOptions"));
         assert!(s.contains("_id"));
     }
+
+    /// Helper: a minimal valid options instance (no FTS / vector) for
+    /// exercising the builder methods that don't touch the schema.
+    fn plain_opts() -> SupertableOptions {
+        let s = Arc::new(Schema::new(vec![Field::new(
+            "category",
+            DataType::Utf8,
+            false,
+        )]));
+        SupertableOptions::new(s, vec![], vec![], None).expect("valid options")
+    }
+
+    #[test]
+    fn consistency_default_is_bounded_staleness_one_sec() {
+        assert_eq!(
+            Consistency::default(),
+            Consistency::BoundedStaleness(std::time::Duration::from_secs(
+                DEFAULT_READ_STALENESS_SECS
+            ))
+        );
+    }
+
+    #[test]
+    fn new_sets_documented_defaults() {
+        let opts = plain_opts();
+        assert!(opts.prepopulate_cache_on_commit);
+        assert!(opts.verify_crc_on_open);
+        assert!(opts.storage.is_none());
+        assert!(opts.disk_cache.is_none());
+        assert!(opts.memory_budget_bytes.is_none());
+        assert!(opts.partition_strategy.is_none());
+        assert_eq!(
+            opts.target_superfiles_per_partition,
+            DEFAULT_TARGET_SUPERFILES_PER_PARTITION
+        );
+        assert_eq!(
+            opts.part_size_threshold_bytes,
+            DEFAULT_PART_SIZE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            opts.eager_load_threshold_parts,
+            DEFAULT_EAGER_LOAD_THRESHOLD_PARTS
+        );
+        assert_eq!(opts.max_commit_retries, DEFAULT_MAX_COMMIT_RETRIES);
+        assert_eq!(
+            opts.commit_threshold_size_mb,
+            DEFAULT_COMMIT_THRESHOLD_SIZE_MB
+        );
+        assert_eq!(
+            opts.put_multipart_threshold_bytes,
+            DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES
+        );
+        assert_eq!(opts.read_consistency, Consistency::default());
+    }
+
+    #[test]
+    fn effective_partition_strategy_defaults_to_single_bucket_hash() {
+        use crate::supertable::manifest::list::PartitionStrategy;
+        let opts = plain_opts();
+        match opts.effective_partition_strategy() {
+            PartitionStrategy::Hash { column, n_buckets } => {
+                assert_eq!(column, "_id");
+                assert_eq!(n_buckets, DEFAULT_PARTITION_N_BUCKETS);
+            }
+            other => panic!("expected single-bucket Hash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_partition_strategy_returns_configured_strategy() {
+        use crate::supertable::manifest::list::PartitionStrategy;
+        let strat = PartitionStrategy::Hash {
+            column: "category".into(),
+            n_buckets: 64,
+        };
+        let opts = plain_opts().with_partition_strategy(strat.clone());
+        assert_eq!(opts.effective_partition_strategy(), strat);
+    }
+
+    #[test]
+    fn scalar_threshold_builders_set_their_fields() {
+        let opts = plain_opts()
+            .with_target_superfiles_per_partition(42)
+            .with_part_size_threshold_bytes(4096)
+            .with_eager_load_threshold(0)
+            .with_max_commit_retries(99)
+            .with_commit_threshold_size_mb(7)
+            .with_put_multipart_threshold_bytes(1)
+            .with_memory_budget(1 << 30)
+            .with_cache_prepopulation(false)
+            .with_verify_crc_on_open(false);
+        assert_eq!(opts.target_superfiles_per_partition, 42);
+        assert_eq!(opts.part_size_threshold_bytes, 4096);
+        assert_eq!(opts.eager_load_threshold_parts, 0);
+        assert_eq!(opts.max_commit_retries, 99);
+        assert_eq!(opts.commit_threshold_size_mb, 7);
+        assert_eq!(opts.put_multipart_threshold_bytes, 1);
+        assert_eq!(opts.memory_budget_bytes, Some(1 << 30));
+        assert!(!opts.prepopulate_cache_on_commit);
+        assert!(!opts.verify_crc_on_open);
+    }
+
+    #[test]
+    fn with_read_consistency_overrides_default() {
+        let opts = plain_opts().with_read_consistency(Consistency::Strong);
+        assert_eq!(opts.read_consistency, Consistency::Strong);
+        let opts = opts.with_read_consistency(Consistency::Snapshot);
+        assert_eq!(opts.read_consistency, Consistency::Snapshot);
+    }
+
+    #[test]
+    fn with_reader_and_writer_pool_override_pools() {
+        let reader = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("reader pool"),
+        );
+        let writer = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .expect("writer pool"),
+        );
+        let opts = plain_opts()
+            .with_reader_pool(Arc::clone(&reader))
+            .with_writer_pool(Arc::clone(&writer));
+        assert_eq!(opts.reader_pool.current_num_threads(), 2);
+        assert_eq!(opts.writer_pool.current_num_threads(), 3);
+        assert!(Arc::ptr_eq(&opts.reader_pool, &reader));
+        assert!(Arc::ptr_eq(&opts.writer_pool, &writer));
+    }
+
+    #[test]
+    fn with_store_replaces_default_store() {
+        let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
+        let opts = plain_opts().with_store(Arc::clone(&store));
+        // The Arc held by opts is the one we passed in.
+        let opts_store: Arc<dyn SuperfileReaderCache> = Arc::clone(&opts.store);
+        assert!(Arc::ptr_eq(&opts_store, &store));
+    }
+
+    #[test]
+    fn with_storage_attaches_provider() {
+        let dir = std::env::temp_dir().join(format!("infino-opts-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
+        let opts = plain_opts().with_storage(storage);
+        assert!(opts.storage.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn superfile_open_options_track_verify_crc_flag() {
+        let opts = plain_opts();
+        assert!(opts.superfile_open_options().verify_crc);
+        let opts = opts.with_verify_crc_on_open(false);
+        assert!(!opts.superfile_open_options().verify_crc);
+    }
+
+    #[test]
+    fn builder_options_use_scalar_schema_and_id_column() {
+        let s = schema_with_vector(16);
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+            .expect("valid options");
+        let bo = opts.builder_options();
+        // builder_options carries the scalar-only schema (vectors
+        // dropped, id prepended) and the same id column + role configs.
+        let names: Vec<_> = bo
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["_id", "title"]);
+        assert_eq!(bo.id_column, "_id");
+        assert_eq!(bo.fts_columns.len(), 1);
+        assert_eq!(bo.vector_columns.len(), 1);
+    }
+
+    #[test]
+    fn apply_config_overrides_id_column_when_no_collision() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        let yaml = r#"
+supertable:
+  id_column: row_pk
+"#;
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert_eq!(opts.id_column, "row_pk");
+    }
+
+    #[test]
+    fn apply_config_rejects_id_column_that_collides_with_schema() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // Config id column collides with the user-schema field
+        // `category`.
+        let yaml = r#"
+supertable:
+  id_column: category
+"#;
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts().apply_config(&cfg).expect_err("collision");
+        assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "category"));
+    }
+
+    #[test]
+    fn apply_config_with_none_backend_leaves_storage_unattached() {
+        // Default config has storage.backend = none → no storage /
+        // disk cache attached, exercising the early-return arm of
+        // apply_storage_config.
+        let cfg = crate::config::Config::defaults().expect("defaults");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_none());
+        assert!(opts.disk_cache.is_none());
+    }
+
+    #[test]
+    fn with_disk_cache_attaches_cache() {
+        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
+
+        let dir = std::env::temp_dir().join(format!("infino-opts-dc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.join("cache"),
+                mmap_cold_threshold_secs: 0,
+                eviction: Box::new(LruPolicy::new()),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+
+        let opts = plain_opts().with_storage(storage).with_disk_cache(cache);
+        assert!(opts.disk_cache.is_some());
+        assert!(opts.storage.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_attaches_local_fs_storage() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // `storage.backend = local_fs` with a local_root exercises
+        // the LocalFs arm of apply_storage_config; no disk_cache_root
+        // means the cache stays unattached.
+        let dir =
+            std::env::temp_dir().join(format!("infino-opts-localfs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let yaml = format!(
+            "storage:\n  backend: local_fs\n  local_root: {}\n",
+            dir.display()
+        );
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(&yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_some(), "local_fs backend attaches storage");
+        assert!(
+            opts.disk_cache.is_none(),
+            "no disk_cache_root ⇒ no cache attached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_local_fs_with_disk_cache_root_attaches_both() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // local_fs backend + a disk_cache_root drives the disk-cache
+        // construction branch of apply_storage_config (cold-fetch
+        // mode mapping, DiskCacheConfig build, new_unpinned).
+        let dir = std::env::temp_dir().join(format!("infino-opts-dcroot-{}", uuid::Uuid::new_v4()));
+        let cache_root = dir.join("cache");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let yaml = format!(
+            "storage:\n  backend: local_fs\n  local_root: {}\n  disk_cache_root: {}\n",
+            dir.display(),
+            cache_root.display()
+        );
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(&yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_some());
+        assert!(
+            opts.disk_cache.is_some(),
+            "disk_cache_root ⇒ cache attached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_local_fs_without_root_is_rejected() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // local_fs backend but no local_root → the typed Store error
+        // arm of apply_storage_config.
+        let yaml = "storage:\n  backend: local_fs\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts()
+            .apply_config(&cfg)
+            .expect_err("missing local_root");
+        assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
 }

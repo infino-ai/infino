@@ -1838,8 +1838,14 @@ mod tests {
     /// > 1 distinguishes "kept waiting" from "barreled ahead".
     const HELD_POLL_TURNS: u32 = 5;
 
-    /// Minimal eager superfile reader (one scalar batch, no indexes).
-    fn tiny_reader() -> Arc<SuperfileReader> {
+    /// Generous timeout for [`DiskCacheStore::wait_until_mmap_promoted`]
+    /// in tests — the background fill is local-fs only, so promotion
+    /// lands in well under a second; this just bounds a hang.
+    const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Build the raw bytes of a minimal superfile (one scalar batch,
+    /// no indexes).
+    fn tiny_superfile_bytes() -> Bytes {
         let schema = Arc::new(Schema::new(vec![
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
@@ -1851,20 +1857,48 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
-        let bytes = Bytes::from(b.finish().expect("finish"));
-        Arc::new(SuperfileReader::open(bytes).expect("open"))
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Minimal eager superfile reader (one scalar batch, no indexes).
+    fn tiny_reader() -> Arc<SuperfileReader> {
+        Arc::new(SuperfileReader::open(tiny_superfile_bytes()).expect("open"))
     }
 
     fn test_store() -> (TempDir, Arc<DiskCacheStore>) {
+        test_store_with(|cfg| {
+            cfg.mmap_cold_threshold_secs = 0;
+        })
+    }
+
+    /// Build a store, applying `mutate` to the default config first.
+    /// The storage root is the tempdir; cache files live under
+    /// `<tempdir>/cache`. The sweep thread is left disabled by
+    /// default (callers that want it enable it through `mutate`).
+    fn test_store_with(
+        mutate: impl FnOnce(&mut DiskCacheConfig),
+    ) -> (TempDir, Arc<DiskCacheStore>) {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
-        let cfg = DiskCacheConfig {
+        let mut cfg = DiskCacheConfig {
             cache_root: dir.path().join("cache"),
+            mmap_cold_threshold_secs: 0,
             ..Default::default()
         };
+        mutate(&mut cfg);
         let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
         (dir, store)
+    }
+
+    /// Put `bytes` at the storage location `store.reader(&uri)` will
+    /// cold-fetch from, so the cold path has something to read.
+    async fn put_superfile(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, bytes: Bytes) {
+        store
+            .storage
+            .put_atomic(&uri.storage_path(), bytes)
+            .await
+            .expect("put superfile");
     }
 
     /// Regression: `strong_count == 1` is also what *acquisition*
@@ -1913,5 +1947,487 @@ mod tests {
             "wait must yield the store once the foreground hold releases"
         );
         drop(reader);
+    }
+
+    // ----- construction / config -----
+
+    #[tokio::test]
+    async fn new_creates_cache_root() {
+        let (dir, store) = test_store();
+        assert!(dir.path().join("cache").is_dir(), "cache_root created");
+        // Debug impl exercises the custom formatter.
+        let dbg = format!("{store:?}");
+        assert!(dbg.contains("DiskCacheStore"));
+        assert!(dbg.contains("n_cold_fetches"));
+    }
+
+    #[tokio::test]
+    async fn new_with_sweep_thread_enabled_spawns_and_drops_cleanly() {
+        // threshold > 0 takes the std::thread::spawn branch; interval
+        // is clamped to >= 1. The Weak<Self> lets the thread exit when
+        // we drop the last Arc.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.mmap_cold_threshold_secs = 1;
+            cfg.mmap_sweep_interval_secs = 0; // exercises `.max(1)` clamp
+        });
+        drop(store); // thread observes the failed Weak upgrade and exits
+    }
+
+    #[tokio::test]
+    async fn new_unpinned_installs_empty_pinned_set() {
+        let (_dir, store) = test_store();
+        assert!(store.current_pinned_uris().is_empty());
+    }
+
+    // ----- stats / accessors -----
+
+    #[tokio::test]
+    async fn stats_reflect_config_and_counters() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = 12345;
+        });
+        let s = store.stats();
+        assert_eq!(s.budget_bytes, 12345);
+        assert_eq!(s.n_entries, 0);
+        assert_eq!(s.current_bytes, 0);
+        assert_eq!(s.n_cold_fetches, 0);
+        assert_eq!(s.n_evictions, 0);
+        assert_eq!(s.n_madvise_calls, 0);
+        // CacheStats is Clone + Debug + Default.
+        let _ = format!("{:?}", s.clone());
+        assert_eq!(CacheStats::default().n_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn set_and_read_pinned_fn() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store.set_pinned_fn(Arc::new(move || {
+            let mut s = HashSet::new();
+            s.insert(uri);
+            s
+        }));
+        let pinned = store.current_pinned_uris();
+        assert!(pinned.contains(&uri));
+        assert_eq!(pinned.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn is_mmap_promoted_false_for_unknown_uri() {
+        let (_dir, store) = test_store();
+        assert!(!store.is_mmap_promoted(&SuperfileUri::new_v4()));
+    }
+
+    // ----- warm insert path (insert_warm + cold-free path) -----
+
+    #[tokio::test]
+    async fn insert_warm_caches_and_serves_reader() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = bytes.len() as u64;
+        store.insert_warm(&uri, bytes).await.expect("insert_warm");
+
+        // Entry is mmap-backed, counted, and warm inserts don't bump
+        // the cold-fetch counter.
+        assert!(store.is_mmap_promoted(&uri));
+        let s = store.stats();
+        assert_eq!(s.n_entries, 1);
+        assert_eq!(s.current_bytes, size);
+        assert_eq!(s.n_cold_fetches, 0);
+        assert_eq!(store.current_mmap_size_bytes(), size);
+
+        // The cache file landed on disk.
+        assert!(store.cache_path(&uri).is_file());
+
+        // reader() hits the cache (still no cold fetch).
+        let _r = store.reader(&uri).await.expect("reader");
+        assert_eq!(store.stats().n_cold_fetches, 0);
+    }
+
+    #[tokio::test]
+    async fn insert_warm_is_idempotent() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("first");
+        let before = store.stats().current_bytes;
+        // Second insert with the same URI is a no-op.
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("second");
+        assert_eq!(store.stats().current_bytes, before);
+        assert_eq!(store.stats().n_entries, 1);
+    }
+
+    #[tokio::test]
+    async fn insert_warm_rejects_unparseable_bytes() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let err = store
+            .insert_warm(&uri, Bytes::from_static(b"not a superfile"))
+            .await
+            .expect_err("garbage must fail to open");
+        // Reservation rolled back on the error path.
+        assert_eq!(store.stats().current_bytes, 0);
+        assert_eq!(store.stats().n_entries, 0);
+        // Surfaced as a typed open/read error.
+        let _ = format!("{err}");
+        let _ = format!("{err:?}");
+    }
+
+    #[tokio::test]
+    async fn insert_warm_budget_exceeded_when_too_big() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = 4; // smaller than any real superfile
+        });
+        let uri = SuperfileUri::new_v4();
+        let err = store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect_err("must exceed budget");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded));
+        assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    // ----- cold fetch: synchronous path -----
+
+    #[tokio::test]
+    async fn reader_synchronous_cold_then_warm_hit() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes).await;
+
+        let _r = store.reader_synchronous(&uri).await.expect("cold");
+        let s = store.stats();
+        assert_eq!(s.n_cold_fetches, 1);
+        assert_eq!(s.n_entries, 1);
+        assert_eq!(s.current_bytes, size);
+        // mmap-backed after the synchronous fetch.
+        assert!(store.is_mmap_promoted(&uri));
+
+        // Second call is a warm cache hit (no new cold fetch).
+        let _r2 = store.reader_synchronous(&uri).await.expect("warm");
+        assert_eq!(store.stats().n_cold_fetches, 1);
+    }
+
+    #[tokio::test]
+    async fn reader_synchronous_missing_object_errors() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        // Nothing put at the storage path → head() fails.
+        let err = store.reader_synchronous(&uri).await.expect_err("no object");
+        let _ = format!("{err}");
+        // Coordinator removed so a later (successful) put can proceed.
+        assert!(store.coordinators.is_empty());
+    }
+
+    // ----- cold fetch: hybrid path (default mode) -----
+
+    #[tokio::test]
+    async fn reader_hybrid_cold_then_promotes_to_mmap() {
+        let (_dir, store) = test_store(); // default = HybridWithPrefetch
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // reader() dispatches to reader_hybrid.
+        let r = store.reader(&uri).await.expect("cold hybrid");
+        assert_eq!(r.n_docs(), 1);
+        assert_eq!(store.stats().n_cold_fetches, 1);
+        assert_eq!(store.stats().n_entries, 1);
+
+        // Background finalizer eventually swaps in the mmap entry.
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promotion");
+        assert!(store.is_mmap_promoted(&uri));
+
+        // Warm hit after promotion.
+        let _r2 = store.reader(&uri).await.expect("warm");
+        assert_eq!(store.stats().n_cold_fetches, 1);
+    }
+
+    #[tokio::test]
+    async fn reader_hybrid_empty_object_zero_chunks() {
+        // size == 0 takes the n_chunks == 0 branch in cold_fetch_hybrid;
+        // the empty buffer fails to parse as a superfile, surfacing an
+        // open error rather than a cache entry.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, Bytes::new()).await;
+        let err = store.reader(&uri).await.expect_err("empty not a superfile");
+        let _ = format!("{err}");
+    }
+
+    // ----- RangeOnly mode rejects + open_range_only bypass -----
+
+    #[tokio::test]
+    async fn reader_range_only_mode_is_rejected() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::RangeOnly;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        let err = store.reader(&uri).await.expect_err("RangeOnly rejected");
+        assert!(matches!(err, DiskCacheError::SuperfileOpen(_)));
+    }
+
+    #[tokio::test]
+    async fn open_range_only_unknown_size_reads_directly() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        // offsets = None → unknown-size StorageRangeSource.
+        let r = store.open_range_only(&uri, None).await.expect("range open");
+        assert_eq!(r.n_docs(), 1);
+        // Bypasses the cache entirely — nothing admitted.
+        assert_eq!(store.stats().n_entries, 0);
+        assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn open_range_only_known_size_reads_directly() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let total = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes).await;
+        let offsets = SubsectionOffsets {
+            total_size: total,
+            vec: None,
+            fts: None,
+            vec_open_ranges: Vec::new(),
+            fts_open_ranges: Vec::new(),
+            open_blob: Vec::new(),
+        };
+        let r = store
+            .open_range_only(&uri, Some(&offsets))
+            .await
+            .expect("known-size range open");
+        assert_eq!(r.n_docs(), 1);
+    }
+
+    // ----- lazy-foreground-with-background-fill mode -----
+
+    #[tokio::test]
+    async fn reader_lazy_unknown_size_cold_then_promotes() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // reader_with_hints(None) → unknown-size lazy cold fetch.
+        let r = store.reader(&uri).await.expect("lazy cold");
+        assert_eq!(r.n_docs(), 1);
+        assert_eq!(store.stats().n_cold_fetches, 1);
+
+        // Drop the foreground reader so the background fill can start.
+        drop(r);
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("lazy promotion");
+        assert!(store.is_mmap_promoted(&uri));
+    }
+
+    #[tokio::test]
+    async fn reader_lazy_with_hints_known_size_promotes() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let total = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes).await;
+
+        // Known size, no open_blob → fetches the open batch over the
+        // wire (parquet tail + vec + fts ranges) using the fallback
+        // header lengths derived from `vec`/`fts` hints.
+        let offsets = SubsectionOffsets {
+            total_size: total,
+            vec: None,
+            fts: None,
+            vec_open_ranges: Vec::new(),
+            fts_open_ranges: Vec::new(),
+            open_blob: Vec::new(),
+        };
+        let r = store
+            .reader_with_hints(&uri, Some(&offsets))
+            .await
+            .expect("lazy hinted cold");
+        assert_eq!(r.n_docs(), 1);
+        assert_eq!(store.stats().n_cold_fetches, 1);
+        drop(r);
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("lazy hinted promotion");
+        assert!(store.is_mmap_promoted(&uri));
+    }
+
+    // ----- wait_until_mmap_promoted timeout path -----
+
+    #[tokio::test]
+    async fn wait_until_mmap_promoted_times_out_for_unpromoted() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        // Never fetched → never promoted → times out.
+        let err = store
+            .wait_until_mmap_promoted(&uri, Duration::from_millis(30))
+            .await
+            .expect_err("must time out");
+        assert!(matches!(err, DiskCacheError::SuperfileOpen(_)));
+        // Guard restored the waiter counter.
+        assert_eq!(store.n_promotion_waiters.load(Ordering::Acquire), 0);
+    }
+
+    // ----- eviction + budget -----
+
+    #[tokio::test]
+    async fn cold_fetch_evicts_lru_when_over_budget() {
+        // Budget fits ~1.5 entries, forcing eviction of the older one
+        // when the second cold fetch reserves.
+        let one = tiny_superfile_bytes();
+        let entry_size = one.len() as u64;
+        let (_dir, store) = test_store_with(move |cfg| {
+            cfg.disk_budget_bytes = entry_size + entry_size / 2;
+        });
+
+        let uri_a = SuperfileUri::new_v4();
+        let uri_b = SuperfileUri::new_v4();
+        put_superfile(&store, &uri_a, tiny_superfile_bytes()).await;
+        put_superfile(&store, &uri_b, tiny_superfile_bytes()).await;
+
+        store.reader_synchronous(&uri_a).await.expect("a");
+        store.reader_synchronous(&uri_b).await.expect("b");
+
+        // a was the LRU victim; b is resident.
+        assert_eq!(store.stats().n_evictions, 1);
+        assert!(store.cached.contains_key(&uri_b));
+        assert!(!store.cached.contains_key(&uri_a));
+        // a's cache file was unlinked.
+        assert!(!store.cache_path(&uri_a).exists());
+        assert_eq!(store.stats().current_bytes, entry_size);
+    }
+
+    #[tokio::test]
+    async fn cold_fetch_budget_exceeded_with_all_pinned() {
+        let one = tiny_superfile_bytes();
+        let entry_size = one.len() as u64;
+        let (_dir, store) = test_store_with(move |cfg| {
+            cfg.disk_budget_bytes = entry_size + entry_size / 2;
+        });
+
+        let uri_a = SuperfileUri::new_v4();
+        let uri_b = SuperfileUri::new_v4();
+        put_superfile(&store, &uri_a, tiny_superfile_bytes()).await;
+        put_superfile(&store, &uri_b, tiny_superfile_bytes()).await;
+
+        // First fetch lands.
+        store.reader_synchronous(&uri_a).await.expect("a");
+        // Pin everything so eviction finds no victims.
+        store.set_pinned_fn(Arc::new(move || {
+            let mut s = HashSet::new();
+            s.insert(uri_a);
+            s
+        }));
+        let err = store
+            .reader_synchronous(&uri_b)
+            .await
+            .expect_err("no eligible victims");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded));
+        // a stays put; budget unchanged.
+        assert!(store.cached.contains_key(&uri_a));
+    }
+
+    // ----- sweep_once / sweep_for_budget / madvise counters -----
+
+    #[tokio::test]
+    async fn sweep_once_advises_idle_mmap_entries() {
+        // threshold 0 means every entry is immediately "idle".
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("warm");
+        let advised = store.sweep_once();
+        assert_eq!(advised, 1);
+        assert_eq!(store.stats().n_madvise_calls, 1);
+        // A second sweep advises again (counter accumulates).
+        assert_eq!(store.sweep_once(), 1);
+        assert_eq!(store.stats().n_madvise_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn sweep_once_skips_when_threshold_not_reached() {
+        // Large threshold → nothing is idle, so no madvise.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.mmap_cold_threshold_secs = 1_000_000;
+        });
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("warm");
+        assert_eq!(store.sweep_once(), 0);
+        assert_eq!(store.stats().n_madvise_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_for_budget_noop_under_budget() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("warm");
+        // budget far above resident size → no madvise.
+        assert_eq!(store.sweep_for_budget(u64::MAX), 0);
+        assert_eq!(store.stats().n_madvise_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_for_budget_reclaims_oldest_first() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("warm");
+        let resident = store.current_mmap_size_bytes();
+        assert!(resident > 0);
+        // budget 0 forces every entry to be advised.
+        let advised = store.sweep_for_budget(0);
+        assert_eq!(advised, 1);
+        assert_eq!(store.stats().n_madvise_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn current_mmap_size_bytes_zero_when_empty() {
+        let (_dir, store) = test_store();
+        assert_eq!(store.current_mmap_size_bytes(), 0);
+    }
+
+    // ----- error type conversions / Debug -----
+
+    #[tokio::test]
+    async fn disk_cache_error_displays_all_variants() {
+        let variants = [
+            DiskCacheError::SuperfileOpen("x".into()),
+            DiskCacheError::BudgetExceeded,
+            DiskCacheError::Io(std::io::Error::other("boom")),
+        ];
+        for v in variants {
+            assert!(!format!("{v}").is_empty());
+            assert!(!format!("{v:?}").is_empty());
+        }
     }
 }

@@ -530,4 +530,136 @@ mod tests {
             .expect("multipart handle");
         upload.abort().await.expect("abort");
     }
+
+    #[tokio::test]
+    async fn list_with_prefix_returns_matching_keys() {
+        let (_dir, p) = provider();
+        for key in ["seg/a.parquet", "seg/b.parquet", "other/c.parquet"] {
+            p.put_atomic(key, Bytes::from_static(b"x"))
+                .await
+                .expect("put");
+        }
+        let mut under_seg = p.list_with_prefix("seg").await.expect("list");
+        under_seg.sort();
+        assert_eq!(under_seg, vec!["seg/a.parquet", "seg/b.parquet"]);
+
+        let all = p.list_with_prefix("").await.expect("list all");
+        assert_eq!(all.len(), 3);
+
+        let none = p
+            .list_with_prefix("does-not-exist")
+            .await
+            .expect("list empty");
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_store_handle_exposes_store_and_key() {
+        let (_dir, p) = provider();
+        let (_store, path) = p
+            .object_store_handle("seg/x.parquet")
+            .expect("handle for valid uri");
+        assert_eq!(path.to_string(), "seg/x.parquet");
+    }
+
+    #[test]
+    fn new_records_root_and_creates_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("nested/created/here");
+        let p = LocalFsStorageProvider::new(&root).expect("provider creates root");
+        assert_eq!(p.root(), &root);
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn translate_maps_generic_to_transient_exhausted() {
+        // `object_store` retries transient failures internally per its
+        // RetryConfig; a `Generic` reaching `translate` is post-retry,
+        // so it maps to `TransientExhausted`.
+        let boxed: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        let e = ObjError::Generic {
+            store: "test",
+            source: boxed,
+        };
+        let mapped = translate("data/x.sf.parquet", e);
+        assert!(
+            matches!(mapped, StorageError::TransientExhausted { .. }),
+            "expected TransientExhausted, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn translate_maps_unhandled_variant_to_permanent() {
+        // A variant with no dedicated arm (e.g. `NotImplemented`)
+        // falls through to the catch-all `Permanent`.
+        let e = ObjError::NotImplemented {
+            operation: "put_opts(Update)".into(),
+            implementer: "LocalFileSystem".into(),
+        };
+        let mapped = translate("data/x.sf.parquet", e);
+        match mapped {
+            StorageError::Permanent { uri, .. } => assert_eq!(uri, "data/x.sf.parquet"),
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_maps_already_exists_and_precondition_to_precondition_failed() {
+        let already = ObjError::AlreadyExists {
+            path: "p".into(),
+            source: "exists".into(),
+        };
+        assert!(matches!(
+            translate("uri", already),
+            StorageError::PreconditionFailed { .. }
+        ));
+        let precond = ObjError::Precondition {
+            path: "p".into(),
+            source: "stale".into(),
+        };
+        assert!(matches!(
+            translate("uri", precond),
+            StorageError::PreconditionFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_maps_not_found() {
+        let nf = ObjError::NotFound {
+            path: "p".into(),
+            source: "missing".into(),
+        };
+        assert!(matches!(
+            translate("uri", nf),
+            StorageError::NotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_path_surfaces_permanent_error() {
+        // A NUL byte is illegal in an `object_store::path::Path`, so
+        // `Self::path` fails before any I/O — surfacing the `path()`
+        // error arm as `Permanent`.
+        let (_dir, p) = provider();
+        let bad_uri = "data/seg\0bad.sf.parquet";
+        let err = p.head(bad_uri).await.expect_err("illegal path must fail");
+        match err {
+            StorageError::Permanent { uri, .. } => assert_eq!(uri, bad_uri),
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        // The same rejection happens on the write paths.
+        let err = p
+            .put_atomic(bad_uri, Bytes::from_static(b"x"))
+            .await
+            .expect_err("illegal path must fail on put");
+        assert!(matches!(err, StorageError::Permanent { .. }));
+    }
+
+    #[tokio::test]
+    async fn object_store_handle_returns_none_for_invalid_path() {
+        // `object_store_handle` swallows the path-parse error and
+        // returns `None` (the `?`-via-`.ok()?` arm).
+        let (_dir, p) = provider();
+        assert!(p.object_store_handle("data/bad\0path").is_none());
+    }
 }

@@ -558,6 +558,16 @@ mod tests {
     use super::*;
     use datafusion::prelude::lit;
 
+    use arrow_array::{Array, FixedSizeListArray, LargeStringArray};
+    use arrow_schema::Field;
+
+    use crate::superfile::builder::{FtsConfig, VectorConfig};
+    use crate::superfile::fts::reader::BoolMode;
+    use crate::superfile::vector::distance::Metric;
+    use crate::superfile::vector::rerank_codec::RerankCodec;
+    use crate::supertable::{Supertable, SupertableOptions};
+    use crate::test_helpers::default_tokenizer as tok;
+
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {
         assert_eq!(
@@ -568,10 +578,28 @@ mod tests {
     }
 
     #[test]
+    fn arg_to_string_accepts_large_utf8_and_utf8_view() {
+        let large = Expr::Literal(ScalarValue::LargeUtf8(Some("body".into())), None);
+        assert_eq!(arg_to_string(&large, "column").expect("large utf8"), "body");
+        let view = Expr::Literal(ScalarValue::Utf8View(Some("title".into())), None);
+        assert_eq!(arg_to_string(&view, "column").expect("utf8 view"), "title");
+    }
+
+    #[test]
     fn arg_to_usize_accepts_int_rejects_negative_and_nonint() {
         assert_eq!(arg_to_usize(&lit(10_i64), "k").expect("int literal"), 10);
         assert!(arg_to_usize(&lit(-1_i64), "k").is_err());
         assert!(arg_to_usize(&lit("nope"), "k").is_err());
+    }
+
+    #[test]
+    fn arg_to_usize_accepts_all_integer_widths() {
+        let i32e = Expr::Literal(ScalarValue::Int32(Some(7)), None);
+        let u64e = Expr::Literal(ScalarValue::UInt64(Some(8)), None);
+        let u32e = Expr::Literal(ScalarValue::UInt32(Some(9)), None);
+        assert_eq!(arg_to_usize(&i32e, "k").expect("i32"), 7);
+        assert_eq!(arg_to_usize(&u64e, "k").expect("u64"), 8);
+        assert_eq!(arg_to_usize(&u32e, "k").expect("u32"), 9);
     }
 
     #[test]
@@ -581,5 +609,155 @@ mod tests {
         assert_eq!(out.fields().len(), 2);
         assert_eq!(out.field(1).name(), "score");
         assert_eq!(out.field(1).data_type(), &DataType::Float32);
+    }
+
+    // ---- harness exercising resolve_hits_named / resolve_ids_arithmetic /
+    //      resolve_columns through the public search methods ----
+
+    fn fixed_list_f32(dim: usize) -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+        )
+    }
+
+    fn options_title_emb(dim: usize) -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("emb", fixed_list_f32(dim), false),
+        ]));
+        SupertableOptions::new(
+            schema,
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    fn build_batch(titles: &[&str], dim: usize, schema: Arc<Schema>) -> RecordBatch {
+        let n = titles.len();
+        let title_arr = LargeStringArray::from(titles.to_vec());
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            for d in 0..dim {
+                flat.push(if d == i % dim { 1.0 } else { 0.0 });
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)) as ArrayRef,
+            None,
+        )
+        .expect("FSL");
+        RecordBatch::try_new(schema, vec![Arc::new(title_arr), Arc::new(fsl)]).expect("batch")
+    }
+
+    fn demo(dim: usize) -> Supertable {
+        let st = Supertable::create(options_title_emb(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        w.append(&build_batch(
+            &["rust async", "python data", "rust systems", "go routines"],
+            dim,
+            schema,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    #[test]
+    fn resolve_hits_named_id_only_takes_arithmetic_fast_path() {
+        // `_id`-only projection drives resolve_hits_named → the
+        // resolve_ids_arithmetic no-I/O fast path (single contiguous
+        // span: id_max - id_min + 1 == n_docs).
+        let st = demo(16);
+        let batches = st
+            .reader()
+            .bm25_search("title", "rust", 10, BoolMode::Or, Some(&["_id"]))
+            .expect("bm25_search _id");
+        let b = &batches[0];
+        assert_eq!(b.num_columns(), 1);
+        assert_eq!(b.schema().field(0).name(), "_id");
+        assert_eq!(b.num_rows(), 2, "two docs contain 'rust'");
+    }
+
+    #[test]
+    fn resolve_hits_named_default_is_id_and_score() {
+        // `None` projection is the engine-native `_id` + `score` pair.
+        let st = demo(16);
+        let batches = st
+            .reader()
+            .bm25_search("title", "rust", 10, BoolMode::Or, None)
+            .expect("bm25_search default");
+        let b = &batches[0];
+        assert_eq!(b.num_columns(), 2);
+        assert_eq!(b.schema().field(0).name(), "_id");
+        assert_eq!(b.schema().field(1).name(), "score");
+    }
+
+    #[test]
+    fn resolve_hits_named_scalar_column_decodes_via_resolve_columns() {
+        // Naming a scalar column (`title`) forces resolve_columns to
+        // decode the column bytes; `score` synthesized alongside.
+        let st = demo(16);
+        let batches = st
+            .reader()
+            .bm25_search(
+                "title",
+                "rust",
+                10,
+                BoolMode::Or,
+                Some(&["_id", "title", "score"]),
+            )
+            .expect("bm25_search title");
+        let b = &batches[0];
+        assert_eq!(b.num_columns(), 3);
+        let titles = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title col");
+        for i in 0..titles.len() {
+            assert!(titles.value(i).contains("rust"));
+        }
+    }
+
+    #[test]
+    fn resolve_hits_named_unknown_column_errors() {
+        let st = demo(16);
+        let res = st
+            .reader()
+            .bm25_search("title", "rust", 10, BoolMode::Or, Some(&["nope"]));
+        assert!(res.is_err(), "unknown projected column must error");
+    }
+
+    #[test]
+    fn resolve_hits_named_empty_hits_returns_empty_batch() {
+        let st = demo(16);
+        let batches = st
+            .reader()
+            .bm25_search("title", "nonexistentterm", 10, BoolMode::Or, Some(&["_id"]))
+            .expect("bm25_search empty");
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 0);
     }
 }

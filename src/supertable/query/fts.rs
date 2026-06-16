@@ -1275,4 +1275,204 @@ mod tests {
             .expect("query");
         assert_eq!(hits.len(), 2);
     }
+
+    fn seeded_three_doc_supertable() -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["the quick brown fox", "a lazy dog", "quick thinking"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    #[test]
+    fn supertable_bm25_search_rows_default_and_projected() {
+        let st = seeded_three_doc_supertable();
+
+        // Bare call → `_id` + `score` only (no scalar decode).
+        let bare = st
+            .bm25_search("title", "fox", 10, BoolMode::Or, None)
+            .expect("bm25 rows");
+        assert_eq!(bare.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(bare[0].num_columns(), 2, "_id + score");
+
+        // Named projection materializes the requested columns.
+        let rows = st
+            .bm25_search(
+                "title",
+                "fox",
+                10,
+                BoolMode::Or,
+                Some(&["_id", "title", "score"]),
+            )
+            .expect("bm25 projected rows");
+        assert_eq!(rows[0].num_columns(), 3);
+    }
+
+    #[test]
+    fn supertable_token_match_and_exact_match_rows() {
+        let st = seeded_three_doc_supertable();
+
+        // token_match: any row containing "quick" (Or over one token).
+        let tm = st
+            .token_match("title", "quick", BoolMode::Or, None)
+            .expect("token_match");
+        assert_eq!(tm.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        // exact_match: only the row equal to the raw string.
+        let em = st
+            .exact_match("title", "a lazy dog", Some(&["_id", "title"]))
+            .expect("exact_match");
+        assert_eq!(em.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(em[0].num_columns(), 2);
+    }
+
+    #[test]
+    fn reader_token_match_and_exact_match_hits() {
+        let st = seeded_three_doc_supertable();
+        let r = st.reader();
+
+        // token_match And requires every token to be present.
+        let any = r.token_match("title", "quick", BoolMode::And).expect("tm");
+        assert_eq!(any.len(), 2);
+
+        // Token-less value (punctuation only) prunes nothing and matches
+        // no stored row exactly.
+        let none = r.exact_match("title", "!!!").expect("em punctuation");
+        assert!(none.is_empty());
+
+        // Exact verify against a real row.
+        let one = r.exact_match("title", "quick thinking").expect("em");
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn token_match_empty_query_short_circuits() {
+        let st = seeded_three_doc_supertable();
+        let r = st.reader();
+        // A query that tokenizes to nothing returns empty without
+        // touching the store.
+        let hits = r
+            .token_match("title", "   ", BoolMode::Or)
+            .expect("tm empty");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn token_match_no_match_returns_empty() {
+        let st = seeded_three_doc_supertable();
+        let r = st.reader();
+        let hits = r
+            .token_match("title", "nonexistentterm", BoolMode::Or)
+            .expect("tm");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn fanout_for_only_multi_term_or_without_negation_subranges() {
+        // Multi-term OR, no negation → sub-range eligible.
+        assert!(matches!(
+            super::fanout_for(BoolMode::Or, 2, false),
+            super::FanOut::SubRanges
+        ));
+        // Single-term OR stays per-superfile.
+        assert!(matches!(
+            super::fanout_for(BoolMode::Or, 1, false),
+            super::FanOut::PerSuperfile
+        ));
+        // Negation disables sub-ranges.
+        assert!(matches!(
+            super::fanout_for(BoolMode::Or, 2, true),
+            super::FanOut::PerSuperfile
+        ));
+        // And mode stays per-superfile.
+        assert!(matches!(
+            super::fanout_for(BoolMode::And, 2, false),
+            super::FanOut::PerSuperfile
+        ));
+    }
+
+    #[test]
+    fn build_work_units_per_superfile_is_one_unranged_unit_each() {
+        use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
+            let id = Uuid::new_v4();
+            Arc::new(SuperfileEntry {
+                superfile_id: id,
+                uri: SuperfileUri(id),
+                n_docs,
+                id_min: 0,
+                id_max: n_docs.saturating_sub(1) as i128,
+                scalar_stats: ScalarStatsTable::new(),
+                fts_summary: HashMap::new(),
+                vector_summary: HashMap::new(),
+                partition_key: Vec::new(),
+                partition_hint: None,
+                subsection_offsets: None,
+            })
+        }
+
+        let e0 = entry(100);
+        let e1 = entry(200);
+        let kept = vec![&e0, &e1];
+
+        // PerSuperfile always yields exactly one un-ranged unit per kept
+        // superfile regardless of pool width.
+        let units = super::build_work_units(&kept, super::FanOut::PerSuperfile, 8);
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.range.is_none()));
+
+        // SubRanges with one pool thread collapses to per-superfile too
+        // (no spare threads to slice across).
+        let units = super::build_work_units(&kept, super::FanOut::SubRanges, 1);
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.range.is_none()));
+
+        // Tiny superfiles below SUBRANGE_MIN_DOCS never slice even with
+        // spare threads.
+        let units = super::build_work_units(&kept, super::FanOut::SubRanges, 16);
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.range.is_none()));
+    }
+
+    #[test]
+    fn build_work_units_slices_large_superfiles_when_threads_spare() {
+        use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let id = Uuid::new_v4();
+        // One large superfile, well above SUBRANGE_MIN_DOCS (50k).
+        let big = Arc::new(SuperfileEntry {
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 200_000,
+            id_min: 0,
+            id_max: 199_999,
+            scalar_stats: ScalarStatsTable::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: None,
+        });
+        let kept = vec![&big];
+        // 4 spare threads, 1 superfile → slice into multiple ranged units
+        // that tile [0, n_docs) without gaps.
+        let units = super::build_work_units(&kept, super::FanOut::SubRanges, 4);
+        assert!(units.len() > 1, "large superfile sliced into sub-ranges");
+        let mut cursor = 0u32;
+        for u in &units {
+            let (start, end) = u.range.expect("ranged unit");
+            assert_eq!(start, cursor);
+            cursor = end;
+        }
+        assert_eq!(cursor, 200_000, "sub-ranges tile the whole superfile");
+    }
 }

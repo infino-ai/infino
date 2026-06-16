@@ -707,4 +707,143 @@ mod tests {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
     }
+
+    // ---- arg-parsing helper unit coverage ----
+
+    #[test]
+    fn scalar_to_f32_accepts_every_numeric_variant_rejects_other() {
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::Float32(Some(1.5))).expect("test"),
+            1.5
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::Float64(Some(2.5))).expect("test"),
+            2.5
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::Int64(Some(3))).expect("test"),
+            3.0
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::Int32(Some(4))).expect("test"),
+            4.0
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::UInt64(Some(5))).expect("test"),
+            5.0
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::UInt32(Some(6))).expect("test"),
+            6.0
+        );
+        assert!(scalar_to_f32(&ScalarValue::Utf8(Some("x".into()))).is_err());
+    }
+
+    #[test]
+    fn scalar_expr_to_f32_rejects_non_literal() {
+        // A literal flows through to scalar_to_f32.
+        assert_eq!(scalar_expr_to_f32(&lit(2.0_f32)).expect("test"), 2.0);
+        // A column reference is not a literal → error.
+        let col = datafusion::prelude::col("x");
+        assert!(scalar_expr_to_f32(&col).is_err());
+    }
+
+    #[test]
+    fn array_to_f32_casts_and_rejects_nulls() {
+        let ok: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3]));
+        assert_eq!(array_to_f32(&ok).expect("test"), vec![1.0, 2.0, 3.0]);
+        let with_null: ArrayRef = Arc::new(Float32Array::from(vec![Some(1.0), None]));
+        assert!(
+            array_to_f32(&with_null).is_err(),
+            "null query-vector element must error"
+        );
+    }
+
+    #[test]
+    fn list_literal_to_f32_requires_single_row() {
+        // Single-row list `[1, 2]` → ok.
+        let single =
+            ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![Some(
+                vec![Some(1), Some(2)],
+            )]);
+        assert_eq!(list_literal_to_f32(&single).expect("test"), vec![1.0, 2.0]);
+        // Two-row list → error.
+        let two = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![Some(2)]),
+        ]);
+        assert!(
+            list_literal_to_f32(&two).is_err(),
+            "multi-row list must error"
+        );
+    }
+
+    #[test]
+    fn arg_to_query_vector_parses_list_scalar_literal() {
+        // `ScalarValue::List` branch (a const-folded SQL array literal).
+        let list =
+            ListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(vec![Some(
+                vec![Some(0.1_f32), Some(0.2), Some(0.3)],
+            )]);
+        let expr = Expr::Literal(ScalarValue::List(Arc::new(list)), None);
+        assert_eq!(
+            arg_to_query_vector(&expr).expect("test"),
+            vec![0.1_f32, 0.2, 0.3]
+        );
+    }
+
+    #[test]
+    fn arg_to_query_vector_rejects_unsupported_expr() {
+        // A bare column reference is neither string, list, nor make_array.
+        let col = datafusion::prelude::col("x");
+        assert!(arg_to_query_vector(&col).is_err());
+    }
+
+    #[test]
+    fn vector_search_tvf_arity_error() {
+        let dim = 16;
+        let st = supertable_one_superfile(dim, 8);
+        // 2 args (missing k) → planning error.
+        assert!(
+            st.reader()
+                .query_sql(&format!(
+                    "SELECT _id FROM vector_search('emb', '{}')",
+                    csv_one_hot(dim, 0)
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vector_search_exec_display_describes_invocation() {
+        let dim = 16;
+        let st = supertable_one_superfile(dim, 8);
+        let batches = st
+            .reader()
+            .query_sql(&format!(
+                "EXPLAIN SELECT _id FROM vector_search('emb', '{}', 5)",
+                csv_one_hot(dim, 0)
+            ))
+            .expect("explain");
+        let mut text = String::new();
+        for b in &batches {
+            for c in b.columns() {
+                if let Some(s) = c.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..s.len() {
+                        if !s.is_null(i) {
+                            text.push_str(s.value(i));
+                            text.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            text.contains("VectorSearchExec")
+                && text.contains("column=emb")
+                && text.contains("k=5")
+                && text.contains(&format!("dim={dim}")),
+            "vector describe missing: {text}"
+        );
+    }
 }

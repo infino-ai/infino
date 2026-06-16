@@ -848,4 +848,124 @@ mod tests {
         // trait's idempotent-delete contract.
         ws.delete_state(state.wal_id).await.expect("second delete");
     }
+
+    // ---- delete_arrow is idempotent --------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_arrow_is_idempotent_and_removes_sidecar() {
+        let (_dir, ws) = store();
+        let wal_id = WalId(43);
+        ws.put_arrow(wal_id, Bytes::from_static(b"payload"))
+            .await
+            .expect("put_arrow");
+        // First delete removes it.
+        ws.delete_arrow(wal_id).await.expect("first delete");
+        // Re-fetch now fails (object gone) — confirms the delete landed.
+        ws.get_arrow(wal_id, None)
+            .await
+            .expect_err("sidecar must be gone after delete");
+        // Second delete against the absent path is still Ok.
+        ws.delete_arrow(wal_id).await.expect("second delete");
+    }
+
+    // ---- list_wal_ids enumerates + sorts state docs ----------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_wal_ids_returns_only_state_docs_sorted_ascending() {
+        let (_dir, ws) = store();
+        // Create three state docs out of ascending order.
+        for id in [50i128, 10, 30] {
+            ws.create(&sample_state(id)).await.expect("create");
+        }
+        // Drop an `.arrow` sidecar under the same prefix — it must
+        // NOT appear in the list (only `.json` state docs do).
+        ws.put_arrow(WalId(99), Bytes::from_static(b"ignored"))
+            .await
+            .expect("put_arrow");
+
+        let ids = ws.list_wal_ids().await.expect("list");
+        let raw: Vec<i128> = ids.iter().map(|w| w.0).collect();
+        assert_eq!(raw, vec![10, 30, 50], "ascending oldest-first order");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_wal_ids_on_empty_prefix_is_empty() {
+        let (_dir, ws) = store();
+        let ids = ws.list_wal_ids().await.expect("list");
+        assert!(ids.is_empty());
+    }
+
+    // ---- list_tombstone_ids enumerates sidecars --------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_tombstone_ids_returns_superfiles_with_sidecars() {
+        let (_dir, ws) = store();
+        let a = uuid::Uuid::from_u128(0x1111);
+        let b = uuid::Uuid::from_u128(0x2222);
+        let empty = TombstonesSidecar {
+            seal: None,
+            bitmap: roaring::RoaringBitmap::new(),
+        };
+        ws.put_tombstones(a, None, &empty).await.expect("put a");
+        ws.put_tombstones(b, None, &empty).await.expect("put b");
+
+        let mut ids = ws.list_tombstone_ids().await.expect("list");
+        ids.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_tombstone_ids_on_empty_prefix_is_empty() {
+        let (_dir, ws) = store();
+        let ids = ws.list_tombstone_ids().await.expect("list");
+        assert!(ids.is_empty());
+    }
+
+    // ---- put_tombstones create-only via Some(empty etag) -----------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_tombstones_with_empty_expected_etag_is_create_only() {
+        // `Some(empty)` collapses to `None` (create-only) inside
+        // put_tombstones; a first write under it must land, and a
+        // second create-only write against the now-present object
+        // must lose CAS.
+        let (_dir, ws) = store();
+        let superfile_id = uuid::Uuid::from_u128(0xABCD);
+        let mut bitmap = roaring::RoaringBitmap::new();
+        bitmap.insert(1);
+        let sidecar = TombstonesSidecar { seal: None, bitmap };
+        let empty_etag: Etag = String::new();
+        ws.put_tombstones(superfile_id, Some(&empty_etag), &sidecar)
+            .await
+            .expect("first create-only put lands");
+        let err = ws
+            .put_tombstones(superfile_id, Some(&empty_etag), &sidecar)
+            .await
+            .expect_err("second create-only put must lose CAS");
+        assert!(matches!(err, WalStoreError::CasFailed { .. }), "{err:?}");
+    }
+
+    // ---- get_tombstones surfaces a decode error on garbage bytes ---------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_tombstones_surfaces_codec_error_on_corrupt_bytes() {
+        let (dir, ws) = store();
+        let superfile_id = uuid::Uuid::from_u128(0xDEAD);
+        // Write raw garbage directly to the sidecar path, bypassing
+        // the encoder, so the decode in `get_tombstones` fails.
+        let provider: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let path = WalStore::tombstones_path(superfile_id);
+        provider
+            .put_atomic(&path, Bytes::from_static(b"not a valid sidecar"))
+            .await
+            .expect("write garbage");
+        let err = ws
+            .get_tombstones(superfile_id)
+            .await
+            .expect_err("decode must fail");
+        assert!(matches!(err, WalStoreError::SidecarCodec { .. }), "{err:?}");
+    }
 }

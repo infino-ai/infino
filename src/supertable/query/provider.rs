@@ -1473,4 +1473,194 @@ mod tests {
             "non-FTS predicate matching all superfiles prunes nothing"
         );
     }
+
+    /// Build a provider over a freshly-committed two-superfile table
+    /// (the `cat_title` schema), returning the provider and a runtime to
+    /// drive its async surface.
+    fn provider_over_two_superfiles() -> (SupertableProvider, tokio::runtime::Runtime) {
+        let st = Supertable::create(cat_title_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&cat_title_batch(&["a", "a"], &["alpha beta", "gamma"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
+        w.commit().expect("c2");
+
+        let reader = st.reader();
+        let provider = SupertableProvider::new(
+            st.options().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        (provider, rt)
+    }
+
+    #[test]
+    fn trait_accessors_and_debug() {
+        let (provider, _rt) = provider_over_two_superfiles();
+
+        // as_any downcasts back to the concrete provider.
+        assert!(
+            provider
+                .as_any()
+                .downcast_ref::<SupertableProvider>()
+                .is_some()
+        );
+        // table_type is a base table.
+        assert!(matches!(provider.table_type(), TableType::Base));
+        // schema() returns the scalar schema (category + title + _id).
+        let sch = provider.schema();
+        assert!(sch.field_with_name("category").is_ok());
+        assert!(sch.field_with_name("title").is_ok());
+
+        // Debug renders a structural summary, not the trait-object fields.
+        let dbg = format!("{provider:?}");
+        assert!(dbg.contains("SupertableProvider"));
+        assert!(dbg.contains("n_superfiles"));
+    }
+
+    #[test]
+    fn supports_filters_pushdown_is_always_inexact() {
+        let (provider, _rt) = provider_over_two_superfiles();
+        let f1 = col("category").eq(lit("a"));
+        let f2 = col("title").eq(lit("alpha"));
+        let filters = [&f1, &f2];
+        let pushdown = provider
+            .supports_filters_pushdown(&filters)
+            .expect("pushdown");
+        assert_eq!(pushdown.len(), 2);
+        assert!(
+            pushdown
+                .iter()
+                .all(|p| matches!(p, TableProviderFilterPushDown::Inexact))
+        );
+    }
+
+    #[test]
+    fn statistics_exact_on_clean_in_memory_flat_manifest() {
+        let (provider, _rt) = provider_over_two_superfiles();
+        // In-memory (no manifest list) flat manifest → whole-table
+        // statistics are available and the row count is Exact (3 docs,
+        // no tombstones).
+        let stats = provider.statistics().expect("flat-manifest statistics");
+        assert!(matches!(stats.num_rows, Precision::Exact(3)));
+        // One ColumnStatistics per scalar-schema field.
+        assert_eq!(
+            stats.column_statistics.len(),
+            provider.schema().fields().len()
+        );
+    }
+
+    #[test]
+    fn manifest_accessor_and_restricted_to_idempotency_guard() {
+        let (provider, _rt) = provider_over_two_superfiles();
+        // Unrestricted provider is not a residual scan.
+        assert!(!provider.is_segment_restricted());
+
+        // manifest() exposes the pinned snapshot.
+        let ids: Vec<uuid::Uuid> = provider
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+
+        // restricted_to keeps only the named segment and flips the guard.
+        let only_first: std::collections::HashSet<uuid::Uuid> = [ids[0]].into_iter().collect();
+        let restricted = provider.restricted_to(only_first);
+        assert!(restricted.is_segment_restricted());
+        // Both providers see the same pinned manifest (Arc::clone).
+        assert!(Arc::ptr_eq(restricted.manifest(), provider.manifest()));
+    }
+
+    #[test]
+    fn entry_is_clean_true_without_tombstone_overlay() {
+        let (provider, _rt) = provider_over_two_superfiles();
+        // In-memory tables carry no tombstone overlay, so every entry is
+        // trivially clean.
+        for entry in provider.manifest().superfiles.iter() {
+            assert!(provider.entry_is_clean(entry));
+        }
+    }
+
+    #[test]
+    fn restricted_provider_scans_only_its_segment() {
+        let (provider, rt) = provider_over_two_superfiles();
+        let first = provider.manifest().superfiles[0].superfile_id;
+        let only_first: std::collections::HashSet<uuid::Uuid> = [first].into_iter().collect();
+        let restricted = provider.restricted_to(only_first);
+        // With no filters, the unrestricted provider keeps both
+        // superfiles; the restricted one keeps only the allowed segment.
+        assert_eq!(rt.block_on(provider.surviving_superfile_count(&[])), 2);
+        assert_eq!(rt.block_on(restricted.surviving_superfile_count(&[])), 1);
+    }
+
+    // ---- Scalar aggregate helpers over a numeric column -------------
+
+    fn num_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]))
+    }
+
+    fn num_opts() -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        // No FTS column — this fixture exercises the scalar-stats path
+        // (min/max/sum/null/distinct), not the term bloom.
+        SupertableOptions::new(num_schema(), vec![], vec![], None)
+            .expect("opts")
+            .with_writer_pool(pool)
+    }
+
+    fn num_batch(vals: &[Option<i64>]) -> RecordBatch {
+        RecordBatch::try_new(
+            num_schema(),
+            vec![Arc::new(Int64Array::from(vals.to_vec()))],
+        )
+        .expect("batch")
+    }
+
+    #[test]
+    fn statistics_for_aggregates_scalar_stats_across_superfiles() {
+        let st = Supertable::create(num_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        // Superfile 1: 1,2,3 (one null). Superfile 2: 10, 20.
+        w.append(&num_batch(&[Some(1), Some(2), Some(3), None]))
+            .expect("a1");
+        w.commit().expect("c1");
+        w.append(&num_batch(&[Some(10), Some(20)])).expect("a2");
+        w.commit().expect("c2");
+
+        let reader = st.reader();
+        let provider = SupertableProvider::new(
+            st.options().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        );
+
+        let stats = provider.statistics().expect("statistics");
+        // 6 rows total across both superfiles, clean view → Exact.
+        assert!(matches!(stats.num_rows, Precision::Exact(6)));
+
+        // Find the `n` column's statistics and assert aggregated min/max.
+        let sch = provider.schema();
+        let n_idx = sch.index_of("n").expect("n column");
+        let cs = &stats.column_statistics[n_idx];
+        assert_eq!(cs.min_value, Precision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(cs.max_value, Precision::Exact(ScalarValue::Int64(Some(20))));
+        // One null planted in superfile 1.
+        assert_eq!(cs.null_count, Precision::Exact(1));
+    }
 }

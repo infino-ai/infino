@@ -1537,7 +1537,160 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_phase_without_storage_is_rejected() {
+        // A supertable with no storage attached can't commit the
+        // manifest, so `do_apply` surfaces NoStorageAttached. We use
+        // a fresh in-memory supertable + an independent WalStore
+        // (storage-backed only for the WAL artifacts) so the
+        // idempotency probe misses and we fall through to do_apply.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        // Supertable WITHOUT storage.
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        let ws = WalStore::new(Arc::clone(&storage));
+
+        let user_batch = build_title_batch(&["x"]);
+        let ipc_bytes = encode_ipc(&user_batch);
+        let content_hash = blake3::hash(&ipc_bytes).to_hex().to_string();
+        let wal_id = WalId(701);
+        ws.put_arrow(wal_id, ipc_bytes).await.expect("put_arrow");
+        let wal_doc = WalStateDoc {
+            wal_id,
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Update,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "no storage".into(),
+            target_ids: vec![RowId(1)],
+            new_row_count: Some(1),
+            new_row_content_hash: Some(content_hash),
+            preallocated_superfile_id: Some(Uuid::from_u128(0x7070)),
+            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+                first: RowId(1),
+                last: RowId(1),
+            }],
+            tombstone_progress: vec![TombstoneEntry {
+                target_id: RowId(1),
+                outcome: TombstoneOutcome::Pending,
+                tombstoned_in_superfile: None,
+            }],
+        };
+        let etag = ws.create(&wal_doc).await.expect("create");
+        let err = run_append_phase(&st, &ws, &wal_doc, &etag)
+            .await
+            .expect_err("must error without storage");
+        assert!(
+            matches!(err, AppendPhaseError::NoStorageAttached),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_phase_missing_new_row_count_is_rejected() {
+        let (_dir, st, ws, mut wal, etag) = fixture_with_ipc_payload(&["foo"], 711, 1_000).await;
+        wal.new_row_count = None;
+        let bad_etag = ws
+            .update_with_etag(wal.wal_id, &etag, &wal)
+            .await
+            .expect("re-cas");
+        let err = run_append_phase(&st, &ws, &wal, &bad_etag)
+            .await
+            .expect_err("must error");
+        assert!(
+            matches!(
+                err,
+                AppendPhaseError::MissingField {
+                    field: "new_row_count"
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_phase_id_span_count_mismatch_is_rejected() {
+        // new_row_count says 1 but the minted_id_spans flatten to 2
+        // ids — the lockstep invariant is violated, surfacing a
+        // typed IdSpansLengthMismatch.
+        let (_dir, st, ws, mut wal, etag) = fixture_with_ipc_payload(&["foo"], 721, 1_000).await;
+        wal.minted_id_spans = vec![crate::supertable::wal::state_doc::IdSpan {
+            first: RowId(1),
+            last: RowId(2), // two ids, but new_row_count == 1
+        }];
+        let bad_etag = ws
+            .update_with_etag(wal.wal_id, &etag, &wal)
+            .await
+            .expect("re-cas");
+        let err = run_append_phase(&st, &ws, &wal, &bad_etag)
+            .await
+            .expect_err("must error");
+        assert!(
+            matches!(
+                err,
+                AppendPhaseError::IdSpansLengthMismatch {
+                    flat_len: 2,
+                    expected: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_phase_corrupt_ipc_surfaces_decode_error() {
+        // The recorded content hash matches the stored bytes (so the
+        // hash check passes), but the bytes aren't a valid IPC
+        // stream — decode_ipc_batch fails with IpcDecode.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let ws = WalStore::new(Arc::clone(&storage));
+        let wal_id = WalId(731);
+        let garbage = Bytes::from_static(b"this is not arrow ipc");
+        let content_hash = blake3::hash(&garbage).to_hex().to_string();
+        ws.put_arrow(wal_id, garbage).await.expect("put_arrow");
+        let wal_doc = WalStateDoc {
+            wal_id,
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Update,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "corrupt ipc".into(),
+            target_ids: vec![RowId(1)],
+            new_row_count: Some(1),
+            new_row_content_hash: Some(content_hash),
+            preallocated_superfile_id: Some(Uuid::from_u128(0x7373)),
+            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+                first: RowId(1),
+                last: RowId(1),
+            }],
+            tombstone_progress: vec![TombstoneEntry {
+                target_id: RowId(1),
+                outcome: TombstoneOutcome::Pending,
+                tombstoned_in_superfile: None,
+            }],
+        };
+        let etag = ws.create(&wal_doc).await.expect("create");
+        let err = run_append_phase(&st, &ws, &wal_doc, &etag)
+            .await
+            .expect_err("must error on bad ipc");
+        assert!(matches!(err, AppendPhaseError::IpcDecode { .. }), "{err:?}");
+    }
+
     // ---- flatten_spans property ----------------------------------------
+
+    #[test]
+    fn flatten_spans_empty_is_empty() {
+        assert!(flatten_spans(&[]).is_empty());
+    }
 
     #[test]
     fn flatten_spans_concatenates_inclusive_ranges_in_order() {

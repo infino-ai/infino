@@ -1119,4 +1119,124 @@ mod tests {
         let s = format!("{:?}", r);
         assert!(s.contains("SupertableReader"));
     }
+
+    #[test]
+    fn schema_returns_user_schema_without_injected_id() {
+        let st = Supertable::create(opts()).expect("create");
+        let sch = st.schema();
+        // The user-facing schema is exactly the column the test fixture
+        // declared — the auto-injected `_id` is not part of it.
+        assert_eq!(sch.fields().len(), 1);
+        assert_eq!(sch.field(0).name(), "title");
+    }
+
+    #[test]
+    fn manifest_accessor_matches_reader_manifest_id() {
+        let st = Supertable::create(opts()).expect("create");
+        assert_eq!(st.manifest_id(), 0);
+        publish_appended(&st, vec![entry(3)]);
+        // The handle-level `manifest_id` advances with the swap, and a
+        // fresh reader pins the same value.
+        assert_eq!(st.manifest_id(), 1);
+        assert_eq!(st.reader().manifest_id(), 1);
+    }
+
+    #[test]
+    fn handle_id_is_stable_for_a_handle_and_distinct_across_handles() {
+        let st1 = Supertable::create(opts()).expect("create");
+        let st2 = Supertable::create(opts()).expect("create");
+        // Stable within one handle (and its clones).
+        assert_eq!(st1.handle_id(), st1.clone().handle_id());
+        // Distinct across independently-created handles.
+        assert_ne!(st1.handle_id(), st2.handle_id());
+    }
+
+    #[test]
+    fn query_runtime_is_lazily_built_and_cached() {
+        let st = Supertable::create(opts()).expect("create");
+        let rt1 = st.query_runtime();
+        let rt2 = st.query_runtime();
+        // Second call returns the same cached runtime, not a fresh one.
+        assert!(Arc::ptr_eq(&rt1, &rt2));
+    }
+
+    #[test]
+    fn block_on_query_drives_a_future_to_completion() {
+        let st = Supertable::create(opts()).expect("create");
+        let out = st.block_on_query(async { 7_u32 + 35 });
+        assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn stats_reports_in_memory_snapshot() {
+        let st = Supertable::create(opts()).expect("create");
+        publish_appended(&st, vec![entry(10), entry(20)]);
+        let s = st.stats();
+        assert_eq!(s.manifest_id, 1);
+        assert_eq!(s.n_superfiles, 2);
+        // In-memory supertable has no manifest list / disk cache.
+        assert_eq!(s.n_manifest_parts, None);
+        assert_eq!(s.mmap_resident_bytes, None);
+        assert_eq!(s.n_cold_fetches, None);
+    }
+
+    #[test]
+    fn wait_until_warm_is_noop_without_disk_cache() {
+        let st = Supertable::create(opts()).expect("create");
+        // No disk cache attached → returns Ok immediately.
+        st.wait_until_warm(std::time::Duration::from_millis(1))
+            .expect("warm no-op");
+    }
+
+    #[test]
+    fn debug_cached_session_populates_the_session_cache() {
+        let st = Supertable::create(opts()).expect("create");
+        // Building the diagnostic session forces a SessionContext to be
+        // built and cached on the inner.
+        let _ctx = st.__debug_cached_session();
+        let guard = st
+            .sql_session_cache()
+            .lock()
+            .expect("sql_session_cache mutex");
+        assert!(guard.is_some(), "session cache populated after warm-up");
+    }
+
+    #[test]
+    fn weak_reader_round_trips_and_debug() {
+        let st = Supertable::create(opts()).expect("create");
+        publish_appended(&st, vec![entry(4)]);
+        let reader = st.reader();
+        let weak = WeakReader::from_reader(&reader);
+        // Debug is non-exhaustive but must not explode.
+        assert!(format!("{weak:?}").contains("WeakReader"));
+        // While the parent + reader are alive, upgrade succeeds and
+        // observes the same pinned snapshot.
+        let upgraded = weak.upgrade().expect("upgrade while inner alive");
+        assert_eq!(upgraded.manifest_id(), reader.manifest_id());
+        assert_eq!(upgraded.n_superfiles(), 1);
+    }
+
+    #[test]
+    fn weak_reader_upgrade_fails_after_inner_dropped() {
+        let weak = {
+            let st = Supertable::create(opts()).expect("create");
+            let reader = st.reader();
+            let weak = WeakReader::from_reader(&reader);
+            drop(reader);
+            drop(st);
+            weak
+        };
+        // The owning inner is gone, so upgrade yields None.
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn reader_options_match_handle_options() {
+        let st = Supertable::create(opts()).expect("create");
+        let r = st.reader();
+        // The reader's options accessor reaches the same validated
+        // options the handle exposes.
+        assert_eq!(r.options().id_column, st.options().id_column);
+        assert_eq!(r.options().fts_columns.len(), 1);
+    }
 }
