@@ -630,7 +630,7 @@ pub fn open_superfile_cold_reader(
     (cache_dir, reader)
 }
 
-fn fresh_disk_cache_with_mode(
+pub(crate) fn fresh_disk_cache_with_mode(
     storage: Arc<dyn StorageProvider>,
     disk_budget_bytes: u64,
     cold_fetch_mode: ColdFetchMode,

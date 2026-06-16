@@ -105,7 +105,7 @@ use infino::superfile::vector::distance::Metric;
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::supertable::SuperfileUri;
 use infino::supertable::query::VectorSearchOptions;
-use infino::supertable::reader_cache::DiskCacheStore;
+use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheStore};
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
 use infino::supertable::{Supertable, SupertableOptions};
 use infino::test_helpers::default_tokenizer;
@@ -570,6 +570,16 @@ pub fn run() {
     }
     if std::env::var("INFINO_DIAG_QUERY_SQL_OVERHEAD").is_ok() {
         diag::diagnose_query_sql_overhead();
+        return;
+    }
+    // Unhinted-vs-hinted cold-open / cold-search A/B over s3s-fs (no
+    // real-S3 credentials needed). The hinted path mirrors what the
+    // supertable pays (manifest `open_blob` offsets → parallel
+    // prefetch); the unhinted path is the pointer-chasing footer walk.
+    // Surfaces the serial-wave depth of each, which the always-on
+    // summary `run()` collapses into one phase number.
+    if std::env::var("INFINO_DIAG_S3S_COLD").is_ok() {
+        diag::diagnose_s3s_fs_cold_path();
         return;
     }
 
@@ -1250,7 +1260,6 @@ pub(crate) mod diag {
     /// the cold-fetch coordinator issues against the wire. The
     /// unhinted-vs-hinted A/B + raw-RTT probes here go beyond the
     /// always-on summary `run()` emits; kept as an opt-in deep dive.
-    #[allow(dead_code)]
     pub fn diagnose_s3s_fs_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
         let superfile = superfile_bytes();
@@ -1664,9 +1673,170 @@ pub(crate) mod diag {
     /// vector+FTS supertable through `SupertableOptions::apply_config`,
     /// commit to S3, then reopen from a fresh config-backed handle and
     /// time cold open, cold vector, cold BM25, and warm repeated reads.
+    /// Read-path meter that counts **whole-object `get` as well as
+    /// `get_range`/`tail`**. The shared `storage_meter` records only range
+    /// reads, but the supertable manifest — pointer, list, and the parts
+    /// carrying the per-cluster centroid summary — is fetched via
+    /// whole-object `get` (`handle::open_async`), so isolating that traffic
+    /// needs a meter that sees `get`.
+    /// Range reads below this size are foreground Wave A/B prefix/rerank
+    /// fetches (the critical-path round trips); at/above it they are
+    /// background whole-superfile fill chunks (`cold_fetch_chunk_bytes`
+    /// ≈ 8 MiB). Splitting them isolates the Wave A round trips from the
+    /// bandwidth-bound background fill.
+    const FG_RANGE_MAX_BYTES: u64 = 1 << 20;
+
+    /// Foreground GET latency histogram bucket upper bounds (ms). Aligned
+    /// to retry-backoff steps: a 13 KB GET floors at ~35 ms, so a clean
+    /// `<50` peak = no retry, and peaks at `50–150` / `150–350` / `350+`
+    /// (floor + 1/2/3× object_store backoff) are the discrete signature of
+    /// 503-throttle retries — vs a continuous smear, which would mean
+    /// connection/bandwidth contention rather than retries.
+    const FG_LAT_BUCKET_MAX_MS: [u64; 4] = [50, 150, 350, 750];
+
+    #[derive(Default)]
+    struct ReadMeter {
+        get_count: AtomicU64,
+        get_bytes: AtomicU64,
+        fg_count: AtomicU64,
+        fg_bytes: AtomicU64,
+        fg_lat_sum_us: AtomicU64,
+        fg_lat_max_us: AtomicU64,
+        // 5 buckets: <50, 50–150, 150–350, 350–750, 750+ ms.
+        fg_lat_buckets: [AtomicU64; 5],
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct ReadMeterSnapshot {
+        get_count: u64,
+        get_bytes: u64,
+        fg_count: u64,
+        fg_bytes: u64,
+        fg_lat_sum_us: u64,
+        fg_lat_max_us: u64,
+        fg_lat_buckets: [u64; 5],
+    }
+
+    impl ReadMeter {
+        fn snapshot(&self) -> ReadMeterSnapshot {
+            ReadMeterSnapshot {
+                get_count: self.get_count.load(Ordering::Relaxed),
+                get_bytes: self.get_bytes.load(Ordering::Relaxed),
+                fg_count: self.fg_count.load(Ordering::Relaxed),
+                fg_bytes: self.fg_bytes.load(Ordering::Relaxed),
+                fg_lat_sum_us: self.fg_lat_sum_us.load(Ordering::Relaxed),
+                fg_lat_max_us: self.fg_lat_max_us.load(Ordering::Relaxed),
+                fg_lat_buckets: std::array::from_fn(|i| {
+                    self.fg_lat_buckets[i].load(Ordering::Relaxed)
+                }),
+            }
+        }
+        fn record(&self, bytes: u64, lat: Duration) {
+            self.get_count.fetch_add(1, Ordering::Relaxed);
+            self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+            if bytes < FG_RANGE_MAX_BYTES {
+                let lat_us = lat.as_micros() as u64;
+                let lat_ms = lat_us / 1000;
+                self.fg_count.fetch_add(1, Ordering::Relaxed);
+                self.fg_bytes.fetch_add(bytes, Ordering::Relaxed);
+                self.fg_lat_sum_us.fetch_add(lat_us, Ordering::Relaxed);
+                self.fg_lat_max_us.fetch_max(lat_us, Ordering::Relaxed);
+                let b = FG_LAT_BUCKET_MAX_MS
+                    .iter()
+                    .position(|&hi| lat_ms < hi)
+                    .unwrap_or(FG_LAT_BUCKET_MAX_MS.len());
+                self.fg_lat_buckets[b].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    struct MeteredReads {
+        inner: Arc<dyn StorageProvider>,
+        meter: Arc<ReadMeter>,
+    }
+
+    impl std::fmt::Debug for MeteredReads {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MeteredReads").finish_non_exhaustive()
+        }
+    }
+
+    impl MeteredReads {
+        /// Wrap `inner`, returning the metered provider and a handle to read
+        /// cumulative `get`/`get_range`/`tail` counts + bytes.
+        fn new(inner: Arc<dyn StorageProvider>) -> (Arc<dyn StorageProvider>, Arc<ReadMeter>) {
+            let meter = Arc::new(ReadMeter::default());
+            let provider: Arc<dyn StorageProvider> = Arc::new(MeteredReads {
+                inner,
+                meter: Arc::clone(&meter),
+            });
+            (provider, meter)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for MeteredReads {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            let t = Instant::now();
+            let (bytes, meta) = self.inner.get(uri).await?;
+            self.meter.record(bytes.len() as u64, t.elapsed());
+            Ok((bytes, meta))
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            let t = Instant::now();
+            let bytes = self.inner.get_range(uri, range).await?;
+            self.meter.record(bytes.len() as u64, t.elapsed());
+            Ok(bytes)
+        }
+        async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+            let t = Instant::now();
+            let (bytes, size) = self.inner.tail(uri, len).await?;
+            self.meter.record(bytes.len() as u64, t.elapsed());
+            Ok((bytes, size))
+        }
+        async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(
+            &self,
+            uri: &str,
+        ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+        async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list_with_prefix(prefix).await
+        }
+        fn object_store_handle(
+            &self,
+            uri: &str,
+        ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+            self.inner.object_store_handle(uri)
+        }
+    }
+
     pub fn diagnose_real_s3_supertable_e2e() {
         let rt = Runtime::new().expect("tokio runtime");
-        let n = quick_iter_n_docs();
+        // Honor INFINO_BENCH_SUPERTABLE_DOCS so this diag can run at the
+        // 1M / 10M shapes where the manifest centroid summary dominates cold
+        // open; unset keeps the quick single-digit-second default.
+        let n = std::env::var("INFINO_BENCH_SUPERTABLE_DOCS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(quick_iter_n_docs);
         let nprobe = BENCH_NPROBE;
         let bucket = std::env::var("INFINO_REAL_S3_BUCKET")
             .or_else(|_| std::env::var("INFINO_TEST_REAL_S3_BUCKET"))
@@ -1711,22 +1881,67 @@ pub(crate) mod diag {
                 );
             }
 
+            // Meter the manifest read path: wrap a dedicated S3 provider and
+            // inject it via `with_storage` (which overrides the provider the
+            // supertable uses for manifest/centroid reads — `apply_config`
+            // builds the disk cache over its own provider, so superfile-byte
+            // cold fetches stay unmetered). The manifest carries the
+            // dim-scaled per-cluster centroid summary; per-phase GET deltas
+            // reveal whether it is fetched at open or lazily during the first
+            // search, and how many bytes it costs.
+            let (metered_provider, meter) = MeteredReads::new(Arc::new(
+                S3StorageProvider::new_with_prefix(
+                    cfg.storage.bucket.as_deref().expect("bucket in cfg"),
+                    &cfg.storage.prefix,
+                )
+                .expect("metered manifest S3 provider"),
+            ) as Arc<dyn StorageProvider>);
+            // Build the disk cache OVER the metered provider so Wave A/B cold
+            // fetches (superfile chunks) are counted — `apply_config` would
+            // otherwise build it over its own un-metered provider. Per-phase
+            // meter deltas then separate manifest (open) bytes from Wave A/B
+            // (search) bytes, settling RTT- vs bandwidth-bound. Kept alive to
+            // end of block (TempDir drop deletes the cache dir).
+            // INFINO_DIAG_COLD_FETCH_MODE lets us A/B the background-fill
+            // contention hypothesis: `range-only` fetches just the foreground
+            // ranges (no whole-superfile fill), `lazy` (default) keeps the
+            // background fill, `hybrid` prefetches.
+            let cold_fetch_mode = match std::env::var("INFINO_DIAG_COLD_FETCH_MODE")
+                .ok()
+                .as_deref()
+            {
+                Some("range-only") | Some("rangeonly") | Some("range") => ColdFetchMode::RangeOnly,
+                Some("hybrid") => ColdFetchMode::HybridWithPrefetch,
+                _ => ColdFetchMode::LazyForegroundWithBackgroundFill,
+            };
+            eprintln!("[diag-real-s3-supertable] cold_fetch_mode={cold_fetch_mode:?}");
+            let (_metered_cache_dir, metered_cache) = crate::tiers::fresh_disk_cache_with_mode(
+                Arc::clone(&metered_provider),
+                cfg.storage.disk_budget_bytes,
+                cold_fetch_mode,
+            );
+            let meter_start = meter.snapshot();
             let open_t0 = Instant::now();
             let consumer = Supertable::open(
                 real_s3_supertable_options()
                     .apply_config(&cfg)
                     .expect("apply real S3 config to consumer")
+                    .with_storage(Arc::clone(&metered_provider))
+                    .with_disk_cache(metered_cache)
                     .with_read_consistency(infino::supertable::options::Consistency::Snapshot),
             )
             .expect("open unified supertable from real S3");
             let cold_open = open_t0.elapsed();
+            let meter_after_open = meter.snapshot();
             let reader = consumer.reader();
             eprintln!(
-                "[diag-real-s3-supertable] cold_open wall={:.1} ms manifest_id={} n_superfiles={} n_docs_total={}",
+                "[diag-real-s3-supertable] cold_open wall={:.1} ms manifest_id={} n_superfiles={} n_docs_total={} | manifest GETs={} bytes={:.1} MiB",
                 cold_open.as_secs_f64() * MS_PER_SEC,
                 consumer.manifest_id(),
                 reader.n_superfiles(),
-                reader.n_docs_total()
+                reader.n_docs_total(),
+                meter_after_open.get_count - meter_start.get_count,
+                (meter_after_open.get_bytes - meter_start.get_bytes) as f64 / 1024.0 / 1024.0,
             );
 
             {
@@ -1760,10 +1975,37 @@ pub(crate) mod diag {
                 )
                 .expect("cold vector search over real S3 supertable");
             let cold_vec = vec_t0.elapsed();
+            let meter_after_vec = meter.snapshot();
+            let mib = |b: u64| b as f64 / 1024.0 / 1024.0;
+            let fg_gets = meter_after_vec.fg_count - meter_after_open.fg_count;
+            let fg_bytes = meter_after_vec.fg_bytes - meter_after_open.fg_bytes;
+            let fg_lat_sum_ms =
+                (meter_after_vec.fg_lat_sum_us - meter_after_open.fg_lat_sum_us) as f64 / 1000.0;
+            let fg_lat_avg_ms = if fg_gets > 0 {
+                fg_lat_sum_ms / fg_gets as f64
+            } else {
+                0.0
+            };
+            let fg_lat_max_ms = meter_after_vec.fg_lat_max_us as f64 / 1000.0;
+            let tot_gets = meter_after_vec.get_count - meter_after_open.get_count;
+            let tot_bytes = meter_after_vec.get_bytes - meter_after_open.get_bytes;
             eprintln!(
-                "[diag-real-s3-supertable] cold_vector wall={:.1} ms hits={} nprobe={nprobe}",
+                "[diag-real-s3-supertable] cold_vector wall={:.1} ms hits={} nprobe={nprobe} | \
+                 WaveA/B foreground(<1MiB) GETs={fg_gets} bytes={:.1} MiB lat(avg={fg_lat_avg_ms:.1} max={fg_lat_max_ms:.1} ms) | \
+                 total(incl bg fill) GETs={tot_gets} bytes={:.1} MiB",
                 cold_vec.as_secs_f64() * MS_PER_SEC,
-                vec_hits.len()
+                vec_hits.len(),
+                mib(fg_bytes),
+                mib(tot_bytes),
+            );
+            let hb: [u64; 5] = std::array::from_fn(|i| {
+                meter_after_vec.fg_lat_buckets[i] - meter_after_open.fg_lat_buckets[i]
+            });
+            eprintln!(
+                "[diag-real-s3-supertable] cold_vector fg-GET latency histogram (ms, isolated floor ~35): \
+                 <50={} 50-150={} 150-350={} 350-750={} 750+={} \
+                 (floor<50 = warm-conn reuse; higher = per-GET cost under the concurrent burst)",
+                hb[0], hb[1], hb[2], hb[3], hb[4],
             );
 
             let bm25_t0 = Instant::now();
@@ -1811,6 +2053,87 @@ pub(crate) mod diag {
                 warm_bm25.as_secs_f64() * MS_PER_SEC,
                 warm_bm25_hits.len()
             );
+
+            // Isolated single-GET latency floor: sequential small-range GETs
+            // on the same prefix, no fan-out. If this is far below the
+            // in-query foreground GET latency (~160 ms), the in-query
+            // inflation is burst/concurrency-induced (S3 per-prefix throttle
+            // + retry backoff, or connection storm) rather than intrinsic GET
+            // cost — i.e. partly a fresh-prefix bench artifact.
+            if let Some(path) = consumer
+                .reader()
+                .manifest()
+                .superfiles
+                .first()
+                .map(|e| e.uri.storage_path())
+            {
+                const ISO_ITERS: usize = 10;
+                let mut sum_ms = 0.0_f64;
+                let mut max_ms = 0.0_f64;
+                for _ in 0..ISO_ITERS {
+                    let t = Instant::now();
+                    let _ = metered_provider.get_range(&path, 0u64..16384).await;
+                    let ms = t.elapsed().as_secs_f64() * MS_PER_SEC;
+                    sum_ms += ms;
+                    max_ms = max_ms.max(ms);
+                }
+                eprintln!(
+                    "[diag-real-s3-supertable] isolated 16KiB GET (sequential, no fan-out): avg={:.1} max={:.1} ms over {ISO_ITERS} iters",
+                    sum_ms / ISO_ITERS as f64,
+                    max_ms
+                );
+            }
+
+            // Optional cold-query loop for profiling. Each iter rebuilds a
+            // fresh disk cache + consumer so the vector search is a true cold
+            // query, giving a sustained cold-fetch window to profile without
+            // the one-time ingest in the trace. Prints the PID and pauses so
+            // a profiler (perf) can attach to just this window.
+            if let Some(iters) = std::env::var("INFINO_DIAG_COLD_VECTOR_ITERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+            {
+                eprintln!(
+                    "[diag-real-s3-supertable] PROFILE: pid={} — attach perf now; cold-query loop ({iters} iters) starts in 10s",
+                    std::process::id()
+                );
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let loop_t0 = Instant::now();
+                for _ in 0..iters {
+                    let (_cache_dir, cache) = crate::tiers::fresh_disk_cache_with_mode(
+                        Arc::clone(&metered_provider),
+                        cfg.storage.disk_budget_bytes,
+                        ColdFetchMode::LazyForegroundWithBackgroundFill,
+                    );
+                    let c = Supertable::open(
+                        real_s3_supertable_options()
+                            .apply_config(&cfg)
+                            .expect("apply cfg (profile loop)")
+                            .with_storage(Arc::clone(&metered_provider))
+                            .with_disk_cache(cache)
+                            .with_read_consistency(
+                                infino::supertable::options::Consistency::Snapshot,
+                            ),
+                    )
+                    .expect("open consumer (profile loop)");
+                    let _ = c
+                        .reader()
+                        .vector_search(
+                            VEC_COLUMN,
+                            &query,
+                            TOP_K,
+                            VectorSearchOptions::new().with_nprobe(nprobe),
+                            None,
+                        )
+                        .expect("cold vector search (profile loop)");
+                    drop(c);
+                }
+                eprintln!(
+                    "[diag-real-s3-supertable] PROFILE: cold-query loop done in {:.1} ms",
+                    loop_t0.elapsed().as_secs_f64() * MS_PER_SEC
+                );
+            }
             })
         }));
 

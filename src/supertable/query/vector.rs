@@ -63,6 +63,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -82,6 +84,15 @@ use super::exec::common::resolve_hits_named;
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
+}
+
+/// Stage-timing toggle for cold/warm latency attribution. When
+/// `INFINO_DIAG_VECTOR_STAGES` is set, [`vector_search_async`] logs the
+/// superfile-gather / global-selection / fan-out split so we can tell which
+/// stage owns a query's wall time. Read once; zero overhead when unset.
+fn stage_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INFINO_DIAG_VECTOR_STAGES").is_ok())
 }
 
 impl SupertableReader {
@@ -111,6 +122,8 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let timing = stage_timing_enabled();
+        let t0 = timing.then(Instant::now);
         let manifest = self.manifest();
 
         let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
@@ -131,6 +144,7 @@ impl SupertableReader {
                 manifest.as_ref(),
             ),
         };
+        let t_gather = timing.then(Instant::now);
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -208,6 +222,7 @@ impl SupertableReader {
                 units.push((Arc::clone(entry), Probe::Nprobe));
             }
         }
+        let t_select = timing.then(Instant::now);
         if units.is_empty() {
             return Ok(Vec::new());
         }
@@ -235,6 +250,18 @@ impl SupertableReader {
             }
         };
         let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        if let (Some(t0), Some(t_gather), Some(t_select)) = (t0, t_gather, t_select) {
+            let t_fanout = Instant::now();
+            eprintln!(
+                "[diag-vec-stages] gather={:.1} ms  select(scan {} superfiles)={:.1} ms  \
+                 fanout(probe+rerank)={:.1} ms  total={:.1} ms",
+                (t_gather - t0).as_secs_f64() * 1e3,
+                superfiles.len(),
+                (t_select - t_gather).as_secs_f64() * 1e3,
+                (t_fanout - t_select).as_secs_f64() * 1e3,
+                (t_fanout - t0).as_secs_f64() * 1e3,
+            );
+        }
 
         Ok(top_k_ascending(per_superfile, k))
     }
@@ -258,7 +285,15 @@ impl SupertableReader {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
+            // DIAG: split the public-call wall into search vs hit→_id
+            // resolution. `vector_search_async` is the staged search
+            // (gather/select/fanout); `resolve_hits_named` reads the _id
+            // pages for the top-k hits — its own cold-fetch path, not
+            // counted in the search stages. Gated by INFINO_DIAG_VECTOR_STAGES.
+            let t0 = stage_timing_enabled().then(Instant::now);
             let hits = self.vector_search_async(column, query, k, options).await?;
+            let t_search = t0.map(|t| t.elapsed());
+            let t1 = stage_timing_enabled().then(Instant::now);
             // `projection` selects output columns by name (`_id`, the
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
@@ -266,6 +301,14 @@ impl SupertableReader {
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
+            if let (Some(ts), Some(t1)) = (t_search, t1) {
+                eprintln!(
+                    "[diag-vec-resolve] search_async={:.1} ms  resolve_hits(_id pages)={:.1} ms  hits={}",
+                    ts.as_secs_f64() * 1e3,
+                    t1.elapsed().as_secs_f64() * 1e3,
+                    hits.len(),
+                );
+            }
             Ok(vec![batch])
         })
     }

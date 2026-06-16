@@ -34,6 +34,9 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::storage::StorageProvider;
 use crate::superfile::SuperfileReader;
@@ -139,6 +142,10 @@ where
     let storage = manifest.options.storage.as_ref().map(Arc::clone);
     let tombstone_cache = reader.tombstone_cache.clone();
     let now = std::time::Instant::now();
+    // Per-unit open-reader vs kernel timing (gated). Sum = total work
+    // across superfiles; max = critical-path contribution (all units are
+    // awaited, so wall ≈ max over units of open+kernel).
+    let stats = fanout_timing_enabled().then(|| Arc::new(FanoutStats::default()));
 
     // Warm the tombstone sidecars for every distinct superfile in one
     // concurrent batch before the per-superfile fan-out.
@@ -157,9 +164,16 @@ where
             let storage = storage.clone();
             let tombstone_cache = tombstone_cache.clone();
             let kernel = kernel.clone();
+            let stats = stats.clone();
             tokio::spawn(async move {
+                let t_open = stats.as_ref().map(|_| Instant::now());
                 let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+                let open_us = t_open.map(|t| t.elapsed().as_micros() as u64);
+                let t_kernel = stats.as_ref().map(|_| Instant::now());
                 let hits = kernel(r, params).await?;
+                if let (Some(s), Some(open_us), Some(t_kernel)) = (&stats, open_us, t_kernel) {
+                    s.record(open_us, t_kernel.elapsed().as_micros() as u64);
+                }
                 let mut tagged = tag_hits(&entry, hits);
                 apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
@@ -174,5 +188,60 @@ where
             .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))??;
         out.push(tagged);
     }
+    if let Some(s) = stats {
+        let units = s.units.load(Ordering::Relaxed).max(1);
+        let us = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1000.0;
+        eprintln!(
+            "[diag-fanout] units={units} | open_reader sum={:.1} avg={:.1} max={:.1} ms | \
+             kernel(probe+rerank) sum={:.1} avg={:.1} max={:.1} ms",
+            us(&s.sum_open_us),
+            us(&s.sum_open_us) / units as f64,
+            us(&s.max_open_us),
+            us(&s.sum_kernel_us),
+            us(&s.sum_kernel_us) / units as f64,
+            us(&s.max_kernel_us),
+        );
+    }
+    if let Some(line) = crate::superfile::vector::reader::drain_kernel_stage_report() {
+        eprintln!("{line}");
+    }
+    // Direct 503/transient tally from the app retry layer (populated when
+    // object_store retries are off, i.e. INFINO_S3_MAX_RETRIES=0). Drain to
+    // reset regardless; print only in diag mode.
+    if let Some(line) = crate::storage::retry::drain_retryable_error_report() {
+        if fanout_timing_enabled() {
+            eprintln!("{line}");
+        }
+    }
     Ok(out)
+}
+
+/// Aggregated per-unit fan-out timing (gated). `sum` is total work across
+/// all superfile tasks; `max` is the slowest single unit — the
+/// critical-path contribution, since [`fanout`] awaits every unit.
+#[derive(Default)]
+struct FanoutStats {
+    units: AtomicU64,
+    sum_open_us: AtomicU64,
+    max_open_us: AtomicU64,
+    sum_kernel_us: AtomicU64,
+    max_kernel_us: AtomicU64,
+}
+
+impl FanoutStats {
+    fn record(&self, open_us: u64, kernel_us: u64) {
+        self.units.fetch_add(1, Ordering::Relaxed);
+        self.sum_open_us.fetch_add(open_us, Ordering::Relaxed);
+        self.max_open_us.fetch_max(open_us, Ordering::Relaxed);
+        self.sum_kernel_us.fetch_add(kernel_us, Ordering::Relaxed);
+        self.max_kernel_us.fetch_max(kernel_us, Ordering::Relaxed);
+    }
+}
+
+/// Gated by `INFINO_DIAG_VECTOR_STAGES` (shared with the vector-stage
+/// probe). When set, [`fanout`] logs per-unit open-reader vs kernel time.
+/// Covers whichever modality is fanning out (vector or FTS). Read once.
+fn fanout_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INFINO_DIAG_VECTOR_STAGES").is_ok())
 }

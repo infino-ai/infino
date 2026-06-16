@@ -7,6 +7,9 @@
 //! translation and feeds already-translated results in.
 
 use std::ops::Range;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -30,10 +33,71 @@ const BACKOFF_CAP_MS: u64 = 2000;
 /// socket the service dropped under us).
 const MAX_TRANSIENT_RETRIES: u32 = 8;
 
+/// Optional override of the retry budget — **both** the `object_store`
+/// 503/5xx retry depth **and** this app-level transient re-issue budget —
+/// via `INFINO_S3_MAX_RETRIES`. Setting it to `0` disables *all* retries,
+/// so a throttle (503 SlowDown) surfaces as a **hard failure** instead of
+/// hidden latency: the query errors with the literal S3 status (proof that
+/// throttling is occurring), and after a request-rate fix the same `=0` run
+/// **succeeds** (validation that the fix removed it). Unset ⇒ the defaults
+/// ([`MAX_RETRIES`] / [`MAX_TRANSIENT_RETRIES`]). Read once.
+fn retry_budget_override() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INFINO_S3_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    })
+}
+
+fn max_retries() -> usize {
+    retry_budget_override().unwrap_or(MAX_RETRIES)
+}
+
+fn max_transient_retries() -> u32 {
+    retry_budget_override()
+        .map(|v| v as u32)
+        .unwrap_or(MAX_TRANSIENT_RETRIES)
+}
+
+// Direct tally of retryable (transient / 503-throttle) errors seen at the
+// app retry layer — populated when `object_store` retries are off so the
+// 503s reach us. Counts the actual errors instead of inferring from
+// latency, and samples the first message so we can confirm it is a 503.
+static RETRYABLE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+static RETRYABLE_ERROR_SAMPLE: Mutex<Option<String>> = Mutex::new(None);
+
+fn note_retryable(e: &StorageError) {
+    RETRYABLE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut s) = RETRYABLE_ERROR_SAMPLE.lock() {
+        if s.is_none() {
+            *s = Some(format!("{e:?}"));
+        }
+    }
+}
+
+/// Drain + reset the app-layer retryable-error tally, returning a one-line
+/// report (or `None` if none seen). With `INFINO_S3_MAX_RETRIES=0` this is
+/// the direct count of 503-throttle errors hit during the window.
+pub(crate) fn drain_retryable_error_report() -> Option<String> {
+    let n = RETRYABLE_ERROR_COUNT.swap(0, Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let sample = RETRYABLE_ERROR_SAMPLE
+        .lock()
+        .ok()
+        .and_then(|mut s| s.take())
+        .unwrap_or_default();
+    Some(format!(
+        "[diag-retry] app-layer retryable(transient/503) errors = {n} | sample: {sample}"
+    ))
+}
+
 /// Retry budget applied to a store builder via `.with_retry(...)`.
 pub(crate) fn config() -> object_store::RetryConfig {
     object_store::RetryConfig {
-        max_retries: MAX_RETRIES,
+        max_retries: max_retries(),
         retry_timeout: RETRY_TIMEOUT,
         ..Default::default()
     }
@@ -76,7 +140,8 @@ where
     loop {
         match op().await {
             Ok(v) => return Ok(v),
-            Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+            Err(e) if is_retryable(&e) && attempt < max_transient_retries() => {
+                note_retryable(&e);
                 tokio::time::sleep(backoff(attempt)).await;
                 attempt += 1;
             }
@@ -112,7 +177,8 @@ where
     loop {
         let chunk = match fetch(cursor..range.end).await {
             Ok(c) => c,
-            Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+            Err(e) if is_retryable(&e) && attempt < max_transient_retries() => {
+                note_retryable(&e);
                 tokio::time::sleep(backoff(attempt)).await;
                 attempt += 1;
                 continue;
@@ -122,7 +188,7 @@ where
         if chunk.is_empty() {
             // Empty body for an in-bounds range is a transport glitch,
             // not end-of-object (that surfaces as a typed error).
-            if attempt < MAX_TRANSIENT_RETRIES {
+            if attempt < max_transient_retries() {
                 tokio::time::sleep(backoff(attempt)).await;
                 attempt += 1;
                 continue;

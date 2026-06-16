@@ -165,8 +165,40 @@ pub(crate) async fn resolve_hits(
         // id-page read for any segment where the span check fails
         // (multi-span commits can gap the range).
         match resolve_ids_arithmetic(reader, hits) {
-            Some(batch) => Some(batch?),
-            None => Some(resolve_columns(reader, hits, &needed).await?),
+            Some(batch) => {
+                if std::env::var("INFINO_DIAG_VECTOR_STAGES").is_ok() {
+                    eprintln!(
+                        "[diag-resolve] _id via arithmetic (no I/O); hits={}",
+                        hits.len()
+                    );
+                }
+                Some(batch?)
+            }
+            None => {
+                if std::env::var("INFINO_DIAG_VECTOR_STAGES").is_ok() {
+                    let manifest = reader.manifest();
+                    let mut why = String::from("(no gap found?)");
+                    for hit in hits {
+                        if let Some(e) =
+                            manifest.superfiles.iter().find(|e| e.uri == hit.superfile)
+                        {
+                            let span = (e.id_max as i128) - (e.id_min as i128) + 1;
+                            if span != e.n_docs as i128 {
+                                why = format!(
+                                    "span={span} n_docs={} id_min={} id_max={}",
+                                    e.n_docs, e.id_min, e.id_max
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[diag-resolve] _id via id-page FALLBACK (decode); hits={} | first gap: {why}",
+                        hits.len()
+                    );
+                }
+                Some(resolve_columns(reader, hits, &needed).await?)
+            }
         }
     } else {
         Some(resolve_columns(reader, hits, &needed).await?)
@@ -340,6 +372,13 @@ async fn resolve_columns(
         }
     }
 
+    // DIAG: how many distinct hit superfiles, split by tier, + how long
+    // the (concurrent) resolve waves take — to distinguish "few heavy
+    // units" from "many units" when resolve_columns shows up hot.
+    let diag_resolve = std::env::var("INFINO_DIAG_VECTOR_STAGES").is_ok();
+    let (n_warm, n_cold) = (warm_inputs.len(), cold_units.len());
+    let t_resolve = diag_resolve.then(std::time::Instant::now);
+
     let warm_wave = async {
         if warm_inputs.is_empty() {
             return Ok::<Vec<(usize, RecordBatch)>, DataFusionError>(Vec::new());
@@ -404,6 +443,16 @@ async fn resolve_columns(
     ));
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
+    if let Some(t) = t_resolve {
+        eprintln!(
+            "[diag-resolve-cols] hit-superfiles={} (warm/rayon={n_warm} cold/async={n_cold}) \
+             hits={} cols={:?} wall={:.1} ms",
+            seg_order.len(),
+            hits.len(),
+            names,
+            t.elapsed().as_secs_f64() * 1e3,
+        );
+    }
     let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
     for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
         slots[i] = Some(batch);

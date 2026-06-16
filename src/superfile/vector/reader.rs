@@ -29,7 +29,9 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::superfile::format::vec::{
     CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
@@ -50,6 +52,75 @@ const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 /// first-pass Sq8 scan, only the top `SQ8_RESIDUAL_REFINE_MULT × k`
 /// survivors are re-scored with the more expensive residual leg.
 const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
+
+// ── Per-superfile kernel stage timing (gated diagnostic) ─────────────
+// `probe_clusters_async` records its Wave-A-fetch / shortlist-scan /
+// Wave-B-fetch / rerank split here, aggregated across the fan-out's
+// per-superfile calls. The fan-out layer drains + prints one
+// `[diag-kernel]` line per query via [`drain_kernel_stage_report`].
+// Gated by INFINO_DIAG_VECTOR_STAGES; zero overhead when unset.
+struct KernelStageStats {
+    calls: AtomicU64,
+    wave_a_us: AtomicU64,
+    shortlist_us: AtomicU64,
+    wave_b_us: AtomicU64,
+    rerank_us: AtomicU64,
+}
+
+static KERNEL_STAGES: KernelStageStats = KernelStageStats {
+    calls: AtomicU64::new(0),
+    wave_a_us: AtomicU64::new(0),
+    shortlist_us: AtomicU64::new(0),
+    wave_b_us: AtomicU64::new(0),
+    rerank_us: AtomicU64::new(0),
+};
+
+fn kernel_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INFINO_DIAG_VECTOR_STAGES").is_ok())
+}
+
+fn record_kernel_stages(wave_a: Duration, shortlist: Duration, wave_b: Duration, rerank: Duration) {
+    KERNEL_STAGES.calls.fetch_add(1, AtomicOrdering::Relaxed);
+    KERNEL_STAGES
+        .wave_a_us
+        .fetch_add(wave_a.as_micros() as u64, AtomicOrdering::Relaxed);
+    KERNEL_STAGES
+        .shortlist_us
+        .fetch_add(shortlist.as_micros() as u64, AtomicOrdering::Relaxed);
+    KERNEL_STAGES
+        .wave_b_us
+        .fetch_add(wave_b.as_micros() as u64, AtomicOrdering::Relaxed);
+    KERNEL_STAGES
+        .rerank_us
+        .fetch_add(rerank.as_micros() as u64, AtomicOrdering::Relaxed);
+}
+
+/// Drain + reset the aggregated kernel-stage timers, returning a one-line
+/// report (or `None` if timing is off or no calls were recorded since the
+/// last drain). The fan-out layer calls this once per query.
+pub(crate) fn drain_kernel_stage_report() -> Option<String> {
+    if !kernel_timing_enabled() {
+        return None;
+    }
+    let calls = KERNEL_STAGES.calls.swap(0, AtomicOrdering::Relaxed);
+    if calls == 0 {
+        return None;
+    }
+    let drain = |a: &AtomicU64| a.swap(0, AtomicOrdering::Relaxed) as f64 / 1000.0;
+    let (a, s, b, r) = (
+        drain(&KERNEL_STAGES.wave_a_us),
+        drain(&KERNEL_STAGES.shortlist_us),
+        drain(&KERNEL_STAGES.wave_b_us),
+        drain(&KERNEL_STAGES.rerank_us),
+    );
+    let n = calls as f64;
+    Some(format!(
+        "[diag-kernel] calls={calls} | avg/superfile: wave_a={:.2} shortlist={:.2} wave_b={:.2} rerank={:.2} ms | \
+         sum: a={:.0} sl={:.0} b={:.0} rr={:.0} ms",
+        a / n, s / n, b / n, r / n, a, s, b, r,
+    ))
+}
 
 /// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
 /// value is a JSON array of these in declaration order.
@@ -72,6 +143,10 @@ pub(super) enum Sq8ColumnMeta {
     },
     Lazy {
         scale_abs_off: usize,
+        // POC (interleave): redundant — offset[c] is derived from
+        // scale_abs_off + c·2·dim·4 + dim·4. Kept for now to minimize the
+        // throwaway diff; remove if interleave lands.
+        #[allow(dead_code)]
         offset_abs_off: usize,
         norms_abs_off: Option<usize>,
     },
@@ -986,18 +1061,28 @@ impl VectorReader {
             let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
                 let meta_abs_start = subsection_off + codec_meta_off;
                 let meta_abs_end = meta_abs_start + actual_codec_meta_size;
-                let so_block_bytes = (n_cent as usize) * dim * 4;
-                let scale_end = so_block_bytes;
-                let offset_end = scale_end + so_block_bytes;
+                // POC (interleave): meta is `[scale[c] ‖ offset[c]]` per
+                // cluster (stride 2·dim·4), followed by the norms block.
+                let so_pair_bytes = 2 * dim * 4;
+                let so_region_end = (n_cent as usize) * so_pair_bytes;
                 if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
-                    let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
-                    let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                    // De-interleave into the same flat by-cluster Vecs the
+                    // scoring path expects (scale[c*dim..], offset[c*dim..]).
+                    let mut scale: Vec<f32> = Vec::with_capacity((n_cent as usize) * dim);
+                    let mut offset: Vec<f32> = Vec::with_capacity((n_cent as usize) * dim);
+                    for c in 0..(n_cent as usize) {
+                        let base = c * so_pair_bytes;
+                        scale.extend_from_slice(&parse_f32_le_vec(&meta_bytes[base..base + dim * 4]));
+                        offset.extend_from_slice(&parse_f32_le_vec(
+                            &meta_bytes[base + dim * 4..base + 2 * dim * 4],
+                        ));
+                    }
                     let per_doc_norms: Option<Arc<[f32]>> =
                         if matches!(metric, Metric::L2Sq | Metric::Cosine) {
-                            let norms_end = offset_end + (col_n_docs as usize) * 4;
+                            let norms_end = so_region_end + (col_n_docs as usize) * 4;
                             debug_assert_eq!(norms_end, actual_codec_meta_size);
                             Some(Arc::from(parse_f32_le_vec(
-                                &meta_bytes[offset_end..norms_end],
+                                &meta_bytes[so_region_end..norms_end],
                             )))
                         } else {
                             None
@@ -1008,11 +1093,14 @@ impl VectorReader {
                         per_doc_norms,
                     })
                 } else {
+                    // Interleaved: scale[0] at meta start, offset[0] at
+                    // +dim·4; per-cluster stride is 2·dim·4 (applied by the
+                    // fetch sites).
                     Some(Sq8ColumnMeta::Lazy {
                         scale_abs_off: meta_abs_start,
-                        offset_abs_off: meta_abs_start + scale_end,
+                        offset_abs_off: meta_abs_start + dim * 4,
                         norms_abs_off: matches!(metric, Metric::L2Sq | Metric::Cosine)
-                            .then_some(meta_abs_start + offset_end),
+                            .then_some(meta_abs_start + so_region_end),
                     })
                 }
             } else {
@@ -1361,6 +1449,7 @@ impl VectorReader {
         rerank_candidates_from_blocks(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
+            None,
             &cluster_blocks,
             survivor_full_rows.as_deref(),
             &candidates,
@@ -1482,6 +1571,8 @@ impl VectorReader {
         k: usize,
         rerank_mult: usize,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let timing = kernel_timing_enabled();
+        let t0 = timing.then(Instant::now);
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
         let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(chosen.len());
@@ -1506,30 +1597,48 @@ impl VectorReader {
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
         let survivor_only_rerank_fetch = true;
-        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
-        {
-            let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
-                let mut fetched = self
-                    .source
-                    .get_ranges_parallel_async(&[range])
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                fetched.pop()
+        let (cluster_blocks, lazy_sq8_meta_bytes, probed_sq8) =
+            if let Some(prefix_blocks) = prefix_blocks_sync {
+                // Warm: prefixes resident → fetch the whole Sq8 table (a
+                // zero-copy resident slice) so it parses once and is reused
+                // across queries via the `lazy_sq8_parsed` OnceLock.
+                let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
+                    let mut fetched = self
+                        .source
+                        .get_ranges_parallel_async(&[range])
+                        .await
+                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    fetched.pop()
+                } else {
+                    None
+                };
+                (prefix_blocks, meta_bytes, None)
+            } else if sq8_probed_meta_enabled() {
+                // Cold (default): codes+doc_ids prefixes (coalesced) AND
+                // only the probed clusters' Sq8 scale/offset (+norms) — both
+                // in one concurrent wave. Avoids the whole-table `sq8_meta`
+                // over-fetch (~8 MiB/superfile at dim=1024) without adding a
+                // dependent round trip.
+                let (blocks, probed) = futures::try_join!(
+                    get_cluster_ranges_coalesced_async(&self.source, &cluster_prefix_ranges),
+                    fetch_sq8_probed_meta(&self.source, col, &cluster_meta),
+                )
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                (blocks, None, probed)
             } else {
-                None
+                // Cold A/B baseline (`INFINO_VECTOR_SQ8_PROBED=0`): prefixes
+                // + the whole per-cluster Sq8 table in one batch (one big
+                // GET/superfile vs the probed subset's many small GETs).
+                let (blocks, meta) = get_cluster_ranges_coalesced_with_extra_async(
+                    &self.source,
+                    &cluster_prefix_ranges,
+                    lazy_sq8_meta_range,
+                )
+                .await
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                (blocks, meta, None)
             };
-            (prefix_blocks, meta_bytes)
-        } else {
-            // Cold: codes+doc_ids prefixes (coalesced) + Sq8 meta in one
-            // concurrent batch on the caller's runtime.
-            get_cluster_ranges_coalesced_with_extra_async(
-                &self.source,
-                &cluster_prefix_ranges,
-                lazy_sq8_meta_range,
-            )
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?
-        };
+        let t_a = timing.then(Instant::now);
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
         // Shared pure-CPU shortlist + candidate-build stage (see
@@ -1547,12 +1656,18 @@ impl VectorReader {
         )
         .await
         {
-            ShortlistOutcome::Done(out) => return Ok(out),
+            ShortlistOutcome::Done(out) => {
+                if let (Some(t0), Some(t_a)) = (t0, t_a) {
+                    record_kernel_stages(t_a - t0, t_a.elapsed(), Duration::ZERO, Duration::ZERO);
+                }
+                return Ok(out);
+            }
             ShortlistOutcome::Rerank {
                 candidates,
                 survivor_full_ranges,
             } => (candidates, survivor_full_ranges),
         };
+        let t_sl = timing.then(Instant::now);
         // Survivor rerank rows in one concurrent batch on the caller's
         // runtime; warm ranges resolve sync/zero-copy with no await.
         let survivor_full_rows = match survivor_full_ranges {
@@ -1563,10 +1678,12 @@ impl VectorReader {
             ),
             None => None,
         };
+        let t_b = timing.then(Instant::now);
 
-        rerank_candidates_from_blocks(
+        let result = rerank_candidates_from_blocks(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
+            probed_sq8.as_ref(),
             &cluster_blocks,
             survivor_full_rows.as_deref(),
             &candidates,
@@ -1575,7 +1692,11 @@ impl VectorReader {
             k,
         )
         .await
-        .map_err(|e| VectorError::LazySource(e.to_string()))
+        .map_err(|e| VectorError::LazySource(e.to_string()));
+        if let (Some(t0), Some(t_a), Some(t_sl), Some(t_b)) = (t0, t_a, t_sl, t_b) {
+            record_kernel_stages(t_a - t0, t_sl - t_a, t_b - t_sl, t_b.elapsed());
+        }
+        result
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -2182,6 +2303,7 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 async fn rerank_candidates_from_blocks(
     source: &Source,
     lazy_sq8_meta_bytes: Option<&Bytes>,
+    probed_sq8: Option<&Sq8ProbedMeta>,
     cluster_blocks: &[Bytes],
     survivor_full_rows: Option<&[Bytes]>,
     candidates: &[RerankCandidate],
@@ -2259,7 +2381,7 @@ async fn rerank_candidates_from_blocks(
                 }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
-                    offset_abs_off,
+                    offset_abs_off: _,
                     norms_abs_off,
                 } => {
                     if let Some(meta_bytes) = lazy_sq8_meta_bytes {
@@ -2272,7 +2394,16 @@ async fn rerank_candidates_from_blocks(
                                 norms_abs_off.is_some(),
                             ))
                         }));
-                        return Ok(sq8_score_and_refine(
+                        // Arm value (NOT an early return): the result must
+                        // flow through the final score-sort + `truncate(k)`
+                        // at the end of this fn. `sq8_score_and_refine`
+                        // returns the refine set (k·SQ8_RESIDUAL_REFINE_MULT
+                        // rows, ordered by the first-pass score, not the
+                        // final metric), exactly like the Eager arm above —
+                        // both rely on the caller's finalize. (Early-
+                        // returning here skipped it, leaking an unsorted,
+                        // untruncated list on the lazy whole-table path.)
+                        sq8_score_and_refine(
                             candidates,
                             cluster_blocks,
                             survivor_full_rows,
@@ -2284,138 +2415,102 @@ async fn rerank_candidates_from_blocks(
                             k,
                             stride,
                         )
-                        .await);
-                    }
-                    let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
-                    clusters.sort_unstable();
-                    clusters.dedup();
-
-                    let cluster_meta_len = dim * 4;
-                    let mut ranges = Vec::with_capacity(clusters.len() * 2);
-                    for &cluster_id in &clusters {
-                        let c = cluster_id as usize;
-                        let scale_start = *scale_abs_off + c * cluster_meta_len;
-                        let offset_start = *offset_abs_off + c * cluster_meta_len;
-                        ranges.push(scale_start..scale_start + cluster_meta_len);
-                        ranges.push(offset_start..offset_start + cluster_meta_len);
-                    }
-                    let bytes = source.get_ranges_parallel(&ranges)?;
-                    let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
-                        HashMap::with_capacity(clusters.len());
-                    for (idx, &cluster_id) in clusters.iter().enumerate() {
-                        let scale = parse_f32_le_vec(&bytes[idx * 2]);
-                        let offset = parse_f32_le_vec(&bytes[idx * 2 + 1]);
-                        scale_offset_by_cluster.insert(cluster_id, (scale, offset));
-                    }
-
-                    let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
-                        let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
-                        for cand in candidates {
-                            spans
-                                .entry(cand.cluster_id)
-                                .and_modify(|(lo, hi)| {
-                                    *lo = (*lo).min(cand.pos);
-                                    *hi = (*hi).max(cand.pos);
-                                })
-                                .or_insert((cand.pos, cand.pos));
-                        }
-                        let mut span_items: Vec<(u32, u32, u32)> = spans
-                            .into_iter()
-                            .map(|(cluster_id, (lo, hi))| (cluster_id, lo, hi))
-                            .collect();
-                        span_items.sort_unstable_by_key(|&(cluster_id, _, _)| cluster_id);
-                        let norm_ranges: Vec<Range<usize>> = span_items
-                            .iter()
-                            .map(|&(_, lo, hi)| {
-                                let start = *norms_abs_off + lo as usize * 4;
-                                start..start + (hi - lo + 1) as usize * 4
-                            })
-                            .collect();
-                        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
-                        let mut out = HashMap::new();
-                        for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
-                            let vals = parse_f32_le_vec(&bytes);
-                            for (i, pos) in (lo..=hi).enumerate() {
-                                out.insert(pos, vals[i]);
-                            }
-                        }
-                        Some(out)
+                        .await
+                    } else if let Some(probed) = probed_sq8 {
+                        // Cold path: rerank straight from the probed-cluster
+                        // Sq8 subset pre-fetched in wave A
+                        // (`fetch_sq8_probed_meta`). No whole-table fetch, no
+                        // extra round trip.
+                        sq8_residual_rerank_from_maps(
+                            candidates,
+                            cluster_blocks,
+                            survivor_full_rows,
+                            col,
+                            query,
+                            dim,
+                            stride,
+                            k,
+                            &probed.scale_offset_by_cluster,
+                            probed.norm_by_pos.as_ref(),
+                        )
                     } else {
-                        None
-                    };
+                        // Fallback: neither the whole table nor a probed
+                        // subset was supplied — fetch only the survivor
+                        // clusters' scale/offset (+norm spans) on demand.
+                        let mut clusters: Vec<u32> =
+                            candidates.iter().map(|c| c.cluster_id).collect();
+                        clusters.sort_unstable();
+                        clusters.dedup();
 
-                    let scored: Vec<(u32, f32, usize, u32, u32)> = candidates
-                        .iter()
-                        .enumerate()
-                        .map(|(i, cand)| {
-                            let row = candidate_full_bytes(
-                                cluster_blocks,
-                                survivor_full_rows,
-                                cand,
-                                stride,
-                            );
-                            let code = &row[..dim];
-                            let (scale, offset) = scale_offset_by_cluster
-                                .get(&cand.cluster_id)
-                                .expect("cluster metadata fetched");
-                            let kernel = Sq8Kernel::new(
-                                col.metric,
-                                query,
-                                scale.as_slice(),
-                                offset.as_slice(),
-                                None,
-                            );
-                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&cand.pos).copied());
-                            (
-                                cand.did,
-                                kernel.distance_with_norm(code, norm),
-                                i,
-                                cand.pos,
-                                cand.cluster_id,
-                            )
-                        })
-                        .collect();
-                    // Refine the top final-set with the residual leg.
-                    // The residual kernel takes its per-doc norm
-                    // explicitly because the lazy norms live in a
-                    // sparse `pos → norm` map, not a contiguous slice.
-                    let mut scored = scored;
-                    scored
-                        .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-                    let final_refine = k
-                        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
-                        .max(k)
-                        .min(scored.len());
-                    scored.truncate(final_refine);
-                    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
-                    scored
-                        .into_iter()
-                        .map(|(did, _, i, pos, cluster_id)| {
-                            let row = candidate_full_bytes(
-                                cluster_blocks,
-                                survivor_full_rows,
-                                &candidates[i],
-                                stride,
-                            );
-                            let code = &row[..dim];
-                            let residual = &row[dim..dim * 2];
-                            let kernel = rk.entry(cluster_id).or_insert_with(|| {
-                                let (scale, offset) = scale_offset_by_cluster
-                                    .get(&cluster_id)
-                                    .expect("cluster metadata fetched");
-                                Sq8ResidualKernel::new(
-                                    col.metric,
-                                    query,
-                                    scale.as_slice(),
-                                    offset.as_slice(),
-                                    SQ8_RESIDUAL_DIVISOR,
-                                    None,
-                                )
-                            });
-                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&pos).copied());
-                            (did, kernel.distance_with_norm(code, residual, norm))
-                        })
-                        .collect()
+                        // POC (interleave): one contiguous range/cluster
+                        // covering scale ‖ offset (stride 2·dim·4).
+                        let so_pair_bytes = 2 * dim * 4;
+                        let mut ranges = Vec::with_capacity(clusters.len());
+                        for &cluster_id in &clusters {
+                            let c = cluster_id as usize;
+                            let base = *scale_abs_off + c * so_pair_bytes;
+                            ranges.push(base..base + so_pair_bytes);
+                        }
+                        let bytes = source.get_ranges_parallel_async(&ranges).await?;
+                        let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
+                            HashMap::with_capacity(clusters.len());
+                        for (idx, &cluster_id) in clusters.iter().enumerate() {
+                            let pair = &bytes[idx];
+                            let scale = parse_f32_le_vec(&pair[0..dim * 4]);
+                            let offset = parse_f32_le_vec(&pair[dim * 4..2 * dim * 4]);
+                            scale_offset_by_cluster.insert(cluster_id, (scale, offset));
+                        }
+
+                        let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
+                            let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
+                            for cand in candidates {
+                                spans
+                                    .entry(cand.cluster_id)
+                                    .and_modify(|(lo, hi)| {
+                                        *lo = (*lo).min(cand.pos);
+                                        *hi = (*hi).max(cand.pos);
+                                    })
+                                    .or_insert((cand.pos, cand.pos));
+                            }
+                            let mut span_items: Vec<(u32, u32, u32)> = spans
+                                .into_iter()
+                                .map(|(cluster_id, (lo, hi))| (cluster_id, lo, hi))
+                                .collect();
+                            span_items.sort_unstable_by_key(|&(cluster_id, _, _)| cluster_id);
+                            let norm_ranges: Vec<Range<usize>> = span_items
+                                .iter()
+                                .map(|&(_, lo, hi)| {
+                                    let start = *norms_abs_off + lo as usize * 4;
+                                    start..start + (hi - lo + 1) as usize * 4
+                                })
+                                .collect();
+                            let norm_bytes =
+                                source.get_ranges_parallel_async(&norm_ranges).await?;
+                            let mut out = HashMap::new();
+                            for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
+                                let vals = parse_f32_le_vec(&bytes);
+                                for (i, pos) in (lo..=hi).enumerate() {
+                                    out.insert(pos, vals[i]);
+                                }
+                            }
+                            Some(out)
+                        } else {
+                            None
+                        };
+
+                        sq8_residual_rerank_from_maps(
+                            candidates,
+                            cluster_blocks,
+                            survivor_full_rows,
+                            col,
+                            query,
+                            dim,
+                            stride,
+                            k,
+                            &scale_offset_by_cluster,
+                            norm_by_pos.as_ref(),
+                        )
+                    }
                 }
             }
         }
@@ -2427,6 +2522,177 @@ async fn rerank_candidates_from_blocks(
     reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     reranked.truncate(k);
     Ok(reranked)
+}
+
+/// Pre-fetched Sq8 dequantization parameters for the **probed clusters
+/// only**, built by the cold path in wave A (see [`fetch_sq8_probed_meta`])
+/// so rerank reads the ~`nprobe` probed clusters' scale/offset (~64 KiB)
+/// instead of the whole-table `sq8_meta` (~`2·n_cent·dim·4` ≈ 8 MiB at
+/// dim=1024). The warm path keeps the whole-table fetch + parsed
+/// `OnceLock` reuse and passes `None`.
+struct Sq8ProbedMeta {
+    scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)>,
+    norm_by_pos: Option<HashMap<u32, f32>>,
+}
+
+/// Fetch the probed clusters' Sq8 scale/offset (and, for L2Sq/Cosine,
+/// the per-doc norms spanning each probed cluster's docs) in one batch,
+/// so it rides wave A with the cluster-prefix fetch — no extra round
+/// trip. `cluster_meta` is `(cluster_id, doc_off, doc_cnt)` for the
+/// probed clusters; a cluster's docs occupy the contiguous `pos` range
+/// `[doc_off, doc_off+doc_cnt)` (see `build_shortlist`), so survivor
+/// norms are always covered. Returns `None` for non-`Lazy` columns
+/// (Eager / whole-table-resident columns rerank without this).
+async fn fetch_sq8_probed_meta(
+    source: &Source,
+    col: &ColumnReader,
+    cluster_meta: &[(usize, u32, u32)],
+) -> Result<Option<Sq8ProbedMeta>, crate::superfile::lazy_source::LazyByteSourceError> {
+    let Some(Sq8ColumnMeta::Lazy {
+        scale_abs_off,
+        offset_abs_off: _,
+        norms_abs_off,
+    }) = col.sq8_meta.as_ref()
+    else {
+        return Ok(None);
+    };
+    let dim = col.dim;
+    // POC (interleave): each cluster's scale and offset are contiguous
+    // (stride 2·dim·4), so scale+offset is ONE range/cluster (vs two
+    // before). For L2Sq/Cosine the per-cluster norm span is a second
+    // range. All in one batch / one wave with the cluster-prefix fetch.
+    let so_pair_bytes = 2 * dim * 4;
+    let want_norms = norms_abs_off.is_some();
+    let mut ranges = Vec::with_capacity(cluster_meta.len() * 2);
+    for &(c, _off, _cnt) in cluster_meta {
+        let base = *scale_abs_off + c * so_pair_bytes;
+        ranges.push(base..base + so_pair_bytes);
+    }
+    let so_len = ranges.len();
+    if let Some(norms_abs_off) = norms_abs_off {
+        for &(_c, off, cnt) in cluster_meta {
+            let start = *norms_abs_off + off as usize * 4;
+            ranges.push(start..start + cnt as usize * 4);
+        }
+    }
+    let bytes = source.get_ranges_parallel_async(&ranges).await?;
+
+    let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
+        HashMap::with_capacity(cluster_meta.len());
+    for (i, &(c, _off, _cnt)) in cluster_meta.iter().enumerate() {
+        let pair = &bytes[i];
+        let scale = parse_f32_le_vec(&pair[0..dim * 4]);
+        let offset = parse_f32_le_vec(&pair[dim * 4..2 * dim * 4]);
+        scale_offset_by_cluster.insert(c as u32, (scale, offset));
+    }
+
+    let norm_by_pos = if want_norms {
+        let mut out: HashMap<u32, f32> = HashMap::new();
+        for (j, &(_c, off, cnt)) in cluster_meta.iter().enumerate() {
+            let vals = parse_f32_le_vec(&bytes[so_len + j]);
+            for (idx, pos) in (off..off + cnt).enumerate() {
+                out.insert(pos, vals[idx]);
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    Ok(Some(Sq8ProbedMeta {
+        scale_offset_by_cluster,
+        norm_by_pos,
+    }))
+}
+
+/// Cold-path Sq8 metadata strategy toggle (`INFINO_VECTOR_SQ8_PROBED`,
+/// default on). When on, a cold query fetches only the probed clusters'
+/// scale/offset (+norms) — the `sq8_probed_meta` subset. When `0`/`false`
+/// it falls back to fetching the whole per-cluster table in one GET
+/// (the prior behavior), so the two can be A/B'd on one binary without
+/// recompiling. Read once.
+fn sq8_probed_meta_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INFINO_VECTOR_SQ8_PROBED")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
+/// Sq8Residual rerank from already-resolved per-cluster `scale`/`offset`
+/// maps (+ sparse `pos → norm`): the pure-CPU first-pass scan + residual
+/// refinement shared by the cold probed-subset path and the on-demand
+/// fallback in [`rerank_candidates_from_blocks`]. No I/O — callers
+/// resolve the maps first (wave A for the probed path).
+#[allow(clippy::too_many_arguments)]
+fn sq8_residual_rerank_from_maps(
+    candidates: &[RerankCandidate],
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    col: &ColumnReader,
+    query: &[f32],
+    dim: usize,
+    stride: usize,
+    k: usize,
+    scale_offset_by_cluster: &HashMap<u32, (Vec<f32>, Vec<f32>)>,
+    norm_by_pos: Option<&HashMap<u32, f32>>,
+) -> Vec<(u32, f32)> {
+    let scored: Vec<(u32, f32, usize, u32, u32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, cand)| {
+            let row = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+            let code = &row[..dim];
+            let (scale, offset) = scale_offset_by_cluster
+                .get(&cand.cluster_id)
+                .expect("cluster metadata fetched");
+            let kernel = Sq8Kernel::new(col.metric, query, scale.as_slice(), offset.as_slice(), None);
+            let norm = norm_by_pos.and_then(|m| m.get(&cand.pos).copied());
+            (
+                cand.did,
+                kernel.distance_with_norm(code, norm),
+                i,
+                cand.pos,
+                cand.cluster_id,
+            )
+        })
+        .collect();
+    // Refine the top final-set with the residual leg. The residual
+    // kernel takes its per-doc norm explicitly because the lazy norms
+    // live in a sparse `pos → norm` map, not a contiguous slice.
+    let mut scored = scored;
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    let final_refine = k
+        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
+        .max(k)
+        .min(scored.len());
+    scored.truncate(final_refine);
+    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
+    scored
+        .into_iter()
+        .map(|(did, _, i, pos, cluster_id)| {
+            let row =
+                candidate_full_bytes(cluster_blocks, survivor_full_rows, &candidates[i], stride);
+            let code = &row[..dim];
+            let residual = &row[dim..dim * 2];
+            let kernel = rk.entry(cluster_id).or_insert_with(|| {
+                let (scale, offset) = scale_offset_by_cluster
+                    .get(&cluster_id)
+                    .expect("cluster metadata fetched");
+                Sq8ResidualKernel::new(
+                    col.metric,
+                    query,
+                    scale.as_slice(),
+                    offset.as_slice(),
+                    SQ8_RESIDUAL_DIVISOR,
+                    None,
+                )
+            });
+            let norm = norm_by_pos.and_then(|m| m.get(&pos).copied());
+            (did, kernel.distance_with_norm(code, residual, norm))
+        })
+        .collect()
 }
 
 /// Shared Sq8 first-pass scorer used by both the eager and
@@ -2579,14 +2845,21 @@ fn parse_sq8_meta_bytes(
     n_docs: usize,
     has_norms: bool,
 ) -> Sq8ParsedMeta {
-    let so_block_bytes = n_cent * dim * 4;
-    let scale_end = so_block_bytes;
-    let offset_end = scale_end + so_block_bytes;
-    let scale = parse_f32_le_vec(&bytes[0..scale_end]);
-    let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
+    // POC (interleave): bytes are `[scale[c] ‖ offset[c]]` per cluster
+    // (stride 2·dim·4), then the norms block. De-interleave into the flat
+    // by-cluster Vecs the scorer expects.
+    let so_pair_bytes = 2 * dim * 4;
+    let so_region_end = n_cent * so_pair_bytes;
+    let mut scale: Vec<f32> = Vec::with_capacity(n_cent * dim);
+    let mut offset: Vec<f32> = Vec::with_capacity(n_cent * dim);
+    for c in 0..n_cent {
+        let base = c * so_pair_bytes;
+        scale.extend_from_slice(&parse_f32_le_vec(&bytes[base..base + dim * 4]));
+        offset.extend_from_slice(&parse_f32_le_vec(&bytes[base + dim * 4..base + 2 * dim * 4]));
+    }
     let per_doc_norms = has_norms.then(|| {
-        let norms_end = offset_end + n_docs * 4;
-        Arc::from(parse_f32_le_vec(&bytes[offset_end..norms_end]))
+        let norms_end = so_region_end + n_docs * 4;
+        Arc::from(parse_f32_le_vec(&bytes[so_region_end..norms_end]))
     });
     Sq8ParsedMeta {
         scale,
@@ -2626,8 +2899,43 @@ fn read_u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
-const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
+/// Default max gap (bytes) bridged when coalescing probed-cluster prefix
+/// ranges into one GET, and the cap on total overfetched (gap) bytes per
+/// merged span. In a large superfile the handful of probed clusters sit
+/// far apart, so a small gap rarely merges them — leaving ~one GET per
+/// probed cluster. Since the cold path is round-trip-bound, raising these
+/// trades overfetched gap bytes for far fewer concurrent GETs. Override at
+/// runtime with `INFINO_VECTOR_COALESCE_MAX_GAP` /
+/// `INFINO_VECTOR_COALESCE_MAX_OVERFETCH` (bytes) for tuning.
+const CLUSTER_RANGE_COALESCE_MAX_GAP_DEFAULT: usize = 64 * 1024;
+const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH_DEFAULT: usize = 512 * 1024;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn cluster_range_coalesce_max_gap() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        env_usize(
+            "INFINO_VECTOR_COALESCE_MAX_GAP",
+            CLUSTER_RANGE_COALESCE_MAX_GAP_DEFAULT,
+        )
+    })
+}
+
+fn cluster_range_coalesce_max_overfetch() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        env_usize(
+            "INFINO_VECTOR_COALESCE_MAX_OVERFETCH",
+            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH_DEFAULT,
+        )
+    })
+}
 
 fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
@@ -2673,8 +2981,8 @@ fn plan_cluster_coalesce(ranges: &[Range<usize>]) -> CoalescePlan {
             let new_payload_len = *payload_len + range.len();
             let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
             if range.start <= merged.end
-                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
-                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+                || (gap <= cluster_range_coalesce_max_gap()
+                    && new_overfetch <= cluster_range_coalesce_max_overfetch())
             {
                 merged.end = merged_end;
                 *payload_len = new_payload_len;
@@ -2722,9 +3030,10 @@ fn get_cluster_ranges_coalesced_with_extra(
     Ok((apply_coalesce(&plan, &fetched), extra_bytes))
 }
 
-/// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Same
-/// coalescing plan, dispatched as one `try_join_all` batch on the
-/// caller's runtime so connections pool and the fan-out is concurrent.
+/// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Fetches
+/// the coalesced cluster ranges plus one `extra` range (the whole-table
+/// Sq8 meta) in a single batch. Retained for the `INFINO_VECTOR_SQ8_PROBED=0`
+/// whole-table A/B baseline.
 async fn get_cluster_ranges_coalesced_with_extra_async(
     source: &Source,
     ranges: &[Range<usize>],
@@ -5391,6 +5700,72 @@ mod tests {
             "cold first search must issue at least 2 async range GETs (centroids+ \
              cluster_idx + ≥1 cluster block); observed {search_calls} suggests \
              search accidentally short-circuited the cold fetch paths",
+        );
+    }
+
+    /// The cold **async** search path (`search_async` →
+    /// `probe_clusters_async`) fetches only the **probed clusters'** Sq8
+    /// scale/offset (+norms for Cosine/L2Sq) in wave A — the
+    /// `probed_sq8` subset — instead of the whole-table `sq8_meta`. This
+    /// pins that the subset resolves the **correct** per-cluster dequant
+    /// params: a cold self-query must recover itself, and the cold
+    /// (probed-subset) top-k must match the resident (whole-table) top-k.
+    /// A wrong scale/offset/norm offset would corrupt distances and
+    /// change the top-k set, failing here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_async_probed_sq8_matches_resident_and_recovers_self() {
+        let (blob, json, all) =
+            build_small_superfile(32, 8, 128, RerankCodec::Sq8Residual, Metric::Cosine);
+
+        // Resident (whole-table `sq8_meta`) reference ranking.
+        let r_mem = VectorReader::open(blob.clone(), &json).expect("open resident");
+        let want = r_mem
+            .search_async("v", &all[42], 5, 8, 20)
+            .await
+            .expect("resident async search");
+
+        // Cold lazy: disable the zero-copy sync path so every read goes
+        // through the async bridge, forcing `probe_clusters_async`'s cold
+        // branch → `fetch_sq8_probed_meta` (the probed subset).
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        counting.disable_sync();
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+        let got = r_lazy
+            .search_async("v", &all[42], 5, 8, 20)
+            .await
+            .expect("cold async search");
+
+        assert_eq!(
+            want[0].0, 42,
+            "resident (whole-table) self-query baseline must recover self"
+        );
+        assert_eq!(want.len(), 5, "resident search must return exactly k=5");
+        assert_eq!(
+            got.len(),
+            5,
+            "cold search must return exactly k=5 (regression guard: the lazy \
+             whole-table rerank once leaked the untruncated refine set)"
+        );
+        assert_eq!(
+            got[0].0, 42,
+            "cold async (probed Sq8 subset) self-query must recover self"
+        );
+        // Top-k sets must agree (compare as sets — float-assoc differences
+        // between the parallel resident scorer and the cold path can
+        // reorder near-ties, but must not change membership).
+        let mut got_ids: Vec<u32> = got.iter().map(|(d, _)| *d).collect();
+        let mut want_ids: Vec<u32> = want.iter().map(|(d, _)| *d).collect();
+        got_ids.sort_unstable();
+        want_ids.sort_unstable();
+        assert_eq!(
+            got_ids, want_ids,
+            "cold probed-subset top-k must match resident whole-table top-k"
         );
     }
 

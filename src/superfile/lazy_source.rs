@@ -42,6 +42,27 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+use tokio::sync::Semaphore;
+
+/// Optional **global** cap on concurrent foreground range GETs, via
+/// `INFINO_VECTOR_MAX_INFLIGHT_GETS`. A single shared semaphore that every
+/// cold-miss range fetch acquires before issuing, so the whole query's
+/// in-flight GET count is bounded across all superfiles' fan-out (not just
+/// per call site). Diagnostic knob to A/B whether the per-GET latency
+/// inflation is contention from too many simultaneous GETs. Unset ⇒ no cap.
+fn foreground_get_semaphore() -> Option<Arc<Semaphore>> {
+    static SEM: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+    SEM.get_or_init(|| {
+        std::env::var("INFINO_VECTOR_MAX_INFLIGHT_GETS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| Arc::new(Semaphore::new(n)))
+    })
+    .clone()
+}
 
 /// Source of byte ranges from an arbitrary backing.
 ///
@@ -346,7 +367,20 @@ impl Source {
                 .into_iter()
                 .map(|(_i, start, len)| {
                     let s = Arc::clone(s);
-                    async move { s.range(start, len).await }
+                    let sem = foreground_get_semaphore();
+                    async move {
+                        // Hold a permit across the GET so at most N are in
+                        // flight globally (no-op when the cap is unset).
+                        let _permit = match sem {
+                            Some(sem) => Some(
+                                sem.acquire_owned()
+                                    .await
+                                    .expect("foreground GET semaphore not closed"),
+                            ),
+                            None => None,
+                        };
+                        s.range(start, len).await
+                    }
                 })
                 .collect::<Vec<_>>();
             let bytes = futures::future::try_join_all(futs).await?;

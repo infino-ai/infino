@@ -997,20 +997,22 @@ fn build_subsection_streaming(
         debug_assert_eq!(acc_off as usize, n_docs);
     }
 
-    let sq8_scale_block_off = codec_meta_off;
-    let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
+    // POC (interleave): per cluster write `[scale[c] ‖ offset[c]]`
+    // contiguously, so cold rerank fetches one range per cluster instead
+    // of two scattered blocks. Norms (if any) follow after the
+    // interleaved scale/offset region — same total size as before.
+    let so_pair_bytes = 2 * dim * 4;
     let sq8_norms_block_off = if sq8_family && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
-        Some(sq8_offset_block_off + n_cent * dim * 4)
+        Some(codec_meta_off + n_cent * so_pair_bytes)
     } else {
         None
     };
 
     if sq8_family {
         for (cid, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate().take(n_cent) {
-            let sc_off = sq8_scale_block_off + cid * dim * 4;
-            bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
-            let oc_off = sq8_offset_block_off + cid * dim * 4;
-            bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
+            let base = codec_meta_off + cid * so_pair_bytes;
+            bytes[base..base + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
+            bytes[base + dim * 4..base + 2 * dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
         }
     }
 
