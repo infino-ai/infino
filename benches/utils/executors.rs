@@ -93,7 +93,7 @@ pub mod fts {
     use infino::supertable::SupertableReader;
 
     use crate::harness::{BoolMode, FtsQuery};
-    use crate::markdown::fmt_time;
+    use crate::markdown::{fmt_count, fmt_time};
     use crate::report::{Better, Block, Cell, Report, Section, metric, text};
     use crate::rss::{self, PeakSampler, RssStats};
 
@@ -284,6 +284,19 @@ pub mod fts {
             k: usize,
             mode: InfinoBoolMode,
         ) -> usize;
+
+        /// Count phase, **fast path**: the matching-doc count from the
+        /// dedicated count primitives — single-term `term_df` (O(1) from
+        /// the dictionary header), multi-term `token_match` cardinality —
+        /// with no BM25 scoring and no row materialization. `terms` are
+        /// the already-tokenized query terms.
+        fn count_fast(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64;
+
+        /// Count phase, **legacy path**: the same count obtained by
+        /// asking for every hit (`bm25` with `k = usize::MAX`) and
+        /// counting the rows — the "score everything just to count it"
+        /// path the count primitives replace.
+        fn count_scan(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64;
     }
 
     /// Fetch-phase measurement for a raw superfile reader: kernel hits,
@@ -325,6 +338,31 @@ pub mod fts {
         ) -> usize {
             superfile_rows_fetched(self, column, query, k, mode)
         }
+
+        fn count_fast(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            crate::tiers::block_on(async {
+                // Single term: df is the exact match count, read O(1)
+                // from the dictionary header. Multi-term: the union /
+                // intersection cardinality from `token_match`.
+                if terms.len() == 1 {
+                    self.term_df(column, terms[0])
+                        .await
+                        .expect("superfile term_df")
+                } else {
+                    self.token_match(column, terms, mode)
+                        .await
+                        .expect("superfile token_match")
+                        .len() as u64
+                }
+            })
+        }
+
+        fn count_scan(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            let query = terms.join(" ");
+            crate::tiers::block_on(self.bm25_hits_async(column, &query, usize::MAX, mode))
+                .expect("superfile bm25_search count")
+                .len() as u64
+        }
     }
 
     impl FtsRead for SupertableReader {
@@ -348,6 +386,20 @@ pub mod fts {
                 .iter()
                 .map(|b| b.num_rows())
                 .sum()
+        }
+
+        fn count_fast(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            let query = terms.join(" ");
+            self.count(column, &query, mode).expect("supertable count")
+        }
+
+        fn count_scan(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            let query = terms.join(" ");
+            self.bm25_search(column, &query, usize::MAX, mode, None)
+                .expect("supertable bm25_search count")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>() as u64
         }
     }
 
@@ -578,6 +630,122 @@ pub mod fts {
             title,
             note: note.into(),
             blocks,
+        });
+    }
+
+    /// Warm count timings for one query: `fast` is the dedicated count
+    /// path, `scan` the legacy "score every hit" path; `n` is the
+    /// matching-doc count (the two paths must agree on it, which the
+    /// measurement asserts).
+    #[derive(Clone, Debug)]
+    pub struct CountStat {
+        pub name: &'static str,
+        pub fast: Duration,
+        pub scan: Duration,
+        pub n: u64,
+    }
+
+    /// Measure the count battery against an already-warm reader: for
+    /// each query, the fast count path vs the legacy `bm25(k=MAX)` path,
+    /// `iters` timed iterations each. Asserts both paths return the same
+    /// count first — a correctness gate folded into the measurement.
+    pub fn measure_count<R: FtsRead>(
+        reader: &R,
+        battery: &[FtsQuery],
+        column: &str,
+        iters: usize,
+        log_prefix: &str,
+    ) -> Vec<CountStat> {
+        battery
+            .iter()
+            .map(|q| {
+                eprintln!("[{log_prefix}] count: query {}...", q.name);
+                let mode = to_infino_mode(q.mode);
+                let n_fast = reader.count_fast(column, q.terms, mode);
+                let n_scan = reader.count_scan(column, q.terms, mode);
+                assert_eq!(
+                    n_fast, n_scan,
+                    "[{log_prefix}] count mismatch on {}: fast={n_fast} scan={n_scan}",
+                    q.name
+                );
+                let mut fast_samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let n = reader.count_fast(column, q.terms, mode);
+                    fast_samples.push(t.elapsed());
+                    std::hint::black_box(n);
+                }
+                let mut scan_samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let n = reader.count_scan(column, q.terms, mode);
+                    scan_samples.push(t.elapsed());
+                    std::hint::black_box(n);
+                }
+                CountStat {
+                    name: q.name,
+                    fast: p50(&mut fast_samples),
+                    scan: p50(&mut scan_samples),
+                    n: n_fast,
+                }
+            })
+            .collect()
+    }
+
+    fn count_row(name: &'static str, stats: &HashMap<&'static str, CountStat>) -> Vec<Cell> {
+        match stats.get(&name) {
+            Some(c) => {
+                let fast_ns = c.fast.as_secs_f64() * NS_PER_SEC;
+                let scan_ns = c.scan.as_secs_f64() * NS_PER_SEC;
+                let speedup = if fast_ns > 0.0 {
+                    scan_ns / fast_ns
+                } else {
+                    0.0
+                };
+                vec![
+                    text(name),
+                    text(fmt_count(c.n as usize)),
+                    metric(fast_ns, fmt_time(fast_ns), Better::Lower),
+                    metric(scan_ns, fmt_time(scan_ns), Better::Lower),
+                    metric(speedup, format!("{speedup:.1}×"), Better::Higher),
+                ]
+            }
+            None => vec![text(name), text("—"), text("—"), text("—"), text("—")],
+        }
+    }
+
+    /// Render the count battery: the dedicated count path vs the legacy
+    /// "score every hit just to count it" path (`bm25` with
+    /// `k = usize::MAX`), with the resulting speedup. infino-only — the
+    /// same table shape for both tiers.
+    pub fn emit_count(
+        report: &mut Report,
+        anchor: &str,
+        title: String,
+        note: &str,
+        counts: &[CountStat],
+    ) {
+        let map: HashMap<&'static str, CountStat> =
+            counts.iter().map(|c| (c.name, c.clone())).collect();
+        let headers: Vec<String> = ["Query", "matches", "count()", "bm25 (k=MAX)", "speedup"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let or_block = Block {
+            subtitle: "OR queries".into(),
+            headers: headers.clone(),
+            rows: OR_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
+        };
+        let and_block = Block {
+            subtitle: "AND queries".into(),
+            headers,
+            rows: AND_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
+        };
+        report.emit(&Section {
+            anchor: anchor.into(),
+            title,
+            note: note.into(),
+            blocks: vec![or_block, and_block],
         });
     }
 }
