@@ -211,7 +211,7 @@ mod tests {
             async { Ok(7u8) }
         })
         .await;
-        assert_eq!(r.unwrap(), 7);
+        assert_eq!(r.expect("test"), 7);
         assert_eq!(calls.get(), 1);
     }
 
@@ -224,7 +224,7 @@ mod tests {
             async move { if c < 2 { Err(transient()) } else { Ok(7u8) } }
         })
         .await;
-        assert_eq!(r.unwrap(), 7);
+        assert_eq!(r.expect("test"), 7);
         assert_eq!(calls.get(), 3);
     }
 
@@ -256,7 +256,7 @@ mod tests {
     async fn range_zero_length_is_empty() {
         let r = complete_range("u", 5..5, |_| async { Ok(Bytes::new()) })
             .await
-            .unwrap();
+            .expect("test");
         assert!(r.is_empty());
     }
 
@@ -264,7 +264,7 @@ mod tests {
     async fn range_single_full_chunk() {
         let r = complete_range("u", 0..3, |_| async { Ok(Bytes::from_static(b"abc")) })
             .await
-            .unwrap();
+            .expect("test");
         assert_eq!(&r[..], b"abc");
     }
 
@@ -272,7 +272,7 @@ mod tests {
     async fn range_truncates_overlong_chunk() {
         let r = complete_range("u", 0..3, |_| async { Ok(Bytes::from_static(b"abcdef")) })
             .await
-            .unwrap();
+            .expect("test");
         assert_eq!(&r[..], b"abc");
     }
 
@@ -285,7 +285,7 @@ mod tests {
             Ok(Bytes::copy_from_slice(&data[start..end]))
         })
         .await
-        .unwrap();
+        .expect("test");
         assert_eq!(&r[..], b"abcde");
     }
 
@@ -304,7 +304,7 @@ mod tests {
             }
         })
         .await
-        .unwrap();
+        .expect("test");
         assert_eq!(&r[..], b"abc");
     }
 
@@ -323,7 +323,7 @@ mod tests {
             }
         })
         .await
-        .unwrap();
+        .expect("test");
         assert_eq!(&r[..], b"abc");
     }
 

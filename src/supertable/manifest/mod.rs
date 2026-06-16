@@ -2259,11 +2259,17 @@ mod tests {
         // min/max present for both orderable columns.
         let (mn, mx) = stats.cols.get("ints").expect("ints min/max");
         assert_eq!(
-            mn.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            mn.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
             1
         );
         assert_eq!(
-            mx.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            mx.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
             5
         );
         // null count tracked (one null in `ints`).
@@ -2271,9 +2277,23 @@ mod tests {
         assert_eq!(*stats.null_counts.get("floats").expect("null count"), 0);
         // exact sum: ints = 3+1+5 = 9 (Int64), floats = 10.0 (Float64).
         let s = stats.sums.get("ints").expect("int sum");
-        assert_eq!(s.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 9);
+        assert_eq!(
+            s.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            9
+        );
         let s = stats.sums.get("floats").expect("float sum");
-        assert!((s.as_any().downcast_ref::<Float64Array>().unwrap().value(0) - 10.0).abs() < 1e-9);
+        assert!(
+            (s.as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("test")
+                .value(0)
+                - 10.0)
+                .abs()
+                < 1e-9
+        );
         // HLL sketch recorded for both columns.
         assert!(stats.hll.contains_key("ints"));
         assert!(stats.hll.contains_key("floats"));
@@ -2288,17 +2308,26 @@ mod tests {
         let stats = ScalarStatsTable::from_batches(&schema, &[&b1, &b2]);
         let (mn, mx) = stats.cols.get("v").expect("min/max");
         assert_eq!(
-            mn.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
+            mn.as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("test")
+                .value(0),
             5
         );
         assert_eq!(
-            mx.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
+            mx.as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("test")
+                .value(0),
             30
         );
         // sum across both batches = 10+20+5+30 = 65.
         let s = stats.sums.get("v").expect("sum");
         assert_eq!(
-            s.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            s.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
             65
         );
     }
@@ -2371,7 +2400,10 @@ mod tests {
         // sums add: 100 + 50 = 150.
         let s = a.sums.get("n").expect("merged sum");
         assert_eq!(
-            s.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            s.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
             150
         );
         // The one-sided "solo" entry is gone.
@@ -2387,7 +2419,13 @@ mod tests {
             &(Arc::new(Int64Array::from(vec![4])) as ArrayRef),
         )
         .expect("int sum");
-        assert_eq!(r.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 7);
+        assert_eq!(
+            r.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            7
+        );
         // UInt64 + UInt64.
         let r = add_sum_arrays(
             &(Arc::new(UInt64Array::from(vec![3u64])) as ArrayRef),
@@ -2395,7 +2433,10 @@ mod tests {
         )
         .expect("uint sum");
         assert_eq!(
-            r.as_any().downcast_ref::<UInt64Array>().unwrap().value(0),
+            r.as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("test")
+                .value(0),
             7
         );
         // Float64 + Float64.
@@ -2404,7 +2445,15 @@ mod tests {
             &(Arc::new(Float64Array::from(vec![2.5])) as ArrayRef),
         )
         .expect("float sum");
-        assert!((r.as_any().downcast_ref::<Float64Array>().unwrap().value(0) - 4.0).abs() < 1e-9);
+        assert!(
+            (r.as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("test")
+                .value(0)
+                - 4.0)
+                .abs()
+                < 1e-9
+        );
         // Overflow → None.
         let r = add_sum_arrays(
             &(Arc::new(Int64Array::from(vec![i64::MAX])) as ArrayRef),
@@ -2439,14 +2488,14 @@ mod tests {
         assert_eq!(
             mn.as_any()
                 .downcast_ref::<Decimal128Array>()
-                .unwrap()
+                .expect("test")
                 .value(0),
             5
         );
         assert_eq!(
             mx.as_any()
                 .downcast_ref::<Decimal128Array>()
-                .unwrap()
+                .expect("test")
                 .value(0),
             50
         );
@@ -2470,7 +2519,17 @@ mod tests {
         );
         a.merge(&b);
         let (mn, mx) = a.cols.get("flag").expect("bool col");
-        assert!(!mn.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
-        assert!(mx.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
+        assert!(
+            !mn.as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("test")
+                .value(0)
+        );
+        assert!(
+            mx.as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("test")
+                .value(0)
+        );
     }
 }

@@ -5940,8 +5940,13 @@ mod tests {
         // shortlist (k·rerank_mult ≥ PARALLEL_SCAN_MIN) on an Sq8 column.
         let n_docs = 3000u32;
         let n_cent = 4usize;
-        let (blob, json, all) =
-            build_large_corpus(16, n_cent, n_docs, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+        let (blob, json, all) = build_large_corpus(
+            16,
+            n_cent,
+            n_docs,
+            RerankCodec::Sq8ResidualEpsilon,
+            Metric::L2Sq,
+        );
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("v", &all[2001], 64, n_cent, 40)

@@ -713,24 +713,36 @@ mod tests {
     #[test]
     fn scalar_to_f32_accepts_every_numeric_variant_rejects_other() {
         assert_eq!(
-            scalar_to_f32(&ScalarValue::Float32(Some(1.5))).unwrap(),
+            scalar_to_f32(&ScalarValue::Float32(Some(1.5))).expect("test"),
             1.5
         );
         assert_eq!(
-            scalar_to_f32(&ScalarValue::Float64(Some(2.5))).unwrap(),
+            scalar_to_f32(&ScalarValue::Float64(Some(2.5))).expect("test"),
             2.5
         );
-        assert_eq!(scalar_to_f32(&ScalarValue::Int64(Some(3))).unwrap(), 3.0);
-        assert_eq!(scalar_to_f32(&ScalarValue::Int32(Some(4))).unwrap(), 4.0);
-        assert_eq!(scalar_to_f32(&ScalarValue::UInt64(Some(5))).unwrap(), 5.0);
-        assert_eq!(scalar_to_f32(&ScalarValue::UInt32(Some(6))).unwrap(), 6.0);
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::Int64(Some(3))).expect("test"),
+            3.0
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::Int32(Some(4))).expect("test"),
+            4.0
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::UInt64(Some(5))).expect("test"),
+            5.0
+        );
+        assert_eq!(
+            scalar_to_f32(&ScalarValue::UInt32(Some(6))).expect("test"),
+            6.0
+        );
         assert!(scalar_to_f32(&ScalarValue::Utf8(Some("x".into()))).is_err());
     }
 
     #[test]
     fn scalar_expr_to_f32_rejects_non_literal() {
         // A literal flows through to scalar_to_f32.
-        assert_eq!(scalar_expr_to_f32(&lit(2.0_f32)).unwrap(), 2.0);
+        assert_eq!(scalar_expr_to_f32(&lit(2.0_f32)).expect("test"), 2.0);
         // A column reference is not a literal → error.
         let col = datafusion::prelude::col("x");
         assert!(scalar_expr_to_f32(&col).is_err());
@@ -739,7 +751,7 @@ mod tests {
     #[test]
     fn array_to_f32_casts_and_rejects_nulls() {
         let ok: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3]));
-        assert_eq!(array_to_f32(&ok).unwrap(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(array_to_f32(&ok).expect("test"), vec![1.0, 2.0, 3.0]);
         let with_null: ArrayRef = Arc::new(Float32Array::from(vec![Some(1.0), None]));
         assert!(
             array_to_f32(&with_null).is_err(),
@@ -754,7 +766,7 @@ mod tests {
             ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![Some(
                 vec![Some(1), Some(2)],
             )]);
-        assert_eq!(list_literal_to_f32(&single).unwrap(), vec![1.0, 2.0]);
+        assert_eq!(list_literal_to_f32(&single).expect("test"), vec![1.0, 2.0]);
         // Two-row list → error.
         let two = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![
             Some(vec![Some(1)]),
@@ -774,7 +786,10 @@ mod tests {
                 vec![Some(0.1_f32), Some(0.2), Some(0.3)],
             )]);
         let expr = Expr::Literal(ScalarValue::List(Arc::new(list)), None);
-        assert_eq!(arg_to_query_vector(&expr).unwrap(), vec![0.1_f32, 0.2, 0.3]);
+        assert_eq!(
+            arg_to_query_vector(&expr).expect("test"),
+            vec![0.1_f32, 0.2, 0.3]
+        );
     }
 
     #[test]
