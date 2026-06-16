@@ -44,9 +44,10 @@ const SCORE_COLUMN: &str = "rating";
 const VECTOR_COLUMN: &str = "emb";
 const WRITE_CHUNK: usize = 65_536;
 
-/// Small vector dimension — this is a SQL/hybrid query-latency bench, not
-/// a vector-recall bench, so a tiny dim keeps the vector index cheap.
-pub const SQL_DIM: usize = 16;
+/// Vector dimension for the SQL/hybrid arms. Matches the suite-wide corpus
+/// dimension so `vector_search` / `hybrid_search` exercise the same
+/// dimensionality the vector cell tests, not a toy size.
+pub const SQL_DIM: usize = crate::corpus::DIM;
 const ROT_SEED: u64 = 7;
 
 fn fixed_list_f32(dim: usize) -> DataType {
@@ -129,6 +130,9 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
             FtsConfig {
                 column: KEY_COLUMN.into(),
             },
+            FtsConfig {
+                column: CATEGORY_COLUMN.into(),
+            },
         ],
         vec![VectorConfig {
             column: VECTOR_COLUMN.into(),
@@ -136,7 +140,7 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
             n_cent: n_cent_for(n_rows),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
         }],
         Some(default_tokenizer()),
     )

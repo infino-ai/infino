@@ -60,7 +60,7 @@ fn build_superfile(
             n_cent,
             rot_seed: ROT_SEED,
             metric: map_metric(metric),
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
         }],
         None,
     );

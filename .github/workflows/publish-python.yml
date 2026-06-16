@@ -74,7 +74,8 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-14,         target: aarch64-apple-darwin }
           - { os: macos-15-intel,   target: x86_64-apple-darwin }
-          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
+          # No Windows: the core crate uses Unix-only APIs (std::os::unix
+          # positional writes, memmap2 madvise) that don't compile on MSVC.
     steps:
       - uses: actions/checkout@v5
 
@@ -96,6 +97,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # Restore the dep graph (datafusion etc.) so only infino-python rebuilds.
+      # Order matters: rust-cache keys on Cargo.lock, which the stamp step
+      # bumps — cache before stamp to keep the key stable across releases.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-python
 
       # Version is dynamic (pyproject `dynamic = ["version"]`) → maturin reads
       # it from Cargo.toml. Stamp it into Cargo.toml *and* Cargo.lock so the

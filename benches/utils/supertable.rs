@@ -815,15 +815,34 @@ pub mod vector {
         }
 
         let n_docs = supertable::n_docs();
-        // Corpus to disk + mmap (engine-only window). Kept alive for the
-        // search phase: the same vectors back the brute-force ground truth,
-        // so dataset mode regenerates it too (skipping only the ingest).
-        let corpus = supertable::prepare_corpus(Modality::Vector);
         let mut report = Report::load("supertable_vector");
-        let (built, ingest_metrics) = if crate::dataset::dataset_mode() && !phases.build {
+
+        // Existing-prefix mode: read directly against an already-built,
+        // retained supertable (`INFINO_BENCH_EXISTING_PREFIX`) — no corpus, no
+        // ingest. With no corpus to back recall, calibration + the brute-force
+        // gate are forced off below and queries are corpus-free.
+        let existing = tiers::block_on(tiers::existing_supertable_storage_fixture());
+
+        // Corpus to disk + mmap (engine-only window), EXCEPT in existing-prefix
+        // mode. Kept alive for the search phase: the same vectors back the
+        // brute-force ground truth, so dataset mode regenerates it too
+        // (skipping only the ingest).
+        let corpus = existing
+            .is_none()
+            .then(|| supertable::prepare_corpus(Modality::Vector));
+
+        let (built, ingest_metrics) = if let Some(fixture) = existing {
+            (supertable::open_existing(Modality::Vector, fixture), None)
+        } else if crate::dataset::dataset_mode() && !phases.build {
             (supertable::open_dataset(Modality::Vector), None)
         } else {
-            build_measured(Modality::Vector, &corpus, phases)
+            build_measured(
+                Modality::Vector,
+                corpus
+                    .as_ref()
+                    .expect("non-existing path prepared a corpus"),
+                phases,
+            )
         };
         if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
@@ -845,49 +864,74 @@ pub mod vector {
         }
 
         if phases.warm || phases.cold {
-            let skip_cal = skip_calibration();
+            // No corpus (existing-prefix) ⇒ no ground truth possible ⇒ force
+            // skip-calibration: this path measures latency + memory only.
+            let skip_cal = skip_calibration() || corpus.is_none();
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            // The ingested vectors are still mmapped from the prepared
-            // corpus — queries and ground truth come from them instead
-            // of a regeneration. Skip-calibration needs no ground truth
-            // (no recall gate / grid), so the brute-force pass is elided
-            // there; otherwise both query batches share ONE streamed
-            // oracle pass: the pass is I/O-bound over a corpus several
-            // times RAM, so its cost is corpus bytes, not query count.
-            let vslice = corpus
-                .vectors()
-                .expect("vector modality prepared a vector corpus")
-                .as_slice();
-            let q_correct = corpus::generate_realistic_queries(
-                vslice,
-                n_docs,
-                N_CORRECTNESS_QUERIES,
-                QUERY_CORRECTNESS_SEED,
-                true,
-                QUERY_SIGMA,
-            );
-            let q_cal = corpus::generate_realistic_queries(
-                vslice,
-                n_docs,
-                N_CALIBRATION_QUERIES,
-                QUERY_CALIBRATION_SEED,
-                true,
-                QUERY_SIGMA,
-            );
-            let (gt_correct, gt_cal): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if skip_cal {
-                (Vec::new(), Vec::new())
-            } else {
-                eprintln!(
-                    "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
-                    q_correct.len() + q_cal.len(),
+            #[allow(clippy::type_complexity)]
+            let (q_correct, q_cal, gt_correct, gt_cal): (
+                Vec<Vec<f32>>,
+                Vec<Vec<f32>>,
+                Vec<Vec<u32>>,
+                Vec<Vec<u32>>,
+            ) = if let Some(corpus) = &corpus {
+                // The ingested vectors are still mmapped from the prepared
+                // corpus — queries and ground truth come from them instead
+                // of a regeneration. Skip-calibration needs no ground truth
+                // (no recall gate / grid), so the brute-force pass is elided
+                // there; otherwise both query batches share ONE streamed
+                // oracle pass: the pass is I/O-bound over a corpus several
+                // times RAM, so its cost is corpus bytes, not query count.
+                let vslice = corpus
+                    .vectors()
+                    .expect("vector modality prepared a vector corpus")
+                    .as_slice();
+                let q_correct = corpus::generate_realistic_queries(
+                    vslice,
+                    n_docs,
+                    N_CORRECTNESS_QUERIES,
+                    QUERY_CORRECTNESS_SEED,
+                    true,
+                    QUERY_SIGMA,
                 );
-                let all_queries: Vec<Vec<f32>> =
-                    q_correct.iter().chain(q_cal.iter()).cloned().collect();
-                let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
-                let gt_cal = gt_all.split_off(q_correct.len());
-                (gt_all, gt_cal)
+                let q_cal = corpus::generate_realistic_queries(
+                    vslice,
+                    n_docs,
+                    N_CALIBRATION_QUERIES,
+                    QUERY_CALIBRATION_SEED,
+                    true,
+                    QUERY_SIGMA,
+                );
+                let (gt_correct, gt_cal): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if skip_cal {
+                    (Vec::new(), Vec::new())
+                } else {
+                    eprintln!(
+                        "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
+                        q_correct.len() + q_cal.len(),
+                    );
+                    let all_queries: Vec<Vec<f32>> =
+                        q_correct.iter().chain(q_cal.iter()).cloned().collect();
+                    let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
+                    let gt_cal = gt_all.split_off(q_correct.len());
+                    (gt_all, gt_cal)
+                };
+                (q_correct, q_cal, gt_correct, gt_cal)
+            } else {
+                // Existing-prefix: no corpus → corpus-free Gaussian queries
+                // and no ground truth. Recall is meaningless here; this path
+                // reuses the normal vector search implementation to measure
+                // cold/warm latency and RSS against a retained large table.
+                eprintln!(
+                    "[supertable_vector] existing-prefix: corpus-free queries, calibration + recall gate disabled",
+                );
+                (
+                    corpus::generate_queries(N_CORRECTNESS_QUERIES, QUERY_CORRECTNESS_SEED),
+                    corpus::generate_queries(N_CALIBRATION_QUERIES, QUERY_CALIBRATION_SEED),
+                    Vec::new(),
+                    Vec::new(),
+                )
             };
             // Queries + ground truth extracted; free the corpus pages
             // + temp file so the warm/cold samplers measure the engine

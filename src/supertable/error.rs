@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::storage::StorageError;
 use crate::superfile::error::BuildError as SuperfileBuildError;
+use crate::supertable::ManifestLoadError;
 
 /// Errors raised when constructing or operating against a
 /// `SupertableOptions` / `SupertableWriter`.
@@ -150,6 +151,10 @@ pub enum CommitError {
     #[error("build error during commit")]
     Build(#[from] BuildError),
 
+    /// Manifest error
+    #[error("manifest load error: {0}")]
+    ManifestLoadError(#[from] ManifestLoadError),
+
     /// Failed to encode a manifest part or list to its wire
     /// format. Indicates a programmer error (e.g., a
     /// non-serializable scalar value in a manifest list), not
@@ -203,6 +208,10 @@ pub enum OpenError {
     #[error("manifest list parse failed")]
     ManifestListParse(String),
 
+    /// Manifest load error.
+    #[error("manifest load error")]
+    ManifestLoadError(#[from] ManifestLoadError),
+
     /// Manifest part load or parse failed during open or
     /// refresh.
     #[error("manifest part load failed: {part_id}")]
@@ -236,22 +245,6 @@ pub enum OpenError {
     /// path.
     #[error("commit error during open")]
     Commit(#[from] CommitError),
-
-    /// The persisted manifest list's `options_hash` doesn't
-    /// match the digest computed from the caller's
-    /// `SupertableOptions`. Either the caller built options
-    /// inconsistent with the on-disk supertable (schema /
-    /// partition strategy / id column changed) or the
-    /// manifest was written by a different supertable.
-    /// Surfaced ahead of any per-superfile decode so callers
-    /// see a typed mismatch instead of a downstream parquet
-    /// or arrow error.
-    ///
-    /// Bypass: stamping `options_hash = ContentHash([0u8; 32])`
-    /// in a manifest list (the legacy / synthetic-fixture
-    /// path) skips the check entirely.
-    #[error("options_hash mismatch: caller={expected} list={actual}")]
-    OptionsHashMismatch { expected: String, actual: String },
 }
 
 /// Errors raised by [`crate::supertable::Supertable::compact`].

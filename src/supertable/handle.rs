@@ -26,6 +26,7 @@ use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
 use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
+use crate::supertable::ManifestLoadError;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -278,8 +279,7 @@ impl Supertable {
     /// snapshot at the pointer's `manifest_id`.
     ///
     /// Errors:
-    /// - [`OpenError::PointerUnreadable`] if the pointer
-    ///   doesn't exist (open-or-create trigger).
+    /// - [`OpenError::ManifestLoadError`] for manifest load failures.
     /// - [`OpenError::Build`] if `options.storage` is `None`
     ///   (open requires a storage backend).
     /// - [`OpenError::Storage`], [`OpenError::ManifestListParse`],
@@ -299,11 +299,6 @@ impl Supertable {
     /// sync [`Supertable::open`]; this is the I/O implementation it
     /// (and the open-time create path) drive on the ambient runtime.
     pub(crate) async fn open_async(options: SupertableOptions) -> Result<Self, OpenError> {
-        use crate::supertable::ManifestPartLoader;
-        use crate::supertable::manifest::commit::read_pointer;
-        use crate::supertable::manifest::list as list_mod;
-        use crate::supertable::manifest::{Manifest, SuperfileList};
-
         let storage = options
             .storage
             .as_ref()
@@ -315,117 +310,9 @@ impl Supertable {
                 ))
             })?
             .clone();
-
-        // 1. Read the pointer file.
-        let pointer = match read_pointer(&*storage).await? {
-            Some(p) => p,
-            None => {
-                // No pointer → no supertable at this location.
-                // Map to OpenError::PointerUnreadable so the
-                // open-or-create caller can pattern-match.
-                return Err(OpenError::PointerUnreadable(
-                    crate::storage::StorageError::NotFound {
-                        uri: "_supertable/current".into(),
-                    },
-                ));
-            }
-        };
-
-        // 2. Load + parse the manifest list.
-        let (list_bytes, _) = storage
-            .get(&pointer.manifest_list_uri)
-            .await
-            .map_err(OpenError::Storage)?;
-        let list = list_mod::decode(&list_bytes)
-            .map_err(|e| OpenError::ManifestListParse(format!("{e}")))?;
-
-        // Verify the caller's options match the
-        // manifest's stamped digest. The all-zero stored
-        // hash bypasses validation (legacy + synthetic
-        // fixtures).
-        let expected_hash = crate::supertable::manifest::options_hash::compute_options_hash(
-            &options,
-            &list.partition_strategy,
-        );
-        if let Err(mismatch) = crate::supertable::manifest::options_hash::verify_options_hash(
-            expected_hash,
-            list.options_hash,
-        ) {
-            return Err(OpenError::OptionsHashMismatch {
-                expected: mismatch.expected,
-                actual: mismatch.actual,
-            });
-        }
-
-        // 3. Build the loader. Then either eager-fetch every
-        //    part (small manifests — fast first query) or
-        //    populate empty `OnceCell`s for lazy-load (large
-        //    manifests pay no upfront cost; parts hydrate on
-        //    first `Manifest::part(id).await`).
-        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
-        let n_parts = list.parts.len();
-        let threshold = options.eager_load_threshold_parts as usize;
-        let eager = n_parts <= threshold;
-
-        let parts_map = dashmap::DashMap::new();
-        let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
-        if eager {
-            // Eager path: parallel-fetch every part + populate
-            // the flat superfile_list.superfiles view so the
-            // iteration-style query paths (`bm25_search`,
-            // `vector_search`, `query_sql`) see all superfiles
-            // without going through the hierarchical iterator.
-            let part_ids: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-            let load_futs = part_ids
-                .iter()
-                .map(|id| {
-                    let loader = Arc::clone(&loader);
-                    let pid = *id;
-                    async move { loader.load(pid).await }
-                })
-                .collect::<Vec<_>>();
-            let loaded = futures::future::join_all(load_futs).await;
-            for (pid, result) in part_ids.iter().zip(loaded) {
-                let part = result.map_err(|e| OpenError::ManifestPartLoad {
-                    part_id: pid.0.to_string(),
-                    source: Box::new(e),
-                })?;
-                all_superfiles.extend(part.superfiles.iter().cloned());
-                let cell = tokio::sync::OnceCell::new();
-                cell.set(part).expect("fresh OnceCell");
-                parts_map.insert(*pid, Arc::new(cell));
-            }
-        } else {
-            // Lazy path: each part gets an empty
-            // `OnceCell`; first `Manifest::part(id).await`
-            // triggers a single storage GET for that part.
-            // `superfile_list.superfiles` stays empty — legacy
-            // flat-iteration queries return zero results
-            // until the hierarchical query path lands.
-            // Callers in lazy mode today drive
-            // `Manifest::part().await` directly.
-            for entry in &list.parts {
-                parts_map.insert(entry.part_id, Arc::new(tokio::sync::OnceCell::new()));
-            }
-        }
-
-        // 4. Build the in-memory hierarchical Manifest.
-        //    `manifest_id` mirrors the pointer. The flat
-        //    `superfile_list.superfiles` is populated only in
-        //    eager mode (see above); lazy mode leaves it
-        //    empty until the hierarchical query path lands.
         let options_arc = Arc::new(options);
-        let mut superfile_list = SuperfileList::empty(options_arc.clone());
-        superfile_list.manifest_id = pointer.manifest_id;
-        superfile_list.superfiles = all_superfiles;
 
-        let manifest = Manifest {
-            superfile_list,
-            list: Some(list),
-            parts: parts_map,
-            loader: Some(loader),
-        };
-
+        let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
         let tombstone_cache = build_tombstone_cache(&options_arc);
         // Fresh generator per open. The 64-bit ms timestamp
         // prefix advances naturally across process restarts, so
@@ -438,7 +325,7 @@ impl Supertable {
             crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options: options_arc,
-            manifest: ArcSwap::new(Arc::new(manifest)),
+            manifest: ArcSwap::new(manifest),
             writer_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
             query_runtime: OnceLock::new(),
@@ -483,11 +370,6 @@ impl Supertable {
     /// [`crate::supertable::options::Consistency`]. This is the
     /// mechanism that drives the pointer re-check.
     pub(crate) async fn refresh(&self) -> Result<bool, OpenError> {
-        use crate::supertable::ManifestPartLoader;
-        use crate::supertable::manifest::commit::read_pointer;
-        use crate::supertable::manifest::list as list_mod;
-        use crate::supertable::manifest::{Manifest, SuperfileList};
-
         let storage = self
             .inner
             .options
@@ -500,104 +382,14 @@ impl Supertable {
             })?
             .clone();
 
-        // 1. Read the current pointer. If it's not newer than
-        //    our in-memory manifest_id, no-op.
-        let pointer = match read_pointer(&*storage).await? {
-            Some(p) => p,
-            None => return Ok(false),
-        };
         let current = self.inner.manifest.load_full();
-        if pointer.manifest_id <= current.superfile_list.manifest_id {
-            return Ok(false);
-        }
-
-        // 2. Load + parse the new manifest list.
-        let (list_bytes, _) = storage
-            .get(&pointer.manifest_list_uri)
-            .await
-            .map_err(OpenError::Storage)?;
-        let new_list = list_mod::decode(&list_bytes)
-            .map_err(|e| OpenError::ManifestListParse(format!("{e}")))?;
-
-        // 3. Inherit unchanged parts via content-addressed
-        //    lookup. For each part in the new list whose
-        //    PartId is also in the current Manifest's
-        //    parts cache, Arc::clone the OnceCell — same
-        //    bytes, no re-fetch, no re-parse. Parts in the
-        //    new list that aren't in the current cache are
-        //    eager-fetched.
-        let new_loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &new_list));
-        let new_parts: dashmap::DashMap<_, _> = dashmap::DashMap::new();
-        let mut missing_part_ids = Vec::new();
-        for entry in &new_list.parts {
-            if let Some(existing) = current.parts.get(&entry.part_id) {
-                new_parts.insert(entry.part_id, existing.value().clone());
-            } else {
-                missing_part_ids.push(entry.part_id);
-            }
-        }
-
-        // Eager-fetch the missing ones in parallel — but
-        // only when the total post-refresh part count is at
-        // or under the eager-load threshold. Above
-        // it, leave missing parts as empty `OnceCell`s for
-        // lazy-load on first access, matching the lazy-open
-        // semantics. Inherited parts (Arc::clone'd above)
-        // keep whatever state they had — already-loaded
-        // stays loaded; lazy stays lazy.
-        let threshold = self.inner.options.eager_load_threshold_parts as usize;
-        let eager = new_list.parts.len() <= threshold;
-        if eager {
-            let load_futs = missing_part_ids
-                .iter()
-                .map(|id| {
-                    let loader = Arc::clone(&new_loader);
-                    let pid = *id;
-                    async move { loader.load(pid).await }
-                })
-                .collect::<Vec<_>>();
-            let loaded = futures::future::join_all(load_futs).await;
-            for (pid, result) in missing_part_ids.iter().zip(loaded) {
-                let part = result.map_err(|e| OpenError::ManifestPartLoad {
-                    part_id: pid.0.to_string(),
-                    source: Box::new(e),
-                })?;
-                let cell = tokio::sync::OnceCell::new();
-                cell.set(part).expect("fresh cell");
-                new_parts.insert(*pid, Arc::new(cell));
-            }
-        } else {
-            for pid in &missing_part_ids {
-                new_parts.insert(*pid, Arc::new(tokio::sync::OnceCell::new()));
-            }
-        }
-
-        // 4. Rebuild the flat superfile_list from all parts in
-        //    the new manifest — eager mode only. In lazy
-        //    mode the flat view stays empty until the hierarchical query path lands.
-        let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
-        if eager {
-            for entry in &new_list.parts {
-                let cell = new_parts.get(&entry.part_id).expect("part inserted above");
-                let part = cell
-                    .value()
-                    .get()
-                    .expect("eager-fetched or inherited; must be set");
-                all_superfiles.extend(part.superfiles.iter().cloned());
-            }
-        }
-
-        // 5. Build + ArcSwap the new Manifest.
-        let mut new_superfile_list = SuperfileList::empty(self.inner.options.clone());
-        new_superfile_list.manifest_id = pointer.manifest_id;
-        new_superfile_list.superfiles = all_superfiles;
-        let new_manifest = Manifest {
-            superfile_list: new_superfile_list,
-            list: Some(new_list),
-            parts: new_parts,
-            loader: Some(new_loader),
+        let manifest = match Manifest::load(Some(current), storage, None).await {
+            Ok(manifest) => manifest,
+            Err(ManifestLoadError::PointerNotFound) => return Ok(false),
+            Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
+            Err(err) => return Err(OpenError::ManifestLoadError(err)),
         };
-        self.inner.manifest.store(Arc::new(new_manifest));
+        self.inner.manifest.store(manifest);
         Ok(true)
     }
 

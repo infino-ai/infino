@@ -576,7 +576,7 @@ impl SuperfileBuilder {
     ///
     /// **Requirements:**
     /// - The reader's vector columns must use the **Fp32 codec**. Other codecs
-    ///   (Sq8Residual, RabitqOnly) will fail with `BuildError::VectorReadError`.
+    ///   (Sq8ResidualEpsilon, RabitqOnly) will fail with `BuildError::VectorReadError`.
     /// - Vector column names and dimensions in the reader must match those in
     ///   `self.opts.vector_columns` in the exact same order. Mismatches will
     ///   return `BuildError::VectorDimMismatch` error.
@@ -1698,7 +1698,8 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+                rerank_codec:
+                    crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
             }],
             None,
         );
@@ -1715,7 +1716,7 @@ mod tests {
             .expect("get vector reader")
             .get_vectors_fp32("emb");
 
-        assert!(result.is_err(), "should reject Sq8Residual codec");
+        assert!(result.is_err(), "should reject Sq8ResidualEpsilon codec");
     }
 
     #[tokio::test]

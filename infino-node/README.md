@@ -1,50 +1,60 @@
-# infino — Node.js bindings
+# infino
 
-Node.js bindings for infino. Synchronous; pass arrays of objects (or
-apache-arrow Tables) in, get plain records out. Pass `{ arrow: true }` to
-a search or query to get an apache-arrow `Table` instead.
+Fast search on object storage — SQL, full-text, and vector search — for Node.js.
+
+Synchronous: pass arrays of objects (or apache-arrow `Table`s) in, get plain
+records out; pass `{ arrow: true }` to a search or query for an apache-arrow
+`Table` instead.
 
 ## Install
 
 ```sh
-npm install infino-node
+npm install infino --registry https://npm-proxy.fury.io/infino/
 ```
 
 A prebuilt native binary is selected automatically at install time — no Rust
-toolchain needed. Supported platforms:
+toolchain required. Supported platforms:
 
 | Platform      | Architectures |
 | ------------- | ------------- |
 | macOS         | x64, arm64    |
 | Linux (glibc) | x64, arm64    |
 
-`apache-arrow` is installed as a dependency and is used at the boundary
-(passing in Tables, or `{ arrow: true }` results). Node.js >= 18.
+`apache-arrow` is installed as a dependency and used at the boundary (passing
+in `Table`s, or `{ arrow: true }` results). Requires Node.js >= 18.
 
 ## Usage
 
 ```javascript
-const { connect, IndexSpec } = require("infino-node");
-const { Schema, Field, LargeUtf8 } = require("apache-arrow");
+import { connect, IndexSpec } from "infino";
 
-const db = connect("memory://"); // or "./data", "s3://bucket/prefix"
+// A knowledge base your agent retrieves over. "memory://" is in-process;
+// use "./data" or "s3://bucket/prefix" to persist.
+const db = connect("memory://");
 
-// FTS columns must be LargeUtf8.
-const schema = new Schema([new Field("title", new LargeUtf8(), false)]);
-const docs = db.createTable("docs", schema, new IndexSpec().fts("title"));
+// Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+// one-hot by topic. Real embeddings are dense and higher-dimensional.
+const embed = (topic) => { const v = Array(16).fill(0.0); v[topic] = 1.0; return v; };
 
-docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
+const docs = db.createTable(
+  "docs",
+  { source: "large_utf8", body: "large_utf8", embedding: { vector: 16 } },
+  new IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+);
 
-const rows = docs.bm25Search("title", "fox", 10);  // matching rows as records
-const hits = docs.tokenMatch("title", "fox");      // unranked matching rows (score 0)
-const out  = db.querySql("SELECT COUNT(*) AS n FROM docs"); // records (or { arrow: true })
+docs.append([
+  { source: "help-center", body: "To cancel a subscription, open Settings then Billing.", embedding: embed(0) },
+  { source: "help-center", body: "Refunds return to the original payment method.",         embedding: embed(0) },
+  { source: "blog",        body: "Enable dark mode under Settings then Appearance.",        embedding: embed(1) },
+]);
+
+// Three ways to retrieve context to ground the agent's next answer:
+const keyword  = docs.bm25Search("body", "cancel subscription", 5);            // BM25
+const semantic = docs.vectorSearch("embedding", embed(0), 5);                  // vector kNN
+const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'");  // SQL filter
 ```
 
-ES modules work the same way:
-
-```javascript
-import { connect, IndexSpec } from "infino-node";
-```
+CommonJS works too — `const { connect, IndexSpec } = require("infino");`.
 
 ## API
 
@@ -76,3 +86,4 @@ must be `FixedSizeList<Float32, dim>` with `dim` in `[16, 4096]`.
 - The API is **synchronous**. In a long-running server, run calls in a
   `worker_thread` so a query doesn't block the event loop.
 - `_id` comes back as a JavaScript `bigint`.
+```

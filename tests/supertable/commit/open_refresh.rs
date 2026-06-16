@@ -29,7 +29,7 @@ use infino::superfile::fts::reader::BoolMode;
 use infino::superfile::fts::tokenize::Tokenizer;
 use infino::supertable::options::Consistency;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::{OpenError, Supertable, SupertableOptions};
+use infino::supertable::{ManifestLoadError, OpenError, Supertable, SupertableOptions};
 use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
 
 /// BM25 top-k for the open/refresh consistency queries.
@@ -81,7 +81,7 @@ fn open_on_fresh_tempdir_returns_pointer_unreadable() {
     let err = Supertable::open(default_supertable_options().with_storage(storage))
         .expect_err("must reject fresh dir");
     assert!(
-        matches!(err, OpenError::PointerUnreadable(_)),
+        matches!(err, OpenError::ManifestLoadError(_)),
         "expected PointerUnreadable, got {err:?}"
     );
 }
@@ -256,7 +256,10 @@ fn open_rejects_mismatched_options_via_options_hash() {
     let err = Supertable::open(mismatched_opts)
         .expect_err("open must surface OptionsHashMismatch for a reordered schema");
     assert!(
-        matches!(err, OpenError::OptionsHashMismatch { .. }),
+        matches!(
+            err,
+            OpenError::ManifestLoadError(ManifestLoadError::ContentHashMismatch { .. })
+        ),
         "expected OptionsHashMismatch; got {err:?}"
     );
 }

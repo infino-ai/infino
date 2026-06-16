@@ -22,7 +22,7 @@ use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
+/// Residual quantization step divisor for [`RerankCodec::Sq8ResidualEpsilon`].
 /// The signed 8-bit residual code at dim `d` carries
 /// `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized steps around the Sq8
 /// dequant base. `16` hit the recall target with the best
@@ -357,9 +357,9 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Sq8Residual => {
+        RerankCodec::Sq8ResidualEpsilon => {
             unreachable!(
-                "distance_bytes_codec called with Sq8Residual — Sq8Residual rerank goes \
+                "distance_bytes_codec called with Sq8ResidualEpsilon — Sq8ResidualEpsilon rerank goes \
                  through dedicated kernels (need per-column scale/offset + per-doc \
                  norm context)"
             )
@@ -508,7 +508,7 @@ impl Sq8Kernel {
     }
 }
 
-/// `Sq8Residual` rerank context — the residual-corrected sibling of
+/// `Sq8ResidualEpsilon` rerank context — the residual-corrected sibling of
 /// [`Sq8Kernel`]. Captures the per-cluster quantizer (`scale[dim]`,
 /// `offset[dim]`) plus the query-side precomputes for both the Sq8
 /// code leg and the i8 residual leg, so the per-candidate inner loop
@@ -517,7 +517,7 @@ impl Sq8Kernel {
 /// Applied only to the small final-refine set the Sq8 score selects,
 /// so it never runs over the full shortlist. One kernel per query +
 /// cluster, reused across that cluster's refine candidates.
-pub(crate) struct Sq8ResidualKernel<'a> {
+pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
     metric: Metric,
     dim: usize,
     /// `q_code[d] = query[d] * scale[d]`. Per-doc step is
@@ -535,7 +535,7 @@ pub(crate) struct Sq8ResidualKernel<'a> {
     per_doc_norms: Option<&'a [f32]>,
 }
 
-impl<'a> Sq8ResidualKernel<'a> {
+impl<'a> Sq8ResidualEpsilonKernel<'a> {
     /// Build the per-query residual kernel. `scale` + `offset` are
     /// the per-cluster quantizer arrays; `residual_divisor` is
     /// [`SQ8_RESIDUAL_DIVISOR`]. `per_doc_norms` is `Some` for L2Sq
@@ -647,7 +647,7 @@ impl<'a> Sq8ResidualKernel<'a> {
         match self.metric {
             Metric::Cosine => {
                 let x_norm = norm
-                    .expect("Sq8ResidualKernel + Cosine requires per_doc_norms")
+                    .expect("Sq8ResidualEpsilonKernel + Cosine requires per_doc_norms")
                     .sqrt();
                 if x_norm > 0.0 {
                     COSINE_DISTANCE_BASE - dot / x_norm
@@ -657,7 +657,8 @@ impl<'a> Sq8ResidualKernel<'a> {
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
-                let x_norm_sq = norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
+                let x_norm_sq =
+                    norm.expect("Sq8ResidualEpsilonKernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
@@ -1085,7 +1086,7 @@ mod tests {
             .collect()
     }
 
-    /// Decode `Sq8Residual` codes (`code * scale + offset + residual
+    /// Decode `Sq8ResidualEpsilon` codes (`code * scale + offset + residual
     /// * scale / divisor`) — the reference the residual kernel must
     /// agree with.
     fn decode_sq8_residual(
@@ -1129,7 +1130,7 @@ mod tests {
                 Metric::Cosine | Metric::L2Sq => Some(&norms[..]),
                 Metric::NegDot => None,
             };
-            let kernel = Sq8ResidualKernel::new(
+            let kernel = Sq8ResidualEpsilonKernel::new(
                 metric,
                 &query,
                 &scale,
@@ -1162,7 +1163,7 @@ mod tests {
             .collect();
         let corrected =
             decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
-        let kernel = Sq8ResidualKernel::new(
+        let kernel = Sq8ResidualEpsilonKernel::new(
             Metric::NegDot,
             &query,
             &scale,

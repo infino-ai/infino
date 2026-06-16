@@ -107,7 +107,7 @@ mod tests {
             text_seed: 1,
             rot_seed: 7,
             metric: "Cosine".into(),
-            rerank_codec: "Sq8Residual".into(),
+            rerank_codec: "Sq8ResidualEpsilon".into(),
             modality: "Combined".into(),
         }
     }

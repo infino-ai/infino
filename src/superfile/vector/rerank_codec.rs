@@ -7,7 +7,7 @@
 //!
 //! - [`RerankCodec::Fp32`]: little-endian fp32, `dim × 4` bytes
 //!   per vector. Zero-copy on the rerank distance kernel.
-//! - [`RerankCodec::Sq8Residual`]: `Sq8` codes plus a signed
+//! - [`RerankCodec::Sq8ResidualEpsilon`]: `Sq8` codes plus a signed
 //!   8-bit residual sidecar, `dim × 2` bytes per vector
 //!   (row-interleaved `[code dim u8 ‖ residual dim i8]`). The
 //!   Sq8 score selects a small final-refine set; the residual
@@ -30,7 +30,7 @@
 //! ## `codec_meta` region
 //!
 //! For codecs that need per-column auxiliary data (today:
-//! `Sq8Residual`'s scale + offset arrays), the subsection carries a
+//! `Sq8ResidualEpsilon`'s scale + offset arrays), the subsection carries a
 //! `codec_meta` region between the `codes` region and the
 //! `full[]` region. The region's relative offset within the
 //! subsection is recorded in sub-header bytes 12..16 as
@@ -57,14 +57,14 @@ const FP32_LOW_DIM_RERANK_FLOOR: usize = 20;
 /// needed to recover the same recall.
 const FP32_HIGH_DIM_RERANK_FLOOR: usize = 50;
 
-/// Recommended floor on `rerank_mult` for `Sq8Residual` columns at
+/// Recommended floor on `rerank_mult` for `Sq8ResidualEpsilon` columns at
 /// `dim ≤ 384`. The compressed first-pass score needs more
 /// candidates than fp32 to
 /// recover equivalent recall because the dequant noise floor is
 /// higher.
 const SQ8_LOW_DIM_RERANK_FLOOR: usize = 50;
 
-/// Recommended floor on `rerank_mult` for `Sq8Residual` columns at
+/// Recommended floor on `rerank_mult` for `Sq8ResidualEpsilon` columns at
 /// `dim > 384`. See [`SQ8_LOW_DIM_RERANK_FLOOR`] and
 /// [`FP32_HIGH_DIM_RERANK_FLOOR`] for the underlying
 /// calibration rationale.
@@ -88,7 +88,7 @@ pub enum RerankCodec {
     /// final-refine set, then applies the residual correction to
     /// that set — closing the tight top-K cosine recall gap plain
     /// Sq8 exhibits on production-shaped 384D corpora.
-    Sq8Residual,
+    Sq8ResidualEpsilon,
     /// No rerank column at all. The 1-bit RaBitQ shortlist is
     /// the final ranking. Opt-in — recall drops 0.05–0.15 on
     /// typical normalized-Gaussian / image-embedding corpora;
@@ -102,13 +102,13 @@ pub enum RerankCodec {
 }
 
 impl Default for RerankCodec {
-    /// `Sq8Residual` keeps the compressed Sq8 path as the default
+    /// `Sq8ResidualEpsilon` keeps the compressed Sq8 path as the default
     /// while correcting the tight top-K swaps that plain Sq8
     /// exhibited in the residual-selection diagnostics. Callers that
     /// need bit-exact fp32 (oracles, regression fixtures,
     /// recall-floor reference runs) opt in to [`RerankCodec::Fp32`].
     fn default() -> Self {
-        Self::Sq8Residual
+        Self::Sq8ResidualEpsilon
     }
 }
 
@@ -121,7 +121,7 @@ impl RerankCodec {
     pub const fn codec_id(self) -> u8 {
         match self {
             Self::Fp32 => 0,
-            Self::Sq8Residual => 1,
+            Self::Sq8ResidualEpsilon => 1,
             Self::RabitqOnly => 2,
         }
     }
@@ -134,7 +134,7 @@ impl RerankCodec {
     pub const fn from_codec_id(id: u8) -> Option<Self> {
         match id {
             0 => Some(Self::Fp32),
-            1 => Some(Self::Sq8Residual),
+            1 => Some(Self::Sq8ResidualEpsilon),
             2 => Some(Self::RabitqOnly),
             _ => None,
         }
@@ -146,7 +146,7 @@ impl RerankCodec {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Fp32 => "fp32",
-            Self::Sq8Residual => "sq8_residual",
+            Self::Sq8ResidualEpsilon => "sq8_residual",
             Self::RabitqOnly => "rabitq_only",
         }
     }
@@ -157,7 +157,7 @@ impl RerankCodec {
     pub const fn per_vector_bytes(self, dim: usize) -> usize {
         match self {
             Self::Fp32 => dim * 4,
-            Self::Sq8Residual => dim * 2,
+            Self::Sq8ResidualEpsilon => dim * 2,
             Self::RabitqOnly => 0,
         }
     }
@@ -181,7 +181,10 @@ impl RerankCodec {
     /// writing a byte format that the reader can't decode.
     #[inline]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Fp32 | Self::Sq8Residual | Self::RabitqOnly)
+        matches!(
+            self,
+            Self::Fp32 | Self::Sq8ResidualEpsilon | Self::RabitqOnly
+        )
     }
 
     /// Recommended **lower bound** on `rerank_mult` for this
@@ -190,7 +193,7 @@ impl RerankCodec {
     /// [`Self::RabitqOnly`], which skips the rerank step
     /// entirely).
     ///
-    /// Sq8Residual needs more candidates to recover fp32-equivalent
+    /// Sq8ResidualEpsilon needs more candidates to recover fp32-equivalent
     /// recall because the first-pass dequant noise floor is higher
     /// than fp32. The bench harness uses this as the calibration-grid
     /// lower bound; direct `search(.., rerank_mult)` callers are
@@ -206,7 +209,7 @@ impl RerankCodec {
             } else {
                 FP32_LOW_DIM_RERANK_FLOOR
             }),
-            Self::Sq8Residual => Some(if high_dim {
+            Self::Sq8ResidualEpsilon => Some(if high_dim {
                 SQ8_HIGH_DIM_RERANK_FLOOR
             } else {
                 SQ8_LOW_DIM_RERANK_FLOOR
@@ -220,7 +223,7 @@ impl RerankCodec {
     /// Stored immediately before the subsection's `full[]` region.
     ///
     /// - `Fp32` / `RabitqOnly`: `0` (no codec metadata).
-    /// - `Sq8Residual`: **per-cluster** per-dim `(scale, offset)` arrays
+    /// - `Sq8ResidualEpsilon`: **per-cluster** per-dim `(scale, offset)` arrays
     ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`/`Cosine`-metric
     ///   columns, a per-doc `sum_x_decoded² : f32` table
     ///   (`n_docs × 4` bytes) used to short-circuit the `Σx²`
@@ -254,7 +257,7 @@ impl RerankCodec {
     ) -> usize {
         match self {
             Self::Fp32 | Self::RabitqOnly => 0,
-            Self::Sq8Residual => {
+            Self::Sq8ResidualEpsilon => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
                     Metric::L2Sq | Metric::Cosine => n_docs * 4,
@@ -276,13 +279,13 @@ impl std::fmt::Display for RerankCodec {
 mod tests {
     use super::*;
 
-    /// Default codec is `Sq8Residual`. Any change here is a
+    /// Default codec is `Sq8ResidualEpsilon`. Any change here is a
     /// load-bearing format choice — every caller that uses
     /// `RerankCodec::default()` silently follows this pick, so
     /// the test pins the contract.
     #[test]
     fn default_is_sq8_residual() {
-        assert_eq!(RerankCodec::default(), RerankCodec::Sq8Residual);
+        assert_eq!(RerankCodec::default(), RerankCodec::Sq8ResidualEpsilon);
     }
 
     /// `Fp32`'s codec_id is zero. Older superfiles have all-zero
@@ -302,7 +305,7 @@ mod tests {
     fn codec_id_roundtrips_every_variant() {
         for c in [
             RerankCodec::Fp32,
-            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8ResidualEpsilon,
             RerankCodec::RabitqOnly,
         ] {
             assert_eq!(
@@ -334,7 +337,7 @@ mod tests {
     #[test]
     fn per_vector_bytes_matches_spec() {
         assert_eq!(RerankCodec::Fp32.per_vector_bytes(384), 1536);
-        assert_eq!(RerankCodec::Sq8Residual.per_vector_bytes(384), 768);
+        assert_eq!(RerankCodec::Sq8ResidualEpsilon.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::RabitqOnly.per_vector_bytes(384), 0);
     }
 
@@ -346,7 +349,7 @@ mod tests {
     fn writes_full_matches_per_vector_bytes() {
         for c in [
             RerankCodec::Fp32,
-            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8ResidualEpsilon,
             RerankCodec::RabitqOnly,
         ] {
             assert_eq!(
@@ -361,7 +364,7 @@ mod tests {
     #[test]
     fn all_codecs_implemented() {
         assert!(RerankCodec::Fp32.is_implemented());
-        assert!(RerankCodec::Sq8Residual.is_implemented());
+        assert!(RerankCodec::Sq8ResidualEpsilon.is_implemented());
         assert!(RerankCodec::RabitqOnly.is_implemented());
     }
 
@@ -378,7 +381,7 @@ mod tests {
             Some(20)
         );
         assert_eq!(
-            RerankCodec::Sq8Residual.recommended_rerank_mult_floor(384),
+            RerankCodec::Sq8ResidualEpsilon.recommended_rerank_mult_floor(384),
             Some(50)
         );
         assert_eq!(
@@ -391,7 +394,7 @@ mod tests {
             Some(50)
         );
         assert_eq!(
-            RerankCodec::Sq8Residual.recommended_rerank_mult_floor(1024),
+            RerankCodec::Sq8ResidualEpsilon.recommended_rerank_mult_floor(1024),
             Some(100)
         );
         assert_eq!(
@@ -401,12 +404,12 @@ mod tests {
         // Split point: dim == 384 is the low-dim cell; dim == 385
         // crosses into high-dim.
         assert_eq!(
-            RerankCodec::Sq8Residual.recommended_rerank_mult_floor(385),
+            RerankCodec::Sq8ResidualEpsilon.recommended_rerank_mult_floor(385),
             Some(100)
         );
     }
 
-    /// Sq8Residual's codec_meta size: `8·n_cent·dim` for negdot,
+    /// Sq8ResidualEpsilon's codec_meta size: `8·n_cent·dim` for negdot,
     /// `8·n_cent·dim + 4·n_docs` for L2Sq/Cosine (per-doc decoded-norm
     /// cache). Fp32 / RabitqOnly always contribute zero
     /// bytes. Per-cluster scale/offset is the recall-recovery
@@ -423,23 +426,23 @@ mod tests {
                 );
             }
         }
-        // Sq8Residual negdot: per-cluster scale + offset arrays.
+        // Sq8ResidualEpsilon negdot: per-cluster scale + offset arrays.
         let so_bytes = 2 * 1024 * 384 * 4;
         assert_eq!(
-            RerankCodec::Sq8Residual.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
+            RerankCodec::Sq8ResidualEpsilon.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
             so_bytes
         );
-        // Sq8Residual L2Sq/Cosine: per-cluster scale + offset + per-doc norms.
+        // Sq8ResidualEpsilon L2Sq/Cosine: per-cluster scale + offset + per-doc norms.
         assert_eq!(
-            RerankCodec::Sq8Residual.codec_meta_bytes(384, 1_000_000, 1024, Metric::Cosine),
+            RerankCodec::Sq8ResidualEpsilon.codec_meta_bytes(384, 1_000_000, 1024, Metric::Cosine),
             so_bytes + 1_000_000 * 4
         );
         assert_eq!(
-            RerankCodec::Sq8Residual.codec_meta_bytes(384, 1_000_000, 1024, Metric::L2Sq),
+            RerankCodec::Sq8ResidualEpsilon.codec_meta_bytes(384, 1_000_000, 1024, Metric::L2Sq),
             so_bytes + 1_000_000 * 4
         );
         assert_eq!(
-            RerankCodec::Sq8Residual.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
+            RerankCodec::Sq8ResidualEpsilon.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
             so_bytes
         );
     }

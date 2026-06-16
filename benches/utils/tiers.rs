@@ -457,6 +457,41 @@ pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
     }
 }
 
+/// Full object-store prefix of an already-built supertable to open directly
+/// for the read phases. Set to a retained `INFINO_BENCH_KEEP_TABLE` prefix
+/// (e.g. `infino-supertable-bench/<pid>-<nanos>`) to skip corpus generation
+/// and ingest entirely and read against the existing artifact.
+const EXISTING_SUPERTABLE_PREFIX_ENV: &str = "INFINO_BENCH_EXISTING_PREFIX";
+
+/// The configured existing-supertable prefix, if any (non-empty).
+fn existing_supertable_prefix() -> Option<String> {
+    std::env::var(EXISTING_SUPERTABLE_PREFIX_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Storage scoped to an already-built supertable at the absolute prefix in
+/// `INFINO_BENCH_EXISTING_PREFIX`. `None` when the env is unset. No unique
+/// suffix and no cleanup — the data persists across runs. Real backend only,
+/// same guard as [`supertable_storage_fixture`].
+pub(crate) async fn existing_supertable_storage_fixture() -> Option<StorageFixture> {
+    let prefix = existing_supertable_prefix()?;
+    let backend = match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
+        Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
+        backend => backend,
+    };
+    let label = backend.label();
+    let storage = backend.provider(&prefix).expect("existing-prefix provider");
+    eprintln!("[tiers] existing supertable {label} prefix={prefix} (read-only, no cleanup)");
+    Some(StorageFixture {
+        storage,
+        storage_label: label,
+        remote: true,
+        cleanup: None,
+        _keepalive: StorageKeepalive::Remote,
+    })
+}
+
 /// Upload one superfile blob for superfile-shaped warm/cold benches (1M).
 pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
     let fixture = backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await;

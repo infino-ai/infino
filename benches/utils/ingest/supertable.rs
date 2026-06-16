@@ -67,14 +67,19 @@ const CORPUS_TEXT_SEED: u64 = 1;
 
 /// Random-rotation RNG seed for the bench vector index.
 const ROT_SEED: u64 = 7;
+/// Bytes in one gibibyte, for GiB-denominated memory and report values.
+const GIB_BYTES: u64 = 1u64 << 30;
+
 /// Distance metric for the bench vector index.
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Rerank residual codec for the bench vector index.
-const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
+const BENCH_RERANK: RerankCodec = RerankCodec::Sq8ResidualEpsilon;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
-/// Producer memory budget (8 GiB) capping resident RSS during ingest.
-const WRITER_MEMORY_BUDGET_BYTES: u64 = 8 * (1u64 << 30);
+/// Producer memory budget in GiB, capping resident RSS during ingest.
+const WRITER_MEMORY_BUDGET_GIB: u64 = 8;
+/// Producer memory budget in bytes, derived from [`WRITER_MEMORY_BUDGET_GIB`].
+const WRITER_MEMORY_BUDGET_BYTES: u64 = WRITER_MEMORY_BUDGET_GIB * GIB_BYTES;
 
 /// Result of one object-storage ingest run.
 pub struct IngestResult {
@@ -385,7 +390,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
     drop(cache_dir);
     eprintln!(
         "[supertable_ingest] ingest complete: {n_superfiles} superfiles, {:.2} GiB index bytes on {}",
-        total_index_bytes as f64 / (1u64 << 30) as f64,
+        total_index_bytes as f64 / GIB_BYTES as f64,
         storage_backend.storage_label,
     );
     // SQL query predicates sample the mid-corpus row (one mmap page
@@ -462,7 +467,7 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
         "[supertable_dataset] opened {} dataset: {} superfiles, {:.2} GiB index bytes on {}",
         modality.dataset_dir(),
         meta.n_superfiles,
-        meta.total_index_bytes as f64 / (1u64 << 30) as f64,
+        meta.total_index_bytes as f64 / GIB_BYTES as f64,
         storage_backend.storage_label,
     );
     IngestResult {
@@ -473,6 +478,45 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
         cleanup: None,
         sql_sample_title: meta.sql_sample_title,
         sql_sample_key: meta.sql_sample_key,
+    }
+}
+
+/// Open an already-built supertable at `INFINO_BENCH_EXISTING_PREFIX` for the
+/// read phases: no corpus, no ingest, no sidecar. A one-time manifest read
+/// learns the superfile count + index bytes the warm/cold runners need to size
+/// the search cache; the options the consumer reopens with must match the build
+/// (same `INFINO_BENCH_SUPERTABLE_DOCS`), exactly like the dataset path.
+pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) -> IngestResult {
+    let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&fixture.storage));
+    let opts = options_for(modality, Some(Arc::clone(&fixture.storage))).with_disk_cache(cache);
+    let st =
+        Supertable::open(opts).expect("open existing supertable at INFINO_BENCH_EXISTING_PREFIX");
+    let reader = st.reader();
+    let n_superfiles = reader.n_superfiles();
+    let total_index_bytes: u64 = reader
+        .manifest()
+        .superfiles
+        .iter()
+        .filter_map(|e| e.subsection_offsets.as_ref())
+        .map(|off| off.total_size)
+        .sum();
+    drop(reader);
+    drop(st);
+    drop(cache_dir);
+    eprintln!(
+        "[supertable_existing] opened {} supertable: {n_superfiles} superfiles, {:.2} GiB index bytes on {}",
+        modality.dataset_dir(),
+        total_index_bytes as f64 / GIB_BYTES as f64,
+        fixture.storage_label,
+    );
+    IngestResult {
+        storage: fixture.storage,
+        storage_label: fixture.storage_label,
+        n_superfiles,
+        total_index_bytes,
+        cleanup: None,
+        sql_sample_title: None,
+        sql_sample_key: None,
     }
 }
 

@@ -75,6 +75,20 @@ const PASS2_CHUNK_ROWS_MIN: usize = 1024;
 /// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
 const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
 
+/// Superfile-local document thresholds for capping the physical IVF centroid
+/// count. Caller-supplied `n_cent` remains a tuning knob, but the builder will
+/// not train more centroids than this row-count policy permits for the physical
+/// superfile being written.
+const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
+/// Maximum IVF centroids for large physical vector indexes.
+const N_CENT_LARGE: usize = 4096;
+/// Medium-index document threshold for the IVF centroid cap.
+const N_CENT_MEDIUM_DOC_THRESHOLD: usize = 100_000;
+/// Maximum IVF centroids for medium physical vector indexes.
+const N_CENT_MEDIUM: usize = 1024;
+/// Maximum IVF centroids for small physical vector indexes.
+const N_CENT_SMALL: usize = 64;
+
 /// Fixed-point scale for the per-subsection summary radius. The
 /// radius is stored as `round(radius × 100)` in a `u32` and decoded
 /// back by the reader as `value / 100.0`.
@@ -85,10 +99,20 @@ const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 /// `[0, SQ8_CODE_MAX]`.
 const SQ8_CODE_MAX: f32 = 255.0;
 
-/// Symmetric clamp bound for the Sq8Residual i8 leg. The residual is
+/// Symmetric clamp bound for the Sq8ResidualEpsilon i8 leg. The residual is
 /// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
 /// quantized magnitude stays symmetric about zero.
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
+
+fn n_cent_row_count_cap(n_docs: usize) -> usize {
+    if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
+        N_CENT_LARGE
+    } else if n_docs >= N_CENT_MEDIUM_DOC_THRESHOLD {
+        N_CENT_MEDIUM
+    } else {
+        N_CENT_SMALL
+    }
+}
 
 /// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
 /// 2 = NegDot.
@@ -717,7 +741,12 @@ fn build_subsection_streaming(
     // by the trainer). At steady-state shapes (`n_docs > sample_size`,
     // `sample_size ≥ 100_000`) the sample_rows bound is the active
     // one and is comfortably above any sane n_cent.
-    let n_cent = cfg.n_cent.max(1).min(n_docs.max(1)).min(sample_rows.max(1));
+    let n_cent = cfg
+        .n_cent
+        .max(1)
+        .min(n_cent_row_count_cap(n_docs))
+        .min(n_docs.max(1))
+        .min(sample_rows.max(1));
 
     // ---- Pass 1: k-means on the reservoir sample ----
     let centroids = if sample_rows == 0 || n_docs == 0 {
@@ -776,9 +805,9 @@ fn build_subsection_streaming(
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
     let codec = cfg.rerank_codec;
-    // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
+    // `Sq8ResidualEpsilon` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
-    let sq8_family = matches!(codec, RerankCodec::Sq8Residual);
+    let sq8_family = matches!(codec, RerankCodec::Sq8ResidualEpsilon);
     let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if sq8_family {
         (
             vec![f32::INFINITY; n_cent * dim],
@@ -1057,7 +1086,7 @@ fn build_subsection_streaming(
                 let full_base = block_base + codes_len + ids_len;
                 bytes[full_base..full_base + cluster_count * dim * 4].copy_from_slice(&full_block);
             }
-            RerankCodec::Sq8Residual => {
+            RerankCodec::Sq8ResidualEpsilon => {
                 let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                 let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
                 let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
@@ -1100,7 +1129,7 @@ fn build_subsection_streaming(
     })
 }
 
-/// `Sq8Residual` per-cluster encode. Writes a row-interleaved
+/// `Sq8ResidualEpsilon` per-cluster encode. Writes a row-interleaved
 /// `[code dim u8 ‖ residual dim i8]` body (`2 × dim` bytes per row)
 /// at `full_chunk_base + i × 2·dim`. The Sq8 code is the same
 /// `sq8_encode_row` quantization; the residual code captures the
@@ -1457,7 +1486,7 @@ mod tests {
             n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");
