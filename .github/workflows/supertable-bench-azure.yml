@@ -50,6 +50,11 @@ on:
         required: false
         default: false
         type: boolean
+      skip_calibration:
+        description: "Vector only: skip recall calibration, report fixed-config cold latency (no recall gate)."
+        required: false
+        default: false
+        type: boolean
   # Callable from other workflows (e.g. the PR group in ci.yml). Same
   # inputs; `choice` isn't valid here so `bench` is a string.
   workflow_call:
@@ -67,6 +72,8 @@ on:
       # On main: publish the run as the baseline pointer + per-commit
       # history. On a PR: false — restore main's baseline and diff against it.
       update_baseline: { type: boolean, required: false, default: false }
+      # Vector only: skip recall calibration, fixed-config cold latency only.
+      skip_calibration: { type: boolean, required: false, default: false }
 
 permissions:
   id-token: write   # Azure OIDC federated login
@@ -304,11 +311,13 @@ jobs:
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              KEEP='${{ inputs.keep_table }}' \
+             SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
           set -euo pipefail
           cd "$HOME/infino-src"
           export INFINO_BENCH_STORE=azure
           [ "$KEEP" = "true" ] && export INFINO_BENCH_KEEP_TABLE=1
+          [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           # The multi-commit build holds many superfile files + object-store
           # connections open at once; raise the fd soft limit to the hard
           # max so commits don't hit EMFILE ("too many open files").
