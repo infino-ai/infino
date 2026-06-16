@@ -2148,6 +2148,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "datafusion",
  "infino",
  "napi",
  "napi-build",

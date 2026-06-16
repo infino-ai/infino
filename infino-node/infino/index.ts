@@ -6,9 +6,12 @@
 // query returns an apache-arrow `Table` instead of records.
 
 import * as arrow from "apache-arrow";
-import { connect as nativeConnect, IndexSpec } from "./native.js";
+import { connect as nativeConnect, IndexSpec, builderId } from "./native.js";
 
 export { IndexSpec };
+
+/** Infino's build identifier (version + build hash). */
+export const BUILDER_ID: string = builderId();
 
 const STREAM = "stream";
 
@@ -25,12 +28,39 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
-/** Storage config the `connect` URI can't carry (S3-compatible creds). */
+/** Storage and cache config the `connect` URI can't carry. All optional. */
 export interface ConnectOptions {
+  /** S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`. */
   endpoint?: string;
   region?: string;
   accessKey?: string;
   secretKey?: string;
+  /** Local disk-cache directory for remote-backed tables. */
+  cacheDir?: string;
+  /** Disk-cache budget in bytes. */
+  cacheBudgetBytes?: number;
+  /** How cold misses are serviced. */
+  coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
+}
+
+/** Row counts returned by `update` / `delete`. */
+export interface MutationStats {
+  /** Rows the predicate matched. */
+  matched: number;
+  /** Rows tombstoned (removed from the live set). */
+  nTombstoned: number;
+  /** Matched rows not found in any live segment. */
+  nNotFound: number;
+}
+
+/** Tuning for `compact`; all fields optional (omitted ⇒ engine default). */
+export interface CompactOptions {
+  /** Build-time memory budget, in MB. */
+  maxMemoryMb?: number;
+  /** Only compact superfiles below this fill percent (0–100). */
+  minFillPercent?: number;
+  /** Target merged-superfile size, in MB. */
+  targetSuperfileSizeMb?: number;
 }
 
 export interface Bm25SearchOptions {
@@ -40,7 +70,10 @@ export interface Bm25SearchOptions {
   arrow?: boolean;
 }
 export interface VectorSearchOptions {
+  /** IVF partitions to probe (higher = better recall, more work). */
   nprobe?: number;
+  /** Over-fetch multiplier for the exact-rerank stage (higher = better recall). */
+  rerankMult?: number;
   projection?: string[];
   arrow?: boolean;
 }
@@ -238,7 +271,7 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
-    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.projection);
+    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection);
     return decode(buf, opts.arrow);
   }
 
@@ -256,6 +289,25 @@ export class Table {
   exactMatch(column: string, value: string, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
     const buf = this.inner.exactMatch(column, value, opts.projection);
     return decode(buf, opts.arrow);
+  }
+
+  /** Replace rows matching a SQL predicate (e.g. `"status = 'spam'"`) with
+   * `data` (same shapes as `append`), 1:1 — the matched count must equal the
+   * replacement-row count. Requires durable storage (not `memory://`). */
+  update(predicate: string, data: AppendData): MutationStats {
+    return this.inner.update(predicate, dataToIpc(data, () => this.schema()));
+  }
+
+  /** Delete rows matching a SQL predicate (e.g. `"status = 'spam'"`).
+   * Requires durable storage (not `memory://`). */
+  delete(predicate: string): MutationStats {
+    return this.inner.delete(predicate);
+  }
+
+  /** Merge small / underfilled superfiles into larger ones (omit `settings`
+   * for engine defaults). */
+  compact(settings?: CompactOptions): void {
+    this.inner.compact(settings);
   }
 }
 

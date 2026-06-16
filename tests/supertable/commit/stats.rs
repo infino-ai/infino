@@ -48,7 +48,7 @@ fn fresh_supertable_returns_empty_stats() {
     assert_eq!(s.manifest_id, 0);
     assert_eq!(s.n_superfiles, 0);
     assert_eq!(
-        s.n_manifest_parts, None,
+        s.n_manifest_parts, 0,
         "fresh in-process supertable has no ManifestList"
     );
     assert_eq!(s.n_manifest_parts_loaded, 0);
@@ -82,7 +82,7 @@ fn stats_track_commits_on_in_process_supertable() {
         s2.n_superfiles
     );
     assert_eq!(
-        s2.n_manifest_parts, None,
+        s2.n_manifest_parts, 0,
         "in-process supertable never has a ManifestList"
     );
 }
@@ -108,8 +108,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
     let producer_stats = producer.stats();
     assert_eq!(producer_stats.manifest_id, 1);
     assert_eq!(
-        producer_stats.n_manifest_parts,
-        Some(1),
+        producer_stats.n_manifest_parts, 1,
         "post-commit ManifestList exists with one part"
     );
     assert_eq!(
@@ -125,7 +124,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
             .expect("open");
     let consumer_stats = consumer.stats();
     assert_eq!(consumer_stats.manifest_id, 1);
-    assert_eq!(consumer_stats.n_manifest_parts, Some(1));
+    assert_eq!(consumer_stats.n_manifest_parts, 1);
     assert_eq!(
         consumer_stats.n_manifest_parts_loaded, 1,
         "open eager-fetches every part"

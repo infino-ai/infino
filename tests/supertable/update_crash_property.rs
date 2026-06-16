@@ -91,8 +91,7 @@ async fn seed_partial_state(
         .expect("open for ids");
     let manifest = st.reader().manifest().clone();
     let id_min = manifest
-        .superfile_list
-        .superfiles
+        .get_all_superfiles()
         .first()
         .expect("superfile")
         .id_min;
@@ -116,8 +115,7 @@ async fn seed_partial_state(
                 tombstoned_in_superfile: if outcome == TombstoneOutcome::Tombstoned {
                     Some(
                         manifest
-                            .superfile_list
-                            .superfiles
+                            .get_all_superfiles()
                             .first()
                             .expect("superfile")
                             .superfile_id,

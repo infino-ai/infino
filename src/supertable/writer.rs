@@ -70,12 +70,9 @@ use crate::superfile::format::vec::{
 };
 use crate::superfile::format::{footer::read_kv_metadata, kv};
 use crate::supertable::manifest::Manifest;
-use crate::supertable::manifest::ManifestPartLoader;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
 use crate::supertable::manifest::commit::{self as commit_mod};
-use crate::supertable::manifest::list::{
-    FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
-};
+use crate::supertable::manifest::list::{FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList};
 use crate::supertable::manifest::part::{self as part_mod, PartId};
 use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
 
@@ -1661,8 +1658,15 @@ pub(in crate::supertable) fn persist_commit(
             // iteration) feeds into our successor's
             // `new_superfile_list`.
             let old = inner.manifest.load_full();
-            let new_superfile_list = old.superfile_list.with_appended(new_entries.clone());
+            let new_superfile_list = old
+                .get_all_superfiles()
+                .iter()
+                .chain(new_entries.iter())
+                .map(Arc::clone)
+                .collect::<Vec<_>>();
+
             let pending_writes = &mut pending_storage_writes;
+            let new_manifest_id = old.manifest_id + 1;
 
             match try_commit_attempt(
                 Arc::clone(&storage_async),
@@ -1670,13 +1674,17 @@ pub(in crate::supertable) fn persist_commit(
                 Arc::clone(&old),
                 &new_entries,
                 &[],
-                new_superfile_list.manifest_id,
+                new_manifest_id,
                 pending_writes,
             )
             .await
             {
                 Ok(new_list) => {
-                    return Ok::<_, crate::supertable::CommitError>((new_list, new_superfile_list));
+                    return Ok::<_, crate::supertable::CommitError>((
+                        new_manifest_id,
+                        new_list,
+                        new_superfile_list,
+                    ));
                 }
                 Err(crate::supertable::CommitError::WriteContentionExhausted)
                     if attempt + 1 < max_retries =>
@@ -1696,30 +1704,34 @@ pub(in crate::supertable) fn persist_commit(
         Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
     };
 
-    let (new_list, new_superfile_list) = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // Ambient tokio runtime present — use it. Don't
-            // touch `inner.query_runtime()` so we don't risk
-            // dropping our owned runtime from within
-            // another's worker context.
-            tokio::task::block_in_place(|| handle.block_on(drive))?
-        }
-        Err(_) => {
-            // Sync caller; lazy-init the supertable's
-            // owned runtime.
-            inner.query_runtime().block_on(drive)?
-        }
-    };
+    let (new_manifest_id, new_list, new_superfile_list) =
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Ambient tokio runtime present — use it. Don't
+                // touch `inner.query_runtime()` so we don't risk
+                // dropping our owned runtime from within
+                // another's worker context.
+                tokio::task::block_in_place(|| handle.block_on(drive))?
+            }
+            Err(_) => {
+                // Sync caller; lazy-init the supertable's
+                // owned runtime.
+                inner.query_runtime().block_on(drive)?
+            }
+        };
 
     // Build the new in-memory Manifest with the persisted
     // list + a fresh ManifestPartLoader installed.
-    let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &new_list));
-    Ok(Manifest {
-        superfile_list: new_superfile_list,
-        list: Some(new_list),
-        parts: dashmap::DashMap::new(),
-        loader: Some(loader),
-    })
+    let opts = Arc::clone(&inner.options);
+    let manifest = Manifest::new(
+        new_manifest_id,
+        opts,
+        new_superfile_list,
+        Some(storage),
+        Some(new_list),
+    );
+
+    Ok(manifest)
 }
 
 // Writes the superfile list to storage. Performs the side-effect of modifying pending_storage_writes
@@ -1832,11 +1844,7 @@ pub(crate) async fn try_commit_attempt(
     //    against this so a schema mismatch surfaces as a
     //    typed error rather than a downstream decode
     //    failure.
-    let strategy: PartitionStrategy = old
-        .list
-        .as_ref()
-        .map(|l| l.partition_strategy.clone())
-        .unwrap_or_else(|| opts.effective_partition_strategy());
+    let strategy = old.get_partition_strategy();
     let opts_hash =
         crate::supertable::manifest::options_hash::compute_options_hash(opts.as_ref(), &strategy);
     let new_list = ManifestList {

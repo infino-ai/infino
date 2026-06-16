@@ -112,25 +112,11 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
+        let superfiles = manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
 
-        let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
-            Some(list) => {
-                let kept = crate::supertable::manifest::list_prune::prune_parts_for_vector(
-                    list,
-                    column,
-                    query,
-                    f32::INFINITY,
-                );
-                crate::supertable::query::hierarchical_iter::load_and_flatten(
-                    manifest.as_ref(),
-                    &kept,
-                )
-                .await?
-            }
-            None => crate::supertable::query::hierarchical_iter::fallback_to_flat_superfiles(
-                manifest.as_ref(),
-            ),
-        };
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }

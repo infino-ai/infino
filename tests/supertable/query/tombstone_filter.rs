@@ -93,8 +93,7 @@ async fn fts_query_excludes_tombstoned_row() {
     // contiguously starting at `id_min`, so middle = id_min + 1.
     let manifest = st.reader().manifest().clone();
     let entry = manifest
-        .superfile_list
-        .superfiles
+        .get_all_superfiles()
         .first()
         .expect("at least one superfile");
     let target = entry.id_min + 1;
@@ -139,8 +138,7 @@ async fn sql_query_excludes_tombstoned_row() {
 
     let manifest = st.reader().manifest().clone();
     let entry = manifest
-        .superfile_list
-        .superfiles
+        .get_all_superfiles()
         .first()
         .expect("at least one superfile");
     // Tombstone two of the four rows: id_min and id_min+2.
@@ -300,8 +298,7 @@ async fn vector_query_excludes_tombstoned_row() {
 
     let manifest = st.reader().manifest().clone();
     let entry = manifest
-        .superfile_list
-        .superfiles
+        .get_all_superfiles()
         .first()
         .expect("at least one superfile");
     let target = entry.id_min; // row 0
