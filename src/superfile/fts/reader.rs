@@ -781,11 +781,18 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = self.build_term_cursors(column_id, tokens).await?;
-        // AND needs every token present; a missing token ⇒ empty set.
-        if mode == BoolMode::And && cursors.len() != tokens.len() {
-            return Ok(Vec::new());
-        }
-        Ok(walk_cursors_unranked(cursors, mode))
+        Ok(match mode {
+            BoolMode::And => {
+                // AND needs every token present; a missing token ⇒ empty
+                // set. Otherwise intersect via the same optimized
+                // block flat-merge the ranked scorer uses.
+                if cursors.len() != tokens.len() {
+                    return Ok(Vec::new());
+                }
+                self.collect_and_intersect(column_id, cursors)
+            }
+            BoolMode::Or => or_merge_unranked(cursors),
+        })
     }
 
     /// Document frequency of `token` in `column` — the number of docs
@@ -1440,30 +1447,54 @@ impl FtsReader {
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-
-        // 2-term shape gets a specialized flat-merge inner loop: when
-        // both cursors sit in their decoded block buffers, we walk the
-        // two sorted `block_doc_ids` arrays with two index pointers
-        // instead of calling `skip_to` per leader doc. That removes
-        // the function-call + within-block linear-scan overhead on the
-        // hottest AND case (rare ∧ common). The general path is kept
-        // for n >= 3 because flat-merge across N arrays doesn't
-        // straightforwardly generalize and the per-doc leapfrog still
-        // amortizes well with the block-max pruning below.
-        if cursors.len() == 2 {
-            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, k, &mut heap, filter, floor_eff);
-        } else {
-            self.run_and_intersect_general(
-                &mut cursors,
-                dl_norm_k1,
-                k,
-                &mut heap,
-                filter,
-                floor_eff,
-            );
-        }
-
+        let mut sink = ScoreSink {
+            heap: &mut heap,
+            k,
+            filter,
+            floor_eff,
+        };
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
         Ok(drain_top_k_desc(heap))
+    }
+
+    /// Unranked multi-term AND: the matching doc ids in ascending order
+    /// via the block flat-merge in [`and_flat_merge`](Self::and_flat_merge),
+    /// with no BM25 scoring and no top-k heap. Because it shares that
+    /// traversal with the ranked [`run_and_intersect`](Self::run_and_intersect),
+    /// the two always agree on which docs match, and an unranked count
+    /// over high-frequency terms costs the same posting-list work as the
+    /// ranked search minus the scoring.
+    fn collect_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> Vec<u32> {
+        if cursors.is_empty() {
+            return Vec::new();
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        cursors.sort_by_key(|c| c.block_count());
+        let mut sink = CollectSink { out: Vec::new() };
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        sink.out
+    }
+
+    /// Dispatch to the 2-term specialization or the general `n >= 3`
+    /// (and `n == 1`) flat-merge. The 2-term shape walks the two sorted
+    /// `block_doc_ids` arrays with two index pointers instead of calling
+    /// `skip_to` per leader doc — removing the function-call +
+    /// within-block linear-scan overhead on the hottest AND case
+    /// (rare ∧ common). The general path keeps the per-doc leapfrog,
+    /// which amortizes well with the block-max pruning a scoring sink
+    /// drives.
+    fn and_flat_merge<S: AndSink>(
+        &self,
+        cursors: &mut [TermCursor],
+        dl_norm_k1: &[f32],
+        sink: &mut S,
+    ) {
+        if cursors.len() == 2 {
+            self.and_flat_merge_2term(cursors, dl_norm_k1, sink);
+        } else {
+            self.and_flat_merge_general(cursors, dl_norm_k1, sink);
+        }
     }
 
     /// General `n >= 3`-term AND path. Same shape as the 2-term path:
@@ -1475,32 +1506,27 @@ impl FtsReader {
     /// overhead per leader doc, just integer comparisons over the
     /// already-decoded buffers. When any cursor exhausts its block,
     /// the outer loop crosses blocks via `next()` and re-aligns.
-    fn run_and_intersect_general(
+    fn and_flat_merge_general<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
-        k: usize,
-        heap: &mut BinaryHeap<TopKEntry>,
-        mut filter: Option<&mut ExcludeFilter>,
-        floor_eff: f32,
+        sink: &mut S,
     ) {
         'outer: loop {
             if cursors[0].is_exhausted() {
                 break;
             }
 
-            // Block-max-AND pruning. The bar is the kth-best once the
-            // heap fills, or the caller's seeded floor before that —
-            // whichever is higher. If the leader's current block can't
-            // possibly produce a bar-beating score, skip the whole
-            // block — the safest UB sums leader's block_max with each
-            // other cursor's max block_max across all blocks that
-            // overlap the leader's block doc-id range.
-            let bar = if heap.len() >= k {
-                heap.peek().expect("heap len == k").0.max(floor_eff)
-            } else {
-                floor_eff
-            };
+            // Block-max-AND pruning (scoring sinks only; the unranked
+            // sink's `bar()` is NEG_INFINITY, so this whole block is
+            // skipped). The bar is the kth-best once the heap fills, or
+            // the caller's seeded floor before that — whichever is
+            // higher. If the leader's current block can't possibly
+            // produce a bar-beating score, skip the whole block — the
+            // safest UB sums leader's block_max with each other cursor's
+            // max block_max across all blocks that overlap the leader's
+            // block doc-id range.
+            let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let range_start = cursors[0].current_doc_id();
                 let range_end = cursors[0].current_block_last_doc_id();
@@ -1584,24 +1610,25 @@ impl FtsReader {
                     break;
                 }
                 if all_match {
-                    let norm = dl_norm_k1[a as usize];
-                    let mut score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                        c0.idf_x_k1p1,
-                        c0.block_tfs[i],
-                        norm,
-                    );
-                    for o in others.iter() {
-                        score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                            o.idf_x_k1p1,
-                            o.block_tfs[o.pos],
+                    let score = if sink.needs_score() {
+                        let norm = dl_norm_k1[a as usize];
+                        let mut score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                            c0.idf_x_k1p1,
+                            c0.block_tfs[i],
                             norm,
                         );
-                    }
-                    // Floor gate: strictly-below-floor docs are dead to
-                    // the caller.
-                    if score > floor_eff {
-                        and_heap_push(heap, k, filter.as_deref_mut(), score, a);
-                    }
+                        for o in others.iter() {
+                            score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                                o.idf_x_k1p1,
+                                o.block_tfs[o.pos],
+                                norm,
+                            );
+                        }
+                        score
+                    } else {
+                        0.0
+                    };
+                    sink.emit(a, score);
                     i += 1;
                     for o in others.iter_mut() {
                         o.pos += 1;
@@ -1633,14 +1660,11 @@ impl FtsReader {
     /// scan — just two index pointers walking forward. When either
     /// block exhausts, the cursor crosses to its next block (decoding
     /// on demand) and the merge resumes.
-    fn run_and_intersect_2term(
+    fn and_flat_merge_2term<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
-        k: usize,
-        heap: &mut BinaryHeap<TopKEntry>,
-        mut filter: Option<&mut ExcludeFilter>,
-        floor_eff: f32,
+        sink: &mut S,
     ) {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
@@ -1655,14 +1679,12 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning at the leader's current block. The
-            // bar is the kth-best once the heap fills, or the caller's
-            // seeded floor before that — whichever is higher.
-            let bar = if heap.len() >= k {
-                heap.peek().expect("heap len == k").0.max(floor_eff)
-            } else {
-                floor_eff
-            };
+            // Block-max-AND pruning at the leader's current block
+            // (scoring sinks only; the unranked sink's `bar()` is
+            // NEG_INFINITY, so this is skipped). The bar is the kth-best
+            // once the heap fills, or the caller's seeded floor before
+            // that — whichever is higher.
+            let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let range_start = c0.current_doc_id();
                 let range_end = c0.current_block_last_doc_id();
@@ -1715,21 +1737,21 @@ impl FtsReader {
                 } else if a > b {
                     j += 1;
                 } else {
-                    let norm = dl_norm_k1[a as usize];
-                    let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                        c0_idf,
-                        c0.block_tfs[i],
-                        norm,
-                    ) + crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                        c1_idf,
-                        c1.block_tfs[j],
-                        norm,
-                    );
-                    // Floor gate: strictly-below-floor docs are dead to
-                    // the caller.
-                    if score > floor_eff {
-                        and_heap_push(heap, k, filter.as_deref_mut(), score, a);
-                    }
+                    let score = if sink.needs_score() {
+                        let norm = dl_norm_k1[a as usize];
+                        crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                            c0_idf,
+                            c0.block_tfs[i],
+                            norm,
+                        ) + crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                            c1_idf,
+                            c1.block_tfs[j],
+                            norm,
+                        )
+                    } else {
+                        0.0
+                    };
+                    sink.emit(a, score);
                     i += 1;
                     j += 1;
                 }
@@ -2428,6 +2450,94 @@ impl ExcludeFilter {
     }
 }
 
+/// Per-hit action for the multi-term AND flat-merge intersection.
+///
+/// The traversal in [`FtsReader::and_flat_merge_general`] /
+/// [`FtsReader::and_flat_merge_2term`] — cursor alignment, block
+/// crossing, and the in-block pointer walk — runs identically whether
+/// the caller wants ranked hits or just the matching doc ids. Only the
+/// action at each converged doc differs, so both go through one
+/// traversal parameterized by this trait and cannot disagree on which
+/// docs match.
+///
+/// [`ScoreSink`] computes BM25 and feeds a top-k heap (the ranked
+/// search path); [`CollectSink`] records the doc id and computes no
+/// score (the unranked `token_match` / count path). The traversal is
+/// monomorphized per sink, so `needs_score()` folds to a constant: the
+/// scorer compiles to a dedicated copy with scoring inlined, and the
+/// collector's copy drops the scoring arithmetic as dead code.
+trait AndSink {
+    /// Block-max pruning bar: docs whose block can't reach this score
+    /// are skipped. Returning `NEG_INFINITY` (the default) disables
+    /// pruning, which is what an unranked sink wants — it has no score
+    /// threshold to prune against.
+    fn bar(&self) -> f32 {
+        f32::NEG_INFINITY
+    }
+
+    /// Whether the traversal should compute a hit's BM25 score. A sink
+    /// that returns `false` skips all scoring arithmetic — what makes an
+    /// unranked count over a large intersection cheaper than ranking it.
+    fn needs_score(&self) -> bool;
+
+    /// Record one doc in the intersection. `score` is meaningful only
+    /// when [`needs_score`](AndSink::needs_score) returns `true`;
+    /// otherwise it is `0.0` and ignored.
+    fn emit(&mut self, doc: u32, score: f32);
+}
+
+/// Ranked sink: floor-gates each hit and pushes it into the top-k heap.
+struct ScoreSink<'a> {
+    heap: &'a mut BinaryHeap<TopKEntry>,
+    k: usize,
+    filter: Option<&'a mut ExcludeFilter>,
+    floor_eff: f32,
+}
+
+impl AndSink for ScoreSink<'_> {
+    fn bar(&self) -> f32 {
+        // kth-best once the heap fills, else the caller's seeded floor —
+        // whichever is higher.
+        if self.heap.len() >= self.k {
+            self.heap
+                .peek()
+                .expect("heap len == k")
+                .0
+                .max(self.floor_eff)
+        } else {
+            self.floor_eff
+        }
+    }
+
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn emit(&mut self, doc: u32, score: f32) {
+        // Floor gate: strictly-below-floor docs are dead to the caller.
+        if score > self.floor_eff {
+            and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+        }
+    }
+}
+
+/// Unranked sink: collect the matching doc ids in ascending order, no
+/// scoring, no top-k. Drives the `token_match` AND path through the
+/// same optimized flat-merge the scorer uses.
+struct CollectSink {
+    out: Vec<u32>,
+}
+
+impl AndSink for CollectSink {
+    fn needs_score(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, doc: u32, _score: f32) {
+        self.out.push(doc);
+    }
+}
+
 /// Push `(score, doc_id)` into the top-k AND heap with the same
 /// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
 /// agree on score-tied docs.
@@ -2534,48 +2644,25 @@ fn read_u64_le(b: &[u8]) -> u64 {
 /// [`FtsReader::run_and_intersect`] (And) / the OR merge. Cursors
 /// traverse blocks in doc-id order, so the result is ascending with no
 /// extra sort. Used by [`FtsReader::token_match`].
-fn walk_cursors_unranked(mut cursors: Vec<TermCursor>, mode: BoolMode) -> Vec<u32> {
+/// Unranked multi-term OR: the union of the cursors' doc ids in
+/// ascending order. A k-way merge — each step emits the minimum
+/// current doc id across the live cursors and advances every cursor
+/// sitting on it. No scoring; the caller wants membership, not rank.
+fn or_merge_unranked(mut cursors: Vec<TermCursor>) -> Vec<u32> {
     let mut out = Vec::new();
-    match mode {
-        BoolMode::And => {
-            // Rarest term leads so the leapfrog converges fastest — the
-            // same cursor ordering `run_and_intersect` uses.
-            cursors.sort_by_key(|c| c.block_count());
-            'and: loop {
-                if cursors[0].is_exhausted() {
-                    break;
-                }
-                let leader = cursors[0].current_doc_id();
-                let mut max_doc = leader;
-                for c in cursors[1..].iter_mut() {
-                    c.skip_to(leader);
-                    if c.is_exhausted() {
-                        break 'and;
-                    }
-                    max_doc = max_doc.max(c.current_doc_id());
-                }
-                if max_doc == leader {
-                    out.push(leader);
-                    cursors.iter_mut().for_each(TermCursor::next);
-                } else {
-                    cursors[0].skip_to(max_doc);
-                }
+    loop {
+        let min_doc = cursors
+            .iter()
+            .filter(|c| !c.is_exhausted())
+            .map(TermCursor::current_doc_id)
+            .min();
+        let Some(min_doc) = min_doc else { break };
+        out.push(min_doc);
+        for c in cursors.iter_mut() {
+            if !c.is_exhausted() && c.current_doc_id() == min_doc {
+                c.next();
             }
         }
-        BoolMode::Or => loop {
-            let min_doc = cursors
-                .iter()
-                .filter(|c| !c.is_exhausted())
-                .map(TermCursor::current_doc_id)
-                .min();
-            let Some(min_doc) = min_doc else { break };
-            out.push(min_doc);
-            for c in cursors.iter_mut() {
-                if !c.is_exhausted() && c.current_doc_id() == min_doc {
-                    c.next();
-                }
-            }
-        },
     }
     out
 }
