@@ -78,7 +78,7 @@ docs.bm25Search("body", "fox", 10, { projection: ["_id", "score"] }); // id + sc
   - `append(data)` — an array of objects or an apache-arrow
     `Table`/`RecordBatch`. One `append` is one commit.
   - `bm25Search(col, q, k, { mode?, projection?, arrow? })` /
-    `vectorSearch(col, query, k, { nprobe?, projection?, arrow? })` —
+    `vectorSearch(col, query, k, { nprobe?, rerankMult?, projection?, arrow? })` —
     ranked search; return matching rows as records (or an apache-arrow
     `Table` with `{ arrow: true }`). `query` is a `number[]` or
     `Float32Array`. `projection` (e.g. `["_id", "score"]`) selects the
@@ -91,8 +91,12 @@ docs.bm25Search("body", "fox", 10, { projection: ["_id", "score"] }); // id + sc
     matched rows 1:1 with `data` (same shapes as `append`). Both return
     `{ matched, nTombstoned, nNotFound }` and require durable storage (not
     `memory://`).
+  - `compact({ maxMemoryMb?, minFillPercent?, targetSuperfileSizeMb? })` —
+    merge small / underfilled superfiles into larger ones (omit settings for
+    engine defaults).
   - `schema()` — the table's apache-arrow `Schema`.
 - `IndexSpec().fts(col).vector(col, dim, nCent, metric)`.
+- `BUILDER_ID` (named export) — the engine's build identifier string.
 
 Local disk cache over object storage:
 

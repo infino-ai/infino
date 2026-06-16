@@ -43,7 +43,10 @@ use napi_derive::napi;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
-use infino::{BoolMode, ColdFetchMode, InfinoError, Metric, VectorSearchOptions};
+use infino::{
+    BoolMode, ColdFetchMode, CompactionError, CompactionSettings, InfinoError, Metric,
+    VectorSearchOptions,
+};
 
 // ---------------------------------------------------------------------------
 // Error mapping
@@ -73,6 +76,19 @@ fn map_err(e: InfinoError) -> Error {
 
 fn arrow_err(e: ArrowError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
+}
+
+/// Map a [`CompactionError`] (a distinct error type from `InfinoError`) to a
+/// JS error. `NoStorage` is a bad-argument case (compaction needs durable
+/// storage); everything else is a runtime failure carrying the message.
+fn compact_err(e: CompactionError) -> Error {
+    match e {
+        CompactionError::NoStorage => Error::new(
+            Status::InvalidArg,
+            "compact requires durable storage (not memory://)",
+        ),
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
 }
 
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
@@ -187,6 +203,17 @@ pub struct ConnectOptions {
     /// Cold-miss strategy: `"hybrid_with_prefetch"` | `"range_only"` |
     /// `"lazy_foreground_with_background_fill"`.
     pub cold_fetch_mode: Option<String>,
+}
+
+/// Tuning for `compact`; all fields optional (omitted ⇒ engine default).
+#[napi(object)]
+pub struct CompactOptions {
+    /// Build-time memory budget, in MB.
+    pub max_memory_mb: Option<u32>,
+    /// Only compact superfiles below this fill percent (0–100).
+    pub min_fill_percent: Option<u32>,
+    /// Target merged-superfile size, in MB.
+    pub target_superfile_size_mb: Option<u32>,
 }
 
 /// Row counts from an `update` / `delete`.
@@ -304,6 +331,13 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
     Ok(Connection { inner })
 }
 
+/// Infino's build identifier (version + build hash) from the core crate.
+/// Re-exported on the JS side as the `BUILDER_ID` string constant.
+#[napi]
+pub fn builder_id() -> String {
+    infino::BUILDER_ID.to_string()
+}
+
 /// A catalog connection. `const db = connect(uri)`.
 #[napi]
 pub struct Connection {
@@ -417,11 +451,15 @@ impl Table {
         query: Float32Array,
         k: u32,
         nprobe: Option<u32>,
+        rerank_mult: Option<u32>,
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n as usize);
+        }
+        if let Some(m) = rerank_mult {
+            opts = opts.with_rerank_mult(m as usize);
         }
         let proj: Option<Vec<&str>> =
             projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
@@ -495,6 +533,26 @@ impl Table {
             self.align_batches(batches)?
         };
         Ok(self.inner.update(expr, &aligned).map_err(map_err)?.into())
+    }
+
+    /// Merge small / underfilled superfiles into larger ones. `settings` tunes
+    /// the memory budget, fill threshold, and target size (omit for engine
+    /// defaults).
+    #[napi]
+    pub fn compact(&self, settings: Option<CompactOptions>) -> Result<()> {
+        let mut s = CompactionSettings::default();
+        if let Some(o) = settings {
+            if let Some(v) = o.max_memory_mb {
+                s.max_memory_mb = v as u64;
+            }
+            if let Some(v) = o.min_fill_percent {
+                s.min_fill_percent = v as u8;
+            }
+            if let Some(v) = o.target_superfile_size_mb {
+                s.target_superfile_size_mb = v as u64;
+            }
+        }
+        self.inner.compact(&s).map_err(compact_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

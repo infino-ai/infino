@@ -17,7 +17,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { connect, IndexSpec } from "../infino/index.js";
+import { connect, IndexSpec, BUILDER_ID } from "../infino/index.js";
 import { Schema, Field, LargeUtf8, Float32, FixedSizeList, Table, vectorFromArray } from "apache-arrow";
 
 // FTS columns must be LargeUtf8; non-null to match the appended data.
@@ -108,6 +108,11 @@ test("tokenMatch and exactMatch return unranked rows", () => {
   assert.equal(ex.length, 1);
 });
 
+test("BUILDER_ID is a non-empty string", () => {
+  assert.equal(typeof BUILDER_ID, "string");
+  assert.ok(BUILDER_ID.length > 0);
+});
+
 test("unknown table throws", () => {
   const db = connect("memory://");
   assert.throws(() => db.openTable("nope"));
@@ -136,6 +141,10 @@ test("vector search end-to-end", () => {
   // query vector as a plain array (wrapper coerces to Float32Array).
   const rows = docs.vectorSearch("emb", onehot(0, dim), 10);
   assert.ok(rows.length >= 1);
+
+  // nprobe + rerankMult tuning knobs are accepted.
+  const tuned = docs.vectorSearch("emb", onehot(0, dim), 5, { nprobe: 1, rerankMult: 4 });
+  assert.ok(tuned.length >= 1);
 });
 
 test("update and delete by SQL predicate (localfs)", () => {
@@ -153,6 +162,32 @@ test("update and delete by SQL predicate (localfs)", () => {
   assert.equal(upd.matched, 1);
   assert.equal(docs.tokenMatch("title", "alpha").length, 0);
   assert.equal(docs.tokenMatch("title", "alpha2").length, 1);
+});
+
+test("compact merges superfiles, data intact (localfs)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-compact-"));
+  const db = connect(dir);
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  // three appends => three superfiles
+  docs.append([{ title: "alpha" }]);
+  docs.append([{ title: "beta" }]);
+  docs.append([{ title: "gamma" }]);
+
+  docs.compact({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMemoryMb: 512 });
+  // data is intact after compaction
+  assert.equal(docs.tokenMatch("title", "beta").length, 1);
+  assert.equal(docs.tokenMatch("title", "alpha").length, 1);
+  assert.equal(Number(db.querySql("SELECT COUNT(*) AS n FROM docs")[0].n), 3);
+
+  docs.compact(); // default settings also run cleanly
+});
+
+test("update and delete require durable storage (reject memory://)", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }]);
+  assert.throws(() => docs.delete("title = 'alpha'"));
+  assert.throws(() => docs.update("title = 'alpha'", [{ title: "beta" }]));
 });
 
 test("update enforces 1:1 cardinality", () => {

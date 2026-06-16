@@ -6,9 +6,12 @@
 // query returns an apache-arrow `Table` instead of records.
 
 import * as arrow from "apache-arrow";
-import { connect as nativeConnect, IndexSpec } from "./native.js";
+import { connect as nativeConnect, IndexSpec, builderId } from "./native.js";
 
 export { IndexSpec };
+
+/** Infino's build identifier (version + build hash). */
+export const BUILDER_ID: string = builderId();
 
 const STREAM = "stream";
 
@@ -50,6 +53,16 @@ export interface MutationStats {
   nNotFound: number;
 }
 
+/** Tuning for `compact`; all fields optional (omitted ⇒ engine default). */
+export interface CompactOptions {
+  /** Build-time memory budget, in MB. */
+  maxMemoryMb?: number;
+  /** Only compact superfiles below this fill percent (0–100). */
+  minFillPercent?: number;
+  /** Target merged-superfile size, in MB. */
+  targetSuperfileSizeMb?: number;
+}
+
 export interface Bm25SearchOptions {
   mode?: BoolMode;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
@@ -57,7 +70,10 @@ export interface Bm25SearchOptions {
   arrow?: boolean;
 }
 export interface VectorSearchOptions {
+  /** IVF partitions to probe (higher = better recall, more work). */
   nprobe?: number;
+  /** Over-fetch multiplier for the exact-rerank stage (higher = better recall). */
+  rerankMult?: number;
   projection?: string[];
   arrow?: boolean;
 }
@@ -255,7 +271,7 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
-    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.projection);
+    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection);
     return decode(buf, opts.arrow);
   }
 
@@ -286,6 +302,12 @@ export class Table {
    * Requires durable storage (not `memory://`). */
   delete(predicate: string): MutationStats {
     return this.inner.delete(predicate);
+  }
+
+  /** Merge small / underfilled superfiles into larger ones (omit `settings`
+   * for engine defaults). */
+  compact(settings?: CompactOptions): void {
+    this.inner.compact(settings);
   }
 }
 
