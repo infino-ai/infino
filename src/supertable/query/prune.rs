@@ -26,7 +26,6 @@
 //! different shape from these static boolean tests. It keeps its own
 //! path.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::ipc::reader::StreamReader;
@@ -41,7 +40,6 @@ use crate::supertable::manifest::list_prune::{
 use crate::supertable::manifest::part::PartId;
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
-use super::hierarchical_iter;
 use super::skip::{
     ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match,
 };
@@ -69,7 +67,7 @@ pub(crate) enum PruneLeaf {
 impl PruneLeaf {
     /// Part-tier keep set for this leaf, or `None` when the leaf has no
     /// part-level pruner (it imposes no part constraint → keep all).
-    fn keep_parts(&self, list: &ManifestList) -> Option<Vec<PartId>> {
+    pub(crate) fn keep_parts(&self, list: &ManifestList) -> Option<Vec<PartId>> {
         match self {
             PruneLeaf::TermPresence {
                 column,
@@ -145,34 +143,10 @@ pub(crate) async fn select_superfiles(
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
     // ---- Tier A: part-level prune (only when a hierarchical list
     // exists; otherwise the flat superfile view is the whole table).
-    let superfiles: Vec<Arc<SuperfileEntry>> = match manifest.list.as_ref() {
-        Some(list) => {
-            // Intersect each constraining leaf's kept-part set. A leaf
-            // with no part pruner (`None`) imposes no constraint.
-            let mut kept: Option<HashSet<PartId>> = None;
-            for leaf in leaves {
-                if let Some(part_ids) = leaf.keep_parts(list) {
-                    let set: HashSet<PartId> = part_ids.into_iter().collect();
-                    kept = Some(match kept {
-                        None => set,
-                        Some(existing) => existing.intersection(&set).copied().collect(),
-                    });
-                }
-            }
-            // Preserve manifest (time) order of the surviving parts.
-            let ordered: Vec<PartId> = match kept {
-                Some(set) => list
-                    .parts
-                    .iter()
-                    .map(|p| p.part_id)
-                    .filter(|id| set.contains(id))
-                    .collect(),
-                None => list.parts.iter().map(|p| p.part_id).collect(),
-            };
-            hierarchical_iter::load_and_flatten(manifest, &ordered).await?
-        }
-        None => hierarchical_iter::fallback_to_flat_superfiles(manifest),
-    };
+    let superfiles = manifest
+        .get_pruned_superfiles(leaves)
+        .await
+        .map_err(QueryError::ManifestLoad)?;
 
     if superfiles.is_empty() {
         return Ok(Vec::new());

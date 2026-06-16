@@ -46,14 +46,7 @@ pub struct SupertableStats {
 
     /// Number of manifest parts referenced in the currently
     /// pinned [`crate::supertable::manifest::list::ManifestList`].
-    ///
-    /// `None` for supertables whose current `Manifest` has no
-    /// persisted list — i.e., freshly `create`'d in-process
-    /// supertables, or supertables with `options.storage =
-    /// None`. Such supertables operate entirely through the
-    /// flat `SuperfileList`; the hierarchical part structure is
-    /// only meaningful for persisted supertables.
-    pub n_manifest_parts: Option<usize>,
+    pub n_manifest_parts: usize,
 
     /// Number of manifest parts that have been hydrated in
     /// the in-memory cache. Always ≤ `n_manifest_parts` when

@@ -171,7 +171,7 @@ async fn three_handles_concurrent_commits_all_succeed() {
     // assert specific id values across writer processes (each
     // gets its own random worker_id).
     let reader = consumer.reader();
-    let segs = &reader.manifest().superfile_list.superfiles;
+    let segs = reader.manifest().get_all_superfiles();
     let uris: std::collections::HashSet<_> = segs.iter().map(|s| s.uri.0).collect();
     assert_eq!(
         uris.len(),

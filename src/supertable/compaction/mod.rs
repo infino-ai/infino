@@ -172,8 +172,7 @@ impl Supertable {
         // This populates both bitmap and seal information for all superfiles.
         // The cache returns empty bitmaps for superfiles without tombstones.
         let superfile_ids: Vec<Uuid> = manifest
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .map(|e| e.superfile_id)
             .collect();
@@ -204,8 +203,7 @@ impl Supertable {
 
         // Build SuperfileStats for every superfile in the snapshot.
         let stats: Vec<SuperfileStats> = manifest
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .map(|entry| {
                 let (bitmap, seal) = sidecar_map
@@ -321,8 +319,7 @@ impl Supertable {
             .iter()
             .map(|id| {
                 manifest
-                    .superfile_list
-                    .superfiles
+                    .get_all_superfiles()
                     .iter()
                     .find(|e| e.superfile_id == *id)
                     .cloned()
@@ -675,8 +672,7 @@ mod tests {
         let reader = st.reader();
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .take(2)
             .cloned()
@@ -719,8 +715,7 @@ mod tests {
         let reader = st.reader();
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .take(2)
             .cloned()
@@ -812,8 +807,7 @@ mod tests {
         let reader = st.reader();
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .take(3)
             .cloned()
@@ -884,8 +878,7 @@ mod tests {
         let reader = st.reader();
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .take(1)
             .cloned()

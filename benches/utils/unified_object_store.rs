@@ -1736,9 +1736,8 @@ pub(crate) mod diag {
                 keys.push(infino::supertable::manifest::commit::list_uri(
                     consumer.manifest_id(),
                 ));
-                if let Some(list) = &manifest.list {
-                    keys.extend(list.parts.iter().map(|p| p.uri.clone()));
-                }
+                let list_entries = manifest.get_all_list_entries();
+                keys.extend(list_entries.iter().map(|p| p.uri.clone()));
                 keys.extend(
                     manifest
                         .superfiles
