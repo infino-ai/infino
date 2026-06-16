@@ -48,13 +48,10 @@ fn py_err(e: InfinoError) -> PyErr {
 }
 
 /// Compaction has its own error type, so it doesn't go through `py_err`.
+/// These are storage / build failures — surfaced as runtime errors, like
+/// the mutation paths.
 fn compact_err(e: CompactionError) -> PyErr {
-    match e {
-        CompactionError::NoStorage => {
-            PyValueError::new_err("compact requires durable storage (not memory://)")
-        }
-        other => PyRuntimeError::new_err(other.to_string()),
-    }
+    PyRuntimeError::new_err(e.to_string())
 }
 
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
