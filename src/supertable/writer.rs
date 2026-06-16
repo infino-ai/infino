@@ -1574,7 +1574,7 @@ fn publish_superfiles(
 /// jitter to break up lockstep retries from racing writers.
 /// Jitter source is the low bits of the system's nanosecond
 /// clock — no `rand` dep needed.
-fn backoff_delay(attempt: u32) -> std::time::Duration {
+pub(super) fn backoff_delay(attempt: u32) -> std::time::Duration {
     const BASE_MS: u64 = 10;
     const CAP_MS: u64 = 1000;
     // Cap the doubling exponent so the pre-cap delay plateaus instead

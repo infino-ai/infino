@@ -13,14 +13,16 @@ use crate::{
     config::CompactionSettings,
     superfile::builder::SuperfileBuilder,
     supertable::{
-        BuildError, SuperfileEntry,
+        BuildError, CommitError, SuperfileEntry,
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
             WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
-        writer::{PreparedSuperfile, ShardOutput, prepare_superfile, try_commit_attempt},
+        writer::{
+            PreparedSuperfile, ShardOutput, backoff_delay, prepare_superfile, try_commit_attempt,
+        },
     },
 };
 use bytes::Bytes;
@@ -403,20 +405,58 @@ impl Supertable {
         ];
 
         let opts = Arc::clone(&inner.options);
-        let new_manifest_id = manifest.manifest_id + 1;
-        try_commit_attempt(
-            storage.clone(),
-            opts,
-            manifest.clone(),
-            &new_entries,
-            &inputs,
-            new_manifest_id,
-            &mut pending_storage_writes,
-        )
-        .await
-        .map_err(|e| CompactionError::Commit(e.to_string()))?;
+        let max_retries = opts.max_commit_retries.max(1);
 
-        Ok(())
+        for attempt in 0..max_retries {
+            let old = inner.manifest.load_full();
+
+            // Another compactor already merged our inputs — nothing left to commit.
+            if !job.inputs.iter().all(|id| {
+                old.superfile_list
+                    .superfiles
+                    .iter()
+                    .any(|e| e.superfile_id == *id)
+            }) {
+                return Ok(());
+            }
+
+            let entries_to_remove: Vec<Arc<SuperfileEntry>> = job
+                .inputs
+                .iter()
+                .filter_map(|id| {
+                    old.superfile_list
+                        .superfiles
+                        .iter()
+                        .find(|e| e.superfile_id == *id)
+                        .cloned()
+                })
+                .collect();
+
+            match try_commit_attempt(
+                storage.clone(),
+                Arc::clone(&opts),
+                old,
+                &new_entries,
+                &entries_to_remove,
+                inner.manifest.load().manifest_id + 1,
+                &mut pending_storage_writes,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                    self.refresh()
+                        .await
+                        .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                }
+                Err(e) => return Err(CompactionError::Commit(e.to_string())),
+            }
+        }
+
+        Err(CompactionError::Commit(
+            "commit retries exhausted".to_string(),
+        ))
     }
 }
 
@@ -1036,6 +1076,54 @@ mod tests {
         st.compact_async(&small_compact_cfg())
             .await
             .expect("second compact after slot release");
+    }
+
+    // OCC retry tests
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_succeeds_when_concurrent_writer_commits_during_compaction() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Enough superfiles to trigger a compaction job.
+        for title in &[
+            ["alpha first", "alpha second"],
+            ["bravo first", "bravo second"],
+            ["charlie first", "charlie second"],
+            ["delta first", "delta second"],
+            ["echo first", "echo second"],
+            ["foxtrot first", "foxtrot second"],
+            ["golf first", "golf second"],
+            ["hotel first", "hotel second"],
+            ["india first", "india second"],
+            ["juliet first", "juliet second"],
+        ] {
+            commit_titles(&st, title);
+        }
+
+        let before_docs = st.reader().n_docs_total();
+        let st2 = st.clone();
+
+        // Race a writer commit against compaction. The compactor will
+        // hit WriteContentionExhausted on its first pointer CAS attempt
+        // (or succeed before the writer — either way both must succeed).
+        let writer_handle = tokio::task::spawn_blocking(move || {
+            commit_titles(&st2, &["kilo first", "kilo second"]);
+        });
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact must succeed despite concurrent writer");
+
+        writer_handle.await.expect("writer task");
+
+        // All docs from both paths must be visible after refresh.
+        st.refresh().await.expect("refresh");
+        let after_docs = st.reader().n_docs_total();
+        assert_eq!(
+            after_docs,
+            before_docs + 2,
+            "writer's 2 docs must survive alongside compacted data"
+        );
     }
 
     // ─── End-to-end compact() tests ────────────────────────────────────────
