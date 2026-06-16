@@ -76,6 +76,7 @@ use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
+use super::candidate::CandidatePlan;
 use super::exec::common::resolve_hits_named;
 
 /// How to probe one superfile in the vector fan-out: the globally-selected
@@ -268,28 +269,29 @@ impl SupertableReader {
         // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
-        let kernel = move |reader: Arc<SuperfileReader>,
-                           (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
-            let column = Arc::clone(&column_arc);
-            let query = Arc::clone(&query_arc);
-            async move {
-                let res = match probe {
-                    Probe::Clusters(ids) => {
-                        reader
-                            .vector_search_clusters_filtered(
-                                &column, &query, k, &ids, options, bitmap,
-                            )
-                            .await
-                    }
-                    Probe::Nprobe => {
-                        reader
-                            .vector_hits_filtered_async(&column, &query, k, options, bitmap)
-                            .await
-                    }
-                };
-                res.map_err(|e| QueryError::Parquet(e.to_string()))
-            }
-        };
+        let kernel =
+            move |reader: Arc<SuperfileReader>,
+                  (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
+                let column = Arc::clone(&column_arc);
+                let query = Arc::clone(&query_arc);
+                async move {
+                    let res = match probe {
+                        Probe::Clusters(ids) => {
+                            reader
+                                .vector_search_clusters_filtered(
+                                    &column, &query, k, &ids, options, bitmap,
+                                )
+                                .await
+                        }
+                        Probe::Nprobe => {
+                            reader
+                                .vector_hits_filtered_async(&column, &query, k, options, bitmap)
+                                .await
+                        }
+                    };
+                    res.map_err(|e| QueryError::Parquet(e.to_string()))
+                }
+            };
         let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
         let mut per_superfile = Vec::new();
         while !units.is_empty() {
@@ -410,20 +412,113 @@ impl SupertableReader {
         // tombstone filter, so deleted rows are dropped from the
         // allow-set too (a tombstoned row must never be a kNN candidate).
         let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
-        let mut map: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
-        for hits in per_superfile {
-            for h in hits {
-                map.entry(h.superfile)
-                    .or_default()
-                    .insert(h.local_doc_id);
-            }
-        }
-        Ok(map
-            .into_iter()
-            .filter(|(_, bm)| !bm.is_empty())
-            .map(|(uri, bm)| (uri, Arc::new(bm)))
-            .collect())
+        Ok(group_doc_ids_to_allow(per_superfile))
     }
+
+    /// Filtered vector kNN driven by a SQL `WHERE` [`CandidatePlan`] — the
+    /// pushdown path for the `vector_search` table-valued function — rather
+    /// than the single text-predicate shape of
+    /// [`Self::vector_hits_filtered_async`].
+    ///
+    /// `plan` must be a **bounded** plan (not [`CandidatePlan::Unbounded`]):
+    /// the caller routes `Unbounded` to the unfiltered
+    /// [`Self::vector_search_async`], where DataFusion's `FilterExec`
+    /// re-applies the predicate. For a bounded plan, each superfile's vector
+    /// kernel ranks distance only among the `local_doc_id`s the plan admits,
+    /// so the result is the true k-nearest among matching rows.
+    ///
+    /// There is deliberately **no selectivity gate** here (unlike the scan
+    /// provider, which skips the index path above ~1% match density because
+    /// a Parquet `RowSelection` can't skip saturated pages). The vector
+    /// kernel reads the same IVF clusters either way; the allow-set only
+    /// filters which candidates enter the shortlist heap, and even a
+    /// non-selective predicate must still yield exactly-k matching hits — so
+    /// a bounded plan is always pushed down.
+    pub(crate) async fn vector_hits_filtered_by_plan(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        plan: &CandidatePlan,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        let superfiles = manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allow = self.candidate_bitmaps_from_plan(&superfiles, plan).await?;
+        if allow.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+            .await
+    }
+
+    /// Resolve a [`CandidatePlan`] to a per-superfile allow-set of matching
+    /// `local_doc_id`s over the given vector-pruned `superfiles` — the
+    /// boolean-plan analog of [`Self::candidate_bitmaps`] (which evaluates a
+    /// single term match). `token_match` leaves are combined by `AND`/`OR`;
+    /// superfiles whose plan matches no row are omitted so the caller skips
+    /// them. Tombstoned rows are dropped by the shared `fanout` (a deleted
+    /// row must never be a kNN candidate).
+    ///
+    /// The caller passes only a bounded plan, so `evaluate` returns
+    /// `Some(bitmap)` per superfile; a defensive `None` (unbounded) is
+    /// treated as the empty set, skipping that superfile.
+    async fn candidate_bitmaps_from_plan(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        plan: &CandidatePlan,
+    ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
+        let units: Vec<(Arc<SuperfileEntry>, ())> =
+            superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
+        let plan_arc = Arc::new(plan.clone());
+        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+            let plan = Arc::clone(&plan_arc);
+            async move {
+                // `evaluate` is postings-only (no column decode), the same
+                // retrieval the FTS scan pushdown uses. `None` (unbounded)
+                // cannot occur for a bounded plan; treat it as empty. The
+                // fan-out hit shape is `(local_doc_id, score)`; the score is
+                // an unused `0.0` placeholder (the predicate is unranked).
+                let docs = plan
+                    .evaluate(r.as_ref())
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    .unwrap_or_default();
+                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+            }
+        };
+        let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        Ok(group_doc_ids_to_allow(per_superfile))
+    }
+}
+
+/// Group per-superfile candidate hits into a `superfile → allow-set` map
+/// of matching `local_doc_id`s, dropping superfiles whose set is empty (so
+/// the caller skips them entirely). Shared by the text-predicate
+/// ([`SupertableReader::candidate_bitmaps`]) and SQL-plan
+/// ([`SupertableReader::candidate_bitmaps_from_plan`]) allow-set builders.
+fn group_doc_ids_to_allow(
+    per_superfile: Vec<Vec<SuperfileHit>>,
+) -> HashMap<SuperfileUri, Arc<RoaringBitmap>> {
+    let mut map: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
+    for hits in per_superfile {
+        for h in hits {
+            map.entry(h.superfile).or_default().insert(h.local_doc_id);
+        }
+    }
+    map.into_iter()
+        .filter(|(_, bm)| !bm.is_empty())
+        .map(|(uri, bm)| (uri, Arc::new(bm)))
+        .collect()
 }
 
 impl SupertableReader {
@@ -1122,7 +1217,11 @@ mod tests {
     /// neighbors are a mix of both — making post-filtering observably
     /// wrong versus true pushdown.
     fn filter_token(global_id: usize) -> &'static str {
-        if global_id % 3 == 0 { "beta" } else { "alpha" }
+        if global_id.is_multiple_of(3) {
+            "beta"
+        } else {
+            "alpha"
+        }
     }
 
     /// Build one superfile's batch for the filtered-search corpus.
@@ -1219,15 +1318,7 @@ mod tests {
             .with_rerank_mult(64);
 
         let hits = reader
-            .vector_hits_filtered(
-                "emb",
-                &query,
-                k,
-                opts,
-                "title",
-                "alpha",
-                BoolMode::Or,
-            )
+            .vector_hits_filtered("emb", &query, k, opts, "title", "alpha", BoolMode::Or)
             .expect("filtered query");
 
         // (a) Hard constraint: EVERY returned hit is an alpha row.
@@ -1247,9 +1338,14 @@ mod tests {
         // different (and short) set.
         let got: std::collections::HashSet<usize> =
             hits.iter().map(|h| hit_global_id(&reader, h)).collect();
-        let truth: std::collections::HashSet<usize> =
-            brute_force_filtered_topk(&query, "alpha", k).into_iter().collect();
-        assert_eq!(got.len(), k, "filtered kNN must return exactly k matching hits");
+        let truth: std::collections::HashSet<usize> = brute_force_filtered_topk(&query, "alpha", k)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            got.len(),
+            k,
+            "filtered kNN must return exactly k matching hits"
+        );
         assert_eq!(
             got, truth,
             "filtered kNN set must equal brute-force k-nearest among alpha rows;\n got   = {got:?}\n truth = {truth:?}"
@@ -1315,7 +1411,10 @@ mod tests {
                 BoolMode::Or,
             )
             .expect("filtered query");
-        assert!(hits.is_empty(), "empty-match filter must return empty: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "empty-match filter must return empty: {hits:?}"
+        );
     }
 
     #[test]
@@ -1331,9 +1430,7 @@ mod tests {
             .with_rerank_mult(64);
 
         let bare = st
-            .vector_search_filtered(
-                "emb", &query, 5, opts, "title", "alpha", BoolMode::Or, None,
-            )
+            .vector_search_filtered("emb", &query, 5, opts, "title", "alpha", BoolMode::Or, None)
             .expect("filtered rows bare");
         let n: usize = bare.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(n, 5, "five matching nearest rows");

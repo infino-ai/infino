@@ -1434,8 +1434,17 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult, allow)
-            .await
+        self.probe_clusters_async(
+            col,
+            query,
+            &q_rot,
+            &cluster_idx,
+            &chosen,
+            k,
+            rerank_mult,
+            allow,
+        )
+        .await
     }
 
     /// Async IVF probe over an **externally chosen** set of cluster ids.
@@ -1472,8 +1481,17 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult, allow)
-            .await
+        self.probe_clusters_async(
+            col,
+            query,
+            &q_rot,
+            &cluster_idx,
+            &chosen,
+            k,
+            rerank_mult,
+            allow,
+        )
+        .await
     }
 
     /// Shared async tail of the IVF probe: given a chosen set of cluster
