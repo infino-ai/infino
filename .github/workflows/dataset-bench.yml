@@ -1,0 +1,105 @@
+name: Dataset bench (Azure)
+
+# Benchmark prepared datasets on ephemeral Azure VMs.
+#
+# Fans out one VM per modality (matrix over dataset-bench-vm.yml): each
+# modality is benchmarked in its own process, so memory metrics are not skewed
+# by a prior modality's resident set. Modalities run in parallel and fail
+# independently.
+#
+# Datasets must already exist (see dataset-prepare.yml); a missing dataset
+# fails pre-flight before a VM is provisioned.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Blob prefix for the dataset (e.g. datasets/bench-10m)."
+        required: true
+        type: string
+      modality:
+        description: "Indexes to benchmark, space-separated (own VM each)."
+        required: false
+        default: "fts vector sql"
+        type: string
+      phase:
+        description: "Read phase: warm, cold, or search (both)."
+        required: false
+        default: search
+        type: choice
+        options: [search, warm, cold]
+      cache_gib:
+        description: "Read disk-cache budget (GiB). Empty = auto-size from the index."
+        required: false
+        default: ""
+        type: string
+      skip_calibration:
+        description: "Vector only: skip recall calibration, report fixed-config cold latency (no recall gate)."
+        required: false
+        default: false
+        type: boolean
+      vm_size:
+        description: "Azure VM size (L-series = local NVMe)."
+        required: false
+        default: "Standard_L8aos_v4"
+        type: string
+      location:
+        description: "Azure region."
+        required: false
+        default: "eastus"
+        type: string
+      ref:
+        description: "Git ref or SHA to build from."
+        required: false
+        default: "main"
+        type: string
+      timeout_minutes:
+        description: "Per-VM auto-stop, minutes (GitHub caps at 360)."
+        required: false
+        default: "240"
+        type: string
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      modalities: ${{ steps.parse.outputs.list }}
+    steps:
+      - name: Parse modality list → JSON matrix
+        id: parse
+        env:
+          MODALITY: ${{ inputs.modality }}
+        run: |
+          set -euo pipefail
+          # MODALITY is split on whitespace into tokens, on purpose.
+          # "fts vector sql" → ["fts","vector","sql"]; reject unknown tokens.
+          # shellcheck disable=SC2086
+          for m in $MODALITY; do
+            case "$m" in fts|vector|sql) ;; *)
+              echo "::error::unknown modality '$m' (allowed: fts vector sql)"; exit 1 ;; esac
+          done
+          # shellcheck disable=SC2086
+          arr="$(printf '%s\n' $MODALITY | sort -u | jq -R . | jq -cs .)"
+          [ "$arr" != "[]" ] || { echo "::error::no modality given"; exit 1; }
+          echo "list=$arr" >> "$GITHUB_OUTPUT"
+          echo "matrix: $arr"
+
+  bench:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        modality: ${{ fromJSON(needs.setup.outputs.modalities) }}
+    uses: ./.github/workflows/dataset-bench-vm.yml
+    with:
+      dataset: ${{ inputs.dataset }}
+      mode: bench
+      modality: ${{ matrix.modality }}
+      phase: ${{ inputs.phase }}
+      cache_gib: ${{ inputs.cache_gib }}
+      skip_calibration: ${{ inputs.skip_calibration }}
+      vm_size: ${{ inputs.vm_size }}
+      location: ${{ inputs.location }}
+      ref: ${{ inputs.ref }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+    secrets: inherit

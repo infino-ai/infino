@@ -1,0 +1,92 @@
+name: Dataset prepare (Azure)
+
+# Prepare reusable benchmark datasets on ephemeral Azure VMs: generate the
+# corpus, ingest it to a blob prefix, and write its metadata sidecar.
+#
+# Fans out one VM per modality (matrix over dataset-bench-vm.yml), ingesting in
+# parallel. Modalities fail independently. A prepared dataset is reused across
+# many benchmark runs (see dataset-bench.yml).
+#
+# Preparing a prefix that already holds a dataset fails pre-flight; choose a
+# new prefix, or benchmark the existing one with dataset-bench.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Blob prefix to write the dataset under (e.g. datasets/bench-10m)."
+        required: true
+        type: string
+      modality:
+        description: "Indexes to prepare, space-separated (own VM each)."
+        required: false
+        default: "fts vector sql"
+        type: string
+      docs:
+        description: "Documents to generate (plain integer)."
+        required: true
+        default: "1000000000"
+        type: string
+      vm_size:
+        description: "Azure VM size (L-series = local NVMe)."
+        required: false
+        default: "Standard_L8aos_v4"
+        type: string
+      location:
+        description: "Azure region."
+        required: false
+        default: "eastus"
+        type: string
+      ref:
+        description: "Git ref or SHA to build from."
+        required: false
+        default: "main"
+        type: string
+      timeout_minutes:
+        description: "Per-VM auto-stop, minutes (GitHub caps at 360)."
+        required: false
+        default: "240"
+        type: string
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      modalities: ${{ steps.parse.outputs.list }}
+    steps:
+      - name: Parse modality list → JSON matrix
+        id: parse
+        env:
+          MODALITY: ${{ inputs.modality }}
+        run: |
+          set -euo pipefail
+          # MODALITY is split on whitespace into tokens, on purpose.
+          # "fts vector sql" → ["fts","vector","sql"]; reject unknown tokens.
+          # shellcheck disable=SC2086
+          for m in $MODALITY; do
+            case "$m" in fts|vector|sql) ;; *)
+              echo "::error::unknown modality '$m' (allowed: fts vector sql)"; exit 1 ;; esac
+          done
+          # shellcheck disable=SC2086
+          arr="$(printf '%s\n' $MODALITY | sort -u | jq -R . | jq -cs .)"
+          [ "$arr" != "[]" ] || { echo "::error::no modality given"; exit 1; }
+          echo "list=$arr" >> "$GITHUB_OUTPUT"
+          echo "matrix: $arr"
+
+  prepare:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        modality: ${{ fromJSON(needs.setup.outputs.modalities) }}
+    uses: ./.github/workflows/dataset-bench-vm.yml
+    with:
+      dataset: ${{ inputs.dataset }}
+      mode: prepare
+      modality: ${{ matrix.modality }}
+      docs: ${{ inputs.docs }}
+      vm_size: ${{ inputs.vm_size }}
+      location: ${{ inputs.location }}
+      ref: ${{ inputs.ref }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+    secrets: inherit
