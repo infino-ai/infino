@@ -1,0 +1,71 @@
+# PR-Agent review configuration.
+#
+# Behavior only. The model, API key, and endpoint live in the review
+# workflow's env so no provider details ship in this public file.
+
+[pr_reviewer]
+num_max_findings = 5
+require_can_be_split_review = true
+enable_review_labels_effort = false
+extra_instructions = """\
+Hold the PR to infino's acceptance bars:
+- Correctness > complexity > performance, in that order. Flag clever or fast \
+code that sacrifices correctness or simplicity.
+- A bug fix must add a regression test that fails before the change and passes \
+after. Flag fixes with no accompanying test, and flag deleted or weakened tests \
+that lack a rationale.
+- Reject changes that regress query latency, ingest throughput, or cost (bytes \
+fetched, request count, memory) unless the PR documents the trade-off. Material \
+changes to scoring math, distance/SIMD kernels, quantization codecs, the \
+commit/manifest path, or the reader cache should report a benchmark comparison \
+against main in the PR body; flag if absent.
+- For changes to scoring math, distance/SIMD kernels, or quantization codecs, \
+expect a vector recall@10 number at or above 0.99 in the PR; flag if absent.
+- New `unsafe` is allowed only in the documented areas and must carry a SAFETY \
+comment proving the invariant. Flag any other `unsafe`. Commit-path changes must \
+preserve the crash-safety contract (a committed superfile survives SIGABRT).
+- Changes to the on-disk format, commit/manifest semantics, the crate-root \
+public API (public-api.txt), or a new top-level module are high-risk and should \
+reference prior discussion or an issue; flag if introduced cold.
+- A new direct dependency needs a justification in the PR body; flag new deps \
+added without one.
+- Flag commits carrying an AI-attribution or Co-Authored-By trailer, and any use \
+of hook-bypass flags such as --no-verify.
+- Flag any reference — in code, comments, docs, or commit message — to \
+internal, private, or predecessor repositories or projects. The public surface \
+must not name them.
+"""
+
+[pr_code_suggestions]
+extra_instructions = """\
+Favor correctness and clarity over micro-optimizations. Enforce infino's code
+standards on the changed lines:
+- No panicking constructs in non-test `src/`: no `.unwrap()`, `.expect()`, \
+`panic!`, or unchecked indexing that can panic. Return a `Result` carrying the \
+appropriate `InfinoError` instead.
+- No magic numbers: a numeric literal carrying meaning should be a named \
+`const` with a short doc-comment, declared at the top of the file. Trivial \
+arithmetic and index values are exempt.
+- All `use` imports belong at the top of the file (or top of an inline test \
+module), never function-local or mid-expression.
+- Items used only inside the crate should be `pub(crate)`, not `pub`; \
+test-only methods belong behind `#[cfg(test)]`, not `#[allow(dead_code)]`.
+- No duplicated logic — prefer reusing or extracting a shared helper.
+- CPU-bound work (decode, scoring, rerank, encode) runs on the configured \
+reader pool via rayon, never inline in an async fn; I/O runs on the shared \
+tokio runtime — flag a throwaway per-call runtime on a worker thread. Bridge \
+async to CPU with a oneshot.
+- `unsafe` only in the documented areas, each with a SAFETY comment proving \
+the invariant.
+- Prefer plain language and inline reasoning in comments; no cryptic shorthand \
+or external tracker references.
+"""
+
+[ignore]
+glob = [
+  "Cargo.lock",
+  "public-api.txt",
+  "**/*.snap",
+  "target/**",
+  "benches/**/*.json",
+]

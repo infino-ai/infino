@@ -28,8 +28,8 @@ test:
 	cargo test --features test-helpers
 
 # Coverage (cargo-llvm-cov; install: cargo install cargo-llvm-cov)
-coverage:                      # CI gate: ≥90% overall + lcov.info for codecov upload
-	cargo llvm-cov --summary-only --features test-helpers
+coverage:                      # CI gate: ≥90% lines/functions/regions + lcov.info for codecov upload
+	cargo llvm-cov --summary-only --features test-helpers --fail-under-lines 90 --fail-under-functions 85 --fail-under-regions 90
 
 coverage-summary:              # quick terminal summary
 	cargo llvm-cov --summary-only --features test-helpers
