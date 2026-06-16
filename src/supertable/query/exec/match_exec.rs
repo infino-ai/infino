@@ -710,6 +710,35 @@ mod tests {
         assert!(ef.call(&[]).is_err(), "0 args must fail");
     }
 
+    /// Construct `MatchTable` directly through the `token_match` TVF
+    /// `call` path and exercise its `TableProvider` metadata methods
+    /// (`Debug`, `as_any`, `table_type`) — none of which normal query
+    /// execution touches.
+    #[test]
+    fn match_table_trait_methods() {
+        use datafusion::catalog::TableFunctionImpl;
+        use datafusion::logical_expr::TableType;
+        use datafusion::prelude::lit;
+
+        use super::MatchTable;
+
+        let st = demo();
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let func = TokenMatchFunc::new(reader, scalar_schema);
+        let table = func
+            .call(&[lit("title"), lit("rust")])
+            .expect("match table");
+
+        let dbg = format!("{table:?}");
+        assert!(dbg.contains("MatchTable"), "Debug missing: {dbg}");
+        assert!(
+            table.as_any().downcast_ref::<MatchTable>().is_some(),
+            "as_any downcasts to MatchTable"
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+    }
+
     #[test]
     fn match_tvf_bad_arg_types_error() {
         let st = demo();

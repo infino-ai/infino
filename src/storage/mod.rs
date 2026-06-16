@@ -268,3 +268,277 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::ops::Range;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    /// Fixed etag the mock reports for any stored object.
+    const MOCK_ETAG: &str = "mock-etag";
+
+    /// Minimal in-memory [`StorageProvider`] implementing only the
+    /// required methods, leaving `tail`, `list_with_prefix`, and
+    /// `object_store_handle` at their trait defaults — those default
+    /// bodies are the code under test here, since every production
+    /// provider overrides all three.
+    #[derive(Debug, Default)]
+    struct InMemoryMock {
+        objects: Mutex<HashMap<String, Bytes>>,
+    }
+
+    impl InMemoryMock {
+        fn with(uri: &str, bytes: &[u8]) -> Self {
+            let mock = Self::default();
+            mock.objects
+                .lock()
+                .expect("lock")
+                .insert(uri.into(), Bytes::copy_from_slice(bytes));
+            mock
+        }
+    }
+
+    fn not_found(uri: &str) -> StorageError {
+        StorageError::NotFound { uri: uri.into() }
+    }
+
+    #[async_trait]
+    impl StorageProvider for InMemoryMock {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            let map = self.objects.lock().expect("lock");
+            match map.get(uri) {
+                Some(b) => Ok(ObjectMeta {
+                    size: b.len() as u64,
+                    etag: Some(MOCK_ETAG.into()),
+                    last_modified: SystemTime::UNIX_EPOCH,
+                }),
+                None => Err(not_found(uri)),
+            }
+        }
+
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            let map = self.objects.lock().expect("lock");
+            match map.get(uri) {
+                Some(b) => Ok((
+                    b.clone(),
+                    ObjectMeta {
+                        size: b.len() as u64,
+                        etag: Some(MOCK_ETAG.into()),
+                        last_modified: SystemTime::UNIX_EPOCH,
+                    },
+                )),
+                None => Err(not_found(uri)),
+            }
+        }
+
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            let map = self.objects.lock().expect("lock");
+            match map.get(uri) {
+                Some(b) => Ok(b.slice(range.start as usize..range.end as usize)),
+                None => Err(not_found(uri)),
+            }
+        }
+
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            let mut map = self.objects.lock().expect("lock");
+            if map.contains_key(uri) {
+                return Err(StorageError::PreconditionFailed { uri: uri.into() });
+            }
+            map.insert(uri.into(), bytes);
+            Ok(Some(MOCK_ETAG.into()))
+        }
+
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            _expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.objects.lock().expect("lock").insert(uri.into(), bytes);
+            Ok(Some(MOCK_ETAG.into()))
+        }
+
+        async fn put_multipart(
+            &self,
+            uri: &str,
+        ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+            // The mock doesn't support streaming uploads; a permanent
+            // error is enough to exercise the call path.
+            let boxed: Box<dyn std::error::Error + Send + Sync> = "multipart unsupported".into();
+            Err(StorageError::Permanent {
+                uri: uri.into(),
+                source: boxed,
+            })
+        }
+
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.objects.lock().expect("lock").remove(uri);
+            Ok(())
+        }
+    }
+
+    // ---- default `tail` body (LocalFs aside, this is the fallback) ----
+
+    #[tokio::test]
+    async fn default_tail_returns_trailing_bytes_and_size() {
+        let mock = InMemoryMock::with("k", b"abcdefgh");
+        let (bytes, size) = mock.tail("k", 3).await.expect("tail");
+        assert_eq!(size, 8);
+        assert_eq!(&bytes[..], b"fgh");
+    }
+
+    #[tokio::test]
+    async fn default_tail_clamps_len_to_object_size() {
+        let mock = InMemoryMock::with("k", b"abc");
+        let (bytes, size) = mock.tail("k", 100).await.expect("tail over-long");
+        assert_eq!(size, 3);
+        assert_eq!(&bytes[..], b"abc", "len clamps to the whole object");
+    }
+
+    #[tokio::test]
+    async fn default_tail_zero_len_returns_empty_with_size() {
+        let mock = InMemoryMock::with("k", b"abc");
+        let (bytes, size) = mock.tail("k", 0).await.expect("tail zero");
+        assert_eq!(size, 3);
+        assert!(bytes.is_empty(), "zero-len tail still discloses size");
+    }
+
+    #[tokio::test]
+    async fn default_tail_propagates_not_found() {
+        let mock = InMemoryMock::default();
+        assert!(matches!(
+            mock.tail("missing", 4).await,
+            Err(StorageError::NotFound { .. })
+        ));
+    }
+
+    // ---- default `list_with_prefix` + `object_store_handle` ----
+
+    #[tokio::test]
+    async fn default_list_with_prefix_is_empty() {
+        let mock = InMemoryMock::with("a/b", b"x");
+        assert!(
+            mock.list_with_prefix("a/").await.expect("list").is_empty(),
+            "the default list never enumerates objects",
+        );
+    }
+
+    #[test]
+    fn default_object_store_handle_is_none() {
+        let mock = InMemoryMock::default();
+        assert!(mock.object_store_handle("k").is_none());
+    }
+
+    // ---- exercise the required methods so the mock's own surface is
+    //      covered too (and the byte ops behave as the trait specifies) ----
+
+    #[tokio::test]
+    async fn mock_byte_ops_round_trip() {
+        let mock = InMemoryMock::default();
+
+        // put_atomic creates; a second create hits the precondition.
+        assert_eq!(
+            mock.put_atomic("k", Bytes::from_static(b"hello"))
+                .await
+                .expect("put_atomic"),
+            Some(MOCK_ETAG.to_string()),
+        );
+        assert!(matches!(
+            mock.put_atomic("k", Bytes::from_static(b"x")).await,
+            Err(StorageError::PreconditionFailed { .. })
+        ));
+
+        // head + get + get_range read it back.
+        assert_eq!(mock.head("k").await.expect("head").size, 5);
+        let (bytes, _) = mock.get("k").await.expect("get");
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(&mock.get_range("k", 1..3).await.expect("range")[..], b"el");
+
+        // put_if_match overwrites unconditionally for the mock.
+        mock.put_if_match("k", Bytes::from_static(b"world!"), Some(MOCK_ETAG))
+            .await
+            .expect("put_if_match");
+        assert_eq!(mock.head("k").await.expect("head2").size, 6);
+
+        // delete is idempotent.
+        mock.delete("k").await.expect("delete");
+        mock.delete("k").await.expect("delete idempotent");
+        assert!(matches!(
+            mock.get("k").await,
+            Err(StorageError::NotFound { .. })
+        ));
+        assert!(matches!(
+            mock.head("missing").await,
+            Err(StorageError::NotFound { .. })
+        ));
+        assert!(matches!(
+            mock.get_range("missing", 0..1).await,
+            Err(StorageError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_put_multipart_surfaces_permanent_error() {
+        let mock = InMemoryMock::default();
+        assert!(matches!(
+            mock.put_multipart("k").await,
+            Err(StorageError::Permanent { .. })
+        ));
+    }
+
+    // ---- error Display + ObjectMeta derives ----
+
+    #[test]
+    fn storage_error_display_covers_every_variant() {
+        let cases: [(StorageError, &str); 4] = [
+            (StorageError::NotFound { uri: "u".into() }, "not found"),
+            (
+                StorageError::PreconditionFailed { uri: "u".into() },
+                "precondition failed",
+            ),
+            (
+                StorageError::TransientExhausted {
+                    uri: "u".into(),
+                    source: "boom".into(),
+                },
+                "transient",
+            ),
+            (
+                StorageError::Permanent {
+                    uri: "u".into(),
+                    source: "boom".into(),
+                },
+                "permanent",
+            ),
+        ];
+        for (err, needle) in cases {
+            assert!(
+                err.to_string().contains(needle),
+                "{err:?} display should contain {needle:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn object_meta_is_clone_and_debug() {
+        let meta = ObjectMeta {
+            size: 7,
+            etag: Some("e".into()),
+            last_modified: SystemTime::UNIX_EPOCH,
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.size, 7);
+        assert_eq!(cloned.etag.as_deref(), Some("e"));
+        assert!(format!("{meta:?}").contains("ObjectMeta"));
+    }
+}

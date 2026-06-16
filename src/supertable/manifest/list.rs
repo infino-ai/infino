@@ -1030,4 +1030,71 @@ mod tests {
             "expected Base64 error, got {err:?}"
         );
     }
+
+    /// A `content_hash` lacking the `blake3:` prefix is rejected with a
+    /// `BadContentHash` error (`decode_hash`'s prefix-strip branch).
+    #[test]
+    fn options_hash_without_blake3_prefix_rejected() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let s = std::str::from_utf8(&bytes).expect("utf8");
+        // rich_list stamps options_hash = blake3:abab...; drop the prefix.
+        let tampered = s.replacen("\"blake3:", "\"nothex:", 1);
+        let err = decode(tampered.as_bytes()).expect_err("missing prefix");
+        assert!(
+            matches!(err, ListParseError::BadContentHash(_)),
+            "expected BadContentHash, got {err:?}"
+        );
+    }
+
+    /// A `content_hash` whose hex payload is the wrong length is rejected
+    /// (`decode_hash`'s length-check branch).
+    #[test]
+    fn content_hash_wrong_hex_length_rejected() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let s = std::str::from_utf8(&bytes).expect("utf8");
+        // The first per-part content_hash is 64 hex chars of 'c' (seed 0
+        // ⇒ ContentHash([0;32]) ⇒ all "00"). Shorten it to 2 chars.
+        let full = "0".repeat(BLAKE3_HEX_LEN);
+        let tampered = s.replacen(&format!("blake3:{full}"), "blake3:00", 1);
+        assert_ne!(tampered, s, "tamper must change the bytes");
+        let err = decode(tampered.as_bytes()).expect_err("short hash");
+        assert!(
+            matches!(err, ListParseError::BadContentHash(_)),
+            "expected BadContentHash, got {err:?}"
+        );
+    }
+
+    /// A non-numeric `id_range` value surfaces a `BadFieldValue` error
+    /// (`entry_from_dto`'s `i128::parse` branch).
+    #[test]
+    fn non_numeric_id_range_rejected() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        v["parts"][0]["id_range"][0] = serde_json::Value::String("not-an-int".into());
+        let tampered = serde_json::to_vec(&v).expect("reencode");
+        let err = decode(&tampered).expect_err("bad id_range");
+        assert!(
+            matches!(err, ListParseError::BadFieldValue("id_range[0]", _)),
+            "expected BadFieldValue, got {err:?}"
+        );
+    }
+
+    /// The upper id_range bound is validated independently of the lower
+    /// one (`entry_from_dto`'s second `i128::parse` branch).
+    #[test]
+    fn non_numeric_id_range_upper_bound_rejected() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        v["parts"][0]["id_range"][1] = serde_json::Value::String("xyz".into());
+        let tampered = serde_json::to_vec(&v).expect("reencode");
+        let err = decode(&tampered).expect_err("bad id_range upper");
+        assert!(
+            matches!(err, ListParseError::BadFieldValue("id_range[1]", _)),
+            "expected BadFieldValue, got {err:?}"
+        );
+    }
 }

@@ -501,6 +501,157 @@ fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>
 }
 
 #[cfg(test)]
+mod decode_error_tests {
+    //! Exercise the error/empty branches of the binary decoders so the
+    //! shape-mismatch paths (truncation, bad arrow columns, unpaired
+    //! min/max, non-UTF-8 map keys) are covered, not just the happy
+    //! round-trips.
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::{
+        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary,
+        decode_vector_summary_map, encode_scalar_stats, read_n, read_u32,
+    };
+    use crate::supertable::manifest::ScalarStatsTable;
+
+    /// One length-1 arrow-IPC RecordBatch with the given fields/columns,
+    /// matching the on-wire shape `encode_scalar_stats` emits.
+    fn ipc_batch(fields: Vec<Field>, arrays: Vec<ArrayRef>) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), arrays).expect("batch");
+        let mut out = Vec::new();
+        {
+            let mut w =
+                arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            w.write(&batch).expect("ipc write");
+            w.finish().expect("ipc finish");
+        }
+        out
+    }
+
+    /// An empty blob decodes to an empty table (the zero-length sentinel
+    /// `encode_scalar_stats` emits for an empty input).
+    #[test]
+    fn decode_scalar_stats_empty_is_empty_table() {
+        let table = decode_scalar_stats(&[]).expect("empty");
+        assert!(table.cols.is_empty());
+        // The empty table round-trips back to a zero-length blob.
+        assert!(encode_scalar_stats(&ScalarStatsTable::new()).is_empty());
+    }
+
+    /// Garbage (non-arrow-IPC) bytes surface an `ArrowIpc` decode error.
+    #[test]
+    fn decode_scalar_stats_garbage_is_arrow_ipc_error() {
+        let err = decode_scalar_stats(b"definitely not arrow ipc").expect_err("garbage");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A `__nulls` column typed as something other than UInt64 is rejected.
+    #[test]
+    fn decode_scalar_stats_wrong_nulls_type_errors() {
+        let bytes = ipc_batch(
+            vec![Field::new("c__nulls", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("bad nulls type");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A column whose name carries no recognized stats suffix is rejected.
+    #[test]
+    fn decode_scalar_stats_unknown_suffix_errors() {
+        let bytes = ipc_batch(
+            vec![Field::new("c__bogus", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("bad suffix");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A `__min` without a matching `__max` is an unpaired-column error.
+    #[test]
+    fn decode_scalar_stats_unpaired_min_errors() {
+        let bytes = ipc_batch(
+            vec![Field::new("c__min", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec!["a"])) as ArrayRef],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("unpaired min");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// Truncated bytes (here a too-short vector summary) surface a
+    /// `Truncated` error via the cursor helpers.
+    #[test]
+    fn decode_vector_summary_truncated_errors() {
+        // Claims dim = 4 (LE u32) but supplies no centroid bytes.
+        let bytes = 4u32.to_le_bytes().to_vec();
+        let err = decode_vector_summary(&bytes).expect_err("truncated");
+        assert!(matches!(err, DecodeError::Truncated { .. }), "got {err:?}");
+    }
+
+    /// A map whose key bytes are not valid UTF-8 surfaces a decode error
+    /// rather than panicking.
+    #[test]
+    fn decode_summary_maps_reject_non_utf8_keys() {
+        // n_entries = 1, key_len = 1, key = 0xff (invalid UTF-8).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0xff);
+        let fts_err = decode_fts_summary_map(&bytes).expect_err("bad fts key");
+        assert!(
+            matches!(fts_err, DecodeError::ArrowIpc(_)),
+            "got {fts_err:?}"
+        );
+        let vec_err = decode_vector_summary_map(&bytes).expect_err("bad vec key");
+        assert!(
+            matches!(vec_err, DecodeError::ArrowIpc(_)),
+            "got {vec_err:?}"
+        );
+    }
+
+    /// An empty map round-trips: both decoders read `n_entries = 0` and
+    /// return an empty `HashMap`.
+    #[test]
+    fn decode_summary_maps_empty() {
+        let zero = 0u32.to_le_bytes().to_vec();
+        let fts: HashMap<_, _> = decode_fts_summary_map(&zero).expect("empty fts");
+        assert!(fts.is_empty());
+        let vec: HashMap<_, _> = decode_vector_summary_map(&zero).expect("empty vec");
+        assert!(vec.is_empty());
+    }
+
+    /// The cursor helpers report `Truncated` (with the field name) when
+    /// the buffer is shorter than the requested read.
+    #[test]
+    fn cursor_helpers_truncate() {
+        let mut c = std::io::Cursor::new(&[0u8, 1][..]);
+        let err = read_u32(&mut c, "header").expect_err("only 2 bytes");
+        assert!(
+            matches!(err, DecodeError::Truncated { what: "header", .. }),
+            "got {err:?}"
+        );
+        let mut c = std::io::Cursor::new(&[0u8, 1, 2][..]);
+        let err = read_n(&mut c, 8, "body").expect_err("only 3 bytes");
+        assert!(
+            matches!(
+                err,
+                DecodeError::Truncated {
+                    what: "body",
+                    needed: 8,
+                    had: 3
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod vector_summary_tests {
     use super::{decode_vector_summary, encode_vector_summary};
     use crate::supertable::manifest::{ClusterCentroids, VectorSummary};

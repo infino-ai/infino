@@ -6715,4 +6715,453 @@ mod tests {
         assert_eq!(out[1].as_ref(), &bytes[80..100]);
         assert_eq!(out[2].as_ref(), &bytes[130..150]);
     }
+
+    // -----------------------------------------------------------------
+    // Lazy-source failure propagation
+    // -----------------------------------------------------------------
+    //
+    // The reader maps every `LazyByteSource` failure to
+    // `VectorError::LazySource`. These tests drive a source that can be
+    // switched into a failing mode so the search / get_vectors / open
+    // error-mapping arms run rather than only the happy paths.
+
+    /// `range()`-call index at which [`FlakyLazyByteSource`] starts
+    /// erroring. The open path issues a fixed, small number of fetches
+    /// (outer header, directory, then one per subsection); a value past
+    /// those lets open succeed before the failing mode trips.
+    const FAIL_NEVER: u64 = u64::MAX;
+
+    /// Test-only [`LazyByteSource`] over a real blob that serves bytes
+    /// until the test flips it into a failing mode. `try_get_range_sync`
+    /// always returns `None`, so every reader fetch routes through the
+    /// async `range()` (or its sync bridge) and observes the flag. Used
+    /// to pin that a backing-store failure surfaces as
+    /// `VectorError::LazySource` instead of a panic or silent miss.
+    #[derive(Debug)]
+    struct FlakyLazyByteSource {
+        bytes: Bytes,
+        /// Number of `range()` calls observed so far.
+        calls: AtomicU64,
+        /// Once `calls >= fail_after`, every `range()` returns an error.
+        fail_after: AtomicU64,
+    }
+
+    impl FlakyLazyByteSource {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                bytes,
+                calls: AtomicU64::new(0),
+                fail_after: AtomicU64::new(FAIL_NEVER),
+            }
+        }
+
+        /// Begin failing on the next `range()` call. Called after a
+        /// successful open so search-time fetches hit the failing arm.
+        fn fail_from_now(&self) {
+            let seen = self.calls.load(AtomicOrdering::Relaxed);
+            self.fail_after.store(seen, AtomicOrdering::Relaxed);
+        }
+
+        /// Fail starting from the `nth` (0-based) `range()` call — used
+        /// to fail a specific open-time fetch wave.
+        fn fail_after_call(&self, nth: u64) {
+            self.fail_after.store(nth, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for FlakyLazyByteSource {
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let n = self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if n >= self.fail_after.load(AtomicOrdering::Relaxed) {
+                return Err(LazyByteSourceError::ShortRead {
+                    start,
+                    requested: len,
+                    got: 0,
+                });
+            }
+            let total = self.bytes.len() as u64;
+            if start.saturating_add(len) > total {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: total,
+                });
+            }
+            let s = start as usize;
+            Ok(self.bytes.slice(s..s + len as usize))
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            // Always miss so reader fetches take the async `range()`
+            // path and observe the failing flag.
+            None
+        }
+    }
+
+    /// A backing-store failure during sync `search()` surfaces as
+    /// `VectorError::LazySource` rather than a panic. Exercises the
+    /// `map_err(LazySource)` arms on the cold fetch path.
+    #[tokio::test]
+    async fn search_propagates_lazy_source_error() {
+        let (blob, json, all) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        let r = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy before failing mode");
+        flaky.fail_from_now();
+        let err = r
+            .search("embedding", &all[0], 5, 4, 5)
+            .await
+            .expect_err("search must surface the backing-store failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "expected LazySource, got {err:?}"
+        );
+    }
+
+    /// The async `search_async` and externally-selected
+    /// `search_clusters_async` paths also map a backing-store failure to
+    /// `VectorError::LazySource`. Exercises the async error arms in
+    /// `search_async` / `search_clusters_async` / `probe_clusters_async`.
+    #[tokio::test]
+    async fn async_search_paths_propagate_lazy_source_error() {
+        let (blob, json, all) = build_search_corpus();
+
+        let flaky_a = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        let ra = VectorReader::open_lazy(
+            StdArc::clone(&flaky_a) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy for search_async");
+        flaky_a.fail_from_now();
+        let err = ra
+            .search_async("embedding", &all[0], 5, 4, 5)
+            .await
+            .expect_err("search_async must surface failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "search_async expected LazySource, got {err:?}"
+        );
+
+        let flaky_c = StdArc::new(FlakyLazyByteSource::new(blob));
+        let rc = VectorReader::open_lazy(
+            StdArc::clone(&flaky_c) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy for search_clusters_async");
+        flaky_c.fail_from_now();
+        let err = rc
+            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5)
+            .await
+            .expect_err("search_clusters_async must surface failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "search_clusters_async expected LazySource, got {err:?}"
+        );
+    }
+
+    /// `get_vectors_fp32` maps a backing-store failure on the
+    /// cluster-index / block fetch to `VectorError::LazySource`.
+    #[tokio::test]
+    async fn get_vectors_fp32_propagates_lazy_source_error() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        let r = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy before failing mode");
+        flaky.fail_from_now();
+        let err = r
+            .get_vectors_fp32("embedding")
+            .expect_err("get_vectors_fp32 must surface the backing-store failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "expected LazySource, got {err:?}"
+        );
+    }
+
+    /// A failure on the outer-header fetch during `open_lazy` maps to a
+    /// `MalformedVersion` read error (the open path stringifies the
+    /// lazy error into its own structural-decode error).
+    #[tokio::test]
+    async fn open_lazy_header_fetch_failure_errors() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        flaky.fail_after_call(0); // fail the very first (header) fetch
+        let err = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect_err("header fetch failure must abort open_lazy");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    /// A failure on the directory fetch (the second `range()` wave)
+    /// during `open_lazy` also aborts open with a `MalformedVersion`
+    /// read error, exercising the directory-fetch error arm.
+    #[tokio::test]
+    async fn open_lazy_directory_fetch_failure_errors() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        flaky.fail_after_call(1); // header succeeds, directory fetch fails
+        let err = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect_err("directory fetch failure must abort open_lazy");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    /// A failure on the subsection-header fetch wave (third `range()`
+    /// onward) during `open_lazy` aborts open with a `MalformedVersion`
+    /// read error, exercising the subheader-fetch error arm.
+    #[tokio::test]
+    async fn open_lazy_subheader_fetch_failure_errors() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        flaky.fail_after_call(2); // header + directory succeed, subheaders fail
+        let err = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect_err("subheader fetch failure must abort open_lazy");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    /// Malformed `inf.vec.columns` JSON is rejected at open with a
+    /// `MalformedVersion` read error — exercises the JSON-parse error
+    /// arm in `open_with_source`.
+    #[test]
+    fn open_rejects_malformed_columns_json() {
+        let (blob, _json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let err = VectorReader::open(blob, "{ this is not valid json")
+            .expect_err("malformed JSON must be rejected");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Per-wave cold-fetch failure sweeps
+    // -----------------------------------------------------------------
+    //
+    // The single-wave `*_propagates_lazy_source_error` tests above fail
+    // the *first* search-time fetch, so only the earliest `map_err`
+    // closure on each path runs. These sweeps fail every successive
+    // fetch wave in turn — opening a fresh source each time and tripping
+    // the failing mode at one later `range()` call — so each path's
+    // *downstream* cold-fetch error closures (Sq8-meta batch, the
+    // coalesced survivor-rerank wave, and the final rerank fetch) all
+    // execute, not just the leading one. Every wave must surface a
+    // `VectorError::LazySource`.
+
+    /// Number of open-time `range()` calls a `FlakyLazyByteSource` sees
+    /// before any search fetch — read back from the source's own counter
+    /// after a successful `open_lazy`, so the sweep starts failing at the
+    /// first *search* wave rather than re-failing an open wave.
+    fn open_call_count(flaky: &FlakyLazyByteSource) -> u64 {
+        flaky.calls.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Drive `search` on a fresh cold lazy source that errors starting at
+    /// the `nth` `range()` call. Returns the search result so the caller
+    /// can assert per-wave behavior.
+    async fn search_failing_at_call(
+        blob: &Bytes,
+        json: &str,
+        query: &[f32],
+        fail_at: u64,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        let r = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy before failing mode");
+        flaky.fail_after_call(fail_at);
+        r.search("embedding", query, 5, 4, 5).await
+    }
+
+    /// Failing each successive cold-fetch wave of the sync `search` path
+    /// in turn surfaces a `LazySource` error on at least one wave beyond
+    /// the leading centroid fetch — exercising the coalesced-prefix,
+    /// survivor-rerank, and final-rerank `map_err` closures.
+    #[tokio::test]
+    async fn search_every_cold_wave_failure_surfaces_lazy_source() {
+        let (blob, json, all) = build_search_corpus();
+        // Learn open's call count from a clean open.
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy to count open calls");
+        let open_calls = open_call_count(&flaky);
+
+        // Sweep a generous window of search-time waves; each fresh source
+        // re-runs the identical open, so `open_calls` is the stable base.
+        /// Number of successive search-time `range()` waves to fail.
+        const SEARCH_WAVE_SWEEP: u64 = 12;
+        let mut lazy_errors = 0usize;
+        for offset in 0..SEARCH_WAVE_SWEEP {
+            match search_failing_at_call(&blob, &json, &all[0], open_calls + offset).await {
+                Err(VectorError::LazySource(_)) => lazy_errors += 1,
+                // Some waves may already have all bytes in hand (e.g. a
+                // coalesced fetch served everything), so a clean result
+                // is allowed — we only require that failures map cleanly.
+                Ok(_) => {}
+                other => panic!("unexpected non-LazySource outcome: {other:?}"),
+            }
+        }
+        assert!(
+            lazy_errors >= 2,
+            "at least the centroid and one downstream cold wave must surface LazySource"
+        );
+    }
+
+    /// The async `search_async` and `search_clusters_async` paths surface
+    /// `LazySource` on each successive cold wave too — covering their
+    /// downstream coalesced-fetch / rerank error closures, not just the
+    /// leading centroid+index fetch.
+    #[tokio::test]
+    async fn async_search_every_cold_wave_failure_surfaces_lazy_source() {
+        let (blob, json, all) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy to count open calls");
+        let open_calls = open_call_count(&flaky);
+
+        /// Successive search-time waves to fail on the async paths.
+        const ASYNC_WAVE_SWEEP: u64 = 12;
+        let mut async_errors = 0usize;
+        let mut clusters_errors = 0usize;
+        for offset in 0..ASYNC_WAVE_SWEEP {
+            let fail_at = open_calls + offset;
+
+            let flaky_a = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+            let ra = VectorReader::open_lazy(
+                StdArc::clone(&flaky_a) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open_lazy search_async");
+            flaky_a.fail_after_call(fail_at);
+            match ra.search_async("embedding", &all[0], 5, 4, 5).await {
+                Err(VectorError::LazySource(_)) => async_errors += 1,
+                Ok(_) => {}
+                other => panic!("search_async unexpected outcome: {other:?}"),
+            }
+
+            let flaky_c = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+            let rc = VectorReader::open_lazy(
+                StdArc::clone(&flaky_c) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open_lazy search_clusters_async");
+            flaky_c.fail_after_call(fail_at);
+            match rc
+                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5)
+                .await
+            {
+                Err(VectorError::LazySource(_)) => clusters_errors += 1,
+                Ok(_) => {}
+                other => panic!("search_clusters_async unexpected outcome: {other:?}"),
+            }
+        }
+        assert!(
+            async_errors >= 2,
+            "search_async must surface LazySource on the centroid and a downstream wave"
+        );
+        assert!(
+            clusters_errors >= 2,
+            "search_clusters_async must surface LazySource on the index and a downstream wave"
+        );
+    }
+
+    /// `get_vectors_fp32` surfaces `LazySource` on both its fetch waves:
+    /// the cluster-index `get_range` and the per-cluster block
+    /// `get_ranges_parallel`. The single-wave test above only trips the
+    /// first; sweeping both indices exercises the second `map_err` arm.
+    #[tokio::test]
+    async fn get_vectors_fp32_every_cold_wave_failure_surfaces_lazy_source() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy to count open calls");
+        let open_calls = open_call_count(&flaky);
+
+        /// `get_vectors_fp32` issues an index fetch then a block fetch;
+        /// fail each in turn (plus a small margin).
+        const GET_VECTORS_WAVE_SWEEP: u64 = 4;
+        let mut lazy_errors = 0usize;
+        for offset in 0..GET_VECTORS_WAVE_SWEEP {
+            let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+            let r = VectorReader::open_lazy(
+                StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open_lazy before failing mode");
+            flaky.fail_after_call(open_calls + offset);
+            match r.get_vectors_fp32("embedding") {
+                Err(VectorError::LazySource(_)) => lazy_errors += 1,
+                Ok(_) => {}
+                other => panic!("get_vectors_fp32 unexpected outcome: {other:?}"),
+            }
+        }
+        assert!(
+            lazy_errors >= 2,
+            "both the cluster-index and block fetch waves must surface LazySource"
+        );
+    }
 }

@@ -4907,4 +4907,269 @@ mod tests {
         // Latest part still has 1 sf (removal did not touch it)
         assert_eq!(list_entries[1].n_superfiles, 1);
     }
+
+    /// Build a single-part `ManifestList` carrying `n_parts` placeholder
+    /// entries — enough to exercise the list-aware `Manifest` accessors
+    /// without attaching storage.
+    fn list_with_parts(n_parts: usize) -> list::ManifestList {
+        use list::{ManifestList, ManifestListEntry, PartitionStrategy};
+        let parts = (0..n_parts)
+            .map(|i| ManifestListEntry {
+                part_id: part::PartId(Uuid::from_u128(i as u128 + 1)),
+                uri: format!("manifests/part-{i}"),
+                n_superfiles: 0,
+                size_bytes_compressed: 0,
+                size_bytes_uncompressed: 0,
+                content_hash: part::ContentHash([0u8; 32]),
+                partition_key: Vec::new(),
+                id_range: (0, 0),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+                vector_summary_agg: Default::default(),
+            })
+            .collect();
+        ManifestList {
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: part::ContentHash([0u8; 32]),
+            schema: Vec::new(),
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            parts,
+        }
+    }
+
+    fn manifest_with_list(list: list::ManifestList) -> Manifest {
+        Manifest {
+            superfile_list: SuperfileList::empty(opts()),
+            list: Some(list),
+            parts: dashmap::DashMap::new(),
+            loader: None,
+        }
+    }
+
+    /// `get_num_parts` / `get_all_list_entries` read straight off the
+    /// attached `ManifestList` (the Some-arm of both accessors).
+    #[test]
+    fn list_accessors_read_from_attached_list() {
+        let m = manifest_with_list(list_with_parts(3));
+        assert_eq!(m.get_num_parts(), 3);
+        assert_eq!(m.get_all_list_entries().len(), 3);
+        assert_eq!(m.get_num_parts_loaded(), 0, "nothing eagerly loaded");
+        assert!(!m.is_in_process_only(), "a list is attached");
+
+        // No-list manifest takes the None-arms.
+        let empty = Manifest::empty(opts());
+        assert_eq!(empty.get_num_parts(), 0);
+        assert!(empty.get_all_list_entries().is_empty());
+        assert!(empty.is_in_process_only());
+    }
+
+    /// `get_cached_part_by_id` / `get_cached_part_by_list_idx` return
+    /// `None` before any part is fetched into the per-part cache; the
+    /// list-index variant resolves the index to a `PartId` first.
+    #[test]
+    fn cached_part_lookups_miss_before_load() {
+        let m = manifest_with_list(list_with_parts(2));
+        let known_id = part::PartId(Uuid::from_u128(1));
+        assert!(m.get_cached_part_by_id(&known_id).is_none());
+        assert!(m.get_cached_part_by_list_idx(0).is_none());
+        assert!(m.get_cached_part_by_list_idx(1).is_none());
+
+        // A manifest with no list has no parts to resolve by index.
+        let empty = Manifest::empty(opts());
+        assert!(empty.get_cached_part_by_list_idx(0).is_none());
+    }
+
+    /// `Manifest::new` with no storage/list takes the in-process-only
+    /// constructor branch (loader + list both `None`).
+    #[test]
+    fn manifest_new_without_storage_is_in_process_only() {
+        let m = Manifest::new(7, opts(), vec![seg_entry(Uuid::new_v4(), 4)], None, None);
+        assert_eq!(m.get_manifest_id(), 7);
+        assert!(m.is_in_process_only());
+        assert_eq!(m.get_num_parts(), 0);
+        assert_eq!(m.superfiles.len(), 1);
+    }
+
+    /// Merging two tables that each carry an HLL sketch on the same
+    /// column folds the sketches together (the HLL-merge closure in
+    /// `ScalarStatsTable::merge`), and the merged distinct estimate
+    /// covers the union of both inputs.
+    #[test]
+    fn merge_folds_hll_sketches_on_shared_column() {
+        use arrow_array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let a_batch = batch_with_columns(
+            &schema,
+            vec![Arc::new(Int64Array::from((0..100i64).collect::<Vec<_>>())) as ArrayRef],
+        );
+        let b_batch = batch_with_columns(
+            &schema,
+            vec![Arc::new(Int64Array::from((50..200i64).collect::<Vec<_>>())) as ArrayRef],
+        );
+        let mut a = ScalarStatsTable::from_batch(&schema, &a_batch);
+        let b = ScalarStatsTable::from_batch(&schema, &b_batch);
+        assert!(a.hll.contains_key("v") && b.hll.contains_key("v"));
+
+        a.merge(&b);
+        // The merged sketch must survive (both sides had one) and its
+        // estimate should reflect the ~200-value union, not just 100.
+        let merged = a.hll.get("v").expect("merged hll");
+        let sketch = hll::HllSketch::from_bytes(merged).expect("decode merged hll");
+        let estimate = sketch.estimate();
+        assert!(
+            estimate > 120.0,
+            "merged HLL should estimate the union (~200), got {estimate}"
+        );
+    }
+
+    /// String columns route through the `Utf8` / `LargeUtf8` arms of
+    /// `column_min_max` (lexicographic min/max), `column_hll` (distinct
+    /// sketch over raw bytes), and the string `merge_min_max_arrays`
+    /// branch. Build per-batch stats over both string widths, then merge
+    /// to widen the lexicographic range.
+    #[test]
+    fn scalar_stats_string_columns_min_max_hll_and_merge() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("u", DataType::Utf8, false),
+            Field::new("l", DataType::LargeUtf8, false),
+        ]));
+        let a_u: ArrayRef = Arc::new(StringArray::from(vec!["delta", "bravo"]));
+        let a_l: ArrayRef = Arc::new(LargeStringArray::from(vec!["mike", "kilo"]));
+        let a_batch = batch_with_columns(&schema, vec![a_u, a_l]);
+        let mut a = ScalarStatsTable::from_batch(&schema, &a_batch);
+
+        // Utf8 min/max are lexicographic over the first batch.
+        let (mn, mx) = a.cols.get("u").expect("utf8 min/max");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("test")
+                .value(0),
+            "bravo"
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("test")
+                .value(0),
+            "delta"
+        );
+        // LargeUtf8 min/max likewise.
+        let (mn, mx) = a.cols.get("l").expect("largeutf8 min/max");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("test")
+                .value(0),
+            "kilo"
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("test")
+                .value(0),
+            "mike"
+        );
+        // HLL sketches recorded for both string widths.
+        assert!(a.hll.contains_key("u"));
+        assert!(a.hll.contains_key("l"));
+
+        // Second batch extends the range on both ends; merge widens it.
+        let b_u: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "echo"]));
+        let b_l: ArrayRef = Arc::new(LargeStringArray::from(vec!["november", "alfa"]));
+        let b_batch = batch_with_columns(&schema, vec![b_u, b_l]);
+        let b = ScalarStatsTable::from_batch(&schema, &b_batch);
+        a.merge(&b);
+
+        let (mn, mx) = a.cols.get("u").expect("merged utf8");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("test")
+                .value(0),
+            "alpha"
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("test")
+                .value(0),
+            "echo"
+        );
+        let (mn, mx) = a.cols.get("l").expect("merged largeutf8");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("test")
+                .value(0),
+            "alfa"
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("test")
+                .value(0),
+            "november"
+        );
+    }
+
+    /// `merge_min_max_arrays` returns `None` when the two sides disagree
+    /// on type (the `as_any().downcast_ref()?` short-circuit). On a
+    /// `None`, `merge` leaves the existing min/max untouched rather than
+    /// panicking or clobbering it.
+    #[test]
+    fn merge_min_max_keeps_existing_on_type_mismatch() {
+        let mut a = ScalarStatsTable::new();
+        a.cols.insert(
+            "x".into(),
+            (
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![5])) as ArrayRef,
+            ),
+        );
+        let mut b = ScalarStatsTable::new();
+        b.cols.insert(
+            "x".into(),
+            (
+                Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["z"])) as ArrayRef,
+            ),
+        );
+        a.merge(&b);
+        let (mn, mx) = a.cols.get("x").expect("col retained");
+        assert_eq!(
+            mn.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            1
+        );
+        assert_eq!(
+            mx.as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test")
+                .value(0),
+            5
+        );
+    }
+
+    /// `ClusterCentroids::from_fp32` clamps a non-finite component
+    /// min/max to zero (the `is_finite` guard branches).
+    #[test]
+    fn from_fp32_handles_non_finite_components() {
+        let centroids = [f32::INFINITY, f32::NEG_INFINITY, 0.0, 1.0];
+        let cc = ClusterCentroids::from_fp32(1, 4, &centroids, vec![1]);
+        // Degenerate (non-finite) min/max collapse to a zero scale, so
+        // every code in the cluster is 0 — no NaN/inf leaks through.
+        assert_eq!(cc.scales[0], 0.0);
+        assert!(cc.mins[0].is_finite());
+        assert!(cc.codes.iter().all(|&c| c == 0));
+    }
 }

@@ -995,6 +995,32 @@ mod tests {
         );
     }
 
+    /// An in-memory supertable (no storage, no tombstone cache) takes
+    /// the empty-sidecar-map fallback arm in `compact_async`: it still
+    /// builds per-superfile stats and runs `select`, and with a single
+    /// committed superfile `select` finds nothing to do, so the call
+    /// returns `Ok(())` without touching storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_in_memory_table_takes_empty_sidecar_fallback() {
+        let st =
+            Supertable::create(default_supertable_options()).expect("create in-memory supertable");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&["alpha first", "alpha second"]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("in-memory compact is a no-op, not an error");
+        assert_eq!(
+            st.manifest_id(),
+            before,
+            "single superfile yields no compaction job"
+        );
+    }
+
     // ─── Helpers shared by the end-to-end compact() tests ─────────────────
 
     fn make_st(dir: &TempDir) -> Supertable {

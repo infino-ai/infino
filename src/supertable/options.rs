@@ -1657,4 +1657,54 @@ supertable:
             .expect_err("missing local_root");
         assert!(matches!(err, BuildError::Store(_)), "{err:?}");
     }
+
+    #[test]
+    fn apply_config_attaches_s3_storage_from_bucket() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // `storage.backend = s3` with a bucket drives the S3 arm of
+        // apply_storage_config. `S3StorageProvider::new` only builds a
+        // client object from the AWS credential chain — it makes no
+        // network call — so the arm is exercised offline.
+        let yaml = "storage:\n  backend: s3\n  bucket: example-bucket\n  prefix: tbl/example\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_some(), "s3 backend attaches storage");
+        assert!(
+            opts.disk_cache.is_none(),
+            "no disk_cache_root ⇒ no cache attached"
+        );
+    }
+
+    #[test]
+    fn apply_config_s3_without_bucket_is_rejected() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // s3 backend but no bucket → the typed Store error arm of
+        // apply_storage_config.
+        let yaml = "storage:\n  backend: s3\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts().apply_config(&cfg).expect_err("missing bucket");
+        assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
+
+    #[test]
+    fn apply_config_azure_without_bucket_is_rejected() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // azure backend but no container → the typed Store error arm
+        // of apply_storage_config.
+        let yaml = "storage:\n  backend: azure\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts()
+            .apply_config(&cfg)
+            .expect_err("missing container");
+        assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
 }

@@ -2034,4 +2034,191 @@ mod tests {
         let m: FtsBoolMode = FtsBoolMode::And;
         assert_eq!(m, BoolMode::And);
     }
+
+    // ── KV-validation error branches (eager + lazy open paths) ─────────
+
+    /// A complete superfile's worth of bytes whose footer carries only
+    /// the caller-supplied `extra_kv`. Reuses the production parquet
+    /// encode + splice path so the bytes are a real parquet file; the
+    /// missing/garbled `inf.*` keys then drive the open-time validation
+    /// branches. No FTS/vector blobs are spliced — every key under test
+    /// is hand-supplied through `extra_kv`.
+    fn superfile_with_kv(extra_kv: &[(String, String)]) -> Bytes {
+        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
+        use parquet::basic::Compression;
+        /// One row group; the body is tiny, so a single group is enough.
+        const ROW_GROUP_SIZE: usize = 1024;
+        let schema = schema_with_text();
+        let ids = decimal128_ids(vec![1u64]);
+        let title = LargeStringArray::from(vec!["x"]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(title)])
+            .expect("build RecordBatch");
+        let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, ROW_GROUP_SIZE, &[])
+            .expect("encode parquet body");
+        let parts = splice_index_blobs(body, &[], &[], extra_kv).expect("splice index blobs");
+        Bytes::from(parts.bytes)
+    }
+
+    /// The five always-required KV entries, with a correct format value
+    /// and a current-major version, so a superfile carrying exactly
+    /// these passes required-key + version validation and exposes the
+    /// remaining (FTS/vector) branches under test.
+    fn required_kv() -> Vec<(String, String)> {
+        vec![
+            (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
+            (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
+            (kv::ID_COLUMN.into(), "doc_id".into()),
+            (kv::N_DOCS.into(), "1".into()),
+            (kv::BUILDER.into(), "test".into()),
+        ]
+    }
+
+    #[test]
+    fn open_with_rejects_format_value_mismatch() {
+        // Required keys present, but inf.format carries the wrong sentinel.
+        let mut kvs = required_kv();
+        kvs[0] = (kv::FORMAT.into(), "not-a-superfile".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_incompatible_version() {
+        // A valid semver that parses but whose major differs from ours.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "9999.0.0".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_partial_fts_keys() {
+        // Only one of the three all-or-none inf.fts.* keys present.
+        let mut kvs = required_kv();
+        kvs.push((kv::FTS_OFFSET.into(), "0".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_partial_vec_keys() {
+        // Only one of the three all-or-none inf.vec.* keys present.
+        let mut kvs = required_kv();
+        kvs.push((kv::VEC_OFFSET.into(), "0".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[tokio::test]
+    async fn open_lazy_rejects_malformed_kvs() {
+        // Same crafted-KV bytes, wrapped in a lazy source, must exercise
+        // the lazy open path's mirror validation branches.
+        let lazy = |bytes: Bytes| -> Arc<dyn crate::superfile::LazyByteSource> {
+            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes))
+        };
+
+        // Missing a required key (drop inf.n_docs) → MissingKv.
+        let mut kvs = required_kv();
+        kvs.retain(|(k, _)| k != kv::N_DOCS);
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("missing required");
+        assert!(matches!(err, ReadError::MissingKv(_)));
+
+        // Wrong format sentinel → MalformedKv.
+        let mut kvs = required_kv();
+        kvs[0] = (kv::FORMAT.into(), "not-a-superfile".into());
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("bad format");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+
+        // Incompatible version → UnsupportedVersion.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "9999.0.0".into());
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("bad version");
+        assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+
+        // Partial vec keys → MalformedKv (the lazy partial-vec branch).
+        let mut kvs = required_kv();
+        kvs.push((kv::VEC_OFFSET.into(), "0".into()));
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("partial vec");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+
+        // Partial fts keys → MalformedKv (the lazy partial-fts branch).
+        let mut kvs = required_kv();
+        kvs.push((kv::FTS_OFFSET.into(), "0".into()));
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("partial fts");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[tokio::test]
+    async fn id_lookup_on_lazy_reader_is_unsupported() {
+        // id_lookup needs resident bytes; a lazy-opened reader must
+        // surface an Io error rather than silently scanning nothing.
+        let bytes = build_simple_fts_only_superfile();
+        let src: Arc<dyn crate::superfile::LazyByteSource> =
+            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes));
+        let r = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+        let err = r.id_lookup(10).expect_err("lazy id_lookup rejected");
+        assert!(matches!(err, ReadError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn exact_match_with_no_token_candidates_returns_empty() {
+        // A value whose tokens are present in the dictionary but never
+        // co-occur in one row drives the empty-candidates short-circuit:
+        // "rust" (docs 0,2) AND "javascript" (doc 3) ⇒ no candidate row.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .exact_match("title", "rust javascript")
+            .await
+            .expect("exact_match");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bm25_search_prefix_range_unmatched_prefix_is_empty() {
+        // A valid (non-degenerate) range with a prefix no term begins
+        // with drives the empty-term-expansion short-circuit.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .bm25_search_prefix_range("title", "zz", 10, 0, 4)
+            .await
+            .expect("prefix range");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_match_on_non_text_column_errors() {
+        // `exact_match` only supports LargeUtf8 columns. Querying the
+        // Decimal128 `doc_id` column drives the non-LargeUtf8 downcast
+        // failure. The value tokenizes to nothing (punctuation only),
+        // so every row becomes a candidate and the verify pass reaches
+        // the downcast on the decimal column.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let err = r
+            .exact_match("doc_id", "!!!")
+            .await
+            .expect_err("expected error");
+        match err {
+            ReadError::Io(e) => {
+                assert!(e.to_string().contains("not LargeUtf8"));
+            }
+            other => panic!("expected ReadError::Io, got {:?}", other),
+        }
+    }
 }

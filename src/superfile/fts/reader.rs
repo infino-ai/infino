@@ -4125,6 +4125,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wand_bmw_exercises_block_skips_on_multi_block_lists() {
+        // A corpus large enough that the common terms span several
+        // 128-doc posting blocks, with five query terms of differing
+        // document frequency and a handful of docs carrying all five.
+        // Running WAND+BMW at a small k forces the pivot to move, the
+        // block-upper-bound skip to fire, lagging cursors to re-align,
+        // and the 4-wide SIMD scoring pack to be used on the
+        // all-terms docs — then cross-checks the result against BMM.
+
+        /// Total planted docs; well over several `BLOCK_LEN` (128) so
+        /// the dense-term posting lists occupy multiple blocks.
+        const N_DOCS: u32 = 400;
+        /// Requested top-K — small, so the heap fills early and the
+        /// score threshold starts pruning blocks.
+        const K: usize = 5;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            // `alpha` in ~every doc, `beta` in ~half, `gamma` every
+            // 5th, `delta` every 13th, `epsilon` every 29th — a
+            // descending-df mix that makes the WAND pivot non-trivial.
+            text.push_str("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 5 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 13 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 29 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta", "epsilon"];
+        let wand = r
+            .search_with_algo_for_bench("body", terms, K, OrAlgo::WandBmw)
+            .await
+            .expect("wand");
+        let bmm = r
+            .search_with_algo_for_bench("body", terms, K, OrAlgo::Bmm)
+            .await
+            .expect("bmm");
+        assert_eq!(wand.len(), bmm.len(), "result length mismatch");
+        assert_eq!(wand.len(), K, "expected a full top-K");
+        for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
+            assert_eq!(dw, db, "doc_id mismatch wand={dw} bmm={db}");
+            assert!((sw - sb).abs() < 1e-4, "score mismatch {sw} vs {sb}");
+        }
+    }
+
+    #[tokio::test]
     async fn search_with_algo_empty_and_zero_k_short_circuit() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");

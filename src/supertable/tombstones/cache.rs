@@ -508,4 +508,20 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
     }
+
+    /// `clear` drops every cached entry, returning the cache to its
+    /// empty state after a lookup has populated it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_empties_the_cache() {
+        let (_dir, _ws, cache) = fixture();
+        // A lookup against an absent sidecar still primes one cached
+        // "known 404" entry.
+        let _ = cache
+            .bitmap_for(Uuid::from_u128(0x1234), Instant::now())
+            .expect("lookup");
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty(), "clear drops all entries");
+        assert_eq!(cache.len(), 0);
+    }
 }
