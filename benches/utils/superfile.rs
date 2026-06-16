@@ -517,11 +517,10 @@ pub mod fts {
                         "Superfile FTS — count, single-superfile / in-memory ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Matching-doc count via the dedicated count path (single-term `term_df`, read \
+                    "Matching-doc count via the dedicated count path: single-term `term_df`, read \
                      O(1) from the dictionary header; multi-term union/intersection cardinality via \
-                     `token_match`) vs the legacy path that scores every hit (`bm25_search` with \
-                     `k = usize::MAX`) only to count them. Both paths are asserted to return the \
-                     same count. Δ is vs the previous run.",
+                     `token_match`. No BM25 scoring, no row materialization. `matches` is the count \
+                     returned. Δ is vs the previous run.",
                     &counts,
                 );
             }
@@ -701,12 +700,8 @@ pub mod fts {
             exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
         }
 
-        fn count_fast(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
-            self.reader.count_fast(column, terms, mode)
-        }
-
-        fn count_scan(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
-            self.reader.count_scan(column, terms, mode)
+        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            self.reader.count_matching(column, terms, mode)
         }
     }
 
