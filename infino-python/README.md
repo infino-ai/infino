@@ -18,6 +18,29 @@ ids = docs.bm25_search("title", "fox", 10, projection=["_id", "score"])    # no 
 table = db.query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
 ```
 
+### Update & delete
+
+Mutations need durable storage (a local path or object store, not
+`memory://`). The predicate is a SQL boolean expression — the same thing
+you'd put after `WHERE` — evaluated against the table's columns:
+
+```python
+db = infino.connect("./data")
+docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
+docs.append([{"title": "draft post"}, {"title": "spam"}])
+
+docs.delete("title = 'spam'")                          # drop matching rows
+stats = docs.update("title = 'draft post'",            # replace matched rows 1:1
+                    [{"title": "published post"}])
+stats.matched, stats.n_tombstoned                      # -> (1, 1)
+
+docs.compact()                                         # merge small superfiles
+```
+
+`update` is a 1:1 replacement: the number of rows the predicate matches
+must equal the number of rows you supply, or it raises. `new_rows` takes
+the same shapes as `append` (pyarrow, pandas, or `list[dict]`).
+
 ## Build & test (requires online crates.io access)
 
 This crate is **excluded** from the infino cargo workspace so the core

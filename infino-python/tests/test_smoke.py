@@ -146,6 +146,55 @@ def test_update_cardinality_mismatch(tmp_path):
         t.update("title = 'alpha'", [{"title": "x"}, {"title": "y"}])
 
 
+def test_delete_matching_many_and_none(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "spam"}, {"title": "spam"}, {"title": "ham"}])
+
+    deleted = t.delete("title = 'spam'")
+    assert deleted.matched == 2
+    assert _count(db, "docs") == 1
+
+    missed = t.delete("title = 'nothing-here'")
+    assert missed.matched == 0
+    assert missed.n_tombstoned == 0
+
+
+def test_update_accepts_pyarrow_record_batch(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "draft"}])
+
+    t.update("title = 'draft'", _title_batch(["published"]))
+    assert t.token_match("title", "published").num_rows == 1
+
+
+def test_invalid_predicate_raises(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+
+    with pytest.raises(ValueError):
+        t.delete("no_such_column = 'x'")
+    with pytest.raises(ValueError):
+        t.delete("this is not sql")
+
+
+def test_mutations_persist_across_reconnect(tmp_path):
+    uri = str(tmp_path / "catalog")
+    db = infino.connect(uri)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}, {"title": "beta"}])
+    t.delete("title = 'alpha'")
+    t.update("title = 'beta'", [{"title": "beta2"}])
+    del t
+    del db
+
+    reopened = infino.connect(uri).open_table("docs")
+    assert reopened.token_match("title", "alpha").num_rows == 0
+    assert reopened.token_match("title", "beta2").num_rows == 1
+
+
 def test_mutations_reject_memory():
     db = infino.connect("memory://")
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
