@@ -576,7 +576,7 @@ pub async fn rebalance_for_commit(
                     });
                 } else {
                     // Rewrite: load existing part and combine with new superfiles.
-                    let existing_part = old.part(entry.part_id).await.map_err(|e| {
+                    let existing_part = old.get_part_by_id(entry.part_id).await.map_err(|e| {
                         crate::supertable::CommitError::PointerParse(format!(
                             "loading existing part {} for partition rewrite: {e}",
                             entry.part_id.0
@@ -657,7 +657,7 @@ pub async fn rebalance_for_commit(
                     .collect::<Vec<_>>(),
                 Some(existing),
             )
-        } else if let Ok(existing_part) = old.part(entry.part_id).await {
+        } else if let Ok(existing_part) = old.get_part_by_id(entry.part_id).await {
             (
                 existing_part
                     .superfiles

@@ -64,17 +64,17 @@ fn one_part_eager_fetches_under_default_threshold() {
 
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    assert_eq!(list.parts.len(), 1);
+    let list_entries = m.get_all_list_entries();
+    assert_eq!(list_entries.len(), 1);
     assert_eq!(
-        m.superfile_list.superfiles.len(),
+        m.get_all_superfiles().len(),
         1,
         "eager mode must populate superfile_list.superfiles"
     );
     // Eager-mode populates the OnceCell.
-    let cell = m.parts.get(&list.parts[0].part_id).expect("part in cache");
+    let part = m.get_cached_part_by_list_idx(0);
     assert!(
-        cell.value().get().is_some(),
+        part.is_some(),
         "eager-fetched OnceCell should be initialized"
     );
 }
@@ -107,25 +107,19 @@ fn many_parts_skip_eager_fetch() {
             .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    assert_eq!(list.parts.len(), 5);
+    let list_entries = m.get_all_list_entries();
+    assert_eq!(list_entries.len(), 5);
     assert!(
-        m.superfile_list.superfiles.is_empty(),
+        m.get_all_superfiles().is_empty(),
         "lazy mode leaves superfile_list.superfiles empty pending \
          the hierarchical query path; got {} superfiles",
-        m.superfile_list.superfiles.len()
+        m.get_all_superfiles().len()
     );
 
     // Every part has an empty OnceCell.
-    let n_loaded = list
-        .parts
+    let n_loaded = list_entries
         .iter()
-        .filter(|entry| {
-            m.parts
-                .get(&entry.part_id)
-                .map(|c| c.value().get().is_some())
-                .unwrap_or(false)
-        })
+        .filter(|entry| m.get_cached_part_by_id(&entry.part_id).is_some())
         .count();
     assert_eq!(
         n_loaded, 0,
@@ -160,16 +154,16 @@ async fn manifest_part_lazy_loads_on_first_access() {
             .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    let target_pid = list.parts[LAZY_LOAD_TARGET_PART_INDEX].part_id;
+    let list_entries = m.get_all_list_entries();
+    let target_pid = list_entries[LAZY_LOAD_TARGET_PART_INDEX].part_id;
 
     // Pre-condition: target part's OnceCell empty.
-    let cell = m.parts.get(&target_pid).expect("part in cache");
-    assert!(cell.value().get().is_none(), "target part starts cold");
-    drop(cell);
+    let part = m.get_cached_part_by_id(&target_pid);
+    assert!(part.is_none(), "target part starts cold");
+    drop(part);
 
     // First load: pulls bytes.
-    let part = m.part(target_pid).await.expect("first load");
+    let part = m.get_part_by_id(target_pid).await.expect("first load");
     assert_eq!(part.superfiles.len(), 1);
 
     // Cell is now populated.
@@ -178,24 +172,18 @@ async fn manifest_part_lazy_loads_on_first_access() {
     // on the same shard via `entry()`, which would
     // deadlock against a still-held read `Ref`.
     {
-        let cell = m.parts.get(&target_pid).expect("still in cache");
-        assert!(
-            cell.value().get().is_some(),
-            "first part().await must populate the OnceCell"
-        );
+        let _part = m
+            .get_cached_part_by_id(&target_pid)
+            .expect("still in cache");
     }
 
     // Other parts stay cold. Same shard-lock discipline:
     // each iteration's `Ref` drops at end of its closure
     // body.
-    let other_loaded = list
-        .parts
+    let other_loaded = list_entries
         .iter()
         .filter(|e| e.part_id != target_pid)
-        .filter(|entry| {
-            let c = m.parts.get(&entry.part_id);
-            c.map(|c| c.value().get().is_some()).unwrap_or(false)
-        })
+        .filter(|entry| m.get_cached_part_by_id(&entry.part_id).is_some())
         .count();
     assert_eq!(
         other_loaded, 0,
@@ -203,7 +191,7 @@ async fn manifest_part_lazy_loads_on_first_access() {
     );
 
     // Second load on the same part: OnceCell hit.
-    let part_again = m.part(target_pid).await.expect("second load");
+    let part_again = m.get_part_by_id(target_pid).await.expect("second load");
     // Both references point at the same Arc — OnceCell
     // hands out an Arc::clone on each get_or_init call.
     assert!(
@@ -238,15 +226,12 @@ fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
     .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    assert_eq!(list.parts.len(), 1);
+    let list_entries = m.get_all_list_entries();
+    assert_eq!(list_entries.len(), 1);
     assert!(
-        m.superfile_list.superfiles.is_empty(),
+        m.get_all_superfiles().is_empty(),
         "threshold=0 forces lazy even on 1-part manifest"
     );
-    let cell = m.parts.get(&list.parts[0].part_id).expect("in cache");
-    assert!(
-        cell.value().get().is_none(),
-        "threshold=0 must not eager-fetch"
-    );
+    let part = m.get_cached_part_by_id(&list_entries[0].part_id);
+    assert!(part.is_none(), "threshold=0 must not eager-fetch");
 }

@@ -32,7 +32,7 @@ pub mod part;
 pub mod partition;
 pub mod term_range;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::compute::kernels::aggregate as agg;
@@ -42,11 +42,13 @@ use dashmap::DashMap;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::supertable::manifest::part::PartId;
+use crate::supertable::query::prune::PruneLeaf;
 use crate::{
     superfile::vector::distance::{
         COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq,
     },
-    supertable::manifest::commit::read_pointer,
+    supertable::{manifest::commit::read_pointer, query::hierarchical_iter},
 };
 
 use bloom::Bloom;
@@ -142,13 +144,13 @@ impl SuperfileList {
 ///
 /// [`ManifestList`]: list::ManifestList
 pub struct Manifest {
-    pub superfile_list: SuperfileList,
-    pub list: Option<list::ManifestList>,
-    pub parts: dashmap::DashMap<
+    superfile_list: SuperfileList,
+    list: Option<list::ManifestList>,
+    parts: dashmap::DashMap<
         part::PartId,
         std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<part::ManifestPart>>>,
     >,
-    pub loader: Option<std::sync::Arc<ManifestPartLoader>>,
+    loader: Option<std::sync::Arc<ManifestPartLoader>>,
 }
 
 impl std::fmt::Debug for Manifest {
@@ -175,6 +177,38 @@ impl std::ops::Deref for Manifest {
 }
 
 impl Manifest {
+    pub fn new(
+        manifest_id: u64,
+        options: Arc<SupertableOptions>,
+        superfile_list: Vec<Arc<SuperfileEntry>>,
+        storage: Option<Arc<dyn crate::storage::StorageProvider>>,
+        list: Option<list::ManifestList>,
+    ) -> Self {
+        let superfile_list = SuperfileList {
+            manifest_id,
+            options,
+            superfiles: superfile_list,
+        };
+        if let Some(storage) = storage
+            && let Some(list) = list
+        {
+            let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+            Self {
+                superfile_list,
+                list: Some(list),
+                parts: dashmap::DashMap::new(),
+                loader: Some(loader),
+            }
+        } else {
+            Self {
+                superfile_list,
+                list: None,
+                parts: dashmap::DashMap::new(),
+                loader: None,
+            }
+        }
+    }
+
     /// Empty initial manifest at `manifest_id = 0`. Used by
     /// `Supertable::create` when no storage is attached.
     pub fn empty(options: Arc<SupertableOptions>) -> Self {
@@ -184,6 +218,43 @@ impl Manifest {
             parts: dashmap::DashMap::new(),
             loader: None,
         }
+    }
+
+    pub fn get_manifest_id(&self) -> u64 {
+        self.superfile_list.manifest_id
+    }
+
+    pub fn get_partition_strategy(&self) -> list::PartitionStrategy {
+        self.list
+            .as_ref()
+            .map(|l| l.partition_strategy.clone())
+            .unwrap_or(self.superfile_list.options.effective_partition_strategy())
+    }
+
+    pub fn get_num_parts(&self) -> usize {
+        self.list.as_ref().map(|l| l.parts.len()).unwrap_or(0)
+    }
+
+    pub fn get_num_parts_loaded(&self) -> usize {
+        self.parts.len()
+    }
+
+    pub fn is_in_process_only(&self) -> bool {
+        self.list.is_none()
+    }
+
+    pub fn get_cached_part_by_id(&self, part_id: &part::PartId) -> Option<Arc<part::ManifestPart>> {
+        self.parts
+            .get(part_id)
+            .and_then(|cell| cell.value().get().cloned())
+    }
+
+    pub fn get_cached_part_by_list_idx(&self, idx: usize) -> Option<Arc<part::ManifestPart>> {
+        let Some(list) = &self.list else {
+            return None;
+        };
+        let part_id = list.parts[idx].part_id;
+        self.get_cached_part_by_id(&part_id)
     }
 
     pub(crate) async fn load(
@@ -347,6 +418,70 @@ impl Manifest {
         Ok(Arc::new(new_manifest))
     }
 
+    pub fn get_all_superfiles(&self) -> &[Arc<SuperfileEntry>] {
+        &self.superfile_list.superfiles
+    }
+
+    pub(crate) async fn get_pruned_superfiles(
+        &self,
+        leaves: &[PruneLeaf],
+    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
+        match &self.list {
+            Some(list) => {
+                // Intersect each constraining leaf's kept-part set. A leaf
+                // with no part pruner (`None`) imposes no constraint.
+                let mut kept: Option<HashSet<PartId>> = None;
+                for leaf in leaves {
+                    if let Some(part_ids) = leaf.keep_parts(list) {
+                        let set: HashSet<PartId> = part_ids.into_iter().collect();
+                        kept = Some(match kept {
+                            None => set,
+                            Some(existing) => existing.intersection(&set).copied().collect(),
+                        });
+                    }
+                }
+                // Preserve manifest (time) order of the surviving parts.
+                let ordered: Vec<PartId> = match kept {
+                    Some(set) => list
+                        .parts
+                        .iter()
+                        .map(|p| p.part_id)
+                        .filter(|id| set.contains(id))
+                        .collect(),
+                    None => list.parts.iter().map(|p| p.part_id).collect(),
+                };
+                hierarchical_iter::load_and_flatten(self, &ordered).await
+            }
+            None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
+        }
+    }
+
+    pub(crate) async fn get_pruned_superfiles_for_vector(
+        &self,
+        column: &str,
+        query: &[f32],
+    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
+        match &self.list {
+            Some(list) => {
+                let kept = crate::supertable::manifest::list_prune::prune_parts_for_vector(
+                    list,
+                    column,
+                    query,
+                    f32::INFINITY,
+                );
+                hierarchical_iter::load_and_flatten(self, &kept).await
+            }
+            None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
+        }
+    }
+
+    pub fn get_all_list_entries(&self) -> &[list::ManifestListEntry] {
+        match &self.list {
+            Some(list) => &list.parts,
+            None => &[],
+        }
+    }
+
     /// Build a successor manifest with `new_entries` appended.
     /// Preserves the persistence-side metadata (`list`, `loader`)
     /// from the predecessor; the per-part cache is fresh (an empty
@@ -376,7 +511,7 @@ impl Manifest {
     ///   blake3 doesn't match the manifest list's recorded hash.
     /// - `OpenError::ManifestPartParse { … }` for Avro / zstd
     ///   decode failures.
-    pub async fn part(
+    pub async fn get_part_by_id(
         &self,
         part_id: part::PartId,
     ) -> Result<std::sync::Arc<part::ManifestPart>, ManifestLoadError> {
@@ -2019,7 +2154,7 @@ mod tests {
             let manifest =
                 build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
-            let loaded = manifest.part(part.part_id).await.expect("load");
+            let loaded = manifest.get_part_by_id(part.part_id).await.expect("load");
             assert_eq!(loaded.part_id, part.part_id);
             assert_eq!(storage.get_call_count(), 1, "exactly one storage.get");
         }
@@ -2033,8 +2168,14 @@ mod tests {
             let manifest =
                 build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
-            let a = manifest.part(part.part_id).await.expect("first load");
-            let b = manifest.part(part.part_id).await.expect("second load");
+            let a = manifest
+                .get_part_by_id(part.part_id)
+                .await
+                .expect("first load");
+            let b = manifest
+                .get_part_by_id(part.part_id)
+                .await
+                .expect("second load");
             assert!(Arc::ptr_eq(&a, &b), "second touch must return cached Arc");
             assert_eq!(storage.get_call_count(), 1, "cache hit ⇒ no extra get");
         }
@@ -2055,7 +2196,7 @@ mod tests {
             for _ in 0..100 {
                 let m = Arc::clone(&manifest);
                 let pid = part.part_id;
-                handles.push(tokio::spawn(async move { m.part(pid).await }));
+                handles.push(tokio::spawn(async move { m.get_part_by_id(pid).await }));
             }
             let mut first: Option<Arc<ManifestPart>> = None;
             for h in handles {
@@ -2095,7 +2236,7 @@ mod tests {
                 build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
             let err = manifest
-                .part(part.part_id)
+                .get_part_by_id(part.part_id)
                 .await
                 .expect_err("must reject tampered bytes");
             assert!(
@@ -2109,7 +2250,7 @@ mod tests {
             // not magically succeed.
             let _pre = storage.get_call_count();
             let err2 = manifest
-                .part(part.part_id)
+                .get_part_by_id(part.part_id)
                 .await
                 .expect_err("must reject on retry too");
             assert!(matches!(
@@ -2128,7 +2269,10 @@ mod tests {
                 build_manifest_with_loader(list, Arc::clone(&storage) as Arc<dyn StorageProvider>);
 
             let stranger = PartId(Uuid::from_bytes([0xff; 16]));
-            let err = manifest.part(stranger).await.expect_err("must reject");
+            let err = manifest
+                .get_part_by_id(stranger)
+                .await
+                .expect_err("must reject");
             assert!(
                 matches!(err, ManifestLoadError::PartNotInList { .. }),
                 "expected PartNotInList, got {err:?}"
@@ -2147,7 +2291,7 @@ mod tests {
             // not panic.
             let manifest = Manifest::empty(options_for_test());
             let err = manifest
-                .part(PartId(Uuid::nil()))
+                .get_part_by_id(PartId(Uuid::nil()))
                 .await
                 .expect_err("must error");
             assert!(

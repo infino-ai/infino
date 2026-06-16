@@ -642,7 +642,7 @@ impl Supertable {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn stats(&self) -> crate::supertable::SupertableStats {
         let manifest = self.inner.manifest.load();
-        let n_manifest_parts = manifest.list.as_ref().map(|l| l.parts.len());
+        let n_manifest_parts = manifest.get_num_parts();
         let cache = self.inner.options.disk_cache.as_ref();
         let mmap_resident_bytes = cache.map(|c| c.current_mmap_size_bytes());
         // One `cache.stats()` call covers four fields. Cache
@@ -652,10 +652,10 @@ impl Supertable {
         // adequate for observability.
         let cache_snapshot = cache.map(|c| c.stats());
         crate::supertable::SupertableStats {
-            manifest_id: manifest.superfile_list.manifest_id,
-            n_superfiles: manifest.superfile_list.superfiles.len(),
+            manifest_id: manifest.get_manifest_id(),
+            n_superfiles: manifest.get_all_superfiles().len(),
             n_manifest_parts,
-            n_manifest_parts_loaded: manifest.parts.len(),
+            n_manifest_parts_loaded: manifest.get_num_parts_loaded(),
             process_rss_bytes: crate::supertable::stats::process_rss_bytes(),
             mmap_resident_bytes,
             memory_budget_bytes: self.inner.options.memory_budget_bytes,
@@ -1175,7 +1175,7 @@ mod tests {
         assert_eq!(s.manifest_id, 1);
         assert_eq!(s.n_superfiles, 2);
         // In-memory supertable has no manifest list / disk cache.
-        assert_eq!(s.n_manifest_parts, None);
+        assert_eq!(s.n_manifest_parts, 0);
         assert_eq!(s.mmap_resident_bytes, None);
         assert_eq!(s.n_cold_fetches, None);
     }

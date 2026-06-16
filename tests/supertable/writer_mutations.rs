@@ -291,8 +291,7 @@ async fn update_emitted_superfile_carries_subsection_offsets() {
     let reader = st.reader();
     let manifest = reader.manifest();
     let emitted = manifest
-        .superfile_list
-        .superfiles
+        .get_all_superfiles()
         .iter()
         .find(|e| e.n_docs == 1)
         .expect("update-emitted single-row superfile present");

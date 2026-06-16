@@ -169,7 +169,7 @@ impl WorkloadState {
 fn drive_tombstones(st: &Supertable, ws: &WalStore, fraction: f64, churn: bool) {
     let manifest = st.reader().manifest().clone();
     let mut targets: Vec<i128> = Vec::new();
-    for entry in manifest.superfile_list.superfiles.iter() {
+    for entry in manifest.get_all_superfiles().iter() {
         let n = (entry.n_docs as f64 * fraction).ceil() as i64;
         for i in 0..n {
             targets.push(entry.id_min + i as i128);

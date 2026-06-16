@@ -85,22 +85,19 @@ fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a
 
     let r = st.reader();
     let m = r.manifest();
-    let list = m
-        .list
-        .as_ref()
-        .expect("list exists after storage-backed commits");
+    let list_entries = m.get_all_list_entries();
     assert_eq!(
-        list.parts.len(),
+        list_entries.len(),
         1,
         "single-bucket default → one list entry; got {} entries",
-        list.parts.len()
+        list_entries.len()
     );
     assert_eq!(
-        list.parts[0].n_superfiles, 3,
+        list_entries[0].n_superfiles, 3,
         "after 3 single-superfile commits the part should hold 3 superfiles"
     );
     // partition_key is the 4-byte LE encoding of bucket 0.
-    assert_eq!(list.parts[0].partition_key, [0u8, 0, 0, 0]);
+    assert_eq!(list_entries[0].partition_key, [0u8, 0, 0, 0]);
 }
 
 #[test]
@@ -123,8 +120,8 @@ fn rewrite_path_produces_fresh_part_id_per_commit() {
         let m_id = {
             let r = st.reader();
             let m = r.manifest();
-            let list = m.list.as_ref().expect("list");
-            list.parts[0].part_id
+            let list_entries = m.get_all_list_entries();
+            list_entries[0].part_id
         };
         part_ids.push(m_id);
     }
@@ -158,19 +155,19 @@ fn target_superfiles_per_partition_triggers_part_split() {
 
     let r = st.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
+    let list_entries = m.get_all_list_entries();
     assert_eq!(
-        list.parts.len(),
+        list_entries.len(),
         2,
         "after 3 commits with target=2, the partition should split into 2 entries; \
          got {} entries",
-        list.parts.len()
+        list_entries.len()
     );
     assert_eq!(
-        list.parts[0].partition_key, list.parts[1].partition_key,
+        list_entries[0].partition_key, list_entries[1].partition_key,
         "both entries should share the same partition_key (same partition, split into 2 parts)"
     );
-    let total_superfiles: u64 = list.parts.iter().map(|p| p.n_superfiles).sum();
+    let total_superfiles: u64 = list_entries.iter().map(|p| p.n_superfiles).sum();
     assert_eq!(total_superfiles, 3);
 }
 
@@ -295,16 +292,16 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
     }
     let r = st.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
+    let list_entries = m.get_all_list_entries();
     assert_eq!(
-        list.parts.len(),
+        list_entries.len(),
         1,
         "single-bucket commit produces one part"
     );
     // TimeRange partition_key is 8 bytes LE bucket index.
-    assert_eq!(list.parts[0].partition_key.len(), PARTITION_KEY_BYTES);
+    assert_eq!(list_entries[0].partition_key.len(), PARTITION_KEY_BYTES);
     let bucket = u64::from_le_bytes(
-        list.parts[0]
+        list_entries[0]
             .partition_key
             .as_slice()
             .try_into()

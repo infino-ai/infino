@@ -257,8 +257,7 @@ pub async fn run_append_phase(
 /// linear scan is fine at the supertable sizes we target.
 fn manifest_contains(manifest: &crate::supertable::Manifest, superfile_id: Uuid) -> bool {
     manifest
-        .superfile_list
-        .superfiles
+        .get_all_superfiles()
         .iter()
         .any(|s| s.uri.0 == superfile_id)
 }
@@ -1057,7 +1056,7 @@ fn resolve_target_id_in_manifest(
 ) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
     let target = target_id.0;
 
-    for entry in manifest.superfile_list.superfiles.iter() {
+    for entry in manifest.get_all_superfiles().iter() {
         if target < entry.id_min || target > entry.id_max {
             continue;
         }
@@ -1473,8 +1472,7 @@ mod tests {
         let manifest1 = st1.inner().manifest.load_full();
         let pre_uuid = wal.preallocated_superfile_id.expect("set");
         let entry1 = manifest1
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .find(|e| e.uri.0 == pre_uuid)
             .expect("entry");
@@ -1505,8 +1503,7 @@ mod tests {
         // Sanity: the entry's stats also agree.
         let manifest2 = st2.inner().manifest.load_full();
         let entry2 = manifest2
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .iter()
             .find(|e| e.uri.0 == pre_uuid)
             .expect("entry");

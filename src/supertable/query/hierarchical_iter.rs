@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use crate::supertable::error::QueryError;
+use crate::supertable::ManifestLoadError;
 use crate::supertable::manifest::part::{ManifestPart, PartId};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
@@ -46,7 +46,7 @@ use crate::supertable::manifest::{Manifest, SuperfileEntry};
 pub async fn load_kept_parts(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
-) -> Result<Vec<Arc<ManifestPart>>, QueryError> {
+) -> Result<Vec<Arc<ManifestPart>>, ManifestLoadError> {
     if kept_part_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -54,14 +54,14 @@ pub async fn load_kept_parts(
         .iter()
         .map(|id| {
             let pid = *id;
-            async move { manifest.part(pid).await }
+            async move { manifest.get_part_by_id(pid).await }
         })
         .collect();
 
     let loaded = futures::future::join_all(load_futs).await;
     let mut out = Vec::with_capacity(loaded.len());
     for r in loaded {
-        out.push(r.map_err(|e| QueryError::Store(format!("part load: {e}")))?);
+        out.push(r?);
     }
     Ok(out)
 }
@@ -84,7 +84,7 @@ pub fn flatten_superfiles(parts: &[Arc<ManifestPart>]) -> Vec<Arc<SuperfileEntry
 pub async fn load_and_flatten(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
-) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
     let parts = load_kept_parts(manifest, kept_part_ids).await?;
     Ok(flatten_superfiles(&parts))
 }
