@@ -6,6 +6,7 @@ lcov.info
 # Never commit secrets / local credentials.
 .env
 .env.*
+*.env
 *.pem
 *.key
 
