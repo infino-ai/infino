@@ -219,6 +219,19 @@ def test_compact_preserves_data(tmp_path):
     t.compact()  # defaults run cleanly too
 
 
+def test_compact_on_memory_is_noop():
+    # Compaction needs a store to write merged files, but "memory://" is a
+    # store — so this is a no-op, not the durable-storage rejection that
+    # delete / update raise. Pin that contract.
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in ("alpha", "beta", "gamma"):
+        t.append([{"title": title}])
+
+    assert t.compact() is None
+    assert _count(db, "docs") == 3
+
+
 def test_vector_search_end_to_end():
     db = infino.connect("memory://")
     dim = 16  # infino requires vector dim in [16, 4096]
