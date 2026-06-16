@@ -5941,7 +5941,7 @@ mod tests {
         let n_docs = 3000u32;
         let n_cent = 4usize;
         let (blob, json, all) =
-            build_large_corpus(16, n_cent, n_docs, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_large_corpus(16, n_cent, n_docs, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("v", &all[2001], 64, n_cent, 40)
@@ -6075,7 +6075,7 @@ mod tests {
         // `Sq8ColumnMeta::Lazy` and the first search resolves the
         // scale/offset (and L2Sq norms) through the deferred-fetch arm.
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         // Disable sync BEFORE open so the deferred codec_meta probe inside
@@ -6132,7 +6132,7 @@ mod tests {
         // so the lazy arm takes the `norms_abs_off = None` branch — no
         // norm span fetch, `norm_by_pos = None`.
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::NegDot);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::NegDot);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         counting.disable_sync();
@@ -6164,7 +6164,7 @@ mod tests {
         // on a cold lazy Sq8 source drives the async coalesced
         // codes/doc_ids + Sq8-meta fetch and the async survivor-row fetch.
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         counting.disable_sync();
