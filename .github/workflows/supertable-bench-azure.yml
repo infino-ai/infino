@@ -50,6 +50,11 @@ on:
         required: false
         default: false
         type: boolean
+      pr_number:
+        description: "PR to post the results comment on (blank = summary only)."
+        required: false
+        default: ""
+        type: string
   # Callable from other workflows (e.g. the PR group in ci.yml). Same
   # inputs; `choice` isn't valid here so `bench` is a string.
   workflow_call:
@@ -67,10 +72,13 @@ on:
       # On main: publish the run as the baseline pointer + per-commit
       # history. On a PR: false — restore main's baseline and diff against it.
       update_baseline: { type: boolean, required: false, default: false }
+      # PR to post the sticky results comment on. Blank ⇒ summary only.
+      pr_number:       { type: string, required: false, default: "" }
 
 permissions:
-  id-token: write   # Azure OIDC federated login
-  contents: read    # clone the repo on the VM via the job token
+  id-token: write       # Azure OIDC federated login
+  contents: read        # clone the repo on the VM via the job token
+  pull-requests: write  # post the sticky bench-results comment on a PR
 
 # Concurrency is owned by the caller (per-PR cancel in ci.yml); a manual
 # dispatch needs none — runs are isolated by run_id and self-clean.
@@ -441,7 +449,13 @@ jobs:
           # Best-effort parser: never abort early; exit codes are set
           # explicitly below.
           set +e -u -o pipefail
-          SUMMARY="$GITHUB_STEP_SUMMARY"
+          # Build the report body into a file, then fan it out to both the
+          # run summary and (on a PR) a sticky comment. One source, two sinks.
+          # Body to a file; flushed to the summary on exit, reused by the
+          # comment step.
+          SUMMARY=/tmp/summary.md
+          : > "$SUMMARY"
+          trap 'cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"' EXIT
           LOG=/tmp/bench.clean
           {
             echo "## Benchmark \`${{ inputs.bench }}\` — Azure (${{ inputs.location }})"
@@ -515,6 +529,41 @@ jobs:
             echo "::error::Benchmark produced no results — every shape failed."
             exit 1
           fi
+
+      # Sticky PR comment, one per matrix leg. The hidden marker lets a new
+      # push edit in place instead of stacking comments.
+      - name: Post results to PR
+        if: ${{ always() && inputs.pr_number != '' }}
+        uses: actions/github-script@v7
+        env:
+          MARKER: <!-- infino-bench:${{ inputs.bench }}${{ inputs.name_suffix }} -->
+        with:
+          script: |
+            const fs = require('fs');
+            // GitHub caps comment bodies at 65536 chars; full output is the artifact.
+            const LIMIT = 60000;
+            let body;
+            try { body = fs.readFileSync('/tmp/summary.md', 'utf8'); }
+            catch { body = '_No summary produced — see the run logs._'; }
+            if (body.length > LIMIT) {
+              body = body.slice(0, LIMIT) + '\n\n_…truncated — see the artifact._';
+            }
+            const marker = process.env.MARKER;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            body = `${marker}\n${body}\n\n[Full run ↗](${runUrl})`;
+
+            const issue_number = Number('${{ inputs.pr_number }}');
+            const { owner, repo } = context.repo;
+            const existing = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 },
+            ).then(cs => cs.find(c => c.body && c.body.includes(marker)));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
 
       - name: Upload full log
         if: always()

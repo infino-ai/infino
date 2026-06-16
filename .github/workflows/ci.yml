@@ -197,6 +197,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      pull-requests: write   # post the bench-results comment on the PR
     # Informational: keep these checks out of branch-protection's required
     # set so a red bench never blocks merge.
     uses: ./.github/workflows/supertable-bench-azure.yml
@@ -206,4 +207,5 @@ jobs:
       ref: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
       name_suffix: -${{ matrix.suffix }}
       update_baseline: ${{ github.event_name == 'push' }}
+      pr_number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
     secrets: inherit
