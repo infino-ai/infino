@@ -113,6 +113,63 @@ def test_append_accepts_pandas_dataframe():
     assert _count(db, "docs") == 2
 
 
+def test_delete_by_predicate(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))  # mutations need durable storage
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}, {"title": "bravo"}, {"title": "charlie"}])
+
+    stats = t.delete("title = 'bravo'")
+    assert stats.matched == 1
+    assert stats.n_tombstoned == 1
+    assert t.token_match("title", "bravo").num_rows == 0
+    assert _count(db, "docs") == 2
+
+
+def test_update_by_predicate(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "draft"}, {"title": "keep"}])
+
+    stats = t.update("title = 'draft'", [{"title": "published"}])
+    assert stats.matched == 1
+    assert t.token_match("title", "draft").num_rows == 0
+    assert t.token_match("title", "published").num_rows == 1
+
+
+def test_update_cardinality_mismatch(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}, {"title": "beta"}])
+
+    # One row matches, two replacements supplied.
+    with pytest.raises(ValueError):
+        t.update("title = 'alpha'", [{"title": "x"}, {"title": "y"}])
+
+
+def test_mutations_reject_memory():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+
+    with pytest.raises(RuntimeError):
+        t.delete("title = 'alpha'")
+    with pytest.raises(RuntimeError):
+        t.update("title = 'alpha'", [{"title": "beta"}])
+
+
+def test_compact_preserves_data(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in ("alpha", "beta", "gamma"):  # three appends -> three superfiles
+        t.append([{"title": title}])
+
+    t.compact(infino.CompactOptions(target_superfile_size_mb=256, min_fill_percent=50))
+    assert _count(db, "docs") == 3
+    assert t.token_match("title", "beta").num_rows == 1
+
+    t.compact()  # defaults run cleanly too
+
+
 def test_vector_search_end_to_end():
     db = infino.connect("memory://")
     dim = 16  # infino requires vector dim in [16, 4096]
