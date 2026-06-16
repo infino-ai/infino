@@ -49,7 +49,14 @@ pytest tests/
   `DataFrame`, or a `list[dict]` — coerced to Arrow against the table's
   declared schema (Python sources are nullable; null-free columns are
   re-wrapped to match). One `append` is one commit.
+- `Table` mutations — `delete(predicate)` and `update(predicate, new_rows)`
+  take a SQL predicate string (e.g. `"status = 'spam'"`); `update` replaces
+  the matched rows 1:1 with `new_rows` (same shapes as `append`). Both
+  return `MutationStats` (`matched`, `n_tombstoned`, `n_not_found`) and need
+  durable storage (not `memory://`).
+- `Table.compact(CompactOptions(...))` — merge small / underfilled
+  superfiles; omit the options for engine defaults.
 - `IndexSpec().fts(col).vector(col, dim, n_cent, metric)`.
 
-Next: `update` / `delete`; richer `ConnectOptions` (disk cache);
-abi3 wheels + CI for distribution.
+Next: richer `ConnectOptions` (disk cache); abi3 wheels + CI for
+distribution.
