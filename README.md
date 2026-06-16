@@ -3,14 +3,14 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Point it at a bucket on S3 (or Azure, or local disk) and query the same rows three ways from one system — no separate search cluster, vector database, and warehouse to provision and keep in sync, and no daemon or managed service to operate.
+**infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Data stays in Parquet on S3 (or Azure, or local disk) and you can query it flexibly. Runs on your existing stack or standalone.
 
 **Why infino**
 
-- **Best performance per dollar** — engineered for the strongest speed-per-dollar trade-off, not just raw latency: object-storage economics plus a read path continuously benchmarked on speed *and* cost (bytes fetched, request count, memory footprint).
-- **Three modalities, one engine** — keyword (BM25), vector, and SQL over the same rows; no copying data between systems to combine them.
-- **Object-storage-native** — your data lives on S3, Azure, or local disk, with snapshot-isolated reads and append / update / delete through atomic commits. No cluster to stand up.
-- **Open, no lock-in** — superfiles are spec-compliant Parquet, so anything that reads Parquet can read your data.
+- **Reduce retrieval costs** — object-storage economics at search engine speeds.
+- **Three modalities, one engine** — keyword (BM25), vector, and SQL queries over the same rows.
+- **Object-storage-native** — data lives on S3, Azure, or local disk, with snapshot-isolated reads and atomic commits. 
+- **Open format** — data is stored as spec-compliant Parquet.
 
 ## Contents
 
