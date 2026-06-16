@@ -60,6 +60,12 @@ pub(super) struct SupertableInner {
     /// concurrent `Supertable::writer()` call until the first
     /// writer is dropped.
     pub(super) writer_outstanding: AtomicBool,
+    /// Single-compaction slot. Same acquire/release pattern as
+    /// `writer_outstanding`. Prevents concurrent `compact()` calls
+    /// within the same process from racing on seals and manifest
+    /// writes. Cross-process coordination happens at the sidecar-seal
+    /// level.
+    pub(super) compaction_outstanding: AtomicBool,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, mints
     /// `batch.num_rows()` ids, and unlocks. The
@@ -240,6 +246,7 @@ impl Supertable {
             options,
             manifest: ArcSwap::new(Arc::new(initial)),
             writer_outstanding: AtomicBool::new(false),
+            compaction_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
             query_runtime: OnceLock::new(),
             sql_session_cache: Mutex::new(None),
@@ -327,6 +334,7 @@ impl Supertable {
             options: options_arc,
             manifest: ArcSwap::new(manifest),
             writer_outstanding: AtomicBool::new(false),
+            compaction_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
             query_runtime: OnceLock::new(),
             sql_session_cache: Mutex::new(None),

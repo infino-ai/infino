@@ -24,8 +24,16 @@ use crate::{
     },
 };
 use bytes::Bytes;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, sync::atomic::Ordering};
 use uuid::Uuid;
+
+struct CompactionSlot<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for CompactionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 const MIB: u64 = 1024 * 1024;
 
@@ -166,6 +174,18 @@ impl Supertable {
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
         let inner = self.inner();
+
+        match inner.compaction_outstanding.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {}
+            Err(_) => return Err(CompactionError::AlreadyCompacting),
+        }
+        let _slot = CompactionSlot(&inner.compaction_outstanding);
+
         let manifest = inner.manifest.load_full();
 
         // Prefetch sidecars using the cache to batch storage GETs.
@@ -405,6 +425,7 @@ mod tests {
     use super::*;
     use crate::BoolMode;
     use crate::Supertable;
+    use crate::supertable::error::CompactionError;
     use crate::supertable::storage::LocalFsStorageProvider;
     use crate::test_helpers::{build_title_batch, default_supertable_options};
     use std::collections::HashSet;
@@ -972,6 +993,49 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(titles)).expect("append");
         w.commit().expect("commit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_rejects_concurrent_call_while_slot_held() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Manually set the slot as if a compaction is running.
+        st.inner()
+            .compaction_outstanding
+            .store(true, Ordering::Release);
+
+        let err = st
+            .compact_async(&small_compact_cfg())
+            .await
+            .expect_err("must reject while slot held");
+
+        assert!(
+            matches!(err, CompactionError::AlreadyCompacting),
+            "expected AlreadyCompacting, got {err:?}"
+        );
+
+        // Release so the supertable is clean for drop.
+        st.inner()
+            .compaction_outstanding
+            .store(false, Ordering::Release);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_slot_released_after_completion() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("first compact");
+
+        // Slot must be released so a second call succeeds.
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("second compact after slot release");
     }
 
     // ─── End-to-end compact() tests ────────────────────────────────────────

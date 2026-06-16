@@ -292,6 +292,10 @@ pub enum CompactionError {
     /// Refreshing the in-memory manifest after a successful commit failed.
     #[error("post-commit manifest refresh failed: {0}")]
     Refresh(String),
+
+    /// Another compaction is already running on this supertable handle.
+    #[error("compaction already in progress on this supertable handle")]
+    AlreadyCompacting,
 }
 
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]
