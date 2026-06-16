@@ -292,4 +292,99 @@ mod tests {
             .expect_err("writes to the read-only store must fail");
         assert!(matches!(err, OsError::NotImplemented { .. }), "{err}");
     }
+
+    #[tokio::test]
+    async fn head_only_request_returns_metadata_without_bytes() {
+        // `options.head = true` short-circuits before any range read:
+        // empty payload, the fixed UNIX-epoch last_modified, and a
+        // 0..0 range, but a correct `size`.
+        let (store, p) = store_with("seg-a.parquet", b"0123456789");
+        let res = store
+            .get_opts(
+                &p,
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("head get_opts");
+        assert_eq!(res.meta.size, 10);
+        assert_eq!(res.meta.last_modified, super::SUPERFILE_LAST_MODIFIED);
+        assert_eq!(res.range, 0..0);
+        let bytes = res.bytes().await.expect("bytes");
+        assert!(bytes.is_empty(), "HEAD payload carries no bytes");
+    }
+
+    #[tokio::test]
+    async fn put_multipart_and_copy_are_not_implemented() {
+        let (store, p) = store_with("seg-a.parquet", b"abc");
+        let mp_err = store
+            .put_multipart(&p)
+            .await
+            .expect_err("multipart upload must fail on the read-only store");
+        assert!(matches!(mp_err, OsError::NotImplemented { .. }), "{mp_err}");
+
+        let copy_err = store
+            .copy(&p, &ObjPath::from("dst.parquet"))
+            .await
+            .expect_err("copy must fail on the read-only store");
+        assert!(
+            matches!(copy_err, OsError::NotImplemented { .. }),
+            "{copy_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_stream_yields_not_implemented_per_location() {
+        let (store, p) = store_with("seg-a.parquet", b"abc");
+        let locations = stream::iter(vec![Ok(p.clone()), Ok(ObjPath::from("seg-b.parquet"))]);
+        let results: Vec<OsResult<ObjPath>> =
+            store.delete_stream(locations.boxed()).collect().await;
+        assert_eq!(results.len(), 2);
+        for r in results {
+            let err = r.expect_err("delete must fail on the read-only store");
+            assert!(matches!(err, OsError::NotImplemented { .. }), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_is_empty_and_list_with_delimiter_returns_no_entries() {
+        // The store never advertises its contents during a scan;
+        // DataFusion reaches each superfile by its registered path.
+        let (store, _p) = store_with("seg-a.parquet", b"abc");
+        let listed: Vec<OsResult<ObjectMeta>> = store.list(None).collect().await;
+        assert!(listed.is_empty(), "list yields nothing");
+
+        let res = store
+            .list_with_delimiter(Some(&ObjPath::from("data")))
+            .await
+            .expect("list_with_delimiter");
+        assert!(res.objects.is_empty());
+        assert!(res.common_prefixes.is_empty());
+    }
+
+    #[test]
+    fn debug_and_display_report_superfile_count() {
+        let (store, _p) = store_with("seg-a.parquet", b"abc");
+        let dbg = format!("{store:?}");
+        assert!(dbg.contains("SuperfileObjectStore"), "{dbg}");
+        assert!(dbg.contains("n_superfiles"), "{dbg}");
+        let disp = format!("{store}");
+        assert_eq!(disp, "SuperfileObjectStore(1 superfiles)");
+    }
+
+    #[test]
+    fn resolve_range_clamps_every_variant() {
+        // Drive the pure range resolver across all four arms,
+        // including the past-the-end / oversized clamps.
+        assert_eq!(resolve_range(None, 10), 0..10);
+        assert_eq!(resolve_range(Some(GetRange::Bounded(2..5)), 10), 2..5);
+        // Bounded past the end clamps both ends to `size`.
+        assert_eq!(resolve_range(Some(GetRange::Bounded(8..20)), 10), 8..10);
+        assert_eq!(resolve_range(Some(GetRange::Offset(7)), 10), 7..10);
+        assert_eq!(resolve_range(Some(GetRange::Offset(99)), 10), 10..10);
+        assert_eq!(resolve_range(Some(GetRange::Suffix(4)), 10), 6..10);
+        assert_eq!(resolve_range(Some(GetRange::Suffix(99)), 10), 0..10);
+    }
 }

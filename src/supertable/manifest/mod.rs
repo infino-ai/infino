@@ -2008,6 +2008,50 @@ mod tests {
     }
 
     #[test]
+    fn manifest_debug_with_list_reports_part_count() {
+        // A Manifest carrying a `list` exercises the Some-arm of the
+        // `n_parts` closure in Debug (the empty-Manifest test above
+        // only hits the `unwrap_or(0)` None-arm).
+        use list::{ManifestList, PartitionStrategy};
+        let entry = part::PartId::new_v4();
+        let list = ManifestList {
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: part::ContentHash([0u8; 32]),
+            schema: Vec::new(),
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            parts: vec![list::ManifestListEntry {
+                part_id: entry,
+                uri: "manifests/part-x".into(),
+                n_superfiles: 0,
+                size_bytes_compressed: 0,
+                size_bytes_uncompressed: 0,
+                content_hash: part::ContentHash([0u8; 32]),
+                partition_key: Vec::new(),
+                id_range: (0, 0),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+                vector_summary_agg: Default::default(),
+            }],
+        };
+        let m = Manifest {
+            superfile_list: SuperfileList::empty(opts()),
+            list: Some(list),
+            parts: dashmap::DashMap::new(),
+            loader: None,
+        };
+        let dbg = format!("{m:?}");
+        assert!(dbg.contains("n_parts: 1"), "{dbg}");
+        assert!(dbg.contains("has_list: true"), "{dbg}");
+    }
+
+    #[test]
     fn cluster_centroids_empty_is_empty_and_default_matches() {
         let cc = ClusterCentroids::empty();
         assert!(cc.is_empty());

@@ -1563,4 +1563,98 @@ supertable:
         assert!(opts.storage.is_none());
         assert!(opts.disk_cache.is_none());
     }
+
+    #[test]
+    fn with_disk_cache_attaches_cache() {
+        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
+
+        let dir = std::env::temp_dir().join(format!("infino-opts-dc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.join("cache"),
+                mmap_cold_threshold_secs: 0,
+                eviction: Box::new(LruPolicy::new()),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+
+        let opts = plain_opts().with_storage(storage).with_disk_cache(cache);
+        assert!(opts.disk_cache.is_some());
+        assert!(opts.storage.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_attaches_local_fs_storage() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // `storage.backend = local_fs` with a local_root exercises
+        // the LocalFs arm of apply_storage_config; no disk_cache_root
+        // means the cache stays unattached.
+        let dir =
+            std::env::temp_dir().join(format!("infino-opts-localfs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let yaml = format!(
+            "storage:\n  backend: local_fs\n  local_root: {}\n",
+            dir.display()
+        );
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(&yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_some(), "local_fs backend attaches storage");
+        assert!(
+            opts.disk_cache.is_none(),
+            "no disk_cache_root ⇒ no cache attached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_local_fs_with_disk_cache_root_attaches_both() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // local_fs backend + a disk_cache_root drives the disk-cache
+        // construction branch of apply_storage_config (cold-fetch
+        // mode mapping, DiskCacheConfig build, new_unpinned).
+        let dir = std::env::temp_dir().join(format!("infino-opts-dcroot-{}", uuid::Uuid::new_v4()));
+        let cache_root = dir.join("cache");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let yaml = format!(
+            "storage:\n  backend: local_fs\n  local_root: {}\n  disk_cache_root: {}\n",
+            dir.display(),
+            cache_root.display()
+        );
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(&yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_some());
+        assert!(
+            opts.disk_cache.is_some(),
+            "disk_cache_root ⇒ cache attached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_local_fs_without_root_is_rejected() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // local_fs backend but no local_root → the typed Store error
+        // arm of apply_storage_config.
+        let yaml = "storage:\n  backend: local_fs\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts()
+            .apply_config(&cfg)
+            .expect_err("missing local_root");
+        assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
 }

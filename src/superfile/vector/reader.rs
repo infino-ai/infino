@@ -6328,4 +6328,386 @@ mod tests {
             assert!(w[0].1 <= w[1].1, "negdot distances ascending");
         }
     }
+
+    // -----------------------------------------------------------------
+    // Accessor / summary surface
+    // -----------------------------------------------------------------
+
+    /// `cluster_centroids` returns `(n_cent, dim, centroids, counts)`
+    /// with the documented shapes: `centroids.len() == n_cent · dim`,
+    /// one count per cluster, and the counts summing to `n_docs` (every
+    /// doc lands in exactly one cluster).
+    #[test]
+    fn cluster_centroids_returns_well_shaped_centroids_and_counts() {
+        let dim = 16usize;
+        let n_cent = 4u32;
+        let n_docs = 64u32;
+        let (blob, json) = build_blob(n_docs, dim, n_cent as usize, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let (got_n_cent, got_dim, centroids, counts) =
+            r.cluster_centroids("embedding").expect("present column");
+        assert_eq!(got_n_cent, n_cent);
+        assert_eq!(got_dim, dim as u32);
+        assert_eq!(centroids.len(), (n_cent as usize) * dim);
+        assert_eq!(counts.len(), n_cent as usize);
+        assert!(centroids.iter().all(|c| c.is_finite()));
+        let total: u32 = counts.iter().sum();
+        assert_eq!(
+            total, n_docs,
+            "every doc lands in exactly one cluster, so counts sum to n_docs"
+        );
+    }
+
+    /// `cluster_centroids` returns `None` for an unknown column —
+    /// the early `column_id_by_name.get` miss arm.
+    #[test]
+    fn cluster_centroids_unknown_column_returns_none() {
+        let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        assert!(r.cluster_centroids("nope").is_none());
+    }
+
+    /// `vector_columns_config` yields one `ColumnReader` per column,
+    /// exposing the public accessor fields (name, dim, metric, codec).
+    #[test]
+    fn vector_columns_config_exposes_reader_fields() {
+        let (blob, json) = build_blob(32, 16, 4, Metric::Cosine);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let cfgs: Vec<&ColumnReader> = r.vector_columns_config().collect();
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].name, "embedding");
+        assert_eq!(cfgs[0].dim, 16);
+        assert_eq!(cfgs[0].metric, Metric::Cosine);
+        assert_eq!(cfgs[0].rerank_codec, RerankCodec::Fp32);
+    }
+
+    // -----------------------------------------------------------------
+    // ColumnReader range accessors
+    // -----------------------------------------------------------------
+    //
+    // These three range helpers all address the per-cluster blocks
+    // region from the same `(doc_off, count)` cluster entry. The block
+    // is `[codes][doc_ids][full]` at a fixed per-doc stride; the helpers
+    // must agree on the prefix/stride arithmetic or rerank reads the
+    // wrong bytes. Pin the relationships structurally off an Fp32 build.
+
+    #[test]
+    fn column_reader_range_accessors_agree_on_block_layout() {
+        let dim = 16usize;
+        let (blob, json) = build_blob(32, dim, 4, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let col = &r.columns[0];
+
+        let cb = col.quant.code_bytes();
+        let per_vec = col.rerank_codec.per_vector_bytes(dim);
+        let stride = cb + format::vec::DOC_ID_BYTES + per_vec;
+        assert_eq!(col.per_cluster_doc_stride(), stride);
+
+        // Whole-block range covers `count` docs at the full stride.
+        let (off, cnt) = (3u32, 5u32);
+        let block = col.cluster_block_range(off, cnt);
+        assert_eq!(block.len(), (cnt as usize) * stride);
+
+        // The codes+doc_ids prefix shares the block's start and covers
+        // exactly the leading `count · (code_bytes + 4)` bytes.
+        let prefix = col.cluster_codes_doc_ids_range(off, cnt);
+        assert_eq!(prefix.start, block.start);
+        assert_eq!(
+            prefix.len(),
+            (cnt as usize) * (cb + format::vec::DOC_ID_BYTES)
+        );
+
+        // Each rerank row sits after the prefix at `local_idx · per_vec`
+        // and is exactly one per-vector body wide. The last row's end
+        // must coincide with the whole-block end.
+        let row0 = col.cluster_rerank_row_range(off, cnt, 0);
+        assert_eq!(row0.start, block.start + prefix.len());
+        assert_eq!(row0.len(), per_vec);
+        let row_last = col.cluster_rerank_row_range(off, cnt, (cnt as usize) - 1);
+        assert_eq!(row_last.end, block.end);
+    }
+
+    // -----------------------------------------------------------------
+    // score_centroids
+    // -----------------------------------------------------------------
+
+    /// `score_centroids` returns at most `nprobe` clusters, sorted
+    /// ascending by distance, with in-range cluster ids. Querying with
+    /// a centroid's own bytes makes that cluster score ~0 and rank
+    /// first.
+    #[test]
+    fn score_centroids_truncates_and_sorts() {
+        let dim = 16usize;
+        let n_cent = 4u32;
+        let (blob, json) = build_blob(64, dim, n_cent as usize, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let col = &r.columns[0];
+        let (_, _, centroids, _) = r.cluster_centroids("embedding").expect("centroids");
+
+        // Query equal to centroid 0 → cluster 0 is the nearest.
+        let q0: Vec<f32> = centroids[0..dim].to_vec();
+        let sub = r
+            .source
+            .try_get_range_sync(col.subsection_range.clone())
+            .expect("subsection bytes");
+        let centroids_bytes =
+            &sub[col.centroids_off..col.centroids_off + (n_cent as usize) * dim * 4];
+
+        let nprobe = 2usize;
+        let scored = score_centroids(centroids_bytes, col, &q0, nprobe);
+        assert_eq!(scored.len(), nprobe, "truncated to nprobe");
+        assert_eq!(scored[0].0, 0, "self centroid is nearest");
+        for w in scored.windows(2) {
+            assert!(w[0].1 <= w[1].1, "scores ascending by distance");
+        }
+        assert!(scored.iter().all(|(c, _)| (*c as u32) < n_cent));
+
+        // nprobe ≥ n_cent returns every cluster (no truncation).
+        let all = score_centroids(centroids_bytes, col, &q0, n_cent as usize + 5);
+        assert_eq!(all.len(), n_cent as usize);
+    }
+
+    // -----------------------------------------------------------------
+    // parallel_chunks
+    // -----------------------------------------------------------------
+
+    /// `parallel_chunks` is clamped to `[1, available_parallelism]` and
+    /// never exceeds the item count.
+    #[test]
+    fn parallel_chunks_clamped_to_item_count_and_parallelism() {
+        let par = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        assert_eq!(parallel_chunks(0), 1, "never returns zero chunks");
+        assert_eq!(parallel_chunks(1), 1);
+        // For a huge item count the chunk count saturates at parallelism.
+        assert_eq!(parallel_chunks(1_000_000), par);
+        // For a tiny item count it never exceeds the items.
+        assert!(parallel_chunks(2) <= 2);
+    }
+
+    // -----------------------------------------------------------------
+    // little-endian byte readers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn read_u32_le_decodes_little_endian() {
+        let b = [0x78u8, 0x56, 0x34, 0x12, 0xFF];
+        assert_eq!(read_u32_le(&b), 0x1234_5678);
+        assert_eq!(read_u32_le(&[0, 0, 0, 0]), 0);
+        assert_eq!(read_u32_le(&[0xFF, 0xFF, 0xFF, 0xFF]), u32::MAX);
+    }
+
+    #[test]
+    fn read_u64_le_decodes_little_endian() {
+        let b = [0x01u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
+        assert_eq!(read_u64_le(&b), 0x8000_0000_0000_0001);
+        assert_eq!(read_u64_le(&[0u8; 8]), 0);
+    }
+
+    #[test]
+    fn parse_f32_le_vec_round_trips_floats() {
+        let vals = [1.5f32, -2.25, 0.0, 1234.5];
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let got = parse_f32_le_vec(&bytes);
+        assert_eq!(got, vals);
+        assert!(parse_f32_le_vec(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // fetch_sync error arm
+    // -----------------------------------------------------------------
+
+    /// `fetch_sync` surfaces a `MalformedVersion` whose message names
+    /// the out-of-bounds range when the requested span runs past the
+    /// blob.
+    #[test]
+    fn fetch_sync_out_of_bounds_errors_with_range_in_message() {
+        let src = Source::InMemory(Bytes::from(vec![0u8; 8]));
+        let ok = fetch_sync(&src, 0..4, "header").expect("in-bounds succeeds");
+        assert_eq!(ok.len(), 4);
+        let err = fetch_sync(&src, 4..100, "directory").expect_err("oob fails");
+        let msg = err.to_string();
+        assert!(matches!(
+            err,
+            VectorError::Read(ReadError::MalformedVersion(_))
+        ));
+        assert!(
+            msg.contains("directory") && msg.contains("4..100"),
+            "message names the region and range, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // OpenOptions::for_object_store
+    // -----------------------------------------------------------------
+
+    /// `for_object_store` disables CRC verification (the cold-open
+    /// byte-budget default), unlike the CRC-on `Default`.
+    #[test]
+    fn open_options_for_object_store_disables_crc() {
+        assert!(!OpenOptions::for_object_store().verify_crc);
+        assert!(OpenOptions::default().verify_crc);
+        // Debug + Clone + Copy are derived; exercise them so the impls
+        // are covered and a clone is independent.
+        let opts = OpenOptions::for_object_store();
+        let copy = opts;
+        assert_eq!(format!("{copy:?}"), format!("{opts:?}"));
+    }
+
+    // -----------------------------------------------------------------
+    // CoarseCandidate ordering + BoundedCoarseHeap
+    // -----------------------------------------------------------------
+
+    fn coarse(did: u32, estimate: f32) -> CoarseCandidate {
+        CoarseCandidate {
+            did,
+            estimate,
+            pos: did,
+            cluster_id: 0,
+        }
+    }
+
+    /// `CoarseCandidate` is reverse-ordered on `estimate` so a max-heap
+    /// `peek()` yields the *worst* (lowest-estimate) retained candidate.
+    /// Also exercises `PartialEq`/`Eq` (identical fields compare equal,
+    /// differing fields do not).
+    #[test]
+    fn coarse_candidate_reverse_orders_on_estimate() {
+        let lo = coarse(1, 0.1);
+        let hi = coarse(2, 0.9);
+        // Higher estimate is "better" → compares as Less under the
+        // reversed Ord (so it sinks to the bottom of a max-heap's worst).
+        assert_eq!(hi.cmp(&lo), Ordering::Less);
+        assert_eq!(lo.cmp(&hi), Ordering::Greater);
+        assert_eq!(lo.partial_cmp(&hi), Some(Ordering::Greater));
+
+        // PartialEq / Eq.
+        assert_eq!(coarse(5, 0.5), coarse(5, 0.5));
+        assert_ne!(coarse(5, 0.5), coarse(6, 0.5));
+        assert_ne!(coarse(5, 0.5), coarse(5, 0.6));
+
+        // The max-heap's peek is the worst (lowest-estimate) candidate.
+        let mut heap = BinaryHeap::new();
+        heap.push(coarse(1, 0.1));
+        heap.push(coarse(2, 0.9));
+        heap.push(coarse(3, 0.5));
+        assert_eq!(heap.peek().expect("non-empty").estimate, 0.1);
+    }
+
+    /// `BoundedCoarseHeap` retains the `limit` highest-estimate
+    /// candidates; pushes beyond the limit evict the current worst.
+    #[test]
+    fn bounded_coarse_heap_retains_top_by_estimate() {
+        let mut h = BoundedCoarseHeap::new(3);
+        for (did, est) in [(0u32, 0.1f32), (1, 0.9), (2, 0.5), (3, 0.7), (4, 0.2)] {
+            h.push(coarse(did, est));
+        }
+        let mut kept: Vec<u32> = h.into_vec().into_iter().map(|(did, ..)| did).collect();
+        kept.sort_unstable();
+        // The three highest estimates are 0.9 (did 1), 0.7 (did 3),
+        // 0.5 (did 2).
+        assert_eq!(kept, vec![1, 2, 3]);
+    }
+
+    /// A zero-limit `BoundedCoarseHeap` drops every push and yields an
+    /// empty result.
+    #[test]
+    fn bounded_coarse_heap_zero_limit_keeps_nothing() {
+        let mut h = BoundedCoarseHeap::new(0);
+        h.push(coarse(0, 0.5));
+        h.push(coarse(1, 0.9));
+        assert!(h.into_vec().is_empty());
+    }
+
+    /// `merge` folds another heap's candidates in under the receiver's
+    /// limit, preserving the global top-by-estimate set.
+    #[test]
+    fn bounded_coarse_heap_merge_preserves_global_top() {
+        let mut a = BoundedCoarseHeap::new(2);
+        a.push(coarse(0, 0.1));
+        a.push(coarse(1, 0.4));
+        let mut b = BoundedCoarseHeap::new(2);
+        b.push(coarse(2, 0.9));
+        b.push(coarse(3, 0.2));
+        a.merge(b);
+        let mut kept: Vec<u32> = a.into_vec().into_iter().map(|(did, ..)| did).collect();
+        kept.sort_unstable();
+        // Across both heaps the two best estimates are 0.9 (did 2) and
+        // 0.4 (did 1).
+        assert_eq!(kept, vec![1, 2]);
+    }
+
+    // -----------------------------------------------------------------
+    // plan_cluster_coalesce / apply_coalesce
+    // -----------------------------------------------------------------
+
+    /// Far-apart ranges (gap beyond the coalesce window) stay as
+    /// separate fetches; `apply_coalesce` slices each requested range
+    /// back out byte-for-byte and preserves input order.
+    #[test]
+    fn plan_cluster_coalesce_keeps_distant_ranges_separate() {
+        let ranges = vec![0..4, 1_000_000..1_000_008];
+        let plan = plan_cluster_coalesce(&ranges);
+        assert_eq!(
+            plan.fetch_ranges.len(),
+            2,
+            "ranges past the coalesce gap are not merged"
+        );
+
+        // Build a synthetic blob and confirm apply_coalesce recovers the
+        // exact requested bytes in input order.
+        let mut blob = vec![0u8; 1_000_016];
+        for (i, byte) in blob.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        let bytes = Bytes::from(blob);
+        let fetched: Vec<Bytes> = plan
+            .fetch_ranges
+            .iter()
+            .map(|r| bytes.slice(r.clone()))
+            .collect();
+        let out = apply_coalesce(&plan, &fetched);
+        assert_eq!(out.len(), ranges.len());
+        for (o, r) in out.iter().zip(ranges.iter()) {
+            assert_eq!(o.as_ref(), &bytes[r.clone()]);
+        }
+    }
+
+    /// Adjacent / near-adjacent ranges fuse into one fetch span, and
+    /// `apply_coalesce` still slices each original range out correctly —
+    /// including when the input order is not sorted by start offset.
+    #[test]
+    fn plan_cluster_coalesce_merges_adjacent_and_slices_back() {
+        // Two adjacent ranges plus one within the gap window → all fused.
+        let ranges = vec![100..120, 80..100, 130..150];
+        let plan = plan_cluster_coalesce(&ranges);
+        assert_eq!(
+            plan.fetch_ranges.len(),
+            1,
+            "near-adjacent ranges fuse into a single fetch"
+        );
+        let merged = &plan.fetch_ranges[0];
+        assert_eq!(merged.start, 80);
+        assert_eq!(merged.end, 150);
+
+        let mut blob = vec![0u8; 256];
+        for (i, byte) in blob.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(3);
+        }
+        let bytes = Bytes::from(blob);
+        let fetched: Vec<Bytes> = plan
+            .fetch_ranges
+            .iter()
+            .map(|r| bytes.slice(r.clone()))
+            .collect();
+        let out = apply_coalesce(&plan, &fetched);
+        // Output order matches input order, not sorted order.
+        assert_eq!(out[0].as_ref(), &bytes[100..120]);
+        assert_eq!(out[1].as_ref(), &bytes[80..100]);
+        assert_eq!(out[2].as_ref(), &bytes[130..150]);
+    }
 }

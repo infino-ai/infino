@@ -1376,6 +1376,55 @@ mod tests {
     }
 
     #[test]
+    fn decode_superfile_rejects_non_record_value() {
+        // A non-record Avro value where a SuperfileEntry record is
+        // expected → SchemaMismatch.
+        let err = decode_superfile(AvroValue::Long(7)).expect_err("non-record");
+        assert!(
+            matches!(err, PartParseError::SchemaMismatch(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_superfile_rejects_malformed_superfile_id_uuid() {
+        // A record whose superfile_id isn't a valid UUID → BadSuperfileId
+        // from the first Uuid::parse_str in decode_superfile.
+        let rec = AvroValue::Record(vec![(
+            "superfile_id".into(),
+            AvroValue::String("not-a-uuid".into()),
+        )]);
+        let err = decode_superfile(rec).expect_err("bad uuid");
+        assert!(
+            matches!(err, PartParseError::BadSuperfileId(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_open_blob_rejects_truncated_entry() {
+        // A version-3 blob whose open_blob entry claims a length longer
+        // than the remaining bytes → SchemaMismatch (truncated) from the
+        // final `take` inside decode_open_blob.
+        let mut bytes = encode_subsection_offsets(&SubsectionOffsets {
+            total_size: 1,
+            vec: None,
+            fts: None,
+            vec_open_ranges: vec![],
+            fts_open_ranges: vec![],
+            open_blob: vec![(10, vec![0xAA, 0xBB, 0xCC])],
+        });
+        // Drop the trailing payload bytes so the declared length runs
+        // past the end of the buffer.
+        bytes.truncate(bytes.len() - 2);
+        let err = decode_subsection_offsets(&bytes).expect_err("truncated open_blob");
+        assert!(
+            matches!(err, PartParseError::SchemaMismatch(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn take_i128_be_roundtrips_a_full_width_value() {
         // 16-byte big-endian fixed → i128, including a negative.
         let v: i128 = -123_456_789_012_345;
