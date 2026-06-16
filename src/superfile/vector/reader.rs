@@ -1332,6 +1332,8 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             k,
             rerank_mult,
+            // The sync `search` path is unfiltered.
+            None,
         )
         .await
         {
@@ -1393,6 +1395,10 @@ impl VectorReader {
         k: usize,
         nprobe: usize,
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids).
+        // `None` = unfiltered; threaded to the coarse shortlist so the
+        // top-k is the true k-nearest among matching rows.
+        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1428,7 +1434,7 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult, allow)
             .await
     }
 
@@ -1446,6 +1452,10 @@ impl VectorReader {
         k: usize,
         clusters: &[u32],
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids).
+        // `None` = unfiltered; threaded to the coarse shortlist so the
+        // top-k is the true k-nearest among matching rows.
+        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1462,7 +1472,7 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult, allow)
             .await
     }
 
@@ -1472,6 +1482,7 @@ impl VectorReader {
     /// Used by [`Self::search_async`] (clusters from this superfile's
     /// centroid scoring) and [`Self::search_clusters_async`] (clusters
     /// from the global cross-superfile selector).
+    #[allow(clippy::too_many_arguments)]
     async fn probe_clusters_async(
         &self,
         col: &ColumnReader,
@@ -1481,6 +1492,9 @@ impl VectorReader {
         chosen: &[usize],
         k: usize,
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids),
+        // threaded down to the coarse shortlist. `None` = unfiltered.
+        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
@@ -1544,6 +1558,7 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             k,
             rerank_mult,
+            allow,
         )
         .await
         {
@@ -1765,6 +1780,10 @@ async fn build_shortlist(
     survivor_only_rerank_fetch: bool,
     k: usize,
     rerank_mult: usize,
+    // Filtered search: when `Some`, only doc-ids in this per-superfile
+    // bitmap may enter the coarse shortlist (the predicate's allow-set).
+    // `Arc` so the parallel branch can move a clone into the rayon task.
+    allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
 ) -> ShortlistOutcome {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.
@@ -1798,7 +1817,15 @@ async fn build_shortlist(
             let codes = block.slice(0..codes_len);
             let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
             score_cluster_codes_into_heap(
-                &codes, &doc_ids, cnt, off, c as u32, &col.quant, q_rot, heap,
+                &codes,
+                &doc_ids,
+                cnt,
+                off,
+                c as u32,
+                &col.quant,
+                q_rot,
+                allow.as_deref(),
+                heap,
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
@@ -1813,6 +1840,9 @@ async fn build_shortlist(
         let q_rot_v: Vec<f32> = q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
+        // Move an `Arc` clone of the allow-set into the rayon task; each
+        // chunk borrows it as `Option<&RoaringBitmap>` via `as_deref`.
+        let allow_owned = allow.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         rayon::spawn(move || {
             let acc = meta_owned
@@ -1826,7 +1856,15 @@ async fn build_shortlist(
                         let codes = block.slice(0..codes_len);
                         let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
                         score_cluster_codes_into_heap(
-                            &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot_v, &mut heap,
+                            &codes,
+                            &doc_ids,
+                            cnt,
+                            off,
+                            c as u32,
+                            &quant,
+                            &q_rot_v,
+                            allow_owned.as_deref(),
+                            &mut heap,
                         );
                     }
                     heap
@@ -2002,19 +2040,30 @@ fn score_cluster_codes_into_heap(
     cluster_id: u32,
     quant: &BitQuantizer,
     q_rot: &[f32],
+    allow: Option<&roaring::RoaringBitmap>,
     out: &mut BoundedCoarseHeap,
 ) {
     let cb = quant.code_bytes();
     let q_total: f32 = q_rot.iter().sum();
     for i in 0..cnt as usize {
-        let code = &cluster_codes[i * cb..(i + 1) * cb];
-        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         let did = u32::from_le_bytes([
             cluster_doc_ids[i * 4],
             cluster_doc_ids[i * 4 + 1],
             cluster_doc_ids[i * 4 + 2],
             cluster_doc_ids[i * 4 + 3],
         ]);
+        // Filtered search: the predicate's per-superfile allow-set is a
+        // hard constraint applied *before* the candidate enters the
+        // coarse heap. The heap therefore ranks distance only among
+        // matching doc-ids, so the top-k is the true k-nearest among
+        // matching rows with no underflow — no over-fetch, no
+        // post-filter. Decode the code (the hot work) only for an
+        // allowed candidate.
+        if allow.is_some_and(|bm| !bm.contains(did)) {
+            continue;
+        }
+        let code = &cluster_codes[i * cb..(i + 1) * cb];
+        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         out.push(CoarseCandidate {
             did,
             estimate: est,
@@ -3038,11 +3087,11 @@ mod tests {
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
 
         let full = r
-            .search_async("v", q, k, n_cent as usize, rerank)
+            .search_async("v", q, k, n_cent as usize, rerank, None)
             .await
             .expect("search_async");
         let probed = r
-            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank)
+            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank, None)
             .await
             .expect("search_clusters_async");
 
@@ -3057,7 +3106,7 @@ mod tests {
 
         // Probing no clusters returns nothing.
         let none = r
-            .search_clusters_async("v", q, k, &[], rerank)
+            .search_clusters_async("v", q, k, &[], rerank, None)
             .await
             .expect("search_clusters_async empty");
         assert!(none.is_empty(), "probing no clusters returns no hits");
@@ -6182,11 +6231,11 @@ mod tests {
         .expect("open_lazy");
 
         let hits_lazy = r_lazy
-            .search_async("v", &all[17], 5, 4, 20)
+            .search_async("v", &all[17], 5, 4, 20, None)
             .await
             .expect("lazy cold Sq8 search_async");
         let hits_eager = r_eager
-            .search_async("v", &all[17], 5, 4, 20)
+            .search_async("v", &all[17], 5, 4, 20, None)
             .await
             .expect("eager Sq8 search_async");
         // As in the sync lazy-Sq8 test, pin set overlap rather than exact
@@ -6221,11 +6270,11 @@ mod tests {
 
         let clusters: Vec<u32> = (0..4).collect();
         let hits_lazy = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
             .await
             .expect("lazy cold search_clusters_async");
         let hits_eager = r_eager
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
             .await
             .expect("eager search_clusters_async");
         assert_eq!(
@@ -6235,7 +6284,7 @@ mod tests {
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
         let none = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5)
+            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None)
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
@@ -6246,13 +6295,13 @@ mod tests {
         // resolve_column error arms reached through the async entry point.
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5).await;
+        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5, None).await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
-        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5).await;
+        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5, None).await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
-            .search_async("embedding", &[0.0; 16], 0, 4, 5)
+            .search_async("embedding", &[0.0; 16], 0, 4, 5, None)
             .await
             .expect("k=0 empty");
         assert!(empty.is_empty());

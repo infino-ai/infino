@@ -218,6 +218,8 @@ impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 impl infino::Supertable
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+impl infino::Supertable
+pub fn infino::Supertable::vector_search_filtered(&self, &str, &[f32], usize, infino::VectorSearchOptions, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> infino::Supertable
 impl core::fmt::Debug for infino::Supertable

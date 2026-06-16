@@ -1103,12 +1103,30 @@ impl SuperfileReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.vector_hits_filtered_async(column, query, k, options, None)
+            .await
+    }
+
+    /// As [`Self::vector_hits_async`], but restricts the kNN ranking to
+    /// the `local_doc_id`s in `allow` (a per-superfile predicate
+    /// allow-set). The allow-set is applied *inside* the coarse 1-bit
+    /// shortlist, so the returned top-k is the true k-nearest among
+    /// matching rows — pushdown, not post-filter, with no underflow.
+    /// `allow == None` is identical to [`Self::vector_hits_async`].
+    pub async fn vector_hits_filtered_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
         Ok(
-            v.search_async(column, query, k, options.nprobe, rerank_mult)
+            v.search_async(column, query, k, options.nprobe, rerank_mult, allow)
                 .await?,
         )
     }
@@ -1126,12 +1144,29 @@ impl SuperfileReader {
         clusters: &[u32],
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.vector_search_clusters_filtered(column, query, k, clusters, options, None)
+            .await
+    }
+
+    /// As [`Self::vector_search_clusters`], but restricts the kNN
+    /// ranking to the `local_doc_id`s in `allow` (a per-superfile
+    /// predicate allow-set), applied inside the coarse shortlist.
+    /// `allow == None` is identical to [`Self::vector_search_clusters`].
+    pub async fn vector_search_clusters_filtered(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        options: VectorSearchOptions,
+        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
         Ok(
-            v.search_clusters_async(column, query, k, clusters, rerank_mult)
+            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow)
                 .await?,
         )
     }
