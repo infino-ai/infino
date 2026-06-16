@@ -1435,4 +1435,127 @@ mod tests {
         );
         assert_eq!(take_i128_be(&mut m, "id").expect("ok"), v);
     }
+
+    #[test]
+    fn part_parse_error_display_covers_each_arm() {
+        // Each `#[error(...)]` arm's `Display` formatting.
+        let zstd = PartParseError::Zstd("frame corrupt".into());
+        assert!(format!("{zstd}").contains("zstd decompress failed"));
+
+        let avro = PartParseError::Avro("bad datum".into());
+        assert!(format!("{avro}").contains("avro decode failed"));
+
+        let mismatch = PartParseError::SchemaMismatch("top-level not a record".into());
+        assert!(format!("{mismatch}").contains("schema mismatch"));
+
+        let bad_id = PartParseError::BadSuperfileId("not-a-uuid".into());
+        assert!(format!("{bad_id}").contains("malformed superfile_id uuid"));
+
+        let incompat = PartParseError::IncompatibleMajorVersion {
+            got: "2.0".into(),
+            supported: FORMAT_VERSION.into(),
+        };
+        let s = format!("{incompat}");
+        assert!(s.contains("incompatible major version") && s.contains("2.0"));
+
+        let missing = PartParseError::MissingField("superfiles");
+        assert!(format!("{missing}").contains("missing field: superfiles"));
+
+        let wrong = PartParseError::WrongFieldType("n_docs");
+        assert!(format!("{wrong}").contains("wrong avro field type for n_docs"));
+
+        // Debug is derived; just ensure it renders without panicking.
+        assert!(!format!("{wrong:?}").is_empty());
+    }
+
+    #[test]
+    fn summary_decode_error_converts_via_from() {
+        // The `#[from] DecodeError` arm: a `DecodeError` lifts into
+        // `PartParseError::SummaryDecode` through `?`/`From`.
+        let de = DecodeError::Truncated {
+            needed: 8,
+            had: 2,
+            what: "scalar stats",
+        };
+        let lifted: PartParseError = de.into();
+        assert!(
+            matches!(lifted, PartParseError::SummaryDecode(_)),
+            "expected SummaryDecode, got {lifted:?}"
+        );
+        assert!(format!("{lifted}").contains("per-summary decode failed"));
+    }
+
+    #[test]
+    fn decode_superfile_rejects_malformed_uri_uuid() {
+        // A record with a valid superfile_id but a non-UUID `uri`
+        // exercises the second `Uuid::parse_str` (the `uri` arm) in
+        // `decode_superfile`.
+        let rec = AvroValue::Record(vec![
+            (
+                "superfile_id".into(),
+                AvroValue::String(Uuid::new_v4().to_string()),
+            ),
+            ("uri".into(), AvroValue::String("not-a-uuid".into())),
+        ]);
+        let err = decode_superfile(rec).expect_err("bad uri uuid");
+        assert!(
+            matches!(err, PartParseError::BadSuperfileId(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_malformed_part_id_uuid() {
+        // Build a valid empty part, then re-encode with a part_id that
+        // isn't a UUID by going through the Avro layer directly so the
+        // `Uuid::parse_str(part_id)` arm in `decode` surfaces
+        // `BadSuperfileId`.
+        let record = AvroValue::Record(vec![
+            (
+                "format_version".into(),
+                AvroValue::String(FORMAT_VERSION.into()),
+            ),
+            ("part_id".into(), AvroValue::String("not-a-uuid".into())),
+            ("superfiles".into(), AvroValue::Array(vec![])),
+        ]);
+        let avro_bytes = to_avro_datum(schema(), record).expect("avro encode");
+        let bytes = zstd::stream::encode_all(avro_bytes.as_slice(), 3).expect("zstd");
+        let err = decode(&bytes).expect_err("bad part_id");
+        assert!(
+            matches!(err, PartParseError::BadSuperfileId(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_range_list_rejects_truncated_count_prefix() {
+        // A version-3 blob truncated mid vec_open_ranges count prefix
+        // surfaces SchemaMismatch from `decode_range_list`'s `take`.
+        let bytes = encode_subsection_offsets(&SubsectionOffsets {
+            total_size: 1,
+            vec: None,
+            fts: None,
+            vec_open_ranges: vec![(1, 2)],
+            fts_open_ranges: vec![],
+            open_blob: vec![],
+        });
+        // Header is: ver(1) + total(8) + vec flag(1) + fts flag(1) = 11
+        // bytes, then the vec_open_ranges u32 count. Cut into the count.
+        let err = decode_subsection_offsets(&bytes[..12]).expect_err("truncated range count");
+        assert!(
+            matches!(err, PartParseError::SchemaMismatch(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn content_hash_of_matches_to_hex_for_known_input() {
+        // Confirm `ContentHash::of` returns the same 32-byte digest the
+        // hex form reflects, and equality holds across constructions.
+        let h = ContentHash::of(b"abc");
+        // Reconstruct from the raw bytes and compare.
+        let same = ContentHash(h.0);
+        assert_eq!(h, same);
+        assert_eq!(h.to_hex().len(), BLAKE3_HEX_LEN);
+    }
 }

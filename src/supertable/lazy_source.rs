@@ -425,4 +425,92 @@ mod tests {
         assert!(got.is_empty());
         assert_eq!(storage.call_count(), 0);
     }
+
+    /// `new` issues one HEAD up-front and caches the discovered size,
+    /// so `size()` is non-zero before any `range`/`tail` I/O.
+    #[tokio::test]
+    async fn new_heads_and_caches_size() {
+        let blob = Bytes::from(vec![3u8; 512]);
+        let storage = Arc::new(ChunkedStorage::new(blob.clone(), 512, blob.len()));
+        let src = StorageRangeSource::new(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+        )
+        .await
+        .expect("new heads ok");
+        assert_eq!(src.size(), blob.len() as u64);
+        assert_eq!(src.uri(), "seg.sf.parquet");
+    }
+
+    /// `with_unknown_size` leaves `size()` at 0 (no up-front I/O); the
+    /// first `tail()` discovers the total and patches the atomic so a
+    /// subsequent `range()` bounds-checks like a known-size source.
+    #[tokio::test]
+    async fn unknown_size_tail_discovers_and_patches_size() {
+        let blob = Bytes::from((0u8..=255).cycle().take(1024).collect::<Vec<u8>>());
+        let storage = Arc::new(ChunkedStorage::new(blob.clone(), 4096, blob.len()));
+        let src = StorageRangeSource::with_unknown_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+        );
+        // Before any I/O the size is unknown.
+        assert_eq!(src.size(), 0);
+
+        // `tail` routes through the default `StorageProvider::tail`
+        // (head + get_range) and returns (bytes, total).
+        let (tail_bytes, total) = src.tail(64).await.expect("tail");
+        assert_eq!(total, blob.len() as u64);
+        assert_eq!(tail_bytes.as_ref(), &blob[blob.len() - 64..]);
+        // The atomic is now patched.
+        assert_eq!(src.size(), blob.len() as u64);
+
+        // A subsequent out-of-bounds range is now caught by the
+        // bounds check rather than reaching storage.
+        let err = src
+            .range(blob.len() as u64, 8)
+            .await
+            .expect_err("past-end range must be OutOfBounds");
+        match err {
+            LazyByteSourceError::OutOfBounds { start, len, size } => {
+                assert_eq!(start, blob.len() as u64);
+                assert_eq!(len, 8);
+                assert_eq!(size, blob.len() as u64);
+            }
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        }
+    }
+
+    /// A known-size source rejects a range past the end with a typed
+    /// `OutOfBounds` (the `known > 0 && start+len > known` arm) without
+    /// touching storage.
+    #[tokio::test]
+    async fn range_out_of_bounds_when_size_known() {
+        let storage = Arc::new(ChunkedStorage::new(Bytes::from(vec![0u8; 100]), 100, 100));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+            100,
+        );
+        let err = src.range(90, 20).await.expect_err("90+20 > 100");
+        assert!(
+            matches!(err, LazyByteSourceError::OutOfBounds { .. }),
+            "expected OutOfBounds, got {err:?}"
+        );
+        assert_eq!(storage.call_count(), 0);
+    }
+
+    /// `Debug` on `StorageRangeSource` renders the struct name (the
+    /// derived `#[derive(Debug)]` impl) and includes the uri.
+    #[tokio::test]
+    async fn debug_renders_struct_name_and_uri() {
+        let storage = Arc::new(ChunkedStorage::new(Bytes::from(vec![0u8; 8]), 8, 8));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg-debug.sf.parquet",
+            8,
+        );
+        let dbg = format!("{src:?}");
+        assert!(dbg.contains("StorageRangeSource"), "got {dbg}");
+        assert!(dbg.contains("seg-debug.sf.parquet"), "got {dbg}");
+    }
 }
