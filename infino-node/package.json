@@ -1,6 +1,6 @@
 {
   "name": "infino",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/infino-ai/infino#readme",
@@ -52,10 +52,10 @@
     "apache-arrow": "^17"
   },
   "optionalDependencies": {
-    "infino-darwin-x64": "0.1.0",
-    "infino-darwin-arm64": "0.1.0",
-    "infino-linux-x64-gnu": "0.1.0",
-    "infino-linux-arm64-gnu": "0.1.0"
+    "infino-darwin-x64": "0.2.0",
+    "infino-darwin-arm64": "0.2.0",
+    "infino-linux-x64-gnu": "0.2.0",
+    "infino-linux-arm64-gnu": "0.2.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
