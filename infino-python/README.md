@@ -102,12 +102,12 @@ vecs.vector_search("emb", query_vector, k=10, nprobe=32)   # probe more partitio
 
 ## SQL
 
-Run SQL across the catalog's tables. Search is available inside SQL
-through table-valued functions, so you can rank and join in one query.
+Run SQL across the catalog's tables for analytics and filtering. Results
+come back as a `pyarrow.Table`.
 
 ```python
 db.query_sql("SELECT COUNT(*) AS n FROM docs")
-db.query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
+db.query_sql("SELECT title FROM docs WHERE title = 'a lazy dog'")
 ```
 
 ## Projections
@@ -157,11 +157,11 @@ docs.compact(infino.CompactOptions(target_superfile_size_mb=256,
 
 `connect` selects the backend from the URI:
 
-| URI                       | Backend                                  |
-| ------------------------- | ---------------------------------------- |
-| `./data`, `/abs/path`     | Local filesystem                         |
-| `s3://bucket/prefix`      | Amazon S3 / S3-compatible object storage |
-| `memory://`               | In-process, ephemeral (testing)          |
+| URI                   | Backend                                  |
+| --------------------- | ---------------------------------------- |
+| `./data`, `/abs/path` | Local filesystem                         |
+| `s3://bucket/prefix`  | Amazon S3 / S3-compatible object storage |
+| `memory://`           | In-process, ephemeral (testing)          |
 
 For S3-compatible stores that need an explicit endpoint and static
 credentials, pass them as keyword arguments (omit them to use ambient AWS
