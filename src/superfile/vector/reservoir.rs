@@ -51,6 +51,39 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+/// Multiplier on a column's IVF centroid count to size its k-means
+/// training sample. Slightly above the FAISS-empirical 30–60× sweet
+/// spot for IVF training, picked for recall headroom.
+const KMEANS_SAMPLE_NCENT_MULT: usize = 64;
+
+/// Floor on the k-means training sample size, so builds with a small
+/// `n_cent` still see enough corpus variance to converge.
+const KMEANS_SAMPLE_SIZE_FLOOR: usize = 100_000;
+
+/// Cap on the k-means training sample size. Bounds reservoir memory
+/// (≈ 730 MB at dim=384); past this the recall gain is below gate
+/// noise.
+const KMEANS_SAMPLE_SIZE_CAP: usize = 500_000;
+
+/// Default k-means training sample size for a column with
+/// `n_cent` IVF centroids:
+///
+/// ```text
+///   sample_size = max(100_000, min(500_000, 64 × n_cent))
+/// ```
+///
+/// `64 × n_cent` is slightly above the FAISS-empirical sweet
+/// spot of 30–60 × n_cent for IVF training, with a 100 K floor
+/// so small-n_cent builds still see enough variance to converge
+/// and a 500 K cap so the reservoir never gets pathological at
+/// large n_cent. The cap saturates at `n_cent = 7812`; above
+/// that the sample stays at 500 K (≈ 730 MB at dim=384) and the
+/// gain from more training data is well below recall-gate noise.
+pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
+    let target = KMEANS_SAMPLE_NCENT_MULT.saturating_mul(n_cent);
+    target.clamp(KMEANS_SAMPLE_SIZE_FLOOR, KMEANS_SAMPLE_SIZE_CAP)
+}
+
 /// Online reservoir for f32 vector samples.
 ///
 /// One instance per vector column in `VectorBuilder`. Holds at

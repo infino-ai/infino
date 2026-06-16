@@ -240,6 +240,7 @@ fn build_superfile_bytes() -> Bytes {
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim,
+            n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,
@@ -1872,6 +1873,7 @@ pub(crate) mod diag {
             vec![VectorConfig {
                 column: VEC_COLUMN.into(),
                 dim: crate::corpus::DIM,
+                n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
                 rot_seed: ROT_SEED,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8ResidualEpsilon,

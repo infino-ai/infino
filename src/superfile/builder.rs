@@ -255,7 +255,15 @@ impl BuilderOptions {
 
         let vector_columns = if let Some(vec) = &reader.vec() {
             vec.vector_columns_config()
-                .map(|v| VectorConfig::new(v.name.clone(), v.dim as usize, v.rot_seed, v.metric))
+                .map(|v| {
+                    VectorConfig::new(
+                        v.name.clone(),
+                        v.dim,
+                        v.n_cent as usize,
+                        v.rot_seed,
+                        v.metric,
+                    )
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -841,6 +849,8 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
         s.push_str(&escape_json(&c.column));
         s.push_str(r#"","dim":"#);
         s.push_str(&c.dim.to_string());
+        s.push_str(r#","n_cent":"#);
+        s.push_str(&c.n_cent.to_string());
         s.push_str(r#","rot_seed":"#);
         s.push_str(&c.rot_seed.to_string());
         s.push_str(r#","metric":""#);
@@ -1226,6 +1236,7 @@ mod tests {
         let cols = vec![VectorConfig {
             column: "emb".into(),
             dim: 384,
+            n_cent: 64,
             rot_seed: 99,
             metric: Metric::L2Sq,
             rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
@@ -1684,6 +1695,7 @@ mod tests {
             vec![crate::superfile::vector::builder::VectorConfig {
                 column: "emb".into(),
                 dim: 16,
+                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec:

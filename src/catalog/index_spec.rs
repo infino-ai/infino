@@ -14,11 +14,13 @@ use crate::superfile::vector::distance::Metric;
 /// has to be stable for a given table; the public API does not vary it.
 const DEFAULT_ROT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 
-/// A vector index declaration: column, dimensionality, and distance metric.
+/// A vector index declaration: column, dimensionality, IVF centroid
+/// count, and distance metric.
 #[derive(Debug, Clone)]
 struct VectorIndex {
     column: String,
     dim: usize,
+    n_cent: usize,
     metric: Metric,
 }
 
@@ -32,7 +34,7 @@ struct VectorIndex {
 /// use infino::{IndexSpec, Metric};
 /// let spec = IndexSpec::new()
 ///     .fts("body")
-///     .vector("embedding", 384, Metric::Cosine);
+///     .vector("embedding", 384, 256, Metric::Cosine);
 /// # let _ = spec;
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -55,14 +57,21 @@ impl IndexSpec {
     }
 
     /// Mark `column` as vector (IVF kNN) indexed. `dim` is the vector
-    /// dimensionality, and `metric` is the distance metric. The physical
-    /// IVF centroid count is derived from each superfile's row count at
-    /// build time. The column must be a `FixedSizeList<Float32, dim>`
-    /// column in the schema.
-    pub fn vector(mut self, column: impl Into<String>, dim: usize, metric: Metric) -> Self {
+    /// dimensionality, `n_cent` the IVF centroid count (governs the
+    /// recall/latency trade-off — size it to the table's scale), and
+    /// `metric` the distance metric. The column must be a
+    /// `FixedSizeList<Float32, dim>` column in the schema.
+    pub fn vector(
+        mut self,
+        column: impl Into<String>,
+        dim: usize,
+        n_cent: usize,
+        metric: Metric,
+    ) -> Self {
         self.vectors.push(VectorIndex {
             column: column.into(),
             dim,
+            n_cent,
             metric,
         });
         self
@@ -87,7 +96,15 @@ impl IndexSpec {
         let vectors = self
             .vectors
             .iter()
-            .map(|v| VectorConfig::new(v.column.clone(), v.dim, DEFAULT_ROT_SEED, v.metric))
+            .map(|v| {
+                VectorConfig::new(
+                    v.column.clone(),
+                    v.dim,
+                    v.n_cent,
+                    DEFAULT_ROT_SEED,
+                    v.metric,
+                )
+            })
             .collect();
         (fts, vectors)
     }

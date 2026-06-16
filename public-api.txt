@@ -168,7 +168,7 @@ pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::IndexSpec::new() -> Self
-pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, infino::Metric) -> Self
+pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, usize, infino::Metric) -> Self
 impl core::clone::Clone for infino::IndexSpec
 pub fn infino::IndexSpec::clone(&self) -> infino::IndexSpec
 impl core::default::Default for infino::IndexSpec

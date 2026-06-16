@@ -188,6 +188,8 @@ pub fn options_for(
         }
         return opts;
     }
+    let n_cent_total = corpus::n_cent(n_docs());
+    let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n_writers().max(1))
@@ -206,6 +208,7 @@ pub fn options_for(
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim: DIM,
+            n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
             rerank_codec: BENCH_RERANK,

@@ -57,6 +57,7 @@ fn read_f32_le(bytes: &[u8], off: usize) -> f32 {
 #[derive(Clone)]
 struct IvfLayout {
     dim: usize,
+    n_cent: usize,
     n_docs: usize,
     centroids: Vec<f32>,
     cluster_index: Vec<(u32, u32)>,

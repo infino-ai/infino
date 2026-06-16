@@ -18,7 +18,7 @@ use crate::superfile::vector::distance::{Metric, l2_sq};
 use crate::superfile::vector::kmeans::{assign_to_centroids, kmeans};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
-use crate::superfile::vector::reservoir::Reservoir;
+use crate::superfile::vector::reservoir::{Reservoir, default_kmeans_sample_size};
 use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
@@ -75,22 +75,18 @@ const PASS2_CHUNK_ROWS_MIN: usize = 1024;
 /// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
 const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
 
-/// Default reservoir rows kept for k-means training. The final IVF centroid
-/// count is derived from the number of vectors actually written into each
-/// physical superfile, so the reservoir is a bounded internal implementation
-/// detail rather than a user-sized function of `n_cent`.
-const DEFAULT_KMEANS_SAMPLE_ROWS: usize = 500_000;
-
-/// Superfile-local document thresholds for deriving the physical IVF centroid
-/// count from the number of vectors actually indexed in this superfile.
+/// Superfile-local document thresholds for capping the physical IVF centroid
+/// count. Caller-supplied `n_cent` remains a tuning knob, but the builder will
+/// not train more centroids than this row-count policy permits for the physical
+/// superfile being written.
 const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
-/// IVF centroids for large physical vector indexes.
+/// Maximum IVF centroids for large physical vector indexes.
 const N_CENT_LARGE: usize = 4096;
-/// Medium-index document threshold for derived IVF centroid count.
+/// Medium-index document threshold for the IVF centroid cap.
 const N_CENT_MEDIUM_DOC_THRESHOLD: usize = 100_000;
-/// IVF centroids for medium physical vector indexes.
+/// Maximum IVF centroids for medium physical vector indexes.
 const N_CENT_MEDIUM: usize = 1024;
-/// IVF centroids for small physical vector indexes.
+/// Maximum IVF centroids for small physical vector indexes.
 const N_CENT_SMALL: usize = 64;
 
 /// Fixed-point scale for the per-subsection summary radius. The
@@ -108,7 +104,7 @@ const SQ8_CODE_MAX: f32 = 255.0;
 /// quantized magnitude stays symmetric about zero.
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 
-fn derived_n_cent(n_docs: usize) -> usize {
+fn n_cent_row_count_cap(n_docs: usize) -> usize {
     if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
         N_CENT_LARGE
     } else if n_docs >= N_CENT_MEDIUM_DOC_THRESHOLD {
@@ -138,6 +134,7 @@ pub struct VectorConfig {
     /// JSON key in `inf.vec.columns`.
     pub column: String,
     pub dim: usize,
+    pub n_cent: usize,
     pub rot_seed: u64,
     pub metric: Metric,
     /// On-disk rerank codec for this column. See [`RerankCodec`]
@@ -149,10 +146,11 @@ impl VectorConfig {
     /// Construct a config with the default rerank codec
     /// ([`RerankCodec::default()`]). Use [`Self::with_rerank_codec`]
     /// to override.
-    pub fn new(column: String, dim: usize, rot_seed: u64, metric: Metric) -> Self {
+    pub fn new(column: String, dim: usize, n_cent: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
             dim,
+            n_cent,
             rot_seed,
             metric,
             rerank_codec: RerankCodec::default(),
@@ -348,7 +346,7 @@ impl VectorBuilder {
             });
         }
         let column_id = self.columns.len() as u32;
-        let sample_size = DEFAULT_KMEANS_SAMPLE_ROWS;
+        let sample_size = default_kmeans_sample_size(config.n_cent);
         // Seed the reservoir RNG from `rot_seed ^ 0x5a5a` so it
         // stays deterministic with the column config but uses a
         // distinct stream from `RandomRotation` (which seeds from
@@ -647,8 +645,9 @@ impl VectorBuilder {
 /// Builder output for one column's subsection.
 struct SubsectionBytes {
     bytes: Vec<u8>,
-    /// Physical IVF centroid count derived from this superfile's row count
-    /// and written into this subsection.
+    /// Physical IVF centroid count written into this subsection.
+    /// May be lower than the configured `n_cent` for tiny shards
+    /// where `n_docs < n_cent`.
     n_cent: usize,
     /// Byte offset of the summary centroid relative to the subsection
     /// start (matches the directory entry's `summary_offset` after
@@ -742,8 +741,10 @@ fn build_subsection_streaming(
     // by the trainer). At steady-state shapes (`n_docs > sample_size`,
     // `sample_size ≥ 100_000`) the sample_rows bound is the active
     // one and is comfortably above any sane n_cent.
-    let n_cent = derived_n_cent(n_docs)
+    let n_cent = cfg
+        .n_cent
         .max(1)
+        .min(n_cent_row_count_cap(n_docs))
         .min(n_docs.max(1))
         .min(sample_rows.max(1));
 
@@ -1373,6 +1374,7 @@ mod tests {
         VectorConfig {
             column: name.to_string(),
             dim,
+            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -1481,6 +1483,7 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
+            n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,

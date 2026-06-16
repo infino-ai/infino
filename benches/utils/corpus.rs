@@ -491,8 +491,12 @@ pub use combined::SequentialSyntheticCorpus;
 /// per-doc normalization would destroy the cluster signal entirely —
 /// IVF + RaBitQ trained on that data can't recover any meaningful
 /// cluster structure even at full sweep + maximal rerank.
-pub fn generate_vector_corpus(n_docs: usize, seed: u64, normalize_each: bool) -> Vec<f32> {
-    let n_cent = n_cent(n_docs);
+pub fn generate_vector_corpus(
+    n_docs: usize,
+    n_cent: usize,
+    seed: u64,
+    normalize_each: bool,
+) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     let dist = StandardNormal;
 
@@ -1066,11 +1070,17 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
 /// real embeddings). Callers measuring the Fp32 baseline (recall
 /// oracles, bit-exact regression tests) construct their own
 /// `VectorConfig` with `RerankCodec::Fp32`.
-pub fn build_vector_index(vectors: &[f32], n_docs: usize, metric: Metric) -> VectorBuilder {
+pub fn build_vector_index(
+    vectors: &[f32],
+    n_docs: usize,
+    n_cent: usize,
+    metric: Metric,
+) -> VectorBuilder {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         column: "v".into(),
         dim: DIM,
+        n_cent,
         rot_seed: ROT_SEED,
         metric,
         rerank_codec: RerankCodec::Sq8ResidualEpsilon,
@@ -1100,7 +1110,7 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.
-pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
+pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u8> {
     let n = docs.len();
     // `SuperfileBuilder` requires the id column to be
     // `Decimal128(38, 0)` (the supertable's snowflake id type), not
@@ -1122,6 +1132,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: DIM,
+            n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,
@@ -1143,7 +1154,12 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
 }
 
 /// Build a full superfile (FTS + vector) with an explicit metric.
-pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Metric) -> Vec<u8> {
+pub fn build_superfile_with_metric(
+    docs: &[String],
+    vectors: &[f32],
+    n_cent: usize,
+    metric: Metric,
+) -> Vec<u8> {
     let n = docs.len();
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -1162,6 +1178,7 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: DIM,
+            n_cent,
             rot_seed: ROT_SEED,
             metric,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,

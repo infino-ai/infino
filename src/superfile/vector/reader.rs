@@ -57,6 +57,7 @@ const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
 pub struct VectorColumnConfig {
     pub column: String,
     pub dim: usize,
+    pub n_cent: usize,
     pub rot_seed: u64,
     /// `"l2sq"`, `"cosine"`, or `"negdot"`.
     pub metric: String,
@@ -2905,6 +2906,7 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim: 16,
+            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,
@@ -2931,6 +2933,7 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
+            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -3211,6 +3214,7 @@ mod tests {
             b.register_column(VectorConfig {
                 column: "v".into(),
                 dim: 16,
+                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: codec,
@@ -4103,6 +4107,7 @@ mod tests {
             b.register_column(VectorConfig {
                 column: "v".into(),
                 dim,
+                n_cent: n_cent_ivf,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: codec,
@@ -4696,7 +4701,12 @@ mod tests {
     /// folded through a linear congruential step per dim slot.
     /// Same shape the bench corpus generators use, inlined so
     /// the unit test doesn't reach into the bench harness.
-    fn build_corpus_to_file(path: &std::path::Path, n_docs: u32, dim: usize) -> String {
+    fn build_corpus_to_file(
+        path: &std::path::Path,
+        n_docs: u32,
+        dim: usize,
+        n_cent: usize,
+    ) -> String {
         use std::io::BufWriter;
 
         let mut b = VectorBuilder::new();
@@ -5193,6 +5203,7 @@ mod tests {
 
     fn build_small_superfile(
         dim: usize,
+        n_cent: usize,
         n_docs: u32,
         codec: RerankCodec,
         metric: Metric,
@@ -5684,6 +5695,7 @@ mod tests {
             .register_column(VectorConfig {
                 column: "embedding".into(),
                 dim: 16,
+                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8ResidualEpsilon,
@@ -5726,6 +5738,7 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim: 16,
+            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,

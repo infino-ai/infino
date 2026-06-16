@@ -112,6 +112,7 @@ fn build_reader_with_sample_size(
     corpus_flat: &[f32],
     dim: usize,
     n_docs: usize,
+    n_cent: usize,
     sample_size: usize,
     rerank_codec: RerankCodec,
 ) -> VectorReader {

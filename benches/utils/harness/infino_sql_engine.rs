@@ -110,8 +110,14 @@ pub fn sample_query_csv() -> String {
         .join(",")
 }
 
+/// `n_cent` for the vector index, clamped so tiny inputs (unit tests)
+/// don't request more clusters than rows.
+fn n_cent_for(n_rows: usize) -> usize {
+    crate::corpus::n_cent(n_rows).min(n_rows.max(1))
+}
+
 /// Options for the SQL benchmark table shape.
-pub fn sql_options(_n_rows: usize) -> SupertableOptions {
+pub fn sql_options(n_rows: usize) -> SupertableOptions {
     SupertableOptions::new(
         schema(),
         vec![
@@ -131,6 +137,7 @@ pub fn sql_options(_n_rows: usize) -> SupertableOptions {
         vec![VectorConfig {
             column: VECTOR_COLUMN.into(),
             dim: SQL_DIM,
+            n_cent: n_cent_for(n_rows),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,

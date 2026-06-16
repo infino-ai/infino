@@ -1860,6 +1860,7 @@ pub(crate) async fn try_commit_attempt(
             .map(|v| crate::supertable::manifest::list::VectorColumnInfo {
                 column: v.column.clone(),
                 dim: v.dim,
+                n_cent: v.n_cent,
                 rot_seed: v.rot_seed,
                 metric: format!("{:?}", v.metric).to_lowercase(),
             })
