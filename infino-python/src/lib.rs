@@ -398,8 +398,11 @@ impl Table {
     /// Delete rows matching a SQL predicate string, e.g. `"status = 'spam'"`.
     /// Needs durable storage — a `memory://` table raises.
     fn delete(&self, py: Python<'_>, predicate: &str) -> PyResult<MutationStats> {
-        let expr = self.parse_predicate(predicate)?;
-        let stats = py.detach(|| self.inner.delete(expr)).map_err(py_err)?;
+        // Parse and mutate both off the GIL — neither touches Python.
+        let stats = py.detach(|| {
+            let expr = self.parse_predicate(predicate)?;
+            self.inner.delete(expr).map_err(py_err)
+        })?;
         Ok(MutationStats::from_core(&stats))
     }
 
@@ -412,7 +415,6 @@ impl Table {
         predicate: &str,
         new_rows: &Bound<'_, PyAny>,
     ) -> PyResult<MutationStats> {
-        let expr = self.parse_predicate(predicate)?;
         let declared = self.inner.schema();
         let py_schema = declared.as_ref().to_pyarrow(py)?;
         // Pass an empty batch through rather than short-circuiting like
@@ -421,9 +423,11 @@ impl Table {
             Some(batch) => align_to_schema(declared, batch)?,
             None => RecordBatch::new_empty(declared),
         };
-        let stats = py
-            .detach(|| self.inner.update(expr, &aligned))
-            .map_err(py_err)?;
+        // Parse and mutate both off the GIL — neither touches Python.
+        let stats = py.detach(|| {
+            let expr = self.parse_predicate(predicate)?;
+            self.inner.update(expr, &aligned).map_err(py_err)
+        })?;
         Ok(MutationStats::from_core(&stats))
     }
 
