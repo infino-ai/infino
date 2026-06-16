@@ -85,7 +85,6 @@ pub fn default_vector_config(column: &str, rot_seed: u64) -> VectorConfig {
     VectorConfig {
         column: column.into(),
         dim: 16,
-        n_cent: 4,
         rot_seed,
         metric: Metric::Cosine,
         rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,

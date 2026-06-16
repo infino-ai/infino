@@ -84,7 +84,6 @@ pub struct FtsColumnInfo {
 pub struct VectorColumnInfo {
     pub column: String,
     pub dim: usize,
-    pub n_cent: usize,
     pub rot_seed: u64,
     /// `"cosine"`, `"l2sq"`, or `"negdot"` — matches the
     /// `VectorConfig::metric` shape.
@@ -250,14 +249,14 @@ struct ManifestListDto {
     parts: Vec<ManifestListEntryDto>,
 }
 
-// VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
-// JSON should canonicalize as `u64` so round-trip on 32-bit
-// hosts isn't a footgun.
+// VectorColumnInfo's `dim` is `usize` in memory but JSON should canonicalize
+// as `u64` so round-trip on 32-bit hosts isn't a footgun.
 #[derive(Serialize, Deserialize)]
 struct VectorColumnInfoDto {
     column: String,
     dim: u64,
-    n_cent: u64,
+    #[serde(default)]
+    _legacy_n_cent: Option<u64>,
     rot_seed: u64,
     metric: String,
 }
@@ -592,7 +591,7 @@ fn list_to_dto(l: &ManifestList) -> ManifestListDto {
             .map(|c| VectorColumnInfoDto {
                 column: c.column.clone(),
                 dim: c.dim as u64,
-                n_cent: c.n_cent as u64,
+                _legacy_n_cent: None,
                 rot_seed: c.rot_seed,
                 metric: c.metric.clone(),
             })
@@ -623,7 +622,6 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             .map(|c| VectorColumnInfo {
                 column: c.column,
                 dim: c.dim as usize,
-                n_cent: c.n_cent as usize,
                 rot_seed: c.rot_seed,
                 metric: c.metric,
             })

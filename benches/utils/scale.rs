@@ -128,9 +128,9 @@ fn sampled_recall(
 }
 
 fn build_fixture(seed: u64, normalize_each: bool, metric: Metric) -> (Vec<f32>, SuperfileReader) {
-    let vectors = generate_vector_corpus(N_DOCS, N_CENT, seed, normalize_each);
+    let vectors = generate_vector_corpus(N_DOCS, seed, normalize_each);
     let docs: Vec<String> = (0..N_DOCS).map(|i| format!("doc {i}")).collect();
-    let bytes = build_superfile_with_metric(&docs, &vectors, N_CENT, metric);
+    let bytes = build_superfile_with_metric(&docs, &vectors, metric);
     let reader = open_superfile(bytes);
     (vectors, reader)
 }

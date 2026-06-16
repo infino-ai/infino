@@ -219,7 +219,6 @@ mod tests {
         VectorConfig {
             column: name.into(),
             dim,
-            n_cent: 4,
             rot_seed: 0,
             metric: Metric::Cosine,
             rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,

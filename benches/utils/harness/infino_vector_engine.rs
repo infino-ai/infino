@@ -22,7 +22,7 @@ use infino::superfile::vector::distance::Metric as InfinoMetric;
 use infino::superfile::vector::rerank_codec::RerankCodec;
 
 use super::{Capabilities, VectorEngine, VectorHit, VectorMetric, VectorSearch};
-use crate::corpus::{self, block_on_inmem};
+use crate::corpus::block_on_inmem;
 
 const ID_COLUMN: &str = "doc_id";
 const WRITE_CHUNK: usize = 65_536;
@@ -41,7 +41,6 @@ fn build_superfile(
     vectors: &[f32],
     dim: usize,
     metric: VectorMetric,
-    n_cent: usize,
     id_base: usize,
 ) -> Vec<u8> {
     let n_docs = vectors.len() / dim;
@@ -57,10 +56,9 @@ fn build_superfile(
         vec![VectorConfig {
             column: column.into(),
             dim,
-            n_cent,
             rot_seed: ROT_SEED,
             metric: map_metric(metric),
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
         }],
         None,
     );
@@ -88,7 +86,6 @@ pub struct InfinoVectorIndex {
     column: String,
     dim: usize,
     metric: VectorMetric,
-    n_cent: usize,
     bytes: Option<Vec<u8>>,
     reader: Option<SuperfileReader>,
 }
@@ -119,26 +116,18 @@ impl VectorEngine for InfinoVectorEngine {
         }
     }
 
-    fn create(column: &str, dim: usize, metric: VectorMetric, n_cent: usize) -> Self::Index {
+    fn create(column: &str, dim: usize, metric: VectorMetric, _n_cent: usize) -> Self::Index {
         InfinoVectorIndex {
             column: column.to_string(),
             dim,
             metric,
-            n_cent,
             bytes: None,
             reader: None,
         }
     }
 
     fn write(index: &mut Self::Index, vectors: &[f32]) {
-        let bytes = build_superfile(
-            &index.column,
-            vectors,
-            index.dim,
-            index.metric,
-            index.n_cent,
-            0,
-        );
+        let bytes = build_superfile(&index.column, vectors, index.dim, index.metric, 0);
         index.reader =
             Some(SuperfileReader::open(Bytes::from(bytes.clone())).expect("open SuperfileReader"));
         index.bytes = Some(bytes);
@@ -153,15 +142,7 @@ impl VectorEngine for InfinoVectorEngine {
     ) {
         let writers = writers.max(1);
         if writers == 1 {
-            let n_docs = vectors.len() / dim;
-            std::hint::black_box(build_superfile(
-                column,
-                vectors,
-                dim,
-                metric,
-                corpus::n_cent(n_docs),
-                0,
-            ));
+            std::hint::black_box(build_superfile(column, vectors, dim, metric, 0));
             return;
         }
         let n_docs = vectors.len() / dim;
@@ -181,7 +162,6 @@ impl VectorEngine for InfinoVectorEngine {
                     &vectors[start..end],
                     dim,
                     metric,
-                    corpus::n_cent(len_docs),
                     start_doc,
                 ))
             })

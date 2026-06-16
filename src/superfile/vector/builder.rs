@@ -18,7 +18,7 @@ use crate::superfile::vector::distance::{Metric, l2_sq};
 use crate::superfile::vector::kmeans::{assign_to_centroids, kmeans};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
-use crate::superfile::vector::reservoir::{Reservoir, default_kmeans_sample_size};
+use crate::superfile::vector::reservoir::Reservoir;
 use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
@@ -75,6 +75,24 @@ const PASS2_CHUNK_ROWS_MIN: usize = 1024;
 /// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
 const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
 
+/// Default reservoir rows kept for k-means training. The final IVF centroid
+/// count is derived from the number of vectors actually written into each
+/// physical superfile, so the reservoir is a bounded internal implementation
+/// detail rather than a user-sized function of `n_cent`.
+const DEFAULT_KMEANS_SAMPLE_ROWS: usize = 500_000;
+
+/// Superfile-local document thresholds for deriving the physical IVF centroid
+/// count from the number of vectors actually indexed in this superfile.
+const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
+/// IVF centroids for large physical vector indexes.
+const N_CENT_LARGE: usize = 4096;
+/// Medium-index document threshold for derived IVF centroid count.
+const N_CENT_MEDIUM_DOC_THRESHOLD: usize = 100_000;
+/// IVF centroids for medium physical vector indexes.
+const N_CENT_MEDIUM: usize = 1024;
+/// IVF centroids for small physical vector indexes.
+const N_CENT_SMALL: usize = 64;
+
 /// Fixed-point scale for the per-subsection summary radius. The
 /// radius is stored as `round(radius × 100)` in a `u32` and decoded
 /// back by the reader as `value / 100.0`.
@@ -85,10 +103,20 @@ const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 /// `[0, SQ8_CODE_MAX]`.
 const SQ8_CODE_MAX: f32 = 255.0;
 
-/// Symmetric clamp bound for the Sq8Residual i8 leg. The residual is
+/// Symmetric clamp bound for the Sq8ResidualEpsilon i8 leg. The residual is
 /// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
 /// quantized magnitude stays symmetric about zero.
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
+
+fn derived_n_cent(n_docs: usize) -> usize {
+    if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
+        N_CENT_LARGE
+    } else if n_docs >= N_CENT_MEDIUM_DOC_THRESHOLD {
+        N_CENT_MEDIUM
+    } else {
+        N_CENT_SMALL
+    }
+}
 
 /// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
 /// 2 = NegDot.
@@ -110,7 +138,6 @@ pub struct VectorConfig {
     /// JSON key in `inf.vec.columns`.
     pub column: String,
     pub dim: usize,
-    pub n_cent: usize,
     pub rot_seed: u64,
     pub metric: Metric,
     /// On-disk rerank codec for this column. See [`RerankCodec`]
@@ -122,11 +149,10 @@ impl VectorConfig {
     /// Construct a config with the default rerank codec
     /// ([`RerankCodec::default()`]). Use [`Self::with_rerank_codec`]
     /// to override.
-    pub fn new(column: String, dim: usize, n_cent: usize, rot_seed: u64, metric: Metric) -> Self {
+    pub fn new(column: String, dim: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
             dim,
-            n_cent,
             rot_seed,
             metric,
             rerank_codec: RerankCodec::default(),
@@ -322,7 +348,7 @@ impl VectorBuilder {
             });
         }
         let column_id = self.columns.len() as u32;
-        let sample_size = default_kmeans_sample_size(config.n_cent);
+        let sample_size = DEFAULT_KMEANS_SAMPLE_ROWS;
         // Seed the reservoir RNG from `rot_seed ^ 0x5a5a` so it
         // stays deterministic with the column config but uses a
         // distinct stream from `RandomRotation` (which seeds from
@@ -621,9 +647,8 @@ impl VectorBuilder {
 /// Builder output for one column's subsection.
 struct SubsectionBytes {
     bytes: Vec<u8>,
-    /// Physical IVF centroid count written into this subsection.
-    /// May be lower than the configured `n_cent` for tiny shards
-    /// where `n_docs < n_cent`.
+    /// Physical IVF centroid count derived from this superfile's row count
+    /// and written into this subsection.
     n_cent: usize,
     /// Byte offset of the summary centroid relative to the subsection
     /// start (matches the directory entry's `summary_offset` after
@@ -717,7 +742,10 @@ fn build_subsection_streaming(
     // by the trainer). At steady-state shapes (`n_docs > sample_size`,
     // `sample_size ≥ 100_000`) the sample_rows bound is the active
     // one and is comfortably above any sane n_cent.
-    let n_cent = cfg.n_cent.max(1).min(n_docs.max(1)).min(sample_rows.max(1));
+    let n_cent = derived_n_cent(n_docs)
+        .max(1)
+        .min(n_docs.max(1))
+        .min(sample_rows.max(1));
 
     // ---- Pass 1: k-means on the reservoir sample ----
     let centroids = if sample_rows == 0 || n_docs == 0 {
@@ -776,9 +804,9 @@ fn build_subsection_streaming(
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
     let codec = cfg.rerank_codec;
-    // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
+    // `Sq8ResidualEpsilon` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
-    let sq8_family = matches!(codec, RerankCodec::Sq8Residual);
+    let sq8_family = matches!(codec, RerankCodec::Sq8ResidualEpsilon);
     let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if sq8_family {
         (
             vec![f32::INFINITY; n_cent * dim],
@@ -1057,7 +1085,7 @@ fn build_subsection_streaming(
                 let full_base = block_base + codes_len + ids_len;
                 bytes[full_base..full_base + cluster_count * dim * 4].copy_from_slice(&full_block);
             }
-            RerankCodec::Sq8Residual => {
+            RerankCodec::Sq8ResidualEpsilon => {
                 let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                 let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
                 let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
@@ -1100,7 +1128,7 @@ fn build_subsection_streaming(
     })
 }
 
-/// `Sq8Residual` per-cluster encode. Writes a row-interleaved
+/// `Sq8ResidualEpsilon` per-cluster encode. Writes a row-interleaved
 /// `[code dim u8 ‖ residual dim i8]` body (`2 × dim` bytes per row)
 /// at `full_chunk_base + i × 2·dim`. The Sq8 code is the same
 /// `sq8_encode_row` quantization; the residual code captures the
@@ -1345,7 +1373,6 @@ mod tests {
         VectorConfig {
             column: name.to_string(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -1454,10 +1481,9 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");

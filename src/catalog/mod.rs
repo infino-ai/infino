@@ -162,7 +162,6 @@ impl Connection {
                     .map(|vc| VectorEntry {
                         column: vc.column.clone(),
                         dim: vc.dim,
-                        n_cent: vc.n_cent,
                         metric: metric_to_str(vc.metric).to_string(),
                     })
                     .collect();
@@ -254,12 +253,7 @@ impl Connection {
                     spec = spec.fts(column.clone());
                 }
                 for v in &entry.vectors {
-                    spec = spec.vector(
-                        v.column.clone(),
-                        v.dim,
-                        v.n_cent,
-                        metric_from_str(&v.metric)?,
-                    );
+                    spec = spec.vector(v.column.clone(), v.dim, metric_from_str(&v.metric)?);
                 }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
                 let tokenizer = table_tokenizer(&spec);

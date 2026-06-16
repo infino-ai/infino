@@ -73,7 +73,7 @@ const GIB_BYTES: u64 = 1u64 << 30;
 /// Distance metric for the bench vector index.
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Rerank residual codec for the bench vector index.
-const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
+const BENCH_RERANK: RerankCodec = RerankCodec::Sq8ResidualEpsilon;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget in GiB, capping resident RSS during ingest.
@@ -188,8 +188,6 @@ pub fn options_for(
         }
         return opts;
     }
-    let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n_writers().max(1))
@@ -208,7 +206,6 @@ pub fn options_for(
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim: DIM,
-            n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
             rerank_codec: BENCH_RERANK,
