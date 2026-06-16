@@ -25,12 +25,29 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
-/** Storage config the `connect` URI can't carry (S3-compatible creds). */
+/** Storage and cache config the `connect` URI can't carry. All optional. */
 export interface ConnectOptions {
+  /** S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`. */
   endpoint?: string;
   region?: string;
   accessKey?: string;
   secretKey?: string;
+  /** Local disk-cache directory for remote-backed tables. */
+  cacheDir?: string;
+  /** Disk-cache budget in bytes. */
+  cacheBudgetBytes?: number;
+  /** How cold misses are serviced. */
+  coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
+}
+
+/** Row counts returned by `update` / `delete`. */
+export interface MutationStats {
+  /** Rows the predicate matched. */
+  matched: number;
+  /** Rows tombstoned (removed from the live set). */
+  nTombstoned: number;
+  /** Matched rows not found in any live segment. */
+  nNotFound: number;
 }
 
 export interface Bm25SearchOptions {
@@ -256,6 +273,19 @@ export class Table {
   exactMatch(column: string, value: string, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
     const buf = this.inner.exactMatch(column, value, opts.projection);
     return decode(buf, opts.arrow);
+  }
+
+  /** Replace rows matching a SQL predicate (e.g. `"status = 'spam'"`) with
+   * `data` (same shapes as `append`), 1:1 — the matched count must equal the
+   * replacement-row count. Requires durable storage (not `memory://`). */
+  update(predicate: string, data: AppendData): MutationStats {
+    return this.inner.update(predicate, dataToIpc(data, () => this.schema()));
+  }
+
+  /** Delete rows matching a SQL predicate (e.g. `"status = 'spam'"`).
+   * Requires durable storage (not `memory://`). */
+  delete(predicate: string): MutationStats {
+    return this.inner.delete(predicate);
   }
 }
 

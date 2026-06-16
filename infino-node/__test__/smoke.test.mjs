@@ -137,3 +137,47 @@ test("vector search end-to-end", () => {
   const rows = docs.vectorSearch("emb", onehot(0, dim), 10);
   assert.ok(rows.length >= 1);
 });
+
+test("update and delete by SQL predicate (localfs)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-mut-"));
+  const db = connect(dir); // mutations require durable storage
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }, { title: "bravo" }, { title: "charlie" }]);
+
+  const del = docs.delete("title = 'bravo'");
+  assert.equal(del.matched, 1);
+  assert.equal(typeof del.nTombstoned, "number");
+  assert.equal(docs.tokenMatch("title", "bravo").length, 0);
+
+  const upd = docs.update("title = 'alpha'", [{ title: "alpha2" }]); // 1:1 replacement
+  assert.equal(upd.matched, 1);
+  assert.equal(docs.tokenMatch("title", "alpha").length, 0);
+  assert.equal(docs.tokenMatch("title", "alpha2").length, 1);
+});
+
+test("update enforces 1:1 cardinality", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-card-"));
+  const db = connect(dir);
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }, { title: "beta" }]);
+  // predicate matches one row but two replacement rows are supplied
+  assert.throws(() => docs.update("title = 'alpha'", [{ title: "x" }, { title: "y" }]));
+});
+
+test("connect parses cache + cold-fetch options", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-cache-"));
+  const cacheDir = mkdtempSync(join(tmpdir(), "infino-node-cachedir-"));
+  // options parse and apply without error; they're a no-op for local storage.
+  const db = connect(dir, {
+    cacheDir,
+    cacheBudgetBytes: 64 * 1024 * 1024,
+    coldFetchMode: "lazy_foreground_with_background_fill",
+  });
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }]);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
+});
+
+test("connect rejects an invalid coldFetchMode", () => {
+  assert.throws(() => connect("memory://", { coldFetchMode: "nonsense" }));
+});

@@ -40,7 +40,10 @@ use arrow_schema::Schema;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use infino::{BoolMode, InfinoError, Metric, VectorSearchOptions};
+use datafusion::common::DFSchema;
+use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::Expr;
+use infino::{BoolMode, ColdFetchMode, InfinoError, Metric, VectorSearchOptions};
 
 // ---------------------------------------------------------------------------
 // Error mapping
@@ -132,6 +135,25 @@ fn batches_to_ipc(batches: &[RecordBatch]) -> Result<Buffer> {
     write_batches_ipc(schema.as_ref(), batches)
 }
 
+/// Parse a cold-fetch-mode string into a [`ColdFetchMode`]. Short aliases
+/// (`"hybrid"` / `"range"` / `"lazy"`) are accepted alongside the full names.
+fn cold_fetch_from_str(s: &str) -> Result<ColdFetchMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "hybrid_with_prefetch" | "hybrid" => Ok(ColdFetchMode::HybridWithPrefetch),
+        "range_only" | "range" => Ok(ColdFetchMode::RangeOnly),
+        "lazy_foreground_with_background_fill" | "lazy" => {
+            Ok(ColdFetchMode::LazyForegroundWithBackgroundFill)
+        }
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "unknown coldFetchMode {other:?}; use 'hybrid_with_prefetch', 'range_only', \
+                 or 'lazy_foreground_with_background_fill'"
+            ),
+        )),
+    }
+}
+
 /// Parse a boolean-mode string (`"or"` default, or `"and"`).
 fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
     match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
@@ -148,15 +170,44 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Storage config the `connect` URI can't carry. Today: an explicit
-/// S3-compatible endpoint + static credentials; omit for local /
-/// `memory://` / ambient-credential S3.
+/// Storage and cache config the `connect` URI can't carry. All fields are
+/// optional; omit for local / `memory://` / ambient-credential S3 with no
+/// disk cache.
 #[napi(object)]
 pub struct ConnectOptions {
+    /// S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`.
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
+    /// Local disk-cache directory for remote-backed tables.
+    pub cache_dir: Option<String>,
+    /// Disk-cache budget in bytes (a JS number; up to 2^53).
+    pub cache_budget_bytes: Option<f64>,
+    /// Cold-miss strategy: `"hybrid_with_prefetch"` | `"range_only"` |
+    /// `"lazy_foreground_with_background_fill"`.
+    pub cold_fetch_mode: Option<String>,
+}
+
+/// Row counts from an `update` / `delete`.
+#[napi(object)]
+pub struct MutationStats {
+    /// Rows the predicate matched.
+    pub matched: i64,
+    /// Rows tombstoned (removed from the live set).
+    pub n_tombstoned: i64,
+    /// Matched rows that were not found in any live segment.
+    pub n_not_found: i64,
+}
+
+impl From<infino::MutationStats> for MutationStats {
+    fn from(s: infino::MutationStats) -> Self {
+        Self {
+            matched: s.matched() as i64,
+            n_tombstoned: s.n_tombstoned() as i64,
+            n_not_found: s.n_not_found() as i64,
+        }
+    }
 }
 
 /// Declares which columns are full-text (BM25) and which are vector (IVF
@@ -221,25 +272,33 @@ impl IndexSpec {
 #[napi]
 pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connection> {
     let inner = match options {
-        Some(ConnectOptions {
-            endpoint: Some(endpoint),
-            region,
-            access_key,
-            secret_key,
-        }) => {
-            let region = region
-                .ok_or_else(|| Error::new(Status::InvalidArg, "region is required with endpoint"))?;
-            let access_key = access_key.ok_or_else(|| {
-                Error::new(Status::InvalidArg, "accessKey is required with endpoint")
-            })?;
-            let secret_key = secret_key.ok_or_else(|| {
-                Error::new(Status::InvalidArg, "secretKey is required with endpoint")
-            })?;
-            let opts = infino::ConnectOptions::new()
-                .with_s3_endpoint(endpoint, region, access_key, secret_key);
+        None => infino::connect(&uri),
+        Some(o) => {
+            let mut opts = infino::ConnectOptions::new();
+            // S3 endpoint: all four fields are required together.
+            if let Some(endpoint) = o.endpoint {
+                let region = o.region.ok_or_else(|| {
+                    Error::new(Status::InvalidArg, "region is required with endpoint")
+                })?;
+                let access_key = o.access_key.ok_or_else(|| {
+                    Error::new(Status::InvalidArg, "accessKey is required with endpoint")
+                })?;
+                let secret_key = o.secret_key.ok_or_else(|| {
+                    Error::new(Status::InvalidArg, "secretKey is required with endpoint")
+                })?;
+                opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+            }
+            if let Some(dir) = o.cache_dir {
+                opts = opts.with_cache_dir(dir);
+            }
+            if let Some(bytes) = o.cache_budget_bytes {
+                opts = opts.with_cache_budget_bytes(bytes as u64);
+            }
+            if let Some(mode) = o.cold_fetch_mode {
+                opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
+            }
             infino::connect_with(&uri, opts)
         }
-        _ => infino::connect(&uri),
     }
     .map_err(map_err)?;
     Ok(Connection { inner })
@@ -316,22 +375,11 @@ impl Table {
     /// concatenated into one commit; an empty stream is a no-op.
     #[napi]
     pub fn append(&self, data: Buffer) -> Result<()> {
-        let declared = self.inner.schema();
         let batches = read_batches_ipc(&data)?;
         if batches.is_empty() {
             return Ok(());
         }
-        let merged = if batches.len() == 1 {
-            batches[0].clone()
-        } else {
-            let schema = batches[0].schema();
-            concat_batches(&schema, &batches).map_err(arrow_err)?
-        };
-        // Re-wrap the columns under the table's declared schema so the
-        // exact-schema append check accepts otherwise-nullable inputs (a
-        // genuine type mismatch still errors). Mirrors the Python path.
-        let aligned = RecordBatch::try_new(declared, merged.columns().to_vec()).map_err(arrow_err)?;
-        self.inner.append(&aligned).map_err(map_err)
+        self.inner.append(&self.align_batches(batches)?).map_err(map_err)
     }
 
     /// BM25 search over one FTS column. Returns matching rows as an Arrow
@@ -425,11 +473,65 @@ impl Table {
         batches_to_ipc(&batches)
     }
 
+    /// Delete every row matching a SQL `predicate` (e.g. `"status = 'spam'"`),
+    /// returning the mutation counts. Requires durable storage — a `memory://`
+    /// table surfaces a clear error.
+    #[napi]
+    pub fn delete(&self, predicate: String) -> Result<MutationStats> {
+        let expr = self.parse_predicate(&predicate)?;
+        Ok(self.inner.delete(expr).map_err(map_err)?.into())
+    }
+
+    /// Replace every row matching a SQL `predicate` with `rows` (an Arrow IPC
+    /// `Buffer`, like `append`), 1:1 — the matched count must equal the
+    /// replacement-row count or the engine errors. Requires durable storage.
+    #[napi]
+    pub fn update(&self, predicate: String, rows: Buffer) -> Result<MutationStats> {
+        let expr = self.parse_predicate(&predicate)?;
+        let batches = read_batches_ipc(&rows)?;
+        let aligned = if batches.is_empty() {
+            RecordBatch::new_empty(self.inner.schema())
+        } else {
+            self.align_batches(batches)?
+        };
+        Ok(self.inner.update(expr, &aligned).map_err(map_err)?.into())
+    }
+
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty
     /// table carrying the schema; read with `tableFromIPC`).
     #[napi]
     pub fn schema(&self) -> Result<Buffer> {
         let declared = self.inner.schema();
         write_batches_ipc(declared.as_ref(), &[])
+    }
+}
+
+impl Table {
+    /// Merge IPC batches into one and re-wrap under the table's declared
+    /// schema, so the exact-schema check accepts otherwise-nullable inputs (a
+    /// genuine type mismatch still errors). Caller guarantees `batches` is
+    /// non-empty. Shared by `append` and `update`.
+    fn align_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+        let declared = self.inner.schema();
+        let merged = if batches.len() == 1 {
+            batches.into_iter().next().expect("len == 1")
+        } else {
+            let schema = batches[0].schema();
+            concat_batches(&schema, &batches).map_err(arrow_err)?
+        };
+        RecordBatch::try_new(declared, merged.columns().to_vec()).map_err(arrow_err)
+    }
+
+    /// Parse a SQL predicate string into a DataFusion `Expr`, resolved against
+    /// the table's schema. Keeps Python and Node on the same predicate model:
+    /// a SQL `WHERE`-style string rather than a hand-built expression tree.
+    fn parse_predicate(&self, predicate: &str) -> Result<Expr> {
+        let df_schema = DFSchema::try_from(self.inner.schema().as_ref().clone())
+            .map_err(|e| Error::new(Status::InvalidArg, format!("schema: {e}")))?;
+        SessionContext::new()
+            .parse_sql_expr(predicate, &df_schema)
+            .map_err(|e| {
+                Error::new(Status::InvalidArg, format!("invalid predicate {predicate:?}: {e}"))
+            })
     }
 }
