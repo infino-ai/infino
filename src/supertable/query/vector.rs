@@ -588,9 +588,11 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         match filter {
             None => self.block_on(self.vector_search_async(column, query, k, options)),
-            Some(f) => self.block_on(self.vector_hits_filtered_async(
-                column, query, k, options, f.column, f.query, f.mode,
-            )),
+            Some(f) => {
+                self.block_on(self.vector_hits_filtered_async(
+                    column, query, k, options, f.column, f.query, f.mode,
+                ))
+            }
         }
     }
 }
@@ -952,7 +954,10 @@ mod tests {
         let mut q = vec![0f32; dim];
         q[0] = 1.0;
         let opts = VectorSearchOptions::new().with_nprobe(1);
-        let hits = st.reader().vector_hits("emb", &q, 10, opts, None).expect("query");
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 10, opts, None)
+            .expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
         assert!(
@@ -1214,7 +1219,17 @@ mod tests {
             .with_rerank_mult(64);
 
         let hits = reader
-            .vector_hits("emb", &query, k, opts, Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }))
+            .vector_hits(
+                "emb",
+                &query,
+                k,
+                opts,
+                Some(VectorFilter {
+                    column: "title",
+                    query: "alpha",
+                    mode: BoolMode::Or,
+                }),
+            )
             .expect("filtered query");
 
         // (a) Hard constraint: EVERY returned hit is an alpha row.
@@ -1275,7 +1290,17 @@ mod tests {
             .with_nprobe(64)
             .with_rerank_mult(64);
         let hits = reader
-            .vector_hits("emb", &query, 6, opts, Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }))
+            .vector_hits(
+                "emb",
+                &query,
+                6,
+                opts,
+                Some(VectorFilter {
+                    column: "title",
+                    query: "alpha",
+                    mode: BoolMode::Or,
+                }),
+            )
             .expect("filtered query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -1302,7 +1327,11 @@ mod tests {
                 &query,
                 10,
                 opts,
-                Some(VectorFilter { column: "title", query: "nonexistenttoken", mode: BoolMode::Or }),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "nonexistenttoken",
+                    mode: BoolMode::Or,
+                }),
             )
             .expect("filtered query");
         assert!(
@@ -1324,7 +1353,18 @@ mod tests {
             .with_rerank_mult(64);
 
         let bare = st
-            .vector_search("emb", &query, 5, opts, Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }), None)
+            .vector_search(
+                "emb",
+                &query,
+                5,
+                opts,
+                Some(VectorFilter {
+                    column: "title",
+                    query: "alpha",
+                    mode: BoolMode::Or,
+                }),
+                None,
+            )
             .expect("filtered rows bare");
         let n: usize = bare.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(n, 5, "five matching nearest rows");
@@ -1336,7 +1376,11 @@ mod tests {
                 &query,
                 5,
                 opts,
-                Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "alpha",
+                    mode: BoolMode::Or,
+                }),
                 Some(&["_id", "title", "score"]),
             )
             .expect("filtered rows projected");
@@ -1366,7 +1410,11 @@ mod tests {
                 &query,
                 0,
                 VectorSearchOptions::new(),
-                Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "alpha",
+                    mode: BoolMode::Or,
+                }),
             )
             .expect("k=0");
         assert!(hits.is_empty());
