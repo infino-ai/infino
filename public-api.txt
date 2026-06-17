@@ -217,9 +217,7 @@ pub fn infino::Supertable::compact(&self, &infino::CompactionSettings) -> core::
 impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 impl infino::Supertable
-pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-impl infino::Supertable
-pub fn infino::Supertable::vector_search_filtered(&self, &str, &[f32], usize, infino::VectorSearchOptions, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> infino::Supertable
 impl core::fmt::Debug for infino::Supertable
@@ -231,6 +229,17 @@ impl core::marker::Unpin for infino::Supertable
 impl core::marker::UnsafeUnpin for infino::Supertable
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Supertable
 impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
+pub struct infino::VectorFilter<'a>
+pub infino::VectorFilter::column: &'a str
+pub infino::VectorFilter::mode: infino::BoolMode
+pub infino::VectorFilter::query: &'a str
+impl<'a> core::marker::Freeze for infino::VectorFilter<'a>
+impl<'a> core::marker::Send for infino::VectorFilter<'a>
+impl<'a> core::marker::Sync for infino::VectorFilter<'a>
+impl<'a> core::marker::Unpin for infino::VectorFilter<'a>
+impl<'a> core::marker::UnsafeUnpin for infino::VectorFilter<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for infino::VectorFilter<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for infino::VectorFilter<'a>
 pub struct infino::VectorSearchOptions
 pub infino::VectorSearchOptions::nprobe: usize
 impl infino::VectorSearchOptions
