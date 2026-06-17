@@ -464,15 +464,12 @@ async fn supertable_real_azure_round_trip() {
 
         let reader = consumer.reader();
         let manifest = reader.manifest();
-        let list = manifest
-            .list
-            .as_ref()
-            .ok_or_else(|| "real Azure open did not recover persisted manifest list".to_string())?;
         let mut cleanup_keys = vec![
             "_supertable/current".to_string(),
             infino::supertable::manifest::commit::list_uri(consumer.manifest_id()),
         ];
-        cleanup_keys.extend(list.parts.iter().map(|p| p.uri.clone()));
+        let list_entries = manifest.get_all_list_entries();
+        cleanup_keys.extend(list_entries.iter().map(|p| p.uri.clone()));
         cleanup_keys.extend(
             manifest
                 .superfiles

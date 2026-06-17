@@ -194,7 +194,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     )
     .expect("open");
     let reader = consumer.reader();
-    let segs = &reader.manifest().superfile_list.superfiles;
+    let segs = reader.manifest().get_all_superfiles();
     assert_eq!(
         segs.len(),
         N_HANDLES,

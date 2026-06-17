@@ -156,7 +156,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     // Hierarchical manifests keep segments in lazily-loaded parts; the
     // flat view may be partial, so classification would be unsound.
     let manifest = provider.manifest();
-    if manifest.list.is_some() {
+    if !manifest.is_in_process_only() {
         return Ok(None);
     }
     let id_column = manifest.options.id_column.as_str();

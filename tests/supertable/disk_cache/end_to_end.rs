@@ -328,7 +328,7 @@ fn manifest_superfiles_are_not_pinned_by_supertable_create() {
     let post = cache.current_pinned_uris();
     assert!(post.is_empty(), "expected empty pinned set; got {post:?}");
     let reader = st.reader();
-    assert_eq!(reader.manifest().superfile_list.superfiles.len(), 1);
+    assert_eq!(reader.manifest().get_all_superfiles().len(), 1);
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn manifest_superfiles_are_not_pinned_by_supertable_open() {
         pinned.is_empty(),
         "expected empty pinned set; got {pinned:?}"
     );
-    let n_superfiles = consumer.reader().manifest().superfile_list.superfiles.len();
+    let n_superfiles = consumer.reader().manifest().get_all_superfiles().len();
     assert_eq!(n_superfiles, 1);
 }
 

@@ -96,8 +96,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
             .expect("open");
         let manifest = st.reader().manifest().clone();
         target_id = manifest
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .first()
             .expect("superfile present")
             .id_min;
@@ -178,7 +177,7 @@ fn create_with_existing_pointer_delegates_to_open() {
     .expect("create with existing pointer");
     let manifest = st.reader().manifest().clone();
     assert!(
-        !manifest.superfile_list.superfiles.is_empty(),
+        !manifest.get_all_superfiles().is_empty(),
         "create against existing pointer must load the committed manifest"
     );
     let batches = st
@@ -228,8 +227,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
             .expect("open for manifest");
         let manifest = st.reader().manifest().clone();
         target_id = manifest
-            .superfile_list
-            .superfiles
+            .get_all_superfiles()
             .first()
             .expect("superfile")
             .id_min;

@@ -41,6 +41,7 @@ impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 pub enum infino::CompactionError
+pub infino::CompactionError::AlreadyCompacting
 pub infino::CompactionError::Build(alloc::string::String)
 pub infino::CompactionError::Commit(alloc::string::String)
 pub infino::CompactionError::EmptyMergedSuperfile

@@ -17,7 +17,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { connect, IndexSpec } from "../infino/index.js";
+import { connect, IndexSpec, BUILDER_ID } from "../infino/index.js";
 import { Schema, Field, LargeUtf8, Float32, FixedSizeList, Table, vectorFromArray } from "apache-arrow";
 
 // FTS columns must be LargeUtf8; non-null to match the appended data.
@@ -108,6 +108,11 @@ test("tokenMatch and exactMatch return unranked rows", () => {
   assert.equal(ex.length, 1);
 });
 
+test("BUILDER_ID is a non-empty string", () => {
+  assert.equal(typeof BUILDER_ID, "string");
+  assert.ok(BUILDER_ID.length > 0);
+});
+
 test("unknown table throws", () => {
   const db = connect("memory://");
   assert.throws(() => db.openTable("nope"));
@@ -136,4 +141,78 @@ test("vector search end-to-end", () => {
   // query vector as a plain array (wrapper coerces to Float32Array).
   const rows = docs.vectorSearch("emb", onehot(0, dim), 10);
   assert.ok(rows.length >= 1);
+
+  // nprobe + rerankMult tuning knobs are accepted.
+  const tuned = docs.vectorSearch("emb", onehot(0, dim), 5, { nprobe: 1, rerankMult: 4 });
+  assert.ok(tuned.length >= 1);
+});
+
+test("update and delete by SQL predicate (localfs)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-mut-"));
+  const db = connect(dir); // mutations require durable storage
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }, { title: "bravo" }, { title: "charlie" }]);
+
+  const del = docs.delete("title = 'bravo'");
+  assert.equal(del.matched, 1);
+  assert.equal(typeof del.nTombstoned, "number");
+  assert.equal(docs.tokenMatch("title", "bravo").length, 0);
+
+  const upd = docs.update("title = 'alpha'", [{ title: "alpha2" }]); // 1:1 replacement
+  assert.equal(upd.matched, 1);
+  assert.equal(docs.tokenMatch("title", "alpha").length, 0);
+  assert.equal(docs.tokenMatch("title", "alpha2").length, 1);
+});
+
+test("compact merges superfiles, data intact (localfs)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-compact-"));
+  const db = connect(dir);
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  // three appends => three superfiles
+  docs.append([{ title: "alpha" }]);
+  docs.append([{ title: "beta" }]);
+  docs.append([{ title: "gamma" }]);
+
+  docs.compact({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMemoryMb: 512 });
+  // data is intact after compaction
+  assert.equal(docs.tokenMatch("title", "beta").length, 1);
+  assert.equal(docs.tokenMatch("title", "alpha").length, 1);
+  assert.equal(Number(db.querySql("SELECT COUNT(*) AS n FROM docs")[0].n), 3);
+
+  docs.compact(); // default settings also run cleanly
+});
+
+test("update and delete require durable storage (reject memory://)", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }]);
+  assert.throws(() => docs.delete("title = 'alpha'"));
+  assert.throws(() => docs.update("title = 'alpha'", [{ title: "beta" }]));
+});
+
+test("update enforces 1:1 cardinality", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-card-"));
+  const db = connect(dir);
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }, { title: "beta" }]);
+  // predicate matches one row but two replacement rows are supplied
+  assert.throws(() => docs.update("title = 'alpha'", [{ title: "x" }, { title: "y" }]));
+});
+
+test("connect parses cache + cold-fetch options", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-cache-"));
+  const cacheDir = mkdtempSync(join(tmpdir(), "infino-node-cachedir-"));
+  // options parse and apply without error; they're a no-op for local storage.
+  const db = connect(dir, {
+    cacheDir,
+    cacheBudgetBytes: 64 * 1024 * 1024,
+    coldFetchMode: "lazy_foreground_with_background_fill",
+  });
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }]);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
+});
+
+test("connect rejects an invalid coldFetchMode", () => {
+  assert.throws(() => connect("memory://", { coldFetchMode: "nonsense" }));
 });

@@ -34,5 +34,11 @@ arrow = { version = "58", features = ["ipc"] }
 arrow-array = "58"
 arrow-schema = "58"
 
+# Parse a SQL predicate string (for `update` / `delete`) into a DataFusion
+# `Expr` — the type `infino::Supertable::update` / `delete` take. Pinned to
+# infino's datafusion version so the `Expr` type unifies with the core
+# signatures; feature unification reuses infino's already-compiled datafusion.
+datafusion = "53"
+
 [build-dependencies]
 napi-build = "2"

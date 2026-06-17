@@ -133,17 +133,11 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     {
         let r = consumer.reader();
         let m = r.manifest();
-        let list = m.list.as_ref().expect("list");
-        assert_eq!(list.parts.len(), HIERARCHICAL_PART_COUNT);
-        let loaded = list
-            .parts
+        let list_entries = m.get_all_list_entries();
+        assert_eq!(list_entries.len(), HIERARCHICAL_PART_COUNT);
+        let loaded = list_entries
             .iter()
-            .filter(|e| {
-                m.parts
-                    .get(&e.part_id)
-                    .and_then(|c| c.value().get().cloned())
-                    .is_some()
-            })
+            .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
             .count();
         assert_eq!(loaded, 0, "lazy-open should not have eager-fetched");
     }
@@ -164,16 +158,10 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // Post-condition: exactly one OnceCell populated.
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    let n_loaded = list
-        .parts
+    let list_entries = m.get_all_list_entries();
+    let n_loaded = list_entries
         .iter()
-        .filter(|e| {
-            m.parts
-                .get(&e.part_id)
-                .and_then(|c| c.value().get().cloned())
-                .is_some()
-        })
+        .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
     assert_eq!(
         n_loaded, 1,
@@ -214,16 +202,10 @@ fn bm25_term_in_no_part_loads_nothing() {
     // part was ever loaded.
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    let n_loaded = list
-        .parts
+    let list_entries = m.get_all_list_entries();
+    let n_loaded = list_entries
         .iter()
-        .filter(|e| {
-            m.parts
-                .get(&e.part_id)
-                .and_then(|c| c.value().get().cloned())
-                .is_some()
-        })
+        .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
     // Allow some flexibility for bloom false-positives —
     // in degenerate cases the bloom can spuriously claim
@@ -266,16 +248,10 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
 
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    let n_loaded = list
-        .parts
+    let list_entries = m.get_all_list_entries();
+    let n_loaded = list_entries
         .iter()
-        .filter(|e| {
-            m.parts
-                .get(&e.part_id)
-                .and_then(|c| c.value().get().cloned())
-                .is_some()
-        })
+        .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
     // Term-range prune is range-based — a part survives
     // iff [prefix, prefix_upper_bound) overlaps the
@@ -328,16 +304,10 @@ fn sql_loads_all_parts_returns_correct_count() {
     // Post: all 5 parts loaded (SQL doesn't list-prune).
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    let n_loaded = list
-        .parts
+    let list_entries = m.get_all_list_entries();
+    let n_loaded = list_entries
         .iter()
-        .filter(|e| {
-            m.parts
-                .get(&e.part_id)
-                .and_then(|c| c.value().get().cloned())
-                .is_some()
-        })
+        .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
     assert_eq!(
         n_loaded, HIERARCHICAL_PART_COUNT,
@@ -376,13 +346,10 @@ fn eager_mode_query_paths_observationally_unchanged() {
     // Eager: 1 part loaded at open.
     let r = consumer.reader();
     let m = r.manifest();
-    let list = m.list.as_ref().expect("list");
-    assert_eq!(list.parts.len(), 1);
+    let list_entries = m.get_all_list_entries();
+    assert_eq!(list_entries.len(), 1);
     assert!(
-        m.parts
-            .get(&list.parts[0].part_id)
-            .and_then(|c| c.value().get().cloned())
-            .is_some(),
+        m.get_cached_part_by_id(&list_entries[0].part_id).is_some(),
         "eager mode pre-loads the part at open"
     );
     drop(r);

@@ -549,7 +549,7 @@ impl TableProvider for SupertableProvider {
         // there, so whole-table claims would be wrong. The scan-level
         // statistics (computed from the actually-flattened survivors)
         // still apply in that mode.
-        if self.manifest.list.is_some() {
+        if !self.manifest.is_in_process_only() {
             return None;
         }
         Some(self.statistics_for(&self.manifest.superfiles))
