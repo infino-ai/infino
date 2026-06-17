@@ -60,6 +60,13 @@ def test_connect_rejects_invalid_cold_fetch_mode():
         infino.connect("memory://", cold_fetch_mode="nonsense")
 
 
+def test_connect_rejects_partial_s3_credentials():
+    # A credential without the rest must error, not silently fall back to
+    # ambient credentials.
+    with pytest.raises(ValueError):
+        infino.connect("s3://bucket/prefix", access_key="only-this")
+
+
 def test_query_sql_returns_pyarrow_table():
     db = infino.connect("memory://")
     table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))

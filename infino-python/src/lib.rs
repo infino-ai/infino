@@ -105,13 +105,18 @@ fn connect(
     let inner = py.detach(|| {
         let mut opts = ConnectOptions::new();
         let mut has_options = false;
-        if let Some(endpoint) = endpoint {
+        // The S3 endpoint + credentials are all-or-nothing: any one of them
+        // means the caller wants an explicit endpoint, so require the rest
+        // rather than silently dropping a partial config back to ambient.
+        if endpoint.is_some() || region.is_some() || access_key.is_some() || secret_key.is_some() {
+            let endpoint = endpoint
+                .ok_or_else(|| PyValueError::new_err("endpoint is required with S3 credentials"))?;
             let region = region
-                .ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
+                .ok_or_else(|| PyValueError::new_err("region is required for an S3 endpoint"))?;
             let access_key = access_key
-                .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
+                .ok_or_else(|| PyValueError::new_err("access_key is required for an S3 endpoint"))?;
             let secret_key = secret_key
-                .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
+                .ok_or_else(|| PyValueError::new_err("secret_key is required for an S3 endpoint"))?;
             opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
             has_options = true;
         }
