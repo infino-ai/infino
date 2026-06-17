@@ -111,6 +111,14 @@ pub enum PartitionStrategy {
         column: String,
         boundaries: Vec<Vec<u8>>,
     },
+    /// Partition by vector distance to fixed global centroids.
+    /// Each row is assigned to the cell whose centroid is nearest.
+    VectorCell {
+        column: String,
+        n_cells: u32,
+        dim: usize,
+        centroids_b64: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +303,12 @@ enum PartitionStrategyDto {
     ColumnRange {
         column: String,
         boundaries: Vec<String>, // base64 per boundary
+    },
+    VectorCell {
+        column: String,
+        n_cells: u32,
+        dim: u64,
+        centroids_b64: String,
     },
 }
 
@@ -550,6 +564,17 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 boundaries: boundaries.iter().map(|b| encode_b64(b)).collect(),
             }
         }
+        PartitionStrategy::VectorCell {
+            column,
+            n_cells,
+            dim,
+            centroids_b64,
+        } => PartitionStrategyDto::VectorCell {
+            column: column.clone(),
+            n_cells: *n_cells,
+            dim: *dim as u64,
+            centroids_b64: centroids_b64.clone(),
+        },
     }
 }
 
@@ -575,6 +600,17 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
                 boundaries: bs,
             }
         }
+        PartitionStrategyDto::VectorCell {
+            column,
+            n_cells,
+            dim,
+            centroids_b64,
+        } => PartitionStrategy::VectorCell {
+            column,
+            n_cells,
+            dim: dim as usize,
+            centroids_b64,
+        },
     })
 }
 

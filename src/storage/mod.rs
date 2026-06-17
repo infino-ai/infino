@@ -251,3 +251,88 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
         None
     }
 }
+
+/// A wrapper that prepends a sub-prefix to every URI before delegating to an
+/// inner `StorageProvider`. Used to give the hidden `VectorIndexSuperTable` its
+/// own namespace under the user table's storage prefix.
+#[derive(Debug)]
+pub struct PrefixedStorageProvider {
+    inner: Arc<dyn StorageProvider>,
+    sub_prefix: String,
+}
+
+impl PrefixedStorageProvider {
+    pub fn new(inner: Arc<dyn StorageProvider>, sub_prefix: impl Into<String>) -> Self {
+        let mut sub = sub_prefix.into();
+        if !sub.is_empty() && !sub.ends_with('/') {
+            sub.push('/');
+        }
+        Self {
+            inner,
+            sub_prefix: sub,
+        }
+    }
+
+    fn prefixed(&self, uri: &str) -> String {
+        format!("{}{}", self.sub_prefix, uri)
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageProvider for PrefixedStorageProvider {
+    async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+        self.inner.head(&self.prefixed(uri)).await
+    }
+
+    async fn get(&self, uri: &str) -> Result<(bytes::Bytes, ObjectMeta), StorageError> {
+        self.inner.get(&self.prefixed(uri)).await
+    }
+
+    async fn get_range(
+        &self,
+        uri: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, StorageError> {
+        self.inner.get_range(&self.prefixed(uri), range).await
+    }
+
+    async fn put_atomic(
+        &self,
+        uri: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner.put_atomic(&self.prefixed(uri), bytes).await
+    }
+
+    async fn put_if_match(
+        &self,
+        uri: &str,
+        bytes: bytes::Bytes,
+        expected_etag: Option<&str>,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner
+            .put_if_match(&self.prefixed(uri), bytes, expected_etag)
+            .await
+    }
+
+    async fn put_multipart(
+        &self,
+        uri: &str,
+    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        self.inner.put_multipart(&self.prefixed(uri)).await
+    }
+
+    async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+        self.inner.delete(&self.prefixed(uri)).await
+    }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let full = self.prefixed(prefix);
+        let results = self.inner.list_with_prefix(&full).await?;
+        let strip_len = self.sub_prefix.len();
+        Ok(results
+            .into_iter()
+            .map(|s| s[strip_len..].to_owned())
+            .collect())
+    }
+}

@@ -33,6 +33,8 @@ pub enum PartitionKey {
     Hash(u32),
     /// `column_range` bucket = boundary index.
     ColumnRange(u16),
+    /// Cell id (nearest centroid) for VectorCell strategy.
+    VectorCell(u32),
 }
 
 /// Encode a `PartitionKey` to its on-disk bytes — the shape
@@ -44,6 +46,7 @@ pub fn encode_partition_key(key: &PartitionKey) -> Vec<u8> {
         PartitionKey::TimeRange(b) => b.to_le_bytes().to_vec(),
         PartitionKey::Hash(b) => b.to_le_bytes().to_vec(),
         PartitionKey::ColumnRange(b) => b.to_le_bytes().to_vec(),
+        PartitionKey::VectorCell(b) => b.to_le_bytes().to_vec(),
     }
 }
 
@@ -82,6 +85,15 @@ pub fn decode_partition_key(
                 ))
             })?;
             Ok(PartitionKey::ColumnRange(u16::from_le_bytes(arr)))
+        }
+        PartitionStrategy::VectorCell { .. } => {
+            let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+                CommitError::PointerParse(format!(
+                    "VectorCell partition_key must be 4 bytes; got {}",
+                    bytes.len()
+                ))
+            })?;
+            Ok(PartitionKey::VectorCell(u32::from_le_bytes(arr)))
         }
     }
 }
@@ -182,6 +194,25 @@ pub fn assign_partition(
                      no writer currently emits ColumnRange-partitioned commits"
                 .into(),
         }),
+        PartitionStrategy::VectorCell { n_cells, .. } => {
+            let cell = seg
+                .partition_hint
+                .ok_or_else(|| CommitError::SuperfileSpansPartition {
+                    detail: format!(
+                        "VectorCell{{n_cells:{n_cells}}} requires pre-sharded superfiles; \
+                         partition_hint must be Some(cell_id) (superfile {})",
+                        seg.uri.0
+                    ),
+                })?;
+            if cell >= *n_cells {
+                return Err(CommitError::SuperfileSpansPartition {
+                    detail: format!(
+                        "VectorCell{{n_cells:{n_cells}}} got partition_hint={cell} (out of range)"
+                    ),
+                });
+            }
+            Ok(PartitionKey::VectorCell(cell))
+        }
     }
 }
 

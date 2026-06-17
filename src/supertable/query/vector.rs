@@ -60,6 +60,7 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
+use base64::Engine;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
@@ -119,6 +120,190 @@ impl SupertableReader {
 
         if superfiles.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // 024a: route unfiltered vector queries through the hidden
+        // VectorIndexSuperTable, narrowed to routed cell-partitions.
+        if let Some(vit) = self.vector_index_table() {
+            let vit_reader = vit.reader();
+            let vit_manifest = vit_reader.manifest();
+            if !vit_manifest.superfiles.is_empty() {
+                let strategy = vit_manifest.get_partition_strategy();
+                let routed_cells: Vec<u32> = match &strategy {
+                    crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                        centroids_b64,
+                        dim,
+                        n_cells,
+                        ..
+                    } => {
+                        let centroid_bytes = base64::engine::general_purpose::STANDARD
+                            .decode(centroids_b64)
+                            .unwrap_or_default();
+                        let centroids: Vec<f32> = centroid_bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect();
+                        if centroids.is_empty() || *dim == 0 || query.len() != *dim {
+                            (0..*n_cells).collect()
+                        } else {
+                            let mut scored: Vec<(u32, f32)> = (0..*n_cells)
+                                .map(|c| {
+                                    let cen = &centroids[c as usize * dim..(c as usize + 1) * dim];
+                                    (c, crate::superfile::vector::distance::l2_sq(query, cen))
+                                })
+                                .collect();
+                            scored.sort_by(|a, b| {
+                                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let nprobe = options.nprobe.max(2).min(scored.len());
+                            scored.truncate(nprobe);
+                            scored.into_iter().map(|(c, _)| c).collect()
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                let routed_keys: std::collections::HashSet<Vec<u8>> = routed_cells
+                    .iter()
+                    .map(|c| c.to_le_bytes().to_vec())
+                    .collect();
+                let n_total = vit_manifest.superfiles.len();
+                let n_routed = if routed_keys.is_empty() {
+                    n_total
+                } else {
+                    vit_manifest
+                        .superfiles
+                        .iter()
+                        .filter(|sf| {
+                            sf.partition_key.is_empty() || routed_keys.contains(&sf.partition_key)
+                        })
+                        .count()
+                };
+                eprintln!(
+                    "[024a] query routed to {} cells, {}/{} superfiles",
+                    routed_cells.len(),
+                    n_routed,
+                    n_total,
+                );
+                // Build cell-filtered superfile set and fan out using existing
+                // per-superfile cluster selection + rerank, touching only the
+                // routed cells' superfiles.
+                let cell_superfiles: Vec<Arc<crate::supertable::manifest::SuperfileEntry>> =
+                    if routed_keys.is_empty() {
+                        vit_manifest.superfiles.clone()
+                    } else {
+                        vit_manifest
+                            .superfiles
+                            .iter()
+                            .filter(|sf| {
+                                sf.partition_key.is_empty()
+                                    || routed_keys.contains(&sf.partition_key)
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                if cell_superfiles.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let vit_metric = vit_manifest
+                    .options
+                    .vector_columns
+                    .iter()
+                    .find(|vc| vc.column == column)
+                    .map(|vc| vc.metric)
+                    .unwrap_or(Metric::L2Sq);
+                let sum_q: f32 = query.iter().sum();
+                let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+                let mut vi_scored: Vec<(usize, u32, f32)> = Vec::new();
+                let mut vi_fallback: Vec<usize> = Vec::new();
+                for (si, entry) in cell_superfiles.iter().enumerate() {
+                    match entry.vector_summary.get(column) {
+                        Some(vs)
+                            if !vs.clusters.is_empty()
+                                && vs.clusters.dim as usize == query.len() =>
+                        {
+                            vs.clusters.score_clusters_into(
+                                vit_metric,
+                                query,
+                                sum_q,
+                                norm_q_sq,
+                                |c, score| {
+                                    vi_scored.push((si, c, score));
+                                },
+                            );
+                        }
+                        _ => vi_fallback.push(si),
+                    }
+                }
+                let vi_n_eligible = cell_superfiles.len().saturating_sub(vi_fallback.len());
+                let vi_budget = options
+                    .nprobe
+                    .saturating_mul(vi_n_eligible.max(1))
+                    .max(options.nprobe);
+                if vi_scored.len() > vi_budget {
+                    vi_scored.select_nth_unstable_by(vi_budget, |a, b| {
+                        a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+                    });
+                    vi_scored.truncate(vi_budget);
+                }
+                let mut vi_per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
+                for (si, c, _) in vi_scored {
+                    vi_per_seg.entry(si).or_default().push(c);
+                }
+                let vi_fallback_set: std::collections::HashSet<usize> =
+                    vi_fallback.into_iter().collect();
+                let mut vi_units: Vec<(Arc<crate::supertable::manifest::SuperfileEntry>, Probe)> =
+                    Vec::new();
+                for (si, entry) in cell_superfiles.iter().enumerate() {
+                    if let Some(ids) = vi_per_seg.remove(&si) {
+                        vi_units.push((Arc::clone(entry), Probe::Clusters(ids)));
+                    } else if vi_fallback_set.contains(&si) {
+                        vi_units.push((Arc::clone(entry), Probe::Nprobe));
+                    }
+                }
+                if !vi_units.is_empty() {
+                    let column_arc = Arc::new(column.to_owned());
+                    let query_arc = Arc::new(query.to_vec());
+                    let kernel = move |reader: Arc<crate::superfile::SuperfileReader>,
+                                       probe: Probe| {
+                        let col = Arc::clone(&column_arc);
+                        let q = Arc::clone(&query_arc);
+                        async move {
+                            let res = match probe {
+                                Probe::Clusters(ids) => {
+                                    reader
+                                        .vector_search_clusters(&col, &q, k, &ids, options)
+                                        .await
+                                }
+                                Probe::Nprobe => {
+                                    reader.vector_hits_async(&col, &q, k, options).await
+                                }
+                            };
+                            res.map_err(|e| QueryError::Parquet(e.to_string()))
+                        }
+                    };
+                    let fw = vit_manifest
+                        .options
+                        .reader_pool
+                        .current_num_threads()
+                        .max(1);
+                    let mut per_sf = Vec::new();
+                    let mut rem = vi_units;
+                    while !rem.is_empty() {
+                        let n = fw.min(rem.len());
+                        let wave: Vec<_> = rem.drain(..n).collect();
+                        per_sf.extend(
+                            crate::supertable::query::dispatch::fanout(
+                                &vit_reader,
+                                wave,
+                                kernel.clone(),
+                            )
+                            .await?,
+                        );
+                    }
+                    return Ok(top_k_ascending(per_sf, k));
+                }
+                return Ok(Vec::new());
+            }
         }
 
         // ---- Global cross-superfile cluster selection.

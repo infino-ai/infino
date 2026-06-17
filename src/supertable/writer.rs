@@ -55,6 +55,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch,
 };
+use base64::Engine;
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::PutPayload;
@@ -228,6 +229,82 @@ fn split_buffer_into_row_shards(
     }
     shards.retain(|s| !s.is_empty());
     shards
+}
+
+/// Split buffered rows into per-cell shards based on nearest centroid.
+/// Each shard carries all rows assigned to one cell; the caller stamps
+/// `partition_hint` on the resulting superfile entries.
+fn split_buffer_by_vector_cell(
+    buffer: Vec<BufferedBatch>,
+    centroids: &[f32],
+    dim: usize,
+    n_cells: u32,
+    vec_col_idx: usize,
+) -> Vec<(u32, Vec<BufferedBatch>)> {
+    use crate::superfile::vector::distance::l2_sq;
+    let mut cell_batches: Vec<Vec<BufferedBatch>> =
+        (0..n_cells as usize).map(|_| Vec::new()).collect();
+    for batch in buffer {
+        let n_rows = batch.scalar.num_rows();
+        if n_rows == 0 {
+            continue;
+        }
+        let vecs = &batch.vectors[vec_col_idx];
+        let mut per_cell_rows: Vec<Vec<usize>> =
+            (0..n_cells as usize).map(|_| Vec::new()).collect();
+        for row in 0..n_rows {
+            let v = &vecs.values()[row * dim..(row + 1) * dim];
+            let mut best_cell = 0u32;
+            let mut best_dist = f32::INFINITY;
+            for c in 0..n_cells as usize {
+                let centroid = &centroids[c * dim..(c + 1) * dim];
+                let d = l2_sq(v, centroid);
+                if d < best_dist {
+                    best_dist = d;
+                    best_cell = c as u32;
+                }
+            }
+            per_cell_rows[best_cell as usize].push(row);
+        }
+        for (cell_id, rows) in per_cell_rows.into_iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let indices =
+                arrow_array::UInt32Array::from(rows.iter().map(|&r| r as u32).collect::<Vec<_>>());
+            let scalar_cols: Vec<arrow_array::ArrayRef> = (0..batch.scalar.num_columns())
+                .map(|col_idx| {
+                    arrow::compute::take(batch.scalar.column(col_idx), &indices, None)
+                        .expect("take column")
+                })
+                .collect();
+            let scalar_batch =
+                arrow_array::RecordBatch::try_new(batch.scalar.schema(), scalar_cols)
+                    .expect("rebuild batch");
+            let vectors: Vec<std::sync::Arc<arrow_array::Float32Array>> = batch
+                .vectors
+                .iter()
+                .map(|v| {
+                    let vdim = v.len() / n_rows;
+                    let mut out = Vec::with_capacity(rows.len() * vdim);
+                    for &r in &rows {
+                        out.extend_from_slice(&v.values()[r * vdim..(r + 1) * vdim]);
+                    }
+                    std::sync::Arc::new(arrow_array::Float32Array::from(out))
+                })
+                .collect();
+            cell_batches[cell_id].push(BufferedBatch {
+                scalar: scalar_batch,
+                vectors,
+            });
+        }
+    }
+    cell_batches
+        .into_iter()
+        .enumerate()
+        .filter(|(_, batches)| !batches.is_empty())
+        .map(|(cell_id, batches)| (cell_id as u32, batches))
+        .collect()
 }
 
 /// The public folded `update` / `delete` buffer exactly one mutation
@@ -922,6 +999,39 @@ impl SupertableWriter {
         let buffer = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
+        // Dual write to hidden VectorIndexSuperTable (best-effort).
+        // Build vector-only RecordBatches matching the hidden table schema.
+        if let Some(vit) = self.inner.vector_index_table.as_ref()
+            && let Ok(mut vw) = vit.writer()
+        {
+            let hidden_schema = vit.options().schema.clone();
+            for batch in &buffer {
+                let mut cols: Vec<arrow_array::ArrayRef> = Vec::new();
+                let n_rows = batch.scalar.num_rows();
+                for (vi, vc) in self.inner.options.vector_columns.iter().enumerate() {
+                    let flat = &batch.vectors[vi];
+                    let values = Arc::new(Float32Array::from(
+                        flat.values()[..n_rows * vc.dim].to_vec(),
+                    ));
+                    let list = FixedSizeListArray::new(
+                        Arc::new(arrow_schema::Field::new(
+                            "item",
+                            arrow_schema::DataType::Float32,
+                            true,
+                        )),
+                        vc.dim as i32,
+                        values,
+                        None,
+                    );
+                    cols.push(Arc::new(list));
+                }
+                if let Ok(rb) = RecordBatch::try_new(hidden_schema.clone(), cols) {
+                    let _ = vw.append(&rb);
+                }
+            }
+            let _ = vw.commit();
+        }
+
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
             return Ok(());
@@ -938,7 +1048,45 @@ impl SupertableWriter {
             .iter()
             .map(|vc| vc.dim)
             .collect();
-        let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
+        // VectorCell strategy: pre-shard by nearest centroid instead of
+        // round-robin. Each shard becomes one superfile in its cell-partition.
+        let (shards, cell_hints): (Vec<Vec<BufferedBatch>>, Vec<Option<u32>>) =
+            if let Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                ref centroids_b64,
+                dim,
+                n_cells,
+                ..
+            }) = self.inner.options.partition_strategy
+            {
+                let centroid_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(centroids_b64)
+                    .unwrap_or_default();
+                let centroids: Vec<f32> = centroid_bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                if !centroids.is_empty() && dim > 0 {
+                    let cell_shards =
+                        split_buffer_by_vector_cell(buffer, &centroids, dim, n_cells, 0);
+                    let hints: Vec<Option<u32>> = cell_shards
+                        .iter()
+                        .map(|(cell_id, _)| Some(*cell_id))
+                        .collect();
+                    let shards: Vec<Vec<BufferedBatch>> = cell_shards
+                        .into_iter()
+                        .map(|(_, batches)| batches)
+                        .collect();
+                    (shards, hints)
+                } else {
+                    let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
+                    let hints = vec![None; shards.len()];
+                    (shards, hints)
+                }
+            } else {
+                let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
+                let hints = vec![None; shards.len()];
+                (shards, hints)
+            };
 
         // One shared fan-out for every modality — FTS, vector, combined.
         // No per-modality concurrency cap: rayon's work-stealing balances
@@ -948,7 +1096,7 @@ impl SupertableWriter {
             build_one_shard(slice.as_slice(), &self.inner.options)
         })?;
 
-        publish_superfiles(&self.inner, outputs)?;
+        publish_superfiles(&self.inner, outputs, cell_hints)?;
         Ok(())
     }
 }
@@ -1468,11 +1616,42 @@ pub(super) fn prepare_superfile(
 fn publish_superfiles(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
+    hints: Vec<Option<u32>>,
 ) -> Result<(), BuildError> {
     let prepared: Vec<PreparedSuperfile> = inner.options.writer_pool.install(|| {
         outputs
             .into_par_iter()
-            .filter_map(|shard| prepare_superfile(inner, shard).transpose())
+            .zip(hints.into_par_iter())
+            .filter_map(|(shard, hint)| {
+                prepare_superfile(inner, shard).transpose().map(|r| {
+                    r.map(|p| {
+                        if let Some(cell_id) = hint {
+                            let old = p.entry.as_ref();
+                            let new_entry = Arc::new(SuperfileEntry {
+                                superfile_id: old.superfile_id,
+                                uri: old.uri,
+                                n_docs: old.n_docs,
+                                id_min: old.id_min,
+                                id_max: old.id_max,
+                                scalar_stats: old.scalar_stats.clone(),
+                                fts_summary: old.fts_summary.clone(),
+                                vector_summary: old.vector_summary.clone(),
+                                partition_key: old.partition_key.clone(),
+                                partition_hint: Some(cell_id),
+                                subsection_offsets: old.subsection_offsets.clone(),
+                            });
+                            PreparedSuperfile {
+                                entry: new_entry,
+                                bytes_for_store: p.bytes_for_store,
+                                bytes_for_storage: p.bytes_for_storage,
+                                bytes_for_cache: p.bytes_for_cache,
+                            }
+                        } else {
+                            p
+                        }
+                    })
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
     })?;
 

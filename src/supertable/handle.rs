@@ -26,7 +26,10 @@ use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
 use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
+use crate::storage::PrefixedStorageProvider;
+use crate::superfile::vector::kmeans::kmeans;
 use crate::supertable::ManifestLoadError;
+use base64::Engine;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -113,6 +116,9 @@ pub(super) struct SupertableInner {
     /// opens five supertables holds five distinct ids). Minted
     /// via `IdGenerator::next_id()` once at create / open.
     pub(super) handle_id: crate::supertable::wal::state_doc::SupertableHandleId,
+    /// Hidden VectorIndexSuperTable — a cell-partitioned sibling table
+    /// for the global vector index (plan 024a).
+    pub(super) vector_index_table: Option<Arc<Supertable>>,
     /// Last time the read path checked the storage manifest pointer
     /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
     /// until the first check (so the first query always refreshes).
@@ -237,6 +243,7 @@ impl Supertable {
         }
 
         let options = Arc::new(options);
+        let vector_index_table = open_vector_index_table(&options, None);
         let initial = Manifest::empty(options.clone());
         let tombstone_cache = build_tombstone_cache(&options);
         let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
@@ -252,6 +259,7 @@ impl Supertable {
             sql_session_cache: Mutex::new(None),
             tombstone_cache,
             handle_id,
+            vector_index_table,
             last_pointer_check: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
@@ -318,8 +326,8 @@ impl Supertable {
             })?
             .clone();
         let options_arc = Arc::new(options);
-
         let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
+        let vector_index_table = open_vector_index_table(&options_arc, Some(manifest.as_ref()));
         let tombstone_cache = build_tombstone_cache(&options_arc);
         // Fresh generator per open. The 64-bit ms timestamp
         // prefix advances naturally across process restarts, so
@@ -340,6 +348,7 @@ impl Supertable {
             sql_session_cache: Mutex::new(None),
             tombstone_cache,
             handle_id,
+            vector_index_table,
             last_pointer_check: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
@@ -745,6 +754,112 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
+/// Create or open the hidden VectorIndexSuperTable for a user table that
+/// has vector columns and storage attached. Returns `None` when no vector
+/// columns exist or no storage is configured.
+/// Train N global centroids from the user table's manifest cluster summaries.
+/// Returns `(n_cells, dim, centroids_fp32)` or None if no summaries exist.
+fn train_global_centroids(
+    user_opts: &SupertableOptions,
+    manifest: &super::manifest::Manifest,
+    n_cells: usize,
+) -> Option<(usize, usize, Vec<f32>)> {
+    let vc = user_opts.vector_columns.first()?;
+    let mut all_centroids = Vec::new();
+    let mut dim = 0usize;
+    for entry in manifest.superfiles.iter() {
+        let Some(vs) = entry.vector_summary.get(&vc.column) else {
+            continue;
+        };
+        let cc = &vs.clusters;
+        if cc.is_empty() {
+            continue;
+        }
+        dim = cc.dim as usize;
+        for c in 0..cc.n_cent as usize {
+            if cc.counts[c] == 0 {
+                continue;
+            }
+            let base = c * dim;
+            for d in 0..dim {
+                all_centroids.push(cc.mins[c] + cc.scales[c] * cc.codes[base + d] as f32);
+            }
+        }
+    }
+    if all_centroids.is_empty() || dim == 0 {
+        return None;
+    }
+    let n_src = all_centroids.len() / dim;
+    let n = n_cells.min(n_src).max(1);
+    let centroids = kmeans(&all_centroids, dim, n, 8, 0x51ED_2A11);
+    Some((n, dim, centroids))
+}
+
+fn open_vector_index_table(
+    user_opts: &Arc<SupertableOptions>,
+    user_manifest: Option<&super::manifest::Manifest>,
+) -> Option<Arc<Supertable>> {
+    if user_opts.vector_columns.is_empty() {
+        return None;
+    }
+    let storage = user_opts.storage.as_ref()?;
+    let sub_storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
+        PrefixedStorageProvider::new(Arc::clone(storage), "_vector_index"),
+    );
+    // Build options for the hidden table: same schema, same vector columns,
+    // but partitioned by VectorCell (initially with empty centroids — first
+    // commit will train them).
+    // Minimal schema: vector column(s) + source-ref columns for resolving
+    // hits back to the original table. No FTS — the hidden table serves
+    // only unfiltered vector kNN.
+    let mut fields: Vec<arrow_schema::FieldRef> = Vec::new();
+    for vc in &user_opts.vector_columns {
+        let item_field = Arc::new(arrow_schema::Field::new(
+            "item",
+            arrow_schema::DataType::Float32,
+            true,
+        ));
+        fields.push(Arc::new(arrow_schema::Field::new(
+            &vc.column,
+            arrow_schema::DataType::FixedSizeList(item_field, vc.dim as i32),
+            false,
+        )));
+    }
+
+    let hidden_schema = Arc::new(arrow_schema::Schema::new(fields));
+    let mut hidden_opts = SupertableOptions::new(
+        hidden_schema,
+        vec![],
+        user_opts.vector_columns.clone(),
+        user_opts.tokenizer.clone(),
+    )
+    .ok()?;
+    hidden_opts = hidden_opts.with_storage(sub_storage);
+    if let Some(cache) = user_opts.disk_cache.as_ref() {
+        hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
+    }
+    // If the user table has data, train centroids and use VectorCell partitioning.
+    if let Some(manifest) = user_manifest
+        && let Some((n_cells, dim, centroids)) = train_global_centroids(user_opts, manifest, 64)
+    {
+        let centroids_b64 = base64::engine::general_purpose::STANDARD.encode(
+            centroids
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        hidden_opts = hidden_opts.with_partition_strategy(
+            crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                column: user_opts.vector_columns[0].column.clone(),
+                n_cells: n_cells as u32,
+                dim,
+                centroids_b64,
+            },
+        );
+    }
+    Supertable::create(hidden_opts).ok().map(Arc::new)
+}
+
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
     let cache = match inner.options.disk_cache.as_ref() {
         Some(c) => c,
@@ -922,6 +1037,10 @@ impl SupertableReader {
     /// [`SupertableReader::query_sql`] across queries on this snapshot.
     pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
+        self.inner.vector_index_table.as_ref()
     }
 }
 
