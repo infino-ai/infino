@@ -101,6 +101,8 @@ jobs:
           workspaces: infino-python
       # Builds the extension + runs the smoke tests (self-contained venv).
       - run: make python-test
+      # Type-check the shipped stubs against a sample consumer (mypy --strict).
+      - run: make python-typecheck
 
   python-examples:
     name: Python examples (end to end)

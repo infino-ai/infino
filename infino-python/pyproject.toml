@@ -15,6 +15,22 @@ dynamic = ["version"]
 [project.optional-dependencies]
 test = ["pytest", "pyarrow>=14"]
 
+[tool.mypy]
+strict = true
+
+# pyarrow ships no type information; treat it as untyped rather than
+# failing the strict run on a third-party gap.
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
 [tool.maturin]
-# The cdylib's lib name is `infino`, so the built module is `infino`.
+# Mixed layout: the compiled cdylib is the private `infino._infino`
+# extension; the hand-written `python/infino/` package re-exports it and
+# ships the typing artifacts (`py.typed`, stubs) and module metadata.
+python-source = "python"
+module-name = "infino._infino"
 features = ["pyo3/extension-module"]
+# Keep compiled bytecode out of the wheel (a local `develop` leaves it in
+# the source tree).
+exclude = ["**/__pycache__/**"]

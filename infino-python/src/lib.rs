@@ -635,11 +635,13 @@ fn coerce_to_record_batch(
     }
 }
 
-// Named `infino_ext` (not `infino`) so the generated module item doesn't
-// shadow the `infino` crate inside this file; `#[pyo3(name = "infino")]`
-// keeps the Python module name `infino` (init symbol `PyInit_infino`).
+// The compiled extension is `infino._infino`: the `python/infino/`
+// package re-exports it and carries the typing artifacts (`py.typed`,
+// stubs, `__version__`). Naming the module item `infino_ext` keeps it
+// from shadowing the `infino` crate inside this file; the init symbol is
+// `PyInit__infino`.
 #[pymodule]
-#[pyo3(name = "infino")]
+#[pyo3(name = "_infino")]
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;

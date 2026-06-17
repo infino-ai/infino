@@ -8,9 +8,31 @@ Run after `maturin develop`:
     pytest tests/
 """
 
+import pathlib
+
 import infino
 import pyarrow as pa
 import pytest
+
+
+def test_package_metadata():
+    assert isinstance(infino.__version__, str) and infino.__version__
+    assert set(infino.__all__) == {
+        "connect",
+        "Connection",
+        "Table",
+        "IndexSpec",
+        "MutationStats",
+        "OptimizeOptions",
+    }
+
+
+def test_typing_artifacts_are_packaged():
+    # The stub and marker must ship beside the module, or type checkers
+    # silently ignore the package despite the work above.
+    pkg = pathlib.Path(infino.__file__).parent
+    assert (pkg / "py.typed").is_file()
+    assert (pkg / "_infino.pyi").is_file()
 
 
 def _title_schema() -> pa.Schema:

@@ -2,7 +2,7 @@
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
-        python-test python-wheel python-examples-test \
+        python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
 # Import layout: group into std / external / crate blocks and merge each
@@ -116,6 +116,19 @@ python-test:
 	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas
 	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
 	infino-python/.venv/bin/python -m pytest infino-python/tests/ -v
+
+# Type-check the package and a sample consumer under `mypy --strict`,
+# against the source stubs (no extension build needed). Checking
+# `__init__.py` verifies its re-exports match the `_infino` stub; checking
+# the sample fails the run if the surface drifts or a `Literal` argument
+# widens to plain `str`.
+python-typecheck:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip mypy
+	MYPYPATH=infino-python/python infino-python/.venv/bin/mypy \
+		--config-file infino-python/pyproject.toml \
+		infino-python/python/infino/__init__.py \
+		infino-python/tests/typing/quickstart.py
 
 # Build a release abi3 wheel for the current platform into
 # `infino-python/dist/` (one wheel covers CPython >= 3.9).
