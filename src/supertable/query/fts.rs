@@ -473,6 +473,102 @@ impl SupertableReader {
         Ok(per_unit.into_iter().flatten().collect())
     }
 
+    /// Count documents whose `column` matches `query`'s tokens under
+    /// `mode` (`Or` = any token, `And` = every token), over this reader's
+    /// pinned snapshot — **count only, no scoring and no row
+    /// materialization**.
+    ///
+    /// Fast path: a single-token query against a superfile with no
+    /// tombstones resolves from the term dictionary's stored document
+    /// frequency ([`SuperfileReader::term_df`]) — O(1) per superfile, no
+    /// posting decode. A multi-token query, or a superfile with deletes,
+    /// falls back to materializing the matching local doc ids and
+    /// counting those not tombstoned. Tombstoned (deleted) rows are
+    /// always excluded so the count matches what a search would return.
+    pub(crate) async fn token_match_count_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<u64, QueryError> {
+        let manifest = self.manifest();
+        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
+        if term_strings.is_empty() {
+            return Ok(0);
+        }
+        let kept = crate::supertable::query::prune::select_superfiles(
+            manifest.as_ref(),
+            &[crate::supertable::query::prune::PruneLeaf::TermPresence {
+                column: column.to_owned(),
+                terms: term_strings.clone(),
+                mode,
+            }],
+        )
+        .await?;
+        if kept.is_empty() {
+            return Ok(0);
+        }
+
+        let single_term = term_strings.len() == 1;
+        let column_arc = Arc::new(column.to_owned());
+        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+
+        // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
+        // spawns + opens each superfile concurrently, and short-circuits
+        // on the first error. The per-superfile body returns this
+        // superfile's match count; the totals are summed.
+        let per_superfile = crate::supertable::query::dispatch::fanout_with(
+            self,
+            units,
+            move |r, entry, tombstone_cache, now, _params: ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let term_arc = Arc::clone(&term_arc);
+                async move {
+                    // Tombstone bitmap for this superfile (None = no deletes).
+                    let tomb = match tombstone_cache.as_ref() {
+                        Some(c) => {
+                            let b = c
+                                .bitmap_for(entry.superfile_id, now)
+                                .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                            if b.is_empty() { None } else { Some(b) }
+                        }
+                        None => None,
+                    };
+                    let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                    // Deletes present: materialize the matching ids and
+                    // subtract the tombstoned ones (a df read or a bare
+                    // match count would over-count the deleted rows).
+                    if let Some(b) = tomb {
+                        let docs = r
+                            .token_match(&column_arc, &refs, mode)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                        return Ok::<u64, QueryError>(
+                            docs.iter().filter(|d| !b.contains(**d)).count() as u64,
+                        );
+                    }
+                    // No deletes (the common case): count without
+                    // materializing ids — a single token resolves O(1)
+                    // from the stored df, multi-token tallies the match
+                    // walk through the counting sink.
+                    let n = if single_term {
+                        r.term_df(&column_arc, &term_arc[0])
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    } else {
+                        r.token_match_count(&column_arc, &refs, mode)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    };
+                    Ok(n)
+                }
+            },
+        )
+        .await?;
+        Ok(per_superfile.into_iter().sum())
+    }
+
     /// Unranked two-pass exact match of the **raw string** `value`
     /// against `column` across the pinned snapshot. Returns the rows
     /// whose stored value equals `value` exactly as [`SuperfileHit`]s —
@@ -598,6 +694,15 @@ impl SupertableReader {
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         self.block_on(self.token_match_async(column, query, mode))
+    }
+
+    /// Count documents matching `query`'s tokens under `mode` over this
+    /// reader's pinned snapshot — count only, no scoring or row
+    /// materialization. A single-token query on a delete-free superfile
+    /// resolves in O(1) from the stored document frequency. Drives the
+    /// async kernel via the sync→async bridge.
+    pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
+        self.block_on(self.token_match_count_async(column, query, mode))
     }
 
     /// Unranked exact match of the raw string `value` against `column`
@@ -852,6 +957,40 @@ impl Supertable {
             ))
             .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
         Ok(vec![batch])
+    }
+
+    /// Count documents whose `column` matches `query`'s tokens under
+    /// `mode` (`Or` = any token, `And` = every token) over the current
+    /// snapshot — count only, no scoring or row materialization. A
+    /// single-token query on a delete-free snapshot resolves in O(1) per
+    /// superfile from the term dictionary's document frequency, so
+    /// counting a high-frequency term is cheap.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, BoolMode, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema,
+    /// #     vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox", "a lazy dog"]))],
+    /// # )?)?;
+    /// let n = posts.count("body", "fox", BoolMode::Or)?;
+    /// assert_eq!(n, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn count(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<u64, crate::InfinoError> {
+        self.reader()
+            .count(column, query, mode)
+            .map_err(crate::InfinoError::from)
     }
 }
 
@@ -1474,5 +1613,173 @@ mod tests {
             cursor = end;
         }
         assert_eq!(cursor, 200_000, "sub-ranges tile the whole superfile");
+    }
+
+    #[test]
+    fn count_single_term_sums_df_across_superfiles() {
+        // 3 commits → 3 superfiles. Single-term count takes the O(1)
+        // term_df fast path (no deletes) and sums across superfiles.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["alpha delta"])).expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(3, &["beta gamma"])).expect("append");
+        w.commit().expect("commit");
+
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("count"), 3);
+        assert_eq!(st.count("title", "beta", BoolMode::Or).expect("count"), 2);
+        assert_eq!(st.count("title", "gamma", BoolMode::Or).expect("count"), 2);
+        assert_eq!(st.count("title", "absent", BoolMode::Or).expect("count"), 0);
+    }
+
+    #[test]
+    fn count_multi_term_sums_across_superfiles() {
+        // 3 commits → 3 superfiles. Multi-term queries take the general
+        // `token_match` branch (not the single-term df fast path), so this
+        // exercises summing per-superfile match counts across superfiles
+        // for both OR (union spans all three) and AND (intersection lands
+        // in one). Doc ids are globally unique across commits.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["beta gamma", "delta"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(4, &["alpha delta", "beta"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        // OR "alpha beta": alpha∪beta matches in all three superfiles
+        // (2 + 1 + 2) — proves the per-superfile counts are summed.
+        assert_eq!(st.count("title", "alpha beta", BoolMode::Or).expect("c"), 5);
+        // OR "gamma delta": 1 + 2 + 1 across the three superfiles.
+        assert_eq!(
+            st.count("title", "gamma delta", BoolMode::Or).expect("c"),
+            4
+        );
+        // AND "alpha beta": both terms only in the first superfile's
+        // "alpha beta" doc → 1 (the other superfiles contribute 0).
+        assert_eq!(
+            st.count("title", "alpha beta", BoolMode::And).expect("c"),
+            1
+        );
+        // AND "alpha delta": both terms only in the third superfile.
+        assert_eq!(
+            st.count("title", "alpha delta", BoolMode::And).expect("c"),
+            1
+        );
+
+        // Cross-check every shape against token_match cardinality.
+        let r = st.reader();
+        for (q, mode) in [
+            ("alpha beta", BoolMode::Or),
+            ("gamma delta", BoolMode::Or),
+            ("alpha beta", BoolMode::And),
+            ("alpha delta", BoolMode::And),
+        ] {
+            let c = r.count("title", q, mode).expect("count");
+            let n = r.token_match("title", q, mode).expect("token_match").len() as u64;
+            assert_eq!(c, n, "count vs token_match for {q:?} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn count_honors_or_and_modes() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha beta", "alpha gamma", "beta delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        // OR: docs containing alpha OR delta → all three.
+        assert_eq!(
+            st.count("title", "alpha delta", BoolMode::Or).expect("c"),
+            3
+        );
+        // AND: docs containing both alpha AND beta → just "alpha beta".
+        assert_eq!(
+            st.count("title", "alpha beta", BoolMode::And).expect("c"),
+            1
+        );
+        // AND with no doc holding both → 0.
+        assert_eq!(
+            st.count("title", "gamma delta", BoolMode::And).expect("c"),
+            0
+        );
+    }
+
+    #[test]
+    fn count_agrees_with_token_match_len() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha beta", "alpha gamma", "beta delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        let r = st.reader();
+        for (q, mode) in [
+            ("alpha", BoolMode::Or),
+            ("alpha delta", BoolMode::Or),
+            ("alpha beta", BoolMode::And),
+        ] {
+            let c = r.count("title", q, mode).expect("count");
+            let n = r.token_match("title", q, mode).expect("token_match").len() as u64;
+            assert_eq!(c, n, "count vs token_match for {q:?} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn count_empty_query_and_empty_supertable_are_zero() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        // Empty supertable: nothing matches.
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("c"), 0);
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta"])).expect("append");
+        w.commit().expect("commit");
+        // Token-less queries produce no terms → 0.
+        assert_eq!(st.count("title", "", BoolMode::Or).expect("c"), 0);
+        assert_eq!(st.count("title", "   ", BoolMode::Or).expect("c"), 0);
+    }
+
+    #[test]
+    fn count_excludes_tombstoned_docs() {
+        use datafusion::prelude::{col, lit};
+        // Storage-backed so delete (tombstones) is available. After a
+        // delete, the single-term count must drop the term_df fast path
+        // and subtract the tombstone — df would over-count.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha one", "alpha two", "alpha three"]))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer slot so `delete` can acquire it
+
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("count"), 3);
+
+        let stats = st
+            .delete(col("title").eq(lit("alpha two")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+
+        // term_df still says 3; the count must subtract the tombstone → 2.
+        assert_eq!(
+            st.count("title", "alpha", BoolMode::Or)
+                .expect("count after delete"),
+            2
+        );
     }
 }

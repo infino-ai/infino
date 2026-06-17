@@ -20,6 +20,7 @@ use thiserror::Error;
 use crate::storage::StorageError;
 use crate::superfile::error::BuildError as SuperfileBuildError;
 use crate::supertable::ManifestLoadError;
+use crate::supertable::manifest::part;
 
 /// Errors raised when constructing or operating against a
 /// `SupertableOptions` / `SupertableWriter`.
@@ -152,8 +153,8 @@ pub enum CommitError {
     Build(#[from] BuildError),
 
     /// Manifest error
-    #[error("manifest load error: {0}")]
-    ManifestLoadError(#[from] ManifestLoadError),
+    #[error("manifest error: {0}")]
+    ManifestError(#[from] ManifestError),
 
     /// Failed to encode a manifest part or list to its wire
     /// format. Indicates a programmer error (e.g., a
@@ -173,7 +174,10 @@ pub enum CommitError {
     /// loop later is non-breaking.
     #[error("write contention exhausted retries")]
     WriteContentionExhausted,
+}
 
+#[derive(Debug, Error)]
+pub enum ManifestError {
     /// A superfile's column range spans multiple
     /// partitions under the configured `PartitionStrategy`.
     /// For `TimeRange` / `ColumnRange`, the superfile's
@@ -186,6 +190,12 @@ pub enum CommitError {
     /// possible value hashes to bucket 0.
     #[error("superfile spans partition boundary: {detail}")]
     SuperfileSpansPartition { detail: String },
+    /// Manifest load error
+    #[error("manifest load error: {0}")]
+    ManifestLoadError(#[from] ManifestLoadError),
+    /// Unknown part id
+    #[error("unknown part id: {0}")]
+    UnknownPartId(part::PartId),
 }
 
 /// Errors raised by [`crate::supertable::Supertable::open`] and

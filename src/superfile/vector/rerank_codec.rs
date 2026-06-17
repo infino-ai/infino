@@ -409,6 +409,23 @@ mod tests {
         );
     }
 
+    /// `Display` renders the stable [`RerankCodec::name`] for every
+    /// variant — the same string used in JSON config + error messages.
+    #[test]
+    fn display_renders_stable_name() {
+        assert_eq!(RerankCodec::Fp32.to_string(), "fp32");
+        assert_eq!(RerankCodec::Sq8ResidualEpsilon.to_string(), "sq8_residual");
+        assert_eq!(RerankCodec::RabitqOnly.to_string(), "rabitq_only");
+        // `Display` must agree with `name` byte-for-byte.
+        for c in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8ResidualEpsilon,
+            RerankCodec::RabitqOnly,
+        ] {
+            assert_eq!(c.to_string(), c.name());
+        }
+    }
+
     /// Sq8ResidualEpsilon's codec_meta size: `8·n_cent·dim` for negdot,
     /// `8·n_cent·dim + 4·n_docs` for L2Sq/Cosine (per-doc decoded-norm
     /// cache). Fp32 / RabitqOnly always contribute zero

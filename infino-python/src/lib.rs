@@ -20,11 +20,17 @@ use arrow::compute::concat_batches;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use datafusion::common::DFSchema;
+use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::Expr;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use infino::{BoolMode, ConnectOptions, InfinoError, Metric, VectorSearchOptions};
+use infino::{
+    BoolMode, ColdFetchMode, CompactionError, CompactionSettings, ConnectOptions, InfinoError,
+    Metric, VectorSearchOptions,
+};
 
 /// Map a core [`InfinoError`] to the closest Python exception.
 fn py_err(e: InfinoError) -> PyErr {
@@ -41,6 +47,13 @@ fn py_err(e: InfinoError) -> PyErr {
     }
 }
 
+/// Compaction has its own error type, so it doesn't go through `py_err`.
+/// These are storage / build failures — surfaced as runtime errors, like
+/// the mutation paths.
+fn compact_err(e: CompactionError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
 fn metric_from_str(s: &str) -> PyResult<Metric> {
     match s.to_ascii_lowercase().as_str() {
@@ -53,13 +66,29 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
     }
 }
 
+/// Parse a cold-fetch-mode name into its [`ColdFetchMode`].
+fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "hybrid_with_prefetch" => Ok(ColdFetchMode::HybridWithPrefetch),
+        "range_only" => Ok(ColdFetchMode::RangeOnly),
+        "lazy_foreground_with_background_fill" => Ok(ColdFetchMode::LazyForegroundWithBackgroundFill),
+        other => Err(PyValueError::new_err(format!(
+            "unknown cold_fetch_mode {other:?}; use 'hybrid_with_prefetch', \
+             'range_only', or 'lazy_foreground_with_background_fill'"
+        ))),
+    }
+}
+
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments (no separate
-/// `connect_with` in Python). Today that is the explicit S3-compatible
-/// endpoint + static credentials; omit them for local / `memory://` /
-/// ambient-credential S3.
+/// can't carry is passed as keyword arguments: explicit S3 endpoint +
+/// static credentials, and the optional local disk cache (`cache_dir`,
+/// `cache_budget_bytes`, `cold_fetch_mode`). Omit all for local /
+/// `memory://` / ambient-credential S3.
+// Flat kwargs are the intended Python API; a config struct would change it.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None))]
+#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None,
+                    cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
@@ -67,24 +96,49 @@ fn connect(
     region: Option<String>,
     access_key: Option<String>,
     secret_key: Option<String>,
+    cache_dir: Option<String>,
+    cache_budget_bytes: Option<u64>,
+    cold_fetch_mode: Option<String>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
-    let inner = py
-        .detach(|| match endpoint {
-            Some(endpoint) => {
-                let region = region
-                    .ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
-                let access_key = access_key
-                    .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
-                let secret_key = secret_key
-                    .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
-                let opts = ConnectOptions::new()
-                    .with_s3_endpoint(endpoint, region, access_key, secret_key);
-                infino::connect_with(uri, opts).map_err(py_err)
-            }
-            None => infino::connect(uri).map_err(py_err),
-        })?;
+    let inner = py.detach(|| {
+        let mut opts = ConnectOptions::new();
+        let mut has_options = false;
+        // The S3 endpoint + credentials are all-or-nothing: any one of them
+        // means the caller wants an explicit endpoint, so require the rest
+        // rather than silently dropping a partial config back to ambient.
+        if endpoint.is_some() || region.is_some() || access_key.is_some() || secret_key.is_some() {
+            let endpoint = endpoint
+                .ok_or_else(|| PyValueError::new_err("endpoint is required with S3 credentials"))?;
+            let region = region
+                .ok_or_else(|| PyValueError::new_err("region is required for an S3 endpoint"))?;
+            let access_key = access_key
+                .ok_or_else(|| PyValueError::new_err("access_key is required for an S3 endpoint"))?;
+            let secret_key = secret_key
+                .ok_or_else(|| PyValueError::new_err("secret_key is required for an S3 endpoint"))?;
+            opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+            has_options = true;
+        }
+        if let Some(dir) = cache_dir {
+            opts = opts.with_cache_dir(dir);
+            has_options = true;
+        }
+        if let Some(bytes) = cache_budget_bytes {
+            opts = opts.with_cache_budget_bytes(bytes);
+            has_options = true;
+        }
+        if let Some(mode) = cold_fetch_mode {
+            opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
+            has_options = true;
+        }
+        // Preserve the plain `connect(uri)` path when no options are set.
+        if has_options {
+            infino::connect_with(uri, opts).map_err(py_err)
+        } else {
+            infino::connect(uri).map_err(py_err)
+        }
+    })?;
     Ok(Connection { inner })
 }
 
@@ -197,6 +251,63 @@ impl Connection {
     }
 }
 
+/// Row counts returned by `update` / `delete`.
+#[pyclass(name = "MutationStats", frozen)]
+struct MutationStats {
+    #[pyo3(get)]
+    matched: usize,
+    #[pyo3(get)]
+    n_tombstoned: usize,
+    #[pyo3(get)]
+    n_not_found: usize,
+}
+
+impl MutationStats {
+    fn from_core(s: &infino::MutationStats) -> Self {
+        Self {
+            matched: s.matched(),
+            n_tombstoned: s.n_tombstoned(),
+            n_not_found: s.n_not_found(),
+        }
+    }
+}
+
+#[pymethods]
+impl MutationStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "MutationStats(matched={}, n_tombstoned={}, n_not_found={})",
+            self.matched, self.n_tombstoned, self.n_not_found
+        )
+    }
+}
+
+/// Tuning for `compact`; omitted fields fall back to engine defaults.
+#[pyclass(name = "CompactOptions", skip_from_py_object)]
+#[derive(Clone, Default)]
+struct CompactOptions {
+    max_memory_mb: Option<u64>,
+    min_fill_percent: Option<u8>,
+    target_superfile_size_mb: Option<u64>,
+}
+
+#[pymethods]
+impl CompactOptions {
+    #[new]
+    #[pyo3(signature = (*, max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None))]
+    fn new(
+        max_memory_mb: Option<u64>,
+        min_fill_percent: Option<u8>,
+        target_superfile_size_mb: Option<u64>,
+    ) -> Self {
+        Self {
+            max_memory_mb,
+            min_fill_percent,
+            target_superfile_size_mb,
+        }
+    }
+}
+
 /// A single-table handle.
 #[pyclass]
 struct Table {
@@ -214,12 +325,7 @@ impl Table {
         let py_schema = declared.as_ref().to_pyarrow(py)?;
         match coerce_to_record_batch(py, data, &py_schema)? {
             Some(batch) => {
-                // Python sources (pandas, list[dict]) are inherently
-                // nullable; re-wrap the (null-free) columns under the
-                // table's declared schema so the exact-schema append check
-                // accepts them. A genuine type or null mismatch still errors.
-                let aligned = RecordBatch::try_new(declared, batch.columns().to_vec())
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let aligned = align_to_schema(declared, batch)?;
                 // Append commits a superfile to storage — release the GIL.
                 py.detach(|| self.inner.append(&aligned)).map_err(py_err)
             }
@@ -327,9 +433,76 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
+    /// Delete rows matching a SQL predicate string, e.g. `"status = 'spam'"`.
+    /// Needs durable storage — a `memory://` table raises.
+    fn delete(&self, py: Python<'_>, predicate: &str) -> PyResult<MutationStats> {
+        // Parse and mutate both off the GIL — neither touches Python.
+        let stats = py.detach(|| {
+            let expr = self.parse_predicate(predicate)?;
+            self.inner.delete(expr).map_err(py_err)
+        })?;
+        Ok(MutationStats::from_core(&stats))
+    }
+
+    /// Replace rows matching a SQL predicate with `new_rows` (same shapes as
+    /// `append`). Replacement is 1:1 — the match count must equal the number
+    /// of rows supplied. Needs durable storage.
+    fn update(
+        &self,
+        py: Python<'_>,
+        predicate: &str,
+        new_rows: &Bound<'_, PyAny>,
+    ) -> PyResult<MutationStats> {
+        let declared = self.inner.schema();
+        let py_schema = declared.as_ref().to_pyarrow(py)?;
+        // Pass an empty batch through rather than short-circuiting like
+        // `append` does — we want the engine's cardinality check to run.
+        let aligned = match coerce_to_record_batch(py, new_rows, &py_schema)? {
+            Some(batch) => align_to_schema(declared, batch)?,
+            None => RecordBatch::new_empty(declared),
+        };
+        // Parse and mutate both off the GIL — neither touches Python.
+        let stats = py.detach(|| {
+            let expr = self.parse_predicate(predicate)?;
+            self.inner.update(expr, &aligned).map_err(py_err)
+        })?;
+        Ok(MutationStats::from_core(&stats))
+    }
+
+    /// Merge small / underfilled superfiles into larger ones. Omit
+    /// `settings` for engine defaults.
+    #[pyo3(signature = (settings=None))]
+    fn compact(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
+        let mut s = CompactionSettings::default();
+        if let Some(o) = settings {
+            if let Some(v) = o.max_memory_mb {
+                s.max_memory_mb = v;
+            }
+            if let Some(v) = o.min_fill_percent {
+                s.min_fill_percent = v;
+            }
+            if let Some(v) = o.target_superfile_size_mb {
+                s.target_superfile_size_mb = v;
+            }
+        }
+        py.detach(|| self.inner.compact(&s)).map_err(compact_err)
+    }
+
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
     fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.schema().as_ref().to_pyarrow(py)
+    }
+}
+
+impl Table {
+    /// Resolve a SQL predicate string into the `Expr` the core mutation
+    /// API takes. Column names resolve against the table's own schema.
+    fn parse_predicate(&self, predicate: &str) -> PyResult<Expr> {
+        let df_schema = DFSchema::try_from(self.inner.schema().as_ref().clone())
+            .map_err(|e| PyValueError::new_err(format!("schema: {e}")))?;
+        SessionContext::new()
+            .parse_sql_expr(predicate, &df_schema)
+            .map_err(|e| PyValueError::new_err(format!("invalid predicate {predicate:?}: {e}")))
     }
 }
 
@@ -363,6 +536,14 @@ fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
             "mode must be 'or' or 'and', got {other:?}"
         ))),
     }
+}
+
+/// Re-wrap a coerced batch under the table's declared schema. Python
+/// sources (pandas, list[dict]) are inherently nullable; this lets the
+/// exact-schema check accept them. A genuine type / null mismatch still errors.
+fn align_to_schema(declared: Arc<Schema>, batch: RecordBatch) -> PyResult<RecordBatch> {
+    RecordBatch::try_new(declared, batch.columns().to_vec())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Coerce append input — a pyarrow `RecordBatch` / `Table`, a pandas
@@ -433,5 +614,7 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Connection>()?;
     m.add_class::<Table>()?;
     m.add_class::<IndexSpec>()?;
+    m.add_class::<MutationStats>()?;
+    m.add_class::<CompactOptions>()?;
     Ok(())
 }

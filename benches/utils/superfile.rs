@@ -498,6 +498,32 @@ pub mod fts {
                     }],
                 });
             }
+            if phases.warm {
+                eprintln!(
+                    "[superfile_fts] count battery: {} queries × {WARM_ITERS} timed iters...",
+                    FTS_BATTERY.len(),
+                );
+                let counts = exec_fts::measure_count(
+                    index.reader(),
+                    FTS_BATTERY,
+                    FTS_COLUMN,
+                    WARM_ITERS,
+                    "superfile_fts",
+                );
+                exec_fts::emit_count(
+                    &mut report,
+                    "bench/fts/superfile/count",
+                    format!(
+                        "Superfile FTS — count, single-superfile / in-memory ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Matching-doc count via the dedicated count path: single-term `term_df`, read \
+                     O(1) from the dictionary header; multi-term union/intersection cardinality via \
+                     `token_match`. No BM25 scoring, no row materialization. `matches` is the count \
+                     returned. Δ is vs the previous run.",
+                    &counts,
+                );
+            }
             if phases.warm
                 && let Some(ref warm_stats) = warm
             {
@@ -672,6 +698,10 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> usize {
             exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
+        }
+
+        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            self.reader.count_matching(column, terms, mode)
         }
     }
 

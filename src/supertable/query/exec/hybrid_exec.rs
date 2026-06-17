@@ -893,6 +893,50 @@ mod tests {
         out
     }
 
+    /// Construct `HybridSearchTable` directly through the TVF `call`
+    /// path and exercise its `TableProvider` metadata methods (`Debug`,
+    /// `as_any`, `table_type`) plus the lowered `HybridSearchExec`'s
+    /// `name` / `Debug` — none of which normal query execution touches.
+    #[tokio::test]
+    async fn hybrid_table_and_exec_trait_methods() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::prelude::lit;
+
+        let dim = 16;
+        let st = demo(dim);
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let func = HybridSearchFunc::new(reader, scalar_schema);
+        let table = func
+            .call(&[
+                lit("title"),
+                lit("rust"),
+                lit("emb"),
+                lit(csv_one_hot(dim, 0)),
+                lit(5_i64),
+            ])
+            .expect("hybrid table");
+
+        let dbg = format!("{table:?}");
+        assert!(dbg.contains("HybridSearchTable"), "Debug missing: {dbg}");
+        assert!(
+            table.as_any().downcast_ref::<HybridSearchTable>().is_some(),
+            "as_any downcasts to HybridSearchTable"
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(plan.name(), "HybridSearchExec");
+        assert!(
+            format!("{plan:?}").contains("HybridSearchExec"),
+            "Exec Debug missing"
+        );
+    }
+
     #[test]
     fn hybrid_exec_display_describes_invocation() {
         let dim = 16;

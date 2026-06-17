@@ -945,7 +945,10 @@ mod tests {
 
     use crate::superfile::builder::FtsConfig;
 
+    use crate::storage::{LocalFsStorageProvider, StorageProvider};
     use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+    use crate::supertable::options::Consistency;
+    use tempfile::TempDir;
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -1246,5 +1249,29 @@ mod tests {
         // options the handle exposes.
         assert_eq!(r.options().id_column, st.options().id_column);
         assert_eq!(r.options().fts_columns.len(), 1);
+    }
+
+    /// A storage-backed handle under `Consistency::Strong` drives
+    /// `ensure_fresh`'s Strong arm, which calls `refresh`. With no
+    /// commit yet there is no manifest pointer, so `refresh` reports
+    /// "nothing newer" and the snapshot stays at the empty manifest.
+    #[test]
+    fn ensure_fresh_under_strong_consistency_refreshes_against_storage() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = opts()
+            .with_storage(storage)
+            .with_read_consistency(Consistency::Strong);
+        let st = Supertable::create(options).expect("create storage-backed handle");
+        // `reader()` calls `ensure_fresh`, which under Strong drives a
+        // blocking `refresh` against the storage pointer. No pointer is
+        // published yet, so the pinned snapshot remains the empty
+        // manifest.
+        let r = st.reader();
+        assert_eq!(r.n_superfiles(), 0);
+        // A direct refresh likewise reports no newer manifest.
+        let advanced = bridge_sync_to_async(st.refresh()).expect("refresh against empty store");
+        assert!(!advanced, "no commit yet ⇒ refresh finds nothing newer");
     }
 }

@@ -648,3 +648,20 @@ fn has_required_stats(entry: &SuperfileEntry, kinds: &[AggKind]) -> bool {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule opts into the `rewrite` entry point (rather than the
+    /// legacy `try_optimize`), and carries its registered name. Neither
+    /// the `supports_rewrite` flag nor `name` is observed during a plain
+    /// query, so assert them directly.
+    #[test]
+    #[allow(deprecated)] // `supports_rewrite` is the targeted method.
+    fn rule_opts_into_rewrite_and_reports_name() {
+        let rule = CoveredAggregateRewrite;
+        assert!(rule.supports_rewrite(), "rule must use the rewrite path");
+        assert_eq!(rule.name(), "covered_aggregate_rewrite");
+    }
+}

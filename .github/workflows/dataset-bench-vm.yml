@@ -1,64 +1,69 @@
-name: Dataset bench (Azure)
+name: Dataset bench VM (reusable)
 
-# Prepare and/or benchmark a reusable dataset in Azure Blob, via the bench
-# binary's `dataset` verbs:
-#   prepare — generate the corpus, ingest it to the prefix, write the sidecar
-#   bench   — open the existing dataset and run the read phases (no ingest)
-#   run     — prepare if absent, then bench
+# Reusable single-modality runner: provision an ephemeral Azure VM, build the
+# benchmark binary, run one `dataset` verb against one modality, then tear the
+# VM down. Callers (dataset-prepare.yml, dataset-bench.yml) fan this out across
+# modalities via a matrix. Each modality runs in its own VM, and thus its own
+# process, so memory metrics are not skewed by a prior modality's resident set.
+#
+# dataset verbs:
+#   prepare  generate the corpus, ingest it to the prefix, write the sidecar
+#   bench    open an existing dataset and run its read phases (no ingest)
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       dataset:
-        description: "Dataset prefix in the blob container (e.g. datasets/bench-10m)."
+        description: "Blob prefix for the dataset (e.g. datasets/bench-10m)."
         required: true
         type: string
       mode:
-        description: "prepare the dataset, bench an existing one, or run end-to-end."
-        required: false
-        default: bench
-        type: choice
-        options: [bench, prepare, run]
-      modality:
-        description: "Which index to prepare/query."
-        required: false
-        default: vector
-        type: choice
-        options: [fts, vector, sql]
-      docs:
-        description: "Doc count the dataset was prepared with (must match; plain integer)."
+        description: "Dataset verb: prepare or bench."
         required: true
         type: string
-      phase:
-        description: "search = warm + cold; warm or cold to run one tier."
-        required: false
-        default: search
-        type: choice
-        options: [search, warm, cold]
-      cache_gib:
-        description: "Force the read disk-cache budget (GiB). Empty = auto-size from the index."
+      modality:
+        description: "Index: fts, vector, or sql."
+        required: true
+        type: string
+      docs:
+        description: "Document count (plain integer). Required for prepare; empty for bench (read from the sidecar)."
         required: false
         default: ""
         type: string
-      vm_size:
-        description: "Azure VM size."
+      phase:
+        description: "Read phase: warm, cold, or search (both)."
         required: false
-        default: "Standard_D8s_v7"
+        default: search
+        type: string
+      cache_gib:
+        description: "Read disk-cache budget (GiB). Empty = auto-size from the index."
+        required: false
+        default: ""
+        type: string
+      skip_calibration:
+        description: "Vector only: skip recall calibration, report fixed-config cold latency (no recall gate)."
+        required: false
+        default: false
+        type: boolean
+      vm_size:
+        description: "Azure VM size (L-series = local NVMe)."
+        required: false
+        default: "Standard_L8aos_v4"
         type: string
       location:
-        description: "VM region."
+        description: "Azure region."
         required: false
         default: "eastus"
         type: string
       ref:
-        description: "Git ref / SHA to build the bench from."
+        description: "Git ref or SHA to build from."
         required: false
         default: "main"
         type: string
       timeout_minutes:
-        description: "Hard auto-stop; VM is torn down when hit."
+        description: "Per-VM auto-stop, minutes (GitHub caps at 360)."
         required: false
-        default: "30"
+        default: "240"
         type: string
 
 permissions:
@@ -67,7 +72,8 @@ permissions:
 
 env:
   RG: rg-infino-bench
-  VM: dataset-bench-vm-${{ github.run_id }}
+  # Per-modality, per-run name so parallel matrix legs never share a resource.
+  VM: dataset-bench-vm-${{ github.run_id }}-${{ inputs.modality }}
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
 
@@ -77,30 +83,56 @@ jobs:
     environment: ci
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
-      # Fail before spending a VM when the mode can't succeed: bench needs
-      # the dataset (its sidecar) present, prepare needs the prefix free.
-      # `modality` is also the dataset's sub-prefix (see Modality::dataset_dir).
+      # Reject an impossible mode before provisioning: bench needs the dataset
+      # present, prepare needs the prefix free. The dataset's presence is its
+      # sidecar; the modality also names its sub-prefix. Also resolves the
+      # effective doc count — read from the sidecar for an existing dataset,
+      # taken from the input when generating one. Account-key auth, so this
+      # runs before the OIDC login below.
       - name: Pre-flight — dataset state vs mode
+        id: preflight
         env:
           ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
           KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
           CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+          MODALITY: ${{ inputs.modality }}
+          INPUT_DOCS: ${{ inputs.docs }}
         run: |
           set -euo pipefail
-          sidecar="${{ inputs.dataset }}/${{ inputs.modality }}/dataset.json"
+          case "$MODALITY" in fts|vector|sql) ;; *)
+            echo "::error::unknown modality '$MODALITY' (allowed: fts vector sql)"; exit 1 ;; esac
+          sidecar="${{ inputs.dataset }}/${MODALITY}/dataset.json"
           exists="$(az storage blob exists --account-name "$ACC" --account-key "$KEY" \
                      -c "$CONTAINER" -n "$sidecar" --query exists -o tsv)"
+
+          # The sidecar's doc count is authoritative for an existing dataset.
+          docs_from_sidecar() {
+            az storage blob download --account-name "$ACC" --account-key "$KEY" \
+              -c "$CONTAINER" -n "$sidecar" -f /tmp/sidecar.json -o none
+            jq -e -r '.knobs.doc_count' /tmp/sidecar.json
+          }
+
           case "${{ inputs.mode }}" in
             bench)
               [ "$exists" = "true" ] \
-                || { echo "::error::dataset not found: $sidecar — prepare it first."; exit 1; } ;;
+                || { echo "::error::dataset not found: $sidecar — prepare it first."; exit 1; }
+              docs="$(docs_from_sidecar)" ;;
             prepare)
               [ "$exists" != "true" ] \
-                || { echo "::error::dataset already exists: $sidecar — bench it or pick a new prefix."; exit 1; } ;;
-            run)
-              echo "dataset exists=$exists — run will $([ "$exists" = "true" ] && echo 'skip prepare' || echo 'prepare first')" ;;
+                || { echo "::error::dataset already exists: $sidecar — bench it or pick a new prefix."; exit 1; }
+              docs="$INPUT_DOCS" ;;
+            *)
+              echo "::error::unknown mode '${{ inputs.mode }}' (allowed: prepare bench)"; exit 1 ;;
           esac
-          echo "pre-flight OK: mode=${{ inputs.mode }} sidecar=$sidecar"
+
+          # prepare must be told the count; bench derives it from the sidecar.
+          # Guard against an empty or non-numeric result either way.
+          case "$docs" in
+            ''|*[!0-9]*)
+              echo "::error::could not resolve doc count (got '$docs') — provide 'docs' when generating a dataset."; exit 1 ;;
+          esac
+          echo "docs=$docs" >> "$GITHUB_OUTPUT"
+          echo "pre-flight OK: mode=${{ inputs.mode }} sidecar=$sidecar docs=$docs"
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -114,7 +146,10 @@ jobs:
         run: |
           set -euo pipefail
           SIZE="${{ inputs.vm_size }}"
-          TAGS=(purpose=dataset-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}")
+          # Tags attribute spend in Cost Management. Every resource is named
+          # from $VM so teardown deletes by exact name. No default inbound
+          # rule; SSH is opened only to the runner's address, below.
+          TAGS=(purpose=dataset-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}" "modality=${{ inputs.modality }}")
           az vm create \
             -g "$RG" -n "$VM" \
             --image Ubuntu2204 \
@@ -122,7 +157,7 @@ jobs:
             --admin-username "$ADMIN" \
             --generate-ssh-keys \
             --public-ip-sku Standard \
-            --os-disk-size-gb 128 \
+            --os-disk-size-gb 512 \
             --nsg-rule NONE \
             --nsg "${VM}-nsg" \
             --public-ip-address "${VM}-pip" \
@@ -222,8 +257,9 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
-             INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_SUPERTABLE_DOCS='${{ steps.preflight.outputs.docs }}' \
              CACHE_GIB='${{ inputs.cache_gib }}' \
+             SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
              MODE='${{ inputs.mode }}' \
              DATASET='${{ inputs.dataset }}' \
              MODALITY='${{ inputs.modality }}' \
@@ -233,6 +269,7 @@ jobs:
           cd "$HOME/infino-src"
           export INFINO_BENCH_STORE=azure
           [ -n "$CACHE_GIB" ] && export INFINO_SUPERTABLE_SEARCH_CACHE_GIB="$CACHE_GIB"
+          [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           ulimit -n "$(ulimit -Hn)"
           BIN="$(cat "$HOME/bench-bin")"
           echo "===== DATASET ${MODE} ${DATASET} ${MODALITY} ${PHASE} START ====="
@@ -249,7 +286,7 @@ jobs:
           {
             echo "## Dataset \`${{ inputs.mode }}\` — \`${{ inputs.modality }}\` on \`${{ inputs.dataset }}\`"
             echo ""
-            echo "- docs: \`${{ inputs.docs }}\` · phase: \`${{ inputs.phase }}\` · vm: \`${{ inputs.vm_size }}\` · ref: \`${{ inputs.ref }}\`"
+            echo "- docs: \`${{ steps.preflight.outputs.docs || inputs.docs }}\` · phase: \`${{ inputs.phase }}\` · vm: \`${{ inputs.vm_size }}\` · ref: \`${{ inputs.ref }}\`"
             echo ""
           } >> "$SUMMARY"
           : > "$LOG"
@@ -286,7 +323,7 @@ jobs:
             done <<< "$(grep -E 'panicked at|knob mismatch|storage error|HTTP error' "$LOG" | head -n 8)"
           fi
           echo "" >> "$SUMMARY"
-          echo "_Full output attached as the \`dataset-bench-log\` artifact._" >> "$SUMMARY"
+          echo "_Full output attached as the \`dataset-bench-log-${{ inputs.modality }}\` artifact._" >> "$SUMMARY"
           if [ "$REPORT_OK" -ne 1 ]; then
             echo "::error::Dataset bench produced no results."
             exit 1
@@ -296,12 +333,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dataset-bench-log
+          name: dataset-bench-log-${{ inputs.modality }}
           path: |
             /tmp/build.log
             /tmp/bench.log
           if-no-files-found: warn
 
+      # Delete this run's resources by exact name, leaving the shared group.
+      # Ordered so dependencies release first (VM, then NIC, then the rest);
+      # each delete is best-effort so a partial provision still cleans up.
       - name: Teardown (always)
         if: always()
         env:

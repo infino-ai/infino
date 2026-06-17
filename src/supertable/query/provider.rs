@@ -1663,4 +1663,22 @@ mod tests {
         // One null planted in superfile 1.
         assert_eq!(cs.null_count, Precision::Exact(1));
     }
+
+    /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile
+    /// (cached-meta) count and is otherwise unreachable from a normal
+    /// scan. Build one with an empty meta map over an in-memory store
+    /// and render it.
+    #[test]
+    fn cached_metadata_reader_factory_debug_reports_superfile_count() {
+        let store: Arc<dyn OsObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let factory = CachedMetadataReaderFactory {
+            store,
+            metas: HashMap::new(),
+        };
+        let dbg = format!("{factory:?}");
+        assert!(
+            dbg.contains("CachedMetadataReaderFactory") && dbg.contains("superfiles: 0"),
+            "Debug missing fields: {dbg}"
+        );
+    }
 }

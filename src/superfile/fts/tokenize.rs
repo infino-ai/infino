@@ -666,4 +666,17 @@ mod tests {
         assert!(matches!(p.positives[0], Cow::Borrowed(_)));
         assert!(matches!(p.negatives[0], Cow::Owned(_)));
     }
+
+    /// The `new` constructor plus the trait-object `tokenize_each`
+    /// dispatch path (distinct from the inherent `tokenize_each_inline`
+    /// the hot path uses). Mixed case and punctuation confirm the
+    /// lowercasing + separator splitting.
+    #[test]
+    fn dyn_tokenize_each_lowercases_and_splits() {
+        let tok = AsciiLowerTokenizer::new();
+        let dynt: &dyn Tokenizer = &tok;
+        let mut out = Vec::new();
+        dynt.tokenize_each("Hello, World rust", &mut |s| out.push(s.to_string()));
+        assert_eq!(out, vec!["hello", "world", "rust"]);
+    }
 }

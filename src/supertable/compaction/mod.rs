@@ -13,14 +13,16 @@ use crate::{
     config::CompactionSettings,
     superfile::builder::SuperfileBuilder,
     supertable::{
-        BuildError, SuperfileEntry,
+        BuildError, CommitError, SuperfileEntry,
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
             WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
-        writer::{PreparedSuperfile, ShardOutput, prepare_superfile, try_commit_attempt},
+        writer::{
+            PreparedSuperfile, ShardOutput, backoff_delay, prepare_superfile, try_commit_attempt,
+        },
     },
 };
 use bytes::Bytes;
@@ -400,20 +402,52 @@ impl Supertable {
         ];
 
         let opts = Arc::clone(&inner.options);
-        let new_manifest_id = manifest.manifest_id + 1;
-        try_commit_attempt(
-            storage.clone(),
-            opts,
-            manifest.clone(),
-            &new_entries,
-            &inputs,
-            new_manifest_id,
-            &mut pending_storage_writes,
-        )
-        .await
-        .map_err(|e| CompactionError::Commit(e.to_string()))?;
+        let max_retries = opts.max_commit_retries.max(1);
 
-        Ok(())
+        for attempt in 0..max_retries {
+            let current = inner.manifest.load_full();
+
+            let entries_to_remove: Vec<Arc<SuperfileEntry>> = job
+                .inputs
+                .iter()
+                .filter_map(|id| {
+                    current
+                        .get_all_superfiles()
+                        .iter()
+                        .find(|e| e.superfile_id == *id)
+                        .cloned()
+                })
+                .collect();
+
+            // Another compactor already merged our inputs — nothing left to commit.
+            if entries_to_remove.len() != job.inputs.len() {
+                return Ok(());
+            }
+
+            match try_commit_attempt(
+                storage.clone(),
+                Arc::clone(&opts),
+                current,
+                &new_entries,
+                &entries_to_remove,
+                &mut pending_storage_writes,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                    self.refresh()
+                        .await
+                        .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                }
+                Err(e) => return Err(CompactionError::Commit(e.to_string())),
+            }
+        }
+
+        Err(CompactionError::Commit(
+            "commit retries exhausted".to_string(),
+        ))
     }
 }
 
@@ -961,6 +995,32 @@ mod tests {
         );
     }
 
+    /// An in-memory supertable (no storage, no tombstone cache) takes
+    /// the empty-sidecar-map fallback arm in `compact_async`: it still
+    /// builds per-superfile stats and runs `select`, and with a single
+    /// committed superfile `select` finds nothing to do, so the call
+    /// returns `Ok(())` without touching storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_in_memory_table_takes_empty_sidecar_fallback() {
+        let st =
+            Supertable::create(default_supertable_options()).expect("create in-memory supertable");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&["alpha first", "alpha second"]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("in-memory compact is a no-op, not an error");
+        assert_eq!(
+            st.manifest_id(),
+            before,
+            "single superfile yields no compaction job"
+        );
+    }
+
     // ─── Helpers shared by the end-to-end compact() tests ─────────────────
 
     fn make_st(dir: &TempDir) -> Supertable {
@@ -1029,6 +1089,54 @@ mod tests {
         st.compact_async(&small_compact_cfg())
             .await
             .expect("second compact after slot release");
+    }
+
+    // OCC retry tests
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_succeeds_when_concurrent_writer_commits_during_compaction() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Enough superfiles to trigger a compaction job.
+        for title in &[
+            ["alpha first", "alpha second"],
+            ["bravo first", "bravo second"],
+            ["charlie first", "charlie second"],
+            ["delta first", "delta second"],
+            ["echo first", "echo second"],
+            ["foxtrot first", "foxtrot second"],
+            ["golf first", "golf second"],
+            ["hotel first", "hotel second"],
+            ["india first", "india second"],
+            ["juliet first", "juliet second"],
+        ] {
+            commit_titles(&st, title);
+        }
+
+        let before_docs = st.reader().n_docs_total();
+        let st2 = st.clone();
+
+        // Race a writer commit against compaction. The compactor will
+        // hit WriteContentionExhausted on its first pointer CAS attempt
+        // (or succeed before the writer — either way both must succeed).
+        let writer_handle = tokio::task::spawn_blocking(move || {
+            commit_titles(&st2, &["kilo first", "kilo second"]);
+        });
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact must succeed despite concurrent writer");
+
+        writer_handle.await.expect("writer task");
+
+        // All docs from both paths must be visible after refresh.
+        st.refresh().await.expect("refresh");
+        let after_docs = st.reader().n_docs_total();
+        assert_eq!(
+            after_docs,
+            before_docs + 2,
+            "writer's 2 docs must survive alongside compacted data"
+        );
     }
 
     // ─── End-to-end compact() tests ────────────────────────────────────────

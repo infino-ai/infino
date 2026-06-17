@@ -468,4 +468,14 @@ mod tests {
         assert_eq!(worker_id_of(id1), 0xAAAA);
         assert_eq!(worker_id_of(id2), 0xBBBB);
     }
+
+    /// `Default` builds a usable generator equivalent to `new()` — it
+    /// yields strictly-increasing ids.
+    #[test]
+    fn default_constructs_a_usable_generator() {
+        let g = IdGenerator::default();
+        let a = g.next_id();
+        let b = g.next_id();
+        assert!(b > a, "generator must yield monotonically increasing ids");
+    }
 }

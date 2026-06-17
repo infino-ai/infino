@@ -186,6 +186,7 @@ impl StorageProvider for AzureStorageProvider {
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
+            last_modified: meta.last_modified.into(),
         })
     }
 
@@ -198,6 +199,7 @@ impl StorageProvider for AzureStorageProvider {
             let meta = ObjectMeta {
                 size: result.meta.size as u64,
                 etag: result.meta.e_tag.clone(),
+                last_modified: result.meta.last_modified.into(),
             };
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, meta))
@@ -299,12 +301,22 @@ impl StorageProvider for AzureStorageProvider {
         }
     }
 
-    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, super::ObjectMeta)>, StorageError> {
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
-        let mut out: Vec<String> = Vec::new();
+        let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
-            out.push(meta.location.to_string());
+            out.push((
+                meta.location.to_string(),
+                super::ObjectMeta {
+                    size: meta.size,
+                    etag: meta.e_tag,
+                    last_modified: meta.last_modified.into(),
+                },
+            ));
         }
         Ok(out)
     }
