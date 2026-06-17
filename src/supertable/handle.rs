@@ -266,7 +266,7 @@ impl Supertable {
         let options_arc = Arc::new(options);
         let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
         let vector_index_table = if let Some(hidden_opts) =
-            build_vector_index_options(&options_arc, Some(manifest.as_ref()))
+            build_vector_index_options(options_arc.as_ref(), Some(manifest.as_ref()))
         {
             let hidden_storage = hidden_opts.storage.clone().ok_or_else(|| {
                 OpenError::Build(BuildError::Store(
@@ -313,18 +313,12 @@ impl Supertable {
                 }
             }
         }
-        let options_arc = Arc::new(options);
         let vector_index_table =
-            if let Some(hidden_opts) = build_vector_index_options(&options_arc, None) {
+            if let Some(hidden_opts) = build_vector_index_options(&options, None) {
                 Some(Arc::new(create_table_async(hidden_opts, None).await?))
             } else {
                 None
             };
-        let options = Arc::try_unwrap(options_arc).map_err(|_| {
-            OpenError::Build(BuildError::Store(
-                "create_async: options Arc still shared".into(),
-            ))
-        })?;
         create_table_async(options, vector_index_table).await
     }
 
@@ -753,7 +747,7 @@ fn train_global_centroids(
 }
 
 fn build_vector_index_options(
-    user_opts: &Arc<SupertableOptions>,
+    user_opts: &SupertableOptions,
     user_manifest: Option<&super::manifest::Manifest>,
 ) -> Option<SupertableOptions> {
     if user_opts.vector_columns.is_empty() {
@@ -809,40 +803,8 @@ fn build_vector_index_options(
     Some(hidden_opts)
 }
 
-/// Create one supertable handle (empty manifest). Leaf — never creates a sibling.
-async fn create_table_async(
-    options: SupertableOptions,
-    vector_index_table: Option<Arc<Supertable>>,
-) -> Result<Supertable, OpenError> {
-    let options = Arc::new(options);
-    let initial = Manifest::empty(options.clone());
-    let tombstone_cache = build_tombstone_cache(&options);
-    let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
-    let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
-    let inner = Arc::new(SupertableInner {
-        options,
-        manifest: ArcSwap::new(Arc::new(initial)),
-        writer_outstanding: AtomicBool::new(false),
-        compaction_outstanding: AtomicBool::new(false),
-        id_generator: Mutex::new(id_generator),
-        query_runtime: OnceLock::new(),
-        sql_session_cache: Mutex::new(None),
-        tombstone_cache,
-        handle_id,
-        vector_index_table,
-        last_pointer_check: Mutex::new(None),
-    });
-    install_disk_cache_pinning(&inner);
-    let st = Supertable { inner };
-    if st.inner.options.storage.is_some() {
-        let _ = st.run_recovery_sweep_once().await;
-        let _ = st.run_gc_sweep_once().await;
-    }
-    Ok(st)
-}
-
-/// Open one supertable handle from a loaded manifest. Leaf — never creates a sibling.
-async fn open_table_async(
+/// Build one supertable handle. Leaf — never creates a hidden sibling.
+async fn build_handle(
     options: Arc<SupertableOptions>,
     manifest: Arc<Manifest>,
     vector_index_table: Option<Arc<Supertable>>,
@@ -865,9 +827,30 @@ async fn open_table_async(
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
-    let _ = st.run_recovery_sweep_once().await;
-    let _ = st.run_gc_sweep_once().await;
+    if st.inner.options.storage.is_some() {
+        let _ = st.run_recovery_sweep_once().await;
+        let _ = st.run_gc_sweep_once().await;
+    }
     Ok(st)
+}
+
+/// Create one supertable handle (empty manifest). Leaf — never creates a sibling.
+async fn create_table_async(
+    options: SupertableOptions,
+    vector_index_table: Option<Arc<Supertable>>,
+) -> Result<Supertable, OpenError> {
+    let options = Arc::new(options);
+    let manifest = Arc::new(Manifest::empty(options.clone()));
+    build_handle(options, manifest, vector_index_table).await
+}
+
+/// Open one supertable handle from a loaded manifest. Leaf — never creates a sibling.
+async fn open_table_async(
+    options: Arc<SupertableOptions>,
+    manifest: Arc<Manifest>,
+    vector_index_table: Option<Arc<Supertable>>,
+) -> Result<Supertable, OpenError> {
+    build_handle(options, manifest, vector_index_table).await
 }
 
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
