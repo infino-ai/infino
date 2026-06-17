@@ -1443,7 +1443,9 @@ impl VectorReader {
             let allowed = bm.len();
             if n > 0 && allowed > 0 {
                 let selectivity = allowed as f64 / n as f64;
-                let mult = (1.0 / selectivity).ceil().min(MAX_FILTER_NPROBE_MULT as f64) as usize;
+                let mult = (1.0 / selectivity)
+                    .ceil()
+                    .min(MAX_FILTER_NPROBE_MULT as f64) as usize;
                 nprobe.saturating_mul(mult).min(col.n_cent as usize).max(1)
             } else {
                 nprobe.min(col.n_cent as usize).max(1)
