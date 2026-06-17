@@ -481,6 +481,36 @@ fn build_measured(
     (built, metrics)
 }
 
+/// True for a dataset prepare-only run (ingest, no read phases). Such a run
+/// never needs the corpus after ingest, so it streams the corpus instead of
+/// staging the whole thing on disk first.
+fn stream_prepare(phases: Phases) -> bool {
+    crate::dataset::dataset_mode() && phases.build && !phases.warm && !phases.cold
+}
+
+/// Ingest a streamed corpus, sampling RSS over the build window. Same metrics
+/// as [`build_measured`], but no corpus is staged on disk first.
+fn build_measured_streaming(
+    modality: Modality,
+    phases: Phases,
+) -> (supertable::IngestResult, Option<ShapeMetrics>) {
+    let sampler = PeakSampler::start_default();
+    let t0 = Instant::now();
+    let built = supertable::build_on_storage_streaming(modality);
+    let wall = t0.elapsed();
+    let rss = sampler.stop_stats();
+    let metrics = phases.build.then_some(ShapeMetrics {
+        wall_ns: wall.as_secs_f64() * 1e9,
+        n_superfiles: built.n_superfiles,
+        peak_rss_bytes: rss.peak_rss_bytes,
+        median_rss_bytes: rss.median_rss_bytes,
+        p90_rss_bytes: rss.p90_rss_bytes,
+        index_bytes: built.total_index_bytes,
+        corpus_bytes: supertable::corpus_byte_size(modality, supertable::n_docs()),
+    });
+    (built, metrics)
+}
+
 /// Obtain the search artifact for modalities that don't need the corpus after
 /// build (FTS, SQL): in dataset mode open the pre-uploaded dataset (no corpus,
 /// no ingest); otherwise generate the corpus and ingest it. Vector keeps its
@@ -494,6 +524,10 @@ fn build_or_open(
     // prefix).
     if crate::dataset::dataset_mode() && !phases.build {
         return (supertable::open_dataset(modality), None);
+    }
+    // Dataset prepare streams the corpus — no full staging on disk.
+    if stream_prepare(phases) {
+        return build_measured_streaming(modality, phases);
     }
     // Corpus to disk + mmap BEFORE the sampler — engine-only window.
     let corpus = supertable::prepare_corpus(modality);
@@ -824,17 +858,19 @@ pub mod vector {
         let existing = tiers::block_on(tiers::existing_supertable_storage_fixture());
 
         // Corpus to disk + mmap (engine-only window), EXCEPT in existing-prefix
-        // mode. Kept alive for the search phase: the same vectors back the
-        // brute-force ground truth, so dataset mode regenerates it too
-        // (skipping only the ingest).
-        let corpus = existing
-            .is_none()
+        // mode and dataset prepare. Kept alive for the search phase: the same
+        // vectors back the brute-force ground truth, so a benched dataset
+        // regenerates it too (skipping only the ingest). Dataset prepare runs
+        // no search, so it streams the corpus instead of staging it.
+        let corpus = (existing.is_none() && !stream_prepare(phases))
             .then(|| supertable::prepare_corpus(Modality::Vector));
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
             (supertable::open_existing(Modality::Vector, fixture), None)
         } else if crate::dataset::dataset_mode() && !phases.build {
             (supertable::open_dataset(Modality::Vector), None)
+        } else if stream_prepare(phases) {
+            build_measured_streaming(Modality::Vector, phases)
         } else {
             build_measured(
                 Modality::Vector,
