@@ -1976,6 +1976,44 @@ async fn build_shortlist(
     }
 }
 
+/// Maximum multiplier applied to filtered-search probe breadth and
+/// rerank width. Caps the inverse-selectivity boost so very sparse
+/// predicates don't turn every query into a full cluster scan.
+const MAX_FILTER_SELECTIVITY_MULT: usize = 64;
+/// Multiplier for the unfiltered path, and for degenerate empty-column
+/// metadata where there is no population to estimate selectivity from.
+const UNFILTERED_SELECTIVITY_MULT: usize = 1;
+/// Multiplier for a present-but-empty allow-set: no row can match, so
+/// callers should return an empty result without probing.
+const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
+/// Population count for an empty allow-set or empty column.
+const EMPTY_FILTER_POPULATION: u64 = 0;
+/// Numerator for the inverse-selectivity multiplier (`1 / selectivity`).
+const FULL_SELECTIVITY: f64 = 1.0;
+
+/// Compute the inverse-selectivity multiplier for filtered search.
+/// Returns [`UNFILTERED_SELECTIVITY_MULT`] when `allow` is `None`
+/// (unfiltered). Returns [`EMPTY_FILTER_SELECTIVITY_MULT`] when `allow`
+/// is present but empty (no row can match — callers must short-circuit).
+/// Capped at [`MAX_FILTER_SELECTIVITY_MULT`].
+fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> usize {
+    let Some(bm) = allow.as_ref() else {
+        return UNFILTERED_SELECTIVITY_MULT;
+    };
+    let allowed = bm.len();
+    if allowed == EMPTY_FILTER_POPULATION {
+        return EMPTY_FILTER_SELECTIVITY_MULT;
+    }
+    let n = n_docs as u64;
+    if n == EMPTY_FILTER_POPULATION {
+        return UNFILTERED_SELECTIVITY_MULT;
+    }
+    let selectivity = allowed as f64 / n as f64;
+    (FULL_SELECTIVITY / selectivity)
+        .ceil()
+        .min(MAX_FILTER_SELECTIVITY_MULT as f64) as usize
+}
+
 /// Score `query` against every centroid in `centroids_bytes` and
 /// return the top `nprobe` `(cluster_id, distance)` pairs sorted by
 /// ascending distance (closest first).
@@ -1983,37 +2021,6 @@ async fn build_shortlist(
 /// Takes a `&[u8]` view so the caller can hand in either an
 /// in-memory subsection slice or the just-fetched centroids
 /// region bytes from [`Source::get_range`] — both reach this
-/// Compute the inverse-selectivity multiplier for filtered search.
-/// Returns 1 (no boost) when `allow` is `None` (unfiltered) or the
-/// bitmap covers the full column. Capped at 64× so very sparse
-/// predicates don't turn every query into a full cluster scan.
-/// Maximum multiplier applied to filtered-search probe breadth and
-/// rerank width. Caps the inverse-selectivity boost so very sparse
-/// predicates don't turn every query into a full cluster scan.
-const MAX_FILTER_NPROBE_MULT: usize = 64;
-
-/// Compute the inverse-selectivity multiplier for filtered search.
-/// Returns 1 when `allow` is `None` (unfiltered). Returns 0 when
-/// `allow` is present but empty (no row can match — callers must
-/// short-circuit). Capped at [`MAX_FILTER_NPROBE_MULT`].
-fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> usize {
-    let Some(bm) = allow.as_ref() else {
-        return 1;
-    };
-    let allowed = bm.len();
-    if allowed == 0 {
-        return 0;
-    }
-    let n = n_docs as u64;
-    if n == 0 {
-        return 1;
-    }
-    let selectivity = allowed as f64 / n as f64;
-    (1.0 / selectivity)
-        .ceil()
-        .min(MAX_FILTER_NPROBE_MULT as f64) as usize
-}
-
 /// helper through the same shape.
 #[inline]
 fn score_centroids(
