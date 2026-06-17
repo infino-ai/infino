@@ -509,42 +509,22 @@ impl SupertableReader {
             return Ok(0);
         }
 
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let storage = manifest.options.storage.as_ref().map(Arc::clone);
-        let tombstone_cache = self.tombstone_cache.clone();
-        let now = std::time::Instant::now();
-
-        // Warm the tombstone sidecars for every kept superfile in one
-        // concurrent batch, so the per-superfile lookup below is a hit.
-        if let Some(cache) = tombstone_cache.as_ref() {
-            let mut ids: Vec<uuid::Uuid> = kept.iter().map(|e| e.superfile_id).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            cache.prefetch(&ids, now).await;
-        }
-
         let single_term = term_strings.len() == 1;
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
-        let handles: Vec<_> = kept
-            .into_iter()
-            .map(|entry| {
-                let store = Arc::clone(&store);
-                let disk_cache = disk_cache.clone();
-                let storage = storage.clone();
-                let tombstone_cache = tombstone_cache.clone();
+        // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
+        // spawns + opens each superfile concurrently, and short-circuits
+        // on the first error. The per-superfile body returns this
+        // superfile's match count; the totals are summed.
+        let per_superfile = crate::supertable::query::dispatch::fanout_with(
+            self,
+            units,
+            move |r, entry, tombstone_cache, now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
-                tokio::spawn(async move {
-                    let r = crate::supertable::query::dispatch::open_reader(
-                        &store,
-                        disk_cache.as_ref(),
-                        storage.as_ref(),
-                        &entry,
-                    )
-                    .await?;
+                async move {
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
                         Some(c) => {
@@ -574,17 +554,11 @@ impl SupertableReader {
                         Some(b) => docs.iter().filter(|d| !b.contains(**d)).count() as u64,
                     };
                     Ok(n)
-                })
-            })
-            .collect();
-
-        let mut total: u64 = 0;
-        for h in handles {
-            total += h
-                .await
-                .map_err(|e| QueryError::Store(format!("count fan-out join: {e}")))??;
-        }
-        Ok(total)
+                }
+            },
+        )
+        .await?;
+        Ok(per_superfile.into_iter().sum())
     }
 
     /// Unranked two-pass exact match of the **raw string** `value`
@@ -1674,10 +1648,7 @@ mod tests {
 
         // OR "alpha beta": alpha∪beta matches in all three superfiles
         // (2 + 1 + 2) — proves the per-superfile counts are summed.
-        assert_eq!(
-            st.count("title", "alpha beta", BoolMode::Or).expect("c"),
-            5
-        );
+        assert_eq!(st.count("title", "alpha beta", BoolMode::Or).expect("c"), 5);
         // OR "gamma delta": 1 + 2 + 1 across the three superfiles.
         assert_eq!(
             st.count("title", "gamma delta", BoolMode::Or).expect("c"),
