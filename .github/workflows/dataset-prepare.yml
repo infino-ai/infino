@@ -23,9 +23,9 @@ on:
         default: "fts vector sql"
         type: string
       docs:
-        description: "Documents to generate (plain integer)."
+        description: "Documents to generate (plain integer). Larger runs scale fine (the corpus streams), but size the VM's RAM to the per-commit working set."
         required: true
-        default: "1000000000"
+        default: "10000000"
         type: string
       vm_size:
         description: "Azure VM size (L-series = local NVMe)."
