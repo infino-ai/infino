@@ -430,7 +430,6 @@ impl Supertable {
                 current,
                 &new_entries,
                 &entries_to_remove,
-                inner.manifest.load().manifest_id + 1,
                 &mut pending_storage_writes,
             )
             .await

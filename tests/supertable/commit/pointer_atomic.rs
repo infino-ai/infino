@@ -47,7 +47,8 @@ use infino::supertable::manifest::part::{self as part_mod, ContentHash, Manifest
 use infino::supertable::storage::{
     LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
 };
-use infino::supertable::{CommitError, ManifestLoadError};
+use infino::supertable::{CommitError, Manifest, ManifestLoadError};
+use infino::test_helpers::default_supertable_options;
 use tempfile::TempDir;
 
 /// Manifest id used by the pointer-file round-trip fixture.
@@ -69,14 +70,37 @@ const PARALLEL_PUT_POLL_TIMEOUT_SECS: u64 = 5;
 const PARALLEL_PUT_POLL_INTERVAL_MS: u64 = 10;
 
 async fn commit_manifest(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     expected_prev_etag: Option<&str>,
     new_list: &ManifestList,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
     let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p, 3)).collect();
     let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
-    commit::commit_manifest(storage, expected_prev_etag, new_list, &encoded_refs).await
+
+    // Start from an empty manifest (no superfiles) carrying the
+    // new list, then commit it via the production persistence
+    // path. `Manifest::write` issues the part + list PUTs in
+    // parallel and finishes with the conditional pointer PUT (the
+    // visibility barrier). It only serializes the attached list,
+    // so the default options suffice for the persistence side.
+    let manifest = Manifest::new(
+        new_list.manifest_id,
+        Arc::new(default_supertable_options()),
+        Vec::new(),
+        Some(Arc::clone(storage)),
+        Some(new_list.clone()),
+    );
+    manifest
+        .write(storage.as_ref(), expected_prev_etag, &encoded_refs)
+        .await?;
+
+    // Hand back the pointer the commit just published.
+    let (pointer, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("pointer readable after commit")
+        .expect("pointer present after commit");
+    Ok(pointer)
 }
 
 // ============================================================
@@ -116,7 +140,7 @@ fn pointer_file_tolerates_unknown_keys_for_forward_compat() {
               content_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n\
               future_field=whatever\n";
     let p = PointerFile::from_bytes(s).expect("parse");
-    assert_eq!(p.manifest_id, POINTER_FORWARD_COMPAT_MANIFEST_ID);
+    assert_eq!(p.get_manifest_id(), POINTER_FORWARD_COMPAT_MANIFEST_ID);
 }
 
 // ============================================================
@@ -176,7 +200,8 @@ fn entry_for(part: &ManifestPart) -> ManifestListEntry {
 #[tokio::test]
 async fn initial_commit_writes_list_part_pointer() {
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let part = fresh_part(1);
     let list = empty_list(0, vec![entry_for(&part)]);
@@ -185,11 +210,14 @@ async fn initial_commit_writes_list_part_pointer() {
         .await
         .expect("initial commit");
 
-    assert_eq!(pointer.manifest_id, 0);
+    assert_eq!(pointer.get_manifest_id(), 0);
     assert_eq!(pointer.manifest_list_uri, list_uri(0));
 
     // Pointer is readable.
-    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
+    let (read, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("read")
+        .expect("some");
     assert_eq!(read, pointer);
     // List + part are at their expected URIs.
     let (list_bytes, _) = storage.get(&list_uri(0)).await.expect("list bytes");
@@ -212,7 +240,8 @@ async fn no_prior_pointer_is_none() {
 #[tokio::test]
 async fn second_commit_with_valid_prev_etag_succeeds() {
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let part_v0 = fresh_part(2);
     let list_v0 = empty_list(0, vec![entry_for(&part_v0)]);
@@ -234,16 +263,20 @@ async fn second_commit_with_valid_prev_etag_succeeds() {
     let pointer = commit_manifest(&storage, Some(&etag_v0), &list_v1, &[&part_v1])
         .await
         .expect("v1");
-    assert_eq!(pointer.manifest_id, 1);
+    assert_eq!(pointer.get_manifest_id(), 1);
 
-    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
-    assert_eq!(read.manifest_id, 1);
+    let (read, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("read")
+        .expect("some");
+    assert_eq!(read.get_manifest_id(), 1);
 }
 
 #[tokio::test]
 async fn stale_prev_etag_surfaces_write_contention_exhausted() {
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let part_v0 = fresh_part(4);
     let list_v0 = empty_list(0, vec![entry_for(&part_v0)]);
@@ -280,7 +313,8 @@ async fn stale_prev_etag_surfaces_write_contention_exhausted() {
 async fn part_reuse_writes_zero_new_part_files() {
     // Setup: v0 with one part already published.
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let part = fresh_part(7);
     let list_v0 = empty_list(0, vec![entry_for(&part)]);
     commit_manifest(&storage, None, &list_v0, &[&part])
@@ -313,8 +347,11 @@ async fn part_reuse_writes_zero_new_part_files() {
     );
 
     // But manifest_id 1 is published.
-    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
-    assert_eq!(read.manifest_id, 1);
+    let (read, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("read")
+        .expect("some");
+    assert_eq!(read.get_manifest_id(), 1);
 }
 
 #[tokio::test]
@@ -495,9 +532,7 @@ async fn commit_issues_list_and_part_in_parallel() {
         let storage_dyn = Arc::clone(&storage_dyn);
         let part = part.clone();
         let list = list.clone();
-        tokio::spawn(
-            async move { commit_manifest(storage_dyn.as_ref(), None, &list, &[&part]).await },
-        )
+        tokio::spawn(async move { commit_manifest(&storage_dyn, None, &list, &[&part]).await })
     };
 
     // Wait for both PUTs (list + part) to arrive at the
@@ -529,7 +564,7 @@ async fn commit_issues_list_and_part_in_parallel() {
     // pointer PUT which is a third put_calls hit; allowed
     // because barrier(2) is reusable on the next .wait()).
     let pointer = commit_handle.await.expect("join").expect("commit");
-    assert_eq!(pointer.manifest_id, 0);
+    assert_eq!(pointer.get_manifest_id(), 0);
     // Total: 2 PUTs (list+part) + 1 PUT (pointer) = 3.
     assert_eq!(
         storage.put_calls.load(Ordering::Acquire),

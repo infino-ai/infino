@@ -434,16 +434,16 @@ async fn do_apply(
     // `Writer::commit` path arms it. We swap here so subsequent
     // reads + the idempotency probe on a retry both see the
     // new superfile.
-    let new_manifest = crate::supertable::writer::persist_commit(
+    crate::supertable::writer::persist_commit(
         inner,
         storage,
         vec![entry],
+        &[],
         vec![(uri, bytes.clone())],
     )
     .map_err(|e| AppendPhaseError::ManifestCommit {
         message: format!("{e}"),
     })?;
-    inner.manifest.store(Arc::new(new_manifest));
 
     // Warm the in-memory reader cache with the freshly-published
     // bytes so this process's later reads (queries, tombstone
