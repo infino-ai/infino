@@ -298,12 +298,12 @@ impl SupertableProvider {
     /// The set of FTS-indexed column names — used by the candidate
     /// planner and by `supports_filters_pushdown` to decide which
     /// filters the index can resolve.
-    fn fts_cols_set(&self) -> std::collections::HashSet<String> {
+    fn fts_cols_set(&self) -> std::collections::HashSet<&str> {
         self.manifest
             .options
             .fts_columns
             .iter()
-            .map(|c| c.column.clone())
+            .map(|c| c.column.as_str())
             .collect()
     }
 

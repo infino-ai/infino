@@ -356,11 +356,11 @@ impl ExecutionPlan for VectorSearchExec {
             // FTS-resolvable predicate, or none pushed) runs the plain kNN
             // and lets the `FilterExec` above apply the predicate.
             let manifest = reader.manifest();
-            let fts_cols: HashSet<String> = manifest
+            let fts_cols: HashSet<&str> = manifest
                 .options
                 .fts_columns
                 .iter()
-                .map(|c| c.column.clone())
+                .map(|c| c.column.as_str())
                 .collect();
             let plan = CandidatePlan::from_filters(
                 &filters,
