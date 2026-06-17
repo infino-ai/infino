@@ -1654,6 +1654,62 @@ mod tests {
     }
 
     #[test]
+    fn count_multi_term_sums_across_superfiles() {
+        // 3 commits → 3 superfiles. Multi-term queries take the general
+        // `token_match` branch (not the single-term df fast path), so this
+        // exercises summing per-superfile match counts across superfiles
+        // for both OR (union spans all three) and AND (intersection lands
+        // in one). Doc ids are globally unique across commits.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["beta gamma", "delta"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(4, &["alpha delta", "beta"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        // OR "alpha beta": alpha∪beta matches in all three superfiles
+        // (2 + 1 + 2) — proves the per-superfile counts are summed.
+        assert_eq!(
+            st.count("title", "alpha beta", BoolMode::Or).expect("c"),
+            5
+        );
+        // OR "gamma delta": 1 + 2 + 1 across the three superfiles.
+        assert_eq!(
+            st.count("title", "gamma delta", BoolMode::Or).expect("c"),
+            4
+        );
+        // AND "alpha beta": both terms only in the first superfile's
+        // "alpha beta" doc → 1 (the other superfiles contribute 0).
+        assert_eq!(
+            st.count("title", "alpha beta", BoolMode::And).expect("c"),
+            1
+        );
+        // AND "alpha delta": both terms only in the third superfile.
+        assert_eq!(
+            st.count("title", "alpha delta", BoolMode::And).expect("c"),
+            1
+        );
+
+        // Cross-check every shape against token_match cardinality.
+        let r = st.reader();
+        for (q, mode) in [
+            ("alpha beta", BoolMode::Or),
+            ("gamma delta", BoolMode::Or),
+            ("alpha beta", BoolMode::And),
+            ("alpha delta", BoolMode::And),
+        ] {
+            let c = r.count("title", q, mode).expect("count");
+            let n = r.token_match("title", q, mode).expect("token_match").len() as u64;
+            assert_eq!(c, n, "count vs token_match for {q:?} {mode:?}");
+        }
+    }
+
+    #[test]
     fn count_honors_or_and_modes() {
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
