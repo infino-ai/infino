@@ -1112,13 +1112,57 @@ pub mod vector {
                     );
                 }
 
+                let vecs = vectors();
+                let q_corr = queries_correctness();
+                let unfiltered_gt = ground_truth_correctness();
+                let filtered_gt: Vec<Vec<u32>> = q_corr
+                    .iter()
+                    .map(|q| {
+                        let mut dists: Vec<(f32, u32)> = allow
+                            .iter()
+                            .map(|id| {
+                                let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
+                                let dot: f32 =
+                                    row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                (-dot, id)
+                            })
+                            .collect();
+                        dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                        dists.truncate(TOP_K);
+                        dists.into_iter().map(|(_, id)| id).collect()
+                    })
+                    .collect();
+
+                /// Maximum multiplier applied by filtered search's
+                /// selectivity boost in the vector reader.
+                const FILTER_MAX_MULT: usize = 64;
+                let filter_mult = FILTER_KEEP_EVERY.min(FILTER_MAX_MULT);
+                let filtered_nprobe =
+                    DEFAULT_NPROBE.saturating_mul(filter_mult).min(corpus::n_cent(n_docs));
+                let filtered_rerank = DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
+                let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
                 let mut rows = Vec::new();
-                for (label, set) in [
-                    ("unfiltered", None),
-                    ("filtered (~10%)", Some(Arc::clone(&allow))),
+                for (label, set, gt, effective_nprobe, effective_rerank, selectivity_label) in [
+                    (
+                        "unfiltered",
+                        None,
+                        unfiltered_gt,
+                        DEFAULT_NPROBE,
+                        DEFAULT_RERANK_MULT,
+                        "100.0%".to_string(),
+                    ),
+                    (
+                        "filtered (~10%)",
+                        Some(Arc::clone(&allow)),
+                        &filtered_gt,
+                        filtered_nprobe,
+                        filtered_rerank,
+                        format!("{:.1}%", selectivity * 100.0),
+                    ),
                 ] {
                     let mut samples = Vec::new();
-                    for q in queries_correctness() {
+                    let mut recall_samples = Vec::new();
+                    for (qi, q) in q_corr.iter().enumerate() {
                         for _ in 0..CALIBRATION_P50_ITERS {
                             let t0 = Instant::now();
                             let hits = tiers::block_on(reader.vector_hits_filtered_async(
@@ -1129,13 +1173,22 @@ pub mod vector {
                                 set.clone(),
                             ))
                             .expect("filtered vector search");
-                            std::hint::black_box(hits);
                             samples.push(t0.elapsed());
+                            recall_samples.push(corpus::recall_at_k(&hits, &gt[qi]));
                         }
                     }
                     samples.sort_unstable();
                     let ns = samples[samples.len() / 2].as_secs_f64() * NS_PER_SEC;
-                    rows.push(vec![text(label), metric(ns, fmt_time(ns), Better::Lower)]);
+                    let mean_recall: f32 =
+                        recall_samples.iter().sum::<f32>() / recall_samples.len() as f32;
+                    rows.push(vec![
+                        text(label),
+                        text(format!("p={DEFAULT_NPROBE}, r={DEFAULT_RERANK_MULT}")),
+                        text(format!("p={effective_nprobe}, r={effective_rerank}")),
+                        text(selectivity_label),
+                        text(format!("{mean_recall:.3}")),
+                        metric(ns, fmt_time(ns), Better::Lower),
+                    ]);
                 }
                 report.emit(&Section {
                     anchor: "bench/vector/superfile/filtered".into(),
@@ -1143,10 +1196,17 @@ pub mod vector {
                         "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={DIM})",
                         fmt_count(n_docs)
                     ),
-                    note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; p50 over the correctness query battery at the `default` config. Δ is vs the previous run.".into(),
+                    note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; recall and p50 over the correctness query battery at the requested `default` config. `effective (p, r)` includes the reader's selectivity boost. Δ is vs the previous run.".into(),
                     blocks: vec![Block {
                         subtitle: String::new(),
-                        headers: vec!["Filter".into(), "p50".into()],
+                        headers: vec![
+                            "Filter".into(),
+                            "(p, r)".into(),
+                            "effective (p, r)".into(),
+                            "selectivity".into(),
+                            "recall@10".into(),
+                            "p50".into(),
+                        ],
                         rows,
                     }],
                 });

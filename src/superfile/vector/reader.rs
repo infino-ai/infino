@@ -1439,6 +1439,9 @@ impl VectorReader {
         // and rerank_mult=20 miss most k-nearest among allowed rows.
         // Capped at 64× the caller's value.
         let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
         let nprobe_eff = nprobe
             .saturating_mul(filter_mult)
             .min(col.n_cent as usize)
@@ -1984,14 +1987,25 @@ async fn build_shortlist(
 /// Returns 1 (no boost) when `allow` is `None` (unfiltered) or the
 /// bitmap covers the full column. Capped at 64× so very sparse
 /// predicates don't turn every query into a full cluster scan.
+/// Maximum multiplier applied to filtered-search probe breadth and
+/// rerank width. Caps the inverse-selectivity boost so very sparse
+/// predicates don't turn every query into a full cluster scan.
 const MAX_FILTER_NPROBE_MULT: usize = 64;
+
+/// Compute the inverse-selectivity multiplier for filtered search.
+/// Returns 1 when `allow` is `None` (unfiltered). Returns 0 when
+/// `allow` is present but empty (no row can match — callers must
+/// short-circuit). Capped at [`MAX_FILTER_NPROBE_MULT`].
 fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> usize {
     let Some(bm) = allow.as_ref() else {
         return 1;
     };
-    let n = n_docs as u64;
     let allowed = bm.len();
-    if n == 0 || allowed == 0 {
+    if allowed == 0 {
+        return 0;
+    }
+    let n = n_docs as u64;
+    if n == 0 {
         return 1;
     }
     let selectivity = allowed as f64 / n as f64;

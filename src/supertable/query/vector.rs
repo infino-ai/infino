@@ -495,6 +495,67 @@ impl SupertableReader {
             .await
     }
 
+    /// Test/bench-only bitmap-filtered vector kNN. `allow_global` uses the
+    /// same global row numbering as the bench corpus and is translated to
+    /// per-superfile `local_doc_id` bitmaps before entering the normal filtered
+    /// fan-out. This lets the supertable bench mirror the superfile filtered
+    /// recall probe without requiring an FTS predicate on the vector-only
+    /// fixture.
+    #[cfg(feature = "test-helpers")]
+    pub async fn vector_hits_global_allow_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        allow_global: Arc<RoaringBitmap>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 || allow_global.is_empty() {
+            return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        let superfiles = manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut allow_by_uri: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
+        let mut allowed = allow_global.iter().peekable();
+        let mut base = 0u64;
+        for entry in manifest.superfiles.iter() {
+            let end = base.saturating_add(entry.n_docs);
+            while allowed.peek().is_some_and(|&id| (id as u64) < base) {
+                allowed.next();
+            }
+            let mut local = RoaringBitmap::new();
+            while let Some(id) = allowed.peek().copied() {
+                let id = id as u64;
+                if id >= end {
+                    break;
+                }
+                local.insert((id - base) as u32);
+                allowed.next();
+            }
+            if !local.is_empty() {
+                allow_by_uri.insert(entry.uri, local);
+            }
+            base = end;
+        }
+
+        if allow_by_uri.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allow = allow_by_uri
+            .into_iter()
+            .map(|(uri, bm)| (uri, Arc::new(bm)))
+            .collect();
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+            .await
+    }
+
     /// Resolve a [`CandidatePlan`] to a per-superfile allow-set of matching
     /// `local_doc_id`s over the given vector-pruned `superfiles` — the
     /// boolean-plan analog of [`Self::candidate_bitmaps`] (which evaluates a

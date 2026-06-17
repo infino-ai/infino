@@ -37,6 +37,7 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 #[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
@@ -813,6 +814,7 @@ pub mod vector {
     use crate::corpus;
     use crate::executors::vector as exec_vec;
     use crate::executors::vector::VectorRead;
+    use infino::roaring::RoaringBitmap;
 
     // Correctness gate, recall targets, calibration grid, and p50 iters
     // live in `crate::executors::vector` (shared by both tiers).
@@ -823,6 +825,8 @@ pub mod vector {
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
+    /// Filtered vector bench allow-set density: keep every Nth row.
+    const FILTER_KEEP_EVERY: usize = 10;
 
     /// `INFINO_BENCH_SKIP_CALIBRATION=1` measures only the fixed
     /// `(nprobe, rerank)` config — no correctness gate, no recall-target
@@ -915,11 +919,12 @@ pub mod vector {
             let rerank = fixed_rerank_mult();
 
             #[allow(clippy::type_complexity)]
-            let (q_correct, q_cal, gt_correct, gt_cal): (
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt): (
                 Vec<Vec<f32>>,
                 Vec<Vec<f32>>,
                 Vec<Vec<u32>>,
                 Vec<Vec<u32>>,
+                Option<Vec<Vec<u32>>>,
             ) = if let Some(corpus) = &corpus {
                 // The ingested vectors are still mmapped from the prepared
                 // corpus — queries and ground truth come from them instead
@@ -948,8 +953,12 @@ pub mod vector {
                     true,
                     QUERY_SIGMA,
                 );
-                let (gt_correct, gt_cal): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if skip_cal {
-                    (Vec::new(), Vec::new())
+                let (gt_correct, gt_cal, filtered_gt): (
+                    Vec<Vec<u32>>,
+                    Vec<Vec<u32>>,
+                    Option<Vec<Vec<u32>>>,
+                ) = if skip_cal {
+                    (Vec::new(), Vec::new(), None)
                 } else {
                     eprintln!(
                         "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
@@ -959,9 +968,32 @@ pub mod vector {
                         q_correct.iter().chain(q_cal.iter()).cloned().collect();
                     let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
                     let gt_cal = gt_all.split_off(q_correct.len());
-                    (gt_all, gt_cal)
+                    let mut allow = RoaringBitmap::new();
+                    for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+                        allow.insert(i);
+                    }
+                    let filtered_gt = q_correct
+                        .iter()
+                        .map(|q| {
+                            let mut dists: Vec<(f32, u32)> = allow
+                                .iter()
+                                .map(|id| {
+                                    let row = &vslice[id as usize * DIM..(id as usize + 1) * DIM];
+                                    let dot: f32 =
+                                        row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                    (-dot, id)
+                                })
+                                .collect();
+                            dists.sort_unstable_by(|a, b| {
+                                a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+                            });
+                            dists.truncate(TOP_K);
+                            dists.into_iter().map(|(_, id)| id).collect()
+                        })
+                        .collect();
+                    (gt_all, gt_cal, Some(filtered_gt))
                 };
-                (q_correct, q_cal, gt_correct, gt_cal)
+                (q_correct, q_cal, gt_correct, gt_cal, filtered_gt)
             } else {
                 // Existing-prefix: no corpus → corpus-free Gaussian queries
                 // and no ground truth. Recall is meaningless here; this path
@@ -975,6 +1007,7 @@ pub mod vector {
                     corpus::generate_queries(N_CALIBRATION_QUERIES, QUERY_CALIBRATION_SEED),
                     Vec::new(),
                     Vec::new(),
+                    None,
                 )
             };
             // Queries + ground truth extracted; free the corpus pages
@@ -1052,6 +1085,98 @@ pub mod vector {
                     None,
                 );
             }
+            // Filtered vector recall + latency mirrors the superfile tier:
+            // same every-Nth-row allow-set, same brute-force filtered ground
+            // truth, same default config.
+            if phases.warm
+                && let Some(filtered_gt) = filtered_gt.as_ref()
+            {
+                let mut allow = RoaringBitmap::new();
+                for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+                    allow.insert(i);
+                }
+                let allow = Arc::new(allow);
+
+                let consumer_reader = consumer.reader();
+                let manifest = consumer_reader.manifest();
+                let mut offsets: HashMap<_, u32> = HashMap::new();
+                let mut base = 0u32;
+                for entry in manifest.superfiles.iter() {
+                    offsets.insert(entry.uri, base);
+                    base = base.saturating_add(entry.n_docs as u32);
+                }
+                let mut recalls = Vec::new();
+                let mut latencies = Vec::new();
+                for (q, gt) in q_correct.iter().zip(filtered_gt) {
+                    let t0 = Instant::now();
+                    let hits = tiers::block_on(
+                        consumer_reader.vector_hits_global_allow_async(
+                            supertable::VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::search_opts(nprobe, rerank),
+                            Arc::clone(&allow),
+                        ),
+                    )
+                    .expect("filtered recall query");
+                    latencies.push(t0.elapsed());
+                    let global_hits: Vec<(u32, f32)> = hits
+                        .iter()
+                        .filter_map(|h| {
+                            offsets
+                                .get(&h.superfile)
+                                .map(|base| (base.saturating_add(h.local_doc_id), h.score))
+                        })
+                        .collect();
+                    recalls.push(corpus::recall_at_k(&global_hits, gt));
+                }
+                let mean_recall: f32 =
+                    recalls.iter().sum::<f32>() / recalls.len() as f32;
+                latencies.sort_unstable();
+                let p50_ns =
+                    latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
+                let effective_rerank = rerank.saturating_mul(FILTER_KEEP_EVERY);
+
+                eprintln!(
+                    "[supertable_vector] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean_recall:.3}, p50={:.2}ms",
+                    q_correct.len(),
+                    p50_ns / 1e6,
+                );
+
+                report.emit(&Section {
+                    anchor: "bench/vector/supertable/filtered".into(),
+                    title: format!(
+                        "Supertable vector — filtered search ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        DIM
+                    ),
+                    note: format!(
+                        "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
+                        FILTER_KEEP_EVERY
+                    ),
+                    blocks: vec![Block {
+                        subtitle: String::new(),
+                        headers: vec![
+                            "Filter".into(),
+                            "(p, r)".into(),
+                            "effective (p, r)".into(),
+                            "selectivity".into(),
+                            "recall@10".into(),
+                            "p50".into(),
+                        ],
+                        rows: vec![vec![
+                            text("filtered (~10%)"),
+                            text(format!("p={nprobe}, r={rerank}")),
+                            text(format!("p={nprobe}, r={effective_rerank}")),
+                            text(format!("{:.1}%", selectivity * 100.0)),
+                            text(format!("{mean_recall:.3}")),
+                            metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                        ]],
+                    }],
+                });
+            }
+
             drop(consumer);
             drop(cache_dir);
         }

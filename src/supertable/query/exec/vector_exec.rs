@@ -367,6 +367,10 @@ impl ExecutionPlan for VectorSearchExec {
                 &fts_cols,
                 manifest.options.tokenizer.as_ref(),
             );
+            // Inexact pushdown: the FTS candidate plan is a token-match
+            // superset; the FilterExec above reapplies the exact predicate
+            // and can trim results. Over-fetch so it has enough rows.
+            const INEXACT_OVERFETCH_MULT: usize = 4;
             let hits = match plan {
                 CandidatePlan::Unbounded => {
                     reader
@@ -374,8 +378,9 @@ impl ExecutionPlan for VectorSearchExec {
                         .await
                 }
                 bounded => {
+                    let pushed_k = k.saturating_mul(INEXACT_OVERFETCH_MULT);
                     reader
-                        .vector_hits_filtered_by_plan(&column, &query, k, options, &bounded)
+                        .vector_hits_filtered_by_plan(&column, &query, pushed_k, options, &bounded)
                         .await
                 }
             }
