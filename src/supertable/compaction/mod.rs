@@ -405,34 +405,29 @@ impl Supertable {
         let max_retries = opts.max_commit_retries.max(1);
 
         for attempt in 0..max_retries {
-            let old = inner.manifest.load_full();
-
-            // Another compactor already merged our inputs — nothing left to commit.
-            if !job.inputs.iter().all(|id| {
-                old.superfile_list
-                    .superfiles
-                    .iter()
-                    .any(|e| e.superfile_id == *id)
-            }) {
-                return Ok(());
-            }
+            let current = inner.manifest.load_full();
 
             let entries_to_remove: Vec<Arc<SuperfileEntry>> = job
                 .inputs
                 .iter()
                 .filter_map(|id| {
-                    old.superfile_list
-                        .superfiles
+                    current
+                        .get_all_superfiles()
                         .iter()
                         .find(|e| e.superfile_id == *id)
                         .cloned()
                 })
                 .collect();
 
+            // Another compactor already merged our inputs — nothing left to commit.
+            if entries_to_remove.len() != job.inputs.len() {
+                return Ok(());
+            }
+
             match try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
-                old,
+                current,
                 &new_entries,
                 &entries_to_remove,
                 inner.manifest.load().manifest_id + 1,
