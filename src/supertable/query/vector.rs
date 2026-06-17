@@ -305,15 +305,25 @@ impl SupertableReader {
                     res.map_err(|e| QueryError::Parquet(e.to_string()))
                 }
             };
-        let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
-        let mut per_superfile = Vec::new();
-        while !units.is_empty() {
-            let n = fanout_width.min(units.len());
-            let wave: Vec<_> = units.drain(..n).collect();
-            per_superfile.extend(
-                crate::supertable::query::dispatch::fanout(self, wave, kernel.clone()).await?,
-            );
-        }
+        // Filtered search holds a per-superfile RoaringBitmap while the
+        // kernel builds its shortlist; wave-cap the fan-out by reader-pool
+        // width so transient memory stays bounded. The unfiltered path
+        // carries no bitmaps and fans out all units at once (matching
+        // main's concurrency — every superfile GET overlaps on tokio).
+        let per_superfile = if allow.is_some() {
+            let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+            let mut collected = Vec::new();
+            while !units.is_empty() {
+                let n = fanout_width.min(units.len());
+                let wave: Vec<_> = units.drain(..n).collect();
+                collected.extend(
+                    crate::supertable::query::dispatch::fanout(self, wave, kernel.clone()).await?,
+                );
+            }
+            collected
+        } else {
+            crate::supertable::query::dispatch::fanout(self, units, kernel).await?
+        };
 
         Ok(top_k_ascending(per_superfile, k))
     }
