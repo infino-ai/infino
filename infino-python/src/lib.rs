@@ -106,7 +106,7 @@ fn connect(
     // other Python threads run during the (blocking) I/O.
     let inner = py.detach(|| {
         let mut opts = ConnectOptions::new();
-        let mut custom = false;
+        let mut has_options = false;
         if let Some(endpoint) = endpoint {
             let region = region
                 .ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
@@ -115,22 +115,22 @@ fn connect(
             let secret_key = secret_key
                 .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
             opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
-            custom = true;
+            has_options = true;
         }
         if let Some(dir) = cache_dir {
             opts = opts.with_cache_dir(dir);
-            custom = true;
+            has_options = true;
         }
         if let Some(bytes) = cache_budget_bytes {
             opts = opts.with_cache_budget_bytes(bytes);
-            custom = true;
+            has_options = true;
         }
         if let Some(mode) = cold_fetch_mode {
             opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
-            custom = true;
+            has_options = true;
         }
-        // Keep the plain `connect(uri)` path untouched when no options are set.
-        if custom {
+        // Preserve the plain `connect(uri)` path when no options are set.
+        if has_options {
             infino::connect_with(uri, opts).map_err(py_err)
         } else {
             infino::connect(uri).map_err(py_err)
