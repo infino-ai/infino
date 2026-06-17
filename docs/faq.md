@@ -88,4 +88,20 @@ DataFusion executes in-process; you reach it through the connection's
 one engine, so joins and aggregations span tables. The retrievers are also SQL
 table-valued functions (`bm25_search`, `vector_search`, `token_match`,
 `exact_match`, `hybrid_search`), so search composes into a SQL plan as a
-relation. See [Queries](architecture/supertable.md#queries).
+relation.
+
+```python
+import infino
+
+db = infino.connect("memory://")          # in-process; no server, no daemon
+
+# Search is a table function, so it composes into the SQL plan as a relation:
+# rank `docs` by BM25, then group and count — one query, no separate service.
+rows = db.query_sql("""
+    SELECT source, COUNT(*) AS hits
+    FROM bm25_search('docs', 'body', 'cancel subscription', 50)
+    GROUP BY source
+""")
+```
+
+See [Queries](architecture/supertable.md#queries).
