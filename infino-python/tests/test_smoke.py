@@ -42,6 +42,24 @@ def test_memory_roundtrip():
     assert db.list_tables() == []
 
 
+def test_connect_accepts_cache_options(tmp_path):
+    # Cache options are a no-op for local storage but must parse and apply.
+    db = infino.connect(
+        str(tmp_path / "catalog"),
+        cache_dir=str(tmp_path / "cache"),
+        cache_budget_bytes=64 * 1024 * 1024,
+        cold_fetch_mode="lazy",
+    )
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "the quick brown fox"}])
+    assert t.token_match("title", "fox").num_rows == 1
+
+
+def test_connect_rejects_invalid_cold_fetch_mode():
+    with pytest.raises(ValueError):
+        infino.connect("memory://", cold_fetch_mode="nonsense")
+
+
 def test_query_sql_returns_pyarrow_table():
     db = infino.connect("memory://")
     table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
