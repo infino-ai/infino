@@ -774,4 +774,36 @@ supertable:
             "expected an out-of-range message; got {msg:?}"
         );
     }
+
+    /// `ThreadCount` serializes back to its config spelling (`"auto"` /
+    /// an integer), deserializes from an owned-string value, and
+    /// rejects a negative integer and a wrong-typed value (the latter
+    /// surfacing the visitor's `expecting` message).
+    #[test]
+    fn thread_count_serde_round_trips_and_rejects_bad_types() {
+        use serde_json::json;
+
+        // Serialize both variants.
+        assert_eq!(
+            serde_json::to_value(ThreadCount::Auto).expect("serialize auto"),
+            json!("auto")
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadCount::Fixed(8)).expect("serialize fixed"),
+            json!(8)
+        );
+
+        // Deserialize from an owned-string `Value` exercises the
+        // `visit_string` arm (vs `visit_str` for borrowed input).
+        let tc: ThreadCount =
+            serde_json::from_value(json!("auto")).expect("deserialize owned string");
+        assert!(matches!(tc, ThreadCount::Auto));
+
+        // A negative integer is rejected by the signed-int visitor.
+        assert!(serde_json::from_str::<ThreadCount>("-1").is_err());
+
+        // A wrong-typed value (bool) fails through the default visitor,
+        // which formats the `expecting` description.
+        assert!(serde_json::from_str::<ThreadCount>("true").is_err());
+    }
 }

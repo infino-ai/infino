@@ -3315,4 +3315,123 @@ mod tests {
         assert!(dir_off > postings_off, "directory after postings");
         assert!(dir_off <= blob.len(), "directory offset within blob");
     }
+
+    #[test]
+    fn set_spill_partitions_rejects_after_register_column() {
+        // Must be called before the first `register_column`.
+        let mut b = FtsBuilder::new(tokenizer());
+        b.register_column("body".into()).expect("register col");
+        let err = b.set_spill_partitions(16).expect_err("expected error");
+        match err {
+            BuildError::Io(e) => {
+                assert!(e.to_string().contains("before any register_column"));
+            }
+            other => panic!("expected Io error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_spill_partitions_rejects_zero() {
+        let mut b = FtsBuilder::new(tokenizer());
+        let err = b.set_spill_partitions(0).expect_err("expected error");
+        match err {
+            BuildError::Io(e) => assert!(e.to_string().contains("must be ≥ 1")),
+            other => panic!("expected Io error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_spill_partitions_rejects_non_power_of_two() {
+        // Partition selection is `term_id & (n - 1)`, only correct for
+        // power-of-two `n`.
+        const NON_PO2: usize = 7;
+        let mut b = FtsBuilder::new(tokenizer());
+        let err = b.set_spill_partitions(NON_PO2).expect_err("expected error");
+        match err {
+            BuildError::Io(e) => assert!(e.to_string().contains("power of two")),
+            other => panic!("expected Io error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_partition_triples_empty_file_is_empty() {
+        // An empty spill partition file decodes to zero triples.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.part");
+        std::fs::write(&path, []).expect("write empty file");
+        let triples = read_partition_triples(&path).expect("read empty");
+        assert!(triples.is_empty());
+    }
+
+    #[test]
+    fn read_partition_triples_round_trips_le_bytes() {
+        // Spill files are a contiguous run of 12-byte little-endian
+        // `[term_id, doc_id, tf]` triples; decoding restores them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("good.part");
+        let mut bytes = Vec::new();
+        for field in [3u32, 4, 5, 6, 7, 8] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).expect("write triples");
+        let triples = read_partition_triples(&path).expect("read triples");
+        assert_eq!(triples, vec![[3u32, 4, 5], [6u32, 7, 8]]);
+    }
+
+    #[test]
+    fn read_partition_triples_rejects_non_multiple_length() {
+        // A file whose byte length isn't a multiple of the 12-byte
+        // triple size is malformed and must error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ragged.part");
+        // One full triple plus a stray byte.
+        std::fs::write(&path, vec![0u8; TRIPLE_BYTES + 1]).expect("write ragged file");
+        let err = read_partition_triples(&path).expect_err("expected error");
+        match err {
+            BuildError::Io(e) => {
+                assert_eq!(e.kind(), ErrorKind::InvalidData);
+                assert!(e.to_string().contains("not a multiple"));
+            }
+            other => panic!("expected Io error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn merge_entry_orders_by_sort_key_reversed() {
+        // `MergeEntry` is a min-heap entry: `Ord` is reversed so a
+        // BinaryHeap (max-heap) pops the smallest sort_key first. This
+        // exercises the derived `PartialEq` / `PartialOrd` bridges too.
+        let small = MergeEntry {
+            sort_key: 10,
+            term_id: 1,
+            tf: 1,
+            reader_idx: 0,
+        };
+        let large = MergeEntry {
+            sort_key: 20,
+            term_id: 2,
+            tf: 1,
+            reader_idx: 1,
+        };
+        // Reversed ordering: the smaller sort_key is the "greater"
+        // entry so the max-heap surfaces it first.
+        assert_eq!(small.cmp(&large), Ordering::Greater);
+        assert_eq!(small.partial_cmp(&large), Some(Ordering::Greater));
+        assert!(small != large);
+
+        let small_dup = MergeEntry {
+            sort_key: 10,
+            term_id: 9,
+            tf: 9,
+            reader_idx: 0,
+        };
+        // Equality is keyed on the comparator (sort_key then
+        // reader_idx); term_id / tf are payload and don't affect it.
+        assert!(small == small_dup);
+
+        let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::new();
+        heap.push(large);
+        heap.push(small);
+        assert_eq!(heap.pop().expect("non-empty heap").sort_key, 10);
+    }
 }

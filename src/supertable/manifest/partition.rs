@@ -11,7 +11,7 @@
 //! different partitions go into separate parts so a
 //! single-partition commit rewrites exactly one part.
 
-use crate::supertable::error::CommitError;
+use crate::supertable::error::{CommitError, ManifestError};
 use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::manifest::list::PartitionStrategy;
 
@@ -124,14 +124,14 @@ pub fn decode_partition_key(
 pub fn assign_partition(
     seg: &SuperfileEntry,
     strategy: &PartitionStrategy,
-) -> Result<PartitionKey, CommitError> {
+) -> Result<PartitionKey, ManifestError> {
     match strategy {
         PartitionStrategy::TimeRange {
             column,
             granularity_secs,
         } => {
             if *granularity_secs <= 0 {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "TimeRange granularity_secs must be > 0; got {granularity_secs}"
                     ),
@@ -142,7 +142,7 @@ pub fn assign_partition(
             let min_bucket = min.div_euclid(g);
             let max_bucket = max.div_euclid(g);
             if min_bucket != max_bucket {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "superfile {} column {column:?} [{min}, {max}] spans buckets \
                          {min_bucket}..={max_bucket}; reduce commit_threshold_size_mb \
@@ -167,7 +167,7 @@ pub fn assign_partition(
             // partition_hint at pre-shard time.
             let bucket =
                 seg.partition_hint
-                    .ok_or_else(|| CommitError::SuperfileSpansPartition {
+                    .ok_or_else(|| ManifestError::SuperfileSpansPartition {
                         detail: format!(
                             "Hash{{n_buckets:{n_buckets}}} strategy requires pre-sharded \
                          superfiles; SuperfileEntry.partition_hint must be Some(bucket) \
@@ -176,7 +176,7 @@ pub fn assign_partition(
                         ),
                     })?;
             if bucket >= *n_buckets {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "Hash{{n_buckets:{n_buckets}}} got partition_hint={bucket} \
                          (out of range)"
@@ -189,7 +189,7 @@ pub fn assign_partition(
         PartitionStrategy::ColumnRange {
             column: _,
             boundaries: _,
-        } => Err(CommitError::SuperfileSpansPartition {
+        } => Err(ManifestError::SuperfileSpansPartition {
             detail: "ColumnRange partition assignment lands in a follow-up; \
                      no writer currently emits ColumnRange-partitioned commits"
                 .into(),
@@ -197,7 +197,7 @@ pub fn assign_partition(
         PartitionStrategy::VectorCell { n_cells, .. } => {
             let cell = seg
                 .partition_hint
-                .ok_or_else(|| CommitError::SuperfileSpansPartition {
+                .ok_or_else(|| ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "VectorCell{{n_cells:{n_cells}}} requires pre-sharded superfiles; \
                          partition_hint must be Some(cell_id) (superfile {})",
@@ -205,7 +205,7 @@ pub fn assign_partition(
                     ),
                 })?;
             if cell >= *n_cells {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "VectorCell{{n_cells:{n_cells}}} got partition_hint={cell} (out of range)"
                     ),
@@ -231,18 +231,16 @@ pub fn assign_partition(
 /// `granularity_secs` are responsible for matching it to
 /// the column's actual unit (seconds for `Int64`,
 /// microseconds for `TimestampMicrosecond`, etc.).
-fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), CommitError> {
-    let (mn_arr, mx_arr) =
-        seg.scalar_stats
-            .cols
-            .get(column)
-            .ok_or_else(|| CommitError::SuperfileSpansPartition {
-                detail: format!(
-                    "TimeRange strategy: superfile {} has no scalar_stats \
+fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), ManifestError> {
+    let (mn_arr, mx_arr) = seg.scalar_stats.cols.get(column).ok_or_else(|| {
+        ManifestError::SuperfileSpansPartition {
+            detail: format!(
+                "TimeRange strategy: superfile {} has no scalar_stats \
                      for column {column:?}",
-                    seg.uri.0
-                ),
-            })?;
+                seg.uri.0
+            ),
+        }
+    })?;
     let min = downcast_i64(mn_arr.as_ref(), column, seg)?;
     let max = downcast_i64(mx_arr.as_ref(), column, seg)?;
     Ok((min, max))
@@ -252,11 +250,11 @@ fn downcast_i64(
     arr: &dyn arrow_array::Array,
     column: &str,
     seg: &SuperfileEntry,
-) -> Result<i64, CommitError> {
+) -> Result<i64, ManifestError> {
     use arrow_array::*;
     use arrow_schema::DataType;
     if arr.is_empty() || arr.is_null(0) {
-        return Err(CommitError::SuperfileSpansPartition {
+        return Err(ManifestError::SuperfileSpansPartition {
             detail: format!(
                 "TimeRange strategy: superfile {} column {column:?} stats array \
                  is empty or null at index 0",
@@ -286,7 +284,7 @@ fn downcast_i64(
             .downcast_ref::<TimestampNanosecondArray>()
             .map(|a| a.value(0)),
         other => {
-            return Err(CommitError::SuperfileSpansPartition {
+            return Err(ManifestError::SuperfileSpansPartition {
                 detail: format!(
                     "TimeRange strategy: superfile {} column {column:?} has \
                      unsupported type {other:?}; expected Int64 or Timestamp*",
@@ -295,7 +293,7 @@ fn downcast_i64(
             });
         }
     };
-    v.ok_or_else(|| CommitError::SuperfileSpansPartition {
+    v.ok_or_else(|| ManifestError::SuperfileSpansPartition {
         detail: format!(
             "TimeRange strategy: superfile {} column {column:?} downcast failed",
             seg.uri.0
@@ -340,9 +338,9 @@ mod tests {
         s
     }
 
-    fn assert_spans_partition(err: CommitError, needle: &str) {
+    fn assert_spans_partition(err: ManifestError, needle: &str) {
         match err {
-            CommitError::SuperfileSpansPartition { detail } => assert!(
+            ManifestError::SuperfileSpansPartition { detail } => assert!(
                 detail.contains(needle),
                 "expected `{needle}` in detail; got: {detail}"
             ),

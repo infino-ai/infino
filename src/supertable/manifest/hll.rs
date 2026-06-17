@@ -173,4 +173,28 @@ mod tests {
         assert_eq!(restored, sketch);
         assert!(HllSketch::from_bytes(&[0u8; 3]).is_none());
     }
+
+    /// `Default` matches `new()`; the `Debug` impl renders the type and
+    /// its estimate; and an empty sketch exercises the small-range
+    /// linear-counting correction (every register zero → estimate 0).
+    #[test]
+    fn default_debug_and_small_range_estimate() {
+        let sketch = HllSketch::default();
+        assert_eq!(
+            sketch,
+            HllSketch::new(),
+            "Default must equal an empty sketch"
+        );
+        assert_eq!(
+            sketch.estimate() as u64,
+            0,
+            "an all-zero sketch falls into the small-range branch and estimates 0"
+        );
+        let dbg = format!("{sketch:?}");
+        assert!(dbg.contains("HllSketch"), "Debug must name the type: {dbg}");
+        assert!(
+            dbg.contains("estimate"),
+            "Debug must show the estimate: {dbg}"
+        );
+    }
 }

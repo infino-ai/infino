@@ -2469,4 +2469,27 @@ mod tests {
         assert_eq!(body_min, "abc", "body min should be 'abc'");
         assert_eq!(body_max, "xyz", "body max should be 'xyz'");
     }
+
+    /// The `Debug` impl reports the builder's shape (column counts and
+    /// doc-id cursor) without panicking, and `set_fts_spill_threshold_bytes`
+    /// forwards to the live FTS builder.
+    #[test]
+    fn debug_and_set_fts_spill_threshold() {
+        const FORCE_SPILL_THRESHOLD: usize = 1;
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        // A 1-byte threshold forces the FTS column onto the spill path;
+        // reaches the `Some(fb)` branch since opts_minimal registers a
+        // column. (Zero is rejected by the FtsBuilder.)
+        b.set_fts_spill_threshold_bytes(FORCE_SPILL_THRESHOLD);
+
+        let rendered = format!("{b:?}");
+        assert!(
+            rendered.contains("SuperfileBuilder"),
+            "debug output names the struct: {rendered}"
+        );
+        assert!(
+            rendered.contains("n_fts_columns"),
+            "debug output lists fts columns: {rendered}"
+        );
+    }
 }

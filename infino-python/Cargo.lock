@@ -2143,6 +2143,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "datafusion",
  "infino",
  "pyo3",
 ]

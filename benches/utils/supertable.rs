@@ -556,7 +556,10 @@ pub mod fts {
             drop(cache_dir);
         }
 
-        let warm = phases.warm.then(|| measure_warm(&built));
+        let (warm, counts) = match phases.warm.then(|| measure_warm(&built)) {
+            Some((w, c)) => (Some(w), Some(c)),
+            None => (None, None),
+        };
         let cold = phases.cold.then(|| measure_cold(&built));
         if phases.warm || phases.cold {
             exec_fts::emit_search(
@@ -572,6 +575,23 @@ pub mod fts {
                 warm.as_deref(),
                 cold.as_ref(),
                 None,
+            );
+        }
+
+        if let Some(counts) = &counts {
+            exec_fts::emit_count(
+                &mut report,
+                "bench/fts/supertable/count",
+                format!(
+                    "Supertable FTS — count, multi-superfile / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                "Matching-doc count via the dedicated count path: per-superfile single-term `term_df` \
+                 read O(1) from the dictionary header and summed across superfiles; multi-term \
+                 union/intersection via `token_match` cardinality, less tombstoned docs. No BM25 \
+                 scoring, no row materialization. `matches` is the count returned. Δ is vs the \
+                 previous run.",
+                counts,
             );
         }
 
@@ -624,7 +644,9 @@ pub mod fts {
         });
     }
 
-    fn measure_warm(built: &supertable::IngestResult) -> Vec<exec_fts::FtsQueryStat> {
+    fn measure_warm(
+        built: &supertable::IngestResult,
+    ) -> (Vec<exec_fts::FtsQueryStat>, Vec<exec_fts::CountStat>) {
         eprintln!(
             "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
         );
@@ -664,9 +686,22 @@ pub mod fts {
             "supertable_fts",
         );
         crate::rss::log_rss_breakdown("supertable_fts after warm battery");
+        eprintln!(
+            "[supertable_fts] count: cache hot — timing {} queries × {WARM_ITERS} iters \
+             (count vs bm25 k=MAX)...",
+            FTS_BATTERY.len(),
+        );
+        let counts = exec_fts::measure_count(
+            &reader,
+            FTS_BATTERY,
+            supertable::TEXT_COLUMN,
+            WARM_ITERS,
+            "supertable_fts",
+        );
+        crate::rss::log_rss_breakdown("supertable_fts after count battery");
         drop(consumer);
         drop(cache_dir);
-        out
+        (out, counts)
     }
 
     fn measure_cold(
@@ -760,6 +795,15 @@ pub mod fts {
                 .iter()
                 .map(|b| b.num_rows())
                 .sum()
+        }
+
+        fn count_matching(
+            &self,
+            column: &str,
+            terms: &[&str],
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> u64 {
+            self.consumer.reader().count_matching(column, terms, mode)
         }
     }
 }

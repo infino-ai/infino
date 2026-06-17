@@ -1790,4 +1790,68 @@ mod tests {
             .expect("kNN search");
         assert!(!hits.is_empty(), "search returned no hits");
     }
+
+    /// `VectorConfig::new` fills the default rerank codec, and
+    /// `with_rerank_codec` overrides it without touching the other
+    /// fields.
+    #[test]
+    fn vector_config_new_and_with_rerank_codec() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let rot_seed = 7u64;
+        let base = VectorConfig::new("v".into(), dim, n_cent, rot_seed, Metric::Cosine);
+        assert_eq!(base.column, "v");
+        assert_eq!(base.dim, dim);
+        assert_eq!(base.n_cent, n_cent);
+        assert_eq!(base.rot_seed, rot_seed);
+        assert_eq!(base.metric, Metric::Cosine);
+        assert_eq!(base.rerank_codec, RerankCodec::default());
+
+        let overridden = base.with_rerank_codec(RerankCodec::Fp32);
+        assert_eq!(overridden.rerank_codec, RerankCodec::Fp32);
+        assert_eq!(overridden.column, "v");
+    }
+
+    /// `VectorBuilder::default` delegates to `new`, producing an
+    /// empty builder ready to register columns.
+    #[test]
+    fn vector_builder_default_matches_new() {
+        let mut b = VectorBuilder::default();
+        assert_eq!(b.register_column(cfg("a", 16)).expect("register column"), 0);
+    }
+
+    /// `set_kmeans_sample_size` succeeds for a registered column and
+    /// returns the unregistered-column error otherwise.
+    #[test]
+    fn set_kmeans_sample_size_ok_and_unregistered() {
+        const SAMPLE_SIZE: usize = 1024;
+        let mut b = VectorBuilder::new();
+        b.register_column(cfg("a", 16)).expect("register column");
+        b.set_kmeans_sample_size(0, SAMPLE_SIZE)
+            .expect("resize sample for registered column");
+        let err = b
+            .set_kmeans_sample_size(9, SAMPLE_SIZE)
+            .expect_err("unregistered column id");
+        assert!(matches!(err, BuildError::FtsColumnTypeInvalid { .. }));
+    }
+
+    /// `with_scratch` accepts an existing directory (driving
+    /// `ScratchDir::in_parent`) and rejects a path that is not a
+    /// directory.
+    #[test]
+    fn with_scratch_accepts_dir_and_rejects_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut b = VectorBuilder::with_scratch(dir.path().to_path_buf())
+            .expect("scratch under existing dir");
+        assert_eq!(b.register_column(cfg("a", 16)).expect("register column"), 0);
+
+        let file_path = dir.path().join("not-a-dir");
+        std::fs::write(&file_path, b"x").expect("write file");
+        // `VectorBuilder` is not `Debug`, so match the result rather
+        // than calling `expect_err` (which would require `T: Debug`).
+        match VectorBuilder::with_scratch(file_path) {
+            Ok(_) => panic!("scratch path is a file, expected rejection"),
+            Err(err) => assert!(matches!(err, BuildError::Io(_))),
+        }
+    }
 }

@@ -29,3 +29,8 @@ arrow-schema = "58"
 # stable ABI), so distribution needs one wheel per platform rather than
 # one per Python version.
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
+# Parse a SQL predicate string (for `update` / `delete`) into a DataFusion
+# `Expr` — the type the core `update` / `delete` take. Pinned to infino's
+# datafusion version so the `Expr` type unifies with the core signatures;
+# feature unification reuses infino's already-compiled datafusion.
+datafusion = "53"
