@@ -232,7 +232,11 @@ impl SupertableReader {
         // to `nprobe / selectivity` (capped at total clusters) restores
         // coverage without changing the caller's options.
         let effective_nprobe = if let Some(ref allow_map) = allow {
-            let total_docs: u64 = superfiles.iter().map(|e| e.n_docs).sum();
+            let total_docs: u64 = superfiles
+                .iter()
+                .filter(|e| allow_map.contains_key(&e.uri))
+                .map(|e| e.n_docs)
+                .sum();
             let allowed_docs: u64 = allow_map.values().map(|bm| bm.len()).sum();
             if total_docs > 0 && allowed_docs > 0 {
                 let selectivity = allowed_docs as f64 / total_docs as f64;
@@ -282,12 +286,13 @@ impl SupertableReader {
             } else {
                 continue;
             };
-            let bitmap = allow.as_ref().map(|m| {
-                Arc::clone(
-                    m.get(&entry.uri)
-                        .expect("selected superfile is present in allow map"),
-                )
-            });
+            let bitmap = match allow.as_ref() {
+                Some(m) => match m.get(&entry.uri) {
+                    Some(bm) => Some(Arc::clone(bm)),
+                    None => continue,
+                },
+                None => None,
+            };
             units.push((Arc::clone(entry), (probe, bitmap)));
         }
         if units.is_empty() {
