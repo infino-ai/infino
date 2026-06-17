@@ -438,6 +438,23 @@ impl StorageProvider for S3StorageProvider {
         Ok(out)
     }
 
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<super::StorageListEntry>, StorageError> {
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(super::StorageListEntry {
+                key: meta.location.to_string(),
+                last_modified: meta.last_modified.into(),
+                size: meta.size,
+            });
+        }
+        Ok(out)
+    }
+
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let path = self.path(uri).ok()?;
         Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))

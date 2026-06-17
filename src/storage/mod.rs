@@ -32,6 +32,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -56,6 +57,14 @@ pub use s3::S3StorageProvider;
 pub struct ObjectMeta {
     pub size: u64,
     pub etag: Option<String>,
+}
+
+/// One entry returned by [`StorageProvider::list_with_prefix_metadata`].
+#[derive(Debug, Clone)]
+pub struct StorageListEntry {
+    pub key: String,
+    pub last_modified: SystemTime,
+    pub size: u64,
 }
 
 /// Errors surfaced by [`StorageProvider`] implementations.
@@ -230,6 +239,22 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// place; production providers (LocalFs, S3) override.
     async fn list_with_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
+    }
+
+    /// Like [`list_with_prefix`] but also has metadata.
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<StorageListEntry>, StorageError> {
+        let keys = self.list_with_prefix(prefix).await?;
+        Ok(keys
+            .into_iter()
+            .map(|key| StorageListEntry {
+                key,
+                last_modified: SystemTime::UNIX_EPOCH,
+                size: 0,
+            })
+            .collect())
     }
 
     /// Expose the underlying `object_store` handle plus the object

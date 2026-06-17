@@ -279,6 +279,23 @@ impl StorageProvider for LocalFsStorageProvider {
         Ok(out)
     }
 
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<super::StorageListEntry>, StorageError> {
+        let path = ObjPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut out = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            out.push(super::StorageListEntry {
+                key: meta.location.to_string(),
+                last_modified: meta.last_modified.into(),
+                size: meta.size,
+            });
+        }
+        Ok(out)
+    }
+
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         // The prefix (root) is baked into the LocalFileSystem store, so
         // the object key is the bare uri.
@@ -551,6 +568,26 @@ mod tests {
             .await
             .expect("list empty");
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_with_prefix_metadata_returns_mtime() {
+        let (_dir, p) = provider();
+        let before = std::time::SystemTime::now();
+        p.put_atomic("data/a.parquet", Bytes::from_static(b"x"))
+            .await
+            .expect("put");
+        let after = std::time::SystemTime::now();
+
+        let mut entries = p
+            .list_with_prefix_metadata("data/")
+            .await
+            .expect("list metadata");
+        assert_eq!(entries.len(), 1);
+        entries.sort_by_key(|e| e.key.clone());
+        assert_eq!(entries[0].key, "data/a.parquet");
+        assert!(entries[0].last_modified >= before);
+        assert!(entries[0].last_modified <= after);
     }
 
     #[tokio::test]
