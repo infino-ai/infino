@@ -1465,10 +1465,28 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
+        // Boost rerank_mult by the same selectivity factor as nprobe:
+        // the coarse shortlist filters by the allow-set, so only a
+        // fraction of candidates survive to rerank. Without boosting,
+        // a 10% allow-set with rerank_mult=20 yields ~2 eligible
+        // rerank candidates for k=10.
+        let rerank_mult_eff = if let Some(ref bm) = allow {
+            let n = col.n_docs as u64;
+            let allowed = bm.len();
+            if n > 0 && allowed > 0 {
+                let selectivity = allowed as f64 / n as f64;
+                let mult = (1.0 / selectivity).ceil().min(MAX_FILTER_NPROBE_MULT as f64) as usize;
+                rerank_mult.saturating_mul(mult)
+            } else {
+                rerank_mult
+            }
+        } else {
+            rerank_mult
+        };
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
-            rerank_mult,
+            rerank_mult: rerank_mult_eff,
             allow,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
