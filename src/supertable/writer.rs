@@ -999,19 +999,16 @@ impl SupertableWriter {
         self.buffer_bytes = 0;
 
         // Dual write to hidden VectorIndexSuperTable (best-effort).
-        // Build vector-only RecordBatches matching the hidden table schema.
+        // Zero-copy: wrap existing Arc<Float32Array> in FixedSizeListArray
+        // without copying the vector buffer.
         if let Some(vit) = self.inner.vector_index_table.as_ref()
             && let Ok(mut vw) = vit.writer()
         {
             let hidden_schema = vit.options().schema.clone();
             for batch in &buffer {
                 let mut cols: Vec<arrow_array::ArrayRef> = Vec::new();
-                let n_rows = batch.scalar.num_rows();
                 for (vi, vc) in self.inner.options.vector_columns.iter().enumerate() {
-                    let flat = &batch.vectors[vi];
-                    let values = Arc::new(Float32Array::from(
-                        flat.values()[..n_rows * vc.dim].to_vec(),
-                    ));
+                    let flat = Arc::clone(&batch.vectors[vi]);
                     let list = FixedSizeListArray::new(
                         Arc::new(arrow_schema::Field::new(
                             "item",
@@ -1019,7 +1016,7 @@ impl SupertableWriter {
                             true,
                         )),
                         vc.dim as i32,
-                        values,
+                        flat,
                         None,
                     );
                     cols.push(Arc::new(list));
