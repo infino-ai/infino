@@ -6903,7 +6903,7 @@ mod tests {
         .expect("open_lazy for search_async");
         flaky_a.fail_from_now();
         let err = ra
-            .search_async("embedding", &all[0], 5, 4, 5)
+            .search_async("embedding", &all[0], 5, 4, 5, None)
             .await
             .expect_err("search_async must surface failure");
         assert!(
@@ -6921,7 +6921,7 @@ mod tests {
         .expect("open_lazy for search_clusters_async");
         flaky_c.fail_from_now();
         let err = rc
-            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5)
+            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
             .await
             .expect_err("search_clusters_async must surface failure");
         assert!(
@@ -7145,7 +7145,7 @@ mod tests {
             .await
             .expect("open_lazy search_async");
             flaky_a.fail_after_call(fail_at);
-            match ra.search_async("embedding", &all[0], 5, 4, 5).await {
+            match ra.search_async("embedding", &all[0], 5, 4, 5, None).await {
                 Err(VectorError::LazySource(_)) => async_errors += 1,
                 Ok(_) => {}
                 other => panic!("search_async unexpected outcome: {other:?}"),
@@ -7161,7 +7161,7 @@ mod tests {
             .expect("open_lazy search_clusters_async");
             flaky_c.fail_after_call(fail_at);
             match rc
-                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5)
+                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
                 .await
             {
                 Err(VectorError::LazySource(_)) => clusters_errors += 1,
