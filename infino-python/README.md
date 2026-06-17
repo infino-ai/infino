@@ -177,6 +177,23 @@ db = infino.connect(
 )
 ```
 
+### Local disk cache
+
+For object-storage-backed catalogs, a local disk cache keeps hot data on
+fast local storage. `cold_fetch_mode` controls how cache misses are
+served: `"hybrid_with_prefetch"`, `"range_only"`, or
+`"lazy_foreground_with_background_fill"` (aliases `"hybrid"`, `"range"`,
+`"lazy"`).
+
+```python
+db = infino.connect(
+    "s3://bucket/prefix",
+    cache_dir="/mnt/nvme/infino-cache",
+    cache_budget_bytes=64 * 1024**3,
+    cold_fetch_mode="lazy_foreground_with_background_fill",
+)
+```
+
 ## Schema and type requirements
 
 - Full-text columns must be Arrow `large_utf8`.
@@ -189,7 +206,7 @@ db = infino.connect(
 
 ## API reference
 
-- `infino.connect(uri, *, endpoint=None, region=None, access_key=None, secret_key=None) -> Connection`
+- `infino.connect(uri, *, endpoint=None, region=None, access_key=None, secret_key=None, cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None) -> Connection`
 - `Connection`
   - `create_table(name, schema, index_spec) -> Table`
   - `open_table(name) -> Table`
