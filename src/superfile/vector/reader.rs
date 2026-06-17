@@ -1433,26 +1433,16 @@ impl VectorReader {
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        // Filtered search: boost nprobe inversely with selectivity so
-        // the probed clusters cover enough eligible rows. At 10%
-        // selectivity the default nprobe=8 misses most of the k-nearest
-        // among allowed rows. Capped at 64× the caller's nprobe.
-        const MAX_FILTER_NPROBE_MULT: usize = 64;
-        let nprobe_eff = if let Some(ref bm) = allow {
-            let n = col.n_docs as u64;
-            let allowed = bm.len();
-            if n > 0 && allowed > 0 {
-                let selectivity = allowed as f64 / n as f64;
-                let mult = (1.0 / selectivity)
-                    .ceil()
-                    .min(MAX_FILTER_NPROBE_MULT as f64) as usize;
-                nprobe.saturating_mul(mult).min(col.n_cent as usize).max(1)
-            } else {
-                nprobe.min(col.n_cent as usize).max(1)
-            }
-        } else {
-            nprobe.min(col.n_cent as usize).max(1)
-        };
+        // Filtered search: boost nprobe and rerank_mult inversely with
+        // selectivity so probed clusters and the rerank shortlist cover
+        // enough eligible rows. At 10% selectivity the default nprobe=8
+        // and rerank_mult=20 miss most k-nearest among allowed rows.
+        // Capped at 64× the caller's value.
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        let nprobe_eff = nprobe
+            .saturating_mul(filter_mult)
+            .min(col.n_cent as usize)
+            .max(1);
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
@@ -1465,26 +1455,7 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        // Boost rerank_mult by the same selectivity factor as nprobe:
-        // the coarse shortlist filters by the allow-set, so only a
-        // fraction of candidates survive to rerank. Without boosting,
-        // a 10% allow-set with rerank_mult=20 yields ~2 eligible
-        // rerank candidates for k=10.
-        let rerank_mult_eff = if let Some(ref bm) = allow {
-            let n = col.n_docs as u64;
-            let allowed = bm.len();
-            if n > 0 && allowed > 0 {
-                let selectivity = allowed as f64 / n as f64;
-                let mult = (1.0 / selectivity)
-                    .ceil()
-                    .min(MAX_FILTER_NPROBE_MULT as f64) as usize;
-                rerank_mult.saturating_mul(mult)
-            } else {
-                rerank_mult
-            }
-        } else {
-            rerank_mult
-        };
+        let rerank_mult_eff = rerank_mult.saturating_mul(filter_mult);
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
@@ -2009,6 +1980,26 @@ async fn build_shortlist(
 /// Takes a `&[u8]` view so the caller can hand in either an
 /// in-memory subsection slice or the just-fetched centroids
 /// region bytes from [`Source::get_range`] — both reach this
+/// Compute the inverse-selectivity multiplier for filtered search.
+/// Returns 1 (no boost) when `allow` is `None` (unfiltered) or the
+/// bitmap covers the full column. Capped at 64× so very sparse
+/// predicates don't turn every query into a full cluster scan.
+const MAX_FILTER_NPROBE_MULT: usize = 64;
+fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> usize {
+    let Some(bm) = allow.as_ref() else {
+        return 1;
+    };
+    let n = n_docs as u64;
+    let allowed = bm.len();
+    if n == 0 || allowed == 0 {
+        return 1;
+    }
+    let selectivity = allowed as f64 / n as f64;
+    (1.0 / selectivity)
+        .ceil()
+        .min(MAX_FILTER_NPROBE_MULT as f64) as usize
+}
+
 /// helper through the same shape.
 #[inline]
 fn score_centroids(
