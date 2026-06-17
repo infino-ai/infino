@@ -862,14 +862,15 @@ pub mod vector {
         // vectors back the brute-force ground truth, so a benched dataset
         // regenerates it too (skipping only the ingest). Dataset prepare runs
         // no search, so it streams the corpus instead of staging it.
-        let corpus = (existing.is_none() && !stream_prepare(phases))
+        let streaming = stream_prepare(phases);
+        let corpus = (existing.is_none() && !streaming)
             .then(|| supertable::prepare_corpus(Modality::Vector));
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
             (supertable::open_existing(Modality::Vector, fixture), None)
         } else if crate::dataset::dataset_mode() && !phases.build {
             (supertable::open_dataset(Modality::Vector), None)
-        } else if stream_prepare(phases) {
+        } else if streaming {
             build_measured_streaming(Modality::Vector, phases)
         } else {
             build_measured(

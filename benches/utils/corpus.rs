@@ -546,14 +546,18 @@ impl StreamingTextCorpus {
         for i in 0..take {
             let s = self.offs[self.head + i];
             let e = self.offs[self.head + i + 1];
-            out.push(String::from_utf8(self.buf[s..e].to_vec()).expect("generated corpus is UTF-8"));
+            out.push(
+                String::from_utf8(self.buf[s..e].to_vec()).expect("generated corpus is UTF-8"),
+            );
         }
         self.head += take;
         self.compact();
         out
     }
 
-    /// One doc by id, regenerated standalone — for the SQL sample row.
+    /// One doc by id, for the SQL sample row. Replays its generation chunk's
+    /// RNG up to `doc_id` — only called once per prepare, so the replay is
+    /// cheap relative to ingest.
     pub fn doc_at(&self, doc_id: usize) -> String {
         let chunk = doc_id / TEXT_CORPUS_CHUNK_DOCS;
         let chunk_start = chunk * TEXT_CORPUS_CHUNK_DOCS;
@@ -564,12 +568,6 @@ impl StreamingTextCorpus {
             write_text_doc(&mut scratch, d, &mut rng, &self.zipf);
         }
         String::from_utf8(scratch).expect("generated corpus is UTF-8")
-    }
-
-    /// Total logical text bytes across all docs — for build-bandwidth
-    /// reporting, computed from the deterministic layout without generating.
-    pub fn total_bytes(&self) -> u64 {
-        text_corpus_bytes(self.n_docs)
     }
 }
 
@@ -1447,7 +1445,9 @@ mod tests {
     /// streaming and disk both reseed per chunk with `chunk_seed` and share
     /// `write_text_doc` / `fill_vector_row`.
     const STREAM_TEST_DOCS: usize = 4096;
+    /// Seed shared by the streaming and disk corpora under test.
     const STREAM_TEST_SEED: u64 = 7;
+    /// Cluster count for the streaming vector-equivalence test.
     const STREAM_TEST_N_CENT: usize = 16;
 
     #[test]
@@ -1458,7 +1458,15 @@ mod tests {
         assert_eq!(titles.len(), STREAM_TEST_DOCS);
         for (i, title) in titles.iter().enumerate() {
             assert_eq!(title, disk.doc(i), "streamed doc {i} differs from disk");
-            assert_eq!(&stream.doc_at(i), title, "doc_at({i}) differs from stream");
+        }
+        // `doc_at` replays a chunk's RNG, so spot-check a few ids rather than
+        // every doc (an all-ids loop would be quadratic).
+        for i in [0, 1, STREAM_TEST_DOCS / 2, STREAM_TEST_DOCS - 1] {
+            assert_eq!(
+                stream.doc_at(i),
+                titles[i],
+                "doc_at({i}) differs from stream"
+            );
         }
     }
 
@@ -1476,10 +1484,18 @@ mod tests {
 
     #[test]
     fn streaming_vector_matches_disk_corpus() {
-        let disk =
-            MmapVectorCorpus::generate(STREAM_TEST_DOCS, STREAM_TEST_N_CENT, STREAM_TEST_SEED, true);
-        let mut stream =
-            StreamingVectorCorpus::new(STREAM_TEST_DOCS, STREAM_TEST_N_CENT, STREAM_TEST_SEED, true);
+        let disk = MmapVectorCorpus::generate(
+            STREAM_TEST_DOCS,
+            STREAM_TEST_N_CENT,
+            STREAM_TEST_SEED,
+            true,
+        );
+        let mut stream = StreamingVectorCorpus::new(
+            STREAM_TEST_DOCS,
+            STREAM_TEST_N_CENT,
+            STREAM_TEST_SEED,
+            true,
+        );
         let flat = stream.next_flat(STREAM_TEST_DOCS);
         assert_eq!(flat.as_slice(), disk.as_slice(), "streamed vectors differ");
     }

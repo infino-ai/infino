@@ -307,7 +307,14 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
 /// dataset-prepare path). Both yield identical bytes for the same seeds.
 trait ChunkSource {
     /// The Arrow batch for docs `[start, end)`.
-    fn batch(&mut self, modality: Modality, schema: &Arc<Schema>, start: usize, end: usize, len: usize) -> RecordBatch;
+    fn batch(
+        &mut self,
+        modality: Modality,
+        schema: &Arc<Schema>,
+        start: usize,
+        end: usize,
+        len: usize,
+    ) -> RecordBatch;
     /// Drop the just-committed chunk's pages from RSS (resident only).
     fn advise_consumed(&self, _start: usize, _len: usize) {}
     /// The SQL sample title at `doc_id` (SQL modality only).
@@ -321,8 +328,33 @@ struct ResidentSource<'a> {
 }
 
 impl ChunkSource for ResidentSource<'_> {
-    fn batch(&mut self, modality: Modality, schema: &Arc<Schema>, start: usize, end: usize, len: usize) -> RecordBatch {
-        chunk_batch(modality, self.corpus, schema, start, end, len)
+    fn batch(
+        &mut self,
+        modality: Modality,
+        schema: &Arc<Schema>,
+        start: usize,
+        end: usize,
+        len: usize,
+    ) -> RecordBatch {
+        let title = modality.has_text().then(|| {
+            let titles = self
+                .corpus
+                .text
+                .as_ref()
+                .expect("text corpus")
+                .chunk_strs(start, len);
+            LargeStringArray::from(titles)
+        });
+        let vectors = modality.has_vector().then(|| {
+            let all = self
+                .corpus
+                .vectors
+                .as_ref()
+                .expect("vector corpus")
+                .as_slice();
+            all[start * DIM..end * DIM].to_vec()
+        });
+        assemble_batch(modality, schema, title, vectors, start, end, len)
     }
     fn advise_consumed(&self, start: usize, len: usize) {
         if let Some(text) = &self.corpus.text {
@@ -356,34 +388,40 @@ impl StreamingSource {
             .has_text()
             .then(|| corpus::StreamingTextCorpus::new(n_docs, CORPUS_TEXT_SEED));
         let vectors = modality.has_vector().then(|| {
-            corpus::StreamingVectorCorpus::new(n_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+            corpus::StreamingVectorCorpus::new(
+                n_docs,
+                corpus::n_cent(n_docs),
+                CORPUS_VEC_SEED,
+                true,
+            )
         });
         Self { text, vectors }
     }
 }
 
 impl ChunkSource for StreamingSource {
-    fn batch(&mut self, modality: Modality, schema: &Arc<Schema>, start: usize, end: usize, len: usize) -> RecordBatch {
-        let titles: Option<Vec<String>> = modality
-            .has_text()
-            .then(|| self.text.as_mut().expect("text corpus").next_titles(len));
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
-        if let Some(titles) = &titles {
-            columns.push(Arc::new(LargeStringArray::from(
-                titles.iter().map(String::as_str).collect::<Vec<_>>(),
-            )));
-        }
-        if modality.has_sql() {
-            push_sql_columns(&mut columns, start, end, len);
-        }
-        if modality.has_vector() {
-            let flat = self.vectors.as_mut().expect("vector corpus").next_flat(len);
-            columns.push(fsl_column(flat, DIM));
-        }
-        RecordBatch::try_new(schema.clone(), columns).expect("batch")
+    fn batch(
+        &mut self,
+        modality: Modality,
+        schema: &Arc<Schema>,
+        start: usize,
+        end: usize,
+        len: usize,
+    ) -> RecordBatch {
+        let title = modality.has_text().then(|| {
+            let titles = self.text.as_mut().expect("text corpus").next_titles(len);
+            LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>())
+        });
+        let vectors = modality
+            .has_vector()
+            .then(|| self.vectors.as_mut().expect("vector corpus").next_flat(len));
+        assemble_batch(modality, schema, title, vectors, start, end, len)
     }
     fn sample_title(&mut self, doc_id: usize) -> String {
-        self.text.as_ref().expect("sql modality has text").doc_at(doc_id)
+        self.text
+            .as_ref()
+            .expect("sql modality has text")
+            .doc_at(doc_id)
     }
 }
 
@@ -414,11 +452,11 @@ pub fn build_on_storage_streaming(modality: Modality) -> IngestResult {
     build_on_storage_inner(modality, &mut StreamingSource::new(modality))
 }
 
-/// Stream the corpus → append → commit → object storage, building only the
-/// index shapes named by `modality`. One loop for every modality; SQL's extra
-/// columns are derived inline from `doc_id`. The corpus is identical across
-/// modalities (same seeds), so each shape is directly comparable to its
-/// single-modality competitor.
+/// Ingest the corpus chunk by chunk → append → commit → object storage,
+/// building only the index shapes named by `modality`. `src` supplies each
+/// chunk (resident mmap or streamed); the loop is the same either way. The
+/// corpus is identical across modalities (same seeds), so each shape is
+/// directly comparable to its single-modality competitor.
 fn build_on_storage_inner(modality: Modality, src: &mut dyn ChunkSource) -> IngestResult {
     let n_docs = n_docs();
     let commits = n_commits();
@@ -636,39 +674,28 @@ fn read_sidecar(storage: &Arc<dyn StorageProvider>) -> crate::dataset::DatasetMe
     serde_json::from_slice(&bytes).expect("parse dataset sidecar")
 }
 
-/// One commit chunk's `RecordBatch` for `modality`, borrowing the text
-/// / vector payload straight off the prepared corpus mmaps. SQL's
-/// derived columns (buckets, keys, category, rating, small `emb`) are
-/// pure functions of `doc_id`.
-fn chunk_batch(
+/// Assemble one commit chunk's `RecordBatch` in schema order: the optional
+/// title column, SQL's derived columns, then the optional vector column.
+/// The two [`ChunkSource`]s differ only in where `title` and `vectors` come
+/// from; this is the one place that lays out the batch.
+fn assemble_batch(
     modality: Modality,
-    corpus: &PreparedCorpus,
     schema: &Arc<Schema>,
+    title: Option<LargeStringArray>,
+    vectors: Option<Vec<f32>>,
     start: usize,
     end: usize,
     len: usize,
 ) -> RecordBatch {
-    let titles: Option<Vec<&str>> = corpus
-        .text
-        .as_ref()
-        .filter(|_| modality.has_text())
-        .map(|c| c.chunk_strs(start, len));
-
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
-    if let Some(titles) = &titles {
-        columns.push(Arc::new(LargeStringArray::from(titles.clone())));
+    if let Some(title) = title {
+        columns.push(Arc::new(title));
     }
     if modality.has_sql() {
-        let _ = titles.as_ref().expect("sql modality has text");
         push_sql_columns(&mut columns, start, end, len);
     }
-    if modality.has_vector() {
-        let all = corpus
-            .vectors
-            .as_ref()
-            .expect("vector modality has a vector corpus")
-            .as_slice();
-        columns.push(fsl_column(all[start * DIM..end * DIM].to_vec(), DIM));
+    if let Some(flat) = vectors {
+        columns.push(fsl_column(flat, DIM));
     }
     RecordBatch::try_new(schema.clone(), columns).expect("batch")
 }
@@ -677,8 +704,12 @@ fn chunk_batch(
 /// small embedding) for docs `[start, end)`. All are pure functions of
 /// `doc_id`, so resident and streaming ingest share this.
 fn push_sql_columns(columns: &mut Vec<Arc<dyn Array>>, start: usize, end: usize, len: usize) {
-    let bucket_vals: Vec<String> = (start..end).map(|doc_id| format!("b{}", doc_id % 10)).collect();
-    let key_vals: Vec<String> = (start..end).map(|doc_id| scatter_key(doc_id as u64)).collect();
+    let bucket_vals: Vec<String> = (start..end)
+        .map(|doc_id| format!("b{}", doc_id % 10))
+        .collect();
+    let key_vals: Vec<String> = (start..end)
+        .map(|doc_id| scatter_key(doc_id as u64))
+        .collect();
     for vals in [&bucket_vals, &key_vals] {
         columns.push(Arc::new(LargeStringArray::from(
             vals.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -693,7 +724,9 @@ fn push_sql_columns(columns: &mut Vec<Arc<dyn Array>>, start: usize, end: usize,
         })
         .collect::<Vec<_>>();
     columns.push(Arc::new(LargeStringArray::from(categories)));
-    let ratings = (start..end).map(|doc_id| (doc_id % 100) as i64).collect::<Vec<_>>();
+    let ratings = (start..end)
+        .map(|doc_id| (doc_id % 100) as i64)
+        .collect::<Vec<_>>();
     columns.push(Arc::new(Int64Array::from(ratings)));
     // Small deterministic embedding column (not the planted-cluster corpus)
     // — kept for the vector/hybrid TVFs.
