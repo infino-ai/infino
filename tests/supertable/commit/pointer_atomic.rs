@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::time::SystemTime;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;
 
@@ -373,6 +374,7 @@ impl StorageProvider for BarrierMockStorage {
             Some(b) => Ok(ObjectMeta {
                 size: b.len() as u64,
                 etag: Some("mock-etag".into()),
+                last_modified: SystemTime::now(),
             }),
             None => Err(StorageError::NotFound { uri: uri.into() }),
         }
@@ -386,6 +388,7 @@ impl StorageProvider for BarrierMockStorage {
                 ObjectMeta {
                     size: b.len() as u64,
                     etag: Some("mock-etag".into()),
+                    last_modified: SystemTime::now(),
                 },
             )),
             None => Err(StorageError::NotFound { uri: uri.into() }),

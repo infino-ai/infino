@@ -47,24 +47,17 @@ pub use azure::AzureStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub use s3::S3StorageProvider;
 
-/// Cheap object metadata — what HEAD returns.
+/// Object metadata returned by HEAD, GET, and list operations.
 ///
-/// `size` is the object's content length in bytes. `etag` is
-/// the backend's opaque version identifier (S3 ETag, GCS
-/// generation as a string, LocalFS mtime-derived token); used
-/// by [`StorageProvider::put_if_match`] for CAS-fenced writes.
+/// `size` is the content length in bytes. `etag` is the backend's
+/// opaque version token (S3 ETag, LocalFS mtime-derived); used by
+/// [`StorageProvider::put_if_match`] for CAS-fenced writes.
+/// `last_modified` is `UNIX_EPOCH` for providers that don't surface it.
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     pub size: u64,
     pub etag: Option<String>,
-}
-
-/// One entry returned by [`StorageProvider::list_with_prefix_metadata`].
-#[derive(Debug, Clone)]
-pub struct StorageListEntry {
-    pub key: String,
     pub last_modified: SystemTime,
-    pub size: u64,
 }
 
 /// Errors surfaced by [`StorageProvider`] implementations.
@@ -234,26 +227,25 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
     /// invoke this on the hot path — it's an open-time / sweep-
     /// time primitive.
     ///
-    /// Default returns an empty list — test/mock providers that
-    /// don't need WAL recovery support can leave the default in
-    /// place; production providers (LocalFs, S3) override.
-    async fn list_with_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
+    /// List objects under `prefix`, returning each key with its metadata.
+    ///
+    /// Default returns an empty list — test/mock providers that don't
+    /// need listing can leave the default in place; production providers
+    /// (LocalFs, S3, Azure) override.
+    async fn list_with_prefix_metadata(
+        &self,
+        _prefix: &str,
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         Ok(Vec::new())
     }
 
-    /// Like [`list_with_prefix`] but also has metadata.
-    async fn list_with_prefix_metadata(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<StorageListEntry>, StorageError> {
-        let keys = self.list_with_prefix(prefix).await?;
-        Ok(keys
+    /// List object keys under `prefix`. Derived from [`list_with_prefix_metadata`].
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .list_with_prefix_metadata(prefix)
+            .await?
             .into_iter()
-            .map(|key| StorageListEntry {
-                key,
-                last_modified: SystemTime::UNIX_EPOCH,
-                size: 0,
-            })
+            .map(|(key, _)| key)
             .collect())
     }
 

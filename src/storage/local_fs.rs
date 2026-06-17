@@ -111,6 +111,7 @@ impl StorageProvider for LocalFsStorageProvider {
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
+            last_modified: meta.last_modified.into(),
         })
     }
 
@@ -122,6 +123,7 @@ impl StorageProvider for LocalFsStorageProvider {
         let meta = ObjectMeta {
             size: result.meta.size as u64,
             etag: result.meta.e_tag.clone(),
+            last_modified: result.meta.last_modified.into(),
         };
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
         Ok((bytes, meta))
@@ -269,29 +271,22 @@ impl StorageProvider for LocalFsStorageProvider {
         }
     }
 
-    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        let path = ObjPath::from(prefix);
-        let mut stream = self.store.list(Some(&path));
-        let mut out: Vec<String> = Vec::new();
-        while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
-            out.push(meta.location.to_string());
-        }
-        Ok(out)
-    }
-
     async fn list_with_prefix_metadata(
         &self,
         prefix: &str,
-    ) -> Result<Vec<super::StorageListEntry>, StorageError> {
+    ) -> Result<Vec<(String, super::ObjectMeta)>, StorageError> {
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
-            out.push(super::StorageListEntry {
-                key: meta.location.to_string(),
-                last_modified: meta.last_modified.into(),
-                size: meta.size,
-            });
+            out.push((
+                meta.location.to_string(),
+                super::ObjectMeta {
+                    size: meta.size,
+                    etag: meta.e_tag,
+                    last_modified: meta.last_modified.into(),
+                },
+            ));
         }
         Ok(out)
     }
@@ -571,10 +566,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_with_prefix_metadata_returns_mtime() {
+    async fn list_with_prefix_metadata_returns_mtime_and_size() {
         let (_dir, p) = provider();
         let before = std::time::SystemTime::now();
-        p.put_atomic("data/a.parquet", Bytes::from_static(b"x"))
+        p.put_atomic("data/a.parquet", Bytes::from_static(b"hello"))
             .await
             .expect("put");
         let after = std::time::SystemTime::now();
@@ -584,10 +579,12 @@ mod tests {
             .await
             .expect("list metadata");
         assert_eq!(entries.len(), 1);
-        entries.sort_by_key(|e| e.key.clone());
-        assert_eq!(entries[0].key, "data/a.parquet");
-        assert!(entries[0].last_modified >= before);
-        assert!(entries[0].last_modified <= after);
+        entries.sort_by_key(|(key, _)| key.clone());
+        let (key, meta) = &entries[0];
+        assert_eq!(key, "data/a.parquet");
+        assert!(meta.last_modified >= before);
+        assert!(meta.last_modified <= after);
+        assert_eq!(meta.size, 5);
     }
 
     #[tokio::test]

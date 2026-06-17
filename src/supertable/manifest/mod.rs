@@ -1967,6 +1967,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::SystemTime;
         use uuid::Uuid;
 
         use crate::storage::{ObjectMeta, StorageError, StorageProvider};
@@ -2004,6 +2005,7 @@ mod tests {
                     Some(b) => Ok(ObjectMeta {
                         size: b.len() as u64,
                         etag: Some("mock-etag".into()),
+                        last_modified: SystemTime::UNIX_EPOCH,
                     }),
                     None => Err(StorageError::NotFound { uri: uri.into() }),
                 }
@@ -2017,6 +2019,7 @@ mod tests {
                         ObjectMeta {
                             size: b.len() as u64,
                             etag: Some("mock-etag".into()),
+                            last_modified: SystemTime::UNIX_EPOCH,
                         },
                     )),
                     None => Err(StorageError::NotFound { uri: uri.into() }),
