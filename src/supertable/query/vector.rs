@@ -77,6 +77,7 @@ use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
 use super::candidate::CandidatePlan;
+use super::dispatch;
 use super::exec::common::resolve_hits_named;
 
 /// An optional text-predicate filter for vector kNN search. When
@@ -317,12 +318,12 @@ impl SupertableReader {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
                 collected.extend(
-                    crate::supertable::query::dispatch::fanout(self, wave, kernel.clone()).await?,
+                    dispatch::fanout(self, wave, kernel.clone()).await?,
                 );
             }
             collected
         } else {
-            crate::supertable::query::dispatch::fanout(self, units, kernel).await?
+            dispatch::fanout(self, units, kernel).await?
         };
 
         Ok(top_k_ascending(per_superfile, k))
@@ -351,9 +352,7 @@ impl SupertableReader {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
-        filter_col: &str,
-        filter_query: &str,
-        mode: BoolMode,
+        filter: VectorFilter<'_>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
             return Ok(Vec::new());
@@ -373,7 +372,7 @@ impl SupertableReader {
         let Some(tokenizer) = manifest.options.tokenizer.as_ref() else {
             return Ok(Vec::new());
         };
-        let tokens: Vec<String> = tokenizer.tokenize(filter_query).collect();
+        let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -386,7 +385,7 @@ impl SupertableReader {
         // orchestrator (concurrent reader opens) but keeps each unit's
         // result keyed to its superfile URI.
         let allow = self
-            .candidate_bitmaps(&superfiles, filter_col, &tokens, mode)
+            .candidate_bitmaps(&superfiles, filter.column, &tokens, filter.mode)
             .await?;
         if allow.is_empty() {
             return Ok(Vec::new());
@@ -434,7 +433,7 @@ impl SupertableReader {
         // `fanout` tags hits with their superfile URI and applies the
         // tombstone filter, so deleted rows are dropped from the
         // allow-set too (a tombstoned row must never be a kNN candidate).
-        let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_superfile = dispatch::fanout(self, units, kernel).await?;
         Ok(group_doc_ids_to_allow(per_superfile))
     }
 
@@ -515,11 +514,13 @@ impl SupertableReader {
                     .evaluate(r.as_ref())
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?
-                    .unwrap_or_default();
+                    .ok_or_else(|| QueryError::Execute(
+                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                    ))?;
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
-        let per_superfile = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_superfile = dispatch::fanout(self, units, kernel).await?;
         Ok(group_doc_ids_to_allow(per_superfile))
     }
 }
@@ -566,10 +567,8 @@ impl SupertableReader {
             let hits = match filter {
                 None => self.vector_search_async(column, query, k, options).await?,
                 Some(f) => {
-                    self.vector_hits_filtered_async(
-                        column, query, k, options, f.column, f.query, f.mode,
-                    )
-                    .await?
+                    self.vector_hits_filtered_async(column, query, k, options, f)
+                        .await?
                 }
             };
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
@@ -598,11 +597,7 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         match filter {
             None => self.block_on(self.vector_search_async(column, query, k, options)),
-            Some(f) => {
-                self.block_on(self.vector_hits_filtered_async(
-                    column, query, k, options, f.column, f.query, f.mode,
-                ))
-            }
+            Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
         }
     }
 }

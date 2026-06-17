@@ -31,6 +31,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use roaring::RoaringBitmap;
+
 use crate::superfile::format::vec::{
     CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
     dir_entry, outer_hdr, sub_hdr,
@@ -1398,7 +1400,7 @@ impl VectorReader {
         // Filtered search allow-set (per-superfile matching doc-ids).
         // `None` = unfiltered; threaded to the coarse shortlist so the
         // top-k is the true k-nearest among matching rows.
-        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1464,7 +1466,7 @@ impl VectorReader {
         // Filtered search allow-set (per-superfile matching doc-ids).
         // `None` = unfiltered; threaded to the coarse shortlist so the
         // top-k is the true k-nearest among matching rows.
-        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1512,7 +1514,7 @@ impl VectorReader {
         rerank_mult: usize,
         // Filtered search allow-set (per-superfile matching doc-ids),
         // threaded down to the coarse shortlist. `None` = unfiltered.
-        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
@@ -1801,7 +1803,7 @@ async fn build_shortlist(
     // Filtered search: when `Some`, only doc-ids in this per-superfile
     // bitmap may enter the coarse shortlist (the predicate's allow-set).
     // `Arc` so the parallel branch can move a clone into the rayon task.
-    allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+    allow: Option<Arc<RoaringBitmap>>,
 ) -> ShortlistOutcome {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.

@@ -1135,7 +1135,7 @@ impl SuperfileReader {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
-        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let v = self
             .vec()
@@ -1175,7 +1175,7 @@ impl SuperfileReader {
         k: usize,
         clusters: &[u32],
         options: VectorSearchOptions,
-        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let v = self
             .vec()
