@@ -182,8 +182,7 @@ db = infino.connect(
 For object-storage-backed catalogs, a local disk cache keeps hot data on
 fast local storage. `cold_fetch_mode` controls how cache misses are
 served: `"hybrid_with_prefetch"`, `"range_only"`, or
-`"lazy_foreground_with_background_fill"` (aliases `"hybrid"`, `"range"`,
-`"lazy"`).
+`"lazy_foreground_with_background_fill"`.
 
 ```python
 db = infino.connect(

@@ -66,14 +66,12 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
     }
 }
 
-/// Parse a cold-fetch-mode name; short aliases also accepted.
+/// Parse a cold-fetch-mode name into its [`ColdFetchMode`].
 fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
-    match s.to_ascii_lowercase().as_str() {
-        "hybrid_with_prefetch" | "hybrid" => Ok(ColdFetchMode::HybridWithPrefetch),
-        "range_only" | "range" => Ok(ColdFetchMode::RangeOnly),
-        "lazy_foreground_with_background_fill" | "lazy" => {
-            Ok(ColdFetchMode::LazyForegroundWithBackgroundFill)
-        }
+    match s {
+        "hybrid_with_prefetch" => Ok(ColdFetchMode::HybridWithPrefetch),
+        "range_only" => Ok(ColdFetchMode::RangeOnly),
+        "lazy_foreground_with_background_fill" => Ok(ColdFetchMode::LazyForegroundWithBackgroundFill),
         other => Err(PyValueError::new_err(format!(
             "unknown cold_fetch_mode {other:?}; use 'hybrid_with_prefetch', \
              'range_only', or 'lazy_foreground_with_background_fill'"

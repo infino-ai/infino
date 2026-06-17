@@ -48,7 +48,7 @@ def test_connect_accepts_cache_options(tmp_path):
         str(tmp_path / "catalog"),
         cache_dir=str(tmp_path / "cache"),
         cache_budget_bytes=64 * 1024 * 1024,
-        cold_fetch_mode="lazy",
+        cold_fetch_mode="lazy_foreground_with_background_fill",
     )
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     t.append([{"title": "the quick brown fox"}])
