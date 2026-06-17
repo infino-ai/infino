@@ -837,6 +837,22 @@ impl SuperfileReader {
         Ok(fts.token_match(column, tokens, mode).await?)
     }
 
+    /// Unranked token-match **count**: the number of `local_doc_id`s
+    /// [`token_match`](Self::token_match) would return under `mode`,
+    /// without materializing the id `Vec`. Delegates to
+    /// [`FtsReader::token_match_count`].
+    pub async fn token_match_count(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+    ) -> Result<u64, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.token_match_count(column, tokens, mode).await?)
+    }
+
     /// Document frequency of `token` in `column` (0 if absent) — a cheap
     /// header-only read used to estimate a predicate's match count
     /// before running `token_match`. Delegates to

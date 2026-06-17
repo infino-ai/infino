@@ -766,10 +766,11 @@ impl FtsReader {
     /// ascending doc-id order.
     ///
     /// Reuses the same [`build_term_cursors`](Self::build_term_cursors)
-    /// the scored path uses, then walks the cursors with
-    /// [`walk_cursors_unranked`] — no BM25 scoring and no top-k heap, so
-    /// nothing is ranked. Cursors traverse blocks in doc-id order, so
-    /// the result is already ascending (no re-sort).
+    /// the scored path uses, then walks the cursors —
+    /// [`collect_and_intersect`](Self::collect_and_intersect) for `And`,
+    /// [`or_merge_unranked`] for `Or` — with no BM25 scoring and no
+    /// top-k heap, so nothing is ranked. Cursors traverse blocks in
+    /// doc-id order, so the result is already ascending (no re-sort).
     pub async fn token_match(
         &self,
         column: &str,
@@ -792,6 +793,34 @@ impl FtsReader {
                 self.collect_and_intersect(column_id, cursors)
             }
             BoolMode::Or => or_merge_unranked(cursors),
+        })
+    }
+
+    /// Unranked token-match **count** — the cardinality
+    /// [`token_match`](Self::token_match) would return, without
+    /// materializing the doc-id `Vec`. The AND path tallies through a
+    /// [`CountSink`], the OR path counts the union walk; both skip the
+    /// `Vec<u32>` so a high-cardinality count doesn't allocate one id
+    /// per match.
+    pub async fn token_match_count(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+    ) -> Result<u64, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(0);
+        }
+        let cursors = self.build_term_cursors(column_id, tokens).await?;
+        Ok(match mode {
+            BoolMode::And => {
+                if cursors.len() != tokens.len() {
+                    return Ok(0);
+                }
+                self.count_and_intersect(column_id, cursors)
+            }
+            BoolMode::Or => or_count_unranked(cursors),
         })
     }
 
@@ -1474,6 +1503,22 @@ impl FtsReader {
         let mut sink = CollectSink { out: Vec::new() };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
         sink.out
+    }
+
+    /// Unranked multi-term AND **count**: the size of the intersection
+    /// via the same flat-merge as [`collect_and_intersect`](Self::collect_and_intersect),
+    /// but through a [`CountSink`] that tallies hits instead of
+    /// collecting them — no `Vec<u32>` materialized.
+    fn count_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> u64 {
+        if cursors.is_empty() {
+            return 0;
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        cursors.sort_by_key(|c| c.block_count());
+        let mut sink = CountSink { n: 0 };
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        sink.n
     }
 
     /// Dispatch to the 2-term specialization or the general `n >= 3`
@@ -2538,6 +2583,24 @@ impl AndSink for CollectSink {
     }
 }
 
+/// Unranked counting sink: tally the intersection size without
+/// materializing the ids. Drives the count path through the same
+/// flat-merge as [`CollectSink`] but skips the `Vec<u32>` — for a
+/// high-cardinality count that allocation (4 bytes/doc) is pure waste.
+struct CountSink {
+    n: u64,
+}
+
+impl AndSink for CountSink {
+    fn needs_score(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, _doc: u32, _score: f32) {
+        self.n += 1;
+    }
+}
+
 /// Push `(score, doc_id)` into the top-k AND heap with the same
 /// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
 /// agree on score-tied docs.
@@ -2631,6 +2694,44 @@ fn read_u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Unranked multi-term OR walk: the union of the cursors' doc ids in
+/// ascending order. A k-way merge — each step finds the minimum current
+/// doc id across the live cursors, hands it to `emit`, and advances
+/// every cursor sitting on it (so the next minimum is strictly greater
+/// and `emit` is called exactly once per distinct doc). No scoring; the
+/// caller wants membership, not rank.
+fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
+    loop {
+        let min_doc = cursors
+            .iter()
+            .filter(|c| !c.is_exhausted())
+            .map(TermCursor::current_doc_id)
+            .min();
+        let Some(min_doc) = min_doc else { break };
+        emit(min_doc);
+        for c in cursors.iter_mut() {
+            if !c.is_exhausted() && c.current_doc_id() == min_doc {
+                c.next();
+            }
+        }
+    }
+}
+
+/// The union's doc ids ([`or_walk_unranked`] collected into a `Vec`).
+fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
+    let mut out = Vec::new();
+    or_walk_unranked(cursors, |doc| out.push(doc));
+    out
+}
+
+/// The union's cardinality ([`or_walk_unranked`] counted) — no `Vec`
+/// materialized, for the count path.
+fn or_count_unranked(cursors: Vec<TermCursor>) -> u64 {
+    let mut n = 0u64;
+    or_walk_unranked(cursors, |_| n += 1);
+    n
+}
+
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
 /// see [`TERM_META_SIZE`] in `builder.rs` — this struct is its
@@ -2639,38 +2740,9 @@ fn read_u64_le(b: &[u8]) -> u64 {
 /// [`TermMeta::parse`] is the single place that validates untrusted
 /// offsets (the FST value points here) against the postings region:
 /// both the fixed 20-byte header and the skip table it declares are
-/// Drive already-built [`TermCursor`]s to their matching doc-ids with no
-/// scoring and no heap — the unranked analog of
-/// [`FtsReader::run_and_intersect`] (And) / the OR merge. Cursors
-/// traverse blocks in doc-id order, so the result is ascending with no
-/// extra sort. Used by [`FtsReader::token_match`].
-/// Unranked multi-term OR: the union of the cursors' doc ids in
-/// ascending order. A k-way merge — each step emits the minimum
-/// current doc id across the live cursors and advances every cursor
-/// sitting on it. No scoring; the caller wants membership, not rank.
-fn or_merge_unranked(mut cursors: Vec<TermCursor>) -> Vec<u32> {
-    let mut out = Vec::new();
-    loop {
-        let min_doc = cursors
-            .iter()
-            .filter(|c| !c.is_exhausted())
-            .map(TermCursor::current_doc_id)
-            .min();
-        let Some(min_doc) = min_doc else { break };
-        out.push(min_doc);
-        for c in cursors.iter_mut() {
-            if !c.is_exhausted() && c.current_doc_id() == min_doc {
-                c.next();
-            }
-        }
-    }
-    out
-}
-
 /// bounds-checked before any caller touches a byte. Both the
 /// single-term BMW path and [`TermCursor::new`] go through here, so
 /// the header layout is interpreted in exactly one spot.
-
 #[derive(Debug, Copy, Clone)]
 struct TermMeta {
     /// Document frequency — number of docs containing the term.
@@ -3283,6 +3355,36 @@ mod tests {
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn token_match_count_matches_token_match_len() {
+        // The counting path (CountSink for AND, or_count_unranked for OR)
+        // must agree with token_match's materialized length on every
+        // shape — single token, OR union, AND intersection, absent
+        // tokens, and the empty list.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let cases: &[(&[&str], BoolMode)] = &[
+            (&["rust"], BoolMode::Or),
+            (&["rust", "java"], BoolMode::Or),
+            (&["rust", "runtime"], BoolMode::And),
+            (&["rust", "zzz"], BoolMode::And),
+            (&["java", "zzz"], BoolMode::Or),
+            (&[], BoolMode::And),
+        ];
+        for (tokens, mode) in cases {
+            let len = r
+                .token_match("body", tokens, *mode)
+                .await
+                .expect("token_match")
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, *mode)
+                .await
+                .expect("token_match_count");
+            assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
+        }
     }
 
     #[tokio::test]

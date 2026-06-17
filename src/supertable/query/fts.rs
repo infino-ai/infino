@@ -535,23 +535,31 @@ impl SupertableReader {
                         }
                         None => None,
                     };
-                    // O(1) fast path: single token, no deletes → stored df.
-                    if single_term && tomb.is_none() {
-                        let df = r
-                            .term_df(&column_arc, &term_arc[0])
+                    let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                    // Deletes present: materialize the matching ids and
+                    // subtract the tombstoned ones (a df read or a bare
+                    // match count would over-count the deleted rows).
+                    if let Some(b) = tomb {
+                        let docs = r
+                            .token_match(&column_arc, &refs, mode)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                        return Ok::<u64, QueryError>(df);
+                        return Ok::<u64, QueryError>(
+                            docs.iter().filter(|d| !b.contains(**d)).count() as u64,
+                        );
                     }
-                    // General path: matching local doc ids minus tombstones.
-                    let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                    let docs = r
-                        .token_match(&column_arc, &refs, mode)
-                        .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    let n = match tomb {
-                        None => docs.len() as u64,
-                        Some(b) => docs.iter().filter(|d| !b.contains(**d)).count() as u64,
+                    // No deletes (the common case): count without
+                    // materializing ids — a single token resolves O(1)
+                    // from the stored df, multi-token tallies the match
+                    // walk through the counting sink.
+                    let n = if single_term {
+                        r.term_df(&column_arc, &term_arc[0])
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    } else {
+                        r.token_match_count(&column_arc, &refs, mode)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
                     };
                     Ok(n)
                 }
