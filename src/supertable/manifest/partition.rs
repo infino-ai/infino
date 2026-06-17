@@ -194,7 +194,8 @@ pub fn assign_partition(
                      no writer currently emits ColumnRange-partitioned commits"
                 .into(),
         }),
-        PartitionStrategy::VectorCell { n_cells, .. } => {
+        PartitionStrategy::VectorCell { clusters, .. } => {
+            let n_cells = clusters.n_cent;
             let cell =
                 seg.partition_hint
                     .ok_or_else(|| ManifestError::SuperfileSpansPartition {
@@ -204,7 +205,7 @@ pub fn assign_partition(
                             seg.uri.0
                         ),
                     })?;
-            if cell >= *n_cells {
+            if cell >= n_cells {
                 return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "VectorCell{{n_cells:{n_cells}}} got partition_hint={cell} (out of range)"

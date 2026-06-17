@@ -235,35 +235,23 @@ fn split_buffer_into_row_shards(
 /// `partition_hint` on the resulting superfile entries.
 fn split_buffer_by_vector_cell(
     buffer: Vec<BufferedBatch>,
-    centroids: &[f32],
-    dim: usize,
-    n_cells: u32,
+    cells: &crate::supertable::manifest::ClusterCentroids,
+    metric: crate::superfile::vector::distance::Metric,
     vec_col_idx: usize,
 ) -> Vec<(u32, Vec<BufferedBatch>)> {
-    use crate::superfile::vector::distance::l2_sq;
-    let mut cell_batches: Vec<Vec<BufferedBatch>> =
-        (0..n_cells as usize).map(|_| Vec::new()).collect();
+    let k = cells.n_cent as usize;
+    let mut cell_batches: Vec<Vec<BufferedBatch>> = (0..k).map(|_| Vec::new()).collect();
     for batch in buffer {
         let n_rows = batch.scalar.num_rows();
         if n_rows == 0 {
             continue;
         }
-        let vecs = &batch.vectors[vec_col_idx];
-        let mut per_cell_rows: Vec<Vec<usize>> =
-            (0..n_cells as usize).map(|_| Vec::new()).collect();
-        for row in 0..n_rows {
-            let v = &vecs.values()[row * dim..(row + 1) * dim];
-            let mut best_cell = 0u32;
-            let mut best_dist = f32::INFINITY;
-            for c in 0..n_cells as usize {
-                let centroid = &centroids[c * dim..(c + 1) * dim];
-                let d = l2_sq(v, centroid);
-                if d < best_dist {
-                    best_dist = d;
-                    best_cell = c as u32;
-                }
-            }
-            per_cell_rows[best_cell as usize].push(row);
+        let vecs = batch.vectors[vec_col_idx].values();
+        let mut assignments = vec![0u32; n_rows];
+        cells.assign_rows(metric, vecs, &mut assignments);
+        let mut per_cell_rows: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
+        for (row, &cell) in assignments.iter().enumerate() {
+            per_cell_rows[cell as usize].push(row);
         }
         for (cell_id, rows) in per_cell_rows.into_iter().enumerate() {
             if rows.is_empty() {
@@ -1030,7 +1018,9 @@ impl SupertableWriter {
             // Append all batches, then spawn the commit in background.
             for rb in batches {
                 if let Err(e) = vw.append(&rb) {
-                    eprintln!("[024a] hidden table append failed: {e}");
+                    tracing::warn!(
+                        "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
+                    );
                     break;
                 }
             }
@@ -1059,22 +1049,19 @@ impl SupertableWriter {
         // round-robin. Each shard becomes one superfile in its cell-partition.
         let (shards, cell_hints): (Vec<Vec<BufferedBatch>>, Vec<Option<u32>>) =
             if let Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell {
-                ref centroids_b64,
-                dim,
-                n_cells,
+                ref clusters,
                 ..
             }) = self.inner.options.partition_strategy
             {
-                let centroid_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(centroids_b64)
-                    .unwrap_or_default();
-                let centroids: Vec<f32> = centroid_bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-                if !centroids.is_empty() && dim > 0 {
-                    let cell_shards =
-                        split_buffer_by_vector_cell(buffer, &centroids, dim, n_cells, 0);
+                let metric = self
+                    .inner
+                    .options
+                    .vector_columns
+                    .first()
+                    .map(|vc| vc.metric)
+                    .unwrap_or(crate::superfile::vector::distance::Metric::L2Sq);
+                if clusters.n_cent > 0 && clusters.dim > 0 {
+                    let cell_shards = split_buffer_by_vector_cell(buffer, clusters, metric, 0);
                     let hints: Vec<Option<u32>> = cell_shards
                         .iter()
                         .map(|(cell_id, _)| Some(*cell_id))

@@ -115,9 +115,7 @@ pub enum PartitionStrategy {
     /// Each row is assigned to the cell whose centroid is nearest.
     VectorCell {
         column: String,
-        n_cells: u32,
-        dim: usize,
-        centroids_b64: String,
+        clusters: super::ClusterCentroids,
     },
 }
 
@@ -306,9 +304,7 @@ enum PartitionStrategyDto {
     },
     VectorCell {
         column: String,
-        n_cells: u32,
-        dim: u64,
-        centroids_b64: String,
+        clusters_b64: String,
     },
 }
 
@@ -564,17 +560,13 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 boundaries: boundaries.iter().map(|b| encode_b64(b)).collect(),
             }
         }
-        PartitionStrategy::VectorCell {
-            column,
-            n_cells,
-            dim,
-            centroids_b64,
-        } => PartitionStrategyDto::VectorCell {
-            column: column.clone(),
-            n_cells: *n_cells,
-            dim: *dim as u64,
-            centroids_b64: centroids_b64.clone(),
-        },
+        PartitionStrategy::VectorCell { column, clusters } => {
+            let enc = super::encoding::encode_cluster_centroids(clusters);
+            PartitionStrategyDto::VectorCell {
+                column: column.clone(),
+                clusters_b64: encode_b64(&enc),
+            }
+        }
     }
 }
 
@@ -602,15 +594,14 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
         }
         PartitionStrategyDto::VectorCell {
             column,
-            n_cells,
-            dim,
-            centroids_b64,
-        } => PartitionStrategy::VectorCell {
-            column,
-            n_cells,
-            dim: dim as usize,
-            centroids_b64,
-        },
+            clusters_b64,
+        } => {
+            let bytes = decode_b64(&clusters_b64, "partition_strategy.clusters")?;
+            let clusters = super::encoding::decode_cluster_centroids(&bytes).map_err(|e| {
+                ListParseError::BadFieldValue("partition_strategy.clusters", e.to_string())
+            })?;
+            PartitionStrategy::VectorCell { column, clusters }
+        }
     })
 }
 

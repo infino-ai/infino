@@ -122,40 +122,44 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // 024a: route unfiltered vector queries through the hidden
-        // VectorIndexSuperTable, narrowed to routed cell-partitions.
+        // Route unfiltered vector queries through the hidden vector-index
+        // supertable, narrowed to the nearest cell partitions.
         if let Some(vit) = self.vector_index_table() {
             let vit_reader = vit.reader();
             let vit_manifest = vit_reader.manifest();
             if !vit_manifest.superfiles.is_empty() {
                 let strategy = vit_manifest.get_partition_strategy();
+                let vit_metric = vit_manifest
+                    .options
+                    .vector_columns
+                    .iter()
+                    .find(|vc| vc.column == column)
+                    .map(|vc| vc.metric)
+                    .unwrap_or(Metric::L2Sq);
                 let routed_cells: Vec<u32> = match &strategy {
                     crate::supertable::manifest::list::PartitionStrategy::VectorCell {
-                        centroids_b64,
-                        dim,
-                        n_cells,
+                        clusters,
                         ..
                     } => {
-                        let centroid_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(centroids_b64)
-                            .unwrap_or_default();
-                        let centroids: Vec<f32> = centroid_bytes
-                            .chunks_exact(4)
-                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                            .collect();
-                        if centroids.is_empty() || *dim == 0 || query.len() != *dim {
-                            (0..*n_cells).collect()
+                        let dim = clusters.dim as usize;
+                        if clusters.n_cent == 0 || dim == 0 || query.len() != dim {
+                            (0..clusters.n_cent).collect()
                         } else {
-                            let mut scored: Vec<(u32, f32)> = (0..*n_cells)
-                                .map(|c| {
-                                    let cen = &centroids[c as usize * dim..(c as usize + 1) * dim];
-                                    (c, crate::superfile::vector::distance::l2_sq(query, cen))
-                                })
-                                .collect();
+                            let sum_q: f32 = query.iter().sum();
+                            let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+                            let nprobe = options.nprobe.max(2).min(clusters.n_cent as usize);
+                            let mut scored: Vec<(u32, f32)> =
+                                Vec::with_capacity(clusters.n_cent as usize);
+                            clusters.score_clusters_into(
+                                vit_metric,
+                                query,
+                                sum_q,
+                                norm_q_sq,
+                                |c, score| scored.push((c, score)),
+                            );
                             scored.sort_by(|a, b| {
                                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                             });
-                            let nprobe = options.nprobe.max(2).min(scored.len());
                             scored.truncate(nprobe);
                             scored.into_iter().map(|(c, _)| c).collect()
                         }
@@ -186,13 +190,6 @@ impl SupertableReader {
                 if cell_superfiles.is_empty() {
                     return Ok(Vec::new());
                 }
-                let vit_metric = vit_manifest
-                    .options
-                    .vector_columns
-                    .iter()
-                    .find(|vc| vc.column == column)
-                    .map(|vc| vc.metric)
-                    .unwrap_or(Metric::L2Sq);
                 let sum_q: f32 = query.iter().sum();
                 let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
                 let mut vi_scored: Vec<(usize, u32, f32)> = Vec::new();

@@ -121,17 +121,12 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
                 buf.extend_from_slice(b);
             }
         }
-        PartitionStrategy::VectorCell {
-            column,
-            n_cells,
-            dim,
-            centroids_b64,
-        } => {
+        PartitionStrategy::VectorCell { column, clusters } => {
             push_tag(&mut buf, b"vector_cell");
             push_str(&mut buf, column);
-            buf.extend_from_slice(&n_cells.to_le_bytes());
-            buf.extend_from_slice(&(*dim as u64).to_le_bytes());
-            push_str(&mut buf, centroids_b64);
+            let enc = super::encoding::encode_cluster_centroids(clusters);
+            buf.extend_from_slice(&(enc.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&enc);
         }
     }
 

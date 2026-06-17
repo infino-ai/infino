@@ -297,6 +297,74 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummary, DecodeError> {
 //   f32 radius
 // ---------------------------------------------------------
 
+/// Sq8 cluster-centroid block (same layout as the tail of
+/// [`encode_vector_summary`], without the bounding-sphere header).
+pub fn encode_cluster_centroids(cl: &super::ClusterCentroids) -> Vec<u8> {
+    let nc = cl.n_cent as usize;
+    let cd = cl.dim as usize;
+    let mut out = Vec::with_capacity(8 + nc * (4 + 4 + 4) + nc * cd);
+    out.extend_from_slice(&cl.n_cent.to_le_bytes());
+    out.extend_from_slice(&cl.dim.to_le_bytes());
+    for &c in &cl.counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    for &m in &cl.mins {
+        out.extend_from_slice(&m.to_le_bytes());
+    }
+    for &sc in &cl.scales {
+        out.extend_from_slice(&sc.to_le_bytes());
+    }
+    out.extend_from_slice(&cl.codes);
+    out
+}
+
+pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<super::ClusterCentroids, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
+    let cdim = read_u32(&mut c, "cluster_dim")? as usize;
+
+    let counts_b = read_n(&mut c, n_cent * 4, "cluster_counts")?;
+    if counts_b.len() != n_cent * 4 {
+        return Err(DecodeError::InvalidVectorSummary(
+            "truncated cluster counts".into(),
+        ));
+    }
+    let counts: Vec<u32> = counts_b
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let ms_b = read_n(&mut c, n_cent * 8, "cluster_min_scale")?;
+    if ms_b.len() != n_cent * 8 {
+        return Err(DecodeError::InvalidVectorSummary(
+            "truncated cluster min/scale".into(),
+        ));
+    }
+    let floats: Vec<f32> = ms_b
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let mins = floats[0..n_cent].to_vec();
+    let scales = floats[n_cent..2 * n_cent].to_vec();
+
+    let codes_b = read_n(&mut c, n_cent * cdim, "cluster_codes")?;
+    if codes_b.len() != n_cent * cdim {
+        return Err(DecodeError::InvalidVectorSummary(
+            "truncated cluster codes".into(),
+        ));
+    }
+
+    Ok(super::ClusterCentroids {
+        n_cent: n_cent as u32,
+        dim: cdim as u32,
+        codes: codes_b.to_vec(),
+        mins,
+        scales,
+        counts,
+        code_moments: std::sync::OnceLock::new(),
+    })
+}
+
 pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     let dim = s.centroid.len();
     let cl = &s.clusters;

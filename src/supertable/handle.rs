@@ -29,7 +29,6 @@ use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
 use crate::storage::PrefixedStorageProvider;
 use crate::superfile::vector::kmeans::kmeans;
 use crate::supertable::ManifestLoadError;
-use base64::Engine;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -116,8 +115,8 @@ pub(super) struct SupertableInner {
     /// opens five supertables holds five distinct ids). Minted
     /// via `IdGenerator::next_id()` once at create / open.
     pub(super) handle_id: crate::supertable::wal::state_doc::SupertableHandleId,
-    /// Hidden VectorIndexSuperTable — a cell-partitioned sibling table
-    /// for the global vector index (plan 024a).
+    /// Hidden sibling supertable storing vectors only, partitioned by
+    /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
     /// Last time the read path checked the storage manifest pointer
     /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
@@ -708,13 +707,23 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
-/// Train N global centroids from the user table's manifest cluster summaries.
-/// Returns `(n_cells, dim, centroids_fp32)` or None if no summaries exist.
+/// Default number of global vector-index cells for routed search.
+const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
+
+/// Lloyd iterations when folding per-superfile cluster centroids into the
+/// global cell grid at open/create time.
+const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
+
+/// Fixed PRNG seed for global centroid training.
+const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
+
+/// Train global cell centroids from the user table's manifest cluster summaries.
+/// Returns Sq8-encoded centroids or None if no summaries exist.
 fn train_global_centroids(
     user_opts: &SupertableOptions,
     manifest: &super::manifest::Manifest,
     n_cells: usize,
-) -> Option<(usize, usize, Vec<f32>)> {
+) -> Option<super::manifest::ClusterCentroids> {
     let vc = user_opts.vector_columns.first()?;
     let mut all_centroids = Vec::new();
     let mut dim = 0usize;
@@ -742,8 +751,19 @@ fn train_global_centroids(
     }
     let n_src = all_centroids.len() / dim;
     let n = n_cells.min(n_src).max(1);
-    let centroids = kmeans(&all_centroids, dim, n, 8, 0x51ED_2A11);
-    Some((n, dim, centroids))
+    let centroids = kmeans(
+        &all_centroids,
+        dim,
+        n,
+        GLOBAL_VECTOR_KMEANS_ITERS,
+        GLOBAL_VECTOR_KMEANS_SEED,
+    );
+    Some(super::manifest::ClusterCentroids::from_fp32(
+        n as u32,
+        dim as u32,
+        &centroids,
+        vec![1u32; n],
+    ))
 }
 
 fn build_vector_index_options(
@@ -783,20 +803,13 @@ fn build_vector_index_options(
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
     if let Some(manifest) = user_manifest
-        && let Some((n_cells, dim, centroids)) = train_global_centroids(user_opts, manifest, 64)
+        && let Some(clusters) =
+            train_global_centroids(user_opts, manifest, GLOBAL_VECTOR_CELL_COUNT)
     {
-        let centroids_b64 = base64::engine::general_purpose::STANDARD.encode(
-            centroids
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        );
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                 column: user_opts.vector_columns[0].column.clone(),
-                n_cells: n_cells as u32,
-                dim,
-                centroids_b64,
+                clusters,
             },
         );
     }

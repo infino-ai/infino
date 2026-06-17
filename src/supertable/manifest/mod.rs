@@ -1765,6 +1765,19 @@ pub struct ClusterCentroids {
     pub code_moments: std::sync::OnceLock<Vec<(f32, f32)>>,
 }
 
+impl PartialEq for ClusterCentroids {
+    fn eq(&self, other: &Self) -> bool {
+        self.n_cent == other.n_cent
+            && self.dim == other.dim
+            && self.codes == other.codes
+            && self.mins == other.mins
+            && self.scales == other.scales
+            && self.counts == other.counts
+    }
+}
+
+impl Eq for ClusterCentroids {}
+
 impl ClusterCentroids {
     /// The "no cluster centroids" value — a superfile without a vector
     /// index for the column.
@@ -1885,6 +1898,47 @@ impl ClusterCentroids {
             };
             emit(c as u32, score);
         }
+    }
+
+    /// Return the cell whose Sq8 centroid is closest to `query` under `metric`.
+    /// Uses [`Self::score_clusters_into`] — same SIMD path as IVF selection.
+    pub fn nearest_cell(&self, metric: Metric, query: &[f32]) -> u32 {
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+        let mut best_cell = 0u32;
+        let mut best_score = f32::INFINITY;
+        self.score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+            if score < best_score {
+                best_score = score;
+                best_cell = c;
+            }
+        });
+        best_cell
+    }
+
+    /// Assign each row in `vectors` to its nearest cell. Parallel over rows;
+    /// each assignment uses [`Self::nearest_cell`].
+    pub fn assign_rows(&self, metric: Metric, vectors: &[f32], assignments: &mut [u32]) {
+        use rayon::prelude::*;
+        let dim = self.dim as usize;
+        assert_eq!(vectors.len() % dim, 0, "assign_rows: vectors len mismatch");
+        let n = vectors.len() / dim;
+        assert_eq!(
+            assignments.len(),
+            n,
+            "assign_rows: assignments len mismatch"
+        );
+        if n == 0 {
+            return;
+        }
+        let new: Vec<u32> = (0..n)
+            .into_par_iter()
+            .map(|d| {
+                let v = &vectors[d * dim..(d + 1) * dim];
+                self.nearest_cell(metric, v)
+            })
+            .collect();
+        assignments.copy_from_slice(&new);
     }
 
     /// Dequantize cluster `c`'s centroid into `out` (length `dim`).
