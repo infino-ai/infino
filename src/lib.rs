@@ -113,6 +113,13 @@ pub mod supertable;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod supertable;
 
+// `roaring` is already an internal dependency. Re-export it under
+// `test-helpers` only, so a bench can build an allow-set for the filtered
+// vector kernel without its own `roaring` dependency. Off the public
+// contract (the `cargo-public-api` snapshot is taken without the feature).
+#[cfg(feature = "test-helpers")]
+pub use roaring;
+
 // The catalog layer (`Connection` + `connect`). Internal module; its
 // public items are re-exported at the crate root below.
 mod catalog;

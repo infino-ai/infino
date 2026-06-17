@@ -795,7 +795,7 @@ pub mod vector {
     //! ```
 
     use std::sync::{Arc, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::corpus::{self, DIM};
     use crate::cost;
@@ -811,6 +811,7 @@ pub mod vector {
     use crate::supertable::Phases;
     use crate::tiers;
     use bytes::Bytes;
+    use infino::roaring::RoaringBitmap;
 
     // ─── Constants ────────────────────────────────────────────────────────
 
@@ -823,6 +824,11 @@ pub mod vector {
     /// production?" baseline reported in the search markdown.
     const DEFAULT_NPROBE: usize = 8;
     const DEFAULT_RERANK_MULT: usize = 20;
+
+    /// The filtered-search row keeps every Nth row in its allow-set — a
+    /// ~10% selective predicate. Latency depends on the allow-set's density,
+    /// not which rows it holds, so a simple stride suffices.
+    const FILTER_KEEP_EVERY: usize = 10;
 
     /// Nanoseconds per second, for latency markdown.
     const NS_PER_SEC: f64 = 1e9;
@@ -1015,6 +1021,59 @@ pub mod vector {
                     n_docs,
                     &cost::warm_from_vector(&recall_rows),
                 );
+            }
+
+            if phases.warm {
+                // Filtered kNN: rank distance only among an allow-set of
+                // matching `local_doc_id`s (predicate pushdown). Measure its
+                // p50 beside the unfiltered baseline at the same config. The
+                // allow-set keeps every Nth row — for latency only its
+                // density matters, not which rows.
+                let reader = index.reader();
+                let mut allow = RoaringBitmap::new();
+                for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+                    allow.insert(i);
+                }
+                let allow = Arc::new(allow);
+
+                let mut rows = Vec::new();
+                for (label, set) in [
+                    ("unfiltered", None),
+                    ("filtered (~10%)", Some(Arc::clone(&allow))),
+                ] {
+                    let mut samples = Vec::new();
+                    for q in queries_correctness() {
+                        for _ in 0..CALIBRATION_P50_ITERS {
+                            let t0 = Instant::now();
+                            let hits = tiers::block_on(reader.vector_hits_filtered_async(
+                                VEC_COLUMN,
+                                q,
+                                TOP_K,
+                                exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
+                                set.clone(),
+                            ))
+                            .expect("filtered vector search");
+                            std::hint::black_box(hits);
+                            samples.push(t0.elapsed());
+                        }
+                    }
+                    samples.sort_unstable();
+                    let ns = samples[samples.len() / 2].as_secs_f64() * NS_PER_SEC;
+                    rows.push(vec![text(label), metric(ns, fmt_time(ns), Better::Lower)]);
+                }
+                report.emit(&Section {
+                    anchor: "bench/vector/superfile/filtered".into(),
+                    title: format!(
+                        "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={DIM})",
+                        fmt_count(n_docs)
+                    ),
+                    note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; p50 over the correctness query battery at the `default` config. Δ is vs the previous run.".into(),
+                    blocks: vec![Block {
+                        subtitle: String::new(),
+                        headers: vec!["Filter".into(), "p50".into()],
+                        rows,
+                    }],
+                });
             }
 
             struct SuperfileVecColdGuard {
