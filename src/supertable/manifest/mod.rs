@@ -696,7 +696,7 @@ impl Manifest {
                     .expect("touched implies present");
 
                 let combined_n = entry.n_superfiles as usize + new_for_pk.len();
-                if combined_n as u64 > self.superfile_list.options.target_superfiles_per_partition {
+                if combined_n as u64 > self.superfile_list.options.target_superfiles_per_part {
                     // Split: keep the existing entry as-is and emit a
                     // fresh part with just the new superfiles.
                     out_list_entries.push(entry.clone());
@@ -3359,7 +3359,7 @@ mod tests {
     async fn rebalance_rewrite_partition_within_target() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 3;
+        base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
         let pk = hash_bucket_0_pk();
@@ -3451,7 +3451,7 @@ mod tests {
     async fn rebalance_split_partition_exceeds_target() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 2;
+        base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
         let pk = hash_bucket_0_pk();
@@ -3569,7 +3569,7 @@ mod tests {
     async fn rebalance_older_entry_preserved_when_latest_rewritten() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 2;
+        base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
         let pk = hash_bucket_0_pk();
@@ -3697,7 +3697,7 @@ mod tests {
         // entry is added to both. Both should be rewritten independently.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 3;
+        base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
         let pk_a = hash2_pk(0);
@@ -3825,7 +3825,7 @@ mod tests {
         // content_hash that were written — no re-encode, no PUT.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 3;
+        base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
         let pk_a = hash2_pk(0);
@@ -3949,7 +3949,7 @@ mod tests {
         // the older parts over unchanged.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 2;
+        base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
         let pk_a = hash2_pk(0);
@@ -4224,7 +4224,7 @@ mod tests {
         // surviving existing superfile plus the new one — not the removed one.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 3;
+        base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
         let pk = hash_bucket_0_pk();
@@ -4451,7 +4451,7 @@ mod tests {
         // contents did not).
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 2;
+        base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
         let pk = hash_bucket_0_pk();
@@ -4773,7 +4773,7 @@ mod tests {
         // sf_a_old_keep and sf_a_latest survive.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
-        base_opts.target_superfiles_per_partition = 2;
+        base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
         let pk = hash_bucket_0_pk();

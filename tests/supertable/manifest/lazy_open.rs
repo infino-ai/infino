@@ -91,7 +91,7 @@ fn many_parts_skip_eager_fetch() {
 
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(TARGET_SUPERFILES_PER_PARTITION);
+        .with_target_superfiles_per_part(TARGET_SUPERFILES_PER_PARTITION);
     let producer = Supertable::create(producer_opts).expect("create");
     for _i in 0..LAZY_MODE_PART_COUNT {
         let mut w = producer.writer().expect("writer");
@@ -140,7 +140,7 @@ async fn manifest_part_lazy_loads_on_first_access() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let producer_opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(TARGET_SUPERFILES_PER_PARTITION);
+        .with_target_superfiles_per_part(TARGET_SUPERFILES_PER_PARTITION);
     let producer = Supertable::create(producer_opts).expect("create");
     for _i in 0..LAZY_MODE_PART_COUNT {
         let mut w = producer.writer().expect("writer");
