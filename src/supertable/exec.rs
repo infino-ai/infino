@@ -20,9 +20,9 @@ use crate::runtime_bridge::build_query_runtime;
 /// Tokio runtime + rayon reader/writer pools shared across a connection's
 /// tables. Cheap to clone (`Arc`); all clones share the same threads.
 pub(crate) struct ExecContext {
-    /// Drives async I/O (object-store GETs, range fetches). Held in a
-    /// `OnceLock` only so [`Drop`] can `take` it and shut it down without
-    /// blocking — see the `Drop` impl. Always populated after `new`.
+    /// Drives async I/O (object-store GETs, range fetches). A `OnceLock`
+    /// (always set in `new`) rather than a plain `Arc` so [`Drop`] can take
+    /// it back out and shut it down without blocking.
     query_runtime: OnceLock<Arc<Runtime>>,
     /// CPU pool for the read path: page decode, scoring, rerank.
     pub reader_pool: Arc<ThreadPool>,
@@ -32,13 +32,16 @@ pub(crate) struct ExecContext {
 
 impl ExecContext {
     /// Build a context with `reader_threads` / `writer_threads` rayon
-    /// workers. The runtime is multi-thread and sized to the host (see
+    /// workers and a host-sized multi-thread runtime (see
     /// [`build_query_runtime`]).
-    pub(crate) fn new(reader_threads: usize, writer_threads: usize) -> Result<Arc<Self>, BuildError> {
-        let runtime = OnceLock::new();
-        let _ = runtime.set(build_query_runtime("supertable-query"));
+    pub(crate) fn new(
+        reader_threads: usize,
+        writer_threads: usize,
+    ) -> Result<Arc<Self>, BuildError> {
+        let query_runtime = OnceLock::new();
+        let _ = query_runtime.set(build_query_runtime("supertable-query"));
         Ok(Arc::new(Self {
-            query_runtime: runtime,
+            query_runtime,
             reader_pool: Arc::new(build_pool("supertable-reader", reader_threads)?),
             writer_pool: Arc::new(build_pool("supertable-writer", writer_threads)?),
         }))
@@ -53,11 +56,10 @@ impl ExecContext {
 }
 
 impl Drop for ExecContext {
-    /// Shut the runtime down without blocking. Dropping the last reference
-    /// from inside the caller's own runtime would otherwise trip tokio's
-    /// "cannot drop a runtime from within an async context" guard;
-    /// `shutdown_background` is safe from any context. `try_unwrap` shuts it
-    /// down only when this context owns the last reference.
+    /// Shut the runtime down off-thread so dropping the last reference from
+    /// inside the caller's own runtime can't trip tokio's
+    /// drop-runtime-in-async-context guard. `try_unwrap` only fires when
+    /// this is the last owner.
     fn drop(&mut self) {
         if let Some(rt) = self.query_runtime.take()
             && let Ok(rt) = Arc::try_unwrap(rt)

@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema};
 use rayon::ThreadPool;
+use tokio::runtime::Runtime;
 
 use crate::config::{Config, StorageBackend, StorageColdFetchMode};
 use crate::storage::{
@@ -51,6 +52,7 @@ use crate::superfile::builder::{BuilderOptions, FtsConfig, VectorConfig};
 use crate::superfile::fts::tokenize::Tokenizer;
 
 use super::error::BuildError;
+use super::exec::ExecContext;
 use super::reader_cache::{
     ColdFetchMode, DiskCacheConfig, DiskCacheStore, InMemoryReaderCache, LruPolicy,
     SuperfileReaderCache,
@@ -74,13 +76,13 @@ const RESERVED_PREFIX: &str = "inf.";
 /// (rounded up, minimum 1). Read-mostly workloads keep reader p99
 /// stable under writer load; ETL-shaped overrides via
 /// [`SupertableOptions::with_writer_pool`].
-fn default_writer_thread_count() -> usize {
+pub(crate) fn default_writer_thread_count() -> usize {
     num_cpus::get().div_ceil(2).max(1)
 }
 
 /// Default reader-pool size: every logical core. Reader fan-out
 /// across non-pruned superfiles saturates this pool.
-fn default_reader_thread_count() -> usize {
+pub(crate) fn default_reader_thread_count() -> usize {
     num_cpus::get().max(1)
 }
 
@@ -202,6 +204,10 @@ pub struct SupertableOptions {
     /// Pool used by writer commit-time rayon-shard. Default:
     /// half the logical cores.
     pub writer_pool: Arc<ThreadPool>,
+    /// Shared multi-thread runtime for the sync query path. `None` means
+    /// build a per-table one lazily (standalone / tests); a `Connection`
+    /// sets this (via [`Self::with_exec`]) so all its tables share one.
+    pub query_runtime: Option<Arc<Runtime>>,
     /// Where superfile bytes live. Shared across reader threads
     /// and the writer. Default: `InMemoryReaderCache`.
     pub store: Arc<dyn SuperfileReaderCache>,
@@ -504,6 +510,7 @@ impl SupertableOptions {
             tokenizer,
             reader_pool,
             writer_pool,
+            query_runtime: None,
             store,
             storage: None,
             disk_cache: None,
@@ -585,6 +592,18 @@ impl SupertableOptions {
     /// up a shared pool across subsystems.
     pub fn with_reader_pool(mut self, pool: Arc<ThreadPool>) -> Self {
         self.reader_pool = pool;
+        self
+    }
+
+    /// Point this table's runtime and rayon pools at a connection-shared
+    /// [`ExecContext`] so all of a `Connection`'s tables run on one set of
+    /// threads. Replaces the per-table pools `new` builds; that overwrite is
+    /// the price of leaving `new` free of connection wiring, and table open
+    /// is off the hot path.
+    pub(crate) fn with_exec(mut self, exec: &Arc<ExecContext>) -> Self {
+        self.reader_pool = Arc::clone(&exec.reader_pool);
+        self.writer_pool = Arc::clone(&exec.writer_pool);
+        self.query_runtime = Some(Arc::clone(exec.query_runtime()));
         self
     }
 

@@ -21,7 +21,7 @@ mod uri;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
@@ -32,14 +32,17 @@ pub use index_spec::IndexSpec;
 pub use options::{ColdFetchMode, ConnectOptions};
 
 use crate::InfinoError;
-use crate::runtime_bridge::bridge_sync_to_async;
+use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
 use crate::storage::StorageProvider;
 use crate::superfile::builder::FtsConfig;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::vector::distance::Metric;
 use crate::supertable::Supertable;
-use crate::supertable::options::SupertableOptions;
+use crate::supertable::exec::ExecContext;
+use crate::supertable::options::{
+    SupertableOptions, default_reader_thread_count, default_writer_thread_count,
+};
 use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
@@ -90,6 +93,7 @@ pub fn connect_with(
             backend,
             options,
             store,
+            exec: OnceLock::new(),
         }),
     })
 }
@@ -105,6 +109,9 @@ struct ConnectionInner {
     backend: Backend,
     options: ConnectOptions,
     store: CatalogStore,
+    /// Runtime + rayon pools shared by every table this connection opens,
+    /// built once on first table create/open. See [`ExecContext`].
+    exec: OnceLock<Arc<ExecContext>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -116,6 +123,17 @@ enum CatalogStore {
 }
 
 impl Connection {
+    /// The runtime + rayon pools shared across this connection's tables,
+    /// built once on first use. Injected into every table's options
+    /// ([`SupertableOptions::with_exec`]) so N tables run on one set of
+    /// threads instead of N.
+    fn exec(&self) -> Arc<ExecContext> {
+        Arc::clone(self.inner.exec.get_or_init(|| {
+            ExecContext::new(default_reader_thread_count(), default_writer_thread_count())
+                .expect("ExecContext build only fails on catastrophic OS resource exhaustion")
+        }))
+    }
+
     /// Create a new table named `name` with the given Arrow `schema` and
     /// search `indexes`. Fails with [`InfinoError::AlreadyExists`] if a
     /// table of that name already exists. Returns the open handle.
@@ -144,7 +162,7 @@ impl Connection {
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
-                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, None)?;
+                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, None, &self.exec())?;
                 let handle = Supertable::create(opts)?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
@@ -191,8 +209,14 @@ impl Connection {
                 // cache directory; superfile keys carry the location, so a
                 // re-created table never reads a dropped generation's bytes.
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
-                let mut opts =
-                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    Some(table_storage),
+                    &self.exec(),
+                )?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -272,8 +296,14 @@ impl Connection {
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
-                let mut opts =
-                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    Some(table_storage),
+                    &self.exec(),
+                )?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -442,12 +472,15 @@ impl Connection {
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()))
         };
-        // Drive on an established per-supertable multi-thread query runtime
-        // (any referenced table's `block_on_query`); fall back to the shared
-        // bridge for table-free queries such as `SELECT 1`.
+        // A query naming a `FROM` catalog table drives on that table's
+        // runtime; otherwise on the connection's shared one. The fallback
+        // must be multi-thread, not a throwaway current_thread runtime: a
+        // table-free query can be a search TVF (its table is an argument, not
+        // a `FROM` relation), and that fans out object-store reads which
+        // bridge with `block_in_place`.
         match handles.first() {
             Some(table) => table.block_on_query(drive),
-            None => bridge_sync_to_async(drive),
+            None => bridge_on_runtime(drive, self.exec().query_runtime()),
         }
     }
 }
@@ -460,8 +493,9 @@ fn build_options(
     vectors: Vec<VectorConfig>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
+    exec: &Arc<ExecContext>,
 ) -> Result<SupertableOptions, InfinoError> {
-    let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
+    let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?.with_exec(exec);
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -836,6 +870,68 @@ mod tests {
             conn.query_sql("SELECT _id FROM bm25_search('nope', 'title', 'fox', 10)")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn connection_tables_share_one_runtime() {
+        // Every table of a connection runs on the connection's shared
+        // ExecContext, not a per-table runtime.
+        let conn = connect("memory://").expect("connect");
+        let a = conn
+            .create_table("a", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create a");
+        let b = conn
+            .create_table("b", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create b");
+        assert!(
+            Arc::ptr_eq(&a.query_runtime(), &b.query_runtime()),
+            "tables of one connection must share one runtime"
+        );
+    }
+
+    #[test]
+    fn query_sql_search_tvf_over_storage_does_not_panic() {
+        // A search TVF names its table in an argument, not a `FROM` relation,
+        // so query_sql takes the table-free runtime fallback. The shared
+        // ExecContext makes that a multi-thread runtime; over storage the TVF
+        // fans out object-store reads that would panic on a current_thread
+        // runtime. `memory://` has no such reads, so pin it on localfs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append");
+
+        let rows: usize = conn
+            .query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
+            .expect("bm25_search tvf over storage")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "one doc matches 'fox'");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_drops_cleanly_inside_async_runtime() {
+        // The shared runtime is built eagerly; dropping the last Connection
+        // from inside the caller's runtime must not trip tokio's
+        // drop-runtime-in-async-context guard (ExecContext's Drop handles it).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        conn.query_sql("SELECT _id FROM bm25_search('docs', 'title', 'fox', 10)")
+            .expect("query");
+
+        drop(docs);
+        drop(conn); // must not panic
     }
 
     #[test]

@@ -25,7 +25,7 @@ use tokio::runtime::Runtime;
 use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
-use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
+use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime};
 use crate::supertable::ManifestLoadError;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
@@ -77,13 +77,11 @@ pub(super) struct SupertableInner {
     /// supertable, constructed fresh on `create()` /
     /// `open()` with a 40-bit random worker_id.
     pub(super) id_generator: Mutex<crate::supertable::utils::idgen::IdGenerator>,
-    /// Lazily-initialized tokio Runtime that drives DataFusion
-    /// plans for `query_sql`. Tokio is single-worker here — it
-    /// runs the async I/O state machine, not CPU-bound work
-    /// (that lives on `options.reader_pool`). One Runtime per
-    /// supertable, shared across all SQL queries; allocated on
-    /// first use rather than at `create()` so supertables that
-    /// never run SQL don't pay the runtime cost.
+    /// Fallback runtime for a standalone supertable — one built lazily on
+    /// first query so a supertable that never queries pays nothing. Unused
+    /// when the table was opened through a `Connection`, which supplies a
+    /// shared runtime via `options.query_runtime`. Drives async I/O, not
+    /// CPU work (that lives on the rayon pools).
     pub(super) query_runtime: OnceLock<Arc<Runtime>>,
     /// Cached `SessionContext` for `query_sql`, keyed on the
     /// manifest `Arc` it was built against. Building one is
@@ -147,35 +145,21 @@ impl Drop for SupertableInner {
 }
 
 impl SupertableInner {
-    /// Get (or lazily build) the runtime that drives the public sync
-    /// API's async kernels when the caller is not already on a Tokio
-    /// runtime (queries, SQL, writer commits). Sized to the host's
-    /// parallelism: the cold read path fans a query out across every
-    /// superfile via `tokio::spawn` + `spawn_blocking` (range GETs,
-    /// CRC verification, zstd decode), so a single worker would
-    /// serialize that fan-out and inflate cold latency. One worker per
-    /// CPU lets those overlap, matching what an async caller gets.
+    /// The runtime that drives the public sync API's async kernels when the
+    /// caller isn't already on a Tokio runtime (queries, SQL, writer
+    /// commits). A `Connection` shares one runtime across all its tables
+    /// (`options.query_runtime`); a standalone supertable builds its own
+    /// lazily, so one that never runs a query pays nothing. Multi-thread so
+    /// the cold read path's per-superfile fan-out overlaps rather than
+    /// serializes.
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(self.query_runtime.get_or_init(|| {
-            // Fallback worker count when the host won't report its
-            // parallelism; small but multi-threaded so the cold-read
-            // fan-out still overlaps rather than serializing.
-            const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
-            Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(workers)
-                    .enable_all()
-                    .thread_name("supertable-query")
-                    .build()
-                    .expect(
-                        "invariant: tokio Runtime build only fails on \
-                         catastrophic OS resource exhaustion",
-                    ),
-            )
-        }))
+        if let Some(shared) = &self.options.query_runtime {
+            return Arc::clone(shared);
+        }
+        Arc::clone(
+            self.query_runtime
+                .get_or_init(|| build_query_runtime("supertable-query")),
+        )
     }
 }
 
