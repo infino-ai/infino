@@ -26,6 +26,7 @@
 pub(crate) mod build;
 pub(crate) mod compaction;
 pub mod error;
+pub(crate) mod gc;
 pub mod handle;
 pub mod lazy_source;
 pub mod manifest;
@@ -58,7 +59,8 @@ pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
     StorageProvider,
 };
-pub use error::{BuildError, CommitError, CompactionError, OpenError, QueryError};
+pub use error::{BuildError, CommitError, CompactionError, GcError, OpenError, QueryError};
+pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;
 pub use manifest::{

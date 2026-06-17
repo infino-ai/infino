@@ -142,7 +142,7 @@ pub use superfile::vector::distance::Metric;
 /// / `vector_search` / `schema`.
 pub use supertable::Supertable;
 pub use supertable::query::vector::VectorFilter;
-pub use supertable::{CompactionError, MutationStats};
+pub use supertable::{CompactionError, GcError, GcReport, MutationStats};
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)

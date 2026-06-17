@@ -308,6 +308,16 @@ pub enum CompactionError {
     AlreadyCompacting,
 }
 
+/// Errors raised by [`crate::supertable::Supertable::gc`].
+#[derive(Debug, thiserror::Error)]
+pub enum GcError {
+    #[error("gc requires a storage backend")]
+    NoStorage,
+
+    #[error("storage error during gc: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+}
+
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]
 /// (`query_sql`; future: `bm25_search`, `vector_search`).
 ///

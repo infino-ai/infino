@@ -64,6 +64,22 @@ impl core::marker::Unpin for infino::CompactionError
 impl core::marker::UnsafeUnpin for infino::CompactionError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionError
 impl core::panic::unwind_safe::UnwindSafe for infino::CompactionError
+pub enum infino::GcError
+pub infino::GcError::NoStorage
+pub infino::GcError::Storage(infino::storage::StorageError)
+impl core::error::Error for infino::GcError
+pub fn infino::GcError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for infino::GcError
+pub fn infino::GcError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::GcError
+pub fn infino::GcError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::GcError
+impl core::marker::Send for infino::GcError
+impl core::marker::Sync for infino::GcError
+impl core::marker::Unpin for infino::GcError
+impl core::marker::UnsafeUnpin for infino::GcError
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::GcError
+impl !core::panic::unwind_safe::UnwindSafe for infino::GcError
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
@@ -165,6 +181,25 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+pub struct infino::GcReport
+pub infino::GcReport::bytes_freed: u64
+pub infino::GcReport::delete_errors: u64
+pub infino::GcReport::objects_deleted: u64
+pub infino::GcReport::objects_skipped_live: u64
+pub infino::GcReport::objects_skipped_too_new: u64
+impl core::clone::Clone for infino::GcReport
+pub fn infino::GcReport::clone(&self) -> infino::GcReport
+impl core::default::Default for infino::GcReport
+pub fn infino::GcReport::default() -> infino::GcReport
+impl core::fmt::Debug for infino::GcReport
+pub fn infino::GcReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::GcReport
+impl core::marker::Send for infino::GcReport
+impl core::marker::Sync for infino::GcReport
+impl core::marker::Unpin for infino::GcReport
+impl core::marker::UnsafeUnpin for infino::GcReport
+impl core::panic::unwind_safe::RefUnwindSafe for infino::GcReport
+impl core::panic::unwind_safe::UnwindSafe for infino::GcReport
 pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -215,6 +250,8 @@ pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl infino::Supertable
 pub fn infino::Supertable::compact(&self, &infino::CompactionSettings) -> core::result::Result<(), infino::CompactionError>
+impl infino::Supertable
+pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
 impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 impl infino::Supertable
