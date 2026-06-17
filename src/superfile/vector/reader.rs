@@ -145,6 +145,14 @@ pub struct ColumnReader {
     rot: RandomRotation,
 }
 
+/// Shared context threaded through the probe → shortlist → score pipeline.
+struct ProbeCtx<'a> {
+    q_rot: &'a [f32],
+    k: usize,
+    rerank_mult: usize,
+    allow: Option<Arc<RoaringBitmap>>,
+}
+
 impl ColumnReader {
     /// byte range covering one cluster's
     /// `[codes_chunk + doc_ids_chunk]` block as a single
@@ -1325,17 +1333,14 @@ impl VectorReader {
         // `[codes][doc_ids][full?]`; scoring reads the prefix, and the
         // survivor `full[]` rows are fetched below — the only step
         // that differs from the async path.
+        let ctx = ProbeCtx { q_rot: &q_rot, k, rerank_mult, allow: None };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            &q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            k,
-            rerank_mult,
-            // The sync `search` path is unfiltered.
-            None,
+            &ctx,
         )
         .await
         {
@@ -1436,17 +1441,9 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        self.probe_clusters_async(
-            col,
-            query,
-            &q_rot,
-            &cluster_idx,
-            &chosen,
-            k,
-            rerank_mult,
-            allow,
-        )
-        .await
+        let ctx = ProbeCtx { q_rot: &q_rot, k, rerank_mult, allow };
+        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .await
     }
 
     /// Async IVF probe over an **externally chosen** set of cluster ids.
@@ -1483,17 +1480,9 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        self.probe_clusters_async(
-            col,
-            query,
-            &q_rot,
-            &cluster_idx,
-            &chosen,
-            k,
-            rerank_mult,
-            allow,
-        )
-        .await
+        let ctx = ProbeCtx { q_rot: &q_rot, k, rerank_mult, allow };
+        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .await
     }
 
     /// Shared async tail of the IVF probe: given a chosen set of cluster
@@ -1502,19 +1491,13 @@ impl VectorReader {
     /// Used by [`Self::search_async`] (clusters from this superfile's
     /// centroid scoring) and [`Self::search_clusters_async`] (clusters
     /// from the global cross-superfile selector).
-    #[allow(clippy::too_many_arguments)]
     async fn probe_clusters_async(
         &self,
         col: &ColumnReader,
         query: &[f32],
-        q_rot: &[f32],
+        ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
-        k: usize,
-        rerank_mult: usize,
-        // Filtered search allow-set (per-superfile matching doc-ids),
-        // threaded down to the coarse shortlist. `None` = unfiltered.
-        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
@@ -1571,14 +1554,11 @@ impl VectorReader {
         // diverges from the sync path.
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            k,
-            rerank_mult,
-            allow,
+            ctx,
         )
         .await
         {
@@ -1607,7 +1587,7 @@ impl VectorReader {
             &candidates,
             col,
             query,
-            k,
+            ctx.k,
         )
         .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
@@ -1790,20 +1770,13 @@ enum ShortlistOutcome {
 /// then runs [`rerank_candidates_from_blocks`]. Factoring this out
 /// keeps `search` / `search_async` down to their fetch waves around a
 /// single shared kernel, so the two can't drift in scoring/recall.
-#[allow(clippy::too_many_arguments)]
 async fn build_shortlist(
     col: &ColumnReader,
-    q_rot: &[f32],
     cb: usize,
     cluster_meta: &[(usize, u32, u32)],
     cluster_blocks: &[Bytes],
     survivor_only_rerank_fetch: bool,
-    k: usize,
-    rerank_mult: usize,
-    // Filtered search: when `Some`, only doc-ids in this per-superfile
-    // bitmap may enter the coarse shortlist (the predicate's allow-set).
-    // `Arc` so the parallel branch can move a clone into the rayon task.
-    allow: Option<Arc<RoaringBitmap>>,
+    ctx: &ProbeCtx<'_>,
 ) -> ShortlistOutcome {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.
@@ -1815,9 +1788,9 @@ async fn build_shortlist(
     // shortlists rank identically.
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
     let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        k
+        ctx.k
     } else {
-        k.saturating_mul(rerank_mult)
+        ctx.k.saturating_mul(ctx.rerank_mult)
     };
     if coarse_limit == 0 {
         return ShortlistOutcome::Done(Vec::new());
@@ -1843,8 +1816,8 @@ async fn build_shortlist(
                 off,
                 c as u32,
                 &col.quant,
-                q_rot,
-                allow.as_deref(),
+                ctx.q_rot,
+                ctx.allow.as_deref(),
                 heap,
             );
         };
@@ -1857,12 +1830,12 @@ async fn build_shortlist(
         let n_tasks = parallel_chunks(cluster_meta.len());
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
-        let q_rot_v: Vec<f32> = q_rot.to_vec();
+        let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
         // Move an `Arc` clone of the allow-set into the rayon task; each
         // chunk borrows it as `Option<&RoaringBitmap>` via `as_deref`.
-        let allow_owned = allow.clone();
+        let allow_owned = ctx.allow.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         rayon::spawn(move || {
             let acc = meta_owned
@@ -1922,7 +1895,7 @@ async fn build_shortlist(
     // the contract, not numerical agreement with fp32. `rerank_mult`
     // is intentionally ignored — there's nothing to refine.
     if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        let _ = rerank_mult;
+        let _ = ctx.rerank_mult;
         shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         return ShortlistOutcome::Done(
             shortlist

@@ -1066,6 +1066,51 @@ pub mod vector {
                 }
                 let allow = Arc::new(allow);
 
+                // Filtered recall gate: brute-force nearest among the
+                // allowed rows, then measure recall of the filtered kNN
+                // against that filtered ground truth.
+                {
+                    let q_corr = queries_correctness();
+                    let vecs = vectors();
+                    let filtered_gt: Vec<Vec<u32>> = q_corr
+                        .iter()
+                        .map(|q| {
+                            let mut dists: Vec<(f32, u32)> = allow
+                                .iter()
+                                .map(|id| {
+                                    let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
+                                    let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                    (-dot, id)
+                                })
+                                .collect();
+                            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                            dists.truncate(TOP_K);
+                            dists.into_iter().map(|(_, id)| id).collect()
+                        })
+                        .collect();
+                    let mut recalls = Vec::new();
+                    for (q, gt) in q_corr.iter().zip(&filtered_gt) {
+                        let hits = tiers::block_on(reader.vector_hits_filtered_async(
+                            VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT),
+                            Some(Arc::clone(&allow)),
+                        ))
+                        .expect("filtered recall query");
+                        recalls.push(corpus::recall_at_k(&hits, gt));
+                    }
+                    let mean: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
+                    eprintln!(
+                        "[superfile_vec] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean:.3}",
+                        q_corr.len()
+                    );
+                    assert!(
+                        mean >= 0.80,
+                        "filtered recall@{TOP_K} floor: {mean:.3} < 0.80"
+                    );
+                }
+
                 let mut rows = Vec::new();
                 for (label, set) in [
                     ("unfiltered", None),

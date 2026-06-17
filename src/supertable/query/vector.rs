@@ -415,26 +415,37 @@ impl SupertableReader {
             superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
-        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
-            let filter_col_arc = Arc::clone(&filter_col_arc);
-            let tokens_arc = Arc::clone(&tokens_arc);
-            async move {
-                let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
-                let docs = r
-                    .token_match(&filter_col_arc, &refs, mode)
-                    .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                // The fan-out's hit shape is `(local_doc_id, score)`; the
-                // score is unused here (the predicate is unranked) — we
-                // only collect the matching doc-ids per superfile.
-                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
-            }
-        };
-        // `fanout` tags hits with their superfile URI and applies the
-        // tombstone filter, so deleted rows are dropped from the
-        // allow-set too (a tombstoned row must never be a kNN candidate).
-        let per_superfile = dispatch::fanout(self, units, kernel).await?;
-        Ok(group_doc_ids_to_allow(per_superfile))
+        let body =
+            move |r: Arc<SuperfileReader>, entry: Arc<SuperfileEntry>,
+                  tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+                  now: std::time::Instant, _: ()| {
+                let filter_col_arc = Arc::clone(&filter_col_arc);
+                let tokens_arc = Arc::clone(&tokens_arc);
+                async move {
+                    let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
+                    let docs = r
+                        .token_match(&filter_col_arc, &refs, mode)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    let mut bm: RoaringBitmap = docs.into_iter().collect();
+                    if let Some(cache) = tombstone_cache.as_ref() {
+                        let deleted = cache
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                        if !deleted.is_empty() {
+                            bm -= &*deleted;
+                        }
+                    }
+                    Ok((entry.uri, bm))
+                }
+            };
+        let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
+            dispatch::fanout_with(self, units, body).await?;
+        Ok(pairs
+            .into_iter()
+            .filter(|(_, bm)| !bm.is_empty())
+            .map(|(uri, bm)| (uri, Arc::new(bm)))
+            .collect())
     }
 
     /// Filtered vector kNN driven by a SQL `WHERE` [`CandidatePlan`] — the
@@ -502,47 +513,39 @@ impl SupertableReader {
         let units: Vec<(Arc<SuperfileEntry>, ())> =
             superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
         let plan_arc = Arc::new(plan.clone());
-        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
-            let plan = Arc::clone(&plan_arc);
-            async move {
-                // `evaluate` is postings-only (no column decode), the same
-                // retrieval the FTS scan pushdown uses. `None` (unbounded)
-                // cannot occur for a bounded plan; treat it as empty. The
-                // fan-out hit shape is `(local_doc_id, score)`; the score is
-                // an unused `0.0` placeholder (the predicate is unranked).
-                let docs = plan
-                    .evaluate(r.as_ref())
-                    .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?
-                    .ok_or_else(|| QueryError::Execute(
-                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                    ))?;
-                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
-            }
-        };
-        let per_superfile = dispatch::fanout(self, units, kernel).await?;
-        Ok(group_doc_ids_to_allow(per_superfile))
+        let body =
+            move |r: Arc<SuperfileReader>, entry: Arc<SuperfileEntry>,
+                  tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
+                  now: std::time::Instant, _: ()| {
+                let plan = Arc::clone(&plan_arc);
+                async move {
+                    let docs = plan
+                        .evaluate(r.as_ref())
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                        .ok_or_else(|| QueryError::Execute(
+                            "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                        ))?;
+                    let mut bm: RoaringBitmap = docs.into_iter().collect();
+                    if let Some(cache) = tombstone_cache.as_ref() {
+                        let deleted = cache
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                        if !deleted.is_empty() {
+                            bm -= &*deleted;
+                        }
+                    }
+                    Ok((entry.uri, bm))
+                }
+            };
+        let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
+            dispatch::fanout_with(self, units, body).await?;
+        Ok(pairs
+            .into_iter()
+            .filter(|(_, bm)| !bm.is_empty())
+            .map(|(uri, bm)| (uri, Arc::new(bm)))
+            .collect())
     }
-}
-
-/// Group per-superfile candidate hits into a `superfile → allow-set` map
-/// of matching `local_doc_id`s, dropping superfiles whose set is empty (so
-/// the caller skips them entirely). Shared by the text-predicate
-/// ([`SupertableReader::candidate_bitmaps`]) and SQL-plan
-/// ([`SupertableReader::candidate_bitmaps_from_plan`]) allow-set builders.
-fn group_doc_ids_to_allow(
-    per_superfile: Vec<Vec<SuperfileHit>>,
-) -> HashMap<SuperfileUri, Arc<RoaringBitmap>> {
-    let mut map: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
-    for hits in per_superfile {
-        for h in hits {
-            map.entry(h.superfile).or_default().insert(h.local_doc_id);
-        }
-    }
-    map.into_iter()
-        .filter(|(_, bm)| !bm.is_empty())
-        .map(|(uri, bm)| (uri, Arc::new(bm)))
-        .collect()
 }
 
 impl SupertableReader {
