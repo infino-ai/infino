@@ -802,7 +802,20 @@ fn open_vector_index_table(
     if user_opts.vector_columns.is_empty() {
         return None;
     }
+    // Guard against recursion: if this table is already a hidden
+    // VectorIndexSuperTable, do not create another one inside it.
+    if user_opts.partition_strategy.as_ref().map_or(false, |s| {
+        matches!(s, crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
+    }) {
+        return None;
+    }
     let storage = user_opts.storage.as_ref()?;
+    // Guard: if this table is already a hidden VectorIndexSuperTable
+    // (detected by its storage prefix containing _vector_index),
+    // do not recurse.
+    if format!("{storage:?}").contains("_vector_index") {
+        return None;
+    }
     let sub_storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
         PrefixedStorageProvider::new(Arc::clone(storage), "_vector_index"),
     );
