@@ -166,30 +166,12 @@ impl SupertableReader {
                     .iter()
                     .map(|c| c.to_le_bytes().to_vec())
                     .collect();
-                let n_total = vit_manifest.superfiles.len();
-                let n_routed = if routed_keys.is_empty() {
-                    n_total
-                } else {
-                    vit_manifest
-                        .superfiles
-                        .iter()
-                        .filter(|sf| {
-                            sf.partition_key.is_empty() || routed_keys.contains(&sf.partition_key)
-                        })
-                        .count()
-                };
-                eprintln!(
-                    "[024a] query routed to {} cells, {}/{} superfiles",
-                    routed_cells.len(),
-                    n_routed,
-                    n_total,
-                );
                 // Build cell-filtered superfile set and fan out using existing
                 // per-superfile cluster selection + rerank, touching only the
                 // routed cells' superfiles.
                 let cell_superfiles: Vec<Arc<crate::supertable::manifest::SuperfileEntry>> =
                     if routed_keys.is_empty() {
-                        vit_manifest.superfiles.clone()
+                        vit_manifest.superfiles.to_vec()
                     } else {
                         vit_manifest
                             .superfiles

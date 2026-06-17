@@ -1029,7 +1029,10 @@ impl SupertableWriter {
             }
             // Append all batches, then spawn the commit in background.
             for rb in batches {
-                let _ = vw.append(&rb);
+                if let Err(e) = vw.append(&rb) {
+                    eprintln!("[024a] hidden table append failed: {e}");
+                    break;
+                }
             }
             std::thread::spawn(move || {
                 let _ = vw.commit();
