@@ -231,6 +231,10 @@ impl SupertableReader {
         // missing most of the k-nearest among eligible rows. Boosting
         // to `nprobe / selectivity` (capped at total clusters) restores
         // coverage without changing the caller's options.
+        /// Maximum multiplier applied to `nprobe` for filtered search.
+        /// Caps the inverse-selectivity boost so very sparse predicates
+        /// don't silently turn every query into a full cluster scan.
+        const MAX_FILTER_NPROBE_MULTIPLIER: usize = 64;
         let effective_nprobe = if let Some(ref allow_map) = allow {
             let total_docs: u64 = superfiles
                 .iter()
@@ -240,7 +244,11 @@ impl SupertableReader {
             let allowed_docs: u64 = allow_map.values().map(|bm| bm.len()).sum();
             if total_docs > 0 && allowed_docs > 0 {
                 let selectivity = allowed_docs as f64 / total_docs as f64;
-                let boosted = (options.nprobe as f64 / selectivity).ceil() as usize;
+                let boosted_mult = (1.0 / selectivity)
+                    .ceil()
+                    .min(MAX_FILTER_NPROBE_MULTIPLIER as f64)
+                    as usize;
+                let boosted = options.nprobe.saturating_mul(boosted_mult);
                 let total_clusters = scored.len() + fallback.len();
                 boosted.min(total_clusters).max(options.nprobe)
             } else {
@@ -342,9 +350,7 @@ impl SupertableReader {
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(
-                    dispatch::fanout(self, wave, kernel.clone()).await?,
-                );
+                collected.extend(dispatch::fanout(self, wave, kernel.clone()).await?);
             }
             collected
         } else {
@@ -441,9 +447,11 @@ impl SupertableReader {
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
         let body =
-            move |r: Arc<SuperfileReader>, entry: Arc<SuperfileEntry>,
+            move |r: Arc<SuperfileReader>,
+                  entry: Arc<SuperfileEntry>,
                   tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-                  now: std::time::Instant, _: ()| {
+                  now: std::time::Instant,
+                  _: ()| {
                 let filter_col_arc = Arc::clone(&filter_col_arc);
                 let tokens_arc = Arc::clone(&tokens_arc);
                 async move {
@@ -539,18 +547,22 @@ impl SupertableReader {
             superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
         let plan_arc = Arc::new(plan.clone());
         let body =
-            move |r: Arc<SuperfileReader>, entry: Arc<SuperfileEntry>,
+            move |r: Arc<SuperfileReader>,
+                  entry: Arc<SuperfileEntry>,
                   tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-                  now: std::time::Instant, _: ()| {
+                  now: std::time::Instant,
+                  _: ()| {
                 let plan = Arc::clone(&plan_arc);
                 async move {
                     let docs = plan
                         .evaluate(r.as_ref())
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))?
-                        .ok_or_else(|| QueryError::Execute(
-                            "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                        ))?;
+                        .ok_or_else(|| {
+                            QueryError::Execute(
+                                "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                            )
+                        })?;
                     let mut bm: RoaringBitmap = docs.into_iter().collect();
                     if let Some(cache) = tombstone_cache.as_ref() {
                         let deleted = cache

@@ -1333,7 +1333,12 @@ impl VectorReader {
         // `[codes][doc_ids][full?]`; scoring reads the prefix, and the
         // survivor `full[]` rows are fetched below — the only step
         // that differs from the async path.
-        let ctx = ProbeCtx { q_rot: &q_rot, k, rerank_mult, allow: None };
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult,
+            allow: None,
+        };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
             cb,
@@ -1441,7 +1446,12 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        let ctx = ProbeCtx { q_rot: &q_rot, k, rerank_mult, allow };
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult,
+            allow,
+        };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
     }
@@ -1480,7 +1490,12 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        let ctx = ProbeCtx { q_rot: &q_rot, k, rerank_mult, allow };
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult,
+            allow,
+        };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
     }

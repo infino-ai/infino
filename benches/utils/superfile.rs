@@ -1079,7 +1079,8 @@ pub mod vector {
                                 .iter()
                                 .map(|id| {
                                     let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                                    let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                    let dot: f32 =
+                                        row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
                                     (-dot, id)
                                 })
                                 .collect();
