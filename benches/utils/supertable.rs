@@ -167,12 +167,16 @@ fn run_child_shape(key: &str) {
         modality_label(modality),
         fmt_count(supertable::n_docs()),
     );
-    // Corpus is generated to disk + mmapped BEFORE the sampler so the
+    // Dataset prepare streams the corpus (no full staging on disk); the
+    // regular bench stages it to disk + mmap before the sampler so the
     // measured window covers the engine only.
-    let corpus = supertable::prepare_corpus(modality);
+    let corpus = (!crate::dataset::dataset_mode()).then(|| supertable::prepare_corpus(modality));
     let sampler = PeakSampler::start_default();
     let t0 = Instant::now();
-    let built = supertable::build_on_storage(modality, &corpus);
+    let built = match &corpus {
+        Some(corpus) => supertable::build_on_storage(modality, corpus),
+        None => supertable::build_on_storage_streaming(modality),
+    };
     let wall = t0.elapsed();
     let rss = sampler.stop_stats();
 
@@ -191,7 +195,10 @@ fn run_child_shape(key: &str) {
         median_rss_bytes: rss.median_rss_bytes,
         p90_rss_bytes: rss.p90_rss_bytes,
         index_bytes: built.total_index_bytes,
-        corpus_bytes: corpus.byte_size(),
+        corpus_bytes: corpus
+            .as_ref()
+            .map(|c| c.byte_size())
+            .unwrap_or_else(|| supertable::corpus_byte_size(modality, supertable::n_docs())),
     };
     println!("{}", metrics.to_result_line());
 }
