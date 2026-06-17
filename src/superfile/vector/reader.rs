@@ -1433,7 +1433,24 @@ impl VectorReader {
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
+        // Filtered search: boost nprobe inversely with selectivity so
+        // the probed clusters cover enough eligible rows. At 10%
+        // selectivity the default nprobe=8 misses most of the k-nearest
+        // among allowed rows. Capped at 64× the caller's nprobe.
+        const MAX_FILTER_NPROBE_MULT: usize = 64;
+        let nprobe_eff = if let Some(ref bm) = allow {
+            let n = col.n_docs as u64;
+            let allowed = bm.len();
+            if n > 0 && allowed > 0 {
+                let selectivity = allowed as f64 / n as f64;
+                let mult = (1.0 / selectivity).ceil().min(MAX_FILTER_NPROBE_MULT as f64) as usize;
+                nprobe.saturating_mul(mult).min(col.n_cent as usize).max(1)
+            } else {
+                nprobe.min(col.n_cent as usize).max(1)
+            }
+        } else {
+            nprobe.min(col.n_cent as usize).max(1)
+        };
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 

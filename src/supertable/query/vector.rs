@@ -224,42 +224,10 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        // Filtered search: boost the effective nprobe inversely with
-        // selectivity so the probed clusters are likely to contain at
-        // least k eligible rows. At 10% selectivity the default
-        // nprobe=8 would inspect ~10% of the rows it normally does,
-        // missing most of the k-nearest among eligible rows. Boosting
-        // to `nprobe / selectivity` (capped at total clusters) restores
-        // coverage without changing the caller's options.
-        /// Maximum multiplier applied to `nprobe` for filtered search.
-        /// Caps the inverse-selectivity boost so very sparse predicates
-        /// don't silently turn every query into a full cluster scan.
-        const MAX_FILTER_NPROBE_MULTIPLIER: usize = 64;
-        let effective_nprobe = if let Some(ref allow_map) = allow {
-            let total_docs: u64 = superfiles
-                .iter()
-                .filter(|e| allow_map.contains_key(&e.uri))
-                .map(|e| e.n_docs)
-                .sum();
-            let allowed_docs: u64 = allow_map.values().map(|bm| bm.len()).sum();
-            if total_docs > 0 && allowed_docs > 0 {
-                let selectivity = allowed_docs as f64 / total_docs as f64;
-                let boosted_mult = (1.0 / selectivity)
-                    .ceil()
-                    .min(MAX_FILTER_NPROBE_MULTIPLIER as f64)
-                    as usize;
-                let boosted = options.nprobe.saturating_mul(boosted_mult);
-                let total_clusters = scored.len() + fallback.len();
-                boosted.min(total_clusters).max(options.nprobe)
-            } else {
-                options.nprobe
-            }
-        } else {
-            options.nprobe
-        };
-        let budget = effective_nprobe
+        let budget = options
+            .nprobe
             .saturating_mul(n_eligible.max(1))
-            .max(effective_nprobe);
+            .max(options.nprobe);
         if scored.len() > budget {
             scored.select_nth_unstable_by(budget, |a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
