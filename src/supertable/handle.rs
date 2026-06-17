@@ -215,67 +215,7 @@ impl Supertable {
     /// open-time sweep bridge entirely because no WAL/GC I/O can
     /// exist without attached storage.
     fn create(options: SupertableOptions) -> Result<Self, OpenError> {
-        // Pointer-probe pass. When storage is attached AND a
-        // pointer file already exists, we want open's load path
-        // — never silently shadow committed state with an empty
-        // manifest.
-        if let Some(storage) = options.storage.as_ref() {
-            let probe = Arc::clone(storage);
-            let probe_result = bridge_sync_to_async(async move {
-                crate::supertable::manifest::commit::read_pointer(&*probe).await
-            });
-            match probe_result {
-                Ok(Some(_pointer)) => {
-                    return Self::open(options);
-                }
-                Ok(None) => {
-                    // No pointer → fall through to fresh-create.
-                }
-                Err(e) => {
-                    return Err(OpenError::Storage(
-                        crate::storage::StorageError::Permanent {
-                            uri: "_supertable/current".into(),
-                            source: Box::new(std::io::Error::other(format!("{e}"))),
-                        },
-                    ));
-                }
-            }
-        }
-
-        let options = Arc::new(options);
-        let vector_index_table = open_vector_index_table(&options, None);
-        let initial = Manifest::empty(options.clone());
-        let tombstone_cache = build_tombstone_cache(&options);
-        let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
-        let handle_id =
-            crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
-        let inner = Arc::new(SupertableInner {
-            options,
-            manifest: ArcSwap::new(Arc::new(initial)),
-            writer_outstanding: AtomicBool::new(false),
-            compaction_outstanding: AtomicBool::new(false),
-            id_generator: Mutex::new(id_generator),
-            query_runtime: OnceLock::new(),
-            sql_session_cache: Mutex::new(None),
-            tombstone_cache,
-            handle_id,
-            vector_index_table,
-            last_pointer_check: Mutex::new(None),
-        });
-        install_disk_cache_pinning(&inner);
-        let st = Self { inner };
-        // Open-time recovery + GC sweeps need storage. For in-memory
-        // supertables they are guaranteed no-ops, so skip the async
-        // bridge; this keeps `Supertable::create` usable inside
-        // current-thread `#[tokio::test]` contexts for pure in-memory
-        // unit tests.
-        if st.inner.options.storage.is_some() {
-            // Best-effort: a sweep failure here doesn't fail handle
-            // construction; the next sweep gets another shot.
-            let _ = st.run_recovery_sweep_once_blocking();
-            let _ = bridge_sync_to_async(async { st.run_gc_sweep_once().await.map_err(|_| ()) });
-        }
-        Ok(st)
+        bridge_sync_to_async(Self::create_async(options))
     }
     }
 
@@ -310,9 +250,7 @@ impl Supertable {
     }
     }
 
-    /// Async open kernel. `pub(crate)` — the public surface is the
-    /// sync [`Supertable::open`]; this is the I/O implementation it
-    /// (and the open-time create path) drive on the ambient runtime.
+    /// Async open kernel. Sync [`Supertable::open`] bridges here.
     pub(crate) async fn open_async(options: SupertableOptions) -> Result<Self, OpenError> {
         let storage = options
             .storage
@@ -327,45 +265,67 @@ impl Supertable {
             .clone();
         let options_arc = Arc::new(options);
         let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
-        let vector_index_table = open_vector_index_table(&options_arc, Some(manifest.as_ref()));
-        let tombstone_cache = build_tombstone_cache(&options_arc);
-        // Fresh generator per open. The 64-bit ms timestamp
-        // prefix advances naturally across process restarts, so
-        // re-opened supertables never re-mint values that already
-        // live in storage — no resume-from-id_max-on-open logic
-        // needed. The worker_id is also fresh, further insulating
-        // restarts from collisions.
-        let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
-        let handle_id =
-            crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
-        let inner = Arc::new(SupertableInner {
-            options: options_arc,
-            manifest: ArcSwap::new(manifest),
-            writer_outstanding: AtomicBool::new(false),
-            compaction_outstanding: AtomicBool::new(false),
-            id_generator: Mutex::new(id_generator),
-            query_runtime: OnceLock::new(),
-            sql_session_cache: Mutex::new(None),
-            tombstone_cache,
-            handle_id,
-            vector_index_table,
-            last_pointer_check: Mutex::new(None),
-        });
-        install_disk_cache_pinning(&inner);
-        let st = Self { inner };
-        // Open-time recovery sweep — drives every Intent /
-        // Appended WAL discovered in `wal/mutations/` to
-        // Complete (or skips lease-conflicted ones for a peer
-        // to drive). Best-effort: a sweep failure doesn't fail
-        // `open` because the supertable is still functional —
-        // the next sweep gets another shot.
-        let _ = st.run_recovery_sweep_once().await;
-        // GC sweep follows recovery on the same LIST: reaps
-        // Complete WALs past `T_wal_grace` and orphan arrow
-        // sidecars past `T_sidecar_grace`. Best-effort; same
-        // sweep budget.
-        let _ = st.run_gc_sweep_once().await;
-        Ok(st)
+        let vector_index_table = if let Some(hidden_opts) =
+            build_vector_index_options(&options_arc, Some(manifest.as_ref()))
+        {
+            let hidden_storage = hidden_opts.storage.clone().ok_or_else(|| {
+                OpenError::Build(BuildError::Store(
+                    "VectorIndexSuperTable requires options.storage".into(),
+                ))
+            })?;
+            match crate::supertable::manifest::commit::read_pointer(&*hidden_storage).await {
+                Ok(Some(_)) => {
+                    let hidden_arc = Arc::new(hidden_opts);
+                    match Manifest::load(None, hidden_storage, Some(hidden_arc.clone())).await {
+                        Ok(hidden_manifest) => open_table_async(hidden_arc, hidden_manifest, None)
+                            .await
+                            .ok()
+                            .map(Arc::new),
+                        Err(_) => None,
+                    }
+                }
+                Ok(None) => create_table_async(hidden_opts, None)
+                    .await
+                    .ok()
+                    .map(Arc::new),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        open_table_async(options_arc, manifest, vector_index_table).await
+    }
+
+    /// Async create kernel. Sync [`Supertable::create`] bridges here.
+    pub(crate) async fn create_async(options: SupertableOptions) -> Result<Self, OpenError> {
+        if let Some(storage) = options.storage.as_ref() {
+            let probe = Arc::clone(storage);
+            match crate::supertable::manifest::commit::read_pointer(&*probe).await {
+                Ok(Some(_pointer)) => return Self::open_async(options).await,
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(OpenError::Storage(
+                        crate::storage::StorageError::Permanent {
+                            uri: "_supertable/current".into(),
+                            source: Box::new(std::io::Error::other(format!("{e}"))),
+                        },
+                    ));
+                }
+            }
+        }
+        let options_arc = Arc::new(options);
+        let vector_index_table =
+            if let Some(hidden_opts) = build_vector_index_options(&options_arc, None) {
+                Some(Arc::new(create_table_async(hidden_opts, None).await?))
+            } else {
+                None
+            };
+        let options = Arc::try_unwrap(options_arc).map_err(|_| {
+            OpenError::Build(BuildError::Store(
+                "create_async: options Arc still shared".into(),
+            ))
+        })?;
+        create_table_async(options, vector_index_table).await
     }
 
     /// Re-read the manifest pointer from storage.
@@ -754,9 +714,6 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
-/// Create or open the hidden VectorIndexSuperTable for a user table that
-/// has vector columns and storage attached. Returns `None` when no vector
-/// columns exist or no storage is configured.
 /// Train N global centroids from the user table's manifest cluster summaries.
 /// Returns `(n_cells, dim, centroids_fp32)` or None if no summaries exist.
 fn train_global_centroids(
@@ -795,36 +752,17 @@ fn train_global_centroids(
     Some((n, dim, centroids))
 }
 
-fn open_vector_index_table(
+fn build_vector_index_options(
     user_opts: &Arc<SupertableOptions>,
     user_manifest: Option<&super::manifest::Manifest>,
-) -> Option<Arc<Supertable>> {
+) -> Option<SupertableOptions> {
     if user_opts.vector_columns.is_empty() {
         return None;
     }
-    // Guard against recursion: if this table is already a hidden
-    // VectorIndexSuperTable, do not create another one inside it.
-    if user_opts.partition_strategy.as_ref().map_or(false, |s| {
-        matches!(s, crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
-    }) {
-        return None;
-    }
     let storage = user_opts.storage.as_ref()?;
-    // Guard: if this table is already a hidden VectorIndexSuperTable
-    // (detected by its storage prefix containing _vector_index),
-    // do not recurse.
-    if format!("{storage:?}").contains("_vector_index") {
-        return None;
-    }
     let sub_storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
         PrefixedStorageProvider::new(Arc::clone(storage), "_vector_index"),
     );
-    // Build options for the hidden table: same schema, same vector columns,
-    // but partitioned by VectorCell (initially with empty centroids — first
-    // commit will train them).
-    // Minimal schema: vector column(s) + source-ref columns for resolving
-    // hits back to the original table. No FTS — the hidden table serves
-    // only unfiltered vector kNN.
     let mut fields: Vec<arrow_schema::FieldRef> = Vec::new();
     for vc in &user_opts.vector_columns {
         let item_field = Arc::new(arrow_schema::Field::new(
@@ -838,7 +776,6 @@ fn open_vector_index_table(
             false,
         )));
     }
-
     let hidden_schema = Arc::new(arrow_schema::Schema::new(fields));
     let mut hidden_opts = SupertableOptions::new(
         hidden_schema,
@@ -851,7 +788,6 @@ fn open_vector_index_table(
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
-    // If the user table has data, train centroids and use VectorCell partitioning.
     if let Some(manifest) = user_manifest
         && let Some((n_cells, dim, centroids)) = train_global_centroids(user_opts, manifest, 64)
     {
@@ -870,7 +806,68 @@ fn open_vector_index_table(
             },
         );
     }
-    Supertable::create(hidden_opts).ok().map(Arc::new)
+    Some(hidden_opts)
+}
+
+/// Create one supertable handle (empty manifest). Leaf — never creates a sibling.
+async fn create_table_async(
+    options: SupertableOptions,
+    vector_index_table: Option<Arc<Supertable>>,
+) -> Result<Supertable, OpenError> {
+    let options = Arc::new(options);
+    let initial = Manifest::empty(options.clone());
+    let tombstone_cache = build_tombstone_cache(&options);
+    let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
+    let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
+    let inner = Arc::new(SupertableInner {
+        options,
+        manifest: ArcSwap::new(Arc::new(initial)),
+        writer_outstanding: AtomicBool::new(false),
+        compaction_outstanding: AtomicBool::new(false),
+        id_generator: Mutex::new(id_generator),
+        query_runtime: OnceLock::new(),
+        sql_session_cache: Mutex::new(None),
+        tombstone_cache,
+        handle_id,
+        vector_index_table,
+        last_pointer_check: Mutex::new(None),
+    });
+    install_disk_cache_pinning(&inner);
+    let st = Supertable { inner };
+    if st.inner.options.storage.is_some() {
+        let _ = st.run_recovery_sweep_once().await;
+        let _ = st.run_gc_sweep_once().await;
+    }
+    Ok(st)
+}
+
+/// Open one supertable handle from a loaded manifest. Leaf — never creates a sibling.
+async fn open_table_async(
+    options: Arc<SupertableOptions>,
+    manifest: Arc<Manifest>,
+    vector_index_table: Option<Arc<Supertable>>,
+) -> Result<Supertable, OpenError> {
+    let tombstone_cache = build_tombstone_cache(&options);
+    let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
+    let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
+    let inner = Arc::new(SupertableInner {
+        options,
+        manifest: ArcSwap::new(manifest),
+        writer_outstanding: AtomicBool::new(false),
+        compaction_outstanding: AtomicBool::new(false),
+        id_generator: Mutex::new(id_generator),
+        query_runtime: OnceLock::new(),
+        sql_session_cache: Mutex::new(None),
+        tombstone_cache,
+        handle_id,
+        vector_index_table,
+        last_pointer_check: Mutex::new(None),
+    });
+    install_disk_cache_pinning(&inner);
+    let st = Supertable { inner };
+    let _ = st.run_recovery_sweep_once().await;
+    let _ = st.run_gc_sweep_once().await;
+    Ok(st)
 }
 
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
