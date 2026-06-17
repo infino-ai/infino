@@ -48,6 +48,12 @@ on:
         default: "240"
         type: string
 
+# Granted at the caller so the reusable dataset-bench-vm.yml can claim the
+# Azure OIDC token it requests; a called workflow can't escalate beyond this.
+permissions:
+  id-token: write   # Azure OIDC federated login
+  contents: read    # clone the repo on the VM via the job token
+
 jobs:
   setup:
     runs-on: ubuntu-latest
