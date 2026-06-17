@@ -998,16 +998,18 @@ impl SupertableWriter {
         let buffer = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
-        // Dual write to hidden VectorIndexSuperTable (best-effort).
-        // Zero-copy: wrap existing Arc<Float32Array> in FixedSizeListArray
-        // without copying the vector buffer.
+        // Dual write to hidden VectorIndexSuperTable (best-effort, parallel).
+        // Spawn the hidden table commit in the background so it runs
+        // concurrently with the user table's commit below.
         if let Some(vit) = self.inner.vector_index_table.as_ref()
             && let Ok(mut vw) = vit.writer()
         {
             let hidden_schema = vit.options().schema.clone();
+            let vector_columns = self.inner.options.vector_columns.clone();
+            let mut batches = Vec::new();
             for batch in &buffer {
                 let mut cols: Vec<arrow_array::ArrayRef> = Vec::new();
-                for (vi, vc) in self.inner.options.vector_columns.iter().enumerate() {
+                for (vi, vc) in vector_columns.iter().enumerate() {
                     let flat = Arc::clone(&batch.vectors[vi]);
                     let list = FixedSizeListArray::new(
                         Arc::new(arrow_schema::Field::new(
@@ -1022,10 +1024,16 @@ impl SupertableWriter {
                     cols.push(Arc::new(list));
                 }
                 if let Ok(rb) = RecordBatch::try_new(hidden_schema.clone(), cols) {
-                    let _ = vw.append(&rb);
+                    batches.push(rb);
                 }
             }
-            let _ = vw.commit();
+            // Append all batches, then spawn the commit in background.
+            for rb in batches {
+                let _ = vw.append(&rb);
+            }
+            std::thread::spawn(move || {
+                let _ = vw.commit();
+            });
         }
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();

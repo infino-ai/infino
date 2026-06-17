@@ -195,15 +195,15 @@ pub fn assign_partition(
                 .into(),
         }),
         PartitionStrategy::VectorCell { n_cells, .. } => {
-            let cell = seg
-                .partition_hint
-                .ok_or_else(|| ManifestError::SuperfileSpansPartition {
-                    detail: format!(
-                        "VectorCell{{n_cells:{n_cells}}} requires pre-sharded superfiles; \
+            let cell =
+                seg.partition_hint
+                    .ok_or_else(|| ManifestError::SuperfileSpansPartition {
+                        detail: format!(
+                            "VectorCell{{n_cells:{n_cells}}} requires pre-sharded superfiles; \
                          partition_hint must be Some(cell_id) (superfile {})",
-                        seg.uri.0
-                    ),
-                })?;
+                            seg.uri.0
+                        ),
+                    })?;
             if cell >= *n_cells {
                 return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
