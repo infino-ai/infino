@@ -1475,7 +1475,9 @@ impl VectorReader {
             let allowed = bm.len();
             if n > 0 && allowed > 0 {
                 let selectivity = allowed as f64 / n as f64;
-                let mult = (1.0 / selectivity).ceil().min(MAX_FILTER_NPROBE_MULT as f64) as usize;
+                let mult = (1.0 / selectivity)
+                    .ceil()
+                    .min(MAX_FILTER_NPROBE_MULT as f64) as usize;
                 rerank_mult.saturating_mul(mult)
             } else {
                 rerank_mult
