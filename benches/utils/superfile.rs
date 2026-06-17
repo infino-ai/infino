@@ -1122,8 +1122,7 @@ pub mod vector {
                             .iter()
                             .map(|id| {
                                 let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                                let dot: f32 =
-                                    row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
                                 (-dot, id)
                             })
                             .collect();
@@ -1137,8 +1136,9 @@ pub mod vector {
                 /// selectivity boost in the vector reader.
                 const FILTER_MAX_MULT: usize = 64;
                 let filter_mult = FILTER_KEEP_EVERY.min(FILTER_MAX_MULT);
-                let filtered_nprobe =
-                    DEFAULT_NPROBE.saturating_mul(filter_mult).min(corpus::n_cent(n_docs));
+                let filtered_nprobe = DEFAULT_NPROBE
+                    .saturating_mul(filter_mult)
+                    .min(corpus::n_cent(n_docs));
                 let filtered_rerank = DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
                 let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
                 let mut rows = Vec::new();

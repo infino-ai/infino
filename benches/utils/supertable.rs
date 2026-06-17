@@ -984,9 +984,7 @@ pub mod vector {
                                     (-dot, id)
                                 })
                                 .collect();
-                            dists.sort_unstable_by(|a, b| {
-                                a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
-                            });
+                            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                             dists.truncate(TOP_K);
                             dists.into_iter().map(|(_, id)| id).collect()
                         })
@@ -1109,15 +1107,13 @@ pub mod vector {
                 let mut latencies = Vec::new();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
-                    let hits = tiers::block_on(
-                        consumer_reader.vector_hits_global_allow_async(
-                            supertable::VEC_COLUMN,
-                            q,
-                            TOP_K,
-                            exec_vec::search_opts(nprobe, rerank),
-                            Arc::clone(&allow),
-                        ),
-                    )
+                    let hits = tiers::block_on(consumer_reader.vector_hits_global_allow_async(
+                        supertable::VEC_COLUMN,
+                        q,
+                        TOP_K,
+                        exec_vec::search_opts(nprobe, rerank),
+                        Arc::clone(&allow),
+                    ))
                     .expect("filtered recall query");
                     latencies.push(t0.elapsed());
                     let global_hits: Vec<(u32, f32)> = hits
@@ -1130,11 +1126,9 @@ pub mod vector {
                         .collect();
                     recalls.push(corpus::recall_at_k(&global_hits, gt));
                 }
-                let mean_recall: f32 =
-                    recalls.iter().sum::<f32>() / recalls.len() as f32;
+                let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
                 latencies.sort_unstable();
-                let p50_ns =
-                    latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
                 let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
                 let effective_rerank = rerank.saturating_mul(FILTER_KEEP_EVERY);
 
