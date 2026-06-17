@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &query,
         SEARCH_TOP_K,
         VectorSearchOptions::new(),
+        None,
         Some(&["_id", "title", "score"]),
     )?;
     print_batches(&knn);

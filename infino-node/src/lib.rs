@@ -465,7 +465,7 @@ impl Table {
             projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts, proj.as_deref())
+            .vector_search(&column, query.as_ref(), k as usize, opts, None, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }

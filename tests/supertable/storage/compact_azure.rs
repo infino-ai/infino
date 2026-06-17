@@ -333,6 +333,7 @@ fn run_vector_queries(st: &Supertable) -> Vec<Vec<i128>> {
                     VECTOR_K,
                     VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
                     None,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("vector_search(doc {idx}) failed: {e}"));
             extract_sorted_ids(&batches)

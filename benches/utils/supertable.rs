@@ -956,6 +956,7 @@ pub mod vector {
                         TOP_K,
                         exec_vec::search_opts(nprobe, rerank),
                         None,
+                        None,
                     )
                     .expect("warm prewarm vector_search");
                 consumer

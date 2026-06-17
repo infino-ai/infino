@@ -137,6 +137,7 @@ pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
 pub use superfile::fts::reader::BoolMode;
+pub use supertable::query::vector::VectorFilter;
 pub use superfile::vector::distance::Metric;
 /// Single-table handle: `append` / `update` / `delete` / `bm25_search`
 /// / `vector_search` / `schema`.

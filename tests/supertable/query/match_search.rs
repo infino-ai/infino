@@ -258,7 +258,7 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
         .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
         .expect("bm25_search");
     let vector = reader
-        .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new())
+        .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
         .expect("vector_search");
 
     assert!(
@@ -307,7 +307,7 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
         .bm25_hits("title", "async", RANK_TOP_K, BoolMode::Or)
         .expect("bm25_search");
     let vector = reader
-        .vector_hits("emb", &q, RANK_TOP_K, VectorSearchOptions::new())
+        .vector_hits("emb", &q, RANK_TOP_K, VectorSearchOptions::new(), None)
         .expect("vector_search");
 
     assert!(

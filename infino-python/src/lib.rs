@@ -277,7 +277,7 @@ impl Table {
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.vector_search(column, &query, k, opts, names.as_deref())
+                self.inner.vector_search(column, &query, k, opts, None, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)

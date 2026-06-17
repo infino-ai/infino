@@ -667,7 +667,7 @@ pub mod vector {
         ) -> Vec<(u32, f32)> {
             let reader = self.reader();
             let hits = reader
-                .vector_hits(column, query, k, search_opts(nprobe, rerank))
+                .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
                 .expect("supertable vector_hits");
             let manifest = reader.manifest();
             // Per-superfile global-id base offsets in manifest order.

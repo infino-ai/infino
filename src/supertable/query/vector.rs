@@ -11,10 +11,10 @@
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
 //! // Bare call: `_id` + `score` only — no scalar decode.
-//! let ids: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None)?;
+//! let ids: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None, None)?;
 //! // Materialize row data by naming the columns to decode.
 //! let rows: Vec<RecordBatch> =
-//!     table.vector_search("emb", &query_vec, 10, opts, Some(&["_id", "title", "score"]))?;
+//!     table.vector_search("emb", &query_vec, 10, opts, None, Some(&["_id", "title", "score"]))?;
 //! ```
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
@@ -78,6 +78,19 @@ use arrow::record_batch::RecordBatch;
 use super::SuperfileHit;
 use super::candidate::CandidatePlan;
 use super::exec::common::resolve_hits_named;
+
+/// An optional text-predicate filter for vector kNN search. When
+/// supplied, kNN is ranked only among rows matching the predicate
+/// (pushdown, not post-filter). Built from an FTS-indexed column, a
+/// query string, and a [`BoolMode`].
+pub struct VectorFilter<'a> {
+    /// FTS-indexed column the predicate applies to.
+    pub column: &'a str,
+    /// Query string — tokenized with the index tokenizer.
+    pub query: &'a str,
+    /// Token matching mode (AND / OR).
+    pub mode: BoolMode,
+}
 
 /// How to probe one superfile in the vector fan-out: the globally-selected
 /// cluster ids for that superfile, or — for a superfile whose manifest
@@ -536,14 +549,19 @@ impl SupertableReader {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
-            let hits = self.vector_search_async(column, query, k, options).await?;
-            // `projection` selects output columns by name (`_id`, the
-            // visible scalar columns, or the trailing `score`); `None`
-            // returns `_id` + `score` only. The shared resolver decodes
-            // only the projected columns.
+            let hits = match filter {
+                None => self.vector_search_async(column, query, k, options).await?,
+                Some(f) => {
+                    self.vector_hits_filtered_async(
+                        column, query, k, options, f.column, f.query, f.mode,
+                    )
+                    .await?
+                }
+            };
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
@@ -552,6 +570,10 @@ impl SupertableReader {
     }
 
     /// Low-level vector kNN search over this reader's pinned snapshot.
+    ///
+    /// When `filter` is `Some`, kNN is ranked only among rows matching
+    /// the text predicate (pushdown, not post-filter). `None` is the
+    /// unfiltered path.
     ///
     /// Drives the internal async kernel to completion via the
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
@@ -562,40 +584,14 @@ impl SupertableReader {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        filter: Option<VectorFilter<'_>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.block_on(self.vector_search_async(column, query, k, options))
-    }
-
-    /// Filtered vector kNN: the `k` nearest hits **among the rows whose
-    /// `filter_col` matches `filter_query`'s tokens under `mode`**,
-    /// sorted by distance *ascending*.
-    ///
-    /// The predicate is pushed down — each superfile's vector kernel
-    /// ranks distance only among matching `local_doc_id`s — so the
-    /// result is the true k-nearest among matching rows (not a
-    /// post-filtered top-k). See [`Self::vector_hits_filtered_async`].
-    ///
-    /// Drives the async kernel via the sync→async bridge
-    /// ([`SupertableReader::block_on`]).
-    pub fn vector_hits_filtered(
-        &self,
-        column: &str,
-        query: &[f32],
-        k: usize,
-        options: VectorSearchOptions,
-        filter_col: &str,
-        filter_query: &str,
-        mode: BoolMode,
-    ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.block_on(self.vector_hits_filtered_async(
-            column,
-            query,
-            k,
-            options,
-            filter_col,
-            filter_query,
-            mode,
-        ))
+        match filter {
+            None => self.block_on(self.vector_search_async(column, query, k, options)),
+            Some(f) => self.block_on(self.vector_hits_filtered_async(
+                column, query, k, options, f.column, f.query, f.mode,
+            )),
+        }
     }
 }
 
@@ -671,11 +667,11 @@ impl Supertable {
     /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
     /// // Bare call → `_id` + `score`, no scalar decode:
-    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None)?;
+    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None, None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
     /// // Explicit projection names the same columns (scalar columns,
     /// // when present, materialize row data):
-    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), Some(&["_id", "score"]))?;
+    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None, Some(&["_id", "score"]))?;
     /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -685,111 +681,11 @@ impl Supertable {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
         self.reader()
-            .vector_search(column, query, k, options, projection)
-            .map_err(crate::InfinoError::from)
-    }
-
-    /// Filtered vector kNN: the `k` nearest rows **among those matching
-    /// a text predicate**, returned as Arrow rows nearest-first.
-    ///
-    /// The predicate is `filter_col` contains `filter_query`'s tokens
-    /// under `mode`. It is pushed down into each superfile's vector
-    /// kernel (distance is ranked only among matching `local_doc_id`s),
-    /// so the result is the true k-nearest among matching rows — not a
-    /// post-filtered top-k that could underflow. `column` is the vector
-    /// column; `filter_col` must be an FTS-indexed column.
-    ///
-    /// `projection` follows the same rules as [`Self::vector_search`]:
-    /// `None` returns the engine-native `_id` + `score` pair; naming
-    /// scalar columns materializes their row data.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
-    /// # use arrow_array::types::Float32Type;
-    /// # use arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, BoolMode, IndexSpec, Metric, VectorSearchOptions};
-    /// # let db = connect("memory://")?;
-    /// # let schema = Arc::new(Schema::new(vec![
-    /// #     Field::new("cat", DataType::LargeUtf8, false),
-    /// #     Field::new(
-    /// #         "emb",
-    /// #         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
-    /// #         false,
-    /// #     ),
-    /// # ]));
-    /// // The filter column must be FTS-indexed; `emb` is the vector column.
-    /// # let vecs = db.create_table(
-    /// #     "vecs",
-    /// #     schema.clone(),
-    /// #     IndexSpec::new().fts("cat").vector("emb", 16, 1, Metric::Cosine),
-    /// # )?;
-    /// # let one_hot = |active: usize| {
-    /// #     let mut v = vec![0.0f32; 16];
-    /// #     v[active] = 1.0;
-    /// #     v
-    /// # };
-    /// # let cats = LargeStringArray::from(vec!["news", "blog", "news"]);
-    /// # let emb = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-    /// #     vec![0usize, 1, 2]
-    /// #         .into_iter()
-    /// #         .map(|a| Some(one_hot(a).into_iter().map(Some).collect::<Vec<_>>())),
-    /// #     16,
-    /// # );
-    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(cats), Arc::new(emb)])?)?;
-    /// let query = one_hot(0);
-    /// // k-nearest among rows whose `cat` matches "news" — pushed down,
-    /// // so it's the true nearest *among matching*, never a post-filter.
-    /// let rows = vecs.vector_search_filtered(
-    ///     "emb",
-    ///     &query,
-    ///     10,
-    ///     VectorSearchOptions::new(),
-    ///     "cat",
-    ///     "news",
-    ///     BoolMode::Or,
-    ///     Some(&["_id", "cat", "score"]),
-    /// )?;
-    /// let total: usize = rows.iter().map(|b| b.num_rows()).sum();
-    /// assert_eq!(total, 2, "only the two `news` rows match the filter");
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn vector_search_filtered(
-        &self,
-        column: &str,
-        query: &[f32],
-        k: usize,
-        options: VectorSearchOptions,
-        filter_col: &str,
-        filter_query: &str,
-        mode: BoolMode,
-        projection: Option<&[&str]>,
-    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
-        let reader = self.reader();
-        reader
-            .block_on(async {
-                let hits = reader
-                    .vector_hits_filtered_async(
-                        column,
-                        query,
-                        k,
-                        options,
-                        filter_col,
-                        filter_query,
-                        mode,
-                    )
-                    .await?;
-                let batch =
-                    resolve_hits_named(&reader, &hits, projection, "vector_search_filtered")
-                        .await
-                        .map_err(|e| QueryError::Execute(e.to_string()))?;
-                Ok::<Vec<RecordBatch>, QueryError>(vec![batch])
-            })
+            .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
     }
 }
@@ -808,7 +704,7 @@ mod tests {
     use crate::supertable::error::QueryError;
     use crate::supertable::{Supertable, SupertableOptions};
 
-    use super::VectorSearchOptions;
+    use super::{VectorFilter, VectorSearchOptions};
 
     use crate::test_helpers::default_tokenizer as tok;
 
@@ -964,7 +860,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -979,7 +875,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_hits("emb", &q, 0, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 0, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -999,7 +895,7 @@ mod tests {
             *x = (d as f32) / 100.0 + 0.001;
         }
         let hits = r
-            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -1027,7 +923,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_hits("emb", &q, 7, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 7, VectorSearchOptions::new(), None)
             .expect("query");
         assert_eq!(hits.len(), 7);
     }
@@ -1056,7 +952,7 @@ mod tests {
         let mut q = vec![0f32; dim];
         q[0] = 1.0;
         let opts = VectorSearchOptions::new().with_nprobe(1);
-        let hits = st.reader().vector_hits("emb", &q, 10, opts).expect("query");
+        let hits = st.reader().vector_hits("emb", &q, 10, opts, None).expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
         assert!(
@@ -1080,7 +976,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_hits("emb", &q, 24, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 24, VectorSearchOptions::new(), None)
             .expect("query");
         let superfile_uris: std::collections::HashSet<_> =
             hits.iter().map(|h| h.superfile).collect();
@@ -1129,7 +1025,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .vector_hits("emb", &q, 2, opts)
+            .vector_hits("emb", &q, 2, opts, None)
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -1158,7 +1054,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let err = r
-            .vector_hits("nope", &q, 5, VectorSearchOptions::new())
+            .vector_hits("nope", &q, 5, VectorSearchOptions::new(), None)
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
@@ -1318,7 +1214,7 @@ mod tests {
             .with_rerank_mult(64);
 
         let hits = reader
-            .vector_hits_filtered("emb", &query, k, opts, "title", "alpha", BoolMode::Or)
+            .vector_hits("emb", &query, k, opts, Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }))
             .expect("filtered query");
 
         // (a) Hard constraint: EVERY returned hit is an alpha row.
@@ -1357,7 +1253,7 @@ mod tests {
         // exercises the pushdown path rather than coincidentally
         // agreeing with a post-filter.
         let global = reader
-            .vector_hits("emb", &query, k, opts)
+            .vector_hits("emb", &query, k, opts, None)
             .expect("unfiltered query");
         let global_alpha = global
             .iter()
@@ -1379,7 +1275,7 @@ mod tests {
             .with_nprobe(64)
             .with_rerank_mult(64);
         let hits = reader
-            .vector_hits_filtered("emb", &query, 6, opts, "title", "alpha", BoolMode::Or)
+            .vector_hits("emb", &query, 6, opts, Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }))
             .expect("filtered query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -1401,14 +1297,12 @@ mod tests {
         // No row's title contains this token, so the predicate matches
         // nothing in any superfile → empty result (no fan-out GETs).
         let hits = reader
-            .vector_hits_filtered(
+            .vector_hits(
                 "emb",
                 &query,
                 10,
                 opts,
-                "title",
-                "nonexistenttoken",
-                BoolMode::Or,
+                Some(VectorFilter { column: "title", query: "nonexistenttoken", mode: BoolMode::Or }),
             )
             .expect("filtered query");
         assert!(
@@ -1430,21 +1324,19 @@ mod tests {
             .with_rerank_mult(64);
 
         let bare = st
-            .vector_search_filtered("emb", &query, 5, opts, "title", "alpha", BoolMode::Or, None)
+            .vector_search("emb", &query, 5, opts, Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }), None)
             .expect("filtered rows bare");
         let n: usize = bare.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(n, 5, "five matching nearest rows");
         assert_eq!(bare[0].num_columns(), 2, "_id + score");
 
         let projected = st
-            .vector_search_filtered(
+            .vector_search(
                 "emb",
                 &query,
                 5,
                 opts,
-                "title",
-                "alpha",
-                BoolMode::Or,
+                Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }),
                 Some(&["_id", "title", "score"]),
             )
             .expect("filtered rows projected");
@@ -1469,14 +1361,12 @@ mod tests {
         let reader = st.reader();
         let query = filter_vec(1);
         let hits = reader
-            .vector_hits_filtered(
+            .vector_hits(
                 "emb",
                 &query,
                 0,
                 VectorSearchOptions::new(),
-                "title",
-                "alpha",
-                BoolMode::Or,
+                Some(VectorFilter { column: "title", query: "alpha", mode: BoolMode::Or }),
             )
             .expect("k=0");
         assert!(hits.is_empty());
