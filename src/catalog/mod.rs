@@ -21,18 +21,19 @@ mod uri;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::execution::context::SessionContext;
+use tokio::runtime::Runtime;
 
 pub use index_spec::IndexSpec;
 pub use options::{ColdFetchMode, ConnectOptions};
 
 use crate::InfinoError;
-use crate::runtime_bridge::bridge_sync_to_async;
+use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime};
 use crate::storage::StorageProvider;
 use crate::superfile::builder::FtsConfig;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
@@ -90,6 +91,7 @@ pub fn connect_with(
             backend,
             options,
             store,
+            query_runtime: OnceLock::new(),
         }),
     })
 }
@@ -105,6 +107,26 @@ struct ConnectionInner {
     backend: Backend,
     options: ConnectOptions,
     store: CatalogStore,
+    /// Runtime for the table-free `query_sql` fallback — search TVFs name
+    /// their table in an argument, not a `FROM` relation, so no supertable
+    /// runtime is in scope. See [`build_query_runtime`] for why it must be
+    /// multi-thread.
+    query_runtime: OnceLock<Arc<Runtime>>,
+}
+
+impl Drop for ConnectionInner {
+    /// `query_sql` builds `query_runtime` eagerly, and the sync API may be
+    /// called from inside the caller's own runtime — so dropping the last
+    /// `Connection` there must not trip tokio's "cannot drop a runtime from
+    /// within an async context" guard. `shutdown_background` consumes it
+    /// without blocking; `try_unwrap` shuts down only on the last owner.
+    fn drop(&mut self) {
+        if let Some(rt) = self.query_runtime.take()
+            && let Ok(rt) = Arc::try_unwrap(rt)
+        {
+            rt.shutdown_background();
+        }
+    }
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -442,13 +464,24 @@ impl Connection {
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()))
         };
-        // Drive on an established per-supertable multi-thread query runtime
-        // (any referenced table's `block_on_query`); fall back to the shared
-        // bridge for table-free queries such as `SELECT 1`.
+        // A query that names a `FROM` catalog table drives on that table's
+        // runtime; otherwise the connection's own. The fallback still has to
+        // be multi-thread: a table-free query can be a search TVF, which
+        // fans out object-store reads under the hood.
         match handles.first() {
             Some(table) => table.block_on_query(drive),
-            None => bridge_sync_to_async(drive),
+            None => bridge_on_runtime(drive, &self.query_runtime()),
         }
+    }
+
+    /// Runtime for the table-free `query_sql` fallback (see
+    /// [`ConnectionInner::query_runtime`]).
+    fn query_runtime(&self) -> Arc<Runtime> {
+        Arc::clone(
+            self.inner
+                .query_runtime
+                .get_or_init(|| build_query_runtime("catalog-query")),
+        )
     }
 }
 
@@ -836,6 +869,53 @@ mod tests {
             conn.query_sql("SELECT _id FROM bm25_search('nope', 'title', 'fox', 10)")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn query_sql_search_tvf_over_storage_does_not_panic() {
+        // Regression: a search TVF takes the table-free runtime fallback (it
+        // names its table in an argument, not a `FROM` relation). Over a
+        // storage backend it fans out object-store reads that need a
+        // multi-thread runtime; this panicked before the fix. `memory://`
+        // has no such reads, so the bug only showed on localfs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append");
+
+        let rows: usize = conn
+            .query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
+            .expect("bm25_search tvf over storage")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "one doc matches 'fox'");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_drops_cleanly_inside_async_runtime() {
+        // The sync API supports being called from inside the caller's
+        // runtime (the bridge uses `block_in_place`), and `query_sql` builds
+        // the connection runtime eagerly. Dropping the last `Connection`
+        // here must not trip tokio's drop-runtime-in-async-context panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        // Table-free TVF → builds the connection runtime on this thread.
+        conn.query_sql("SELECT _id FROM bm25_search('docs', 'title', 'fox', 10)")
+            .expect("query");
+
+        drop(docs);
+        drop(conn); // must not panic
     }
 
     #[test]

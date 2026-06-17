@@ -25,7 +25,7 @@ use tokio::runtime::Runtime;
 use super::error::{BuildError, OpenError};
 use super::manifest::Manifest;
 use super::options::SupertableOptions;
-use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async};
+use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime};
 use crate::supertable::ManifestLoadError;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
@@ -156,26 +156,10 @@ impl SupertableInner {
     /// serialize that fan-out and inflate cold latency. One worker per
     /// CPU lets those overlap, matching what an async caller gets.
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(self.query_runtime.get_or_init(|| {
-            // Fallback worker count when the host won't report its
-            // parallelism; small but multi-threaded so the cold-read
-            // fan-out still overlaps rather than serializing.
-            const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
-            Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(workers)
-                    .enable_all()
-                    .thread_name("supertable-query")
-                    .build()
-                    .expect(
-                        "invariant: tokio Runtime build only fails on \
-                         catastrophic OS resource exhaustion",
-                    ),
-            )
-        }))
+        Arc::clone(
+            self.query_runtime
+                .get_or_init(|| build_query_runtime("supertable-query")),
+        )
     }
 }
 
