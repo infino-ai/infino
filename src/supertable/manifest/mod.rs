@@ -773,34 +773,28 @@ impl Manifest {
             // TODO: Handle merging 2 parts into one if their sum is within threshold
 
             // First we fetch the latest superfile entries - either from parts_to_write or the old manifest.
-            let (final_superfile_entries, existing_part_to_update) = if let Some(existing) =
+            let (superfile_entries_in_part, existing_part_to_update) = if let Some(existing) =
                 parts_to_write
                     .iter_mut()
                     .find(|ep| ep.part.part_id == entry.part_id)
             {
-                (
-                    existing
-                        .part
-                        .superfiles
-                        .iter()
-                        .filter(|s| !removal_ids.contains(&s.superfile_id))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    Some(existing),
-                )
+                (existing.part.superfiles.clone(), Some(existing))
             } else if let Ok(existing_part) = self.get_part_by_id(entry.part_id).await {
-                (
-                    existing_part
-                        .superfiles
-                        .iter()
-                        .filter(|s| !removal_ids.contains(&s.superfile_id))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    None,
-                )
+                (existing_part.superfiles.clone(), None)
             } else {
                 return Err(ManifestError::UnknownPartId(entry.part_id));
             };
+            let final_superfile_entries = superfile_entries_in_part
+                .iter()
+                .filter(|s| !removal_ids.contains(&s.superfile_id))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            // If there is no update to superfile entries, we dont need to update the entry & part
+            if final_superfile_entries.len() == superfile_entries_in_part.len() {
+                out_list_entries_after_removal.push(entry);
+                continue;
+            }
 
             // Now we build the fresh part and entry based on the final superfile entries.
             let (fresh_entry, fresh_part, fresh_encoded) =
@@ -3356,6 +3350,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebalance_leaves_unchanged_parts_untouched() {
+        // Start with three parts, two superfiles each:
+        //   - part_a_old, part_a_latest  → partition A (pk_a)
+        //   - part_b                     → partition B (pk_b)
+        // The latest part for A has room for one more superfile
+        // (target = 3, so 2 + 1 = 3 stays within target → rewrite, no
+        // split). We then commit a single new superfile into partition
+        // A. After rebalance ONLY the latest A part should change; the
+        // frozen older A part and the entire B partition must carry
+        // over byte-for-byte — same part_id, uri, and content_hash —
+        // and must NOT be re-emitted into `parts_to_write` (no
+        // re-encode, no PUT).
+        const SUPERFILES_PER_PART: u64 = 2;
+        const TARGET_SUPERFILES_PER_PART: u64 = 3;
+
+        let pk_a = hash2_pk(0);
+        let pk_b = hash2_pk(1);
+        let (_dir, storage) = local_storage();
+
+        // Attach storage so the manifests `rebalance` derives also carry
+        // a loader — the second (removal) phase loads carried-over parts
+        // (A_old, B) back from storage.
+        let mut base_opts =
+            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+        base_opts.target_superfiles_per_part = TARGET_SUPERFILES_PER_PART;
+        let opts = Arc::new(base_opts.with_storage(storage.clone()));
+
+        // Helper: build a 2-superfile part for a partition and persist it.
+        async fn two_superfile_part(
+            storage: &dyn StorageProvider,
+            pk: &[u8],
+            hint: u32,
+            docs: [u64; 2],
+        ) -> (
+            ManifestPart,
+            crate::supertable::manifest::commit::PartWriteResult,
+        ) {
+            let part = ManifestPart {
+                format_version: part::FORMAT_VERSION.into(),
+                part_id: PartId::new_v4(),
+                superfiles: vec![
+                    make_superfile_entry_hinted(docs[0], pk.to_vec(), hint),
+                    make_superfile_entry_hinted(docs[1], pk.to_vec(), hint),
+                ],
+            };
+            let pw = write_manifest_part(storage, &part, MANIFEST_ZSTD_LEVEL)
+                .await
+                .expect("write part");
+            (part, pw)
+        }
+
+        let (part_a_old, pw_a_old) =
+            two_superfile_part(storage.as_ref(), &pk_a, 0, [100, 110]).await;
+        let (part_a_latest, pw_a_latest) =
+            two_superfile_part(storage.as_ref(), &pk_a, 0, [120, 130]).await;
+        let (part_b, pw_b) = two_superfile_part(storage.as_ref(), &pk_b, 1, [200, 210]).await;
+
+        // Build a list entry mirroring a persisted part.
+        let entry_for = |pw: &crate::supertable::manifest::commit::PartWriteResult,
+                         pk: &[u8]|
+         -> ManifestListEntry {
+            ManifestListEntry {
+                part_id: pw.part_id,
+                uri: pw.uri.clone(),
+                content_hash: pw.content_hash,
+                size_bytes_compressed: pw.size_bytes_compressed,
+                size_bytes_uncompressed: pw.size_bytes_uncompressed,
+                n_superfiles: SUPERFILES_PER_PART,
+                partition_key: pk.to_vec(),
+                id_range: (0, 0),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+                vector_summary_agg: Default::default(),
+            }
+        };
+
+        // List order: [A_old, A_latest, B]. A_latest is the latest
+        // entry for partition A (the rewrite candidate); A_old is the
+        // frozen older entry; B is an untouched partition.
+        let list = ManifestList {
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 0,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 2,
+            },
+            parts: vec![
+                entry_for(&pw_a_old, &pk_a),
+                entry_for(&pw_a_latest, &pk_a),
+                entry_for(&pw_b, &pk_b),
+            ],
+        };
+        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
+
+        // Only the latest A part is needed in-cache for the rewrite to
+        // load + combine; the loader serves the rest from storage.
+        let parts_map = dashmap::DashMap::new();
+        parts_map.insert(
+            part_a_latest.part_id,
+            Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
+        );
+        let old_manifest = Arc::new(Manifest {
+            superfile_list: crate::supertable::manifest::SuperfileList {
+                manifest_id: 0,
+                options: opts.clone(),
+                superfiles: part_a_old
+                    .superfiles
+                    .iter()
+                    .chain(part_b.superfiles.iter())
+                    .cloned()
+                    .collect(),
+            },
+            list: Some(list),
+            parts: parts_map,
+            loader: Some(Arc::new(loader)),
+        });
+
+        // Commit one new superfile into partition A. Keep `new_entry`
+        // around — the second phase below removes it again.
+        let new_entry = make_superfile_entry_hinted(140, pk_a.clone(), 0);
+        let (new_manifest, parts_to_write) = old_manifest
+            .rebalance(std::slice::from_ref(&new_entry), &[])
+            .await
+            .expect("rebalance");
+        let list_entries = new_manifest.get_all_list_entries();
+
+        // Three list entries remain (A_old carried over, A_latest
+        // rewritten in place, B carried over), and only ONE part is
+        // re-emitted for writing — the rewritten latest-A part.
+        assert_eq!(list_entries.len(), 3, "list entry count");
+        assert_eq!(
+            parts_to_write.len(),
+            1,
+            "only the rewritten latest-A part should be re-emitted; \
+             unchanged parts must not be re-encoded/PUT",
+        );
+
+        // Locate the carried-over entries by their original part_id and
+        // assert they are byte-for-byte identical to what was persisted.
+        let find = |part_id: PartId| {
+            list_entries
+                .iter()
+                .find(|e| e.part_id == part_id)
+                .unwrap_or_else(|| panic!("entry for part {part_id:?} missing after rebalance"))
+        };
+
+        let a_old_after = find(pw_a_old.part_id);
+        assert_eq!(a_old_after.uri, pw_a_old.uri, "frozen older A part uri");
+        assert_eq!(
+            a_old_after.content_hash, pw_a_old.content_hash,
+            "frozen older A part content_hash",
+        );
+        assert_eq!(a_old_after.n_superfiles, SUPERFILES_PER_PART);
+
+        let b_after = find(pw_b.part_id);
+        assert_eq!(b_after.uri, pw_b.uri, "untouched B part uri");
+        assert_eq!(
+            b_after.content_hash, pw_b.content_hash,
+            "untouched B part content_hash",
+        );
+        assert_eq!(b_after.n_superfiles, SUPERFILES_PER_PART);
+
+        // The one re-emitted part is the rewritten latest-A part: it now
+        // holds the original two superfiles plus the new one.
+        assert_eq!(
+            parts_to_write[0].part.superfiles.len(),
+            (SUPERFILES_PER_PART + 1) as usize,
+            "rewritten latest-A part should hold its 2 superfiles + the new one",
+        );
+        // And the original latest-A part_id is gone from the list (it was
+        // rewritten, not carried over).
+        assert!(
+            !list_entries
+                .iter()
+                .any(|e| e.part_id == pw_a_latest.part_id),
+            "the rewritten latest-A part is replaced, so its old part_id must not survive",
+        );
+
+        // ---- Second phase: remove the superfile we just added --------
+        //
+        // The new superfile lives in the rewritten latest-A part. Remove
+        // it. Only that part should change. The frozen older A part
+        // (`A_old`) never held the removed superfile, and partition B is
+        // untouched entirely — both must carry over byte-for-byte.
+        //
+        // Capture the rewritten latest-A part's identity (the part the
+        // removal will legitimately rebuild).
+        let latest_a_v1_part_id = list_entries
+            .iter()
+            .find(|e| e.partition_key == pk_a && e.part_id != pw_a_old.part_id)
+            .expect("rewritten latest-A entry present after the add")
+            .part_id;
+
+        let (after_removal, removal_parts) = new_manifest
+            .rebalance(&[], std::slice::from_ref(&new_entry))
+            .await
+            .expect("rebalance removal");
+        let entries_after = after_removal.get_all_list_entries();
+
+        assert_eq!(entries_after.len(), 3, "list entry count after removal");
+
+        // The part we removed from MUST change: its v1 part_id is gone,
+        // and it now holds two superfiles again.
+        assert!(
+            !entries_after
+                .iter()
+                .any(|e| e.part_id == latest_a_v1_part_id),
+            "the part we removed a superfile from must be rebuilt (new part_id)",
+        );
+
+        // Partition B is untouched by the removal — same part identity.
+        let b_after_removal = entries_after
+            .iter()
+            .find(|e| e.part_id == pw_b.part_id)
+            .expect("untouched B part must survive the removal unchanged");
+        assert_eq!(b_after_removal.uri, pw_b.uri, "B uri after removal");
+        assert_eq!(
+            b_after_removal.content_hash, pw_b.content_hash,
+            "B content_hash after removal",
+        );
+
+        // The frozen older A part did NOT contain the removed superfile,
+        // so it too must stay byte-for-byte identical. (Hunch: the
+        // removal path rebuilds EVERY entry in the affected partition —
+        // not just the part that held the removed superfile — so `A_old`
+        // is churned and this assertion currently fails.)
+        assert!(
+            entries_after.iter().any(|e| e.part_id == pw_a_old.part_id),
+            "frozen older A part holds none of the removed superfile and must stay \
+             unchanged, but the removal rebuilt it under a new part_id; entries now: {:?}",
+            entries_after
+                .iter()
+                .map(|e| (e.part_id, e.partition_key.clone(), e.n_superfiles))
+                .collect::<Vec<_>>(),
+        );
+        let a_old_after_removal = entries_after
+            .iter()
+            .find(|e| e.part_id == pw_a_old.part_id)
+            .expect("frozen older A part must survive the removal unchanged");
+        assert_eq!(
+            a_old_after_removal.uri, pw_a_old.uri,
+            "frozen older A part uri after removal",
+        );
+        assert_eq!(
+            a_old_after_removal.content_hash, pw_a_old.content_hash,
+            "frozen older A part content_hash after removal",
+        );
+
+        // Only the part that actually lost a superfile should be
+        // re-emitted for writing.
+        assert_eq!(
+            removal_parts.len(),
+            1,
+            "only the part we removed from should be rewritten; unchanged parts \
+             must not be re-encoded/PUT",
+        );
+    }
+
+    #[tokio::test]
     async fn rebalance_rewrite_partition_within_target() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
@@ -4547,7 +4805,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
         });
 
-        let (new_manifest, parts) = old_manifest
+        let (new_manifest, parts_to_write) = old_manifest
             .rebalance(&[], std::slice::from_ref(&sf_a_latest_remove))
             .await
             .expect("rebalance");
@@ -4557,7 +4815,7 @@ mod tests {
         // Both parts in the split are rewritten: any part in a partition with a
         // pending removal is rewritten regardless of whether the removal matched
         // anything in it.
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts_to_write.len(), 1);
 
         // Both list entries are for the same partition
         assert_eq!(list_entries[0].partition_key, pk);
@@ -4566,15 +4824,11 @@ mod tests {
         // sf_a_old survives (in one of the output parts)
         // sf_a_latest_keep survives (in one of the output parts)
         // sf_a_latest_remove is absent from every output part
-        let all_ids: Vec<_> = parts
+        let all_ids: Vec<_> = parts_to_write
             .iter()
             .flat_map(|ep| ep.part.superfiles.iter())
             .map(|s| s.superfile_id)
             .collect();
-        assert!(
-            all_ids.contains(&sf_a_old.superfile_id),
-            "sf_a_old must survive"
-        );
         assert!(
             all_ids.contains(&sf_a_latest_keep.superfile_id),
             "sf_a_latest_keep must survive"
@@ -4735,30 +4989,16 @@ mod tests {
         // sf_ghost was never added to any part; its superfile_id won't match anything
         let sf_ghost = make_superfile_entry(50, pk.clone());
 
-        let (new_manifest, parts) = old_manifest
+        let (new_manifest, parts_to_write) = old_manifest
             .rebalance(&[], std::slice::from_ref(&sf_ghost))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 1);
-        assert_eq!(parts.len(), 1);
+        assert_eq!(parts_to_write.len(), 0);
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].part.superfiles.len(), 2);
-
-        let ids: Vec<_> = parts[0]
-            .part
-            .superfiles
-            .iter()
-            .map(|s| s.superfile_id)
-            .collect();
-        assert!(ids.contains(&sf1.superfile_id), "sf1 must survive");
-        assert!(ids.contains(&sf2.superfile_id), "sf2 must survive");
-        assert!(
-            !ids.contains(&sf_ghost.superfile_id),
-            "ghost id must not appear"
-        );
     }
 
     #[tokio::test]
@@ -4869,7 +5109,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
         });
 
-        let (new_manifest, parts) = old_manifest
+        let (new_manifest, parts_to_write) = old_manifest
             .rebalance(&[], std::slice::from_ref(&sf_a_old_remove))
             .await
             .expect("rebalance");
@@ -4878,13 +5118,13 @@ mod tests {
         assert_eq!(list_entries.len(), 2);
         // Both parts rewritten: the fix applies the removal set to every part in
         // the partition, so the latest is also rewritten (no match, same content)
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts_to_write.len(), 1);
 
         assert_eq!(list_entries[0].partition_key, pk);
         assert_eq!(list_entries[1].partition_key, pk);
 
         // sf_a_old_keep and sf_a_latest survive; sf_a_old_remove is absent
-        let all_ids: Vec<_> = parts
+        let all_ids: Vec<_> = parts_to_write
             .iter()
             .flat_map(|ep| ep.part.superfiles.iter())
             .map(|s| s.superfile_id)
@@ -4892,10 +5132,6 @@ mod tests {
         assert!(
             all_ids.contains(&sf_a_old_keep.superfile_id),
             "sf_a_old_keep must survive"
-        );
-        assert!(
-            all_ids.contains(&sf_a_latest.superfile_id),
-            "sf_a_latest must survive"
         );
         assert!(
             !all_ids.contains(&sf_a_old_remove.superfile_id),
