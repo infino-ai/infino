@@ -280,14 +280,22 @@ impl Supertable {
                             .await
                             .ok()
                             .map(Arc::new),
-                        Err(_) => None,
+                        Err(e) => {
+                            tracing::warn!(
+                                "supertable: hidden vector-index table unavailable: {e}"
+                            );
+                            None
+                        }
                     }
                 }
                 Ok(None) => create_table_async(hidden_opts, None)
                     .await
                     .ok()
                     .map(Arc::new),
-                Err(_) => None,
+                Err(e) => {
+                    tracing::warn!("supertable: hidden vector-index table unavailable: {e}");
+                    None
+                }
             }
         } else {
             None
@@ -736,14 +744,13 @@ fn train_global_centroids(
             continue;
         }
         dim = cc.dim as usize;
+        let mut row = vec![0f32; dim];
         for c in 0..cc.n_cent as usize {
             if cc.counts[c] == 0 {
                 continue;
             }
-            let base = c * dim;
-            for d in 0..dim {
-                all_centroids.push(cc.mins[c] + cc.scales[c] * cc.codes[base + d] as f32);
-            }
+            cc.dequantize_into(c, &mut row);
+            all_centroids.extend_from_slice(&row);
         }
     }
     if all_centroids.is_empty() || dim == 0 {
@@ -1374,6 +1381,94 @@ mod tests {
         // options the handle exposes.
         assert_eq!(r.options().id_column, st.options().id_column);
         assert_eq!(r.options().fts_columns.len(), 1);
+    }
+
+    #[test]
+    fn hidden_vector_index_visible_after_commit() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::builder::{FtsConfig, VectorConfig};
+        use crate::superfile::reader::VectorSearchOptions;
+        use crate::superfile::vector::distance::Metric;
+        use crate::superfile::vector::rerank_codec::RerankCodec;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+        assert!(
+            st.reader().vector_index_table().is_some(),
+            "vector columns + storage must create hidden index sibling"
+        );
+
+        let titles = LargeStringArray::from(vec!["a", "b", "c"]);
+        let flat = Float32Array::from(vec![1.0f32; 3 * dim]);
+        let fsl = FixedSizeListArray::new(item_field, dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        assert!(st.reader().n_superfiles() > 0);
+        let reader = st.reader();
+        let hidden = reader.vector_index_table().expect("hidden index");
+        assert!(
+            hidden.reader().n_superfiles() > 0,
+            "dual-write must land in hidden table before commit returns"
+        );
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 3, VectorSearchOptions::new())
+            .expect("vector search");
+        assert!(!hits.is_empty(), "search should find committed vectors");
     }
 
     /// A storage-backed handle under `Consistency::Strong` drives

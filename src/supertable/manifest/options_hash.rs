@@ -466,6 +466,28 @@ mod tests {
     }
 
     #[test]
+    fn compute_options_hash_distinguishes_vector_cell() {
+        use crate::supertable::manifest::ClusterCentroids;
+        let opts = fts_opts();
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let h_vc = compute_options_hash(
+            &opts,
+            &PartitionStrategy::VectorCell {
+                column: "emb".into(),
+                clusters: clusters.clone(),
+            },
+        );
+        let h_hash = compute_options_hash(
+            &opts,
+            &PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 16,
+            },
+        );
+        assert_ne!(h_vc.0, h_hash.0);
+    }
+
+    #[test]
     fn compute_options_hash_partition_field_changes_propagate() {
         // Within each PartitionStrategy variant, mutating a
         // per-variant field must change the hash. Catches the

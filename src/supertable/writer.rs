@@ -55,7 +55,6 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch,
 };
-use base64::Engine;
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::PutPayload;
@@ -986,10 +985,10 @@ impl SupertableWriter {
         let buffer = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
-        // Dual write to hidden VectorIndexSuperTable (best-effort, parallel).
-        // Spawn the hidden table commit in the background so it runs
-        // concurrently with the user table's commit below.
-        if let Some(vit) = self.inner.vector_index_table.as_ref()
+        // Dual write to hidden vector-index supertable. The hidden commit
+        // runs on a background thread overlapping user-table shard build, but
+        // we join before returning so both supertable storage commits finish before commit() returns.
+        let hidden_join = if let Some(vit) = self.inner.vector_index_table.as_ref()
             && let Ok(mut vw) = vit.writer()
         {
             let hidden_schema = vit.options().schema.clone();
@@ -1011,8 +1010,11 @@ impl SupertableWriter {
                     );
                     cols.push(Arc::new(list));
                 }
-                if let Ok(rb) = RecordBatch::try_new(hidden_schema.clone(), cols) {
-                    batches.push(rb);
+                match RecordBatch::try_new(hidden_schema.clone(), cols) {
+                    Ok(rb) => batches.push(rb),
+                    Err(e) => {
+                        tracing::warn!("supertable: hidden vector-index batch build failed: {e}")
+                    }
                 }
             }
             // Append all batches, then spawn the commit in background.
@@ -1024,10 +1026,16 @@ impl SupertableWriter {
                     break;
                 }
             }
-            std::thread::spawn(move || {
-                let _ = vw.commit();
-            });
-        }
+            Some(std::thread::spawn(move || {
+                if let Err(e) = vw.commit() {
+                    tracing::warn!(
+                        "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
+                    );
+                }
+            }))
+        } else {
+            None
+        };
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
@@ -1091,6 +1099,13 @@ impl SupertableWriter {
         })?;
 
         publish_superfiles(&self.inner, outputs, cell_hints)?;
+        if let Some(join) = hidden_join
+            && join.join().is_err()
+        {
+            tracing::warn!(
+                "supertable: hidden vector-index commit thread panicked (vector search may be stale)"
+            );
+        }
         Ok(())
     }
 }

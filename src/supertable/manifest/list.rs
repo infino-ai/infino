@@ -922,6 +922,24 @@ mod tests {
     }
 
     #[test]
+    fn partition_strategy_vector_cell_roundtrip() {
+        use super::super::ClusterCentroids;
+        let mut list = empty_list();
+        list.partition_strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::from_fp32(
+                2,
+                4,
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                vec![1, 1],
+            ),
+        };
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.partition_strategy, list.partition_strategy);
+    }
+
+    #[test]
     fn term_range_union_none_is_absent_from_json() {
         // term_range_union is #[serde(skip_serializing_if =
         // "Option::is_none")], so None must produce field
