@@ -68,7 +68,7 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
 
 /// Parse a cold-fetch-mode name into its [`ColdFetchMode`].
 fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
-    match s {
+    match s.to_ascii_lowercase().as_str() {
         "hybrid_with_prefetch" => Ok(ColdFetchMode::HybridWithPrefetch),
         "range_only" => Ok(ColdFetchMode::RangeOnly),
         "lazy_foreground_with_background_fill" => Ok(ColdFetchMode::LazyForegroundWithBackgroundFill),

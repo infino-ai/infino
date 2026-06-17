@@ -55,6 +55,11 @@ def test_connect_accepts_cache_options(tmp_path):
     assert t.token_match("title", "fox").num_rows == 1
 
 
+def test_connect_cold_fetch_mode_is_case_insensitive():
+    # Consistent with metric / mode parsing.
+    infino.connect("memory://", cold_fetch_mode="RANGE_ONLY")
+
+
 def test_connect_rejects_invalid_cold_fetch_mode():
     with pytest.raises(ValueError):
         infino.connect("memory://", cold_fetch_mode="nonsense")
