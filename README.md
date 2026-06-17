@@ -174,7 +174,7 @@ docs.append(&RecordBatch::try_new(
 
 // Three ways to retrieve context to ground the agent's next answer:
 let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
-let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None)?;
+let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
 let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
 assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
 assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
