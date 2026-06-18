@@ -568,11 +568,15 @@ mod tests {
     #[tokio::test]
     async fn list_with_prefix_metadata_returns_mtime_and_size() {
         let (_dir, p) = provider();
-        let before = std::time::SystemTime::now();
+        let before = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("parsing failed");
         p.put_atomic("data/a.parquet", Bytes::from_static(b"hello"))
             .await
             .expect("put");
-        let after = std::time::SystemTime::now();
+        let after = std::time::SystemTime::now()
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("parsing failed");
 
         let mut entries = p
             .list_with_prefix_metadata("data/")
@@ -582,8 +586,8 @@ mod tests {
         entries.sort_by_key(|(key, _)| key.clone());
         let (key, meta) = &entries[0];
         assert_eq!(key, "data/a.parquet");
-        assert!(meta.last_modified >= before);
-        assert!(meta.last_modified <= after);
+        assert!(meta.last_modified >= before, "mtime too old");
+        assert!(meta.last_modified <= after, "mtime in future");
         assert_eq!(meta.size, 5);
     }
 

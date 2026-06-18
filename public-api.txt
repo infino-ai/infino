@@ -244,7 +244,7 @@ pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
 impl core::clone::Clone for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::clone(&self) -> infino::OptimizeOptions
 impl core::default::Default for infino::OptimizeOptions
-pub fn infino::OptimizeOptions::default() -> Self
+pub fn infino::OptimizeOptions::default() -> infino::OptimizeOptions
 impl core::fmt::Debug for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for infino::OptimizeOptions
