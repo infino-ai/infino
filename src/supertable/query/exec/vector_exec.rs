@@ -375,13 +375,7 @@ impl ExecutionPlan for VectorSearchExec {
                 }
                 bounded => {
                     reader
-                        .vector_hits_filtered_by_plan(
-                            &column,
-                            &query,
-                            k,
-                            options,
-                            &bounded,
-                        )
+                        .vector_hits_filtered_by_plan(&column, &query, k, options, &bounded)
                         .await
                 }
             }

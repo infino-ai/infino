@@ -227,9 +227,7 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        let budget = nprobe
-            .saturating_mul(n_eligible.max(1))
-            .max(nprobe);
+        let budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
         if scored.len() > budget {
             scored.select_nth_unstable_by(budget, |a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
@@ -576,14 +574,7 @@ impl SupertableReader {
         doc_ids: F,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError>
     where
-        F: Fn(
-                Arc<SuperfileReader>,
-                Arc<SuperfileEntry>,
-            ) -> Fut
-            + Send
-            + Sync
-            + Clone
-            + 'static,
+        F: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Result<RoaringBitmap, QueryError>> + Send,
     {
         let units: Vec<(Arc<SuperfileEntry>, ())> =
@@ -679,13 +670,7 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         match filter {
             None => self.block_on(self.vector_search_async(column, query, k, options)),
-            Some(f) => self.block_on(self.vector_hits_filtered_async(
-                column,
-                query,
-                k,
-                options,
-                f,
-            )),
+            Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
         }
     }
 }

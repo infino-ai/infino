@@ -1121,10 +1121,7 @@ pub mod vector {
                         .iter()
                         .map(|h| {
                             let base = offsets.get(&h.superfile).unwrap_or_else(|| {
-                                panic!(
-                                    "missing manifest offset for superfile {:?}",
-                                    h.superfile,
-                                )
+                                panic!("missing manifest offset for superfile {:?}", h.superfile,)
                             });
                             (base.saturating_add(h.local_doc_id), h.score)
                         })
