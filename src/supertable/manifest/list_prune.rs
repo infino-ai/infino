@@ -537,10 +537,9 @@ mod tests {
             .scalar_stats_agg
             .get("ts")
             .expect("ts scalar agg present");
-        // IPC byte introspection is a separate concern; here we just
-        // confirm presence + non-empty encoding.
-        assert!(!s.min.is_empty(), "ts min IPC bytes must be non-empty");
-        assert!(!s.max.is_empty(), "ts max IPC bytes must be non-empty");
+        // The aggregate min/max are length-1 arrays of the column type.
+        assert_eq!(s.min.len(), 1, "ts min must be a length-1 array");
+        assert_eq!(s.max.len(), 1, "ts max must be a length-1 array");
     }
 
     #[test]

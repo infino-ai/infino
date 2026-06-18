@@ -84,6 +84,24 @@ pub enum DecodeError {
     UnexpectedBatchCount(usize),
 }
 
+/// Errors from the per-summary binary encoders.
+///
+/// Surfaced by [`encode_length1_array`] when the Arrow IPC writer rejects
+/// an array; the manifest-list encoder wraps it into its own encode error
+/// so a commit fails cleanly rather than panicking.
+#[derive(Debug, Error)]
+pub enum EncodeError {
+    /// Arrow IPC serialization failed.
+    #[error("arrow ipc encode failed: {0}")]
+    ArrowIpc(String),
+
+    /// A length-1 array was expected (an aggregate is a single value) but
+    /// the array had a different row count — caught before persisting so a
+    /// malformed manifest is never written.
+    #[error("expected a length-1 array, got {0} rows")]
+    WrongRowCount(usize),
+}
+
 // ---------------------------------------------------------
 // ScalarStatsTable: arrow-ipc encoding.
 // ---------------------------------------------------------
@@ -241,6 +259,78 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError
         stats.cols.insert(base, (mn, mx));
     }
     Ok(stats)
+}
+
+/// Encode a single length-1 [`ArrayRef`] as Arrow-IPC stream bytes —
+/// the `ScalarStatsAgg.{min,max,sum}` wire shape (one batch, one
+/// column, one row). `field_name` is recorded in the IPC schema only;
+/// decoders read column 0 by position and ignore the name. Output is
+/// deterministic for identical inputs, which the manifest list's
+/// content-addressing relies on.
+///
+/// Returns [`EncodeError::WrongRowCount`] if `arr` is not exactly one row
+/// (an aggregate is a single value), or [`EncodeError::ArrowIpc`] if the
+/// Arrow IPC writer rejects the array (e.g. an unsupported data type). In
+/// practice the schema is built from the array's own `data_type`, so the
+/// batch always matches — but failures are surfaced rather than panicked so
+/// a bad array can't abort a commit.
+pub(crate) fn encode_length1_array(
+    field_name: &str,
+    arr: &ArrayRef,
+) -> Result<Vec<u8>, EncodeError> {
+    // Enforce the single-value contract before writing — fail fast here
+    // rather than persisting a manifest that `decode_length1_array` would
+    // later reject.
+    if arr.len() != 1 {
+        return Err(EncodeError::WrongRowCount(arr.len()));
+    }
+    let field = Field::new(field_name, arr.data_type().clone(), true);
+    let schema = Arc::new(Schema::new(vec![field]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![arr.clone()])
+        .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+    let mut out = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut out, &schema)
+            .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+        writer
+            .finish()
+            .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+    }
+    Ok(out)
+}
+
+/// Decode the bytes produced by [`encode_length1_array`] back into the
+/// single length-1 [`ArrayRef`] (column 0 of the one-batch stream).
+pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    if batches.len() != 1 {
+        return Err(DecodeError::UnexpectedBatchCount(batches.len()));
+    }
+    let batch = &batches[0];
+    if batch.num_columns() != 1 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "expected exactly one column, got {}",
+            batch.num_columns()
+        )));
+    }
+    // The aggregate is a single value; callers read index 0 as the only
+    // element. Reject any other row count so malformed manifest data fails
+    // loudly here rather than silently yielding a wrong min/max (which would
+    // corrupt list-level prune decisions).
+    if batch.num_rows() != 1 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "expected exactly one row, got {}",
+            batch.num_rows()
+        )));
+    }
+    Ok(batch.column(0).clone())
 }
 
 // ---------------------------------------------------------
@@ -513,8 +603,9 @@ mod decode_error_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary,
-        decode_vector_summary_map, encode_scalar_stats, read_n, read_u32,
+        DecodeError, decode_fts_summary_map, decode_length1_array, decode_scalar_stats,
+        decode_vector_summary, decode_vector_summary_map, encode_length1_array,
+        encode_scalar_stats, read_n, read_u32,
     };
     use crate::supertable::manifest::ScalarStatsTable;
 
@@ -569,6 +660,53 @@ mod decode_error_tests {
             vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
         );
         let err = decode_scalar_stats(&bytes).expect_err("bad suffix");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A single length-1 array round-trips through encode/decode.
+    #[test]
+    fn decode_length1_array_round_trips_single_row() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![42]));
+        let bytes = encode_length1_array("v", &arr).expect("encode");
+        let decoded = decode_length1_array(&bytes).expect("decode");
+        assert_eq!(decoded.to_data(), arr.to_data());
+    }
+
+    /// Encoding a non-length-1 array fails fast, before any bytes are
+    /// written, so an invalid aggregate never reaches a persisted manifest.
+    #[test]
+    fn encode_length1_array_rejects_non_single_row() {
+        use super::EncodeError;
+        let multi: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let err = encode_length1_array("v", &multi).expect_err("multi-row");
+        assert!(matches!(err, EncodeError::WrongRowCount(2)), "got {err:?}");
+
+        let empty: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
+        let err = encode_length1_array("v", &empty).expect_err("zero-row");
+        assert!(matches!(err, EncodeError::WrongRowCount(0)), "got {err:?}");
+    }
+
+    /// A multi-row batch is rejected — callers read index 0 as the only
+    /// element, so accepting >1 rows would silently produce a wrong
+    /// aggregate min/max and corrupt list-level prune decisions.
+    #[test]
+    fn decode_length1_array_rejects_multi_row() {
+        let bytes = ipc_batch(
+            vec![Field::new("v", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        let err = decode_length1_array(&bytes).expect_err("multi-row");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A zero-row batch is rejected for the same single-value contract.
+    #[test]
+    fn decode_length1_array_rejects_zero_row() {
+        let bytes = ipc_batch(
+            vec![Field::new("v", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+        );
+        let err = decode_length1_array(&bytes).expect_err("zero-row");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 

@@ -28,7 +28,6 @@
 
 use std::sync::Arc;
 
-use arrow::ipc::reader::StreamReader;
 use datafusion::scalar::ScalarValue;
 
 use crate::superfile::fts::reader::BoolMode;
@@ -89,8 +88,10 @@ impl PruneLeaf {
 /// the predicate's column could satisfy it. A missing aggregate or
 /// undecodable bounds → keep (conservative — never a false prune).
 ///
-/// The aggregate min/max live as length-1 Arrow IPC batches
-/// (`ScalarStatsAgg.{min,max}`); we decode them and reuse the same
+/// The aggregate min/max are held as length-1 [`ArrayRef`]s
+/// (`ScalarStatsAgg.{min,max}`), already decoded when the manifest list
+/// was loaded — so this hot path reads the [`ScalarValue`] straight from
+/// the array with no per-query Arrow-IPC decode, then reuses the same
 /// comparison core the superfile tier uses ([`scalar_value_may_match`]).
 fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId> {
     list.parts
@@ -100,8 +101,8 @@ fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId>
                 None => true,
                 Some(agg) => {
                     match (
-                        decode_length1_scalar(&agg.min),
-                        decode_length1_scalar(&agg.max),
+                        ScalarValue::try_from_array(agg.min.as_ref(), 0).ok(),
+                        ScalarValue::try_from_array(agg.max.as_ref(), 0).ok(),
                     ) {
                         (Some(min), Some(max)) => {
                             scalar_value_may_match(&min, &max, pred.op, &pred.value)
@@ -113,21 +114,6 @@ fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId>
             keep.then_some(entry.part_id)
         })
         .collect()
-}
-
-/// Decode a length-1 Arrow IPC stream (the `ScalarStatsAgg.{min,max}`
-/// wire shape — one batch, one column, one row) into its single
-/// `ScalarValue`. `None` on any decode failure, which callers treat as
-/// "keep".
-fn decode_length1_scalar(bytes: &[u8]) -> Option<ScalarValue> {
-    let reader = StreamReader::try_new(bytes, None).ok()?;
-    for batch in reader {
-        let batch = batch.ok()?;
-        if batch.num_columns() >= 1 && batch.num_rows() >= 1 {
-            return ScalarValue::try_from_array(batch.column(0).as_ref(), 0).ok();
-        }
-    }
-    None
 }
 
 /// Select the superfiles a predicate could match, newest-first in

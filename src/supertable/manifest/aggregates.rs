@@ -31,9 +31,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::ipc::writer::StreamWriter;
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{Field, Schema};
+use arrow_array::ArrayRef;
 
 use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
@@ -43,7 +41,7 @@ use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSum
 #[derive(Debug, Default)]
 pub struct AggregateSet {
     pub id_range: (i128, i128),
-    pub scalar_stats_agg: BTreeMap<String, ScalarStatsAgg>,
+    pub scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
     pub vector_summary_agg: BTreeMap<String, VectorSummaryAgg>,
 }
@@ -75,7 +73,7 @@ pub fn compute(superfiles: &[Arc<SuperfileEntry>]) -> AggregateSet {
 // Scalar stats: per column, min-of-mins / max-of-maxes.
 // ---------------------------------------------------------
 
-fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, ScalarStatsAgg> {
+fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, ScalarStatsAgg> {
     // Gather, per column, all per-superfile (min, max) ArrayRefs.
     let mut per_column: HashMap<String, (Vec<ArrayRef>, Vec<ArrayRef>)> = HashMap::new();
     for seg in superfiles {
@@ -86,7 +84,7 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Scal
         }
     }
 
-    let mut out = BTreeMap::new();
+    let mut out = HashMap::new();
     for (col, (mins, maxes)) in per_column {
         if mins.is_empty() {
             continue;
@@ -108,8 +106,6 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Scal
         let Some((_, agg_max)) = column_min_max(&combined_max) else {
             continue;
         };
-        let min_bytes = ipc_encode_length1(&col, &agg_min);
-        let max_bytes = ipc_encode_length1(&col, &agg_max);
 
         // Additive rollups (null count / sum / HLL) combine with
         // intersection semantics: every segment must carry the stat or
@@ -126,8 +122,7 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Scal
                     Some(total) => crate::supertable::manifest::add_sum_arrays(&total, part)?,
                 }))
             })
-            .flatten()
-            .map(|total| ipc_encode_length1(&col, &total));
+            .flatten();
         let hll = superfiles
             .iter()
             .try_fold(
@@ -151,8 +146,8 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Scal
         out.insert(
             col,
             ScalarStatsAgg {
-                min: min_bytes,
-                max: max_bytes,
+                min: agg_min,
+                max: agg_max,
                 null_count,
                 sum,
                 hll,
@@ -244,24 +239,6 @@ fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }
         _ => None,
     }
-}
-
-/// Serialize a single length-1 ArrayRef as Arrow IPC bytes —
-/// matches the `ScalarStatsAgg.{min,max}` wire shape
-/// (the per-summary encoding the manifest part carries; we
-/// mirror it at the list level so decoders are uniform).
-fn ipc_encode_length1(col_name: &str, arr: &ArrayRef) -> Vec<u8> {
-    let field = Field::new(col_name, arr.data_type().clone(), true);
-    let schema = Arc::new(Schema::new(vec![field]));
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![arr.clone()]).expect("schema/array match");
-    let mut out = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut out, &schema).expect("ipc writer init");
-        writer.write(&batch).expect("ipc write");
-        writer.finish().expect("ipc finish");
-    }
-    out
 }
 
 // ---------------------------------------------------------
@@ -470,21 +447,16 @@ mod tests {
         })
     }
 
-    fn decode_ipc_string(bytes: &[u8]) -> String {
-        use arrow::ipc::reader::StreamReader;
-        let mut reader = StreamReader::try_new(bytes, None).expect("ipc reader");
-        let batch = reader.next().expect("at least one batch").expect("ok");
-        // The encoder produces a length-1 batch with the column under its name.
-        let col = batch.column(0);
-        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+    fn string_val(arr: &ArrayRef) -> String {
+        if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
             return a.value(0).to_string();
         }
-        if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
             return a.value(0).to_string();
         }
         panic!(
             "expected Utf8 or LargeUtf8 column; got {:?}",
-            col.data_type()
+            arr.data_type()
         );
     }
 
@@ -496,8 +468,8 @@ mod tests {
         ];
         let aggs = scalar_stats_agg(&segs);
         let agg = aggs.get("title").expect("title agg present");
-        assert_eq!(decode_ipc_string(&agg.min), "alpha");
-        assert_eq!(decode_ipc_string(&agg.max), "echo");
+        assert_eq!(string_val(&agg.min), "alpha");
+        assert_eq!(string_val(&agg.max), "echo");
     }
 
     #[test]
@@ -508,7 +480,7 @@ mod tests {
         ];
         let aggs = scalar_stats_agg(&segs);
         let agg = aggs.get("body").expect("body agg present");
-        assert_eq!(decode_ipc_string(&agg.min), "apple");
-        assert_eq!(decode_ipc_string(&agg.max), "papaya");
+        assert_eq!(string_val(&agg.min), "apple");
+        assert_eq!(string_val(&agg.max), "papaya");
     }
 }

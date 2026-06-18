@@ -15,13 +15,15 @@
 //!
 //! [`ManifestPart`]: super::part::ManifestPart
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use arrow_array::ArrayRef;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
 use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
 
 /// Wire format version for the manifest list.
@@ -138,7 +140,7 @@ pub struct ManifestListEntry {
     /// Per-scalar-column aggregate min/max across all
     /// superfiles in this part. An empty map is interpreted as
     /// "always-keep" by the list-level pruner.
-    pub scalar_stats_agg: BTreeMap<String, ScalarStatsAgg>,
+    pub scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
@@ -148,22 +150,47 @@ pub struct ManifestListEntry {
 }
 
 /// Aggregate scalar stats across a part's superfiles. Min/max
-/// are Arrow-IPC bytes of length-1 arrays (matches
-/// `ScalarStatsTable.cols` per-column shape).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// (and the exact sum) are held as length-1 [`ArrayRef`]s of the
+/// column's Arrow type — the same in-memory shape the per-superfile
+/// `ScalarStatsTable.cols` uses. They are decoded once when the
+/// manifest list is loaded, so the list-level scalar prune
+/// ([`crate::supertable::query::prune`]) compares against them
+/// without a per-query Arrow-IPC decode. The JSON wire form still
+/// stores them as base64 Arrow-IPC bytes (see [`ScalarStatsAggDto`]).
+#[derive(Debug, Clone)]
 pub struct ScalarStatsAgg {
-    pub min: Vec<u8>,
-    pub max: Vec<u8>,
+    pub min: ArrayRef,
+    pub max: ArrayRef,
     /// Σ null_count across the part's segments; `None` when any
     /// segment lacks the stat (total unknowable, never zero).
     pub null_count: Option<u64>,
-    /// Part-wide exact sum as Arrow-IPC length-1 bytes (same typing
+    /// Part-wide exact sum as a length-1 [`ArrayRef`] (same typing
     /// as the per-segment `ScalarStatsTable.sums`); `None` when any
     /// segment lacks it or the fold overflowed.
-    pub sum: Option<Vec<u8>>,
+    pub sum: Option<ArrayRef>,
     /// Merged HLL distinct sketch (raw registers); `None` when any
     /// segment lacks one.
     pub hll: Option<Vec<u8>>,
+}
+
+impl PartialEq for ScalarStatsAgg {
+    /// Equality compares the Arrow array contents (via [`ArrayRef::to_data`])
+    /// rather than pointer identity, so two independently-built aggregates
+    /// carrying the same values compare equal — the behaviour the round-trip
+    /// tests rely on. `ArrayRef` is not `Eq` (floats), so this type only
+    /// implements `PartialEq`.
+    fn eq(&self, other: &Self) -> bool {
+        let sum_eq = match (&self.sum, &other.sum) {
+            (Some(a), Some(b)) => a.to_data() == b.to_data(),
+            (None, None) => true,
+            _ => false,
+        };
+        self.min.to_data() == other.min.to_data()
+            && self.max.to_data() == other.max.to_data()
+            && self.null_count == other.null_count
+            && sum_eq
+            && self.hll == other.hll
+    }
 }
 
 /// Aggregate FTS summary across a part's superfiles.
@@ -220,6 +247,11 @@ pub enum ListParseError {
     BadPartId(String),
     #[error("bad value for field {0}: {1:?}")]
     BadFieldValue(&'static str, String),
+    #[error("scalar stats decode failed for {field}: {source}")]
+    ScalarStats {
+        field: &'static str,
+        source: DecodeError,
+    },
     #[error("incompatible major version: got {got}, supported {supported}")]
     IncompatibleMajorVersion { got: String, supported: String },
 }
@@ -228,6 +260,11 @@ pub enum ListParseError {
 pub enum ListEncodeError {
     #[error("json encode failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("scalar stats encode failed for {field}: {source}")]
+    ScalarStats {
+        field: &'static str,
+        source: EncodeError,
+    },
 }
 
 // ---------- Wire (serde) types ----------
@@ -389,8 +426,35 @@ fn decode_b64(s: &str, field: &'static str) -> Result<Vec<u8>, ListParseError> {
         .map_err(|source| ListParseError::Base64 { field, source })
 }
 
-fn entry_to_dto(e: &ManifestListEntry) -> ManifestListEntryDto {
-    ManifestListEntryDto {
+fn encode_scalar_array(
+    column: &str,
+    field: &'static str,
+    arr: &ArrayRef,
+) -> Result<String, ListEncodeError> {
+    let bytes = encode_length1_array(column, arr)
+        .map_err(|source| ListEncodeError::ScalarStats { field, source })?;
+    Ok(encode_b64(&bytes))
+}
+
+fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncodeError> {
+    let mut scalar_stats_agg = BTreeMap::new();
+    for (k, v) in &e.scalar_stats_agg {
+        let sum = match &v.sum {
+            None => None,
+            Some(s) => Some(encode_scalar_array(k, "scalar_stats_agg.sum", s)?),
+        };
+        scalar_stats_agg.insert(
+            k.clone(),
+            ScalarStatsAggDto {
+                min: encode_scalar_array(k, "scalar_stats_agg.min", &v.min)?,
+                max: encode_scalar_array(k, "scalar_stats_agg.max", &v.max)?,
+                null_count: v.null_count,
+                sum,
+                hll: v.hll.as_deref().map(encode_b64),
+            },
+        );
+    }
+    Ok(ManifestListEntryDto {
         part_id: e.part_id.0.to_string(),
         uri: e.uri.clone(),
         n_superfiles: e.n_superfiles,
@@ -399,22 +463,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> ManifestListEntryDto {
         content_hash: encode_hash(&e.content_hash),
         partition_key: encode_b64(&e.partition_key),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
-        scalar_stats_agg: e
-            .scalar_stats_agg
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    ScalarStatsAggDto {
-                        min: encode_b64(&v.min),
-                        max: encode_b64(&v.max),
-                        null_count: v.null_count,
-                        sum: v.sum.as_deref().map(encode_b64),
-                        hll: v.hll.as_deref().map(encode_b64),
-                    },
-                )
-            })
-            .collect(),
+        scalar_stats_agg,
         fts_summary_agg: e
             .fts_summary_agg
             .iter()
@@ -448,7 +497,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> ManifestListEntryDto {
                 )
             })
             .collect(),
-    }
+    })
 }
 
 fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListParseError> {
@@ -457,19 +506,38 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
     );
     let content_hash = decode_hash(&d.content_hash)?;
     let partition_key = decode_b64(&d.partition_key, "partition_key")?;
-    let mut scalar_stats_agg = BTreeMap::new();
+    let mut scalar_stats_agg = HashMap::new();
     for (k, v) in d.scalar_stats_agg {
+        let min = decode_length1_array(&decode_b64(&v.min, "scalar_stats_agg.min")?).map_err(
+            |source| ListParseError::ScalarStats {
+                field: "scalar_stats_agg.min",
+                source,
+            },
+        )?;
+        let max = decode_length1_array(&decode_b64(&v.max, "scalar_stats_agg.max")?).map_err(
+            |source| ListParseError::ScalarStats {
+                field: "scalar_stats_agg.max",
+                source,
+            },
+        )?;
+        let sum = match v.sum.as_deref() {
+            None => None,
+            Some(s) => Some(
+                decode_length1_array(&decode_b64(s, "scalar_stats_agg.sum")?).map_err(
+                    |source| ListParseError::ScalarStats {
+                        field: "scalar_stats_agg.sum",
+                        source,
+                    },
+                )?,
+            ),
+        };
         scalar_stats_agg.insert(
             k,
             ScalarStatsAgg {
-                min: decode_b64(&v.min, "scalar_stats_agg.min")?,
-                max: decode_b64(&v.max, "scalar_stats_agg.max")?,
+                min,
+                max,
                 null_count: v.null_count,
-                sum: v
-                    .sum
-                    .as_deref()
-                    .map(|s| decode_b64(s, "scalar_stats_agg.sum"))
-                    .transpose()?,
+                sum,
                 hll: v
                     .hll
                     .as_deref()
@@ -578,8 +646,13 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
     })
 }
 
-fn list_to_dto(l: &ManifestList) -> ManifestListDto {
-    ManifestListDto {
+fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
+    let parts = l
+        .parts
+        .iter()
+        .map(entry_to_dto)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ManifestListDto {
         format_version: l.format_version.clone(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
@@ -598,8 +671,8 @@ fn list_to_dto(l: &ManifestList) -> ManifestListDto {
             })
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
-        parts: l.parts.iter().map(entry_to_dto).collect(),
-    }
+        parts,
+    })
 }
 
 fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
@@ -640,7 +713,7 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
 /// types, so byte-output is deterministic for content-equal
 /// inputs.
 pub fn encode(list: &ManifestList) -> Result<Vec<u8>, ListEncodeError> {
-    let dto = list_to_dto(list);
+    let dto = list_to_dto(list)?;
     Ok(serde_json::to_vec_pretty(&dto)?)
 }
 
@@ -682,7 +755,9 @@ mod tests {
     //! jq-friendly.
     use super::super::part::{ContentHash, PartId};
     use super::*;
-    use std::collections::BTreeMap;
+    use arrow_array::Int64Array;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn empty_list() -> ManifestList {
@@ -703,17 +778,23 @@ mod tests {
     }
 
     fn rich_entry(seed: u8) -> ManifestListEntry {
-        let mut scalar = BTreeMap::new();
-        scalar.insert(
-            "ts".into(),
-            ScalarStatsAgg {
-                min: vec![seed, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
-                max: vec![seed, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9],
-                null_count: Some(u64::from(seed)),
-                sum: Some(vec![seed, 0x10, 0x20]),
-                hll: Some(vec![seed; 4]),
-            },
-        );
+        // Several columns (inserted out of sorted order) so the JSON
+        // round-trip and byte-equality tests actually exercise the
+        // HashMap → BTreeMap re-sort that keeps the wire form
+        // deterministic for content-addressing.
+        let mut scalar = HashMap::new();
+        for col in ["ts", "amount", "_id"] {
+            scalar.insert(
+                col.to_string(),
+                ScalarStatsAgg {
+                    min: Arc::new(Int64Array::from(vec![i64::from(seed)])) as ArrayRef,
+                    max: Arc::new(Int64Array::from(vec![i64::from(seed) + 1_000])) as ArrayRef,
+                    null_count: Some(u64::from(seed)),
+                    sum: Some(Arc::new(Int64Array::from(vec![i64::from(seed) * 7])) as ArrayRef),
+                    hll: Some(vec![seed; 4]),
+                },
+            );
+        }
 
         let mut fts = BTreeMap::new();
         fts.insert(
