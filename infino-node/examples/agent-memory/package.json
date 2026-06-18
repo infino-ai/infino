@@ -1,0 +1,9 @@
+{
+  "name": "infino-example-agent-memory",
+  "private": true,
+  "type": "module",
+  "description": "Agent long-term memory on infino — hybrid (BM25 + vector) recall and SQL over memory, in one engine.",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0"
+  }
+}

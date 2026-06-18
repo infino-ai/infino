@@ -93,6 +93,27 @@ test("querySql can return an Arrow table with { arrow: true }", () => {
   assert.equal(tbl.numRows, 1);
 });
 
+test("query_sql with a hybrid_search TVF returns rows from a sync host (#170)", () => {
+  const db = connect("memory://");
+  const dim = 16;
+  const schema = new Schema([
+    new Field("title", new LargeUtf8(), false),
+    new Field("emb", new FixedSizeList(dim, new Field("item", new Float32(), true)), false),
+  ]);
+  const docs = db.createTable("docs", schema, new IndexSpec().fts("title").vector("emb", dim, 1, "cosine"));
+  docs.append([
+    { title: "billing and refunds", emb: onehot(0, dim) },
+    { title: "dark mode appearance", emb: onehot(1, dim) },
+  ]);
+  // A search TVF through query_sql used to abort the process from a sync host
+  // (no ambient multi-thread runtime); it must now return rows, not abort.
+  const qvec = onehot(0, dim).join(",");
+  const rows = db.querySql(
+    `SELECT _id, score FROM hybrid_search('docs', 'title', 'billing', 'emb', '${qvec}', 5)`,
+  );
+  assert.ok(rows.length >= 1);
+});
+
 test("tokenMatch and exactMatch return unranked rows", () => {
   const db = connect("memory://");
   const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
