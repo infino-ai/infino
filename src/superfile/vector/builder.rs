@@ -124,13 +124,13 @@ fn metric_id(m: Metric) -> u32 {
     }
 }
 
-/// Per-column user-supplied build configuration.
+/// Per-vector-index build configuration.
 #[derive(Debug, Clone)]
 pub struct VectorConfig {
     /// Logical column name. Must not collide with any other
-    /// column in the same superfile (FTS or vector). Named
-    /// `column` to align with `FtsConfig::column` and the
-    /// public superfile API surface; this is also the on-disk
+    /// logical index in the same superfile (FTS or vector). Named
+    /// `column` for API compatibility with `FtsConfig::column`; semantically
+    /// this is the logical vector index name; this is also the on-disk
     /// JSON key in `inf.vec.columns`.
     pub column: String,
     pub dim: usize,
@@ -250,7 +250,7 @@ impl ScratchDir {
     }
 }
 
-/// Multi-column vector blob builder. The streaming build path changes
+/// Multi-index vector blob builder. The streaming build path changes
 /// the builder from "accumulate full corpus in RAM" to
 /// "reservoir-sample + spill to disk past a threshold"; peak
 /// resident memory is now a function of `(reservoir, n_cent,
@@ -317,7 +317,7 @@ impl VectorBuilder {
         self.spill_threshold_bytes = threshold;
     }
 
-    /// Register a vector column up-front. Returns the assigned
+    /// Register a logical vector index up-front. Returns the assigned
     /// `column_id` (declaration order).
     pub fn register_column(&mut self, config: VectorConfig) -> Result<u32, BuildError> {
         if config.column.as_bytes().contains(&FST_SEPARATOR) {

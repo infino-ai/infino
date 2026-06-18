@@ -742,10 +742,10 @@ pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 
 /// Lloyd iterations when folding per-superfile cluster centroids into the
 /// global cell grid at open/create time.
-const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
+pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 
 /// Fixed PRNG seed for global centroid training.
-const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
+pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 
 /// Train global VectorCell centroids from the user manifest and queue them
 /// on the hidden index table for its next commit.
@@ -759,34 +759,25 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
     }
 }
 
-pub(super) fn queue_hidden_vector_cell_strategy(
-    user_inner: &SupertableInner,
-    hidden: &Supertable,
-) {
-    let Some(clusters) = train_global_centroids(
-        &user_inner.options,
-        &user_inner.manifest.load_full(),
-        GLOBAL_VECTOR_CELL_COUNT,
-    ) else {
-        return;
-    };
-    let column = user_inner
-        .options
-        .vector_columns
-        .first()
-        .map(|vc| vc.column.clone())
-        .unwrap_or_default();
-    let strategy = super::manifest::list::PartitionStrategy::VectorCell {
-        column,
-        clusters,
-    };
-    *hidden
-        .inner
+pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
+    let strategy = inner
         .pending_partition_strategy
         .lock()
-        .expect("pending_partition_strategy mutex poisoned") = Some(strategy);
+        .expect("pending_partition_strategy mutex poisoned")
+        .take();
+    let Some(strategy) = strategy else {
+        return false;
+    };
+    let current = inner.manifest.load_full();
+    inner
+        .manifest
+        .store(Arc::new(current.with_partition_strategy(strategy)));
+    true
 }
 
+/// Open-time bootstrap only: derive initial global centroids from an
+/// existing user-table IVF summary. Hidden commits use
+/// [`super::spfresh`] MVCC maintenance — never call this per commit.
 pub(crate) fn train_global_centroids(
     user_opts: &SupertableOptions,
     manifest: &super::manifest::Manifest,
@@ -892,7 +883,10 @@ fn build_vector_index_options(
         user_opts.tokenizer.clone(),
     )
     .ok()?;
-    hidden_opts = hidden_opts.with_storage(Arc::clone(&sub_storage));
+    hidden_opts = hidden_opts
+        .with_storage(Arc::clone(&sub_storage))
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::CellPosting)
+        .with_eager_load_threshold(128);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
@@ -1208,6 +1202,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }

@@ -28,6 +28,7 @@ pub(crate) mod compaction;
 pub mod error;
 pub mod handle;
 pub mod lazy_source;
+pub(crate) mod spfresh;
 pub mod manifest;
 pub mod mutations;
 pub mod options;

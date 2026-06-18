@@ -45,7 +45,7 @@ pub enum BuildError {
     #[error("user column name {0:?} starts with reserved prefix 'inf.'")]
     ReservedPrefixInColumnName(String),
 
-    #[error("vector column {column:?} declares dim={dim}; must be in [16, 4096]")]
+    #[error("vector index {column:?} declares dim={dim}; must be in [16, 4096]")]
     VectorDimOutOfRange { column: String, dim: usize },
 
     /// The column requested a rerank codec that this build of infino
@@ -53,13 +53,13 @@ pub enum BuildError {
     /// `sq8`, `none` (see
     /// [`crate::superfile::vector::rerank_codec::RerankCodec`]).
     #[error(
-        "vector column {column:?}: rerank codec {codec:?} is not supported; \
+        "vector index {column:?}: rerank codec {codec:?} is not supported; \
          supported codecs are fp32, sq8, none"
     )]
     VectorRerankCodecUnimplemented { column: String, codec: &'static str },
 
     #[error(
-        "vector column {column:?}: query/added vector dim {actual} does not match declared dim {expected}"
+        "vector index {column:?}: query/added vector dim {actual} does not match declared dim {expected}"
     )]
     VectorDimMismatch {
         column: String,
@@ -73,7 +73,7 @@ pub enum BuildError {
     #[error("vectors could not be read")]
     VectorReadError,
 
-    #[error("vectors slice has {actual} entries but {expected} vector columns are declared")]
+    #[error("vectors slice has {actual} entries but {expected} vector indexs are declared")]
     VectorCountMismatch { expected: usize, actual: usize },
 
     #[error("row arrow_values has {actual} entries but schema has {expected} columns")]
@@ -181,7 +181,7 @@ pub enum FtsError {
 /// Errors specific to vector query execution.
 #[derive(Debug, Error)]
 pub enum VectorError {
-    #[error("unknown vector column {0:?}")]
+    #[error("unknown vector index {0:?}")]
     UnknownColumn(String),
 
     #[error("query dimension {got} does not match column dimension {expected}")]

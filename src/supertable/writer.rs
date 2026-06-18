@@ -62,6 +62,8 @@ use rayon::prelude::*;
 
 use crate::storage::{StorageError, StorageProvider};
 use crate::superfile::builder::SuperfileBuilder;
+use crate::superfile::vector::cell_posting;
+use crate::superfile::vector::layout::VectorLayout;
 use crate::superfile::format::CRC_BYTES;
 use crate::superfile::format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr};
 use crate::superfile::format::vec::{
@@ -71,8 +73,8 @@ use crate::superfile::format::vec::{
 use crate::superfile::format::{footer::read_kv_metadata, kv};
 use crate::supertable::error::ManifestError;
 use crate::supertable::manifest::Manifest;
-use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
-use crate::supertable::manifest::commit::get_current_manifest_etag;
+use crate::supertable::manifest::partition::{assign_partition, encode_partition_key, PartitionKey};
+use crate::supertable::manifest::commit::{get_current_manifest_etag, list_uri};
 use crate::supertable::manifest::part::{self as part_mod, PartId};
 use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
 
@@ -228,6 +230,133 @@ fn split_buffer_into_row_shards(
     }
     shards.retain(|s| !s.is_empty());
     shards
+}
+
+
+async fn fetch_cell_posting_blob_writer(
+    storage: &Arc<dyn StorageProvider>,
+    entry: &SuperfileEntry,
+) -> Result<Bytes, BuildError> {
+    let offsets = entry.subsection_offsets.as_ref().ok_or_else(|| {
+        BuildError::Store(format!(
+            "cell posting superfile {:?} missing subsection_offsets",
+            entry.uri
+        ))
+    })?;
+    let (off, len) = offsets.vec.ok_or_else(|| {
+        BuildError::Store(format!(
+            "cell posting superfile {:?} missing vec subsection",
+            entry.uri
+        ))
+    })?;
+    for (blob_off, bytes) in &offsets.open_blob {
+        if *blob_off == off && bytes.len() as u64 == len {
+            return Ok(Bytes::copy_from_slice(bytes));
+        }
+    }
+    let path = entry.uri.storage_path();
+    storage
+        .get_range(&path, off..off.saturating_add(len))
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))
+}
+
+async fn load_cell_rows_from_existing(
+    inner: &SupertableInner,
+    existing: &[Arc<SuperfileEntry>],
+    vec_dim: usize,
+) -> Result<Vec<(i128, Vec<f32>)>, BuildError> {
+    let storage = inner
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| BuildError::Store("storage required for cell posting merge".into()))?;
+    let store = Arc::clone(&inner.options.store);
+    let disk_cache = inner.options.disk_cache.as_ref().map(Arc::clone);
+    let id_column = inner.options.id_column.as_str();
+    let mut rows = Vec::new();
+    for entry in existing {
+        let blob = fetch_cell_posting_blob_writer(storage, entry).await?;
+        let (_metric, dim, local_ids, vectors) =
+            cell_posting::decode_all_vectors(&blob).map_err(|e| BuildError::Store(e))?;
+        if dim != vec_dim {
+            return Err(BuildError::Store(format!(
+                "cell posting dim mismatch: expected {vec_dim}, got {dim}"
+            )));
+        }
+        let sf = crate::supertable::query::dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            Some(storage),
+            entry,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        let locals: Vec<u32> = (0..local_ids.len() as u32).collect();
+        if locals.is_empty() {
+            continue;
+        }
+        let batch = sf
+            .take_by_local_doc_ids(&locals, &[id_column])
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let id_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or(BuildError::BatchSchemaMismatch)?;
+        for row in 0..local_ids.len() {
+            let uid = id_arr.value(row);
+            let start = row * vec_dim;
+            rows.push((uid, vectors[start..start + vec_dim].to_vec()));
+        }
+    }
+    Ok(rows)
+}
+
+fn append_batch_rows(rows: &mut Vec<(i128, Vec<f32>)>, batches: &[BufferedBatch], vec_dim: usize) {
+    for batch in batches {
+        let n_rows = batch.scalar.num_rows();
+        let Some(id_arr) = batch.scalar.column(0).as_any().downcast_ref::<Decimal128Array>() else {
+            continue;
+        };
+        let vecs = batch.vectors[0].values();
+        for row in 0..n_rows {
+            let uid = id_arr.value(row);
+            let start = row * vec_dim;
+            let vector = vecs[start..start + vec_dim].to_vec();
+            if let Some(existing) = rows.iter_mut().find(|(id, _)| *id == uid) {
+                existing.1 = vector;
+            } else {
+                rows.push((uid, vector));
+            }
+        }
+    }
+}
+
+fn rows_to_buffered_batch(
+    rows: &[(i128, Vec<f32>)],
+    options: &SupertableOptions,
+    vec_dim: usize,
+) -> Result<BufferedBatch, BuildError> {
+    let id_array = Decimal128Array::from_iter_values(rows.iter().map(|(id, _)| *id))
+        .with_precision_and_scale(
+            crate::supertable::options::DECIMAL128_PRECISION,
+            crate::supertable::options::DECIMAL128_SCALE,
+        )
+        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+    let mut vec_data = Vec::with_capacity(rows.len() * vec_dim);
+    for (_, v) in rows {
+        vec_data.extend_from_slice(v);
+    }
+    let scalar = RecordBatch::try_new(
+        options.scalar_schema(),
+        vec![Arc::new(id_array) as ArrayRef],
+    )
+    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+    Ok(BufferedBatch {
+        scalar,
+        vectors: vec![Arc::new(Float32Array::from(vec_data))],
+    })
 }
 
 /// Split buffered rows into per-cell shards based on nearest centroid.
@@ -420,6 +549,49 @@ impl Supertable {
     }
 }
 
+fn bootstrap_centroids_from_batch(
+    batches: &[BufferedBatch],
+    vec_dim: usize,
+    n_cells: usize,
+) -> Option<crate::supertable::manifest::ClusterCentroids> {
+    use crate::superfile::vector::kmeans::kmeans_with_assignments;
+    use crate::supertable::handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED};
+
+    let mut vectors = Vec::new();
+    for batch in batches {
+        if batch.vectors.is_empty() {
+            continue;
+        }
+        let vecs = batch.vectors[0].values();
+        let n_rows = batch.scalar.num_rows();
+        for row in 0..n_rows {
+            vectors.extend_from_slice(&vecs[row * vec_dim..(row + 1) * vec_dim]);
+        }
+    }
+    let n_docs = vectors.len() / vec_dim;
+    if n_docs == 0 {
+        return None;
+    }
+    let k = n_cells.min(n_docs).max(1);
+    let (centroids, assignments) = kmeans_with_assignments(
+        &vectors,
+        vec_dim,
+        k,
+        GLOBAL_VECTOR_KMEANS_ITERS,
+        GLOBAL_VECTOR_KMEANS_SEED,
+    );
+    let mut counts = vec![0u32; k];
+    for &a in &assignments {
+        counts[a as usize] += 1;
+    }
+    Some(crate::supertable::manifest::ClusterCentroids::from_fp32(
+        k as u32,
+        vec_dim as u32,
+        &centroids,
+        counts,
+    ))
+}
+
 impl SupertableWriter {
     /// Number of buffered batches not yet committed. Useful for
     /// tests + diagnostics; not part of the production hot path.
@@ -541,7 +713,7 @@ impl SupertableWriter {
         let options = &self.inner.options;
         let n_rows = ids.len();
         if n_rows == 0 {
-            return Ok(());
+            return Ok::<(), BuildError>(());
         }
         if vectors.len() != options.vector_columns.len() {
             return Err(BuildError::BatchSchemaMismatch);
@@ -1018,6 +1190,261 @@ impl SupertableWriter {
 
     /// Drain the pending-appends buffer and publish all shard
     /// outputs in one manifest swap. Internal-only; the public
+
+    /// MVCC SPFresh hidden-index commit: assign batch to nearest cells,
+    /// merge only touched cells, write replacement cell superfiles, swap manifest
+    /// generation (supersede old cell entries), locally refresh centroids.
+
+    fn commit_cell_posting_internal(&mut self) -> Result<(), BuildError> {
+        if self.buffer.is_empty() {
+            return Ok::<(), BuildError>(());
+        }
+        let buffer = std::mem::take(&mut self.buffer);
+        self.buffer_bytes = 0;
+
+        super::handle::apply_pending_partition_strategy(&self.inner);
+        let vec_dim = self
+            .inner
+            .options
+            .vector_columns
+            .first()
+            .map(|vc| vc.dim)
+            .unwrap_or(0);
+        if vec_dim == 0 {
+            return Ok::<(), BuildError>(());
+        }
+        let metric = self
+            .inner
+            .options
+            .vector_columns
+            .first()
+            .map(|vc| vc.metric)
+            .unwrap_or(crate::superfile::vector::distance::Metric::L2Sq);
+        let column = self
+            .inner
+            .options
+            .vector_columns
+            .first()
+            .map(|vc| vc.column.clone())
+            .unwrap_or_default();
+
+        let mut strategy = self.inner.manifest.load().get_partition_strategy();
+        let clusters = match &strategy {
+            crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                clusters, ..
+            } if clusters.n_cent > 0 && clusters.dim > 0 => clusters.clone(),
+            _ => {
+                let boot = bootstrap_centroids_from_batch(
+                    &buffer,
+                    vec_dim,
+                    super::handle::GLOBAL_VECTOR_CELL_COUNT,
+                )
+                .ok_or_else(|| {
+                    BuildError::Store("hidden index: bootstrap centroids from batch failed".into())
+                })?;
+                strategy = crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                    column: column.clone(),
+                    clusters: boot.clone(),
+                };
+                self.inner.manifest.store(Arc::new(
+                    self.inner.manifest.load().with_partition_strategy(strategy.clone()),
+                ));
+                boot
+            }
+        };
+
+        let cell_shards =
+            split_buffer_by_vector_cell(buffer, &clusters, metric, 0);
+
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| BuildError::Store("cell posting commit requires storage".into()))?;
+        let inner = Arc::clone(&self.inner);
+        let options = Arc::clone(&self.inner.options);
+        let column_for_strategy = column;
+
+        let drive = async move {
+            let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::new();
+            let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
+            let mut pending_storage_writes: Vec<(SuperfileUri, Bytes)> = Vec::new();
+            let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
+            let mut pending_cache_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+
+            let manifest_before = inner.manifest.load();
+            let old_list_uri = Some(list_uri(manifest_before.get_manifest_id()));
+            let mut old_part_uris: Vec<String> = Vec::new();
+
+            // Phase 1 (assign): route batch to nearest centroids; merge prior generation.
+            let mut merged_by_cell: std::collections::HashMap<u32, Vec<(i128, Vec<f32>)>> =
+                std::collections::HashMap::new();
+            for (cell_id, batches) in &cell_shards {
+                let pk_bytes = encode_partition_key(&PartitionKey::VectorCell(*cell_id));
+                let existing: Vec<Arc<SuperfileEntry>> = manifest_before
+                    .superfiles_for_partition_key(&pk_bytes)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                let mut rows =
+                    load_cell_rows_from_existing(&inner, &existing, vec_dim).await?;
+                append_batch_rows(&mut rows, batches, vec_dim);
+                rows.sort_by_key(|(id, _)| *id);
+                merged_by_cell.insert(*cell_id, rows);
+            }
+
+            // Phase 2 (split): LIRE-style local k-means(2) when a touched cell overflows.
+            let mut split_new_cell: Option<u32> = None;
+            if let Some((&cell_id, rows)) = merged_by_cell
+                .iter()
+                .max_by_key(|(_, rows)| rows.len())
+            {
+                if rows.len() >= super::spfresh::CELL_SPLIT_THRESHOLD {
+                    if let Some((left, right)) = super::spfresh::split_cell_rows(
+                        rows,
+                        vec_dim,
+                        super::spfresh::GLOBAL_VECTOR_KMEANS_SEED
+                            .wrapping_add(u64::from(cell_id)),
+                    ) {
+                        merged_by_cell.insert(cell_id, left);
+                        let new_id = clusters.n_cent;
+                        merged_by_cell.insert(new_id, right);
+                        split_new_cell = Some(new_id);
+                    }
+                }
+            }
+
+            // Phase 3 (publish): write replacement cell superfiles + centroid refresh.
+            let mut cell_updates: std::collections::HashMap<u32, (Vec<f32>, u32)> =
+                std::collections::HashMap::new();
+            let mut new_cell_centroids: Vec<(Vec<f32>, u32)> = Vec::new();
+            if let Some(new_id) = split_new_cell {
+                if let Some(rows) = merged_by_cell.get(&new_id) {
+                    new_cell_centroids.push((
+                        super::spfresh::centroid_mean_from_rows(rows, vec_dim),
+                        rows.len() as u32,
+                    ));
+                }
+            }
+
+            for (cell_id, rows) in &merged_by_cell {
+                let mean = super::spfresh::centroid_mean_from_rows(rows, vec_dim);
+                cell_updates.insert(*cell_id, (mean, rows.len() as u32));
+
+                let pk_bytes = encode_partition_key(&PartitionKey::VectorCell(*cell_id));
+                for le in manifest_before.get_all_list_entries() {
+                    if le.partition_key == pk_bytes {
+                        old_part_uris.push(le.uri.clone());
+                    }
+                }
+                let existing: Vec<Arc<SuperfileEntry>> = manifest_before
+                    .superfiles_for_partition_key(&pk_bytes)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                to_remove.extend(existing.iter().cloned());
+
+                let merged = rows_to_buffered_batch(rows, options.as_ref(), vec_dim)?;
+                let shard = build_one_shard(std::slice::from_ref(&merged), options.as_ref())?;
+                let reuse_uri = existing.first().map(|e| e.uri);
+                let Some(prepared) = prepare_superfile_with_uri(&inner, shard, reuse_uri)? else {
+                    continue;
+                };
+                let entry = finish_superfile_entry(&inner, prepared.entry, Some(*cell_id))?;
+
+                let uri_reused = reuse_uri.is_some();
+                if let Some((uri, b)) = prepared.bytes_for_store {
+                    if uri_reused {
+                        inner
+                            .options
+                            .store
+                            .replace(uri, b)
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                    } else {
+                        inner
+                            .options
+                            .store
+                            .insert(uri, b)
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                    }
+                }
+                if let Some(t) = prepared.bytes_for_storage {
+                    pending_storage_writes.push(t);
+                }
+                if let Some(t) = prepared.bytes_for_cache {
+                    if uri_reused {
+                        pending_cache_replaces.push(t);
+                    } else {
+                        pending_cache_inserts.push(t);
+                    }
+                }
+                new_entries.push(entry);
+            }
+
+            if new_entries.is_empty() {
+                return Ok::<(), BuildError>(());
+            }
+
+            let updated_clusters =
+                super::spfresh::apply_cell_centroid_updates(&clusters, &cell_updates, &new_cell_centroids);
+            let updated_strategy =
+                crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                    column: column_for_strategy,
+                    clusters: updated_clusters,
+                };
+            inner.manifest.store(Arc::new(
+                manifest_before.with_partition_strategy(updated_strategy),
+            ));
+
+            let new_uris: std::collections::HashSet<_> =
+                new_entries.iter().map(|e| e.uri.clone()).collect();
+            let storage_for_gc = Arc::clone(&storage);
+            persist_commit(&inner, storage, new_entries, &to_remove, pending_storage_writes)
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+
+            for entry in &to_remove {
+                if !new_uris.contains(&entry.uri) {
+                    let path = superfile_storage_path(&entry.uri);
+                    let _ = storage_for_gc.delete(&path).await;
+                }
+            }
+            for uri in old_part_uris {
+                let _ = storage_for_gc.delete(&uri).await;
+            }
+            if let Some(uri) = old_list_uri {
+                let _ = storage_for_gc.delete(&uri).await;
+            }
+
+            if !pending_cache_inserts.is_empty()
+                && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
+            {
+                warm_cache_after_commit(&inner, &cache, pending_cache_inserts);
+            }
+            if !pending_cache_replaces.is_empty()
+                && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
+            {
+                warm_cache_replace_after_commit(&inner, &cache, pending_cache_replaces);
+            }
+            if let (Some(cache), Some(budget)) = (
+                inner.options.disk_cache.as_ref(),
+                inner.options.memory_budget_bytes,
+            ) {
+                cache.sweep_for_budget(budget);
+            }
+            Ok::<(), BuildError>(())
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(drive))?;
+            }
+            Err(_) => {
+                self.inner.query_runtime().block_on(drive)?;
+            }
+        }
+        Ok(())
+    }
+
     /// [`SupertableWriter::commit`] calls this first before
     /// driving pending mutations.
     ///
@@ -1026,46 +1453,55 @@ impl SupertableWriter {
     /// one `commit` produce the same shard layout as one large append.
     fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok::<(), BuildError>(());
+        }
+        if self.inner.options.vector_layout == VectorLayout::CellPosting
+            && self.inner.options.storage.is_some()
+        {
+            return self.commit_cell_posting_internal();
         }
         let buffer = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
-        // Dual write to hidden vector-index supertable. The hidden commit
-        // runs on a background thread overlapping user-table shard build, but
-        // we join before returning so both supertable storage commits finish before commit() returns.
-        let hidden_join = if let Some(vit) = self.inner.vector_index_table.as_ref()
-            && let Ok(mut vw) = vit.writer()
-        {
-            for batch in &buffer {
-                let Some(ids) = batch.scalar.column(0).as_any().downcast_ref::<Decimal128Array>()
-                else {
+        // Dual-write vectors into the hidden index writer. Hidden commit is
+        // deferred until after the user manifest publish so global centroids
+        // can be trained from the freshly-written user superfile summaries.
+        let mut hidden_writer = None;
+        if let Some(vit) = self.inner.vector_index_table.as_ref() {
+            match vit.writer() {
+                Ok(mut vw) => {
+                    for batch in &buffer {
+                        let Some(ids) = batch
+                            .scalar
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                        else {
+                            tracing::warn!(
+                                "supertable: hidden vector-index dual-write missing _id column"
+                            );
+                            continue;
+                        };
+                        if let Err(e) = vw.append_dual_write_batch(ids, &batch.vectors) {
+                            tracing::warn!(
+                                "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
+                            );
+                            break;
+                        }
+                    }
+                    hidden_writer = Some(vw);
+                }
+                Err(e) => {
                     tracing::warn!(
-                        "supertable: hidden vector-index dual-write missing _id column"
+                        "supertable: hidden vector-index writer unavailable: {e} (vector search may be stale)"
                     );
-                    continue;
-                };
-                if let Err(e) = vw.append_dual_write_batch(ids, &batch.vectors) {
-                    tracing::warn!(
-                        "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
-                    );
-                    break;
                 }
             }
-            Some(std::thread::spawn(move || {
-                if let Err(e) = vw.commit() {
-                    tracing::warn!(
-                        "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
-                    );
-                }
-            }))
-        } else {
-            None
-        };
+        }
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
-            return Ok(());
+            return Ok::<(), BuildError>(());
         }
 
         let writer_pool = Arc::clone(&self.inner.options.writer_pool);
@@ -1125,12 +1561,14 @@ impl SupertableWriter {
         })?;
 
         publish_superfiles(&self.inner, outputs, cell_hints)?;
-        if let Some(join) = hidden_join
-            && join.join().is_err()
+        if let Some(_vit) = self.inner.vector_index_table.as_ref()
+            && let Some(mut vw) = hidden_writer
         {
-            tracing::warn!(
-                "supertable: hidden vector-index commit thread panicked (vector search may be stale)"
-            );
+            if let Err(e) = vw.commit() {
+                tracing::warn!(
+                    "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
+                );
+            }
         }
         Ok(())
     }
@@ -1279,9 +1717,14 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
         _ => None,
     };
     let total_size = bytes.len() as u64;
-    let vec_open_ranges = vec
-        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
-        .unwrap_or_default();
+    let layout = read_vector_layout_from_bytes(bytes);
+    let vec_open_ranges = if layout == crate::superfile::vector::layout::VectorLayout::CellPosting {
+        vec.map(|(off, len)| vec![(off, len)]).unwrap_or_default()
+    } else {
+        vec
+            .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+            .unwrap_or_default()
+    };
     let fts_open_ranges = fts
         .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
         .unwrap_or_default();
@@ -1523,11 +1966,19 @@ pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
+    prepare_superfile_with_uri(inner, shard, None)
+}
+
+pub(super) fn prepare_superfile_with_uri(
+    inner: &SupertableInner,
+    shard: ShardOutput,
+    reuse_uri: Option<SuperfileUri>,
+) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
     }
 
-    let uri = SuperfileUri::new_v4();
+    let uri = reuse_uri.unwrap_or_else(SuperfileUri::new_v4);
 
     let bytes_for_storage = inner.options.storage.is_some().then(|| shard.bytes.clone());
     let cache_attached = inner.options.disk_cache.is_some() && inner.options.storage.is_some();
@@ -1628,6 +2079,7 @@ pub(super) fn prepare_superfile(
         partition_key: Vec::new(),
         partition_hint: None,
         subsection_offsets,
+        vector_layout: read_vector_layout_from_bytes(&shard.bytes),
     });
 
     Ok(Some(PreparedSuperfile {
@@ -1667,6 +2119,7 @@ fn finish_superfile_entry(
         partition_key: old.partition_key.clone(),
         partition_hint: hint.or(old.partition_hint),
         subsection_offsets: old.subsection_offsets.clone(),
+        vector_layout: old.vector_layout,
     };
     let strategy = inner.manifest.load().get_partition_strategy();
     let pk = assign_partition(&staged, &strategy)
@@ -1723,7 +2176,7 @@ fn publish_superfiles(
     }
 
     if new_entries.is_empty() {
-        return Ok(());
+        return Ok::<(), BuildError>(());
     }
 
     let old = inner.manifest.load();
@@ -1773,7 +2226,7 @@ fn publish_superfiles(
         ) {
             cache.sweep_for_budget(budget);
         }
-        return Ok(());
+        return Ok::<(), BuildError>(());
     }
 
     let new = old.with_appended(new_entries);
@@ -2195,6 +2648,33 @@ async fn put_superfile_multipart(
 /// manifest commit has succeeded, so the cache miss
 /// becomes a "warm load fails → next query cold-fetches"
 /// degradation, not a correctness break.
+fn warm_cache_replace_after_commit(
+    inner: &SupertableInner,
+    cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
+    pending: Vec<(SuperfileUri, Bytes)>,
+) {
+    let cache = Arc::clone(cache);
+    let drive = async move {
+        for (uri, bytes) in pending {
+            if let Err(e) = cache.replace_warm(&uri, bytes).await {
+                tracing::warn!(
+                    "supertable: warm cache replace failed for {}: {}",
+                    uri.0,
+                    e
+                );
+            }
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(drive));
+        }
+        Err(_) => {
+            inner.query_runtime().block_on(drive);
+        }
+    }
+}
+
 fn warm_cache_after_commit(
     inner: &SupertableInner,
     cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
@@ -2221,6 +2701,18 @@ fn warm_cache_after_commit(
             inner.query_runtime().block_on(drive);
         }
     }
+}
+
+
+pub(crate) fn read_vector_layout_from_bytes(bytes: &bytes::Bytes) -> crate::superfile::vector::layout::VectorLayout {
+    use crate::superfile::format::kv;
+    use crate::superfile::vector::layout::VectorLayout;
+    let Ok(kvs) = crate::superfile::format::footer::read_kv_metadata(bytes.as_ref()) else {
+        return VectorLayout::Ivf;
+    };
+    kvs.get(kv::VEC_LAYOUT)
+        .and_then(|s| VectorLayout::from_kv_value(s))
+        .unwrap_or(VectorLayout::Ivf)
 }
 
 #[cfg(test)]

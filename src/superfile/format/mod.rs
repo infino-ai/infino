@@ -301,14 +301,17 @@ pub mod kv {
     /// Present iff at least one FTS column: per-column FTS config JSON.
     pub const FTS_COLUMNS: &str = "inf.fts.columns";
 
-    /// Present iff at least one vector column: byte offset of vector blob.
+    /// Present iff at least one vector index: byte offset of vector blob.
     pub const VEC_OFFSET: &str = "inf.vec.offset";
 
-    /// Present iff at least one vector column: byte length of vector blob.
+    /// Present iff at least one vector index: byte length of vector blob.
     pub const VEC_LENGTH: &str = "inf.vec.length";
 
-    /// Present iff at least one vector column: per-column vector config JSON.
+    /// Present iff at least one vector index: per-index vector config JSON.
     pub const VEC_COLUMNS: &str = "inf.vec.columns";
+
+    /// Present iff vector blob uses a non-default layout (`ivf` default).
+    pub const VEC_LAYOUT: &str = "inf.vec.layout";
 
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
@@ -335,10 +338,11 @@ pub mod kv {
         VEC_OFFSET,
         VEC_LENGTH,
         VEC_COLUMNS,
+        VEC_LAYOUT,
     ];
 }
 
-/// Reserved column-name prefix; user FTS / vector column names must not
+/// Reserved column-name prefix; user FTS column / vector index names must not
 /// start with this string. Defensive — keeps the user's namespace and our
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";

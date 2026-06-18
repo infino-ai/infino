@@ -48,6 +48,7 @@ use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider,
 };
 use crate::superfile::builder::{BuilderOptions, FtsConfig, VectorConfig};
+use crate::superfile::vector::layout::VectorLayout;
 use crate::superfile::fts::tokenize::Tokenizer;
 
 use super::error::BuildError;
@@ -284,6 +285,7 @@ pub struct SupertableOptions {
     /// the persisted manifest list — config changes after
     /// creation have no effect.
     pub partition_strategy: Option<crate::supertable::manifest::list::PartitionStrategy>,
+    pub vector_layout: VectorLayout,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
     /// the next commit's superfiles for that partition go into
@@ -510,6 +512,7 @@ impl SupertableOptions {
             memory_budget_bytes: None,
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
+            vector_layout: VectorLayout::Ivf,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
@@ -888,6 +891,11 @@ impl SupertableOptions {
     ///   ([`SupertableOptions::scalar_schema`]) — vector columns
     ///   live in the embedded vector blob, never in Parquet.
     ///   The id column is prepended (Decimal128(38, 0)).
+    pub fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
+        self.vector_layout = layout;
+        self
+    }
+
     pub fn builder_options(&self) -> BuilderOptions {
         BuilderOptions::new(
             self.scalar_schema(),
@@ -896,6 +904,7 @@ impl SupertableOptions {
             self.vector_columns.clone(),
             self.tokenizer.clone(),
         )
+        .with_vector_layout(self.vector_layout)
     }
 
     /// Effective scalar-only schema — the user's columns with

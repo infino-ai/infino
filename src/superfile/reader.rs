@@ -38,6 +38,7 @@ use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+use crate::superfile::vector::layout::VectorLayout;
 use crate::superfile::vector::reader::VectorReader;
 use crate::supertable::query::provider::tombstone_access_plan;
 
@@ -46,6 +47,13 @@ use crate::supertable::query::provider::tombstone_access_plan;
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+
+fn vector_layout_from_kv(kv_map: &std::collections::HashMap<String, String>) -> VectorLayout {
+    kv_map
+        .get(kv::VEC_LAYOUT)
+        .and_then(|s| VectorLayout::from_kv_value(s))
+        .unwrap_or(VectorLayout::Ivf)
+}
 
 /// Per-open knobs for [`SuperfileReader::open_with`]. Defaults to
 /// safe behavior (CRC verification on); flip `verify_crc` to `false`
@@ -251,9 +259,13 @@ impl SuperfileReader {
             ));
         }
 
+        let vec_layout = vector_layout_from_kv(&kv_map);
         let vec_fut = async {
             if !vec_present {
                 return Ok::<_, ReadError>(None);
+            }
+            if vec_layout == VectorLayout::CellPosting {
+                return Ok(None);
             }
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
@@ -376,19 +388,24 @@ impl SuperfileReader {
             None
         };
 
-        // 5. Vector path mirrors FTS.
+        // 5. Vector path mirrors FTS (cell posting blobs are scanned separately).
+        let vec_layout = vector_layout_from_kv(&kv_map);
         let vec = if all_present(&kv_map, kv::VEC_KEYS) {
-            let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
-            let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
-            let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
-            let blob = slice_or_err(&bytes, off, len, "vector")?;
-            Some(VectorReader::open_with(
-                blob,
-                cols_json,
-                crate::superfile::vector::reader::OpenOptions {
-                    verify_crc: opts.verify_crc,
-                },
-            )?)
+            if vec_layout == VectorLayout::CellPosting {
+                None
+            } else {
+                let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
+                let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
+                let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
+                let blob = slice_or_err(&bytes, off, len, "vector")?;
+                Some(VectorReader::open_with(
+                    blob,
+                    cols_json,
+                    crate::superfile::vector::reader::OpenOptions {
+                        verify_crc: opts.verify_crc,
+                    },
+                )?)
+            }
         } else if any_present(&kv_map, kv::VEC_KEYS) {
             return Err(ReadError::MalformedKv(
                 "partial inf.vec.* keys present".into(),

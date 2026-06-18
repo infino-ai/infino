@@ -803,6 +803,23 @@ impl DiskCacheStore {
         Ok(())
     }
 
+    /// Replace a cached superfile's bytes. Used when a fixed URI is
+    /// read-merge-write-replaced (cell-posting cells); [`insert_warm`]
+    /// would no-op and leave a stale reader.
+    pub async fn replace_warm(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        bytes: Bytes,
+    ) -> Result<(), DiskCacheError> {
+        if let Some((_, entry)) = self.cached.remove(uri) {
+            self.current_bytes
+                .fetch_sub(entry.size_bytes, Ordering::Release);
+            let _ = std::fs::remove_file(self.cache_path(uri));
+        }
+        self.coordinators.remove(uri);
+        self.insert_warm(uri, bytes).await
+    }
+
     // ----- internals -----
 
     fn now_us(&self) -> u64 {

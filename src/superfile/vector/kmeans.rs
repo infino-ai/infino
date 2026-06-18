@@ -3,7 +3,7 @@
 
 //! K-means clustering — 5-iteration Lloyd's algorithm.
 //!
-//! Used to derive the `n_cent` IVF centroids per vector column at
+//! Used to derive the `n_cent` IVF centroids per vector index at
 //! build time. Five iterations is the standard turn-key default —
 //! diminishing returns past that on most embedding distributions,
 //! and we don't have a quality budget to spend more.

@@ -416,10 +416,12 @@ async fn do_apply(
         // which is correct for the Hash{n_buckets=1} default.
         partition_key: Vec::new(),
         partition_hint: None,
+
         // Mirror the commit path's 1-RTT cold-open hint; `None`
         // only if the bytes don't parse (same fallback as the
         // writer).
         subsection_offsets: build_subsection_offsets(&bytes),
+        vector_layout: crate::supertable::writer::read_vector_layout_from_bytes(&bytes),
     });
 
     // ---- Step 6: PUT bytes + CAS-commit the manifest ----

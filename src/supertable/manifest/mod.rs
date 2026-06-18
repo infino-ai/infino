@@ -185,6 +185,9 @@ pub struct Manifest {
         std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<part::ManifestPart>>>,
     >,
     loader: Option<std::sync::Arc<ManifestPartLoader>>,
+    /// Stamped partition strategy before the first list lands, or
+    /// when updating strategy without rebuilding options.
+    stamped_partition_strategy: Option<list::PartitionStrategy>,
 }
 
 impl std::fmt::Debug for Manifest {
@@ -233,6 +236,7 @@ impl Manifest {
                 list: Some(list),
                 parts: dashmap::DashMap::new(),
                 loader: Some(loader),
+            stamped_partition_strategy: None,
             }
         } else {
             Self {
@@ -240,6 +244,7 @@ impl Manifest {
                 list: None,
                 parts: dashmap::DashMap::new(),
                 loader: None,
+                stamped_partition_strategy: None,
             }
         }
     }
@@ -260,6 +265,7 @@ impl Manifest {
             list: None,
             parts: dashmap::DashMap::new(),
             loader: None,
+            stamped_partition_strategy: None,
         }
     }
 
@@ -275,6 +281,7 @@ impl Manifest {
             list: None,
             parts: dashmap::DashMap::new(),
             loader: None,
+            stamped_partition_strategy: None,
         }
     }
 
@@ -291,6 +298,9 @@ impl Manifest {
     }
 
     pub fn get_partition_strategy(&self) -> list::PartitionStrategy {
+        if let Some(s) = &self.stamped_partition_strategy {
+            return s.clone();
+        }
         self.list
             .as_ref()
             .map(|l| l.partition_strategy.clone())
@@ -503,6 +513,7 @@ impl Manifest {
             list: Some(list),
             parts,
             loader: Some(loader),
+            stamped_partition_strategy: None,
         };
 
         Ok(Arc::new(new_manifest))
@@ -651,8 +662,39 @@ impl Manifest {
             list: self.list.clone(),
             parts: dashmap::DashMap::new(),
             loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
         }
     }
+
+    /// Stamp (or replace) the partition strategy on this manifest snapshot.
+    /// Updates both the persisted list metadata and the in-memory options
+    /// fallback used before the first list write lands.
+    pub fn with_partition_strategy(
+        &self,
+        strategy: list::PartitionStrategy,
+    ) -> Self {
+        let new_list = match self.list.as_ref() {
+            Some(list) => {
+                let mut list = list.clone();
+                list.partition_strategy = strategy.clone();
+                Some(list)
+            }
+            None => None,
+        };
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.manifest_id,
+                options: Arc::clone(&self.options),
+                superfiles: self.superfiles.clone(),
+                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: Some(strategy),
+        }
+    }
+
 
     /// Lazy-load entry point for manifest parts.
     ///
@@ -683,6 +725,53 @@ impl Manifest {
             .clone();
         let loaded = cell.get_or_try_init(|| loader.load(part_id)).await?;
         Ok(std::sync::Arc::clone(loaded))
+    }
+
+    /// All superfiles under list parts for `partition_key`.
+    ///
+    /// The flat [`SuperfileList::superfiles`] view is only populated when
+    /// `parts.len() <= eager_load_threshold_parts`; writers that replace
+    /// per-partition superfiles must use this helper instead.
+    pub(crate) async fn superfiles_for_partition_key(
+        &self,
+        partition_key: &[u8],
+    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
+        let Some(list) = &self.list else {
+            return Ok(self
+                .superfiles
+                .iter()
+                .filter(|e| e.partition_key == partition_key)
+                .cloned()
+                .collect());
+        };
+        let mut out = Vec::new();
+        for entry in &list.parts {
+            if entry.partition_key != partition_key {
+                continue;
+            }
+            let part = self.get_part_by_id(entry.part_id).await?;
+            out.extend(part.superfiles.iter().cloned());
+        }
+        Ok(out)
+    }
+
+    /// Load superfiles for routed VectorCell ids from list parts (works when
+    /// the flat `superfiles` view is empty under lazy manifest loading).
+    pub(crate) async fn superfiles_for_routed_cells(
+        &self,
+        routed_cells: &[u32],
+    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for cell in routed_cells {
+            let pk = encode_partition_key(&crate::supertable::manifest::partition::PartitionKey::VectorCell(*cell));
+            for sf in self.superfiles_for_partition_key(&pk).await? {
+                if seen.insert(sf.superfile_id) {
+                    out.push(sf);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
@@ -961,6 +1050,7 @@ impl Manifest {
             list: Some(new_list),
             parts,
             loader,
+            stamped_partition_strategy: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -1170,6 +1260,7 @@ pub struct SuperfileEntry {
     /// then vec/fts in parallel) — see
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
+    pub vector_layout: crate::superfile::vector::layout::VectorLayout,
 }
 
 /// superfile layout offsets cached on the manifest.
@@ -2174,6 +2265,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -2735,6 +2827,7 @@ mod tests {
                 list: Some(list),
                 parts: dashmap::DashMap::new(),
                 loader: Some(loader),
+            stamped_partition_strategy: None,
             }
         }
 
@@ -2959,6 +3052,7 @@ mod tests {
             list: Some(list),
             parts: dashmap::DashMap::new(),
             loader: None,
+        stamped_partition_strategy: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -3284,6 +3378,7 @@ mod tests {
             vector_summary: Default::default(),
             partition_key: pk,
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -3327,6 +3422,7 @@ mod tests {
             }),
             parts: dashmap::DashMap::new(),
             loader: None,
+            stamped_partition_strategy: None,
         })
     }
 
@@ -3448,6 +3544,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -3541,6 +3638,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -3635,6 +3733,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -3681,6 +3780,7 @@ mod tests {
             vector_summary: Default::default(),
             partition_key: pk,
             partition_hint: Some(hint),
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -3781,6 +3881,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         // Add one new entry for the partition
@@ -3912,6 +4013,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let new_entries = vec![
@@ -4042,6 +4144,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         // Only touch partition A
@@ -4219,6 +4322,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let new_entries = vec![
@@ -4329,6 +4433,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4419,6 +4524,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let sf_new = make_superfile_entry(75, pk.clone());
@@ -4544,6 +4650,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4685,6 +4792,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4793,6 +4901,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4874,6 +4983,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -5013,6 +5123,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+        stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -5097,6 +5208,7 @@ mod tests {
             list: Some(list),
             parts: dashmap::DashMap::new(),
             loader: None,
+            stamped_partition_strategy: None,
         }
     }
 

@@ -56,7 +56,7 @@ pub(crate) const COSINE_DISTANCE_BASE: f32 = 1.0;
 /// the manifest's folded Sq8 centroid scoring).
 pub(crate) const L2_CROSS_TERM_COEFF: f32 = 2.0;
 
-/// Distance metric for a vector column. Stored per-column in
+/// Distance metric for a vector index. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
