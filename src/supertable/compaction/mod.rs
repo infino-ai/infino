@@ -1242,7 +1242,7 @@ mod tests {
             b"sierra",
         ] {
             assert!(
-                fts.term_bloom.contains(term),
+                fts.may_contain(term),
                 "bloom missing term '{}'",
                 std::str::from_utf8(term).expect("term literal is valid utf-8")
             );
@@ -1439,7 +1439,7 @@ mod tests {
             b"juliet",
         ] {
             assert!(
-                fts.term_bloom.contains(term),
+                fts.may_contain(term),
                 "bloom missing term '{}'",
                 std::str::from_utf8(term).expect("term literal is valid utf-8")
             );

@@ -37,7 +37,7 @@ use crate::supertable::manifest::list::{ManifestList, ManifestListEntry};
 use crate::supertable::manifest::part::PartId;
 
 /// Filter the list's parts to those whose
-/// `term_range_union[column]` overlaps the prefix
+/// `fts_summary_agg[column].term_range` overlaps the prefix
 /// `[prefix, prefix_upper_bound)`.
 ///
 /// Parts without an `fts_summary_agg` entry for this column
@@ -102,7 +102,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Filter the list's parts to those whose
-/// `term_bloom_union[column]` allows at least one query
+/// `fts_summary_agg[column].term_bloom` allows at least one query
 /// term (mode = Or) or all of them (mode = And) — i.e. the
 /// list-level analogue of superfile-level `fts_bloom_skip`.
 ///
@@ -260,7 +260,7 @@ mod tests {
         FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
     };
     use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, VectorSummary};
+    use crate::supertable::manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary};
     use crate::supertable::{SuperfileEntry, SuperfileUri};
     use arrow_array::Int64Array;
     use std::collections::HashMap;
@@ -305,11 +305,11 @@ mod tests {
             };
             fts.insert(
                 "title".into(),
-                FtsSummary {
-                    term_bloom: bloom.finish(),
-                    n_terms_distinct: title_terms.len() as u32,
+                FtsSummaryAgg::new_with_params(
+                    bloom.finish(),
+                    title_terms.len() as u32,
                     term_range,
-                },
+                ),
             );
         }
         let mut vec_summary = HashMap::new();
@@ -402,11 +402,11 @@ mod tests {
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
             "title".into(),
-            FtsSummary {
-                term_bloom: BloomBuilder::with_n_blocks(16).finish(),
-                n_terms_distinct: 0,
-                term_range: (Vec::new(), Vec::new()),
-            },
+            FtsSummaryAgg::new_with_params(
+                BloomBuilder::with_n_blocks(16).finish(),
+                0,
+                (Vec::new(), Vec::new()),
+            ),
         );
         let s_c = Arc::new(SuperfileEntry {
             superfile_id: id,
@@ -435,11 +435,11 @@ mod tests {
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
             "title".into(),
-            FtsSummary {
-                term_bloom: BloomBuilder::with_n_blocks(16).finish(),
-                n_terms_distinct: 0,
-                term_range: (Vec::new(), Vec::new()),
-            },
+            FtsSummaryAgg::new_with_params(
+                BloomBuilder::with_n_blocks(16).finish(),
+                0,
+                (Vec::new(), Vec::new()),
+            ),
         );
         let s = Arc::new(SuperfileEntry {
             superfile_id: id,

@@ -12,27 +12,25 @@
 //! - `scalar_stats_agg`: per scalar column, column-wise min /
 //!   max across all superfiles. Encoded as length-1 Arrow IPC
 //!   bytes (same encoding `ManifestListEntry` uses).
-//! - `fts_summary_agg.term_range_union`: per FTS column,
-//!   `(min(min_term), max(max_term))` across superfiles with
-//!   non-empty FSTs. Absent (`None`) if every superfile's FST
-//!   for that column is empty.
+//! - `fts_summary_agg`: per FTS column, the union of the superfiles'
+//!   [`FtsSummaryAgg`]s — bloom bit-OR union + `(min(min_term),
+//!   max(max_term))` term-range union — folded via
+//!   [`FtsSummaryAgg::merge`].
 //! - `vector_summary_agg`: per vector column, mean-of-
 //!   centroids + max(distance + superfile_radius). Bounds every
 //!   superfile's vector ball with one outer ball, so the
 //!   list-level vector skip is correct by construction (no
 //!   false negatives).
 //!
-//! `fts_summary_agg.term_bloom_union` is currently emitted
-//! empty (interpreted as "always-keep" by the list-level
-//! pruner) and `n_terms_distinct` as 0; HLL-sized blooms over
-//! the union of per-superfile FSTs would require a per-commit
-//! cardinality estimate over each superfile's terms.
+//! The bloom union is exact for "any superfile contained this term"
+//! (the block-and-mask scheme is positional). `n_terms_distinct` is a
+//! deferred planner hint; a true HLL-based distinct-term union lands
+//! when measured.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::bloom::Bloom;
 use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
@@ -87,96 +85,22 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, Scala
 }
 
 // ---------------------------------------------------------
-// FTS summary aggregate: term_range_union + term_bloom_union.
+// FTS summary aggregate: fold the superfiles' summaries.
 // ---------------------------------------------------------
-//
-// Bloom union is the bit-OR of each superfile's bloom for the
-// column. Same bloom-shape across all superfiles (the writer
-// builds with `BloomBuilder::new()` — fixed `DEFAULT_N_BLOCKS`
-// + xxh3_64), so bit-OR preserves "any superfile contained
-// this term" with the same FPR. The block-and-mask scheme
-// `Bloom::contains` uses is positional, not arithmetic,
-// so bit-OR is exact for the union semantic. The
-// `n_terms_distinct` field stays 0 — HLL-based estimation
-// would let the planner pick prune ordering across columns,
-// but isn't required for correctness; lands when measured.
-
-type FtsColumnAccumulator = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 
 fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSummaryAgg> {
-    // Per-column accumulators: (min, max, union-bloom-bytes).
-    // The union bloom starts at the first superfile with a populated
-    // bloom for that column; subsequent superfiles bit-OR into it.
-    let mut per_column: HashMap<String, FtsColumnAccumulator> = HashMap::new();
+    // Fold each superfile's per-column summary together via
+    // `FtsSummaryAgg::merge` — bloom bit-OR union (exact for the "any
+    // superfile contained this term" semantic, since the block-and-mask
+    // scheme is positional) + term-range union — sharing one code path with
+    // the per-column merge instead of a hand-rolled fold.
+    let mut out: BTreeMap<String, FtsSummaryAgg> = BTreeMap::new();
     for seg in superfiles {
         for (col, summary) in &seg.fts_summary {
-            let entry = per_column.entry(col.clone()).or_default();
-            // Range update (skipping superfiles with empty FST
-            // ranges; they contribute neither min nor max).
-            let has_range = !(summary.term_range.0.is_empty() && summary.term_range.1.is_empty());
-            if has_range {
-                match &entry.0 {
-                    Some(curr_min) if curr_min.as_slice() <= summary.term_range.0.as_slice() => {}
-                    _ => entry.0 = Some(summary.term_range.0.clone()),
-                }
-                match &entry.1 {
-                    Some(curr_max) if curr_max.as_slice() >= summary.term_range.1.as_slice() => {}
-                    _ => entry.1 = Some(summary.term_range.1.clone()),
-                }
-            }
-            // Union the superfile's bloom into the part-level
-            // bloom. Skip zero-length blooms (superfiles with
-            // no FST entries for this column).
-            let seg_bytes = summary.term_bloom.to_bytes();
-            if seg_bytes.is_empty() {
-                continue;
-            }
-            match &mut entry.2 {
-                None => {
-                    entry.2 = Some(seg_bytes);
-                }
-                Some(acc) => {
-                    // Bloom-union invariant: all superfiles
-                    // share the same shape. If a length
-                    // mismatch ever shows up, drop the
-                    // union to "no info" — correctness is
-                    // preserved (list-level prune treats
-                    // empty union as always-keep), only
-                    // selectivity suffers. This shouldn't
-                    // happen in practice: the writer's bloom
-                    // size is fixed at construction.
-                    if acc.len() == seg_bytes.len() {
-                        for (a, b) in acc.iter_mut().zip(seg_bytes.iter()) {
-                            *a |= *b;
-                        }
-                    } else {
-                        // Mismatched shapes; fall back.
-                        entry.2 = None;
-                    }
-                }
-            }
+            out.entry(col.clone())
+                .and_modify(|acc| acc.merge(summary))
+                .or_insert_with(|| summary.clone());
         }
-    }
-    let mut out = BTreeMap::new();
-    for (col, (mn, mx, bloom_bytes)) in per_column {
-        let term_range = match (mn, mx) {
-            (Some(a), Some(b)) => Some((a, b)),
-            _ => None,
-        };
-        // Wrap the unioned bytes back into a `Bloom`. `from_bytes` returns
-        // `None` for an empty/invalid run → "no bloom info" (always-keep).
-        let term_bloom = bloom_bytes.and_then(|b| Bloom::from_bytes(&b));
-        out.insert(
-            col,
-            FtsSummaryAgg {
-                term_bloom,
-                // HLL-estimated distinct term count stays
-                // deferred — it's a planner hint, not a
-                // correctness requirement.
-                n_terms_distinct: 0,
-                term_range,
-            },
-        );
     }
     out
 }
@@ -251,7 +175,9 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, SuperfileEntry, SuperfileUri};
+    use crate::supertable::manifest::{
+        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+    };
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
     use std::collections::HashMap;
 
@@ -276,7 +202,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: cols,
-            fts_summary: HashMap::<String, FtsSummary>::new(),
+            fts_summary: HashMap::<String, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
@@ -337,7 +263,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: cols,
-            fts_summary: HashMap::<String, FtsSummary>::new(),
+            fts_summary: HashMap::<String, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
@@ -386,7 +312,7 @@ mod tests {
                 id_min: 0,
                 id_max: 0,
                 scalar_stats: cols,
-                fts_summary: HashMap::<String, FtsSummary>::new(),
+                fts_summary: HashMap::<String, FtsSummaryAgg>::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,

@@ -48,7 +48,7 @@ use thiserror::Error;
 
 use crate::supertable::manifest::bloom::Bloom;
 use crate::supertable::manifest::list::ScalarStatsAgg;
-use crate::supertable::manifest::{FtsSummary, VectorSummary};
+use crate::supertable::manifest::{FtsSummaryAgg, VectorSummary};
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -74,6 +74,13 @@ pub enum DecodeError {
     /// Vector dim or centroid bytes mismatch.
     #[error("invalid vector summary: {0}")]
     InvalidVectorSummary(String),
+
+    /// Term range was inverted (`min_term > max_term`). Both-empty is the
+    /// legal "no range" sentinel and an empty min is fine (the empty string
+    /// is lex-smallest), but an out-of-order pair is corrupt input that
+    /// would break prefix-overlap pruning.
+    #[error("invalid term range: min_term > max_term (inverted range)")]
+    InvalidTermRange,
 
     /// Arrow IPC parse failed.
     #[error("arrow ipc parse failed: {0}")]
@@ -367,47 +374,80 @@ pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError
 }
 
 // ---------------------------------------------------------
-// FtsSummary: custom packed.
+// FtsSummaryAgg: custom packed.
 //
 // Layout (all LE):
-//   u32 bloom_len                  (== n_blocks × BLOCK_BYTES)
+//   u32 bloom_len                  (== n_blocks × BLOCK_BYTES; 0 ⇒ no bloom)
 //   [bloom_len bytes]              (Bloom::to_bytes output)
-//   u32 n_terms_distinct
+//   u32 n_terms_distinct           (per-superfile count fits u32; widened to
+//                                   u64 in memory)
 //   u32 min_term_len
 //   [min_term bytes]
 //   u32 max_term_len
-//   [max_term bytes]
+//   [max_term bytes]               (empty min+max ⇒ no range, i.e. None)
+//
 // ---------------------------------------------------------
 
-pub fn encode_fts_summary(s: &FtsSummary) -> Vec<u8> {
-    let bloom_bytes = s.term_bloom.to_bytes();
-    let cap = 4 + bloom_bytes.len() + 4 + 4 + s.term_range.0.len() + 4 + s.term_range.1.len();
+pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
+    let bloom_bytes = s
+        .term_bloom
+        .as_ref()
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
+    // `None` range encodes as empty min+max (the 0-term / no-range sentinel).
+    let (min_term, max_term): (&[u8], &[u8]) = match &s.term_range {
+        Some((mn, mx)) => (mn, mx),
+        None => (&[], &[]),
+    };
+    let cap = 4 + bloom_bytes.len() + 4 + 4 + min_term.len() + 4 + max_term.len();
     let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&bloom_bytes);
-    out.extend_from_slice(&s.n_terms_distinct.to_le_bytes());
-    out.extend_from_slice(&(s.term_range.0.len() as u32).to_le_bytes());
-    out.extend_from_slice(&s.term_range.0);
-    out.extend_from_slice(&(s.term_range.1.len() as u32).to_le_bytes());
-    out.extend_from_slice(&s.term_range.1);
+    // Keep the wire field u32 (a single superfile's distinct count fits) so
+    // the part format is unchanged; saturate the u64 in-memory value.
+    out.extend_from_slice(
+        &u32::try_from(s.n_terms_distinct)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&(min_term.len() as u32).to_le_bytes());
+    out.extend_from_slice(min_term);
+    out.extend_from_slice(&(max_term.len() as u32).to_le_bytes());
+    out.extend_from_slice(max_term);
     out
 }
 
-pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummary, DecodeError> {
+pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     let mut c = Cursor::new(bytes);
     let bloom_len = read_u32(&mut c, "bloom_len")? as usize;
     let bloom_bytes = read_n(&mut c, bloom_len, "bloom_bytes")?;
-    let term_bloom =
-        Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?;
-    let n_terms_distinct = read_u32(&mut c, "n_terms_distinct")?;
+    // Empty bloom run ⇒ "no bloom info" (None); a non-empty run must be a
+    // valid bloom layout.
+    let term_bloom = if bloom_bytes.is_empty() {
+        None
+    } else {
+        Some(Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
+    };
+    let n_terms_distinct = u64::from(read_u32(&mut c, "n_terms_distinct")?);
     let min_len = read_u32(&mut c, "min_term_len")? as usize;
     let min_term = read_n(&mut c, min_len, "min_term")?;
     let max_len = read_u32(&mut c, "max_term_len")? as usize;
     let max_term = read_n(&mut c, max_len, "max_term")?;
-    Ok(FtsSummary {
+    // Both-empty is the "no range" sentinel (None). Otherwise it's a real
+    // `[min, max]` — which must be ordered. An empty min is legal (the empty
+    // string is lex-smallest), but `min > max` is an inverted, corrupt range
+    // that would break prefix-overlap pruning, so reject it.
+    let term_range = if min_term.is_empty() && max_term.is_empty() {
+        None
+    } else if min_term <= max_term {
+        Some((min_term, max_term))
+    } else {
+        return Err(DecodeError::InvalidTermRange);
+    };
+    Ok(FtsSummaryAgg {
         term_bloom,
         n_terms_distinct,
-        term_range: (min_term, max_term),
+        term_range,
     })
 }
 
@@ -533,7 +573,7 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
 //     [value_len bytes]  (encode_<inner>)
 // ---------------------------------------------------------
 
-pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummary>) -> Vec<u8> {
+pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummaryAgg>) -> Vec<u8> {
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     let mut out = Vec::new();
@@ -549,7 +589,7 @@ pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummary>) -> Vec<u8> {
     out
 }
 
-pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary>, DecodeError> {
+pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummaryAgg>, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n = read_u32(&mut c, "fts_map_n")? as usize;
     let mut out = HashMap::with_capacity(n);
@@ -636,10 +676,24 @@ mod decode_error_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, ScalarStatsAgg, decode_fts_summary_map, decode_length1_array,
-        decode_scalar_stats, decode_vector_summary, decode_vector_summary_map,
-        encode_length1_array, encode_scalar_stats, read_n, read_u32,
+        DecodeError, ScalarStatsAgg, decode_fts_summary, decode_fts_summary_map,
+        decode_length1_array, decode_scalar_stats, decode_vector_summary,
+        decode_vector_summary_map, encode_length1_array, encode_scalar_stats, read_n, read_u32,
     };
+
+    /// Hand-build a `decode_fts_summary` payload: no bloom, a given
+    /// distinct count, then the `(min_term, max_term)` pair verbatim.
+    /// Lets a test plant a half-empty range the encoder would never emit.
+    fn fts_summary_bytes(n_terms_distinct: u32, min_term: &[u8], max_term: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes()); // bloom_len = 0 ⇒ no bloom
+        out.extend_from_slice(&n_terms_distinct.to_le_bytes());
+        out.extend_from_slice(&(min_term.len() as u32).to_le_bytes());
+        out.extend_from_slice(min_term);
+        out.extend_from_slice(&(max_term.len() as u32).to_le_bytes());
+        out.extend_from_slice(max_term);
+        out
+    }
 
     /// One length-1 arrow-IPC RecordBatch with the given fields/columns,
     /// matching the on-wire shape `encode_scalar_stats` emits.
@@ -876,6 +930,36 @@ mod decode_error_tests {
             matches!(vec_err, DecodeError::ArrowIpc(_)),
             "got {vec_err:?}"
         );
+    }
+
+    /// An inverted term range (`min_term > max_term`) is corrupt input and
+    /// must surface `InvalidTermRange`, not deserialize into a `Some` that
+    /// would break prefix-overlap pruning. `min_term = "abc", max_term = ""`
+    /// is such a pair (`"" < "abc"`).
+    #[test]
+    fn decode_fts_summary_inverted_term_range_errors() {
+        let inverted = fts_summary_bytes(0, b"abc", b"");
+        let err = decode_fts_summary(&inverted).expect_err("min > max");
+        assert!(matches!(err, DecodeError::InvalidTermRange), "got {err:?}");
+    }
+
+    /// The legal term-range encodings decode as expected: both bounds empty
+    /// ⇒ `None`; both present ⇒ `Some`; and an **empty min** with a present
+    /// max is valid (the empty string is lex-smallest, so `min ≤ max`).
+    #[test]
+    fn decode_fts_summary_legal_term_ranges() {
+        let none = decode_fts_summary(&fts_summary_bytes(0, b"", b"")).expect("both empty");
+        assert_eq!(none.term_range, None);
+
+        let some = decode_fts_summary(&fts_summary_bytes(3, b"alpha", b"omega")).expect("both set");
+        assert_eq!(
+            some.term_range,
+            Some((b"alpha".to_vec(), b"omega".to_vec()))
+        );
+
+        // Empty min, present max: a valid ordered range, not an error.
+        let empty_min = decode_fts_summary(&fts_summary_bytes(1, b"", b"xyz")).expect("empty min");
+        assert_eq!(empty_min.term_range, Some((b"".to_vec(), b"xyz".to_vec())));
     }
 
     /// An empty map round-trips: both decoders read `n_entries = 0` and

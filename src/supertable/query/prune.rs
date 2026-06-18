@@ -202,7 +202,7 @@ mod tests {
     };
     use crate::supertable::manifest::part::{ContentHash, PartId};
     use crate::supertable::manifest::{
-        FtsSummary, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, bloom::BloomBuilder,
+        FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, bloom::BloomBuilder,
     };
     use crate::supertable::query::skip::ScalarOp;
     use arrow_array::{Int64Array, LargeStringArray};
@@ -358,11 +358,11 @@ mod tests {
         let mut fts = HashMap::new();
         fts.insert(
             "title".to_string(),
-            FtsSummary {
-                term_bloom: bb.finish(),
-                n_terms_distinct: titles.len() as u32,
-                term_range: (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
-            },
+            FtsSummaryAgg::new_with_params(
+                bb.finish(),
+                titles.len() as u32,
+                (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
+            ),
         );
 
         let id = Uuid::new_v4();
@@ -468,11 +468,7 @@ mod tests {
         let mut fts = HashMap::new();
         fts.insert(
             "title".to_string(),
-            FtsSummary {
-                term_bloom: bb.finish(),
-                n_terms_distinct: bloom_tokens.len() as u32,
-                term_range,
-            },
+            FtsSummaryAgg::new_with_params(bb.finish(), bloom_tokens.len() as u32, term_range),
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {

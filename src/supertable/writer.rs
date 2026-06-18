@@ -80,7 +80,7 @@ use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
 use super::manifest::{
-    FtsSummary, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
+    FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use super::mutations::{
     CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -1369,7 +1369,7 @@ pub(super) fn prepare_superfile(
     )
     .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
-    let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
+    let mut fts_summary: HashMap<String, FtsSummaryAgg> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
         for fc in &inner.options.fts_columns {
             let terms = fts_reader
@@ -1386,11 +1386,11 @@ pub(super) fn prepare_superfile(
             }
             fts_summary.insert(
                 fc.column.clone(),
-                FtsSummary {
-                    term_bloom: bloom_builder.finish(),
+                FtsSummaryAgg::new_with_params(
+                    bloom_builder.finish(),
                     n_terms_distinct,
-                    term_range: (min_term, max_term),
-                },
+                    (min_term, max_term),
+                ),
             );
         }
     }
@@ -2196,15 +2196,13 @@ mod tests {
             fts.n_terms_distinct,
         );
         // Bloom should report present for inserted terms.
-        assert!(fts.term_bloom.contains(b"alpha"));
-        assert!(fts.term_bloom.contains(b"doc"));
-        // Lex range should be non-empty and consistent.
-        assert!(!fts.term_range.0.is_empty());
-        assert!(!fts.term_range.1.is_empty());
-        assert!(
-            fts.term_range.0 <= fts.term_range.1,
-            "min_term <= max_term invariant",
-        );
+        assert!(fts.may_contain(b"alpha"));
+        assert!(fts.may_contain(b"doc"));
+        // Lex range should be present and consistent.
+        let (min_term, max_term) = fts.term_range.as_ref().expect("non-empty FST has a range");
+        assert!(!min_term.is_empty());
+        assert!(!max_term.is_empty());
+        assert!(min_term <= max_term, "min_term <= max_term invariant");
     }
 
     // ---- vector summary ----------------------------------------------

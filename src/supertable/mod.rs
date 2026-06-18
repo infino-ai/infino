@@ -18,7 +18,7 @@
 //! - [`utils::idgen`] — 128-bit Snowflake-style generator for the
 //!   auto-injected `_id` column.
 //! - [`manifest`] — `Manifest`, `SuperfileEntry`, `ScalarStatsAgg`,
-//!   `FtsSummary`, `VectorSummary`, plus the `Bloom` skip-summary
+//!   `FtsSummaryAgg`, `VectorSummary`, plus the `Bloom` skip-summary
 //!   container.
 //! - [`handle`] — `Supertable` (clone-shared handle) and
 //!   `SupertableReader` (snapshot-pinned reader).
@@ -65,7 +65,7 @@ pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;
 pub use manifest::{
-    FtsSummary, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsAgg, SuperfileEntry,
+    FtsSummaryAgg, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsAgg, SuperfileEntry,
     SuperfileList, SuperfileUri, VectorSummary,
 };
 pub use mutations::MutationStats;
