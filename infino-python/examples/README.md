@@ -17,6 +17,19 @@ optional and only used if you set `OPENAI_API_KEY`.
 pip install -r requirements.txt
 ```
 
+### Optional: LLM answers
+
+The retrieval examples run fully without an LLM (they print the grounded
+context). To generate answers, configure either backend — `_shared/llm.py`
+picks it up automatically, reading from a local `.azure.env` / `.env` if present:
+
+- **Azure AI Foundry** (preferred): `AZURE_AI_ENDPOINT` (the OpenAI-compatible
+  `https://<resource>.openai.azure.com/openai/v1` URL), `AZURE_AI_API_KEY`, and
+  `DEFAULT_AZURE_MODEL`.
+- **OpenAI**: `OPENAI_API_KEY` (optionally `OPENAI_MODEL`).
+
+Keep credentials in an untracked env file — never commit keys.
+
 ## Examples
 
 | # | Example | What it shows | Dataset |
