@@ -113,3 +113,27 @@ def load_amazon(n: int = 1200) -> list[dict]:
         if len(products) >= n:
             break
     return products
+
+
+def load_wikipedia(n: int = 100) -> list[dict]:
+    """Real Wikipedia articles, used as a seed corpus for the chat app.
+
+    Source: `wikimedia/wikipedia` (Simple English, Parquet-native, streamable).
+    Returns a list of `{"title": str, "text": str, "source": str}`.
+    """
+    stream = load_dataset(
+        "wikimedia/wikipedia", "20231101.simple", split="train", streaming=True
+    )
+    docs = []
+    for row in stream:
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        docs.append({
+            "title": (row.get("title") or "").strip(),
+            "text": text,
+            "source": row.get("url") or "wikipedia",
+        })
+        if len(docs) >= n:
+            break
+    return docs

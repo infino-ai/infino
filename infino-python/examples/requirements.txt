@@ -4,3 +4,7 @@ infino
 pyarrow>=14
 sentence-transformers>=3   # local embeddings, no API key needed
 datasets>=2               # pulls the real public corpora from HuggingFace
+
+# Used only by the chat-with-docs app (chat_app/):
+streamlit>=1.30
+pypdf>=4                  # optional: ingest uploaded PDFs
