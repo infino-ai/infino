@@ -430,7 +430,7 @@ impl FtsSummaryAgg {
     /// **`None` is the identity here** (an empty contributor that leaves the
     /// other side intact) — what a fold from [`Default::default`] over
     /// per-superfile summaries needs, since every superfile carries a bloom
-    /// ([`from_superfile`] always yields `Some`). This is deliberately
+    /// ([`new_with_params`] always yields `Some`). This is deliberately
     /// *distinct* from the prune-time reading of `term_bloom: None` as "no
     /// info / always-keep": a sound union of a known bloom with a genuinely
     /// unknown one is unknown (`None`), so `merge` must only be folded over
@@ -440,8 +440,6 @@ impl FtsSummaryAgg {
     /// range-union as [`crate::supertable::manifest::aggregates`]'s rollup; the
     /// `n_terms_distinct` hint differs (here the larger side, vs. the rollup's
     /// current placeholder `0`).
-    ///
-    /// [`from_superfile`]: FtsSummaryAgg::from_superfile
     pub fn merge(&mut self, other: &FtsSummaryAgg) {
         self.term_bloom = match (self.term_bloom.take(), other.term_bloom.as_ref()) {
             (Some(a), Some(b)) => union_blooms(&a, b),
