@@ -71,6 +71,7 @@ use crate::superfile::format::vec::{
 use crate::superfile::format::{footer::read_kv_metadata, kv};
 use crate::supertable::error::ManifestError;
 use crate::supertable::manifest::Manifest;
+use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
 use crate::supertable::manifest::commit::get_current_manifest_etag;
 use crate::supertable::manifest::part::{self as part_mod, PartId};
 use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
@@ -1647,6 +1648,33 @@ pub(super) fn prepare_superfile(
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
 /// docs × 4 superfiles is the dominant cost. Manifest swap +
 /// storage write-through stay serial after the join.
+
+fn finish_superfile_entry(
+    inner: &SupertableInner,
+    entry: Arc<SuperfileEntry>,
+    hint: Option<u32>,
+) -> Result<Arc<SuperfileEntry>, BuildError> {
+    let old = entry.as_ref();
+    let mut staged = SuperfileEntry {
+        superfile_id: old.superfile_id,
+        uri: old.uri,
+        n_docs: old.n_docs,
+        id_min: old.id_min,
+        id_max: old.id_max,
+        scalar_stats: old.scalar_stats.clone(),
+        fts_summary: old.fts_summary.clone(),
+        vector_summary: old.vector_summary.clone(),
+        partition_key: old.partition_key.clone(),
+        partition_hint: hint.or(old.partition_hint),
+        subsection_offsets: old.subsection_offsets.clone(),
+    };
+    let strategy = inner.manifest.load().get_partition_strategy();
+    let pk = assign_partition(&staged, &strategy)
+        .map_err(|e| BuildError::Store(format!("partition assign: {e}")))?;
+    staged.partition_key = encode_partition_key(&pk);
+    Ok(Arc::new(staged))
+}
+
 fn publish_superfiles(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
@@ -1657,34 +1685,18 @@ fn publish_superfiles(
             .into_par_iter()
             .zip(hints.into_par_iter())
             .filter_map(|(shard, hint)| {
-                prepare_superfile(inner, shard).transpose().map(|r| {
-                    r.map(|p| {
-                        if let Some(cell_id) = hint {
-                            let old = p.entry.as_ref();
-                            let new_entry = Arc::new(SuperfileEntry {
-                                superfile_id: old.superfile_id,
-                                uri: old.uri,
-                                n_docs: old.n_docs,
-                                id_min: old.id_min,
-                                id_max: old.id_max,
-                                scalar_stats: old.scalar_stats.clone(),
-                                fts_summary: old.fts_summary.clone(),
-                                vector_summary: old.vector_summary.clone(),
-                                partition_key: old.partition_key.clone(),
-                                partition_hint: Some(cell_id),
-                                subsection_offsets: old.subsection_offsets.clone(),
-                            });
-                            PreparedSuperfile {
-                                entry: new_entry,
-                                bytes_for_store: p.bytes_for_store,
-                                bytes_for_storage: p.bytes_for_storage,
-                                bytes_for_cache: p.bytes_for_cache,
-                            }
-                        } else {
-                            p
-                        }
-                    })
-                })
+                match prepare_superfile(inner, shard) {
+                    Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(
+                        |entry| PreparedSuperfile {
+                            entry,
+                            bytes_for_store: p.bytes_for_store,
+                            bytes_for_storage: p.bytes_for_storage,
+                            bytes_for_cache: p.bytes_for_cache,
+                        },
+                    )),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                }
             })
             .collect::<Result<Vec<_>, _>>()
     })?;

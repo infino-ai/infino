@@ -124,6 +124,10 @@ pub(super) struct SupertableInner {
     /// Unused for [`Consistency::Strong`] (always checks) and
     /// [`Consistency::Snapshot`] (never checks).
     pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
+    /// One-shot partition strategy for the next hidden-index commit
+    /// (synced from the user table's trained global centroids).
+    pub(super) pending_partition_strategy:
+        Mutex<Option<super::manifest::list::PartitionStrategy>>,
 }
 
 impl Drop for SupertableInner {
@@ -734,7 +738,7 @@ impl Supertable {
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
 /// Default number of global vector-index cells for routed search.
-const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
+pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 
 /// Lloyd iterations when folding per-superfile cluster centroids into the
 /// global cell grid at open/create time.
@@ -743,9 +747,47 @@ const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 /// Fixed PRNG seed for global centroid training.
 const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 
-/// Train global cell centroids from the user table's manifest cluster summaries.
-/// Returns Sq8-encoded centroids or None if no summaries exist.
-fn train_global_centroids(
+/// Train global VectorCell centroids from the user manifest and queue them
+/// on the hidden index table for its next commit.
+/// Aggressive compaction profile for the hidden vector-index table: keep
+/// ~one compact superfile per cell instead of many shard-sized files.
+pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
+    crate::config::CompactionSettings {
+        target_superfile_size_mb: 8,
+        min_fill_percent: 40,
+        max_memory_mb: 512,
+    }
+}
+
+pub(super) fn queue_hidden_vector_cell_strategy(
+    user_inner: &SupertableInner,
+    hidden: &Supertable,
+) {
+    let Some(clusters) = train_global_centroids(
+        &user_inner.options,
+        &user_inner.manifest.load_full(),
+        GLOBAL_VECTOR_CELL_COUNT,
+    ) else {
+        return;
+    };
+    let column = user_inner
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())
+        .unwrap_or_default();
+    let strategy = super::manifest::list::PartitionStrategy::VectorCell {
+        column,
+        clusters,
+    };
+    *hidden
+        .inner
+        .pending_partition_strategy
+        .lock()
+        .expect("pending_partition_strategy mutex poisoned") = Some(strategy);
+}
+
+pub(crate) fn train_global_centroids(
     user_opts: &SupertableOptions,
     manifest: &super::manifest::Manifest,
     n_cells: usize,
@@ -889,6 +931,7 @@ async fn build_handle(
         handle_id,
         vector_index_table,
         last_pointer_check: Mutex::new(None),
+        pending_partition_strategy: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };

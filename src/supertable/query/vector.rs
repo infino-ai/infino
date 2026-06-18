@@ -120,7 +120,15 @@ fn filter_superfiles_by_cells(
         .collect();
     superfiles
         .iter()
-        .filter(|sf| !sf.partition_key.is_empty() && routed_keys.contains(&sf.partition_key))
+        .filter(|sf| {
+            if !sf.partition_key.is_empty() {
+                routed_keys.contains(&sf.partition_key)
+            } else if let Some(cell) = sf.partition_hint {
+                routed_keys.contains(&cell.to_le_bytes().to_vec())
+            } else {
+                false
+            }
+        })
         .cloned()
         .collect()
 }

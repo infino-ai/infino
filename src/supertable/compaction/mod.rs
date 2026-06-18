@@ -175,7 +175,22 @@ impl Supertable {
         &self,
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
-        let inner = self.inner();
+        Self::compact_one_table(self, cfg).await?;
+        if let Some(hidden) = self.inner().vector_index_table.as_ref() {
+            Self::compact_one_table(
+                hidden,
+                &crate::supertable::handle::hidden_vector_index_compaction_settings(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn compact_one_table(
+        table: &Supertable,
+        cfg: &CompactionSettings,
+    ) -> Result<(), CompactionError> {
+        let inner = table.inner();
 
         match inner.compaction_outstanding.compare_exchange(
             false,
@@ -252,13 +267,13 @@ impl Supertable {
         let jobs = select(&stats, cfg);
 
         for job in jobs {
-            self.run_compaction_job(job).await?;
-            self.refresh()
+            table.run_compaction_job(job).await?;
+            table.refresh()
                 .await
                 .map_err(|e| CompactionError::Refresh(e.to_string()))?;
         }
 
-        Ok(())
+Ok(())
     }
 
     /// Merges the given superfiles into one
@@ -394,7 +409,23 @@ impl Supertable {
             .await
             .map_err(|e| CompactionError::Build(e.to_string()))?;
 
-        let new_entries = vec![merged_segment.entry];
+        let partition_key = job.partition_key.clone();
+        let partition_hint = inputs.first().and_then(|e| e.partition_hint);
+        let merged_old = merged_segment.entry.as_ref();
+        let merged_entry = Arc::new(SuperfileEntry {
+            superfile_id: merged_old.superfile_id,
+            uri: merged_old.uri,
+            n_docs: merged_old.n_docs,
+            id_min: merged_old.id_min,
+            id_max: merged_old.id_max,
+            scalar_stats: merged_old.scalar_stats.clone(),
+            fts_summary: merged_old.fts_summary.clone(),
+            vector_summary: merged_old.vector_summary.clone(),
+            partition_key,
+            partition_hint,
+            subsection_offsets: merged_old.subsection_offsets.clone(),
+        });
+        let new_entries = vec![merged_entry];
         let mut pending_storage_writes = vec![
             merged_segment
                 .bytes_for_storage
@@ -676,6 +707,25 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn hidden_profile_select_merges_small_same_cell_files() {
+        let mut segs = Vec::new();
+        for i in 0..4 {
+            let mut s = seg(i, 1, 1000, 0);
+            s.partition_key = 3u32.to_le_bytes().to_vec();
+            segs.push(s);
+        }
+        let cfg = crate::supertable::handle::hidden_vector_index_compaction_settings();
+        let jobs = select(&segs, &cfg);
+        assert!(
+            !jobs.is_empty(),
+            "expected a merge job for 4×1MiB files in one cell partition"
+        );
+        assert_eq!(jobs[0].partition_key, 3u32.to_le_bytes().to_vec());
+        assert!(jobs[0].inputs.len() >= 2);
+    }
+
     fn partitions_packed_independently() {
         let mut segs = Vec::new();
         for i in 0..5 {
