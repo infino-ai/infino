@@ -1,0 +1,6 @@
+# Dependencies for the Infino RAG examples.
+# Install with:  pip install -r requirements.txt
+infino
+pyarrow>=14
+sentence-transformers>=3   # local embeddings, no API key needed
+datasets>=2               # pulls the real public corpora from HuggingFace
