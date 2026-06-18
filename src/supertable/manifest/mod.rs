@@ -1348,7 +1348,7 @@ fn merge_known<V: Clone>(
 /// Takes existing (min, max) and other (min, max) arrays and returns the
 /// merged (min, max) where min is the smaller value and max is the larger.
 /// Both arrays are assumed to be length-1 and of the same type.
-fn merge_min_max_arrays(
+pub(crate) fn merge_min_max_arrays(
     existing_min: &ArrayRef,
     other_min: &ArrayRef,
     existing_max: &ArrayRef,
@@ -1495,7 +1495,7 @@ fn merge_min_max_arrays(
 /// floats → `Float64`). `None` for non-summable types (utf8, bool,
 /// decimal) or when the exact total overflows the result type —
 /// consumers treat missing as "no statistics".
-fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
+pub(crate) fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
     macro_rules! signed {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
@@ -1563,7 +1563,7 @@ pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
 /// `None` for types the sketch doesn't cover. Values hash by their
 /// canonical byte representation (little-endian for numerics, raw
 /// bytes for strings, IEEE bits for floats).
-fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
+pub(crate) fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
     let mut sketch = hll::HllSketch::new();
     macro_rules! ints {
         ($array_ty:ty) => {{
@@ -1611,7 +1611,7 @@ fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
     Some(sketch)
 }
 
-fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
+pub(crate) fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     macro_rules! prim {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;

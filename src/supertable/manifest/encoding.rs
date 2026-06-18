@@ -710,6 +710,57 @@ mod decode_error_tests {
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
+    /// A batch with more than one column is rejected — the aggregate is a
+    /// single value, read from column 0.
+    #[test]
+    fn decode_length1_array_rejects_multi_column() {
+        let bytes = ipc_batch(
+            vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ],
+        );
+        let err = decode_length1_array(&bytes).expect_err("multi-column");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A stream carrying more than one batch is rejected with the
+    /// dedicated `UnexpectedBatchCount` error.
+    #[test]
+    fn decode_length1_array_rejects_multi_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("batch");
+        let mut out = Vec::new();
+        {
+            let mut w =
+                arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            w.write(&batch).expect("write 1");
+            w.write(&batch).expect("write 2");
+            w.finish().expect("finish");
+        }
+        let err = decode_length1_array(&out).expect_err("two batches");
+        assert!(
+            matches!(err, DecodeError::UnexpectedBatchCount(2)),
+            "got {err:?}"
+        );
+    }
+
+    /// Garbage (non-arrow-IPC) bytes surface an `ArrowIpc` error from the
+    /// length-1 decoder's reader-init path.
+    #[test]
+    fn decode_length1_array_garbage_is_arrow_ipc_error() {
+        let err = decode_length1_array(b"definitely not arrow ipc").expect_err("garbage");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
     /// A `__min` without a matching `__max` is an unpaired-column error.
     #[test]
     fn decode_scalar_stats_unpaired_min_errors() {

@@ -17,7 +17,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use arrow_array::ArrayRef;
+use arrow::compute::concat;
+use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Schema};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
@@ -191,6 +193,170 @@ impl PartialEq for ScalarStatsAgg {
             && sum_eq
             && self.hll == other.hll
     }
+}
+
+impl ScalarStatsAgg {
+    /// Build the aggregate for one column from a resident Arrow array.
+    ///
+    /// Returns `None` for types without a well-defined ordering (anything
+    /// other than integer / float / boolean / utf8 / decimal) — those carry
+    /// no min/max, so there's nothing to prune on. When present, every
+    /// companion stat (null count, exact sum, HLL sketch) is computed in the
+    /// same pass; sum/hll stay `None` for types that don't support them.
+    pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {
+        let (min, max) = super::column_min_max(column)?;
+        let null_count = u64::try_from(column.null_count()).ok();
+
+        Some(ScalarStatsAgg {
+            min,
+            max,
+            null_count,
+            sum: super::column_sum(column),
+            hll: super::column_hll(column).map(|s| s.as_bytes().to_vec()),
+        })
+    }
+
+    /// Build a per-column aggregate table from one `RecordBatch`, keyed by
+    /// column name. Columns whose type isn't orderable are skipped (no
+    /// entry), mirroring [`ScalarStatsAgg::from_column`]. Thin wrapper over
+    /// [`ScalarStatsAgg::from_batches`] (a single-array concat is a cheap
+    /// clone).
+    pub fn from_batch(
+        scalar_schema: &Schema,
+        batch: &RecordBatch,
+    ) -> HashMap<String, ScalarStatsAgg> {
+        ScalarStatsAgg::from_batches(scalar_schema, &[batch])
+    }
+
+    /// Build a per-column aggregate table across several `RecordBatch`es.
+    ///
+    /// Each column is concatenated across the batches before its stats are
+    /// computed. A column whose concat fails (shape mismatch) is skipped —
+    /// the prune planner treats missing stats as "can't prune", the safe
+    /// default. An empty `batches` slice yields an empty table.
+    pub fn from_batches(
+        scalar_schema: &Schema,
+        batches: &[&RecordBatch],
+    ) -> HashMap<String, ScalarStatsAgg> {
+        let mut out = HashMap::new();
+        if batches.is_empty() {
+            return out;
+        }
+        for (idx, field) in scalar_schema.fields().iter().enumerate() {
+            // A batch shorter than the schema (malformed input) doesn't carry
+            // this column. Use a checked lookup and skip the column rather
+            // than panicking via `RecordBatch::column` — missing stats are the
+            // safe default (the prune planner treats them as "can't prune").
+            let Some(arrays) = batches
+                .iter()
+                .map(|b| b.columns().get(idx).map(|c| c.as_ref()))
+                .collect::<Option<Vec<&dyn Array>>>()
+            else {
+                continue;
+            };
+            let combined = match concat(&arrays) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            if let Some(agg) = ScalarStatsAgg::from_column(&combined) {
+                out.insert(field.name().to_string(), agg);
+            }
+        }
+        out
+    }
+
+    /// Merge `other` into `self` for the same column.
+    ///
+    /// On success, min/max keep the extremes across both sides and the
+    /// additive stats (null count, sum, HLL) combine **only when both sides
+    /// carry them** — a side missing the stat makes the total unknowable, so
+    /// the merged entry drops to `None` (consumers treat missing as "no
+    /// statistics", never as zero).
+    ///
+    /// Returns [`ScalarStatsMergeError`] (leaving `self` **untouched**) when
+    /// the two min/max arrays have incompatible Arrow types. The bounds can't
+    /// be combined soundly, and silently keeping `self`'s bounds would
+    /// under-cover `other`'s values — making the pruner drop matching rows
+    /// (a false prune). In a well-formed table a column has a single type, so
+    /// this signals corruption or a logic bug; the caller decides how to
+    /// degrade (see [`ScalarStatsAgg::merge_tables`]).
+    pub fn merge(&mut self, other: &ScalarStatsAgg) -> Result<(), ScalarStatsMergeError> {
+        // Resolve the bounds first; bail before mutating anything so a failed
+        // merge can't leave half-updated, internally-inconsistent stats.
+        let Some((min, max)) =
+            super::merge_min_max_arrays(&self.min, &other.min, &self.max, &other.max)
+        else {
+            return Err(ScalarStatsMergeError {
+                left: self.min.data_type().clone(),
+                right: other.min.data_type().clone(),
+            });
+        };
+        self.min = min;
+        self.max = max;
+        self.null_count = match (self.null_count, other.null_count) {
+            (Some(a), Some(b)) => a.checked_add(b),
+            _ => None,
+        };
+        self.sum = match (&self.sum, &other.sum) {
+            (Some(a), Some(b)) => super::add_sum_arrays(a, b),
+            _ => None,
+        };
+        self.hll = match (&self.hll, &other.hll) {
+            (Some(a), Some(b)) => {
+                match (
+                    super::hll::HllSketch::from_bytes(a),
+                    super::hll::HllSketch::from_bytes(b),
+                ) {
+                    (Some(mut merged), Some(other_sketch)) => {
+                        merged.merge(&other_sketch);
+                        Some(merged.as_bytes().to_vec())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(())
+    }
+
+    /// Merge two per-column scalar-stats tables
+    /// (`HashMap<String, ScalarStatsAgg>`), folding `other` into `into`.
+    ///
+    /// Column **union**: a column present only in `other` is inserted; a
+    /// column present in both is merged per-column via
+    /// [`ScalarStatsAgg::merge`]. Folding this over a set of per-superfile
+    /// tables yields the part-level aggregate.
+    ///
+    /// If a shared column's min/max types are incompatible (merge errors), the
+    /// column is **dropped** from `into` rather than kept with stale bounds —
+    /// an absent column is "no info" to the pruner (always keep), which is
+    /// conservative; keeping unsound bounds could drop matching rows.
+    pub fn merge_tables(
+        into: &mut HashMap<String, ScalarStatsAgg>,
+        other: &HashMap<String, ScalarStatsAgg>,
+    ) {
+        for (col, other_agg) in other {
+            if let Some(existing) = into.get_mut(col) {
+                if existing.merge(other_agg).is_err() {
+                    into.remove(col);
+                }
+            } else {
+                into.insert(col.clone(), other_agg.clone());
+            }
+        }
+    }
+}
+
+/// Two aggregates for the same column carry incompatible min/max Arrow types,
+/// so their bounds can't be combined into a sound merged bound. Returned by
+/// [`ScalarStatsAgg::merge`] instead of silently keeping stale bounds (which
+/// could make pruning drop matching rows). In a well-formed table a column
+/// has one type, so this signals corruption or a logic bug.
+#[derive(Debug, Error)]
+#[error("incompatible scalar-stats min/max types: {left:?} vs {right:?}")]
+pub struct ScalarStatsMergeError {
+    left: DataType,
+    right: DataType,
 }
 
 /// Aggregate FTS summary across a part's superfiles.
@@ -755,10 +921,413 @@ mod tests {
     //! jq-friendly.
     use super::super::part::{ContentHash, PartId};
     use super::*;
-    use arrow_array::Int64Array;
+    use arrow_array::{BooleanArray, Date32Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// Build a per-column aggregate from a plain `i64` array (no nulls).
+    fn agg_i64(vals: Vec<i64>) -> ScalarStatsAgg {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
+        ScalarStatsAgg::from_column(&arr).expect("i64 is orderable")
+    }
+
+    /// Read the single value out of a length-1 `Int64` aggregate array.
+    fn i64_at0(arr: &ArrayRef) -> i64 {
+        arr.as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 array")
+            .value(0)
+    }
+
+    #[test]
+    fn scalar_agg_from_column_computes_min_max_sum_nullcount() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(7), Some(1)]));
+        let agg = ScalarStatsAgg::from_column(&arr).expect("orderable");
+        assert_eq!(i64_at0(&agg.min), 1);
+        assert_eq!(i64_at0(&agg.max), 7);
+        assert_eq!(agg.null_count, Some(1));
+        assert_eq!(i64_at0(agg.sum.as_ref().expect("sum")), 11); // 3 + 7 + 1
+        assert!(agg.hll.is_some());
+    }
+
+    #[test]
+    fn scalar_agg_from_batch_builds_each_column() {
+        let schema = Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("y", DataType::Int64, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![3, 7, 1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![20, 5, 9])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let table = ScalarStatsAgg::from_batch(&schema, &batch);
+        assert_eq!(table.len(), 2);
+        assert_eq!(i64_at0(&table["x"].min), 1);
+        assert_eq!(i64_at0(&table["x"].max), 7);
+        assert_eq!(i64_at0(&table["y"].min), 5);
+        assert_eq!(i64_at0(&table["y"].max), 20);
+    }
+
+    #[test]
+    fn scalar_agg_from_batches_concats_then_aggregates() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+        let b1 = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![10, 50])) as ArrayRef],
+        )
+        .expect("b1");
+        let b2 = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![5, 200])) as ArrayRef],
+        )
+        .expect("b2");
+        let table = ScalarStatsAgg::from_batches(&schema, &[&b1, &b2]);
+        assert_eq!(i64_at0(&table["x"].min), 5);
+        assert_eq!(i64_at0(&table["x"].max), 200);
+        assert_eq!(i64_at0(table["x"].sum.as_ref().expect("sum")), 265); // 10+50+5+200
+
+        // Empty input yields an empty table.
+        assert!(ScalarStatsAgg::from_batches(&schema, &[]).is_empty());
+    }
+
+    #[test]
+    fn scalar_agg_merge_keeps_extremes_and_adds_additive() {
+        let mut a = agg_i64(vec![10, 50]); // min 10, max 50, sum 60, nulls 0
+        let b = agg_i64(vec![5, 30]); // min 5,  max 30, sum 35, nulls 0
+        a.merge(&b).expect("same type merges");
+        assert_eq!(i64_at0(&a.min), 5);
+        assert_eq!(i64_at0(&a.max), 50);
+        assert_eq!(i64_at0(a.sum.as_ref().expect("sum")), 95); // 60 + 35
+        assert_eq!(a.null_count, Some(0));
+        assert!(a.hll.is_some());
+    }
+
+    #[test]
+    fn scalar_agg_merge_drops_additive_when_one_side_missing() {
+        let mut a = agg_i64(vec![1, 2]);
+        let mut b = agg_i64(vec![3, 4]);
+        // Simulate a contributor that never computed the additive stats.
+        b.sum = None;
+        b.null_count = None;
+        b.hll = None;
+        a.merge(&b).expect("same type merges");
+        // min/max still merge (union semantics over the bounds).
+        assert_eq!(i64_at0(&a.min), 1);
+        assert_eq!(i64_at0(&a.max), 4);
+        // Additive stats become unknowable when any contributor lacks them.
+        assert!(a.sum.is_none());
+        assert!(a.null_count.is_none());
+        assert!(a.hll.is_none());
+    }
+
+    #[test]
+    fn merge_tables_unions_columns_and_merges_shared() {
+        let mut t1: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        t1.insert("a".into(), agg_i64(vec![10, 50]));
+
+        let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        t2.insert("a".into(), agg_i64(vec![5, 30]));
+        t2.insert("b".into(), agg_i64(vec![100, 200]));
+
+        ScalarStatsAgg::merge_tables(&mut t1, &t2);
+        assert_eq!(t1.len(), 2);
+        // Shared column "a" is merged per-column (extremes kept).
+        assert_eq!(i64_at0(&t1["a"].min), 5);
+        assert_eq!(i64_at0(&t1["a"].max), 50);
+        // Column "b", present only in t2, is inserted.
+        assert_eq!(i64_at0(&t1["b"].min), 100);
+        assert_eq!(i64_at0(&t1["b"].max), 200);
+    }
+
+    // ---- from_column: per-type branch coverage ----
+
+    #[test]
+    fn scalar_agg_from_column_utf8_has_minmax_and_hll_but_no_sum() {
+        // Utf8 is orderable (min/max) and hashable (HLL) but not summable.
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "delta", "bravo"]));
+        let agg = ScalarStatsAgg::from_column(&arr).expect("utf8 is orderable");
+        assert_eq!(agg.min.len(), 1);
+        assert_eq!(agg.max.len(), 1);
+        assert!(agg.sum.is_none(), "utf8 is not summable");
+        assert!(agg.hll.is_some(), "utf8 supports HLL");
+        assert_eq!(agg.null_count, Some(0));
+    }
+
+    #[test]
+    fn scalar_agg_from_column_boolean_has_no_sum_no_hll() {
+        // Boolean has min/max but neither a sum nor an HLL sketch.
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+        let agg = ScalarStatsAgg::from_column(&arr).expect("bool is orderable");
+        assert!(agg.sum.is_none(), "bool not summable");
+        assert!(agg.hll.is_none(), "bool not in the HLL type set");
+        assert_eq!(agg.null_count, Some(1));
+    }
+
+    #[test]
+    fn scalar_agg_from_column_unorderable_type_is_none() {
+        // Date32 isn't in `column_min_max`'s supported set → no stats at all.
+        let arr: ArrayRef = Arc::new(Date32Array::from(vec![1, 2, 3]));
+        assert!(ScalarStatsAgg::from_column(&arr).is_none());
+    }
+
+    // ---- from_batches: skip branches ----
+
+    #[test]
+    fn scalar_agg_from_batches_skips_unorderable_column() {
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Date32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("batch");
+        let table = ScalarStatsAgg::from_batches(&schema, &[&batch]);
+        assert!(table.is_empty(), "unorderable column yields no entry");
+    }
+
+    #[test]
+    fn scalar_agg_from_batches_skips_column_on_concat_type_mismatch() {
+        // Two batches whose column 0 differ in type → concat fails → the
+        // column is skipped (the `Err(_) => continue` branch).
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+        let b1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("b1");
+        let b2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a"])) as ArrayRef],
+        )
+        .expect("b2");
+        let table = ScalarStatsAgg::from_batches(&schema, &[&b1, &b2]);
+        assert!(table.is_empty(), "concat type mismatch skips the column");
+    }
+
+    #[test]
+    fn scalar_agg_from_batches_skips_column_missing_from_a_batch() {
+        // The schema names two columns, but the second batch carries only
+        // the first. The lookup for column index 1 must skip, not panic via
+        // `RecordBatch::column`.
+        let schema = Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("y", DataType::Int64, true),
+        ]);
+        let b1 = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+            ],
+        )
+        .expect("b1");
+        let b2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![5])) as ArrayRef],
+        )
+        .expect("b2");
+        let table = ScalarStatsAgg::from_batches(&schema, &[&b1, &b2]);
+        // "x" is in both batches → aggregated; "y" is absent from b2 → skipped.
+        assert!(table.contains_key("x"));
+        assert!(
+            !table.contains_key("y"),
+            "a column missing from a batch is skipped, not panicked"
+        );
+    }
+
+    // ---- merge: per-field branch coverage ----
+
+    #[test]
+    fn scalar_agg_merge_type_mismatch_errors_and_leaves_self_unchanged() {
+        let mut a = agg_i64(vec![10, 50]); // Int64 bounds + sum
+        let sum_present_before = a.sum.is_some();
+        let b = {
+            let arr: ArrayRef = Arc::new(StringArray::from(vec!["m", "z"]));
+            ScalarStatsAgg::from_column(&arr).expect("utf8")
+        };
+        // Incompatible min/max types: merge must error rather than silently
+        // keep stale bounds (which could cause a false prune).
+        assert!(a.merge(&b).is_err(), "incompatible types must error");
+        // `self` is left fully untouched — no half-merged state.
+        assert_eq!(i64_at0(&a.min), 10);
+        assert_eq!(i64_at0(&a.max), 50);
+        assert_eq!(
+            a.sum.is_some(),
+            sum_present_before,
+            "additive stats untouched on error"
+        );
+    }
+
+    #[test]
+    fn scalar_agg_merge_sum_overflow_drops_sum() {
+        let mut a = agg_i64(vec![i64::MAX]); // sum = i64::MAX
+        let b = agg_i64(vec![1]); // sum = 1
+        a.merge(&b).expect("same type merges");
+        assert!(a.sum.is_none(), "i64 sum overflow → None");
+        // min/max still merge correctly.
+        assert_eq!(i64_at0(&a.min), 1);
+        assert_eq!(i64_at0(&a.max), i64::MAX);
+    }
+
+    #[test]
+    fn scalar_agg_merge_invalid_hll_bytes_drops_hll() {
+        let mut a = agg_i64(vec![1, 2]); // valid HLL
+        let mut b = agg_i64(vec![3, 4]);
+        b.hll = Some(vec![1, 2, 3]); // not a valid sketch
+        a.merge(&b).expect("same type merges");
+        assert!(a.hll.is_none(), "unparseable HLL bytes → None");
+    }
+
+    #[test]
+    fn scalar_agg_merge_null_count_overflow_drops() {
+        let mut a = agg_i64(vec![1]);
+        a.null_count = Some(u64::MAX);
+        let mut b = agg_i64(vec![2]);
+        b.null_count = Some(1);
+        a.merge(&b).expect("same type merges");
+        assert!(a.null_count.is_none(), "null_count overflow → None");
+    }
+
+    #[test]
+    fn merge_tables_keeps_columns_only_in_self() {
+        let mut t1: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        t1.insert("a".into(), agg_i64(vec![1, 5]));
+        t1.insert("c".into(), agg_i64(vec![7, 9]));
+        let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        t2.insert("a".into(), agg_i64(vec![0, 3]));
+
+        ScalarStatsAgg::merge_tables(&mut t1, &t2);
+        // "c" exists only in self → untouched.
+        assert_eq!(i64_at0(&t1["c"].min), 7);
+        assert_eq!(i64_at0(&t1["c"].max), 9);
+        // "a" merged.
+        assert_eq!(i64_at0(&t1["a"].min), 0);
+        assert_eq!(i64_at0(&t1["a"].max), 5);
+    }
+
+    #[test]
+    fn merge_tables_drops_shared_column_on_type_mismatch() {
+        // Same column name, incompatible Arrow types across the two tables.
+        // The column must be dropped (→ "no info", always keep) rather than
+        // kept with stale, under-covering bounds.
+        let mut t1: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        t1.insert("x".into(), agg_i64(vec![1, 10]));
+        let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec!["a", "z"]));
+        t2.insert(
+            "x".into(),
+            ScalarStatsAgg::from_column(&utf8).expect("utf8"),
+        );
+
+        ScalarStatsAgg::merge_tables(&mut t1, &t2);
+        assert!(
+            !t1.contains_key("x"),
+            "type-mismatched column is dropped, not kept with stale bounds"
+        );
+    }
+
+    // ---- PartialEq: every inequality branch ----
+
+    #[test]
+    fn scalar_agg_partial_eq_detects_each_field() {
+        let base = agg_i64(vec![1, 10]);
+        assert_eq!(base, base.clone());
+
+        let mut d = base.clone();
+        d.min = Arc::new(Int64Array::from(vec![0])) as ArrayRef;
+        assert_ne!(base, d, "min differs");
+
+        let mut d = base.clone();
+        d.max = Arc::new(Int64Array::from(vec![999])) as ArrayRef;
+        assert_ne!(base, d, "max differs");
+
+        let mut d = base.clone();
+        d.null_count = Some(42);
+        assert_ne!(base, d, "null_count differs");
+
+        let mut d = base.clone();
+        d.sum = None;
+        assert_ne!(base, d, "sum Some vs None");
+
+        let mut d = base.clone();
+        d.sum = Some(Arc::new(Int64Array::from(vec![123])) as ArrayRef);
+        assert_ne!(base, d, "sum Some vs different Some");
+
+        let mut d = base.clone();
+        d.hll = Some(vec![9, 9, 9, 9]);
+        assert_ne!(base, d, "hll differs");
+
+        // Both sides with sum == None compare equal on that field.
+        let mut a = base.clone();
+        a.sum = None;
+        let mut b = base.clone();
+        b.sum = None;
+        assert_eq!(a, b, "both sum None → equal");
+    }
+
+    // ---- encode / decode error propagation through the list ----
+
+    #[test]
+    fn encode_rejects_non_single_row_scalar_agg() {
+        // A min array with more than one row violates the length-1 contract;
+        // encode must surface ListEncodeError::ScalarStats, not panic.
+        let mut list = empty_list();
+        let mut entry = rich_entry(1);
+        let bad: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        entry
+            .scalar_stats_agg
+            .get_mut("ts")
+            .expect("ts present")
+            .min = bad;
+        list.parts = vec![entry];
+        let err = encode(&list).expect_err("non-length-1 min must fail encode");
+        assert!(
+            matches!(
+                err,
+                ListEncodeError::ScalarStats {
+                    field: "scalar_stats_agg.min",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_surfaces_scalar_stats_error_on_corrupt_min() {
+        // Encode a valid list, then replace one column's `min` base64 with
+        // valid base64 of non-IPC bytes; decode must surface a typed error.
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let cols: Vec<String> = v["parts"][0]["scalar_stats_agg"]
+            .as_object()
+            .expect("scalar_stats_agg object")
+            .keys()
+            .cloned()
+            .collect();
+        let key = cols.first().expect("at least one scalar column");
+        let garbage_b64 = BASE64.encode(b"not arrow ipc");
+        v["parts"][0]["scalar_stats_agg"][key.as_str()]["min"] =
+            serde_json::Value::String(garbage_b64);
+        let tampered = serde_json::to_vec(&v).expect("reserialize");
+        let err = decode(&tampered).expect_err("corrupt min must fail decode");
+        assert!(
+            matches!(
+                err,
+                ListParseError::ScalarStats {
+                    field: "scalar_stats_agg.min",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
 
     fn empty_list() -> ManifestList {
         ManifestList {
