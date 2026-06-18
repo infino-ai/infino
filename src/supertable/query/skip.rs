@@ -262,13 +262,13 @@ pub fn scalar_skip(
 /// only from the superfile's persisted min/max. Conservative: any
 /// uncertainty returns `true` (keep).
 fn superfile_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
-    let Some((min_arr, max_arr)) = entry.scalar_stats.cols.get(&pred.column) else {
+    let Some(agg) = entry.scalar_stats.get(&pred.column) else {
         // No stats for this column — can't prove irrelevance.
         return true;
     };
     let (Ok(min), Ok(max)) = (
-        ScalarValue::try_from_array(min_arr.as_ref(), 0),
-        ScalarValue::try_from_array(max_arr.as_ref(), 0),
+        ScalarValue::try_from_array(agg.min.as_ref(), 0),
+        ScalarValue::try_from_array(agg.max.as_ref(), 0),
     ) else {
         return true;
     };
@@ -334,7 +334,7 @@ mod tests {
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::SupertableOptions;
     use crate::supertable::manifest::{
-        FtsSummary, Manifest, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary,
+        FtsSummary, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         bloom::BloomBuilder,
     };
     use arrow_schema::{DataType, Field, Schema};
@@ -401,7 +401,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -611,7 +611,8 @@ mod tests {
         let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![min]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
-        e.scalar_stats.cols.insert(col.to_string(), (mn, mx));
+        e.scalar_stats
+            .insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(e)
     }
 
@@ -619,7 +620,8 @@ mod tests {
         let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
         let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
-        e.scalar_stats.cols.insert(col.to_string(), (mn, mx));
+        e.scalar_stats
+            .insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(e)
     }
 
@@ -752,7 +754,8 @@ mod tests {
         let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
-        e.scalar_stats.cols.insert("x".to_string(), (mn, mx));
+        e.scalar_stats
+            .insert("x".to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         let segs = vec![Arc::new(e)];
         let mask = scalar_skip(
             &segs,

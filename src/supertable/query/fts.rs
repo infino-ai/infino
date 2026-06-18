@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn build_work_units_per_superfile_is_one_unranged_unit_each() {
-        use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
         use std::collections::HashMap;
         use uuid::Uuid;
 
@@ -1548,7 +1548,7 @@ mod tests {
                 n_docs,
                 id_min: 0,
                 id_max: n_docs.saturating_sub(1) as i128,
-                scalar_stats: ScalarStatsTable::new(),
+                scalar_stats: HashMap::new(),
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -1582,7 +1582,7 @@ mod tests {
 
     #[test]
     fn build_work_units_slices_large_superfiles_when_threads_spare() {
-        use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
         use std::collections::HashMap;
         use uuid::Uuid;
 
@@ -1594,7 +1594,7 @@ mod tests {
             n_docs: 200_000,
             id_min: 0,
             id_max: 199_999,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

@@ -186,7 +186,7 @@ pub fn assign_partition(
 }
 
 /// Extract the superfile's `(min, max)` for `column` as `i64`.
-/// `ScalarStatsTable.cols[column]` carries Arrow length-1
+/// `scalar_stats[column]` carries Arrow length-1
 /// `ArrayRef`s; this helper downcasts against the column's
 /// actual Arrow type and returns the value at index 0.
 ///
@@ -201,17 +201,18 @@ pub fn assign_partition(
 /// the column's actual unit (seconds for `Int64`,
 /// microseconds for `TimestampMicrosecond`, etc.).
 fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), ManifestError> {
-    let (mn_arr, mx_arr) = seg.scalar_stats.cols.get(column).ok_or_else(|| {
-        ManifestError::SuperfileSpansPartition {
-            detail: format!(
-                "TimeRange strategy: superfile {} has no scalar_stats \
+    let agg =
+        seg.scalar_stats
+            .get(column)
+            .ok_or_else(|| ManifestError::SuperfileSpansPartition {
+                detail: format!(
+                    "TimeRange strategy: superfile {} has no scalar_stats \
                      for column {column:?}",
-                seg.uri.0
-            ),
-        }
-    })?;
-    let min = downcast_i64(mn_arr.as_ref(), column, seg)?;
-    let max = downcast_i64(mx_arr.as_ref(), column, seg)?;
+                    seg.uri.0
+                ),
+            })?;
+    let min = downcast_i64(agg.min.as_ref(), column, seg)?;
+    let max = downcast_i64(agg.max.as_ref(), column, seg)?;
     Ok((min, max))
 }
 
@@ -273,7 +274,7 @@ fn downcast_i64(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
     use arrow_array::{
         ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
@@ -290,7 +291,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -303,7 +304,8 @@ mod tests {
         let mut s = empty_seg();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![min]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
-        s.scalar_stats.cols.insert(column.to_string(), (mn, mx));
+        s.scalar_stats
+            .insert(column.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         s
     }
 
@@ -517,7 +519,8 @@ mod tests {
         ];
         for (mn, mx) in cases {
             let mut seg = empty_seg();
-            seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+            seg.scalar_stats
+                .insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             let key = assign_partition(&seg, &strategy).expect("assign");
             assert_eq!(key, PartitionKey::TimeRange(0));
         }
@@ -534,7 +537,8 @@ mod tests {
         let mut seg = empty_seg();
         let mn: ArrayRef = Arc::new(Int32Array::from(vec![100]));
         let mx: ArrayRef = Arc::new(Int32Array::from(vec![200]));
-        seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+        seg.scalar_stats
+            .insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
         let err = assign_partition(&seg, &strategy).expect_err("unsupported");
         assert_spans_partition(err, "unsupported type");
     }
@@ -550,7 +554,8 @@ mod tests {
         let nulls: Vec<Option<i64>> = vec![None];
         let mn: ArrayRef = Arc::new(Int64Array::from(nulls.clone()));
         let mx: ArrayRef = Arc::new(Int64Array::from(nulls));
-        seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+        seg.scalar_stats
+            .insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
         let err = assign_partition(&seg, &strategy).expect_err("null stats");
         assert_spans_partition(err, "empty or null at index 0");
     }

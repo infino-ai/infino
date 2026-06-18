@@ -154,7 +154,7 @@ pub struct ManifestListEntry {
 /// Aggregate scalar stats across a part's superfiles. Min/max
 /// (and the exact sum) are held as length-1 [`ArrayRef`]s of the
 /// column's Arrow type — the same in-memory shape the per-superfile
-/// `ScalarStatsTable.cols` uses. They are decoded once when the
+/// `SuperfileEntry.scalar_stats` map uses. They are decoded once when the
 /// manifest list is loaded, so the list-level scalar prune
 /// ([`crate::supertable::query::prune`]) compares against them
 /// without a per-query Arrow-IPC decode. The JSON wire form still
@@ -167,7 +167,7 @@ pub struct ScalarStatsAgg {
     /// segment lacks the stat (total unknowable, never zero).
     pub null_count: Option<u64>,
     /// Part-wide exact sum as a length-1 [`ArrayRef`] (same typing
-    /// as the per-segment `ScalarStatsTable.sums`); `None` when any
+    /// as the per-segment scalar-stats `sum`); `None` when any
     /// segment lacks it or the fold overflowed.
     pub sum: Option<ArrayRef>,
     /// Merged HLL distinct sketch (raw registers); `None` when any
@@ -343,6 +343,20 @@ impl ScalarStatsAgg {
             } else {
                 into.insert(col.clone(), other_agg.clone());
             }
+        }
+    }
+
+    /// Test-only constructor for an aggregate carrying only min/max bounds
+    /// (no null count, sum, or HLL) — the shape many skip-pruning tests
+    /// build directly.
+    #[cfg(test)]
+    pub(crate) fn from_min_max(min: ArrayRef, max: ArrayRef) -> Self {
+        Self {
+            min,
+            max,
+            null_count: None,
+            sum: None,
+            hll: None,
         }
     }
 }

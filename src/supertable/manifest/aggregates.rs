@@ -31,8 +31,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
-
 use crate::supertable::manifest::SuperfileEntry;
 use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
 
@@ -70,175 +68,21 @@ pub fn compute(superfiles: &[Arc<SuperfileEntry>]) -> AggregateSet {
 }
 
 // ---------------------------------------------------------
-// Scalar stats: per column, min-of-mins / max-of-maxes.
+// Scalar stats: per column, fold the superfiles' aggregates.
 // ---------------------------------------------------------
 
 fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, ScalarStatsAgg> {
-    // Gather, per column, all per-superfile (min, max) ArrayRefs.
-    let mut per_column: HashMap<String, (Vec<ArrayRef>, Vec<ArrayRef>)> = HashMap::new();
+    // Fold each superfile's per-column aggregate table together. `merge_tables`
+    // keeps the min/max extremes (column union) and combines the additive
+    // stats (null count / sum / HLL) only when every contributor carries them
+    // — the same part-level semantics, sharing one code path with the
+    // per-column merge instead of a hand-rolled fold + a duplicate min/max
+    // helper.
+    let mut out: HashMap<String, ScalarStatsAgg> = HashMap::new();
     for seg in superfiles {
-        for (col, (mn, mx)) in &seg.scalar_stats.cols {
-            let entry = per_column.entry(col.clone()).or_default();
-            entry.0.push(mn.clone());
-            entry.1.push(mx.clone());
-        }
-    }
-
-    let mut out = HashMap::new();
-    for (col, (mins, maxes)) in per_column {
-        if mins.is_empty() {
-            continue;
-        }
-        // Concat each side into a single Array, then take its
-        // (min, max). Encode as length-1 Arrow IPC bytes (the
-        // ScalarStatsAgg shape).
-        let combined_min = match concat_arrays(&mins) {
-            Some(a) => a,
-            None => continue,
-        };
-        let combined_max = match concat_arrays(&maxes) {
-            Some(a) => a,
-            None => continue,
-        };
-        let Some((agg_min, _)) = column_min_max(&combined_min) else {
-            continue;
-        };
-        let Some((_, agg_max)) = column_min_max(&combined_max) else {
-            continue;
-        };
-
-        // Additive rollups (null count / sum / HLL) combine with
-        // intersection semantics: every segment must carry the stat or
-        // the part-level value is unknowable (`None`, never zero).
-        let null_count = superfiles.iter().try_fold(0u64, |acc, seg| {
-            acc.checked_add(*seg.scalar_stats.null_counts.get(&col)?)
-        });
-        let sum = superfiles
-            .iter()
-            .try_fold(None::<ArrayRef>, |acc, seg| {
-                let part = seg.scalar_stats.sums.get(&col)?;
-                Some(Some(match acc {
-                    None => part.clone(),
-                    Some(total) => crate::supertable::manifest::add_sum_arrays(&total, part)?,
-                }))
-            })
-            .flatten();
-        let hll = superfiles
-            .iter()
-            .try_fold(
-                None::<crate::supertable::manifest::hll::HllSketch>,
-                |acc, seg| {
-                    let sketch = crate::supertable::manifest::hll::HllSketch::from_bytes(
-                        seg.scalar_stats.hll.get(&col)?,
-                    )?;
-                    Some(Some(match acc {
-                        None => sketch,
-                        Some(mut merged) => {
-                            merged.merge(&sketch);
-                            merged
-                        }
-                    }))
-                },
-            )
-            .flatten()
-            .map(|sketch| sketch.as_bytes().to_vec());
-
-        out.insert(
-            col,
-            ScalarStatsAgg {
-                min: agg_min,
-                max: agg_max,
-                null_count,
-                sum,
-                hll,
-            },
-        );
+        ScalarStatsAgg::merge_tables(&mut out, &seg.scalar_stats);
     }
     out
-}
-
-fn concat_arrays(arrays: &[ArrayRef]) -> Option<ArrayRef> {
-    let refs: Vec<&dyn arrow_array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
-    arrow::compute::concat(&refs).ok()
-}
-
-/// Compute (min, max) of a single combined Array as length-1
-/// `ArrayRef`s. Mirrors the helper in `manifest/mod.rs`
-/// (private there); duplicated to avoid pub-ifying that one
-/// since their callers will diverge over time.
-fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
-    use arrow::compute::kernels::aggregate as agg;
-    use arrow_array::*;
-    use arrow_schema::DataType;
-    macro_rules! prim {
-        ($ty:ty) => {{
-            let a = col.as_any().downcast_ref::<$ty>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
-            let mn_arr: ArrayRef = Arc::new(<$ty>::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(<$ty>::from(vec![mx]));
-            Some((mn_arr, mx_arr))
-        }};
-    }
-    match col.data_type() {
-        DataType::Int8 => prim!(Int8Array),
-        DataType::Int16 => prim!(Int16Array),
-        DataType::Int32 => prim!(Int32Array),
-        DataType::Int64 => prim!(Int64Array),
-        DataType::UInt8 => prim!(UInt8Array),
-        DataType::UInt16 => prim!(UInt16Array),
-        DataType::UInt32 => prim!(UInt32Array),
-        DataType::UInt64 => prim!(UInt64Array),
-        DataType::Float32 => prim!(Float32Array),
-        DataType::Float64 => prim!(Float64Array),
-        DataType::Boolean => {
-            let a = col.as_any().downcast_ref::<BooleanArray>()?;
-            let mn = agg::min_boolean(a)?;
-            let mx = agg::max_boolean(a)?;
-            let mn_arr: ArrayRef = Arc::new(BooleanArray::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(BooleanArray::from(vec![mx]));
-            Some((mn_arr, mx_arr))
-        }
-        DataType::Utf8 => {
-            let a = col.as_any().downcast_ref::<StringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
-            let mn_arr: ArrayRef = Arc::new(StringArray::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(StringArray::from(vec![mx]));
-            Some((mn_arr, mx_arr))
-        }
-        DataType::LargeUtf8 => {
-            let a = col.as_any().downcast_ref::<LargeStringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
-            let mn_arr: ArrayRef = Arc::new(LargeStringArray::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(LargeStringArray::from(vec![mx]));
-            Some((mn_arr, mx_arr))
-        }
-        DataType::Decimal128(precision, scale) => {
-            // The id column (`_id`) is the canonical
-            // Decimal128 column. Min/max via Arrow's
-            // generic aggregate kernel; reconstruct the
-            // length-1 array with the same precision +
-            // scale so downstream IPC encoding preserves
-            // the type identity.
-            let a = col.as_any().downcast_ref::<Decimal128Array>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
-            let mn_arr: ArrayRef = Arc::new(
-                Decimal128Array::from(vec![mn])
-                    .with_precision_and_scale(*precision, *scale)
-                    .ok()?,
-            );
-            let mx_arr: ArrayRef = Arc::new(
-                Decimal128Array::from(vec![mx])
-                    .with_precision_and_scale(*precision, *scale)
-                    .ok()?,
-            );
-            Some((mn_arr, mx_arr))
-        }
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------
@@ -411,8 +255,8 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri};
-    use arrow_array::{ArrayRef, LargeStringArray, StringArray};
+    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, SuperfileEntry, SuperfileUri};
+    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
     use std::collections::HashMap;
 
     fn seg_with_string_minmax(col: &str, min: &str, max: &str, large: bool) -> Arc<SuperfileEntry> {
@@ -428,17 +272,14 @@ mod tests {
             )
         };
         let mut cols = HashMap::new();
-        cols.insert(col.to_string(), (mn, mx));
+        cols.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: HashMap::<String, FtsSummary>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -482,5 +323,89 @@ mod tests {
         let agg = aggs.get("body").expect("body agg present");
         assert_eq!(string_val(&agg.min), "apple");
         assert_eq!(string_val(&agg.max), "papaya");
+    }
+
+    /// Build a superfile carrying full per-column stats for one Int64 column
+    /// (min/max + null count + exact sum + HLL), via `from_column`.
+    fn seg_with_i64(col: &str, vals: Vec<i64>) -> Arc<SuperfileEntry> {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
+        let mut cols = HashMap::new();
+        cols.insert(
+            col.to_string(),
+            ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
+        );
+        Arc::new(SuperfileEntry {
+            superfile_id: uuid::Uuid::new_v4(),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: cols,
+            fts_summary: HashMap::<String, FtsSummary>::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: None,
+        })
+    }
+
+    fn i64_val(arr: &ArrayRef) -> i64 {
+        arr.as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 array")
+            .value(0)
+    }
+
+    #[test]
+    fn scalar_stats_agg_folds_additive_stats_across_superfiles() {
+        // Two superfiles, same column: min/max take the extremes; null_count
+        // and sum fold additively; HLL merges.
+        let segs = vec![
+            seg_with_i64("n", vec![10, 50]), // sum 60
+            seg_with_i64("n", vec![5, 30]),  // sum 35
+        ];
+        let aggs = scalar_stats_agg(&segs);
+        let agg = aggs.get("n").expect("n agg present");
+        assert_eq!(i64_val(&agg.min), 5);
+        assert_eq!(i64_val(&agg.max), 50);
+        assert_eq!(agg.null_count, Some(0)); // no nulls in either
+        assert_eq!(i64_val(agg.sum.as_ref().expect("summed")), 95); // 60 + 35
+        assert!(agg.hll.is_some(), "HLL sketches fold across superfiles");
+    }
+
+    #[test]
+    fn scalar_stats_agg_drops_additive_when_a_superfile_lacks_the_stat() {
+        // One superfile carries full stats; the other carries only min/max
+        // (e.g. an older segment). The additive stats become unknowable at
+        // the part level, but min/max still union.
+        let bounds_only = {
+            let mn: ArrayRef = Arc::new(Int64Array::from(vec![3]));
+            let mx: ArrayRef = Arc::new(Int64Array::from(vec![4]));
+            let mut cols = HashMap::new();
+            cols.insert("n".to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+            Arc::new(SuperfileEntry {
+                superfile_id: uuid::Uuid::new_v4(),
+                uri: SuperfileUri::new_v4(),
+                n_docs: 1,
+                id_min: 0,
+                id_max: 0,
+                scalar_stats: cols,
+                fts_summary: HashMap::<String, FtsSummary>::new(),
+                vector_summary: HashMap::new(),
+                partition_key: Vec::new(),
+                partition_hint: None,
+                subsection_offsets: None,
+            })
+        };
+        let segs = vec![seg_with_i64("n", vec![1, 100]), bounds_only];
+        let aggs = scalar_stats_agg(&segs);
+        let agg = aggs.get("n").expect("n agg present");
+        // min/max union across both.
+        assert_eq!(i64_val(&agg.min), 1);
+        assert_eq!(i64_val(&agg.max), 100);
+        // Additive stats drop to None because one contributor lacks them.
+        assert!(agg.sum.is_none(), "sum unknowable when a segment lacks it");
+        assert!(agg.null_count.is_none());
+        assert!(agg.hll.is_none());
     }
 }

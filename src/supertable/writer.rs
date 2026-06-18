@@ -80,7 +80,7 @@ use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
 use super::manifest::{
-    FtsSummary, ScalarStatsTable, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
+    FtsSummary, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use super::mutations::{
     CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -986,7 +986,7 @@ pub struct ShardOutput {
     /// aggregate kernels; types whose ordering isn't well-defined
     /// (FixedSizeList, struct, etc.) are absent and treated as
     /// "can't prune" by the skip planner.
-    scalar_stats: ScalarStatsTable,
+    scalar_stats: HashMap<String, ScalarStatsAgg>,
 }
 
 impl ShardOutput {
@@ -995,7 +995,7 @@ impl ShardOutput {
         n_docs: u64,
         id_min: i128,
         id_max: i128,
-        scalar_stats: ScalarStatsTable,
+        scalar_stats: HashMap<String, ScalarStatsAgg>,
     ) -> Self {
         Self {
             bytes,
@@ -1059,7 +1059,7 @@ fn build_one_shard(
     // batches into the builder via `finish`. We pass references —
     // `from_batches` doesn't take ownership.
     let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
-    let scalar_stats = ScalarStatsTable::from_batches(&scalar_schema, &scalar_batches);
+    let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_batches);
 
     let bytes = Bytes::from(builder.finish()?);
 

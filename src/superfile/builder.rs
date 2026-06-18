@@ -1296,29 +1296,29 @@ mod tests {
 
         // Verify scalar_stats contains entries for all scalar columns
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         assert!(
-            stats.scalar_stats.cols.contains_key("doc_id"),
+            stats.scalar_stats.contains_key("doc_id"),
             "scalar_stats should contain id_column"
         );
         assert!(
-            stats.scalar_stats.cols.contains_key("title"),
+            stats.scalar_stats.contains_key("title"),
             "scalar_stats should contain FTS column"
         );
         assert!(
-            stats.scalar_stats.cols.contains_key("body"),
+            stats.scalar_stats.contains_key("body"),
             "scalar_stats should contain body column"
         );
 
         // Verify scalar_stats values match expected min/max
         // doc_id: IDs are [10, 11], so min=10, max=11
-        let (id_min_arr, id_max_arr) = stats
+        let id_agg = stats
             .scalar_stats
-            .cols
             .get("doc_id")
             .expect("doc_id should have stats");
+        let (id_min_arr, id_max_arr) = (&id_agg.min, &id_agg.max);
         let id_min = id_min_arr
             .as_any()
             .downcast_ref::<Decimal128Array>()
@@ -1333,11 +1333,11 @@ mod tests {
         assert_eq!(id_max, 11i128, "doc_id max should be 11");
 
         // title: ["hello world", "rust async"], so min="hello world", max="rust async"
-        let (title_min_arr, title_max_arr) = stats
+        let title_agg = stats
             .scalar_stats
-            .cols
             .get("title")
             .expect("title should have stats");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -1355,11 +1355,11 @@ mod tests {
         assert_eq!(title_max, "rust async", "title max should be 'rust async'");
 
         // body: ["foo bar", "baz quux"], so min="baz quux", max="foo bar"
-        let (body_min_arr, body_max_arr) = stats
+        let body_agg = stats
             .scalar_stats
-            .cols
             .get("body")
             .expect("body should have stats");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b2.finish().expect("finish builder");
@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b2.finish().expect("finish builder");
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b2.finish().expect("finish builder");
@@ -1594,7 +1594,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = merged.finish().expect("finish builder");
@@ -1755,7 +1755,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b_merged.finish().expect("finish builder");
@@ -1840,9 +1840,9 @@ mod tests {
         assert_eq!(stats.n_docs, 2);
         assert_eq!(stats.id_min, 10);
         assert_eq!(stats.id_max, 11);
-        assert!(stats.scalar_stats.cols.contains_key("doc_id"));
-        assert!(stats.scalar_stats.cols.contains_key("title"));
-        assert!(stats.scalar_stats.cols.contains_key("body"));
+        assert!(stats.scalar_stats.contains_key("doc_id"));
+        assert!(stats.scalar_stats.contains_key("title"));
+        assert!(stats.scalar_stats.contains_key("body"));
 
         // Verify data is preserved
         let merged_reader =
@@ -1898,7 +1898,7 @@ mod tests {
         assert_eq!(stats.n_docs, 4, "should have 4 total documents");
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 21, "id_max should be 21");
-        assert_eq!(stats.scalar_stats.cols.len(), 3, "should have 3 columns");
+        assert_eq!(stats.scalar_stats.len(), 3, "should have 3 columns");
 
         // Verify merged superfile
         let merged_reader =
@@ -2243,11 +2243,8 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify doc_id min/max (10, 11)
-        let (doc_id_min_arr, doc_id_max_arr) = stats
-            .scalar_stats
-            .cols
-            .get("doc_id")
-            .expect("doc_id column");
+        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
             .as_any()
@@ -2264,8 +2261,8 @@ mod tests {
         assert_eq!(doc_id_max, 11, "doc_id max should be 11");
 
         // Verify title min/max (from batch_two_rows: ["hello world", "rust async"])
-        let (title_min_arr, title_max_arr) =
-            stats.scalar_stats.cols.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
             .as_any()
@@ -2285,8 +2282,8 @@ mod tests {
         assert_eq!(title_max, "rust async", "title max should be 'rust async'");
 
         // Verify body min/max (from batch_two_rows: ["foo bar", "baz quux"])
-        let (body_min_arr, body_max_arr) =
-            stats.scalar_stats.cols.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
             .as_any()
@@ -2345,11 +2342,8 @@ mod tests {
         .expect("build_from_readers");
 
         // Verify doc_id: min should be 10, max should be 21 (merged from both readers)
-        let (doc_id_min_arr, doc_id_max_arr) = stats
-            .scalar_stats
-            .cols
-            .get("doc_id")
-            .expect("doc_id column");
+        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
             .as_any()
@@ -2366,8 +2360,8 @@ mod tests {
         assert_eq!(doc_id_max, 21, "merged doc_id max should be 21");
 
         // Verify title: min should be "alpha", max should be "zeta" (lexicographically from both readers)
-        let (title_min_arr, title_max_arr) =
-            stats.scalar_stats.cols.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
             .as_any()
@@ -2384,8 +2378,8 @@ mod tests {
         assert_eq!(title_max, "zeta", "merged title max should be 'zeta'");
 
         // Verify body: min should be "aaa", max should be "zzz" (lexicographically from both readers)
-        let (body_min_arr, body_max_arr) =
-            stats.scalar_stats.cols.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
             .as_any()
@@ -2434,8 +2428,8 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify title min/max (values: ["zebra", "apple"] => min="apple", max="zebra")
-        let (title_min_arr, title_max_arr) =
-            stats.scalar_stats.cols.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
             .as_any()
@@ -2452,8 +2446,8 @@ mod tests {
         assert_eq!(title_max, "zebra", "title max should be 'zebra'");
 
         // Verify body min/max (values: ["xyz", "abc"] => min="abc", max="xyz")
-        let (body_min_arr, body_max_arr) =
-            stats.scalar_stats.cols.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
             .as_any()

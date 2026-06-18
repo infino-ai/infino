@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! In-memory manifest types: `Manifest`, `SuperfileEntry`,
-//! `ScalarStatsTable`, `FtsSummary`, `VectorSummary`.
+//! `FtsSummary`, `VectorSummary`. Per-scalar-column stats live in
+//! `SuperfileEntry.scalar_stats` as a `HashMap<String, ScalarStatsAgg>`.
 //!
 //! `Manifest` is the single immutable point-in-time view of which
 //! superfiles exist. `Supertable` holds the current manifest behind
@@ -32,12 +33,16 @@ pub mod part;
 pub mod partition;
 pub mod term_range;
 
+/// Re-export the per-column scalar aggregate so callers can refer to it as
+/// `manifest::ScalarStatsAgg` (it is the value type of `SuperfileEntry.scalar_stats`).
+pub use list::ScalarStatsAgg;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
-use arrow_schema::{DataType, Schema};
+use arrow_schema::DataType;
 use dashmap::DashMap;
 use futures::future;
 use uuid::Uuid;
@@ -1062,8 +1067,10 @@ pub struct SuperfileEntry {
     /// stays 0 for any plausible current-era timestamp.
     pub id_min: i128,
     pub id_max: i128,
-    /// Per-scalar-column min/max for skip pruning of SQL filters.
-    pub scalar_stats: ScalarStatsTable,
+    /// Per-scalar-column aggregate (min/max + null count, exact sum, HLL),
+    /// keyed by column name, for skip pruning of SQL filters. An absent
+    /// column means "no usable stats" (the pruner keeps the superfile).
+    pub scalar_stats: HashMap<String, ScalarStatsAgg>,
     /// Per-FTS-column term-presence bloom + lex range. The bloom
     /// drives exact-term skip; the term-range drives prefix-query
     /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
@@ -1192,155 +1199,6 @@ impl SuperfileUri {
     pub fn cache_tmp_filename(self) -> String {
         format!("seg-{}.sf.parquet.tmp", self.0)
     }
-}
-
-/// Per-scalar-column min/max for a superfile, used by scalar skip
-/// pruning. Each column's min/max is a length-1 `ArrayRef` of the
-/// column's data type — the most general shape that doesn't
-/// require pulling DataFusion into this layer. The skip helper
-/// converts to DataFusion `ScalarValue` at compare time when
-/// matching against query predicates.
-#[derive(Debug, Clone, Default)]
-pub struct ScalarStatsTable {
-    /// `cols[col_name] = (min_array, max_array)`. Both arrays are
-    /// length-1 with the column's logical Arrow type.
-    pub cols: HashMap<String, (ArrayRef, ArrayRef)>,
-    /// Per-column null counts over the segment's rows. Keyed like
-    /// `cols`; a missing entry means "not computed" (older segments),
-    /// never zero.
-    pub null_counts: HashMap<String, u64>,
-    /// Per-column exact sums, as length-1 arrays typed to match SQL
-    /// `SUM`'s result for the column (signed ints → `Int64`, unsigned
-    /// → `UInt64`, floats → `Float64`). Missing for non-summable
-    /// types or when the exact sum overflows the result type.
-    pub sums: HashMap<String, ArrayRef>,
-    /// Per-column HyperLogLog distinct-count sketches (raw register
-    /// bytes, see [`hll::HllSketch`]). Planner estimates only.
-    pub hll: HashMap<String, Vec<u8>>,
-}
-
-impl ScalarStatsTable {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Compute per-column min / max across `batches` for every
-    /// scalar column in `scalar_schema`, skipping types whose
-    /// ordering isn't well-defined here (anything other than
-    /// integer / float / boolean / utf8).
-    ///
-    /// Used by [`crate::supertable::writer::SupertableWriter`] at
-    /// commit time to populate per-superfile scalar skip stats. The
-    /// resulting table maps `column_name → (min_arr, max_arr)`,
-    /// where each entry is a length-1 [`ArrayRef`] of the column's
-    /// type — zero-pad isn't needed since the skip planner reads
-    /// scalar values out via Arrow's per-type accessors.
-    ///
-    /// Memory cost: one `concat` per skippable column, each
-    /// producing a ~`n_docs`-row temporary that's freed before
-    /// the next column. For a 1M-row shard with 5 skippable
-    /// columns, peak overhead is one column's worth (~MB) — far
-    /// below the parquet footprint we're already paying.
-    pub fn from_batches(scalar_schema: &Schema, batches: &[&RecordBatch]) -> Self {
-        let mut stats = Self::default();
-        if batches.is_empty() {
-            return stats;
-        }
-        for (idx, field) in scalar_schema.fields().iter().enumerate() {
-            let arrays: Vec<&dyn arrow_array::Array> =
-                batches.iter().map(|b| b.column(idx).as_ref()).collect();
-            let combined = match arrow::compute::concat(&arrays) {
-                Ok(a) => a,
-                // Concat fails for shape mismatch; skip silently —
-                // the skip planner treats missing stats as "can't
-                // prune", which is the safe default.
-                Err(_) => continue,
-            };
-            stats.insert_column(field.name(), &combined);
-        }
-        stats
-    }
-
-    pub fn from_batch(scalar_schema: &Schema, batch: &RecordBatch) -> Self {
-        let mut stats = Self::default();
-        for (idx, field) in scalar_schema.fields().iter().enumerate() {
-            stats.insert_column(field.name(), batch.column(idx));
-        }
-        stats
-    }
-
-    /// Compute every per-column stat this table carries from one
-    /// resident column: min/max (skip-pruning), null count, exact sum,
-    /// and the HLL distinct sketch (SQL planner statistics). One pass
-    /// over the values beyond the min/max kernels; cost is linear in
-    /// rows and freed before the next column.
-    fn insert_column(&mut self, name: &str, column: &ArrayRef) {
-        if let Some(pair) = column_min_max(column) {
-            self.cols.insert(name.to_string(), pair);
-            // The companion stats only exist for columns that carry
-            // min/max (same orderable-type set), so consumers can key
-            // everything off `cols`.
-            self.null_counts
-                .insert(name.to_string(), column.null_count() as u64);
-            if let Some(sum) = column_sum(column) {
-                self.sums.insert(name.to_string(), sum);
-            }
-            if let Some(sketch) = column_hll(column) {
-                self.hll
-                    .insert(name.to_string(), sketch.as_bytes().to_vec());
-            }
-        }
-    }
-
-    pub fn merge(&mut self, other: &Self) {
-        for (name, (other_min, other_max)) in &other.cols {
-            if let Some(existing) = self.cols.get_mut(name) {
-                // Merge by comparing and keeping the actual min and max across both stats
-                if let Some((merged_min, merged_max)) =
-                    merge_min_max_arrays(&existing.0, other_min, &existing.1, other_max)
-                {
-                    existing.0 = merged_min;
-                    existing.1 = merged_max;
-                }
-            } else {
-                self.cols
-                    .insert(name.clone(), (other_min.clone(), other_max.clone()));
-            }
-        }
-        // Additive stats combine only when BOTH sides know them — a
-        // side without the stat makes the total unknowable, so the
-        // merged entry is dropped (consumers treat missing as
-        // "no statistics", never as zero).
-        merge_known(&mut self.null_counts, &other.null_counts, |a, b| {
-            a.checked_add(*b)
-        });
-        merge_known(&mut self.sums, &other.sums, add_sum_arrays);
-        merge_known(&mut self.hll, &other.hll, |a, b| {
-            let mut merged = hll::HllSketch::from_bytes(a)?;
-            merged.merge(&hll::HllSketch::from_bytes(b)?);
-            Some(merged.as_bytes().to_vec())
-        });
-    }
-}
-
-/// Merge additive stat maps with intersection semantics: entries
-/// present on both sides combine via `combine` (`None` = combination
-/// failed, e.g. overflow → drop); entries present on only one side are
-/// dropped — the other side's contribution is unknown.
-fn merge_known<V: Clone>(
-    ours: &mut HashMap<String, V>,
-    theirs: &HashMap<String, V>,
-    combine: impl Fn(&V, &V) -> Option<V>,
-) {
-    let mut merged: HashMap<String, V> = HashMap::new();
-    for (name, a) in ours.iter() {
-        if let Some(b) = theirs.get(name)
-            && let Some(c) = combine(a, b)
-        {
-            merged.insert(name.clone(), c);
-        }
-    }
-    *ours = merged;
 }
 
 /// Merge min/max arrays by comparing values and keeping the actual min and max.
@@ -1898,7 +1756,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow_array::{Array, UInt64Array};
+    use arrow_array::Array;
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
     use tokio::sync::OnceCell;
@@ -2048,7 +1906,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -2173,251 +2031,6 @@ mod tests {
         let a = SuperfileUri::new_v4();
         let b = SuperfileUri::new_v4();
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn scalar_stats_table_default_is_empty() {
-        let s = ScalarStatsTable::new();
-        assert!(s.cols.is_empty());
-    }
-
-    #[test]
-    fn scalar_stats_table_can_hold_arrow_array_min_max() {
-        // Spot-check that the (ArrayRef, ArrayRef) shape is
-        // constructable for a typical column type.
-        let mut s = ScalarStatsTable::new();
-        let min: ArrayRef = Arc::new(UInt64Array::from(vec![1u64]));
-        let max: ArrayRef = Arc::new(UInt64Array::from(vec![999u64]));
-        s.cols.insert("ts".into(), (min, max));
-        assert_eq!(s.cols.len(), 1);
-        let (lo, hi) = s.cols.get("ts").expect("inserted");
-        assert_eq!(lo.len(), 1);
-        assert_eq!(hi.len(), 1);
-    }
-
-    #[test]
-    fn fts_summary_round_trip_fields() {
-        // BLOCK_BYTES = 64; smallest valid bloom = one block.
-        let s = FtsSummary {
-            term_bloom: bloom::BloomBuilder::with_n_blocks(1).finish(),
-            n_terms_distinct: 1234,
-            term_range: (b"err".to_vec(), b"foo".to_vec()),
-        };
-        assert_eq!(s.term_bloom.len(), 64);
-        assert_eq!(s.n_terms_distinct, 1234);
-        assert_eq!(s.term_range.0, b"err".to_vec());
-        assert_eq!(s.term_range.1, b"foo".to_vec());
-    }
-
-    #[test]
-    fn vector_summary_round_trip_fields() {
-        let s = VectorSummary {
-            centroid: vec![0.1, 0.2, 0.3],
-            radius: 0.5,
-            clusters: ClusterCentroids::empty(),
-        };
-        assert_eq!(s.centroid.len(), 3);
-        assert!((s.radius - 0.5).abs() < 1e-9);
-    }
-
-    // ============================================================
-    // ScalarStatsTable::merge tests — verify min/max comparison
-    // across different types (integers, floats, strings, decimal128)
-    // ============================================================
-
-    #[test]
-    fn merge_integer_columns_keeps_actual_min_max() {
-        use arrow_array::Int64Array;
-        let mut stats1 = ScalarStatsTable::new();
-        stats1.cols.insert(
-            "id".to_string(),
-            (
-                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![50])) as ArrayRef,
-            ),
-        );
-
-        let mut stats2 = ScalarStatsTable::new();
-        stats2.cols.insert(
-            "id".to_string(),
-            (
-                Arc::new(Int64Array::from(vec![5])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
-            ),
-        );
-
-        stats1.merge(&stats2);
-
-        let (min_arr, max_arr) = stats1.cols.get("id").expect("column should exist");
-        let min_val = min_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("should be Int64Array")
-            .value(0);
-        let max_val = max_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("should be Int64Array")
-            .value(0);
-
-        assert_eq!(min_val, 5, "min should be the smaller value");
-        assert_eq!(max_val, 100, "max should be the larger value");
-    }
-
-    #[test]
-    fn merge_string_columns_keeps_lexicographic_min_max() {
-        use arrow_array::LargeStringArray;
-        let mut stats1 = ScalarStatsTable::new();
-        stats1.cols.insert(
-            "name".to_string(),
-            (
-                Arc::new(LargeStringArray::from(vec!["bob"])) as ArrayRef,
-                Arc::new(LargeStringArray::from(vec!["zebra"])) as ArrayRef,
-            ),
-        );
-
-        let mut stats2 = ScalarStatsTable::new();
-        stats2.cols.insert(
-            "name".to_string(),
-            (
-                Arc::new(LargeStringArray::from(vec!["alice"])) as ArrayRef,
-                Arc::new(LargeStringArray::from(vec!["charlie"])) as ArrayRef,
-            ),
-        );
-
-        stats1.merge(&stats2);
-
-        let (min_arr, max_arr) = stats1.cols.get("name").expect("column should exist");
-        let min_val = min_arr
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("should be LargeStringArray")
-            .value(0);
-        let max_val = max_arr
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("should be LargeStringArray")
-            .value(0);
-
-        assert_eq!(min_val, "alice", "min should be lexicographically smaller");
-        assert_eq!(max_val, "zebra", "max should be lexicographically larger");
-    }
-
-    #[test]
-    fn merge_float_columns_keeps_numeric_min_max() {
-        use arrow_array::Float64Array;
-        let mut stats1 = ScalarStatsTable::new();
-        stats1.cols.insert(
-            "value".to_string(),
-            (
-                Arc::new(Float64Array::from(vec![1.5])) as ArrayRef,
-                Arc::new(Float64Array::from(vec![9.9])) as ArrayRef,
-            ),
-        );
-
-        let mut stats2 = ScalarStatsTable::new();
-        stats2.cols.insert(
-            "value".to_string(),
-            (
-                Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,
-                Arc::new(Float64Array::from(vec![10.5])) as ArrayRef,
-            ),
-        );
-
-        stats1.merge(&stats2);
-
-        let (min_arr, max_arr) = stats1.cols.get("value").expect("column should exist");
-        let min_val = min_arr
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("should be Float64Array")
-            .value(0);
-        let max_val = max_arr
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("should be Float64Array")
-            .value(0);
-
-        assert!((min_val - 0.5).abs() < 1e-9, "min should be 0.5");
-        assert!((max_val - 10.5).abs() < 1e-9, "max should be 10.5");
-    }
-
-    #[test]
-    fn merge_adds_new_columns() {
-        use arrow_array::UInt32Array;
-        let mut stats1 = ScalarStatsTable::new();
-        stats1.cols.insert(
-            "col1".to_string(),
-            (
-                Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
-                Arc::new(UInt32Array::from(vec![10])) as ArrayRef,
-            ),
-        );
-
-        let mut stats2 = ScalarStatsTable::new();
-        stats2.cols.insert(
-            "col2".to_string(),
-            (
-                Arc::new(UInt32Array::from(vec![20])) as ArrayRef,
-                Arc::new(UInt32Array::from(vec![30])) as ArrayRef,
-            ),
-        );
-
-        stats1.merge(&stats2);
-
-        assert_eq!(stats1.cols.len(), 2, "should have both columns");
-        assert!(stats1.cols.contains_key("col1"), "col1 should exist");
-        assert!(stats1.cols.contains_key("col2"), "col2 should exist");
-    }
-
-    #[test]
-    fn merge_multiple_times_maintains_correct_min_max() {
-        use arrow_array::Int32Array;
-        let mut stats = ScalarStatsTable::new();
-        stats.cols.insert(
-            "count".to_string(),
-            (
-                Arc::new(Int32Array::from(vec![50])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![150])) as ArrayRef,
-            ),
-        );
-
-        // First merge
-        let mut stats2 = ScalarStatsTable::new();
-        stats2.cols.insert(
-            "count".to_string(),
-            (
-                Arc::new(Int32Array::from(vec![30])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![200])) as ArrayRef,
-            ),
-        );
-        stats.merge(&stats2);
-
-        // Second merge
-        let mut stats3 = ScalarStatsTable::new();
-        stats3.cols.insert(
-            "count".to_string(),
-            (
-                Arc::new(Int32Array::from(vec![10])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![100])) as ArrayRef,
-            ),
-        );
-        stats.merge(&stats3);
-
-        let (min_arr, max_arr) = stats.cols.get("count").expect("column should exist");
-        let min_val = min_arr
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("should be Int32Array")
-            .value(0);
-        let max_val = max_arr
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("should be Int32Array")
-            .value(0);
-
-        assert_eq!(min_val, 10, "min should be 10 after two merges");
-        assert_eq!(max_val, 200, "max should be 200 after two merges");
     }
 
     // ============================================================
@@ -2774,8 +2387,8 @@ mod tests {
 
     // ============================================================
     // SuperfileUri path helpers, Debug formatters, and the
-    // ScalarStatsTable build/aggregate helpers (from_batch[es],
-    // column_sum / column_hll / column_min_max, additive merge).
+    // `add_sum_arrays` additive-sum helper (the scalar-stats build /
+    // merge logic itself is tested on `ScalarStatsAgg` in `list.rs`).
     // ============================================================
 
     #[test]
@@ -2854,177 +2467,6 @@ mod tests {
         assert_eq!(cc.dim, 4);
     }
 
-    fn batch_with_columns(schema: &Arc<Schema>, cols: Vec<ArrayRef>) -> RecordBatch {
-        RecordBatch::try_new(Arc::clone(schema), cols).expect("batch")
-    }
-
-    #[test]
-    fn scalar_stats_from_batch_computes_min_max_null_sum_hll() {
-        use arrow_array::{Float64Array, Int64Array};
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("ints", DataType::Int64, true),
-            Field::new("floats", DataType::Float64, false),
-        ]));
-        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(1), Some(5)]));
-        let floats: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
-        let batch = batch_with_columns(&schema, vec![ints, floats]);
-
-        let stats = ScalarStatsTable::from_batch(&schema, &batch);
-
-        // min/max present for both orderable columns.
-        let (mn, mx) = stats.cols.get("ints").expect("ints min/max");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            1
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            5
-        );
-        // null count tracked (one null in `ints`).
-        assert_eq!(*stats.null_counts.get("ints").expect("null count"), 1);
-        assert_eq!(*stats.null_counts.get("floats").expect("null count"), 0);
-        // exact sum: ints = 3+1+5 = 9 (Int64), floats = 10.0 (Float64).
-        let s = stats.sums.get("ints").expect("int sum");
-        assert_eq!(
-            s.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            9
-        );
-        let s = stats.sums.get("floats").expect("float sum");
-        assert!(
-            (s.as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("test")
-                .value(0)
-                - 10.0)
-                .abs()
-                < 1e-9
-        );
-        // HLL sketch recorded for both columns.
-        assert!(stats.hll.contains_key("ints"));
-        assert!(stats.hll.contains_key("floats"));
-    }
-
-    #[test]
-    fn scalar_stats_from_batches_concats_across_batches() {
-        use arrow_array::Int32Array;
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let b1 = batch_with_columns(&schema, vec![Arc::new(Int32Array::from(vec![10, 20]))]);
-        let b2 = batch_with_columns(&schema, vec![Arc::new(Int32Array::from(vec![5, 30]))]);
-        let stats = ScalarStatsTable::from_batches(&schema, &[&b1, &b2]);
-        let (mn, mx) = stats.cols.get("v").expect("min/max");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("test")
-                .value(0),
-            5
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("test")
-                .value(0),
-            30
-        );
-        // sum across both batches = 10+20+5+30 = 65.
-        let s = stats.sums.get("v").expect("sum");
-        assert_eq!(
-            s.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            65
-        );
-    }
-
-    #[test]
-    fn scalar_stats_from_batches_empty_is_empty() {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let stats = ScalarStatsTable::from_batches(&schema, &[]);
-        assert!(stats.cols.is_empty());
-    }
-
-    #[test]
-    fn scalar_stats_skips_unorderable_column_types() {
-        // A List column has no well-defined min/max here, so it's
-        // silently skipped (the skip planner treats missing as
-        // "can't prune").
-        let inner = Arc::new(Field::new("item", DataType::Int32, true));
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "tags",
-            DataType::List(inner),
-            true,
-        )]));
-        use arrow_array::builder::{Int32Builder, ListBuilder};
-        let mut lb = ListBuilder::new(Int32Builder::new());
-        lb.values().append_value(1);
-        lb.append(true);
-        let arr: ArrayRef = Arc::new(lb.finish());
-        let batch = batch_with_columns(&schema, vec![arr]);
-        let stats = ScalarStatsTable::from_batch(&schema, &batch);
-        assert!(stats.cols.is_empty(), "list type should be skipped");
-    }
-
-    #[test]
-    fn merge_additive_stats_intersect_on_both_sides() {
-        use arrow_array::Int64Array;
-        // Two tables: only the shared column's null_count / sum
-        // survives the merge; a one-sided column's additive stats
-        // are dropped.
-        let mut a = ScalarStatsTable::new();
-        a.cols.insert(
-            "n".into(),
-            (
-                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
-            ),
-        );
-        a.null_counts.insert("n".into(), 2);
-        a.sums.insert(
-            "n".into(),
-            Arc::new(Int64Array::from(vec![100])) as ArrayRef,
-        );
-
-        let mut b = ScalarStatsTable::new();
-        b.cols.insert(
-            "n".into(),
-            (
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![20])) as ArrayRef,
-            ),
-        );
-        b.null_counts.insert("n".into(), 3);
-        b.sums
-            .insert("n".into(), Arc::new(Int64Array::from(vec![50])) as ArrayRef);
-        // One-sided additive entry that must be dropped.
-        b.null_counts.insert("solo".into(), 9);
-
-        a.merge(&b);
-        // null counts add: 2 + 3 = 5.
-        assert_eq!(*a.null_counts.get("n").expect("merged null"), 5);
-        // sums add: 100 + 50 = 150.
-        let s = a.sums.get("n").expect("merged sum");
-        assert_eq!(
-            s.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            150
-        );
-        // The one-sided "solo" entry is gone.
-        assert!(!a.null_counts.contains_key("solo"));
-    }
-
     #[test]
     fn add_sum_arrays_handles_each_type_and_overflow() {
         use arrow_array::{Float64Array, Int64Array, UInt64Array};
@@ -3081,71 +2523,6 @@ mod tests {
             &(Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef),
         );
         assert!(r.is_none(), "type mismatch drops the stat");
-    }
-
-    #[test]
-    fn merge_decimal128_and_boolean_min_max() {
-        use arrow_array::{BooleanArray, Decimal128Array};
-        // Decimal128 merge keeps numeric min/max.
-        let dec = |v: i128| -> ArrayRef {
-            Arc::new(
-                Decimal128Array::from(vec![v])
-                    .with_precision_and_scale(38, 0)
-                    .expect("decimal"),
-            )
-        };
-        let mut a = ScalarStatsTable::new();
-        a.cols.insert("d".into(), (dec(10), dec(20)));
-        let mut b = ScalarStatsTable::new();
-        b.cols.insert("d".into(), (dec(5), dec(50)));
-        a.merge(&b);
-        let (mn, mx) = a.cols.get("d").expect("decimal col");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("test")
-                .value(0),
-            5
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("test")
-                .value(0),
-            50
-        );
-
-        // Boolean merge: min = AND, max = OR.
-        let mut a = ScalarStatsTable::new();
-        a.cols.insert(
-            "flag".into(),
-            (
-                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
-            ),
-        );
-        let mut b = ScalarStatsTable::new();
-        b.cols.insert(
-            "flag".into(),
-            (
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
-                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
-            ),
-        );
-        a.merge(&b);
-        let (mn, mx) = a.cols.get("flag").expect("bool col");
-        assert!(
-            !mn.as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("test")
-                .value(0)
-        );
-        assert!(
-            mx.as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("test")
-                .value(0)
-        );
     }
 
     // ---- Manifest::rebalance -------------------------------------------
@@ -5231,169 +4608,6 @@ mod tests {
         assert!(m.is_in_process_only());
         assert_eq!(m.get_num_parts(), 0);
         assert_eq!(m.superfiles.len(), 1);
-    }
-
-    /// Merging two tables that each carry an HLL sketch on the same
-    /// column folds the sketches together (the HLL-merge closure in
-    /// `ScalarStatsTable::merge`), and the merged distinct estimate
-    /// covers the union of both inputs.
-    #[test]
-    fn merge_folds_hll_sketches_on_shared_column() {
-        use arrow_array::Int64Array;
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let a_batch = batch_with_columns(
-            &schema,
-            vec![Arc::new(Int64Array::from((0..100i64).collect::<Vec<_>>())) as ArrayRef],
-        );
-        let b_batch = batch_with_columns(
-            &schema,
-            vec![Arc::new(Int64Array::from((50..200i64).collect::<Vec<_>>())) as ArrayRef],
-        );
-        let mut a = ScalarStatsTable::from_batch(&schema, &a_batch);
-        let b = ScalarStatsTable::from_batch(&schema, &b_batch);
-        assert!(a.hll.contains_key("v") && b.hll.contains_key("v"));
-
-        a.merge(&b);
-        // The merged sketch must survive (both sides had one) and its
-        // estimate should reflect the ~200-value union, not just 100.
-        let merged = a.hll.get("v").expect("merged hll");
-        let sketch = hll::HllSketch::from_bytes(merged).expect("decode merged hll");
-        let estimate = sketch.estimate();
-        assert!(
-            estimate > 120.0,
-            "merged HLL should estimate the union (~200), got {estimate}"
-        );
-    }
-
-    /// String columns route through the `Utf8` / `LargeUtf8` arms of
-    /// `column_min_max` (lexicographic min/max), `column_hll` (distinct
-    /// sketch over raw bytes), and the string `merge_min_max_arrays`
-    /// branch. Build per-batch stats over both string widths, then merge
-    /// to widen the lexicographic range.
-    #[test]
-    fn scalar_stats_string_columns_min_max_hll_and_merge() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("u", DataType::Utf8, false),
-            Field::new("l", DataType::LargeUtf8, false),
-        ]));
-        let a_u: ArrayRef = Arc::new(StringArray::from(vec!["delta", "bravo"]));
-        let a_l: ArrayRef = Arc::new(LargeStringArray::from(vec!["mike", "kilo"]));
-        let a_batch = batch_with_columns(&schema, vec![a_u, a_l]);
-        let mut a = ScalarStatsTable::from_batch(&schema, &a_batch);
-
-        // Utf8 min/max are lexicographic over the first batch.
-        let (mn, mx) = a.cols.get("u").expect("utf8 min/max");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<StringArray>()
-                .expect("test")
-                .value(0),
-            "bravo"
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<StringArray>()
-                .expect("test")
-                .value(0),
-            "delta"
-        );
-        // LargeUtf8 min/max likewise.
-        let (mn, mx) = a.cols.get("l").expect("largeutf8 min/max");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("test")
-                .value(0),
-            "kilo"
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("test")
-                .value(0),
-            "mike"
-        );
-        // HLL sketches recorded for both string widths.
-        assert!(a.hll.contains_key("u"));
-        assert!(a.hll.contains_key("l"));
-
-        // Second batch extends the range on both ends; merge widens it.
-        let b_u: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "echo"]));
-        let b_l: ArrayRef = Arc::new(LargeStringArray::from(vec!["november", "alfa"]));
-        let b_batch = batch_with_columns(&schema, vec![b_u, b_l]);
-        let b = ScalarStatsTable::from_batch(&schema, &b_batch);
-        a.merge(&b);
-
-        let (mn, mx) = a.cols.get("u").expect("merged utf8");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<StringArray>()
-                .expect("test")
-                .value(0),
-            "alpha"
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<StringArray>()
-                .expect("test")
-                .value(0),
-            "echo"
-        );
-        let (mn, mx) = a.cols.get("l").expect("merged largeutf8");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("test")
-                .value(0),
-            "alfa"
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("test")
-                .value(0),
-            "november"
-        );
-    }
-
-    /// `merge_min_max_arrays` returns `None` when the two sides disagree
-    /// on type (the `as_any().downcast_ref()?` short-circuit). On a
-    /// `None`, `merge` leaves the existing min/max untouched rather than
-    /// panicking or clobbering it.
-    #[test]
-    fn merge_min_max_keeps_existing_on_type_mismatch() {
-        let mut a = ScalarStatsTable::new();
-        a.cols.insert(
-            "x".into(),
-            (
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![5])) as ArrayRef,
-            ),
-        );
-        let mut b = ScalarStatsTable::new();
-        b.cols.insert(
-            "x".into(),
-            (
-                Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["z"])) as ArrayRef,
-            ),
-        );
-        a.merge(&b);
-        let (mn, mx) = a.cols.get("x").expect("col retained");
-        assert_eq!(
-            mn.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            1
-        );
-        assert_eq!(
-            mx.as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("test")
-                .value(0),
-            5
-        );
     }
 
     /// `ClusterCentroids::from_fp32` clamps a non-finite component

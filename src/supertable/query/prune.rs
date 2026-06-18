@@ -202,20 +202,20 @@ mod tests {
     };
     use crate::supertable::manifest::part::{ContentHash, PartId};
     use crate::supertable::manifest::{
-        FtsSummary, Manifest, ScalarStatsTable, SuperfileEntry, SuperfileUri, bloom::BloomBuilder,
+        FtsSummary, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, bloom::BloomBuilder,
     };
     use crate::supertable::query::skip::ScalarOp;
-    use arrow_array::{ArrayRef, Int64Array, LargeStringArray};
+    use arrow_array::{Int64Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use uuid::Uuid;
 
     fn seg_int(col: &str, min: i64, max: i64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             col.to_string(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(Int64Array::from(vec![min])),
                 Arc::new(Int64Array::from(vec![max])),
             ),
@@ -226,10 +226,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -345,10 +342,10 @@ mod tests {
         sorted.sort();
         let (mn, mx) = (sorted[0], sorted[sorted.len() - 1]);
 
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             "title".to_string(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(LargeStringArray::from(vec![mn])),
                 Arc::new(LargeStringArray::from(vec![mx])),
             ),
@@ -375,10 +372,7 @@ mod tests {
             n_docs: titles.len() as u64,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -449,10 +443,10 @@ mod tests {
     /// for the `title` column. `bloom_tokens` are inserted as exact
     /// terms; the term range is their lex span.
     fn seg(scalar_min: &str, scalar_max: &str, bloom_tokens: &[&str]) -> Arc<SuperfileEntry> {
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             "title".to_string(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(LargeStringArray::from(vec![scalar_min])),
                 Arc::new(LargeStringArray::from(vec![scalar_max])),
             ),
@@ -487,10 +481,7 @@ mod tests {
             n_docs: bloom_tokens.len().max(1) as u64,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

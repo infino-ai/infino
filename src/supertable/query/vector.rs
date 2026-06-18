@@ -1525,7 +1525,7 @@ mod tests {
             n_docs: 100,
             id_min: 0,
             id_max: 99,
-            scalar_stats: crate::supertable::manifest::ScalarStatsTable::default(),
+            scalar_stats: std::collections::HashMap::new(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
