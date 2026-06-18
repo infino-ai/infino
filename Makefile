@@ -2,7 +2,7 @@
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
-        python-test python-wheel \
+        python-test python-wheel python-examples-test \
         node-test node-build node-verify
 
 check:
@@ -115,6 +115,26 @@ python-wheel:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
+
+# Build the bindings from source, install the examples' deps, and run every
+# notebook with nbconvert (a failing cell fails the target). Scratch tables are
+# cleaned afterwards; the venv is a reused throwaway (gitignored).
+python-examples-test:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip maturin
+	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
+	# Drop infino from the requirements; the from-source build above is what runs.
+	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
+		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	infino-python/.venv/bin/pip install -q nbconvert ipykernel
+	@status=0; \
+	for nb in infino-python/examples/[0-9]*.ipynb; do \
+		echo "executing $$nb"; \
+		infino-python/.venv/bin/python -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 "$$nb" >/dev/null || { status=1; break; }; \
+	done; \
+	rm -rf infino-python/examples/*_data infino-python/examples/_shared/__pycache__; \
+	exit $$status
 
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded
 # from the cargo workspace, so the core crate never needs a Node

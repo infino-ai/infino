@@ -102,6 +102,46 @@ jobs:
       # Builds the extension + runs the smoke tests (self-contained venv).
       - run: make python-test
 
+  python-examples:
+    name: Python examples (end to end)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Build infino as a normal dep — don't fail on a transitive deprecation warning.
+    env:
+      RUSTFLAGS: ""
+      # Azure LLM creds; absent on fork PRs, where notebooks print context instead.
+      AZURE_AI_ENDPOINT: ${{ secrets.AZURE_AI_ENDPOINT }}
+      AZURE_AI_API_KEY: ${{ secrets.AZURE_AI_API_KEY }}
+      DEFAULT_AZURE_MODEL: gpt-5.4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-python
+      # Cache the model + dataset samples the notebooks download.
+      - name: Cache HuggingFace assets
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('infino-python/examples/_shared/loaders.py', 'infino-python/examples/_shared/embedding.py') }}
+          restore-keys: hf-${{ runner.os }}-
+      # Run every notebook; the LLM answer step runs when the secrets are present.
+      - run: make python-examples-test
+
   python-wheels:
     name: Wheel (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
