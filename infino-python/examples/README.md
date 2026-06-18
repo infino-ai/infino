@@ -24,9 +24,9 @@ pip install -r requirements.txt
 | 1 | [`01_rag_pdf.ipynb`](01_rag_pdf.ipynb) | The canonical RAG pipeline — chunk, embed, vector-retrieve, ground an answer | arXiv papers |
 | 2 | [`02_hybrid_rag.ipynb`](02_hybrid_rag.ipynb) | **Hybrid search**: BM25 + vector fused in one in-engine SQL query, with measured recall@10 | MS MARCO (labeled) |
 | 3 | [`03_filtered_rag.ipynb`](03_filtered_rag.ipynb) | **Filtered & multi-tenant** retrieval: vector search + SQL `WHERE` over one table | Amazon product catalog |
-| 4 | [`chat_app/`](chat_app/) | A **Streamlit chatbot** over your documents — hybrid retrieval, cited sources, durable local index | Wikipedia + your uploads |
+| 4 | [`04_chat_rag.ipynb`](04_chat_rag.ipynb) | **Conversational RAG** — multi-turn chat with memory, per-turn hybrid retrieval, cited sources, durable local index | Wikipedia |
 
-The notebooks build on each other (1 → 2 → 3); the app composes all three.
+The notebooks build on each other (1 → 2 → 3 → 4).
 
 ## Why one engine
 
