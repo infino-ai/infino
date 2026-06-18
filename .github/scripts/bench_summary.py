@@ -4,8 +4,8 @@
 Diffs this run against the `main` baseline, keeps only changes past the noise
 threshold, annotates each with main's own trend, and writes a lean markdown
 summary. Foundry narrates; the percentages are computed here, never by the
-model. On any model failure or missing creds the deterministic delta table is
-the summary on its own. Stdlib only — the runner needs no pip install.
+model. On any model failure or missing creds the deterministic tables are the
+summary on their own. Stdlib only — the runner needs no pip install.
 
 Inputs (env):
   REPORTS                  space-separated report names (basenames, no .json)
@@ -36,7 +36,7 @@ KEY_PARTS = 4
 HIGHER_BETTER = ("Throughput", "Bandwidth")
 TEXT_ONLY = ("Corpus", "Superfiles")
 
-# Map a report basename to (subsystem label, source area) shown in the summary.
+# Map a report basename to (subsystem label, source area).
 SUBSYSTEM = {
     "supertable": ("Ingest", "src/supertable/writer.rs"),
     "supertable_fts": ("FTS", "src/superfile/fts/"),
@@ -47,18 +47,18 @@ SUBSYSTEM = {
     "sql": ("SQL", "src/supertable/query/"),
 }
 
-# Recall is a pass/fail merge gate, not a noise-banded latency metric: any
-# drop below this bar is flagged regardless of percentage delta.
-RECALL_GATE = 0.99
+# Latency below this (ns) is sub-millisecond timing noise — a big percentage
+# of nearly-nothing. Don't flag it. 0.5 ms.
+MIN_LATENCY_NS = 500_000.0
 
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_OUT = "/tmp/ai-summary.md"
 DEFAULT_THRESHOLD = 10.0
-# Most recent main commits to read when describing main's own trend.
+# Most recent main commits read when describing main's own trend.
 HISTORY_WINDOW = 10
-# Cap each list so a broad regression can't blow past GitHub's comment limit.
-MAX_ROWS = 12
-# Foundry latency ceiling; the fallback table covers us if we trip it.
+# Cap each table so a broad swing can't blow past GitHub's comment limit.
+MAX_ROWS = 15
+# Foundry latency ceiling; the fallback tables cover us if we trip it.
 HTTP_TIMEOUT_S = 60
 
 
@@ -68,6 +68,12 @@ def is_text_only(header):
 
 def higher_is_better(header):
     return any(t in header for t in HIGHER_BETTER)
+
+
+def is_latency(header):
+    """Lower-is-better and measured in nanoseconds (Time, p50, cold, latency)."""
+    h = header.lower()
+    return not higher_is_better(header) and "rss" not in h and "stored" not in h
 
 
 def human(header, value):
@@ -81,7 +87,6 @@ def human(header, value):
         if value >= 1073741824:
             return f"{value / 1073741824:.2f} GiB"
         return f"{value / 1048576:.1f} MiB"
-    # Latency-like (Time, p50/p90, cold, latency) is stored in nanoseconds.
     if value >= 1e9:
         return f"{value / 1e9:.2f} s"
     return f"{value / 1e6:.2f} ms"
@@ -108,8 +113,8 @@ def load_history(history_dir, report):
 
 
 def main_trend(history_maps, key, header, threshold):
-    """How `main` drifted across the window — a PR regression on a metric
-    main has already been pushing the wrong way is the case worth flagging.
+    """How `main` drifted across the window — a PR regression on a metric main
+    has already been pushing the wrong way is the case worth flagging.
     Returns (note, short), or (None, None) without enough points."""
     series = [m[key] for m in history_maps if key in m and m[key] != 0.0]
     if len(series) < 2 or series[0] == 0.0:
@@ -117,19 +122,20 @@ def main_trend(history_maps, key, header, threshold):
     drift = (series[-1] - series[0]) / series[0] * 100.0
     n = len(series)
     if abs(drift) < threshold:
-        return f"main stable ({drift:+.0f}% over {n}c)", "stable"
+        return f"main stable ({drift:+.0f}% over {n} commits)", "flat"
     improved = drift > 0 if higher_is_better(header) else drift < 0
     word = "improving" if improved else "worsening"
-    return f"main {word} {drift:+.0f}% over {n} commits", f"{drift:+.0f}%/{n}c"
+    short = f"{'better' if improved else 'worse'} {abs(drift):.0f}%"
+    return f"main {word} {drift:+.0f}% over {n} commits", short
 
 
 def diff(reports, baseline_dir, current_dir, history_dir, threshold):
     """Classify changes per report.
 
-    Returns (regressions, improvements, gates, had_baseline, cost_present).
+    Returns (regressions, improvements, had_baseline, cost_present).
     `had_baseline` distinguishes 'nothing moved' from 'nothing to compare'.
     """
-    regressions, improvements, gates = [], [], []
+    regressions, improvements = [], []
     had_baseline = False
     cost_present = False
     for report in reports:
@@ -146,22 +152,14 @@ def diff(reports, baseline_dir, current_dir, history_dir, threshold):
             _anchor, _subtitle, label, header = parts
             if "$" in key:
                 cost_present = True
-            # Recall is a hard gate, evaluated on its absolute value.
-            if "recall" in f"{label} {header}".lower():
-                breach = new < RECALL_GATE if new <= 1.0 else new < RECALL_GATE * 100
-                gates.append({
-                    "subsystem": subsystem,
-                    "metric": f"{label} / {header}".strip(" /"),
-                    "value": f"{new:.4f}" if new <= 1.0 else f"{new:.2f}",
-                    "breach": breach,
-                })
-                continue
             if is_text_only(header):
                 continue
             old = base.get(key)
             if old is None or old == 0.0:
                 continue
             had_baseline = True
+            if is_latency(header) and max(abs(old), abs(new)) < MIN_LATENCY_NS:
+                continue
             pct = (new - old) / old * 100.0
             if abs(pct) < threshold:
                 continue
@@ -171,53 +169,28 @@ def diff(reports, baseline_dir, current_dir, history_dir, threshold):
                 "subsystem": subsystem,
                 "area": area,
                 "metric": f"{label} / {header}".strip(" /"),
-                "old": human(header, old),
-                "new": human(header, new),
+                "change": f"{human(header, old)} → {human(header, new)}",
                 "pct": round(pct, 1),
-                "verdict": "improvement" if improved else "regression",
+                "is_cold": "cold" in header.lower(),
                 "main_trend": note,
-                "main_trend_short": short,
+                "main_trend_short": short or "—",
             }
             (improvements if improved else regressions).append(entry)
     regressions.sort(key=lambda e: -abs(e["pct"]))
     improvements.sort(key=lambda e: -abs(e["pct"]))
-    return regressions, improvements, gates, had_baseline, cost_present
+    return regressions, improvements, had_baseline, cost_present
 
 
-def verdict_badge(regressions, gates, failures, improvements):
-    if failures or any(g["breach"] for g in gates) or regressions:
-        return "🔴"
-    if improvements:
-        return "🟢"
-    return "⚪"
-
-
-def gate_table(gates):
-    breached = [g for g in gates if g["breach"]]
-    if not breached:
-        return ""
-    rows = ["| Gate | Subsystem | Value | Bar |", "|---|---|---|---|"]
-    for g in breached:
-        rows.append(f"| 🛑 {g['metric']} | {g['subsystem']} | {g['value']} | ≥ {RECALL_GATE} |")
-    return "\n".join(rows)
-
-
-def delta_table(regressions, improvements):
-    """Deterministic markdown table — the always-correct fallback body."""
-    rows = regressions[:MAX_ROWS] + improvements[:MAX_ROWS]
-    if not rows:
-        return "", 0
-    out = ["| Verdict | Subsystem | Metric | main | this run | Δ% | Main trend |",
-           "|---|---|---|---|---|---|---|"]
-    for e in rows:
-        mark = "🔴" if e["verdict"] == "regression" else "🟢"
-        trend = e.get("main_trend_short") or "—"
-        out.append(
-            f"| {mark} {e['verdict']} | {e['subsystem']} | {e['metric']} "
-            f"| {e['old']} | {e['new']} | {e['pct']:+.1f}% | {trend} |"
-        )
-    dropped = max(0, len(regressions) - MAX_ROWS) + max(0, len(improvements) - MAX_ROWS)
-    return "\n".join(out), dropped
+def table(rows):
+    out = ["| Subsystem | Metric | main → run | Δ | Main (10c) |",
+           "|---|---|---|---|---|"]
+    for e in rows[:MAX_ROWS]:
+        out.append(f"| {e['subsystem']} | {e['metric']} | {e['change']} "
+                   f"| {e['pct']:+.0f}% | {e['main_trend_short']} |")
+    extra = len(rows) - MAX_ROWS
+    if extra > 0:
+        out.append(f"| _+{extra} more_ | | | | |")
+    return "\n".join(out)
 
 
 def narrate(payload, endpoint, key, model):
@@ -225,21 +198,18 @@ def narrate(payload, endpoint, key, model):
     if not endpoint or not key:
         return None
     system = (
-        "You are a performance engineer summarizing benchmark results for a "
-        "pull-request reviewer. You are given a JSON payload of metric changes "
-        "ALREADY filtered to exceed the noise threshold, plus recall gate "
-        "checks and any run failures. Write a terse summary in GitHub markdown:\n"
-        "- Open with a one-line verdict (net regression / net improvement / mixed / clean).\n"
-        "- Call out failures and any breached gate FIRST and plainly.\n"
-        "- Then bullet the notable changes grouped by subsystem (Ingest, FTS, "
-        "Vector, SQL). Regressions before improvements.\n"
-        "- When a change has a 'main_trend', weave it in: a regression on a "
-        "metric main is already worsening is more serious than a one-off.\n"
+        "You are a performance engineer giving a PR reviewer the headline on a "
+        "benchmark run. You are given JSON of metric changes ALREADY filtered "
+        "past the noise threshold, plus any run failures. Write 2-5 lines of "
+        "GitHub markdown:\n"
+        "- Line 1: a one-line verdict (net regression / net improvement / mixed / clean).\n"
+        "- Then call out ONLY the biggest regressions and any failures, with the "
+        "main_trend woven in (a regression on a metric main was already worsening "
+        "is worse news). Do NOT restate every row — tables below carry the detail.\n"
         "- Cite ONLY numbers in the payload. Never invent or recompute a value.\n"
-        "- If there are no changes, no breached gates, and no failures, say "
+        "- If there are no changes and no failures, say "
         f"'No significant changes (within ±{payload['threshold']}%).'\n"
-        "Keep it to what a reviewer needs at a glance. No preamble, no sign-off, "
-        "no restating the raw table."
+        "No preamble, no sign-off, no tables."
     )
     body = json.dumps({
         "model": model,
@@ -263,10 +233,10 @@ def narrate(payload, endpoint, key, model):
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             data = json.load(resp)
-        text = data["choices"][0]["message"]["content"].strip()
-        return text or None
+        text_out = data["choices"][0]["message"]["content"].strip()
+        return text_out or None
     except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError) as exc:
-        print(f"::warning::Foundry summary unavailable ({exc}); using delta table", file=sys.stderr)
+        print(f"::warning::Foundry summary unavailable ({exc}); using tables", file=sys.stderr)
         return None
 
 
@@ -284,60 +254,53 @@ def main():
         threshold = DEFAULT_THRESHOLD
 
     failures = [ln.strip() for ln in os.environ.get("ERRORS", "").splitlines() if ln.strip()]
-    regressions, improvements, gates, had_baseline, cost_present = diff(
+    regressions, improvements, had_baseline, cost_present = diff(
         reports, baseline_dir, current_dir, history_dir, threshold)
 
-    payload = {
-        "threshold": threshold,
-        "regressions": regressions[:MAX_ROWS],
-        "improvements": improvements[:MAX_ROWS],
-        "gates": gates,
-        "failures": failures[:20],
-    }
-
     prose = narrate(
-        payload,
+        {
+            "threshold": threshold,
+            "regressions": regressions[:MAX_ROWS],
+            "improvements": improvements[:MAX_ROWS],
+            "failures": failures[:20],
+        },
         os.environ.get("AZURE_AI_ENDPOINT", ""),
         os.environ.get("AZURE_AI_API_KEY", ""),
         os.environ.get("AZURE_AI_MODEL", DEFAULT_MODEL),
     )
 
-    badge = verdict_badge(regressions, gates, failures, improvements)
-    parts = [f"## {badge} Benchmark `{label}` — significant changes (±{threshold:g}% threshold)", ""]
+    badge = "🔴" if (failures or regressions) else ("🟢" if improvements else "⚪")
+    counts = f"{len(regressions)} regression(s) · {len(improvements)} improvement(s)"
+    parts = [f"## {badge} Benchmark `{label}` — {counts} (±{threshold:g}% vs main)", ""]
 
     if prose:
         parts += [prose, ""]
-    else:
-        # Deterministic fallback body: gates + failures + the delta table.
-        if not had_baseline:
-            parts += ["_No `main` baseline to diff against (first run or new config) — see the full report._", ""]
-        elif not regressions and not improvements and not gates:
-            parts += [f"No significant changes (within ±{threshold:g}%).", ""]
-        gt = gate_table(gates)
-        if gt:
-            parts += ["### 🛑 Gate breach", gt, ""]
-        if failures:
-            parts += ["### 🛑 Failures", "```", "\n".join(failures[:20]), "```", ""]
+    elif failures:
+        parts += ["### 🛑 Failures", "```", "\n".join(failures[:20]), "```", ""]
+    elif not had_baseline:
+        parts += ["_No `main` baseline to diff against (first run or new config) — see the full report._", ""]
+    elif not regressions and not improvements:
+        parts += [f"No significant changes (within ±{threshold:g}%).", ""]
 
-    table, dropped = delta_table(regressions, improvements)
-    if table:
-        parts += ["<details><summary>Significant deltas vs <code>main</code></summary>", "", table]
-        if dropped:
-            parts += ["", f"_…and {dropped} more change(s) past threshold — see the full report._"]
-        parts += ["", "</details>", ""]
+    # Regressions are what gate a merge — keep them visible; fold improvements.
+    if regressions:
+        parts += [f"### 🔴 Regressions ({len(regressions)})", table(regressions), ""]
+    if improvements:
+        parts += [f"<details><summary>🟢 Improvements ({len(improvements)})</summary>",
+                  "", table(improvements), "", "</details>", ""]
 
-    # Source-area hints for the subsystems that actually moved.
-    touched = {}
-    for e in regressions + improvements:
-        if e.get("area"):
-            touched[e["subsystem"]] = e["area"]
-    if touched:
-        hints = " · ".join(f"{s} → `{a}`" for s, a in sorted(touched.items()))
-        parts += [f"_Where to look: {hints}_", ""]
-
-    if cost_present:
-        parts += ["_Cost metrics (bytes / requests / queries-per-$) are not delta-tracked "
-                  "(volatile keys) — check the full report._", ""]
+    if regressions or improvements:
+        parts.append("_`main → run` = baseline vs this PR · `Main (10c)` = how main "
+                     "itself trended over its last ≤10 commits._")
+        touched = {e["subsystem"]: e["area"] for e in regressions + improvements if e.get("area")}
+        if touched:
+            parts.append("_Where to look: " + " · ".join(
+                f"{s} → `{a}`" for s, a in sorted(touched.items())) + "_")
+        if any(e["is_cold"] for e in regressions + improvements):
+            parts.append("_Cold metrics are single-run and noisy — treat large cold deltas as directional._")
+        if cost_present:
+            parts.append("_Cost metrics (bytes / requests / queries-per-$) are not delta-tracked — see the full report._")
+        parts.append("")
 
     if run_url:
         parts.append(f"[Full report & logs ↗]({run_url})")
@@ -346,7 +309,7 @@ def main():
     with open(out_file, "w", encoding="utf-8") as fh:
         fh.write(body)
     print(f"wrote {out_file}: {len(regressions)} regression(s), {len(improvements)} "
-          f"improvement(s), {len(gates)} gate(s), {len(failures)} failure line(s), "
+          f"improvement(s), {len(failures)} failure line(s), "
           f"baseline={'yes' if had_baseline else 'no'}")
 
 
