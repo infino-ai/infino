@@ -67,7 +67,7 @@ fn part_overlaps_prefix(
         // No info → always-keep.
         return true;
     };
-    let Some((min_term, max_term)) = agg.term_range_union.as_ref() else {
+    let Some((min_term, max_term)) = agg.term_range.as_ref() else {
         // Every superfile had an empty FST for this column;
         // nothing to match. Skip.
         return false;
@@ -148,13 +148,8 @@ fn part_matches_terms(
     let Some(agg) = entry.fts_summary_agg.get(column) else {
         return true; // no info → always-keep
     };
-    if agg.term_bloom_union.is_empty() || agg.term_bloom_n_blocks == 0 {
-        return true; // empty union → always-keep
-    }
-    let Some(bloom) = crate::supertable::manifest::bloom::Bloom::from_bytes(&agg.term_bloom_union)
-    else {
-        // Corrupt / unexpected shape → fall back to
-        // always-keep (correctness over selectivity).
+    let Some(bloom) = agg.term_bloom.as_ref() else {
+        // No bloom info → always-keep (correctness over selectivity).
         return true;
     };
     match mode {
@@ -429,7 +424,7 @@ mod tests {
 
         let aggs = aggregates::compute(&[s_a, s_b, s_c]);
         let fts_agg = aggs.fts_summary_agg.get("title").expect("title agg");
-        let (mn, mx) = fts_agg.term_range_union.as_ref().expect("range");
+        let (mn, mx) = fts_agg.term_range.as_ref().expect("range");
         assert_eq!(mn, b"alpha", "min of mins across non-empty FSTs");
         assert_eq!(mx, b"delta", "max of maxes across non-empty FSTs");
     }
@@ -469,7 +464,7 @@ mod tests {
                     .fts_summary_agg
                     .get("title")
                     .expect("agg")
-                    .term_range_union
+                    .term_range
                     .is_none()
         );
     }

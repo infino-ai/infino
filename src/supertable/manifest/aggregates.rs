@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::supertable::manifest::SuperfileEntry;
+use crate::supertable::manifest::bloom::Bloom;
 use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
@@ -100,13 +101,12 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, Scala
 // would let the planner pick prune ordering across columns,
 // but isn't required for correctness; lands when measured.
 
-type FtsColumnAccumulator = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, u32);
+type FtsColumnAccumulator = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 
 fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSummaryAgg> {
-    // Per-column accumulators: (min, max, union-bloom-bytes,
-    // n_blocks). The union bloom starts at zero-init the
-    // first time we see a superfile with a populated bloom for
-    // that column; subsequent superfiles bit-OR into it.
+    // Per-column accumulators: (min, max, union-bloom-bytes).
+    // The union bloom starts at the first superfile with a populated
+    // bloom for that column; subsequent superfiles bit-OR into it.
     let mut per_column: HashMap<String, FtsColumnAccumulator> = HashMap::new();
     for seg in superfiles {
         for (col, summary) in &seg.fts_summary {
@@ -134,7 +134,6 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
             match &mut entry.2 {
                 None => {
                     entry.2 = Some(seg_bytes);
-                    entry.3 = summary.term_bloom.n_blocks() as u32;
                 }
                 Some(acc) => {
                     // Bloom-union invariant: all superfiles
@@ -153,32 +152,29 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
                     } else {
                         // Mismatched shapes; fall back.
                         entry.2 = None;
-                        entry.3 = 0;
                     }
                 }
             }
         }
     }
     let mut out = BTreeMap::new();
-    for (col, (mn, mx, bloom_bytes, n_blocks)) in per_column {
-        let term_range_union = match (mn, mx) {
+    for (col, (mn, mx, bloom_bytes)) in per_column {
+        let term_range = match (mn, mx) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         };
-        let (term_bloom_union, term_bloom_n_blocks) = match bloom_bytes {
-            Some(b) => (b, n_blocks),
-            None => (Vec::new(), 0),
-        };
+        // Wrap the unioned bytes back into a `Bloom`. `from_bytes` returns
+        // `None` for an empty/invalid run → "no bloom info" (always-keep).
+        let term_bloom = bloom_bytes.and_then(|b| Bloom::from_bytes(&b));
         out.insert(
             col,
             FtsSummaryAgg {
-                term_bloom_union,
-                term_bloom_n_blocks,
+                term_bloom,
                 // HLL-estimated distinct term count stays
                 // deferred — it's a planner hint, not a
                 // correctness requirement.
                 n_terms_distinct: 0,
-                term_range_union,
+                term_range,
             },
         );
     }

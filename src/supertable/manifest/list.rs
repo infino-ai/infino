@@ -25,6 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::bloom::Bloom;
 use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
 use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
 
@@ -373,29 +374,46 @@ pub struct ScalarStatsMergeError {
     right: DataType,
 }
 
-/// Aggregate FTS summary across a part's superfiles.
+/// FTS skip summary for one column. Used both per-superfile
+/// (`SuperfileEntry.fts_summary`) and as the per-part aggregate
+/// (`ManifestListEntry.fts_summary_agg`) — the per-part value is the
+/// bloom-union + range-union across the part's superfiles.
 ///
-/// When populated, built via streaming HLL + a power-of-two-
-/// rounded blocked bloom sized to
-/// `manifest.list_bloom_target_fpr` (default 0.10) at the
-/// part's measured distinct-term cardinality. The `Default`
-/// shape — empty bloom, no range — is treated as "always-
-/// keep" by the list-level pruner (correctness preserved;
+/// The bloom is held as a decoded [`Bloom`] (cheap `Arc<[u64]>` clone) so
+/// the prune hot path can call `term_bloom.contains(..)` without a
+/// per-query `Bloom::from_bytes` copy; the JSON/byte wire form stores the
+/// bloom bytes (see [`FtsSummaryAggDto`] / [`super::encoding`]). The
+/// `Default` shape — `term_bloom: None`, no range — is treated as
+/// "always-keep" by the list-level pruner (correctness preserved;
 /// selectivity 0).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct FtsSummaryAgg {
-    pub term_bloom_union: Vec<u8>,
-    /// Power-of-two block count for the union bloom. The
-    /// existing `BloomBuilder::with_n_blocks` asserts pow2;
-    /// emitting this here means decoders can reconstruct the
-    /// bloom shape without inferring from byte length.
-    pub term_bloom_n_blocks: u32,
-    /// HyperLogLog-estimated distinct term count across the
-    /// part's superfiles. `0` for the `Default` shape.
+    /// Term-presence bloom. `None` means "no bloom info" — the list-level
+    /// pruner treats it as always-keep. `Bloom` carries its own block
+    /// count, so no separate `n_blocks` field is needed.
+    pub term_bloom: Option<Bloom>,
+    /// HyperLogLog-estimated distinct term count. `0` for the `Default`
+    /// shape and currently for the part-level rollup (deferred).
     pub n_terms_distinct: u64,
-    /// `(min, max)` term range across the part. `None` if
-    /// every superfile's FST was empty for this column.
-    pub term_range_union: Option<(Vec<u8>, Vec<u8>)>,
+    /// `(min, max)` lex term range. `None` if the FST was empty for this
+    /// column (per-superfile) or every superfile's FST was empty (part).
+    pub term_range: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl PartialEq for FtsSummaryAgg {
+    /// `Bloom` is not `PartialEq`, so compare it by its serialized bytes
+    /// (the round-trip tests rely on value equality). Mirrors the manual
+    /// `PartialEq` on [`ScalarStatsAgg`].
+    fn eq(&self, other: &Self) -> bool {
+        let bloom_eq = match (&self.term_bloom, &other.term_bloom) {
+            (Some(a), Some(b)) => a.to_bytes() == b.to_bytes(),
+            (None, None) => true,
+            _ => false,
+        };
+        bloom_eq
+            && self.n_terms_distinct == other.n_terms_distinct
+            && self.term_range == other.term_range
+    }
 }
 
 /// Aggregate vector summary across a part's superfiles —
@@ -432,6 +450,12 @@ pub enum ListParseError {
         field: &'static str,
         source: DecodeError,
     },
+    /// A non-empty `term_bloom_union` payload didn't decode to a valid
+    /// `Bloom` layout (`n_blocks × BLOCK_BYTES`, power-of-two). Surfaced
+    /// rather than silently dropped to "no bloom", so on-disk corruption
+    /// isn't masked as a valid always-keep summary.
+    #[error("invalid term bloom layout: {0} bytes")]
+    InvalidBloom(usize),
     #[error("incompatible major version: got {got}, supported {supported}")]
     IncompatibleMajorVersion { got: String, supported: String },
 }
@@ -552,8 +576,11 @@ struct ScalarStatsAggDto {
 
 #[derive(Serialize, Deserialize)]
 struct FtsSummaryAggDto {
-    term_bloom_union: String, // base64
-    term_bloom_n_blocks: u32,
+    /// base64 of `Bloom::to_bytes()`; empty string ↔ no bloom (`None`).
+    /// The block count is inferred from the byte length at decode, so no
+    /// separate `n_blocks` field is carried. (Older manifests that still
+    /// carry `term_bloom_n_blocks` decode cleanly — serde ignores it.)
+    term_bloom_union: String,
     n_terms_distinct: u64,
     /// `None` ↔ field absent in JSON, not a `null`. Cleaner
     /// `jq` shape and avoids the
@@ -651,14 +678,15 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
                 (
                     k.clone(),
                     FtsSummaryAggDto {
-                        term_bloom_union: encode_b64(&v.term_bloom_union),
-                        term_bloom_n_blocks: v.term_bloom_n_blocks,
+                        term_bloom_union: v
+                            .term_bloom
+                            .as_ref()
+                            .map(|b| encode_b64(&b.to_bytes()))
+                            .unwrap_or_default(),
                         n_terms_distinct: v.n_terms_distinct,
-                        term_range_union: v.term_range_union.as_ref().map(|(mn, mx)| {
-                            TermRangeUnionDto {
-                                min: encode_b64(mn),
-                                max: encode_b64(mx),
-                            }
+                        term_range_union: v.term_range.as_ref().map(|(mn, mx)| TermRangeUnionDto {
+                            min: encode_b64(mn),
+                            max: encode_b64(mx),
                         }),
                     },
                 )
@@ -731,10 +759,23 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
         fts_summary_agg.insert(
             k,
             FtsSummaryAgg {
-                term_bloom_union: decode_b64(&v.term_bloom_union, "term_bloom_union")?,
-                term_bloom_n_blocks: v.term_bloom_n_blocks,
+                term_bloom: {
+                    let bytes = decode_b64(&v.term_bloom_union, "term_bloom_union")?;
+                    // Empty ⇒ no bloom (the pruner conservatively keeps the
+                    // part). Non-empty but malformed ⇒ on-disk corruption,
+                    // surfaced as a parse error rather than masked as a valid
+                    // "always-keep" summary.
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            Bloom::from_bytes(&bytes)
+                                .ok_or(ListParseError::InvalidBloom(bytes.len()))?,
+                        )
+                    }
+                },
                 n_terms_distinct: v.n_terms_distinct,
-                term_range_union: match v.term_range_union {
+                term_range: match v.term_range_union {
                     None => None,
                     Some(tr) => Some((
                         decode_b64(&tr.min, "term_range_union.min")?,
@@ -933,6 +974,7 @@ mod tests {
     //! major/minor compat; part reuse across versions
     //! decodes to bit-equal entries; top-level JSON keys are
     //! jq-friendly.
+    use super::super::bloom::BloomBuilder;
     use super::super::part::{ContentHash, PartId};
     use super::*;
     use arrow_array::{BooleanArray, Date32Array, Int64Array, StringArray};
@@ -1380,22 +1422,23 @@ mod tests {
         }
 
         let mut fts = BTreeMap::new();
+        let mut title_bloom = BloomBuilder::with_n_blocks(16);
+        title_bloom.insert(format!("title_{seed}").as_bytes());
         fts.insert(
             "title".into(),
             FtsSummaryAgg {
-                term_bloom_union: vec![seed; 64],
-                term_bloom_n_blocks: 16,
+                term_bloom: Some(title_bloom.finish()),
                 n_terms_distinct: 1_048_576,
-                term_range_union: Some((b"alpha".to_vec(), b"zulu".to_vec())),
+                term_range: Some((b"alpha".to_vec(), b"zulu".to_vec())),
             },
         );
+        // "body": no bloom info, no range (the all-None / always-keep shape).
         fts.insert(
             "body".into(),
             FtsSummaryAgg {
-                term_bloom_union: vec![0u8; 32],
-                term_bloom_n_blocks: 8,
+                term_bloom: None,
                 n_terms_distinct: 0,
-                term_range_union: None,
+                term_range: None,
             },
         );
 
@@ -1692,6 +1735,35 @@ mod tests {
         assert!(
             matches!(err, ListParseError::Base64 { .. }),
             "expected Base64 error, got {err:?}"
+        );
+    }
+
+    /// A non-empty `term_bloom_union` that doesn't decode to a valid
+    /// `Bloom` layout is on-disk corruption: surface it as
+    /// `InvalidBloom`, not a silent `None` that the pruner would read as
+    /// a valid "always-keep" summary. (An empty string stays `None` —
+    /// that's the legitimate no-bloom encoding, covered by round-trip.)
+    #[test]
+    fn malformed_term_bloom_surfaces_typed_error() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let s = std::str::from_utf8(&bytes).expect("utf8");
+        // rich_entry's "body" column has term_bloom = None ⇒ "". Swap it
+        // for base64 of 3 bytes ("abc") — non-empty, but not a valid
+        // `n_blocks × BLOCK_BYTES` bloom layout.
+        let tampered = s.replacen(
+            "\"term_bloom_union\": \"\"",
+            "\"term_bloom_union\": \"YWJj\"",
+            1,
+        );
+        assert_ne!(
+            tampered, s,
+            "test fixture must contain an empty bloom union"
+        );
+        let err = decode(tampered.as_bytes()).expect_err("malformed bloom");
+        assert!(
+            matches!(err, ListParseError::InvalidBloom(3)),
+            "expected InvalidBloom(3), got {err:?}"
         );
     }
 
