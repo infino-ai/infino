@@ -13,7 +13,7 @@ use crate::{
     config::CompactionSettings,
     superfile::builder::SuperfileBuilder,
     supertable::{
-        BuildError, CommitError, SuperfileEntry,
+        BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
@@ -459,6 +459,8 @@ Ok(())
                 return Ok(());
             }
 
+            let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+
             match try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -466,6 +468,7 @@ Ok(())
                 &new_entries,
                 &entries_to_remove,
                 &mut pending_storage_writes,
+                &mut pending_storage_replaces,
             )
             .await
             {

@@ -1271,6 +1271,7 @@ impl SupertableWriter {
             let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::new();
             let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
             let mut pending_storage_writes: Vec<(SuperfileUri, Bytes)> = Vec::new();
+            let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
             let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
             let mut pending_cache_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
 
@@ -1369,7 +1370,11 @@ impl SupertableWriter {
                     }
                 }
                 if let Some(t) = prepared.bytes_for_storage {
-                    pending_storage_writes.push(t);
+                    if uri_reused {
+                        pending_storage_replaces.push(t);
+                    } else {
+                        pending_storage_writes.push(t);
+                    }
                 }
                 if let Some(t) = prepared.bytes_for_cache {
                     if uri_reused {
@@ -1399,8 +1404,15 @@ impl SupertableWriter {
             let new_uris: std::collections::HashSet<_> =
                 new_entries.iter().map(|e| e.uri.clone()).collect();
             let storage_for_gc = Arc::clone(&storage);
-            persist_commit(&inner, storage, new_entries, &to_remove, pending_storage_writes)
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            persist_commit(
+                &inner,
+                storage,
+                new_entries,
+                &to_remove,
+                pending_storage_writes,
+                pending_storage_replaces,
+            )
+            .map_err(|e| BuildError::Store(e.to_string()))?;
 
             for entry in &to_remove {
                 if !new_uris.contains(&entry.uri) {
@@ -2193,8 +2205,15 @@ fn publish_superfiles(
         // inner.manifest each iteration to incorporate any
         // commits from other writers that won the race.
         drop(old);
-        persist_commit(inner, storage, new_entries, &[], pending_storage_writes)
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        persist_commit(
+            inner,
+            storage,
+            new_entries,
+            &[],
+            pending_storage_writes,
+            Vec::new(),
+        )
+        .map_err(|e| BuildError::Store(e.to_string()))?;
 
         // Warm the cache with the superfiles we just persisted.
         // Skips the cold-fetch round-trip on the producer's
@@ -2309,6 +2328,7 @@ pub(in crate::supertable) fn persist_commit(
     new_entries: Vec<Arc<SuperfileEntry>>,
     entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
+    mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
 ) -> Result<(), crate::supertable::CommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -2337,6 +2357,7 @@ pub(in crate::supertable) fn persist_commit(
             // `new_superfile_list`.
             let old = inner.manifest.load_full();
             let pending_writes = &mut pending_storage_writes;
+            let pending_replaces = &mut pending_storage_replaces;
 
             match try_commit_attempt(
                 Arc::clone(&storage_async),
@@ -2345,6 +2366,7 @@ pub(in crate::supertable) fn persist_commit(
                 &new_entries,
                 entries_to_remove,
                 pending_writes,
+                pending_replaces,
             )
             .await
             {
@@ -2406,11 +2428,56 @@ pub(in crate::supertable) fn persist_commit(
 // the parallelism below the threshold. The default
 // threshold (100 MiB) matches the S3 SDK's standard
 // cutoff.
+async fn put_superfile_replace(
+    storage: &Arc<dyn StorageProvider>,
+    path: &str,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    match storage.head(path).await {
+        Ok(meta) => storage
+            .put_if_match(path, bytes, meta.etag.as_deref())
+            .await
+            .map(|_| ()),
+        Err(StorageError::NotFound { .. }) => storage.put_atomic(path, bytes).await.map(|_| ()),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
+    pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
+    let replace_futs = pending_storage_replaces
+        .iter()
+        .enumerate()
+        .map(|(i, (uri, bytes))| {
+            let storage = Arc::clone(storage);
+            let bytes = bytes.clone();
+            async move {
+                let path = superfile_storage_path(uri);
+                put_superfile_replace(&storage, &path, bytes)
+                    .await
+                    .map(|()| i)
+                    .map_err(SupertableCommitError::from)
+            }
+        });
+    let mut err = None;
+    let mut successful_replace_idx = Vec::with_capacity(pending_storage_replaces.len());
+    for r in futures::future::join_all(replace_futs).await.into_iter().rev() {
+        match r {
+            Ok(i) => successful_replace_idx.push(i),
+            Err(e) => err = Some(e),
+        }
+    }
+    for idx in successful_replace_idx {
+        pending_storage_replaces.remove(idx);
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+
     let multipart_threshold = opts.put_multipart_threshold_bytes;
     let put_futs = pending_storage_writes
         .iter_mut()
@@ -2482,9 +2549,16 @@ pub(crate) async fn try_commit_attempt(
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
+    pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<Manifest, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
-    write_superfile_list(&storage, &opts, pending_storage_writes).await?;
+    write_superfile_list(
+        &storage,
+        &opts,
+        pending_storage_writes,
+        pending_storage_replaces,
+    )
+    .await?;
 
     // 2. Rebalance the manifest for the commit.
     let (new_manifest, parts_to_write) = current_manifest

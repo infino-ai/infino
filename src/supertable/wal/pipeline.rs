@@ -442,6 +442,7 @@ async fn do_apply(
         vec![entry],
         &[],
         vec![(uri, bytes.clone())],
+        Vec::new(),
     )
     .map_err(|e| AppendPhaseError::ManifestCommit {
         message: format!("{e}"),
