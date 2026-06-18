@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Per-column rerank codec.
+//! Per-vector-index rerank codec.
 //!
-//! Each vector column picks one codec at build time:
+//! Each vector index picks one codec at build time:
 //!
 //! - [`RerankCodec::Fp32`]: little-endian fp32, `dim × 4` bytes
 //!   per vector. Zero-copy on the rerank distance kernel.
@@ -29,7 +29,7 @@
 //!
 //! ## `codec_meta` region
 //!
-//! For codecs that need per-column auxiliary data (today:
+//! For codecs that need per-index auxiliary data (today:
 //! `Sq8ResidualEpsilon`'s scale + offset arrays), the subsection carries a
 //! `codec_meta` region between the `codes` region and the
 //! `full[]` region. The region's relative offset within the
@@ -70,7 +70,7 @@ const SQ8_LOW_DIM_RERANK_FLOOR: usize = 50;
 /// calibration rationale.
 const SQ8_HIGH_DIM_RERANK_FLOOR: usize = 100;
 
-/// Per-column rerank codec. Picks the on-disk byte layout of the
+/// Per-vector-index rerank codec. Picks the on-disk byte layout of the
 /// per-vector rerank values inside the subsection's `full[]`
 /// region.
 ///

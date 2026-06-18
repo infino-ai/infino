@@ -86,7 +86,7 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
 
 /// Online reservoir for f32 vector samples.
 ///
-/// One instance per vector column in `VectorBuilder`. Holds at
+/// One instance per logical vector index in `VectorBuilder`. Holds at
 /// most `sample_size` vectors as contiguous f32s in a single
 /// `Vec<f32>` of capacity `sample_size × dim`. Update cost is
 /// O(1) while the reservoir is filling and O(1) amortized once

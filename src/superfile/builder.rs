@@ -85,6 +85,8 @@ use crate::superfile::fts::builder::FtsBuilder;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::superfile::stats::SuperfileStats;
 use crate::superfile::vector::builder::VectorBuilder;
+use crate::superfile::vector::cell_posting::CellPostingBuilder;
+use crate::superfile::vector::layout::VectorLayout;
 use crate::superfile::vector::reader::ColumnReader;
 use crate::superfile::{BuildError, SuperfileReader};
 // `VectorConfig` lives in `vector::builder` and is re-exported below
@@ -151,30 +153,30 @@ pub struct BuilderOptions {
     /// column in `schema`, and must be unique across both
     /// `fts_columns` and `vector_columns`. May be empty.
     ///
-    /// At this layer (superfile), a vector "column" is a
-    /// **logical name only** — the f32 slices are passed
+    /// At this layer (superfile), a vector entry is a
+    /// **logical index name only** — the f32 slices are passed
     /// separately to `add_batch(scalar_batch, &[&[f32]])` and
-    /// the name lives in `inf.vec.columns` KV metadata, not
+    /// the name lives in the legacy-named `inf.vec.columns` KV metadata, not
     /// in the Parquet schema. The "must NOT collide with a
     /// column in `schema`" rule is the format-layer
     /// disambiguation that keeps vector names out of the
     /// Parquet column namespace.
     ///
-    /// At the supertable layer the constraint reads
-    /// differently: there, vector columns ARE schema fields
+    /// At the supertable ingest boundary the constraint reads
+    /// differently: there, vectors arrive as schema fields
     /// (typed `FixedSizeList<Float32, dim>`). The supertable's
     /// `vector_split` strips them at commit time and forwards
     /// `(scalar_only_batch, &[&[f32]])` down to this builder
-    /// — so by the time a `BuilderOptions` reaches us, the
-    /// vector names have already left the scalar schema. The
+    /// — so by the time a `BuilderOptions` reaches us, those vectors
+    /// have already left the scalar schema and are index payloads. The
     /// supertable enforces the same cross-list uniqueness
     /// against its FTS columns at construction.
     ///
     /// To run both FTS and vector against the same business
     /// concept (e.g. semantic + lexical "description"
-    /// search), model it as **two columns** — one
-    /// `LargeUtf8` for the text and one `FixedSizeList<f32>`
-    /// for the externally-computed embedding. Hybrid retrieval
+    /// search), model it as one stored
+    /// `LargeUtf8` text column plus one ingest-time `FixedSizeList<f32>`
+    /// vector payload. Hybrid retrieval
     /// fuses results from `bm25_search(text_col, ...)` and
     /// `vector_search(emb_col, ...)`.
     pub vector_columns: Vec<VectorConfig>,
@@ -193,6 +195,8 @@ pub struct BuilderOptions {
     /// cost. Compression stays on; the only cost is a few extra
     /// page headers + offset-index entries for the id column.
     pub id_page_size_limit: usize,
+    /// Embedded vector blob layout. Default IVF.
+    pub vector_layout: VectorLayout,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -236,7 +240,13 @@ impl BuilderOptions {
                     .expect("zstd level 3 is in the valid 1..=22 range"),
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
+            vector_layout: VectorLayout::Ivf,
         }
+    }
+
+    pub fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
+        self.vector_layout = layout;
+        self
     }
 
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
@@ -376,6 +386,7 @@ pub struct SuperfileBuilder {
     /// VectorBuilder accumulating vectors across every `add_batch`.
     /// `None` if `opts.vector_columns` is empty.
     vec_builder: Option<VectorBuilder>,
+    cell_posting_builder: Option<CellPostingBuilder>,
     /// Running local doc-id counter, increments with every row in
     /// every `add_batch`.
     next_local_doc_id: u32,
@@ -465,17 +476,20 @@ impl SuperfileBuilder {
             Some(fb)
         };
 
-        let vec_builder = if opts.vector_columns.is_empty() {
-            None
+        let (vec_builder, cell_posting_builder) = if opts.vector_columns.is_empty() {
+            (None, None)
+        } else if opts.vector_layout == VectorLayout::CellPosting {
+            let mut cb = CellPostingBuilder::new();
+            for vc in &opts.vector_columns {
+                cb.register_column(vc.clone())?;
+            }
+            (None, Some(cb))
         } else {
             let mut vb = VectorBuilder::new();
             for vc in &opts.vector_columns {
-                // VectorConfig is now the same type at both layers
-                // (re-exported from vector::builder), so the manual
-                // field-by-field bridge is gone — just clone.
                 vb.register_column(vc.clone())?;
             }
-            Some(vb)
+            (Some(vb), None)
         };
 
         Ok(Self {
@@ -484,6 +498,7 @@ impl SuperfileBuilder {
             batches: Vec::new(),
             fts_builder,
             vec_builder,
+            cell_posting_builder,
             next_local_doc_id: 0,
         })
     }
@@ -561,6 +576,14 @@ impl SuperfileBuilder {
                     vb.add(i as u32, &vectors[i][start..start + dim])?;
                 }
             }
+        } else if let Some(cb) = self.cell_posting_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    cb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
         }
 
         self.next_local_doc_id += n_rows;
@@ -575,7 +598,7 @@ impl SuperfileBuilder {
     /// between builders.
     ///
     /// **Requirements:**
-    /// - The reader's vector columns must use the **Fp32 codec**. Other codecs
+    /// - The reader's vector indexes must use the **Fp32 codec**. Other codecs
     ///   (Sq8ResidualEpsilon, RabitqOnly) will fail with `BuildError::VectorReadError`.
     /// - Vector column names and dimensions in the reader must match those in
     ///   `self.opts.vector_columns` in the exact same order. Mismatches will
@@ -591,7 +614,7 @@ impl SuperfileBuilder {
     /// Returns `BuildError::VectorReadError` if reading vectors fails
     /// (e.g., codec is not Fp32).
     ///
-    /// Returns `BuildError::VectorDimMismatch` if vector column names or
+    /// Returns `BuildError::VectorDimMismatch` if vector index names or
     /// dimensions don't match the builder's configuration.
     pub fn add_batch_from_reader(
         &mut self,
@@ -617,11 +640,11 @@ impl SuperfileBuilder {
         if let Some(v) = reader.vec() {
             let reader_columns: Vec<_> = v.vector_columns_config().collect();
 
-            // Validate that reader's vector columns match builder's configuration
+            // Validate that reader's vector indexes match builder's configuration
             if reader_columns.len() != self.opts.vector_columns.len() {
                 return Err(BuildError::VectorDimMismatch {
                     column: format!(
-                        "vector column count mismatch: expected {}, got {}",
+                        "vector index count mismatch: expected {}, got {}",
                         self.opts.vector_columns.len(),
                         reader_columns.len()
                     ),
@@ -695,6 +718,7 @@ impl SuperfileBuilder {
 
         let fts_builder = self.fts_builder.take();
         let vec_builder = self.vec_builder.take();
+        let cell_posting_builder = self.cell_posting_builder.take();
 
         // Assemble inf.* KV metadata (cheap; do it before the parallel
         // section so the splice has it ready).
@@ -716,6 +740,12 @@ impl SuperfileBuilder {
                 kv::VEC_COLUMNS.into(),
                 vec_columns_json(&self.opts.vector_columns),
             ));
+            if self.opts.vector_layout != VectorLayout::Ivf {
+                kvs.push((
+                    kv::VEC_LAYOUT.into(),
+                    self.opts.vector_layout.as_kv_value().into(),
+                ));
+            }
         }
 
         // A superfile has three independent build outputs: the scalar /
@@ -745,12 +775,12 @@ impl SuperfileBuilder {
             )
         };
         let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
-            let (fts_blob, vec_blob) = finish_index_blobs(fts_builder, vec_builder)?;
+            let (fts_blob, vec_blob) = finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)?;
             let body = encode_body()?;
             (body, fts_blob, vec_blob)
         } else {
             let (body_res, blobs_res) =
-                rayon::join(encode_body, || finish_index_blobs(fts_builder, vec_builder));
+                rayon::join(encode_body, || finish_index_blobs(fts_builder, vec_builder, cell_posting_builder));
             let body = body_res?;
             let (fts_blob, vec_blob) = blobs_res?;
             (body, fts_blob, vec_blob)
@@ -768,15 +798,21 @@ impl SuperfileBuilder {
 fn finish_index_blobs(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
+    cell_posting_builder: Option<CellPostingBuilder>,
 ) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
-    match (fts_builder, vec_builder) {
-        (Some(fb), Some(vb)) => {
+    match (fts_builder, vec_builder, cell_posting_builder) {
+        (Some(fb), Some(vb), None) => {
             let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
             Ok((fts?, vec?))
         }
-        (Some(fb), None) => Ok((fb.finish()?, Vec::new())),
-        (None, Some(vb)) => Ok((Vec::new(), vb.finish()?)),
-        (None, None) => Ok((Vec::new(), Vec::new())),
+        (Some(fb), None, Some(cb)) => Ok((fb.finish()?, cb.finish()?)),
+        (Some(fb), None, None) => Ok((fb.finish()?, Vec::new())),
+        (None, Some(vb), None) => Ok((Vec::new(), vb.finish()?)),
+        (None, None, Some(cb)) => Ok((Vec::new(), cb.finish()?)),
+        (None, None, None) => Ok((Vec::new(), Vec::new())),
+        _ => Err(BuildError::VectorSchemaMismatch(
+            "mixed ivf and cell_posting builders".into(),
+        )),
     }
 }
 
@@ -831,7 +867,7 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
 }
 
 /// Serialize `[VectorConfig]` to the JSON form stored in the
-/// Parquet KV metadata key `inf.vec.columns`. Same hand-rolled
+/// legacy-named Parquet KV metadata key `inf.vec.columns`. Same hand-rolled
 /// rationale as `fts_columns_json` — fixed shape, no derived
 /// `Serialize` needed.
 ///
@@ -862,7 +898,7 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
 }
 
 /// Stable string label for each `Metric` variant — the form
-/// stored in `inf.vec.columns` JSON. Matches the strings the
+/// stored in legacy `inf.vec.columns` JSON. Matches the strings the
 /// reader's parser accepts; do not rename without updating
 /// both sides.
 fn metric_str(m: Metric) -> &'static str {

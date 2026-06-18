@@ -424,6 +424,10 @@ Ok(())
             partition_key,
             partition_hint,
             subsection_offsets: merged_old.subsection_offsets.clone(),
+            vector_layout: inputs
+                .first()
+                .map(|e| e.vector_layout)
+                .unwrap_or(crate::superfile::vector::layout::VectorLayout::Ivf),
         });
         let new_entries = vec![merged_entry];
         let mut pending_storage_writes = vec![

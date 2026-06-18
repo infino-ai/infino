@@ -759,6 +759,32 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
     }
 }
 
+pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
+    let strategy = inner
+        .pending_partition_strategy
+        .lock()
+        .expect("pending_partition_strategy mutex poisoned")
+        .take();
+    let Some(strategy) = strategy else {
+        return false;
+    };
+    let current = inner.manifest.load_full();
+    inner
+        .manifest
+        .store(Arc::new(current.with_partition_strategy(strategy)));
+    true
+}
+
+/// Train global centroids from the user manifest, queue on hidden, and stamp
+/// the hidden manifest list before the hidden writer commits.
+pub(super) fn sync_hidden_vector_cell_strategy_from_user(
+    user_inner: &SupertableInner,
+    hidden: &Supertable,
+) {
+    queue_hidden_vector_cell_strategy(user_inner, hidden);
+    apply_pending_partition_strategy(&hidden.inner);
+}
+
 pub(super) fn queue_hidden_vector_cell_strategy(
     user_inner: &SupertableInner,
     hidden: &Supertable,
@@ -892,7 +918,9 @@ fn build_vector_index_options(
         user_opts.tokenizer.clone(),
     )
     .ok()?;
-    hidden_opts = hidden_opts.with_storage(Arc::clone(&sub_storage));
+    hidden_opts = hidden_opts
+        .with_storage(Arc::clone(&sub_storage))
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::CellPosting);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
@@ -1208,6 +1236,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }

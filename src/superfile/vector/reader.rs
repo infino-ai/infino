@@ -51,7 +51,7 @@ const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 /// survivors are re-scored with the more expensive residual leg.
 const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
 
-/// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
+/// JSON-deserialized form of one vector-index entry in the legacy `inf.vec.columns` metadata. The KV
 /// value is a JSON array of these in declaration order.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorColumnConfig {
@@ -254,7 +254,7 @@ impl OpenOptions {
     }
 }
 
-/// Multi-column vector blob reader. `Send + Sync`; concurrent
+/// Multi-index vector blob reader. `Send + Sync`; concurrent
 /// searches share the underlying [`Source`] (refcount-shared via
 /// `Bytes` / `Arc<dyn LazyByteSource>`).
 #[derive(Debug)]
@@ -267,7 +267,7 @@ pub struct VectorReader {
 
 impl VectorReader {
     /// Open the reader. `columns_json` is the value of the
-    /// `inf.vec.columns` Parquet KV key (a JSON array of
+    /// legacy `inf.vec.columns` Parquet KV key (a JSON array of
     /// [`VectorColumnConfig`]).
     /// Open the reader with default options (CRC verification on).
     pub fn open(blob: Bytes, columns_json: &str) -> Result<Self, VectorError> {
@@ -1161,6 +1161,69 @@ impl VectorReader {
         }
 
         Some((col.n_cent, dim as u32, centroids, counts))
+    }
+
+    /// Decode all `(doc_id, vector)` pairs for a logical vector index by reading each
+    /// cluster's `[codes][doc_ids][full]` block and decoding the `full[]` rerank
+    /// rows. This is used to derive a rebuildable cross-superfile index from
+    /// authoritative superfile bytes at fold/compaction time.
+    ///
+    /// The decoded vectors are approximate: `offset + code * scale + epsilon *
+    /// scale / SQ8_RESIDUAL_DIVISOR`, matching the stored
+    /// [`RerankCodec::Sq8ResidualEpsilon`] rows. Returns `None` unless the
+    /// index uses `Sq8ResidualEpsilon` with resident codec metadata.
+    pub fn decode_index_vectors(&self, index_name: &str) -> Option<(Vec<u32>, Vec<f32>)> {
+        let cid = *self.column_id_by_name.get(index_name)?;
+        let col = &self.columns[cid as usize];
+        let (scale, offset) = match (col.rerank_codec, &col.sq8_meta) {
+            (RerankCodec::Sq8ResidualEpsilon, Some(Sq8ColumnMeta::Eager { scale, offset, .. })) => {
+                (scale.as_slice(), offset.as_slice())
+            }
+            _ => return None,
+        };
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
+        let dim = col.dim;
+        let code_bytes = col.quant.code_bytes();
+        let stride = col.per_cluster_doc_stride();
+        let id_bytes = format::vec::DOC_ID_BYTES;
+        let per_vec = col.rerank_codec.per_vector_bytes(dim);
+        let n_cent = col.n_cent as usize;
+
+        let mut ids: Vec<u32> = Vec::with_capacity(col.n_docs as usize);
+        let mut vecs: Vec<f32> = Vec::with_capacity(col.n_docs as usize * dim);
+        for c in 0..n_cent {
+            let e = col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES;
+            let doc_off = u32::from_le_bytes([sub[e], sub[e + 1], sub[e + 2], sub[e + 3]]) as usize;
+            let cb = e + CLUSTER_IDX_COUNT_OFFSET;
+            let count =
+                u32::from_le_bytes([sub[cb], sub[cb + 1], sub[cb + 2], sub[cb + 3]]) as usize;
+            if count == 0 {
+                continue;
+            }
+            let block = col.per_cluster_blocks_off + doc_off * stride;
+            let doc_ids_at = block + count * code_bytes;
+            let full_at = block + count * (code_bytes + id_bytes);
+            let sc = &scale[c * dim..c * dim + dim];
+            let of = &offset[c * dim..c * dim + dim];
+            for i in 0..count {
+                let idb = doc_ids_at + i * id_bytes;
+                ids.push(u32::from_le_bytes([
+                    sub[idb],
+                    sub[idb + 1],
+                    sub[idb + 2],
+                    sub[idb + 3],
+                ]));
+                let rowb = full_at + i * per_vec;
+                for d in 0..dim {
+                    let code = sub[rowb + d] as f32;
+                    let eps = sub[rowb + dim + d] as i8 as f32;
+                    vecs.push(of[d] + code * sc[d] + eps * sc[d] / SQ8_RESIDUAL_DIVISOR);
+                }
+            }
+        }
+        Some((ids, vecs))
     }
 
     /// Single-column kNN search. Returns `(local_doc_id,
@@ -4690,7 +4753,7 @@ mod tests {
     }
 
     /// Build an `(n_docs × dim)` corpus, register a single
-    /// vector column with the requested IVF shape, and stream
+    /// vector index with the requested IVF shape, and stream
     /// the resulting unified-blob bytes to `tmp` via
     /// `VectorBuilder::finish_to`. The streaming
     /// write avoids materializing a 1.5 GiB `Vec<u8>` in the
@@ -5756,7 +5819,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Catalog-surface accessors: `cluster_centroids` + `vector_columns_config`.
+    // Catalog-surface accessors: `cluster_centroids` + `vector_columns_config` (legacy name for vector indexes).
     // -----------------------------------------------------------------
     //
     // Both feed the cross-superfile manifest staging path. They were

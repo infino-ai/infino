@@ -66,13 +66,18 @@ use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
+use crate::superfile::vector::cell_posting;
 use crate::superfile::vector::distance::Metric;
+use crate::superfile::vector::layout::VectorLayout;
+use crate::storage::StorageProvider;
+use bytes::Bytes;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
+use super::dispatch;
 use super::exec::common::resolve_hits_named;
 
 /// How to probe one superfile in the vector fan-out: the globally-selected
@@ -82,6 +87,36 @@ use super::exec::common::resolve_hits_named;
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
+}
+
+
+/// Load the contiguous cell-posting vec blob for one superfile (one GET).
+pub(crate) async fn fetch_cell_posting_blob(
+    storage: &Arc<dyn StorageProvider>,
+    entry: &SuperfileEntry,
+) -> Result<Bytes, QueryError> {
+    let offsets = entry.subsection_offsets.as_ref().ok_or_else(|| {
+        QueryError::Execute(format!(
+            "cell posting superfile {:?} missing subsection_offsets",
+            entry.uri
+        ))
+    })?;
+    let (off, len) = offsets.vec.ok_or_else(|| {
+        QueryError::Execute(format!(
+            "cell posting superfile {:?} missing vec subsection",
+            entry.uri
+        ))
+    })?;
+    for (blob_off, bytes) in &offsets.open_blob {
+        if *blob_off == off && bytes.len() as u64 == len {
+            return Ok(Bytes::copy_from_slice(bytes));
+        }
+    }
+    let path = entry.uri.storage_path();
+    storage
+        .get_range(&path, off..off.saturating_add(len))
+        .await
+        .map_err(|e| QueryError::Store(e.to_string()))
 }
 
 /// Pick the nearest global cell ids under a VectorCell partition strategy.
@@ -245,6 +280,48 @@ async fn remap_hidden_hits_to_user_hits(
 }
 
 impl SupertableReader {
+
+    /// Cell-posting global kNN: one vec GET per probed cell, scan in memory.
+    async fn fanout_cell_postings(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if superfiles.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        let storage = manifest.options.storage.as_ref().ok_or_else(|| {
+            QueryError::Store("cell posting search requires attached storage".into())
+        })?;
+        let query = Arc::new(query.to_vec());
+        let storage = Arc::clone(storage);
+        let handles: Vec<_> = superfiles
+            .iter()
+            .map(|entry| {
+                let storage = Arc::clone(&storage);
+                let entry = Arc::clone(entry);
+                let query = Arc::clone(&query);
+                tokio::spawn(async move {
+                    let blob = fetch_cell_posting_blob(&storage, &entry).await?;
+                    let hits = cell_posting::search_blob(&blob, &query, k)
+                        .map_err(|e| QueryError::Execute(e))?;
+                    Ok::<_, QueryError>(dispatch::tag_hits(&entry, hits))
+                })
+            })
+            .collect();
+        let mut per_superfile = Vec::with_capacity(handles.len());
+        for handle in handles {
+            per_superfile.push(
+                handle
+                    .await
+                    .map_err(|e| QueryError::Execute(format!("cell posting task: {e}")))??
+            );
+        }
+        Ok(top_k_ascending(per_superfile, k))
+    }
+
     /// Global cross-superfile cluster selection + waved fan-out. Shared
     /// by the user-table path and the hidden vector-index path.
     async fn fanout_vector_clusters(
@@ -413,6 +490,11 @@ impl SupertableReader {
                     _ => vit_manifest.superfiles.to_vec(),
                 };
                 if !cell_superfiles.is_empty() {
+                    if vit_manifest.options.vector_layout == VectorLayout::CellPosting {
+                        return vit_reader
+                            .fanout_cell_postings(&cell_superfiles, query, k)
+                            .await;
+                    }
                     return vit_reader
                         .fanout_vector_clusters(
                             &cell_superfiles,
@@ -992,6 +1074,7 @@ mod tests {
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         }
     }
