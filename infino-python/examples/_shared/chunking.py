@@ -30,8 +30,9 @@ def chunk_text(
     step = chunk_words - overlap_words
     chunks = []
     for start in range(0, len(words), step):
-        window = words[start : start + chunk_words]
-        chunks.append(" ".join(window))
+        chunks.append(" ".join(words[start : start + chunk_words]))
+        # Once a window reaches the end, stop — otherwise the next start would
+        # emit a short trailing chunk already fully covered by this one's tail.
         if start + chunk_words >= len(words):
             break
     return chunks

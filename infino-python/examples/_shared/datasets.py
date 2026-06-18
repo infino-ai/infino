@@ -1,9 +1,8 @@
 """Real public datasets for the RAG examples, pulled from the HuggingFace Hub.
 
-Every loader streams a real, named dataset and takes a small deterministic
-sample so the notebooks run in seconds with no large files committed. Bump the
-`n` argument (or set it to `None` where supported) to scale up to the full
-corpus — the example code does not change.
+Every loader streams a real, named dataset and takes the first `n` rows, so the
+notebooks run in seconds with no large files committed. Raise `n` to index more.
+The first call downloads from the Hub (network-dependent); later calls are cached.
 """
 
 import os

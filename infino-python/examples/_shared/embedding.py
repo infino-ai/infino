@@ -4,9 +4,9 @@ Uses a small local model (`all-MiniLM-L6-v2`, 384-dim) so the examples run
 with no API key, no network at query time, and identical results everywhere.
 
 To swap in a hosted embedder (e.g. OpenAI), replace `embed`/`embed_query` with
-calls to that API and set `DIM` / `METRIC` to match the model — nothing else in
-the examples needs to change, because everything downstream keys off these
-two constants and the Arrow column built by `as_vector_column`.
+calls to that API and set `DIM` / `METRIC` to match the model. The notebooks
+read `DIM`/`METRIC` from here, so the only other change is keeping each
+notebook's `IndexSpec(...).vector(..., DIM, ..., METRIC)` pointed at them.
 """
 
 import os
