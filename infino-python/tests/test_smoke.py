@@ -279,3 +279,56 @@ def test_vector_search_end_to_end():
     hits = t.vector_search("emb", onehot(0), 10)
     assert hits.num_rows >= 1
     assert "_id" in hits.column_names and "score" in hits.column_names
+
+
+def test_filtered_vector_search():
+    db = infino.connect("memory://")
+    dim = 16
+
+    def onehot(i: int) -> list[float]:
+        v = [0.0] * dim
+        v[i] = 1.0
+        return v
+
+    # A table with both an FTS column (title) and a vector column (emb).
+    schema = pa.schema([
+        pa.field("title", pa.large_utf8(), nullable=False),
+        pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
+    ])
+    t = db.create_table(
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+    )
+    t.append(
+        pa.record_batch(
+            [
+                pa.array(
+                    ["billing and refunds", "refund policy", "dark mode appearance"],
+                    type=pa.large_utf8(),
+                ),
+                pa.array([onehot(0), onehot(0), onehot(1)], type=pa.list_(pa.float32(), dim)),
+            ],
+            schema=schema,
+        )
+    )
+
+    # Unfiltered kNN over the topic-0 embedding sees both topic-0 rows.
+    assert t.vector_search("emb", onehot(0), 10).num_rows >= 2
+
+    # Same kNN, restricted to rows whose `title` matches "billing" — a pushdown
+    # pre-filter, so only the matching row comes back (not a post-filter over
+    # the global top-k).
+    filtered = t.vector_search(
+        "emb",
+        onehot(0),
+        10,
+        filter_column="title",
+        filter_query="billing",
+        filter_mode="or",
+        projection=["_id", "title", "score"],
+    )
+    assert filtered.num_rows == 1
+    assert filtered.column("title").to_pylist() == ["billing and refunds"]
+
+    # filter_column and filter_query must be supplied together.
+    with pytest.raises(ValueError):
+        t.vector_search("emb", onehot(0), 10, filter_column="title")
