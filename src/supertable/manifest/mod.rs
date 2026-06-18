@@ -54,7 +54,7 @@ use crate::supertable::manifest::list::{
     FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
 };
 use crate::supertable::manifest::part::{ContentHash, ManifestPart, PartId};
-use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
+use crate::supertable::manifest::partition::{assign_partition, encode_partition_key, PartitionKey};
 use crate::supertable::query::prune::PruneLeaf;
 use crate::{
     superfile::vector::distance::{
@@ -753,6 +753,45 @@ impl Manifest {
             out.extend(part.superfiles.iter().cloned());
         }
         Ok(out)
+    }
+
+    /// Load superfiles for routed VectorCell ids from list parts (works when
+    /// the flat `superfiles` view is empty under lazy manifest loading).
+    pub(crate) async fn superfiles_for_routed_cells(
+        &self,
+        routed_cells: &[u32],
+    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for cell in routed_cells {
+            let pk = encode_partition_key(&crate::supertable::manifest::partition::PartitionKey::VectorCell(*cell));
+            for sf in self.superfiles_for_partition_key(&pk).await? {
+                if seen.insert(sf.superfile_id) {
+                    out.push(sf);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a superfile entry by URI from the flat view or list parts.
+    pub(crate) async fn find_superfile_by_uri(
+        &self,
+        uri: &SuperfileUri,
+    ) -> Result<Option<Arc<SuperfileEntry>>, ManifestLoadError> {
+        if let Some(entry) = self.superfiles.iter().find(|e| e.uri == *uri) {
+            return Ok(Some(Arc::clone(entry)));
+        }
+        let Some(list) = &self.list else {
+            return Ok(None);
+        };
+        for le in &list.parts {
+            let part = self.get_part_by_id(le.part_id).await?;
+            if let Some(entry) = part.superfiles.iter().find(|e| e.uri == *uri) {
+                return Ok(Some(Arc::clone(entry)));
+            }
+        }
+        Ok(None)
     }
 
     /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This

@@ -920,7 +920,8 @@ fn build_vector_index_options(
     .ok()?;
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::CellPosting);
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::CellPosting)
+        .with_eager_load_threshold(128);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }

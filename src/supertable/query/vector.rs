@@ -73,7 +73,7 @@ use crate::storage::StorageProvider;
 use bytes::Bytes;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::SuperfileEntry;
+use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
@@ -208,24 +208,43 @@ async fn remap_hidden_hits_to_user_hits(
     let user_manifest = user_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
 
-    let mut remapped = Vec::with_capacity(hidden_hits.len());
+    let mut by_superfile: std::collections::BTreeMap<
+        SuperfileUri,
+        Vec<(u32, f32)>,
+    > = std::collections::BTreeMap::new();
     for hit in hidden_hits {
+        by_superfile
+            .entry(hit.superfile)
+            .or_default()
+            .push((hit.local_doc_id, hit.score));
+    }
+
+    let mut remapped = Vec::with_capacity(hidden_hits.len());
+    for (uri, mut locals) in by_superfile {
         let hidden_entry = hidden_manifest
-            .superfiles
-            .iter()
-            .find(|e| e.uri == hit.superfile)
+            .find_superfile_by_uri(&uri)
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
             .ok_or_else(|| {
-                QueryError::Execute(format!(
-                    "hidden superfile {:?} missing from manifest",
-                    hit.superfile
-                ))
+                QueryError::Execute(format!("hidden superfile {uri:?} missing from manifest"))
             })?;
 
-        let user_row_id = if let Some(id) =
-            row_id_from_manifest_entry(hidden_entry, hit.local_doc_id)
-        {
-            id
-        } else {
+        locals.sort_by_key(|(local, _)| *local);
+        locals.dedup_by_key(|(local, _)| *local);
+
+        let mut row_ids: Vec<i128> = Vec::with_capacity(locals.len());
+        let mut pending_parquet: Vec<u32> = Vec::new();
+        let mut pending_idx: Vec<usize> = Vec::new();
+        for (i, (local_doc_id, _)) in locals.iter().enumerate() {
+            if let Some(id) = row_id_from_manifest_entry(&hidden_entry, *local_doc_id) {
+                row_ids.push(id);
+            } else {
+                pending_idx.push(i);
+                pending_parquet.push(*local_doc_id);
+                row_ids.push(i128::MIN);
+            }
+        }
+        if !pending_parquet.is_empty() {
             let store = Arc::clone(&hidden_manifest.options.store);
             let disk_cache = hidden_manifest.options.disk_cache.as_ref().map(Arc::clone);
             let storage = hidden_manifest.options.storage.as_ref().map(Arc::clone);
@@ -233,49 +252,62 @@ async fn remap_hidden_hits_to_user_hits(
                 &store,
                 disk_cache.as_ref(),
                 storage.as_ref(),
-                hidden_entry,
+                &hidden_entry,
             )
             .await?;
             let batch = sf
-                .take_by_local_doc_ids(&[hit.local_doc_id], &[id_column])
+                .take_by_local_doc_ids(&pending_parquet, &[id_column])
                 .map_err(|e| QueryError::Parquet(e.to_string()))?;
             let col = batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<arrow_array::Decimal128Array>()
                 .ok_or_else(|| QueryError::Execute("hidden _id column missing".into()))?;
-            col.value(0)
-        };
-
-        let user_entry = user_manifest
-            .superfiles
-            .iter()
-            .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
-            .ok_or_else(|| {
-                QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
-            })?;
-        let n_docs = i128::from(user_entry.n_docs);
-        let span = user_entry
-            .id_max
-            .checked_sub(user_entry.id_min)
-            .and_then(|d| d.checked_add(1))
-            .ok_or_else(|| QueryError::Execute("user id span overflow".into()))?;
-        if n_docs == 0 || span != n_docs {
-            return Err(QueryError::Execute(
-                "user superfile id span mismatch".into(),
-            ));
+            for (slot, row) in pending_idx.into_iter().zip(0..col.len()) {
+                row_ids[slot] = col.value(row);
+            }
         }
-        let local_doc_id = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
-            QueryError::Execute(format!(
-                "local_doc_id out of range for id {user_row_id}"
-            ))
-        })?;
-        remapped.push(SuperfileHit {
-            superfile: user_entry.uri,
-            local_doc_id,
-            score: hit.score,
-        });
+
+        for ((local_doc_id, score), user_row_id) in locals.iter().zip(row_ids.iter()) {
+            if *user_row_id == i128::MIN {
+                return Err(QueryError::Execute("hidden _id remap failed".into()));
+            }
+            let user_entry = user_manifest
+                .superfiles
+                .iter()
+                .find(|e| *user_row_id >= e.id_min && *user_row_id <= e.id_max)
+                .ok_or_else(|| {
+                    QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
+                })?;
+            let n_docs = i128::from(user_entry.n_docs);
+            let span = user_entry
+                .id_max
+                .checked_sub(user_entry.id_min)
+                .and_then(|d| d.checked_add(1))
+                .ok_or_else(|| QueryError::Execute("user id span overflow".into()))?;
+            if n_docs == 0 || span != n_docs {
+                return Err(QueryError::Execute(
+                    "user superfile id span mismatch".into(),
+                ));
+            }
+            let user_local = u32::try_from(*user_row_id - user_entry.id_min).map_err(|_| {
+                QueryError::Execute(format!(
+                    "local_doc_id out of range for id {user_row_id}"
+                ))
+            })?;
+            remapped.push(SuperfileHit {
+                superfile: user_entry.uri,
+                local_doc_id: user_local,
+                score: *score,
+            });
+            let _ = local_doc_id;
+        }
     }
+    remapped.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(Ordering::Equal)
+    });
     Ok(remapped)
 }
 
@@ -485,9 +517,36 @@ impl SupertableReader {
                             query,
                             options.nprobe,
                         );
-                        filter_superfiles_by_cells(&vit_manifest.superfiles, &routed)
+                        if vit_manifest.superfiles.is_empty()
+                            && vit_manifest.get_num_parts() > 0
+                        {
+                            vit_manifest
+                                .superfiles_for_routed_cells(&routed)
+                                .await
+                                .map_err(|e| QueryError::Execute(e.to_string()))?
+                        } else {
+                            filter_superfiles_by_cells(&vit_manifest.superfiles, &routed)
+                        }
                     }
-                    _ => vit_manifest.superfiles.to_vec(),
+                    _ => {
+                        if vit_manifest.superfiles.is_empty()
+                            && vit_manifest.get_num_parts() > 0
+                        {
+                            let part_ids: Vec<_> = vit_manifest
+                                .get_all_list_entries()
+                                .iter()
+                                .map(|e| e.part_id)
+                                .collect();
+                            crate::supertable::query::hierarchical_iter::load_and_flatten(
+                                &vit_manifest,
+                                &part_ids,
+                            )
+                            .await
+                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                        } else {
+                            vit_manifest.superfiles.to_vec()
+                        }
+                    }
                 };
                 if !cell_superfiles.is_empty() {
                     if vit_manifest.options.vector_layout == VectorLayout::CellPosting {
@@ -1052,8 +1111,7 @@ mod tests {
     // contract for the vector side.
 
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::SuperfileUri;
-    use crate::supertable::manifest::SuperfileEntry;
+    use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
     use crate::supertable::query::SuperfileHit;
     use crate::supertable::tombstones::SidecarCache;
     use crate::supertable::tombstones::cache::DEFAULT_REFRESH_TTL;
