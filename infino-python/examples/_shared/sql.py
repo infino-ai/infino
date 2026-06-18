@@ -1,8 +1,4 @@
-"""Small SQL helpers shared by the examples that query Infino via `query_sql`.
-
-Both are one-liners, but they appear in several notebooks, so they live here to
-stay consistent — especially `query`, which guards the empty-result case.
-"""
+"""Small SQL helpers shared by the example notebooks."""
 
 
 def sql_lit(value: str) -> str:

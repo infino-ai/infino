@@ -1,17 +1,9 @@
-"""Optional LLM answer generation for the RAG examples.
+"""Optional LLM answer generation.
 
-Resolves credentials in this order, so the examples run anywhere:
-
-1. **Azure AI Foundry** (preferred) — `AZURE_AI_ENDPOINT`, `AZURE_AI_API_KEY`,
-   `DEFAULT_AZURE_MODEL`. The endpoint is the OpenAI-compatible `/openai/v1`
-   path, so the standard `openai` client talks to it directly.
-2. **OpenAI** — `OPENAI_API_KEY` (optionally `OPENAI_MODEL`).
-3. **Neither** — `complete()` returns `None`, and callers fall back to showing
-   the retrieved sources, so every notebook still runs key-free.
-
-Credentials are read from the environment, or from a `.env`/`.azure.env` file
-found by walking up from this directory (never hard-coded, never committed —
-those files are git-ignored).
+Uses Azure AI Foundry (`AZURE_AI_ENDPOINT`, `AZURE_AI_API_KEY`,
+`DEFAULT_AZURE_MODEL`) or OpenAI (`OPENAI_API_KEY`, optional `OPENAI_MODEL`);
+`complete()` returns `None` when neither is set. Credentials come from the
+environment or a local `.env` / `.azure.env`.
 """
 
 import os
@@ -22,11 +14,7 @@ _loaded = False
 
 
 def _load_env_files() -> None:
-    """Populate os.environ from the nearest .azure.env / .env, once.
-
-    Walks up from this file to the filesystem root. Existing environment
-    variables win, so an explicitly exported value is never overridden.
-    """
+    """Load the nearest .azure.env / .env into os.environ once; existing vars win."""
     global _loaded
     if _loaded:
         return

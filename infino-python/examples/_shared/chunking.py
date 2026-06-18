@@ -1,9 +1,7 @@
-"""Minimal fixed-size, overlapping text chunker.
+"""Fixed-size, overlapping word chunker.
 
-The canonical RAG pre-processing step: split a document into windows small
-enough to embed precisely, with a little overlap so a sentence spanning a
-boundary is not lost. Word-based (not character-based) so chunks never split
-mid-word. No external dependency on purpose — this is all the core path needs.
+Splits text into overlapping word windows so a sentence spanning a boundary
+isn't lost. Word-based, so chunks never split mid-word.
 """
 
 DEFAULT_CHUNK_WORDS = 120
@@ -31,8 +29,6 @@ def chunk_text(
     chunks = []
     for start in range(0, len(words), step):
         chunks.append(" ".join(words[start : start + chunk_words]))
-        # Once a window reaches the end, stop — otherwise the next start would
-        # emit a short trailing chunk already fully covered by this one's tail.
         if start + chunk_words >= len(words):
-            break
+            break  # stop at the end; avoids a redundant trailing chunk
     return chunks

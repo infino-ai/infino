@@ -1,12 +1,6 @@
-"""Local sentence-embedding helper shared across the RAG examples.
+"""Local sentence embeddings for the examples: `all-MiniLM-L6-v2`, 384-dim, cosine.
 
-Uses a small local model (`all-MiniLM-L6-v2`, 384-dim) so the examples run
-with no API key, no network at query time, and identical results everywhere.
-
-To swap in a hosted embedder (e.g. OpenAI), replace `embed`/`embed_query` with
-calls to that API and set `DIM` / `METRIC` to match the model. The notebooks
-read `DIM`/`METRIC` from here, so the only other change is keeping each
-notebook's `IndexSpec(...).vector(..., DIM, ..., METRIC)` pointed at them.
+Swap in a hosted embedder by editing `embed` / `embed_query` and `DIM` / `METRIC`.
 """
 
 import os
@@ -14,23 +8,20 @@ import threading
 
 import pyarrow as pa
 
-# Keep example output clean and reproducible: no download progress bars, no
-# tokenizer fork warnings, no HF rate-limit notices for these public models.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-# Embedding model + the two facts the rest of the pipeline derives from it.
 MODEL_NAME = "all-MiniLM-L6-v2"
-DIM = 384          # output dimension; must match the Infino vector index `dim`
-METRIC = "cosine"  # all-MiniLM vectors are normalized → cosine is the right metric
+DIM = 384          # must match the vector index dim
+METRIC = "cosine"  # MiniLM outputs are normalized
 
 _model = None
 _model_lock = threading.Lock()
 
 
 def _get_model():
-    """Load the model once, lazily (it is a few hundred MB the first time)."""
+    """Load the model once, lazily."""
     global _model
     if _model is None:
         with _model_lock:
@@ -38,7 +29,7 @@ def _get_model():
                 from sentence_transformers import SentenceTransformer
                 from transformers.utils import logging as hf_logging
 
-                hf_logging.set_verbosity_error()  # silence the weight-loading banner
+                hf_logging.set_verbosity_error()
                 _model = SentenceTransformer(MODEL_NAME)
     return _model
 

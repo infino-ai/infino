@@ -1,13 +1,11 @@
-"""Real public datasets for the RAG examples, pulled from the HuggingFace Hub.
+"""Real public datasets for the examples, streamed from the HuggingFace Hub.
 
-Every loader streams a real, named dataset and takes the first `n` rows, so the
-notebooks run in seconds with no large files committed. Raise `n` to index more.
-The first call downloads from the Hub (network-dependent); later calls are cached.
+Each loader takes the first `n` rows; raise `n` to index more. The first call
+downloads from the Hub; later calls are cached.
 """
 
 import os
 
-# Quiet the public-Hub access notices; these datasets need no auth token.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
@@ -15,13 +13,9 @@ from datasets import load_dataset
 
 
 def load_arxiv(n: int = 200) -> list[dict]:
-    """Real arXiv ML papers (title + abstract).
+    """arXiv ML papers (title + abstract) from `CShorten/ML-ArXiv-Papers`.
 
-    Source: `CShorten/ML-ArXiv-Papers` on the HuggingFace Hub. Streamed so we
-    never download the whole set; the first `n` rows are deterministic.
-
-    Returns a list of `{"title": str, "abstract": str}` with empty abstracts
-    dropped.
+    Returns `[{"title": str, "abstract": str}]`, empty abstracts dropped.
     """
     stream = load_dataset("CShorten/ML-ArXiv-Papers", split="train", streaming=True)
     papers = []
@@ -37,18 +31,14 @@ def load_arxiv(n: int = 200) -> list[dict]:
 
 
 def load_ms_marco(n_queries: int = 300) -> tuple[list[dict], list[dict]]:
-    """Real MS MARCO passage-ranking data with ground-truth relevance labels.
+    """MS MARCO passage ranking (v1.1) from `microsoft/ms_marco`, with labels.
 
-    Source: `microsoft/ms_marco` (v1.1) on the HuggingFace Hub. Each query
-    carries a handful of candidate passages, one or more flagged relevant
-    (`is_selected == 1`). We flatten those into a passage corpus with stable
-    `pid`s plus the set of relevant `pid`s per query — exactly what's needed to
-    measure retrieval recall.
-
-    Returns `(passages, queries)` where
+    Flattens candidate passages into a corpus with stable `pid`s and records
+    the relevant `pid`s per query (`is_selected == 1`). Returns
+    `(passages, queries)`:
       passages = [{"pid": int, "text": str}, ...]
       queries  = [{"query": str, "relevant_pids": list[int]}, ...]
-    Queries with no relevant passage are dropped (nothing to score against).
+    Queries with no relevant passage are dropped.
     """
     stream = load_dataset("microsoft/ms_marco", "v1.1", split="validation", streaming=True)
     passages: list[dict] = []
@@ -69,16 +59,11 @@ def load_ms_marco(n_queries: int = 300) -> tuple[list[dict], list[dict]]:
 
 
 def load_amazon(n: int = 1200) -> list[dict]:
-    """Real Amazon product catalog with rich metadata.
+    """Amazon product catalog from `smartcat/Amazon_Sample_Metadata_2023`.
 
-    Source: `smartcat/Amazon_Sample_Metadata_2023` on the HuggingFace Hub
-    (Parquet-native, streamable). Keeps products that have a usable price.
-
-    Returns a list of
-      {"title", "text", "price": float, "rating": float,
-       "category": str, "store": str}
-    where `text` is title + description (what we embed and full-text index) and
-    the remaining fields are genuine catalog metadata to filter on.
+    Keeps products with a usable price. Returns
+    `[{"title", "text", "price", "rating", "category", "store"}]`, where `text`
+    is title + description (indexed for search) and the rest are filterable metadata.
     """
     stream = load_dataset(
         "smartcat/Amazon_Sample_Metadata_2023", split="train", streaming=True
@@ -115,10 +100,9 @@ def load_amazon(n: int = 1200) -> list[dict]:
 
 
 def load_wikipedia(n: int = 100) -> list[dict]:
-    """Real Wikipedia articles, used as a seed corpus for the chat app.
+    """Wikipedia articles (Simple English) from `wikimedia/wikipedia`.
 
-    Source: `wikimedia/wikipedia` (Simple English, Parquet-native, streamable).
-    Returns a list of `{"title": str, "text": str, "source": str}`.
+    Returns `[{"title": str, "text": str, "source": str}]`.
     """
     stream = load_dataset(
         "wikimedia/wikipedia", "20231101.simple", split="train", streaming=True
