@@ -332,3 +332,13 @@ def test_filtered_vector_search():
     # filter_column and filter_query must be supplied together.
     with pytest.raises(ValueError):
         t.vector_search("emb", onehot(0), 10, filter_column="title")
+
+    # filter_mode alone (no column/query) is rejected, not silently ignored.
+    with pytest.raises(ValueError):
+        t.vector_search("emb", onehot(0), 10, filter_mode="or")
+
+    # an invalid filter_mode is rejected when a filter is present.
+    with pytest.raises(ValueError):
+        t.vector_search(
+            "emb", onehot(0), 10, filter_column="title", filter_query="billing", filter_mode="xor"
+        )

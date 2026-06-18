@@ -391,14 +391,21 @@ impl Table {
             opts = opts.with_nprobe(n);
         }
         // Optional text-predicate filter (pushdown). `filter_column` and
-        // `filter_query` must be supplied together.
-        let filter = match (filter_column.as_deref(), filter_query.as_deref()) {
-            (Some(col), Some(q)) => Some(VectorFilter {
+        // `filter_query` must be supplied together; `filter_mode` is only
+        // meaningful alongside them (a lone `filter_mode` is rejected rather
+        // than silently ignored, so an invalid value never passes unnoticed).
+        let filter = match (filter_column.as_deref(), filter_query.as_deref(), filter_mode) {
+            (Some(col), Some(q), mode) => Some(VectorFilter {
                 column: col,
                 query: q,
-                mode: parse_mode(filter_mode)?,
+                mode: parse_mode(mode)?,
             }),
-            (None, None) => None,
+            (None, None, None) => None,
+            (None, None, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "filter_mode requires filter_column and filter_query",
+                ));
+            }
             _ => {
                 return Err(PyValueError::new_err(
                     "filter_column and filter_query must be provided together",
