@@ -411,7 +411,7 @@ async fn remap_hidden_hits_to_user_hits(
 
 impl SupertableReader {
 
-    /// Cell-posting global kNN: one vec GET per probed cell, scan in memory.
+    /// Cell-posting global kNN: one vec GET per visible cell file, scan in memory.
     async fn fanout_cell_postings(
         &self,
         superfiles: &[Arc<SuperfileEntry>],

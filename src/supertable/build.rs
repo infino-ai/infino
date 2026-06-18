@@ -48,3 +48,22 @@ where
 
     pool.install(|| tasks.par_iter().map(&build_one).collect())
 }
+
+/// Like [`fanout_shards`], but assumes the caller already holds
+/// `pool.install` — uses `par_iter` directly to avoid nested install deadlock.
+pub(crate) fn fanout_shards_in_pool_scope<T, O, E, F>(
+    tasks: &[T],
+    build_one: F,
+) -> Result<Vec<O>, E>
+where
+    T: Sync,
+    O: Send,
+    E: Send,
+    F: Fn(&T) -> Result<O, E> + Sync,
+{
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    tasks.par_iter().map(&build_one).collect()
+}
+

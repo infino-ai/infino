@@ -1761,6 +1761,195 @@ mod tests {
     /// commit yet there is no manifest pointer, so `refresh` reports
     /// "nothing newer" and the snapshot stays at the empty manifest.
     #[test]
+    fn hidden_cell_posting_append_only_emits_multiple_files_per_cell() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::builder::{FtsConfig, VectorConfig};
+        use crate::superfile::vector::distance::Metric;
+        use crate::superfile::vector::rerank_codec::RerankCodec;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        for commit in 0..4 {
+            let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+        let hidden_reader = hidden.reader();
+        let hidden_manifest = hidden_reader.manifest();
+        let mut by_cell = HashMap::<Vec<u8>, usize>::new();
+        for entry in hidden_manifest.superfiles.iter() {
+            *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+        }
+        let max_visible = by_cell.values().copied().max().unwrap_or(0);
+        assert!(
+            max_visible >= 2,
+            "append-only hidden path should emit multiple visible files per cell, got {max_visible}"
+        );
+    }
+
+    #[test]
+    fn hidden_cell_posting_compaction_collapses_per_cell() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::config::CompactionSettings;
+        use crate::superfile::builder::{FtsConfig, VectorConfig};
+        use crate::superfile::vector::distance::Metric;
+        use crate::superfile::vector::rerank_codec::RerankCodec;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        for commit in 0..10 {
+            let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+        let count_by_cell = |manifest: &crate::supertable::manifest::Manifest| -> usize {
+            let mut by_cell = HashMap::<Vec<u8>, usize>::new();
+            for entry in manifest.superfiles.iter() {
+                *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+            }
+            by_cell.values().copied().max().unwrap_or(0)
+        };
+        let before = count_by_cell(hidden.reader().manifest());
+        assert!(
+            before >= 2,
+            "need multiple append-only superfiles per cell before compaction, got {before}"
+        );
+
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        };
+        hidden.compact(&cfg).expect("hidden compact");
+
+        let after = count_by_cell(hidden.reader().manifest());
+        assert!(
+            after < before,
+            "compaction should collapse per-cell superfiles: before={before} after={after}"
+        );
+    }
+
+    #[test]
     fn ensure_fresh_under_strong_consistency_refreshes_against_storage() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =

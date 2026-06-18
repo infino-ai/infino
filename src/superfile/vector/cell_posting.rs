@@ -9,18 +9,17 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use wide::f32x8;
 
 use crate::superfile::BuildError;
 use crate::superfile::builder::VectorConfig;
-use crate::superfile::vector::distance::{Metric, SQ8_RESIDUAL_DIVISOR, distance};
+use crate::superfile::vector::distance::{
+    Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel,
+};
 
 const MAGIC: &[u8] = b"infino.cell_posting.v1\n";
 const SQ8_CODE_MAX: f32 = 255.0;
 const EPSILON_I8_CLAMP: f32 = 127.0;
 const ROW_BYTES_PER_DIM: usize = 2;
-/// Lane count of `wide::f32x8` (256-bit / 32-bit), matching `distance.rs`.
-const LANES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct CellPostingBuilder {
@@ -42,10 +41,9 @@ struct DecodedPosting {
     ids: Vec<u32>,
     scale: Vec<f32>,
     offset: Vec<f32>,
-    /// Per-dim residual step (`scale / SQ8_RESIDUAL_DIVISOR`), precomputed
-    /// once so the decode hot loop avoids a division per element per row.
-    step: Vec<f32>,
     rows: Vec<u8>,
+    /// Residual-corrected ||x||² per row (L2Sq/Cosine), matching IVF Sq8+ε layout.
+    per_doc_norms: Option<Vec<f32>>,
 }
 
 impl CellPostingBuilder {
@@ -117,7 +115,7 @@ pub fn encode_blob(
         return Err("cell posting vector length mismatch".into());
     }
     let rows: Vec<usize> = (0..ids.len()).collect();
-    let posting = encode_rows(vectors, ids, dim, &rows);
+    let posting = encode_rows(metric, vectors, ids, dim, &rows);
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.push(metric_id(metric));
@@ -131,6 +129,11 @@ pub fn encode_blob(
     out.extend_from_slice(&posting.rows);
     for id in &posting.ids {
         out.extend_from_slice(&id.to_le_bytes());
+    }
+    if let Some(norms) = &posting.per_doc_norms {
+        for n in norms {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
     }
     Ok(out)
 }
@@ -169,15 +172,27 @@ fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
                 .unwrap(),
         );
     }
-    let step: Vec<f32> = scale.iter().map(|s| s / SQ8_RESIDUAL_DIVISOR).collect();
+    let ids = decode_ids(&body[ids_start..ids_start + ids_len]);
+    let rows = body[rows_start..rows_start + rows_len].to_vec();
+    let norms_start = ids_start + ids_len;
+    let per_doc_norms = if body.len() >= norms_start + n_docs * 4 {
+        let mut norms = Vec::with_capacity(n_docs);
+        for i in 0..n_docs {
+            let off = norms_start + i * 4;
+            norms.push(f32::from_le_bytes(body[off..off + 4].try_into().unwrap()));
+        }
+        Some(norms)
+    } else {
+        None
+    };
     Ok(DecodedPosting {
         dim,
         metric,
-        ids: decode_ids(&body[ids_start..ids_start + ids_len]),
+        ids,
         scale,
         offset,
-        step,
-        rows: body[rows_start..rows_start + rows_len].to_vec(),
+        rows,
+        per_doc_norms,
     })
 }
 
@@ -189,13 +204,31 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
     if k == 0 || posting.ids.is_empty() {
         return Ok(Vec::new());
     }
+    let norms_for_kernel = match posting.metric {
+        Metric::NegDot => None,
+        Metric::L2Sq | Metric::Cosine => Some(
+            posting
+                .per_doc_norms
+                .as_deref()
+                .ok_or_else(|| "cell posting missing per_doc_norms".to_string())?,
+        ),
+    };
+    let kernel = Sq8ResidualEpsilonKernel::new(
+        posting.metric,
+        query,
+        &posting.scale,
+        &posting.offset,
+        SQ8_RESIDUAL_DIVISOR,
+        norms_for_kernel,
+    );
+    let dim = posting.dim;
     let mut heap = BinaryHeap::<WorstHit>::new();
-    // One scratch vector reused across every row — the decode target is
-    // overwritten each iteration, so there is no per-row allocation.
-    let mut decoded = vec![0f32; posting.dim];
     for row in 0..posting.ids.len() {
-        decode_row(&posting, row, &mut decoded);
-        let d = distance(posting.metric, query, &decoded);
+        let base = row * dim * ROW_BYTES_PER_DIM;
+        let codes = &posting.rows[base..base + dim];
+        let residuals = &posting.rows[base + dim..base + dim + dim];
+        let norm = norms_for_kernel.map(|norms| norms[row]);
+        let d = kernel.distance_with_norm(codes, residuals, norm);
         let hit = WorstHit((posting.ids[row], d));
         if heap.len() < k {
             heap.push(hit);
@@ -211,95 +244,6 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
     Ok(out)
 }
 
-/// Decode all vectors from a cell posting blob (for merge/rebuild).
-pub fn decode_all_vectors(bytes: &[u8]) -> Result<(Metric, usize, Vec<u32>, Vec<f32>), String> {
-    let posting = open_blob(bytes)?;
-    Ok((
-        posting.metric,
-        posting.dim,
-        posting.ids.clone(),
-        decode_all(&posting),
-    ))
-}
-
-pub fn merge_blobs(inputs: &[&[u8]]) -> Result<Vec<u8>, String> {
-    if inputs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let first = open_blob(inputs[0])?;
-    let mut all_ids = first.ids.clone();
-    let mut all_vecs = decode_all(&first);
-    for chunk in inputs.iter().skip(1) {
-        let p = open_blob(chunk)?;
-        if p.dim != first.dim || p.metric != first.metric {
-            return Err("cell posting merge metric/dim mismatch".into());
-        }
-        all_ids.extend_from_slice(&p.ids);
-        all_vecs.extend(decode_all(&p));
-    }
-    encode_blob(first.metric, first.dim, &all_ids, &all_vecs)
-}
-
-fn decode_all(p: &DecodedPosting) -> Vec<f32> {
-    let mut out = vec![0f32; p.ids.len() * p.dim];
-    for row in 0..p.ids.len() {
-        decode_row(p, row, &mut out[row * p.dim..(row + 1) * p.dim]);
-    }
-    out
-}
-
-/// Decode one row's Sq8+ε codes into `out` as `offset + code*scale + ε*step`.
-///
-/// Vectorized with `wide::f32x8`: the per-dim affine dequant is lane-
-/// independent, so eight dims are reconstructed per SIMD step. `step` is
-/// precomputed in [`open_blob`], so the loop carries no division. The byte
-/// codes are widened per lane (cheap) and the multiply-adds run in SIMD.
-fn decode_row(p: &DecodedPosting, row: usize, out: &mut [f32]) {
-    let dim = p.dim;
-    let base = row * dim * ROW_BYTES_PER_DIM;
-    let codes = &p.rows[base..base + dim]; // u8 Sq8 codes
-    let eps = &p.rows[base + dim..base + 2 * dim]; // i8 residuals
-    let mut d = 0;
-    while d + LANES <= dim {
-        let code_v = f32x8::from([
-            codes[d] as f32,
-            codes[d + 1] as f32,
-            codes[d + 2] as f32,
-            codes[d + 3] as f32,
-            codes[d + 4] as f32,
-            codes[d + 5] as f32,
-            codes[d + 6] as f32,
-            codes[d + 7] as f32,
-        ]);
-        let eps_v = f32x8::from([
-            eps[d] as i8 as f32,
-            eps[d + 1] as i8 as f32,
-            eps[d + 2] as i8 as f32,
-            eps[d + 3] as i8 as f32,
-            eps[d + 4] as i8 as f32,
-            eps[d + 5] as i8 as f32,
-            eps[d + 6] as i8 as f32,
-            eps[d + 7] as i8 as f32,
-        ]);
-        let scale_v = f32x8::from(
-            <[f32; LANES]>::try_from(&p.scale[d..d + LANES]).expect("slice of length LANES"),
-        );
-        let offset_v = f32x8::from(
-            <[f32; LANES]>::try_from(&p.offset[d..d + LANES]).expect("slice of length LANES"),
-        );
-        let step_v = f32x8::from(
-            <[f32; LANES]>::try_from(&p.step[d..d + LANES]).expect("slice of length LANES"),
-        );
-        let res = offset_v + code_v * scale_v + eps_v * step_v;
-        out[d..d + LANES].copy_from_slice(&res.to_array());
-        d += LANES;
-    }
-    while d < dim {
-        out[d] = p.offset[d] + codes[d] as f32 * p.scale[d] + (eps[d] as i8 as f32) * p.step[d];
-        d += 1;
-    }
-}
-
 fn decode_ids(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
@@ -312,15 +256,23 @@ struct EncodedRows {
     scale: Vec<f32>,
     offset: Vec<f32>,
     rows: Vec<u8>,
+    per_doc_norms: Option<Vec<f32>>,
 }
 
-fn encode_rows(vectors: &[f32], ids: &[u32], dim: usize, rows: &[usize]) -> EncodedRows {
+fn encode_rows(
+    metric: Metric,
+    vectors: &[f32],
+    ids: &[u32],
+    dim: usize,
+    rows: &[usize],
+) -> EncodedRows {
     if rows.is_empty() {
         return EncodedRows {
             ids: Vec::new(),
             scale: vec![1.0; dim],
             offset: vec![0.0; dim],
             rows: Vec::new(),
+            per_doc_norms: None,
         };
     }
     let mut min = vec![f32::INFINITY; dim];
@@ -339,14 +291,17 @@ fn encode_rows(vectors: &[f32], ids: &[u32], dim: usize, rows: &[usize]) -> Enco
         scale[d] = if span > 0.0 { span / SQ8_CODE_MAX } else { 1.0 };
         offset[d] = min[d];
     }
+    let store_norms = matches!(metric, Metric::L2Sq | Metric::Cosine);
     let mut out_ids = Vec::with_capacity(rows.len());
     let mut encoded = Vec::with_capacity(rows.len() * dim * ROW_BYTES_PER_DIM);
+    let mut per_doc_norms = store_norms.then(|| Vec::with_capacity(rows.len()));
     for &row in rows {
         out_ids.push(ids[row]);
         let src = &vectors[row * dim..(row + 1) * dim];
         let code_start = encoded.len();
         encoded.resize(code_start + dim * ROW_BYTES_PER_DIM, 0);
         let eps_start = code_start + dim;
+        let mut acc = 0.0f64;
         for d in 0..dim {
             let q = if scale[d] > 0.0 {
                 ((src[d] - offset[d]) / scale[d])
@@ -366,6 +321,13 @@ fn encode_rows(vectors: &[f32], ids: &[u32], dim: usize, rows: &[usize]) -> Enco
             };
             encoded[code_start + d] = q;
             encoded[eps_start + d] = eps.to_le_bytes()[0];
+            if store_norms {
+                let x = base + (eps as f32) * step;
+                acc += (x as f64) * (x as f64);
+            }
+        }
+        if let Some(norms) = per_doc_norms.as_mut() {
+            norms.push(acc as f32);
         }
     }
     EncodedRows {
@@ -373,6 +335,7 @@ fn encode_rows(vectors: &[f32], ids: &[u32], dim: usize, rows: &[usize]) -> Enco
         scale,
         offset,
         rows: encoded,
+        per_doc_norms,
     }
 }
 
