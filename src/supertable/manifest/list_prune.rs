@@ -339,7 +339,7 @@ mod tests {
     }
 
     fn entry_from_superfiles(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
-        let aggs = aggregates::compute(superfiles);
+        let aggs = aggregates::compute(superfiles, None);
         ManifestListEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn aggregates_compute_empty_returns_default() {
-        let aggs = aggregates::compute(&[]);
+        let aggs = aggregates::compute(&[], None);
         assert_eq!(aggs.id_range, (0, 0));
         assert!(aggs.scalar_stats_agg.is_empty());
         assert!(aggs.fts_summary_agg.is_empty());
@@ -388,7 +388,7 @@ mod tests {
         let s_a = seg(100, 199, &["alpha"], None, 0.0);
         let s_b = seg(0, 99, &["beta"], None, 0.0);
         let s_c = seg(500, 599, &["gamma"], None, 0.0);
-        let aggs = aggregates::compute(&[s_a, s_b, s_c]);
+        let aggs = aggregates::compute(&[s_a, s_b, s_c], None);
         assert_eq!(aggs.id_range, (0, 599));
     }
 
@@ -422,7 +422,7 @@ mod tests {
             subsection_offsets: None,
         });
 
-        let aggs = aggregates::compute(&[s_a, s_b, s_c]);
+        let aggs = aggregates::compute(&[s_a, s_b, s_c], None);
         let fts_agg = aggs.fts_summary_agg.get("title").expect("title agg");
         let (mn, mx) = fts_agg.term_range.as_ref().expect("range");
         assert_eq!(mn, b"alpha", "min of mins across non-empty FSTs");
@@ -455,7 +455,7 @@ mod tests {
             subsection_offsets: None,
         });
 
-        let aggs = aggregates::compute(&[s]);
+        let aggs = aggregates::compute(&[s], None);
         // Column not in the map (skipped entirely) — list-
         // level pruner treats this as "no info, always-keep".
         assert!(
@@ -473,7 +473,7 @@ mod tests {
     fn aggregates_compute_vector_envelope_bounds_all_superfile_balls() {
         let s_a = seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 0.5);
         let s_b = seg(11, 20, &[], Some(vec![0.0, 1.0, 0.0]), 0.5);
-        let aggs = aggregates::compute(&[s_a.clone(), s_b.clone()]);
+        let aggs = aggregates::compute(&[s_a.clone(), s_b.clone()], None);
         let v = aggs.vector_summary_agg.get("emb").expect("vec agg");
         let mean = [0.5, 0.5, 0.0];
         // Each superfile's centroid is ~0.707 from the mean; +
@@ -524,7 +524,7 @@ mod tests {
             })
         }
         let segs = vec![make(0, 100, 200), make(1, 50, 150), make(2, 300, 400)];
-        let aggs = aggregates::compute(&segs);
+        let aggs = aggregates::compute(&segs, None);
         let s = aggs
             .scalar_stats_agg
             .get("ts")
@@ -569,7 +569,7 @@ mod tests {
             })
         }
         let segs = vec![make(0, 99), make(100, 199), make(200, 299)];
-        let aggs = aggregates::compute(&segs);
+        let aggs = aggregates::compute(&segs, None);
         assert_eq!(aggs.id_range, (0, 299));
         assert!(aggs.scalar_stats_agg.contains_key("_id"));
     }

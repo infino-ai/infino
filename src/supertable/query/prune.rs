@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn part_from(segs: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
-        let aggs = aggregates::compute(segs);
+        let aggs = aggregates::compute(segs, None);
         ManifestListEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),

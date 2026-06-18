@@ -25,7 +25,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::VectorSummary;
 use super::bloom::Bloom;
 use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
 use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
@@ -283,7 +282,7 @@ impl ScalarStatsAgg {
     /// (a false prune). In a well-formed table a column has a single type, so
     /// this signals corruption or a logic bug; the caller decides how to
     /// degrade (see [`ScalarStatsAgg::merge_tables`]).
-    pub fn merge(&mut self, other: &ScalarStatsAgg) -> Result<(), ScalarStatsMergeError> {
+    pub fn merge_with(&mut self, other: &ScalarStatsAgg) -> Result<(), ScalarStatsMergeError> {
         // Resolve the bounds first; bail before mutating anything so a failed
         // merge can't leave half-updated, internally-inconsistent stats.
         let Some((min, max)) =
@@ -334,13 +333,13 @@ impl ScalarStatsAgg {
     /// column is **dropped** from `into` rather than kept with stale bounds —
     /// an absent column is "no info" to the pruner (always keep), which is
     /// conservative; keeping unsound bounds could drop matching rows.
-    pub fn merge_tables(
+    pub fn merge(
         into: &mut HashMap<String, ScalarStatsAgg>,
         other: &HashMap<String, ScalarStatsAgg>,
     ) {
         for (col, other_agg) in other {
             if let Some(existing) = into.get_mut(col) {
-                if existing.merge(other_agg).is_err() {
+                if existing.merge_with(other_agg).is_err() {
                     into.remove(col);
                 }
             } else {
@@ -441,7 +440,7 @@ impl FtsSummaryAgg {
     /// range-union as [`crate::supertable::manifest::aggregates`]'s rollup; the
     /// `n_terms_distinct` hint differs (here the larger side, vs. the rollup's
     /// current placeholder `0`).
-    pub fn merge(&mut self, other: &FtsSummaryAgg) {
+    pub fn merge_with(&mut self, other: &FtsSummaryAgg) {
         self.term_bloom = match (self.term_bloom.take(), other.term_bloom.as_ref()) {
             (Some(a), Some(b)) => union_blooms(&a, b),
             (Some(a), None) => Some(a),
@@ -459,6 +458,34 @@ impl FtsSummaryAgg {
             (None, None) => None,
         };
         self.n_terms_distinct = self.n_terms_distinct.max(other.n_terms_distinct);
+    }
+
+    /// Merge two per-FTS-column summary tables
+    /// (`BTreeMap<String, FtsSummaryAgg>`), folding `other` into `into`.
+    ///
+    /// Column **union**: a column present only in `other` is inserted; a
+    /// column present in both is merged per-column via
+    /// [`FtsSummaryAgg::merge`]. Folding this over a set of per-part
+    /// tables yields the table-level aggregate.
+    ///
+    /// If a shared column's bloom shapes are incompatible (merge yields `None`),
+    /// the column is **dropped** from `into` rather than kept with a `None`
+    /// bloom — an absent column is "no info" to the pruner (always keep), which
+    /// is conservative and equivalent.
+    pub fn merge(
+        into: &mut BTreeMap<String, FtsSummaryAgg>,
+        other: &BTreeMap<String, FtsSummaryAgg>,
+    ) {
+        for (col, other_agg) in other {
+            if let Some(existing) = into.get_mut(col) {
+                existing.merge_with(other_agg);
+                if existing.term_bloom.is_none() {
+                    into.remove(col);
+                }
+            } else {
+                into.insert(col.clone(), other_agg.clone());
+            }
+        }
     }
 
     /// Build the per-superfile summary for one column from its freshly-built
@@ -543,72 +570,75 @@ pub struct VectorSummaryAgg {
 }
 
 impl VectorSummaryAgg {
-    /// Fold one superfile's [`VectorSummary`] into this aggregate envelope,
-    /// incrementally and without re-reading the part's other superfiles.
+    /// Merge `other` aggregate into `self` — the union of two part-level
+    /// envelopes (aggregate-to-aggregate merging).
     ///
-    /// After the fold the envelope still **encloses** every input ball, so
-    /// the list-level vector skip stays correct by construction: it can
-    /// only over-keep parts (false positives), never drop one that holds a
-    /// possible hit (no false negatives) — the same guarantee a Bloom
-    /// filter gives.
+    /// The merged envelope encloses both input envelopes:
     ///
-    /// - **Center**: the running mean of the folded centroids, updated with
-    ///   the Welford recurrence so it equals the batch mean-of-centroids
-    ///   that `aggregates::vector_summary_agg` computes, independent of fold
-    ///   order.
-    /// - **Radius**: a conservative triangle bound — `max(dist(old_center,
-    ///   new_center) + old_radius, dist(new_centroid, new_center) +
-    ///   new_radius)`. Looser than the batch `maxᵢ(dist(centroidᵢ, mean) +
-    ///   radiusᵢ)` (it can't see the individual prior centroids), so it
-    ///   admits more false positives but never a false negative. The
-    ///   re-centering term `dist(old_center, new_center)` shrinks as
-    ///   `n_vectors` grows, so the looseness self-limits.
+    /// - **Center**: the weighted mean of the two centroids, weighted by
+    ///   `n_vectors` to preserve the overall mean-of-centroids invariant.
+    /// - **Radius**: a conservative triangle bound covering both balls around
+    ///   the new center — `max(dist(center1, new_center) + radius1,
+    ///   dist(center2, new_center) + radius2)`. This may be looser than the
+    ///   batch optimum but is computed without re-reading individual centroids.
     ///
-    /// An empty base (`n_vectors == 0`) adopts the incoming ball. A `new`
-    /// summary with no centroid (a superfile with no vector index for the
-    /// column) is a no-op. A dimension mismatch (which the schema's
-    /// fixed-per-column dim should make impossible) poisons the envelope to
-    /// a sticky always-keep rather than risk a false negative.
-    pub fn merge(&mut self, new: &VectorSummary) {
-        if new.centroid.is_empty() {
-            // Superfile has no vector index for this column — nothing to add.
+    /// An empty base (`n_vectors == 0`) adopts the incoming envelope. A `other`
+    /// with no centroid (no-info) is a no-op. A dimension mismatch poisons the
+    /// envelope to a sticky always-keep.
+    pub fn merge_with(&mut self, other: &VectorSummaryAgg) {
+        if other.n_vectors == 0 {
             return;
         }
-        // A poisoned envelope (emptied on a prior dim mismatch, but with a
-        // non-zero count) stays always-keep forever — folding more balls in
-        // must not resurrect a bounded shape that could exclude something.
         if self.centroid_envelope.is_empty() && self.n_vectors > 0 {
+            // Poisoned envelope; stay always-keep.
             return;
         }
         if self.n_vectors == 0 {
-            self.centroid_envelope = encode_le_f32(&new.centroid);
-            self.n_vectors = 1;
-            self.envelope_radius = new.radius;
+            self.centroid_envelope = other.centroid_envelope.clone();
+            self.n_vectors = other.n_vectors;
+            self.envelope_radius = other.envelope_radius;
             return;
         }
-        let old_center = decode_le_f32(&self.centroid_envelope);
-        if old_center.len() != new.centroid.len() {
-            // Dim mismatch shouldn't happen (schema fixes dim per column).
-            // Poison to a sticky always-keep instead of corrupting the
-            // envelope or silently dropping the new ball (a false negative).
+        let self_center = decode_le_f32(&self.centroid_envelope);
+        let other_center = decode_le_f32(&other.centroid_envelope);
+        if self_center.len() != other_center.len() {
+            // Dim mismatch; poison to always-keep.
             self.centroid_envelope.clear();
             self.envelope_radius = 0.0;
             return;
         }
-        let old_radius = self.envelope_radius;
-        let n_new = self.n_vectors + 1;
-        // Welford online mean: center += (c - center) / n_new.
-        let mut new_center = old_center.clone();
-        for (m, &c) in new_center.iter_mut().zip(new.centroid.iter()) {
-            *m += (c - *m) / n_new as f32;
+        let n_total = (self.n_vectors as f32) + (other.n_vectors as f32);
+        let mut new_center = vec![0.0; self_center.len()];
+        for (i, &self_c) in self_center.iter().enumerate() {
+            new_center[i] = (self_c * self.n_vectors as f32
+                + other_center[i] * other.n_vectors as f32)
+                / n_total;
         }
-        // Conservative enclosing radius: cover the re-centered old envelope
-        // and the new ball. Both terms use the updated center.
-        let old_ball = l2_distance(&old_center, &new_center) + old_radius;
-        let new_ball = l2_distance(&new.centroid, &new_center) + new.radius;
+        let self_reach = l2_distance(&self_center, &new_center) + self.envelope_radius;
+        let other_reach = l2_distance(&other_center, &new_center) + other.envelope_radius;
         self.centroid_envelope = encode_le_f32(&new_center);
-        self.n_vectors = n_new;
-        self.envelope_radius = old_ball.max(new_ball);
+        self.n_vectors = (self.n_vectors as u64 + other.n_vectors as u64) as u32;
+        self.envelope_radius = self_reach.max(other_reach);
+    }
+
+    /// Merge two per-vector-column summary tables
+    /// (`BTreeMap<String, VectorSummaryAgg>`), folding `other` into `into`.
+    ///
+    /// Column **union**: a column present only in `other` is inserted; a
+    /// column present in both is merged per-column via
+    /// [`VectorSummaryAgg::merge`]. Folding this over a set of per-part
+    /// tables yields the table-level aggregate.
+    pub fn merge(
+        into: &mut BTreeMap<String, VectorSummaryAgg>,
+        other: &BTreeMap<String, VectorSummaryAgg>,
+    ) {
+        for (col, other_agg) in other {
+            if let Some(existing) = into.get_mut(col) {
+                existing.merge_with(other_agg);
+            } else {
+                into.insert(col.clone(), other_agg.clone());
+            }
+        }
     }
 }
 
@@ -638,140 +668,6 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
         })
         .sum::<f32>()
         .sqrt()
-}
-
-#[cfg(test)]
-mod vector_agg_merge_tests {
-    //! `VectorSummaryAgg::merge` — incremental envelope folding.
-    //!
-    //! The load-bearing property is **no false negatives**: after any
-    //! sequence of merges the envelope must enclose every input ball, so
-    //! the list-level vector skip never drops a part that could hold a hit.
-    use super::super::{ClusterCentroids, VectorSummary};
-    use super::{VectorSummaryAgg, decode_le_f32, l2_distance};
-
-    /// Tolerance for f32 centroid/distance comparisons.
-    const EPS: f32 = 1e-4;
-
-    fn summary(centroid: &[f32], radius: f32) -> VectorSummary {
-        VectorSummary {
-            centroid: centroid.to_vec(),
-            radius,
-            clusters: ClusterCentroids::empty(),
-        }
-    }
-
-    /// Folding into the empty/default aggregate adopts the incoming ball
-    /// verbatim: the mean is the centroid, count is 1, radius carries over.
-    #[test]
-    fn merge_into_empty_adopts_ball() {
-        let mut agg = VectorSummaryAgg::default();
-        agg.merge(&summary(&[1.0, 2.0, 3.0], 0.5));
-        assert_eq!(decode_le_f32(&agg.centroid_envelope), vec![1.0, 2.0, 3.0]);
-        assert_eq!(agg.n_vectors, 1);
-        assert_eq!(agg.envelope_radius, 0.5);
-    }
-
-    /// The incrementally-folded center equals the batch mean-of-centroids,
-    /// independent of fold order (Welford). Checks both orders converge.
-    #[test]
-    fn merge_center_matches_batch_mean() {
-        let cs = [[0.0_f32, 0.0, 0.0], [3.0, 6.0, 9.0], [6.0, 0.0, 3.0]];
-        let expected_mean = [3.0_f32, 2.0, 4.0]; // column means of the three
-
-        let mut fwd = VectorSummaryAgg::default();
-        for c in &cs {
-            fwd.merge(&summary(c, 0.0));
-        }
-        let mut rev = VectorSummaryAgg::default();
-        for c in cs.iter().rev() {
-            rev.merge(&summary(c, 0.0));
-        }
-
-        for (got, want) in decode_le_f32(&fwd.centroid_envelope)
-            .iter()
-            .zip(expected_mean.iter())
-        {
-            assert!((got - want).abs() < EPS, "fwd center {got} vs {want}");
-        }
-        // Order-independent center.
-        for (f, r) in decode_le_f32(&fwd.centroid_envelope)
-            .iter()
-            .zip(decode_le_f32(&rev.centroid_envelope).iter())
-        {
-            assert!((f - r).abs() < EPS, "center depends on order: {f} vs {r}");
-        }
-        assert_eq!(fwd.n_vectors, 3);
-    }
-
-    /// After folding a set of balls, the envelope encloses every one of
-    /// them — `dist(centroidᵢ, center) + radiusᵢ ≤ envelope_radius`. This is
-    /// the no-false-negative guarantee the vector skip relies on.
-    #[test]
-    fn merge_encloses_all_input_balls() {
-        let balls = [
-            (vec![10.0_f32, 0.0], 1.0),
-            (vec![-8.0, 4.0], 0.5),
-            (vec![0.0, -12.0], 2.0),
-            (vec![5.0, 5.0], 0.25),
-        ];
-        let mut agg = VectorSummaryAgg::default();
-        for (c, r) in &balls {
-            agg.merge(&summary(c, *r));
-        }
-        let center = decode_le_f32(&agg.centroid_envelope);
-        for (c, r) in &balls {
-            let reach = l2_distance(c, &center) + r;
-            assert!(
-                reach <= agg.envelope_radius + EPS,
-                "ball {c:?} r={r} reaches {reach} > envelope {}",
-                agg.envelope_radius
-            );
-        }
-    }
-
-    /// A summary with no centroid (a superfile with no vector index for the
-    /// column) is a no-op — it neither changes the envelope nor the count.
-    #[test]
-    fn merge_skips_empty_centroid() {
-        let mut agg = VectorSummaryAgg::default();
-        agg.merge(&summary(&[1.0, 1.0], 0.3));
-        let before = agg.clone();
-        agg.merge(&summary(&[], 9.9));
-        assert_eq!(agg, before, "empty-centroid summary must be a no-op");
-    }
-
-    /// A dimension mismatch (which the schema should preclude) poisons the
-    /// envelope to a sticky always-keep — emptied center — rather than
-    /// risk a false negative, and stays that way under further merges.
-    #[test]
-    fn merge_dim_mismatch_poisons_to_always_keep() {
-        let mut agg = VectorSummaryAgg::default();
-        agg.merge(&summary(&[1.0, 2.0], 0.5));
-        agg.merge(&summary(&[1.0, 2.0, 3.0], 0.5)); // wrong dim
-        assert!(
-            agg.centroid_envelope.is_empty(),
-            "dim mismatch must poison to always-keep"
-        );
-        // Sticky: a later well-formed merge does not resurrect a bounded
-        // (and possibly under-covering) envelope.
-        agg.merge(&summary(&[4.0, 5.0], 0.1));
-        assert!(
-            agg.centroid_envelope.is_empty(),
-            "poisoned envelope must stay always-keep"
-        );
-    }
-
-    /// Manifests written before incremental merge omit `n_vectors`; serde
-    /// must default it to 0 rather than fail to decode the list.
-    #[test]
-    fn dto_defaults_n_vectors_when_absent() {
-        let json = r#"{"centroid_envelope":"","envelope_radius":1.5}"#;
-        let dto: super::VectorSummaryAggDto =
-            serde_json::from_str(json).expect("decode legacy dto");
-        assert_eq!(dto.n_vectors, 0);
-        assert_eq!(dto.envelope_radius, 1.5);
-    }
 }
 
 // ---------- Errors ----------
@@ -1408,7 +1304,7 @@ mod tests {
     fn scalar_agg_merge_keeps_extremes_and_adds_additive() {
         let mut a = agg_i64(vec![10, 50]); // min 10, max 50, sum 60, nulls 0
         let b = agg_i64(vec![5, 30]); // min 5,  max 30, sum 35, nulls 0
-        a.merge(&b).expect("same type merges");
+        a.merge_with(&b).expect("same type merges");
         assert_eq!(i64_at0(&a.min), 5);
         assert_eq!(i64_at0(&a.max), 50);
         assert_eq!(i64_at0(a.sum.as_ref().expect("sum")), 95); // 60 + 35
@@ -1424,7 +1320,7 @@ mod tests {
         b.sum = None;
         b.null_count = None;
         b.hll = None;
-        a.merge(&b).expect("same type merges");
+        a.merge_with(&b).expect("same type merges");
         // min/max still merge (union semantics over the bounds).
         assert_eq!(i64_at0(&a.min), 1);
         assert_eq!(i64_at0(&a.max), 4);
@@ -1443,7 +1339,7 @@ mod tests {
         t2.insert("a".into(), agg_i64(vec![5, 30]));
         t2.insert("b".into(), agg_i64(vec![100, 200]));
 
-        ScalarStatsAgg::merge_tables(&mut t1, &t2);
+        ScalarStatsAgg::merge(&mut t1, &t2);
         assert_eq!(t1.len(), 2);
         // Shared column "a" is merged per-column (extremes kept).
         assert_eq!(i64_at0(&t1["a"].min), 5);
@@ -1560,7 +1456,7 @@ mod tests {
         };
         // Incompatible min/max types: merge must error rather than silently
         // keep stale bounds (which could cause a false prune).
-        assert!(a.merge(&b).is_err(), "incompatible types must error");
+        assert!(a.merge_with(&b).is_err(), "incompatible types must error");
         // `self` is left fully untouched — no half-merged state.
         assert_eq!(i64_at0(&a.min), 10);
         assert_eq!(i64_at0(&a.max), 50);
@@ -1575,7 +1471,7 @@ mod tests {
     fn scalar_agg_merge_sum_overflow_drops_sum() {
         let mut a = agg_i64(vec![i64::MAX]); // sum = i64::MAX
         let b = agg_i64(vec![1]); // sum = 1
-        a.merge(&b).expect("same type merges");
+        a.merge_with(&b).expect("same type merges");
         assert!(a.sum.is_none(), "i64 sum overflow → None");
         // min/max still merge correctly.
         assert_eq!(i64_at0(&a.min), 1);
@@ -1587,7 +1483,7 @@ mod tests {
         let mut a = agg_i64(vec![1, 2]); // valid HLL
         let mut b = agg_i64(vec![3, 4]);
         b.hll = Some(vec![1, 2, 3]); // not a valid sketch
-        a.merge(&b).expect("same type merges");
+        a.merge_with(&b).expect("same type merges");
         assert!(a.hll.is_none(), "unparseable HLL bytes → None");
     }
 
@@ -1597,7 +1493,7 @@ mod tests {
         a.null_count = Some(u64::MAX);
         let mut b = agg_i64(vec![2]);
         b.null_count = Some(1);
-        a.merge(&b).expect("same type merges");
+        a.merge_with(&b).expect("same type merges");
         assert!(a.null_count.is_none(), "null_count overflow → None");
     }
 
@@ -1609,7 +1505,7 @@ mod tests {
         let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
         t2.insert("a".into(), agg_i64(vec![0, 3]));
 
-        ScalarStatsAgg::merge_tables(&mut t1, &t2);
+        ScalarStatsAgg::merge(&mut t1, &t2);
         // "c" exists only in self → untouched.
         assert_eq!(i64_at0(&t1["c"].min), 7);
         assert_eq!(i64_at0(&t1["c"].max), 9);
@@ -1632,7 +1528,7 @@ mod tests {
             ScalarStatsAgg::from_column(&utf8).expect("utf8"),
         );
 
-        ScalarStatsAgg::merge_tables(&mut t1, &t2);
+        ScalarStatsAgg::merge(&mut t1, &t2);
         assert!(
             !t1.contains_key("x"),
             "type-mismatched column is dropped, not kept with stale bounds"
@@ -1993,7 +1889,7 @@ mod tests {
         a.n_terms_distinct = 3;
         let b = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
         // b.n_terms_distinct == 1 (one term)
-        a.merge(&b);
+        a.merge_with(&b);
 
         let bloom = a.term_bloom.as_ref().expect("union bloom");
         assert!(
@@ -2008,15 +1904,15 @@ mod tests {
 
     #[test]
     fn fts_agg_merge_none_side_contributes_nothing() {
-        // Some.merge(None) keeps self untouched.
+        // Some.merge_with(None) keeps self untouched.
         let mut a = fts_agg(&[b"x"], 16, Some((b"a", b"m")));
-        a.merge(&FtsSummaryAgg::default());
+        a.merge_with(&FtsSummaryAgg::default());
         assert!(a.term_bloom.as_ref().expect("kept").contains(b"x"));
         assert_eq!(a.term_range, Some((b"a".to_vec(), b"m".to_vec())));
 
-        // None.merge(Some) adopts the other side.
+        // None.merge_with(Some) adopts the other side.
         let mut none_side = FtsSummaryAgg::default();
-        none_side.merge(&fts_agg(&[b"y"], 16, Some((b"n", b"z"))));
+        none_side.merge_with(&fts_agg(&[b"y"], 16, Some((b"n", b"z"))));
         assert!(none_side.term_bloom.as_ref().expect("taken").contains(b"y"));
         assert_eq!(none_side.term_range, Some((b"n".to_vec(), b"z".to_vec())));
     }
@@ -2026,7 +1922,7 @@ mod tests {
         // Different block counts can't be unioned → conservative "no info".
         let mut a = fts_agg(&[b"a"], 16, None);
         let b = fts_agg(&[b"b"], 8, None);
-        a.merge(&b);
+        a.merge_with(&b);
         assert!(
             a.term_bloom.is_none(),
             "shape mismatch → no bloom info (always-keep)"
@@ -2300,5 +2196,513 @@ mod tests {
             matches!(err, ListParseError::BadFieldValue("id_range[1]", _)),
             "expected BadFieldValue, got {err:?}"
         );
+    }
+
+    // ----- Tests for FtsSummaryAgg::merge_tables -----
+
+    #[test]
+    fn fts_merge_empty_into_and_empty_other() {
+        let mut into = BTreeMap::new();
+        let other = BTreeMap::new();
+        FtsSummaryAgg::merge(&mut into, &other);
+        assert!(into.is_empty());
+    }
+
+    #[test]
+    fn fts_merge_empty_into_adopts_other() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let mut b = super::super::bloom::BloomBuilder::with_n_blocks(16);
+        b.insert(b"test");
+        let bloom = b.finish();
+        let summary = FtsSummaryAgg {
+            term_bloom: Some(bloom),
+            n_terms_distinct: 42,
+            term_range: Some((b"apple".to_vec(), b"zebra".to_vec())),
+        };
+        other.insert("col1".to_string(), summary.clone());
+        FtsSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 1);
+        assert_eq!(into["col1"], summary);
+    }
+
+    #[test]
+    fn fts_merge_preserves_columns_only_in_into() {
+        let mut into = BTreeMap::new();
+        let other = BTreeMap::new();
+        let mut b = super::super::bloom::BloomBuilder::with_n_blocks(16);
+        b.insert(b"test");
+        let bloom = b.finish();
+        let summary = FtsSummaryAgg {
+            term_bloom: Some(bloom),
+            n_terms_distinct: 10,
+            term_range: Some((b"a".to_vec(), b"z".to_vec())),
+        };
+        into.insert("only_in_into".to_string(), summary.clone());
+        FtsSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 1);
+        assert_eq!(into["only_in_into"], summary);
+    }
+
+    #[test]
+    fn fts_merge_tables_merges_shared_columns() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let mut b1 = super::super::bloom::BloomBuilder::with_n_blocks(16);
+        b1.insert(b"test1");
+        let bloom1 = b1.finish();
+        let mut b2 = super::super::bloom::BloomBuilder::with_n_blocks(16);
+        b2.insert(b"test2");
+        let bloom2 = b2.finish();
+        let summary1 = FtsSummaryAgg {
+            term_bloom: Some(bloom1),
+            n_terms_distinct: 10,
+            term_range: Some((b"apple".to_vec(), b"mango".to_vec())),
+        };
+        let summary2 = FtsSummaryAgg {
+            term_bloom: Some(bloom2),
+            n_terms_distinct: 15,
+            term_range: Some((b"banana".to_vec(), b"zebra".to_vec())),
+        };
+        into.insert("shared".to_string(), summary1);
+        other.insert("shared".to_string(), summary2);
+        FtsSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 1);
+        // After merge: ranges should widen, distinct count should be max
+        let merged = &into["shared"];
+        assert_eq!(merged.n_terms_distinct, 15);
+        assert_eq!(
+            merged.term_range.as_ref().expect("should be present").0,
+            b"apple"
+        ); // min
+        assert_eq!(
+            merged.term_range.as_ref().expect("should be present").1,
+            b"zebra"
+        ); // max
+    }
+
+    #[test]
+    fn fts_merge_drops_column_on_bloom_shape_mismatch() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let mut b1 = super::super::bloom::BloomBuilder::with_n_blocks(16);
+        b1.insert(b"test1");
+        let bloom1 = b1.finish();
+        let mut b2 = super::super::bloom::BloomBuilder::with_n_blocks(8);
+        b2.insert(b"test2");
+        let bloom2 = b2.finish();
+        let summary1 = FtsSummaryAgg {
+            term_bloom: Some(bloom1),
+            n_terms_distinct: 10,
+            term_range: Some((b"a".to_vec(), b"z".to_vec())),
+        };
+        let summary2 = FtsSummaryAgg {
+            term_bloom: Some(bloom2),
+            n_terms_distinct: 15,
+            term_range: Some((b"a".to_vec(), b"z".to_vec())),
+        };
+        into.insert("col".to_string(), summary1);
+        other.insert("col".to_string(), summary2);
+        FtsSummaryAgg::merge(&mut into, &other);
+        // Column should be dropped because bloom shapes don't match
+        assert!(into.is_empty());
+    }
+
+    #[test]
+    fn fts_merge_union_of_columns() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let mut b = super::super::bloom::BloomBuilder::with_n_blocks(16);
+        b.insert(b"test");
+        let bloom = b.finish();
+        into.insert(
+            "col1".to_string(),
+            FtsSummaryAgg {
+                term_bloom: Some(bloom.clone()),
+                n_terms_distinct: 10,
+                term_range: Some((b"a".to_vec(), b"z".to_vec())),
+            },
+        );
+        other.insert(
+            "col2".to_string(),
+            FtsSummaryAgg {
+                term_bloom: Some(bloom),
+                n_terms_distinct: 20,
+                term_range: Some((b"a".to_vec(), b"z".to_vec())),
+            },
+        );
+        FtsSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 2);
+        assert!(into.contains_key("col1"));
+        assert!(into.contains_key("col2"));
+    }
+
+    #[test]
+    fn fts_merge_with_none_blooms() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let summary1 = FtsSummaryAgg {
+            term_bloom: None,
+            n_terms_distinct: 0,
+            term_range: None,
+        };
+        let summary2 = FtsSummaryAgg {
+            term_bloom: None,
+            n_terms_distinct: 0,
+            term_range: None,
+        };
+        into.insert("col".to_string(), summary1);
+        other.insert("col".to_string(), summary2);
+        FtsSummaryAgg::merge(&mut into, &other);
+        // Both had None blooms, result should be None (dropped)
+        assert!(into.is_empty());
+    }
+
+    // ----- Tests for VectorSummaryAgg::merge_agg -----
+
+    #[test]
+    fn vector_merge_empty_other_is_noop() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            n_vectors: 5,
+            envelope_radius: 0.5,
+        };
+        let other = VectorSummaryAgg::default();
+        let before = agg.clone();
+        agg.merge_with(&other);
+        assert_eq!(agg, before, "merging empty other should be a no-op");
+    }
+
+    #[test]
+    fn vector_merge_empty_self_adopts_other() {
+        let mut agg = VectorSummaryAgg::default();
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            n_vectors: 3,
+            envelope_radius: 0.75,
+        };
+        agg.merge_with(&other);
+        assert_eq!(decode_le_f32(&agg.centroid_envelope), vec![1.0, 2.0, 3.0]);
+        assert_eq!(agg.n_vectors, 3);
+        assert_eq!(agg.envelope_radius, 0.75);
+    }
+
+    #[test]
+    fn vector_merge_poisoned_stays_poisoned() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: Vec::new(),
+            n_vectors: 5,
+            envelope_radius: 0.0,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            n_vectors: 3,
+            envelope_radius: 0.5,
+        };
+        agg.merge_with(&other);
+        // Poisoned envelope should stay empty and never merge
+        assert!(agg.centroid_envelope.is_empty());
+        assert_eq!(agg.n_vectors, 5, "poisoned count should not change");
+    }
+
+    #[test]
+    fn vector_merge_weighted_mean_centroid() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[0.0, 0.0, 0.0]),
+            n_vectors: 3,
+            envelope_radius: 0.0,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[6.0, 6.0, 6.0]),
+            n_vectors: 3,
+            envelope_radius: 0.0,
+        };
+        agg.merge_with(&other);
+        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        // Weighted mean: (0*3 + 6*3)/(3+3) = 3.0 per coordinate
+        for &c in &merged_center {
+            assert!((c - 3.0).abs() < 1e-4);
+        }
+        assert_eq!(agg.n_vectors, 6);
+    }
+
+    #[test]
+    fn vector_merge_unequal_weights() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
+            n_vectors: 1,
+            envelope_radius: 0.0,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[10.0, 10.0]),
+            n_vectors: 9,
+            envelope_radius: 0.0,
+        };
+        agg.merge_with(&other);
+        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        // Weighted mean: (0*1 + 10*9)/(1+9) = 9.0 per coordinate
+        for &c in &merged_center {
+            assert!((c - 9.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn vector_merge_dimension_mismatch_poisons() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            n_vectors: 2,
+            envelope_radius: 0.5,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            n_vectors: 3,
+            envelope_radius: 0.4,
+        };
+        agg.merge_with(&other);
+        // Dimension mismatch should poison to always-keep
+        assert!(agg.centroid_envelope.is_empty());
+        assert_eq!(agg.envelope_radius, 0.0);
+        assert!(agg.n_vectors > 0, "count should not change");
+    }
+
+    #[test]
+    fn vector_merge_encloses_both_balls() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
+            n_vectors: 1,
+            envelope_radius: 1.0,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[10.0, 0.0]),
+            n_vectors: 1,
+            envelope_radius: 1.0,
+        };
+        agg.merge_with(&other);
+        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        // Center should be at (5, 0)
+        assert!((merged_center[0] - 5.0).abs() < 1e-4);
+        assert!(merged_center[1].abs() < 1e-4);
+        // Radius should enclose both: dist(0,5) + 1 = 6, dist(10,5) + 1 = 6
+        assert!(agg.envelope_radius >= 6.0 - 1e-4);
+    }
+
+    #[test]
+    fn vector_merge_radius_conservative_bound() {
+        // Test that the radius is conservative (no false negatives)
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[5.0, 0.0]),
+            n_vectors: 2,
+            envelope_radius: 3.0,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[5.0, 4.0]),
+            n_vectors: 2,
+            envelope_radius: 2.0,
+        };
+        agg.merge_with(&other);
+        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        // Both original balls should be enclosed by the merged envelope
+        let reach1 = l2_distance(&[5.0, 0.0], &merged_center) + 3.0;
+        let reach2 = l2_distance(&[5.0, 4.0], &merged_center) + 2.0;
+        assert!(
+            reach1 <= agg.envelope_radius + 1e-4,
+            "first ball should be enclosed"
+        );
+        assert!(
+            reach2 <= agg.envelope_radius + 1e-4,
+            "second ball should be enclosed"
+        );
+    }
+
+    #[test]
+    fn vector_merge_updates_n_vectors_count() {
+        let mut agg = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0]),
+            n_vectors: 7,
+            envelope_radius: 0.1,
+        };
+        let other = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[2.0]),
+            n_vectors: 5,
+            envelope_radius: 0.2,
+        };
+        agg.merge_with(&other);
+        assert_eq!(agg.n_vectors, 12);
+    }
+
+    // ----- Tests for VectorSummaryAgg::merge_tables -----
+
+    #[test]
+    fn vector_merge_empty_into_and_empty_other() {
+        let mut into = BTreeMap::new();
+        let other = BTreeMap::new();
+        VectorSummaryAgg::merge(&mut into, &other);
+        assert!(into.is_empty());
+    }
+
+    #[test]
+    fn vector_merge_empty_into_adopts_other() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let summary = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            n_vectors: 4,
+            envelope_radius: 0.5,
+        };
+        other.insert("vec_col".to_string(), summary.clone());
+        VectorSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 1);
+        assert_eq!(into["vec_col"], summary);
+    }
+
+    #[test]
+    fn vector_merge_preserves_columns_only_in_into() {
+        let mut into = BTreeMap::new();
+        let other = BTreeMap::new();
+        let summary = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            n_vectors: 2,
+            envelope_radius: 0.3,
+        };
+        into.insert("only_in_into".to_string(), summary.clone());
+        VectorSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 1);
+        assert_eq!(into["only_in_into"], summary);
+    }
+
+    #[test]
+    fn vector_merge_merges_shared_columns() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let summary1 = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
+            n_vectors: 2,
+            envelope_radius: 1.0,
+        };
+        let summary2 = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[10.0, 0.0]),
+            n_vectors: 2,
+            envelope_radius: 1.0,
+        };
+        into.insert("shared".to_string(), summary1);
+        other.insert("shared".to_string(), summary2);
+        VectorSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 1);
+        // After merge: n_vectors should be sum, centroid should be weighted mean
+        assert_eq!(into["shared"].n_vectors, 4);
+        let merged_center = decode_le_f32(&into["shared"].centroid_envelope);
+        assert!((merged_center[0] - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn vector_merge_poisons_on_dimension_mismatch() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let summary1 = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            n_vectors: 2,
+            envelope_radius: 0.5,
+        };
+        let summary2 = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            n_vectors: 2,
+            envelope_radius: 0.5,
+        };
+        into.insert("col".to_string(), summary1);
+        other.insert("col".to_string(), summary2);
+        VectorSummaryAgg::merge(&mut into, &other);
+        // On dimension mismatch, the column is poisoned but not dropped
+        assert_eq!(into.len(), 1);
+        assert!(into["col"].centroid_envelope.is_empty());
+        assert_eq!(into["col"].envelope_radius, 0.0);
+    }
+
+    #[test]
+    fn vector_merge_union_of_columns() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        into.insert(
+            "vec1".to_string(),
+            VectorSummaryAgg {
+                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+                n_vectors: 2,
+                envelope_radius: 0.1,
+            },
+        );
+        other.insert(
+            "vec2".to_string(),
+            VectorSummaryAgg {
+                centroid_envelope: encode_le_f32(&[3.0, 4.0]),
+                n_vectors: 2,
+                envelope_radius: 0.2,
+            },
+        );
+        VectorSummaryAgg::merge(&mut into, &other);
+        assert_eq!(into.len(), 2);
+        assert!(into.contains_key("vec1"));
+        assert!(into.contains_key("vec2"));
+    }
+
+    #[test]
+    fn vector_merge_with_default_other() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        let summary = VectorSummaryAgg {
+            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            n_vectors: 2,
+            envelope_radius: 0.5,
+        };
+        into.insert("col".to_string(), summary.clone());
+        let default_other = VectorSummaryAgg::default();
+        other.insert("col".to_string(), default_other);
+        VectorSummaryAgg::merge(&mut into, &other);
+        // Merging with default (empty) other should be a no-op
+        assert_eq!(into["col"], summary);
+    }
+
+    #[test]
+    fn vector_merge_tables_complex_scenario() {
+        let mut into = BTreeMap::new();
+        let mut other = BTreeMap::new();
+        // into has vec1 and vec2
+        into.insert(
+            "vec1".to_string(),
+            VectorSummaryAgg {
+                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+                n_vectors: 1,
+                envelope_radius: 0.1,
+            },
+        );
+        into.insert(
+            "vec2".to_string(),
+            VectorSummaryAgg {
+                centroid_envelope: encode_le_f32(&[3.0, 4.0]),
+                n_vectors: 1,
+                envelope_radius: 0.2,
+            },
+        );
+        // other has vec1 (to merge), vec3 (to add)
+        other.insert(
+            "vec1".to_string(),
+            VectorSummaryAgg {
+                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+                n_vectors: 1,
+                envelope_radius: 0.1,
+            },
+        );
+        other.insert(
+            "vec3".to_string(),
+            VectorSummaryAgg {
+                centroid_envelope: encode_le_f32(&[5.0, 6.0]),
+                n_vectors: 1,
+                envelope_radius: 0.3,
+            },
+        );
+        VectorSummaryAgg::merge(&mut into, &other);
+        // into should now have vec1 (merged), vec2 (unchanged), vec3 (added)
+        assert_eq!(into.len(), 3);
+        assert_eq!(into["vec1"].n_vectors, 2);
+        assert_eq!(into["vec2"].n_vectors, 1);
+        assert_eq!(into["vec3"].n_vectors, 1);
     }
 }

@@ -475,7 +475,7 @@ impl Manifest {
     ///
     /// `parts_to_write` should contain **only the parts that need
     /// to be persisted** (i.e., new + changed). Each element is the
-    /// pre-encoded (Avro+zstd) bytes produced by [`build_part_and_entry`]
+    /// pre-encoded (Avro+zstd) bytes produced by [`rebuild_part_and_entry`]
     /// — passing them directly avoids a second encode cycle.
     /// Reused parts from the previous manifest version are not in this
     /// list — their URIs are already in `new_list.parts[i].uri`.
@@ -706,26 +706,26 @@ impl Manifest {
                     // Split: keep the existing entry as-is and emit a
                     // fresh part with just the new superfiles.
                     out_list_entries.push(entry.clone());
-                    let (fresh_entry, fresh_part, fresh_encoded) =
-                        build_part_and_entry(opts.clone(), new_for_pk, entry.partition_key.clone());
+                    let (fresh_entry, fresh_part, fresh_encoded) = rebuild_part_and_entry(
+                        opts.clone(),
+                        vec![],
+                        new_for_pk,
+                        entry.partition_key.clone(),
+                        None,
+                    );
                     out_list_entries.push(fresh_entry);
                     parts_to_write.push(EncodedPart {
                         part: fresh_part,
                         encoded: fresh_encoded,
                     });
                 } else {
-                    // Rewrite: load existing part and combine with new superfiles.
                     let existing_part = self.get_part_by_id(entry.part_id).await?;
-                    let combined_superfiles: Vec<Arc<SuperfileEntry>> = existing_part
-                        .superfiles
-                        .iter()
-                        .cloned()
-                        .chain(new_for_pk)
-                        .collect();
-                    let (rebuilt_entry, rebuilt_part, rebuilt_encoded) = build_part_and_entry(
+                    let (rebuilt_entry, rebuilt_part, rebuilt_encoded) = rebuild_part_and_entry(
                         opts.clone(),
-                        combined_superfiles,
+                        existing_part.superfiles.clone(),
+                        new_for_pk,
                         entry.partition_key.clone(),
+                        Some(entry),
                     );
                     out_list_entries.push(rebuilt_entry);
                     parts_to_write.push(EncodedPart {
@@ -751,7 +751,7 @@ impl Manifest {
                 continue;
             }
             let (fresh_entry, fresh_part, fresh_encoded) =
-                build_part_and_entry(opts.clone(), new_for_pk, pk);
+                rebuild_part_and_entry(opts.clone(), vec![], new_for_pk, pk, None);
             out_list_entries.push(fresh_entry);
             parts_to_write.push(EncodedPart {
                 part: fresh_part,
@@ -803,8 +803,13 @@ impl Manifest {
             }
 
             // Now we build the fresh part and entry based on the final superfile entries.
-            let (fresh_entry, fresh_part, fresh_encoded) =
-                build_part_and_entry(opts.clone(), final_superfile_entries, entry.partition_key);
+            let (fresh_entry, fresh_part, fresh_encoded) = rebuild_part_and_entry(
+                opts.clone(),
+                vec![],
+                final_superfile_entries,
+                entry.partition_key,
+                None,
+            );
 
             if let Some(existing) = existing_part_to_update {
                 *existing = EncodedPart {
@@ -910,10 +915,13 @@ impl Manifest {
 /// matching `ManifestListEntry`. Encodes the part once,
 /// content-hashes it, and computes the list-level aggregate
 /// skip summaries that `list_prune` reads at query time.
-fn build_part_and_entry(
+/// If base_part is Some, the superfiles MUST only include the new superfiles to be added.
+fn rebuild_part_and_entry(
     opts: Arc<SupertableOptions>,
-    superfiles: Vec<Arc<SuperfileEntry>>,
+    old_superfiles: Vec<Arc<SuperfileEntry>>,
+    new_superfiles: Vec<Arc<SuperfileEntry>>,
     partition_key: Vec<u8>,
+    base_part: Option<&ManifestListEntry>,
 ) -> (
     crate::supertable::manifest::list::ManifestListEntry,
     crate::supertable::manifest::part::ManifestPart,
@@ -921,6 +929,11 @@ fn build_part_and_entry(
 ) {
     let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
 
+    let aggregates = crate::supertable::manifest::aggregates::compute(&new_superfiles, base_part);
+    let superfiles = old_superfiles
+        .into_iter()
+        .chain(new_superfiles)
+        .collect::<Vec<_>>();
     let part = ManifestPart {
         format_version: part::FORMAT_VERSION.into(),
         part_id: PartId::new_v4(),
@@ -930,7 +943,6 @@ fn build_part_and_entry(
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
-    let aggregates = crate::supertable::manifest::aggregates::compute(&part.superfiles);
     let entry = ManifestListEntry {
         part_id: part.part_id,
         uri: part_uri(&content_hash),

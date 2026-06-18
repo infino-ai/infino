@@ -27,11 +27,14 @@
 //! deferred planner hint; a true HLL-based distinct-term union lands
 //! when measured.
 
+use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
+use crate::supertable::manifest::list::{
+    FtsSummaryAgg, ManifestListEntry, ScalarStatsAgg, VectorSummaryAgg,
+};
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
 /// Built by [`compute`] and inserted verbatim into the entry.
@@ -50,19 +53,40 @@ pub struct AggregateSet {
 /// `(0, 0)`, empty maps). The list-level pruner treats empty
 /// maps as "no info on these columns" and defaults to
 /// "always-keep" — correctness is preserved.
-pub fn compute(superfiles: &[Arc<SuperfileEntry>]) -> AggregateSet {
+pub fn compute(
+    superfiles: &[Arc<SuperfileEntry>],
+    base_part: Option<&ManifestListEntry>,
+) -> AggregateSet {
     if superfiles.is_empty() {
-        return AggregateSet::default();
+        return base_part
+            .map(|b| AggregateSet {
+                id_range: (b.id_range.0, b.id_range.1),
+                scalar_stats_agg: b.scalar_stats_agg.clone(),
+                fts_summary_agg: b.fts_summary_agg.clone(),
+                vector_summary_agg: b.vector_summary_agg.clone(),
+            })
+            .unwrap_or_default();
     }
 
-    let id_min = superfiles.iter().map(|s| s.id_min).min().unwrap_or(0);
-    let id_max = superfiles.iter().map(|s| s.id_max).max().unwrap_or(0);
+    let mut id_min = superfiles.iter().map(|s| s.id_min).min().unwrap_or(0);
+    let mut id_max = superfiles.iter().map(|s| s.id_max).max().unwrap_or(0);
+    let mut scalar_stats_agg = scalar_stats_agg(superfiles);
+    let mut fts_summary_agg = fts_summary_agg(superfiles);
+    let mut vector_summary_agg = vector_summary_agg(superfiles);
+
+    if let Some(base_part) = base_part {
+        id_min = min(id_min, base_part.id_range.0);
+        id_max = max(id_max, base_part.id_range.1);
+        ScalarStatsAgg::merge(&mut scalar_stats_agg, &base_part.scalar_stats_agg);
+        FtsSummaryAgg::merge(&mut fts_summary_agg, &base_part.fts_summary_agg);
+        VectorSummaryAgg::merge(&mut vector_summary_agg, &base_part.vector_summary_agg);
+    }
 
     AggregateSet {
         id_range: (id_min, id_max),
-        scalar_stats_agg: scalar_stats_agg(superfiles),
-        fts_summary_agg: fts_summary_agg(superfiles),
-        vector_summary_agg: vector_summary_agg(superfiles),
+        scalar_stats_agg,
+        fts_summary_agg,
+        vector_summary_agg,
     }
 }
 
@@ -79,7 +103,7 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, Scala
     // helper.
     let mut out: HashMap<String, ScalarStatsAgg> = HashMap::new();
     for seg in superfiles {
-        ScalarStatsAgg::merge_tables(&mut out, &seg.scalar_stats);
+        ScalarStatsAgg::merge(&mut out, &seg.scalar_stats);
     }
     out
 }
@@ -98,7 +122,7 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
     for seg in superfiles {
         for (col, summary) in &seg.fts_summary {
             out.entry(col.clone())
-                .and_modify(|acc| acc.merge(summary))
+                .and_modify(|acc| acc.merge_with(summary))
                 .or_insert_with(|| summary.clone());
         }
     }
@@ -178,11 +202,44 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supertable::manifest::part::{ContentHash, PartId};
     use crate::supertable::manifest::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
     };
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
     use std::collections::HashMap;
+
+    /// A `ManifestListEntry` standing in for an existing part, carrying the
+    /// given id range + per-column scalar aggregates (empty fts/vector aggs).
+    fn base_entry(
+        id_range: (i128, i128),
+        scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
+    ) -> ManifestListEntry {
+        ManifestListEntry {
+            part_id: PartId(uuid::Uuid::from_bytes([0xb; 16])),
+            uri: "manifests/part-base.avro.zst".into(),
+            n_superfiles: 1,
+            size_bytes_compressed: 1,
+            size_bytes_uncompressed: 1,
+            content_hash: ContentHash([0u8; 32]),
+            partition_key: Vec::new(),
+            id_range,
+            scalar_stats_agg,
+            fts_summary_agg: BTreeMap::new(),
+            vector_summary_agg: BTreeMap::new(),
+        }
+    }
+
+    /// A single-column i64 scalar-stats table, for building `base_entry`s.
+    fn scalar_i64(col: &str, vals: Vec<i64>) -> HashMap<String, ScalarStatsAgg> {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
+        let mut m = HashMap::new();
+        m.insert(
+            col.to_string(),
+            ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
+        );
+        m
+    }
 
     fn seg_with_string_minmax(col: &str, min: &str, max: &str, large: bool) -> Arc<SuperfileEntry> {
         let (mn, mx): (ArrayRef, ArrayRef) = if large {
@@ -332,5 +389,55 @@ mod tests {
         assert!(agg.sum.is_none(), "sum unknowable when a segment lacks it");
         assert!(agg.null_count.is_none());
         assert!(agg.hll.is_none());
+    }
+
+    #[test]
+    fn compute_empty_superfiles_with_base_part_returns_base_aggregates() {
+        // No new superfiles, but an existing part is supplied → `compute`
+        // carries the base part's aggregates forward verbatim (the rebalance
+        // "nothing new for this partition" case).
+        let base = base_entry((100, 200), scalar_i64("n", vec![5, 9]));
+        let aggs = compute(&[], Some(&base));
+        assert_eq!(aggs.id_range, (100, 200));
+        let n = aggs.scalar_stats_agg.get("n").expect("n carried forward");
+        assert_eq!(i64_val(&n.min), 5);
+        assert_eq!(i64_val(&n.max), 9);
+        // fts/vector aggregates are carried over as-is (empty here).
+        assert!(aggs.fts_summary_agg.is_empty());
+        assert!(aggs.vector_summary_agg.is_empty());
+    }
+
+    #[test]
+    fn compute_empty_superfiles_without_base_part_is_default() {
+        // The `None` arm of the empty-superfiles branch → all-default.
+        let aggs = compute(&[], None);
+        assert_eq!(aggs.id_range, (0, 0));
+        assert!(aggs.scalar_stats_agg.is_empty());
+    }
+
+    #[test]
+    fn compute_nonempty_superfiles_folds_base_part() {
+        // New superfiles for column "n"; the base part spans a wider id range
+        // on both ends and also carries a column "m" the new superfiles lack.
+        // The fold must: extend id_range to cover both, merge "n", and carry
+        // "m" forward.
+        let new_segs = vec![seg_with_i64("n", vec![20, 80])]; // seg id_range is (0, 0)
+        let mut base_scalar = scalar_i64("n", vec![10, 60]);
+        base_scalar.extend(scalar_i64("m", vec![1, 2]));
+        // Base id_range (-5, 200) straddles the segs' (0, 0) on both ends.
+        let base = base_entry((-5, 200), base_scalar);
+
+        let aggs = compute(&new_segs, Some(&base));
+
+        // id_range = (min(0, -5), max(0, 200)).
+        assert_eq!(aggs.id_range, (-5, 200));
+        // "n" merged across new superfiles + base: min(20, 10), max(80, 60).
+        let n = aggs.scalar_stats_agg.get("n").expect("n");
+        assert_eq!(i64_val(&n.min), 10);
+        assert_eq!(i64_val(&n.max), 80);
+        // "m" exists only in the base part → carried forward by the merge.
+        let m = aggs.scalar_stats_agg.get("m").expect("m from base");
+        assert_eq!(i64_val(&m.min), 1);
+        assert_eq!(i64_val(&m.max), 2);
     }
 }

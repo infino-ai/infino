@@ -63,7 +63,7 @@ impl SuperfileStats {
             n_docs += stat.n_docs;
             id_min = id_min.min(stat.id_min);
             id_max = id_max.max(stat.id_max);
-            ScalarStatsAgg::merge_tables(&mut scalar_stats, &stat.scalar_stats);
+            ScalarStatsAgg::merge(&mut scalar_stats, &stat.scalar_stats);
         }
         Self {
             n_docs,
