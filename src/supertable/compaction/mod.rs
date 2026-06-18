@@ -164,7 +164,7 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
-    pub fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
+    pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
         crate::runtime_bridge::bridge_on_runtime(
             self.compact_async(cfg),
             &self.inner().query_runtime(),

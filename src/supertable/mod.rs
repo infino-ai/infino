@@ -31,6 +31,7 @@ pub mod handle;
 pub mod lazy_source;
 pub mod manifest;
 pub mod mutations;
+pub(crate) mod optimize;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
@@ -59,7 +60,7 @@ pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
     StorageProvider,
 };
-pub use error::{BuildError, CommitError, CompactionError, GcError, OpenError, QueryError};
+pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
 pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;

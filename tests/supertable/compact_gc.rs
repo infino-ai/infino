@@ -16,21 +16,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use infino::CompactionSettings;
 use infino::superfile::fts::reader::BoolMode;
 use infino::supertable::Supertable;
 use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
 use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{CompactionSettings, OptimizeOptions};
 use tempfile::TempDir;
 
 const TOP_K: usize = 10;
 
-fn small_compact_cfg() -> CompactionSettings {
-    CompactionSettings {
+fn small_optimize_opts() -> OptimizeOptions {
+    OptimizeOptions::compact(CompactionSettings {
         target_superfile_size_mb: 1,
         min_fill_percent: 1,
         ..CompactionSettings::default()
-    }
+    })
 }
 
 fn count_dir(dir: &std::path::Path) -> usize {
@@ -111,7 +111,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
     );
 
     // Compact: all 10 superfiles merge into one (or a small number).
-    st.compact(&small_compact_cfg()).expect("compact");
+    st.optimize(&small_optimize_opts()).expect("optimize");
 
     let r = st.reader();
     let n_after_compact = r.n_superfiles();
