@@ -259,6 +259,40 @@ fn resolve_ids_arithmetic(
     )
 }
 
+/// Build the engine-native `_id` + `score` batch directly from already-resolved
+/// stable ids and per-hit scores — the same two-column shape `resolve_hits_named`
+/// returns for a `None` projection, but synthesized without opening any
+/// superfile. Used by the hidden-index id-only fast path, which holds the
+/// stable `_id` after the remap's id-resolution step and so needs neither the
+/// user-superfile lookup nor a data-page read. `ids` and `scores` are parallel
+/// and already in global rank order.
+pub(crate) fn id_score_batch(
+    reader: &SupertableReader,
+    ids: &[i128],
+    scores: &[f32],
+) -> DfResult<RecordBatch> {
+    let id_array = Decimal128Array::from_iter_values(ids.iter().copied())
+        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let score_array = Float32Array::from_iter_values(scores.iter().copied());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            reader.options().id_column.clone(),
+            DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
+            false,
+        ),
+        Field::new(SCORE_COLUMN, DataType::Float32, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(id_array) as ArrayRef,
+            Arc::new(score_array) as ArrayRef,
+        ],
+    )
+    .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
 /// Read `names` (scalar columns) at the `hits`' `(superfile,
 /// local_doc_id)` rows and return them in global rank order.
 ///
@@ -444,7 +478,7 @@ async fn resolve_columns(
 /// store row-resolution path.
 ///
 /// [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
-async fn take_rows_object_store(
+pub(crate) async fn take_rows_object_store(
     store: Arc<dyn object_store::ObjectStore>,
     path: object_store::path::Path,
     file_size: Option<u64>,

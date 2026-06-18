@@ -356,6 +356,18 @@ impl StorageProvider for PrefixedStorageProvider {
             .map(|s| s[strip_len..].to_owned())
             .collect())
     }
+
+    fn object_store_handle(
+        &self,
+        uri: &str,
+    ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+        // Delegate to the parent with the sub-prefix applied, so the hidden
+        // table's superfiles resolve to a real object-store handle for the
+        // async range-GET read paths (e.g. cold `_id`-column resolution).
+        // Without this override the default `None` forces those paths to error
+        // on lazily-opened hidden superfiles.
+        self.inner.object_store_handle(&self.prefixed(uri))
+    }
 }
 
 #[cfg(test)]
