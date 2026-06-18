@@ -47,9 +47,9 @@ SUBSYSTEM = {
     "sql": ("SQL", "src/supertable/query/"),
 }
 
-# Latency below this (ns) is sub-millisecond timing noise — a big percentage
-# of nearly-nothing. Don't flag it. 0.5 ms.
-MIN_LATENCY_NS = 500_000.0
+# Latency at/under this (ns) rounds to ~0.00 ms — a big percentage of nearly
+# nothing. Don't flag it; real sub-ms queries above it still count. 0.1 ms.
+MIN_LATENCY_NS = 100_000.0
 
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_OUT = "/tmp/ai-summary.md"
@@ -269,8 +269,11 @@ def main():
         os.environ.get("AZURE_AI_MODEL", DEFAULT_MODEL),
     )
 
+    def plural(n, word):
+        return f"{n} {word}{'' if n == 1 else 's'}"
+
     badge = "🔴" if (failures or regressions) else ("🟢" if improvements else "⚪")
-    counts = f"{len(regressions)} regression(s) · {len(improvements)} improvement(s)"
+    counts = f"{plural(len(regressions), 'regression')} · {plural(len(improvements), 'improvement')}"
     parts = [f"## {badge} Benchmark `{label}` — {counts} (±{threshold:g}% vs main)", ""]
 
     if prose:
