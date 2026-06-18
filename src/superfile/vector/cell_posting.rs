@@ -9,6 +9,8 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use wide::f32x8;
+
 use crate::superfile::BuildError;
 use crate::superfile::builder::VectorConfig;
 use crate::superfile::vector::distance::{Metric, SQ8_RESIDUAL_DIVISOR, distance};
@@ -17,6 +19,8 @@ const MAGIC: &[u8] = b"infino.cell_posting.v1\n";
 const SQ8_CODE_MAX: f32 = 255.0;
 const EPSILON_I8_CLAMP: f32 = 127.0;
 const ROW_BYTES_PER_DIM: usize = 2;
+/// Lane count of `wide::f32x8` (256-bit / 32-bit), matching `distance.rs`.
+const LANES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct CellPostingBuilder {
@@ -38,6 +42,9 @@ struct DecodedPosting {
     ids: Vec<u32>,
     scale: Vec<f32>,
     offset: Vec<f32>,
+    /// Per-dim residual step (`scale / SQ8_RESIDUAL_DIVISOR`), precomputed
+    /// once so the decode hot loop avoids a division per element per row.
+    step: Vec<f32>,
     rows: Vec<u8>,
 }
 
@@ -162,12 +169,14 @@ fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
                 .unwrap(),
         );
     }
+    let step: Vec<f32> = scale.iter().map(|s| s / SQ8_RESIDUAL_DIVISOR).collect();
     Ok(DecodedPosting {
         dim,
         metric,
         ids: decode_ids(&body[ids_start..ids_start + ids_len]),
         scale,
         offset,
+        step,
         rows: body[rows_start..rows_start + rows_len].to_vec(),
     })
 }
@@ -181,8 +190,12 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
         return Ok(Vec::new());
     }
     let mut heap = BinaryHeap::<WorstHit>::new();
+    // One scratch vector reused across every row — the decode target is
+    // overwritten each iteration, so there is no per-row allocation.
+    let mut decoded = vec![0f32; posting.dim];
     for row in 0..posting.ids.len() {
-        let d = row_distance(&posting, query, row);
+        decode_row(&posting, row, &mut decoded);
+        let d = distance(posting.metric, query, &decoded);
         let hit = WorstHit((posting.ids[row], d));
         if heap.len() < k {
             heap.push(hit);
@@ -235,20 +248,55 @@ fn decode_all(p: &DecodedPosting) -> Vec<f32> {
     out
 }
 
-fn row_distance(p: &DecodedPosting, query: &[f32], row: usize) -> f32 {
-    let mut decoded = vec![0f32; p.dim];
-    decode_row(p, row, &mut decoded);
-    distance(p.metric, query, &decoded)
-}
-
+/// Decode one row's Sq8+ε codes into `out` as `offset + code*scale + ε*step`.
+///
+/// Vectorized with `wide::f32x8`: the per-dim affine dequant is lane-
+/// independent, so eight dims are reconstructed per SIMD step. `step` is
+/// precomputed in [`open_blob`], so the loop carries no division. The byte
+/// codes are widened per lane (cheap) and the multiply-adds run in SIMD.
 fn decode_row(p: &DecodedPosting, row: usize, out: &mut [f32]) {
     let dim = p.dim;
     let base = row * dim * ROW_BYTES_PER_DIM;
-    for d in 0..dim {
-        let code = p.rows[base + d] as f32;
-        let eps = p.rows[base + dim + d] as i8 as f32;
-        let step = p.scale[d] / SQ8_RESIDUAL_DIVISOR;
-        out[d] = p.offset[d] + code * p.scale[d] + eps * step;
+    let codes = &p.rows[base..base + dim]; // u8 Sq8 codes
+    let eps = &p.rows[base + dim..base + 2 * dim]; // i8 residuals
+    let mut d = 0;
+    while d + LANES <= dim {
+        let code_v = f32x8::from([
+            codes[d] as f32,
+            codes[d + 1] as f32,
+            codes[d + 2] as f32,
+            codes[d + 3] as f32,
+            codes[d + 4] as f32,
+            codes[d + 5] as f32,
+            codes[d + 6] as f32,
+            codes[d + 7] as f32,
+        ]);
+        let eps_v = f32x8::from([
+            eps[d] as i8 as f32,
+            eps[d + 1] as i8 as f32,
+            eps[d + 2] as i8 as f32,
+            eps[d + 3] as i8 as f32,
+            eps[d + 4] as i8 as f32,
+            eps[d + 5] as i8 as f32,
+            eps[d + 6] as i8 as f32,
+            eps[d + 7] as i8 as f32,
+        ]);
+        let scale_v = f32x8::from(
+            <[f32; LANES]>::try_from(&p.scale[d..d + LANES]).expect("slice of length LANES"),
+        );
+        let offset_v = f32x8::from(
+            <[f32; LANES]>::try_from(&p.offset[d..d + LANES]).expect("slice of length LANES"),
+        );
+        let step_v = f32x8::from(
+            <[f32; LANES]>::try_from(&p.step[d..d + LANES]).expect("slice of length LANES"),
+        );
+        let res = offset_v + code_v * scale_v + eps_v * step_v;
+        out[d..d + LANES].copy_from_slice(&res.to_array());
+        d += LANES;
+    }
+    while d < dim {
+        out[d] = p.offset[d] + codes[d] as f32 * p.scale[d] + (eps[d] as i8 as f32) * p.step[d];
+        d += 1;
     }
 }
 
