@@ -1119,57 +1119,67 @@ pub mod vector {
                     latencies.push(t0.elapsed());
                     let global_hits: Vec<(u32, f32)> = hits
                         .iter()
-                        .filter_map(|h| {
-                            offsets
-                                .get(&h.superfile)
-                                .map(|base| (base.saturating_add(h.local_doc_id), h.score))
+                        .map(|h| {
+                            let base = offsets.get(&h.superfile).unwrap_or_else(|| {
+                                panic!(
+                                    "missing manifest offset for superfile {:?}",
+                                    h.superfile,
+                                )
+                            });
+                            (base.saturating_add(h.local_doc_id), h.score)
                         })
                         .collect();
                     recalls.push(corpus::recall_at_k(&global_hits, gt));
                 }
-                let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
-                latencies.sort_unstable();
-                let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
-                let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
-                let effective_rerank = rerank.saturating_mul(FILTER_KEEP_EVERY);
+                if recalls.is_empty() || latencies.is_empty() {
+                    eprintln!(
+                        "[supertable_vector] filtered recall skipped: no correctness queries"
+                    );
+                } else {
+                    let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
+                    latencies.sort_unstable();
+                    let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                    let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
+                    let effective_rerank = rerank.saturating_mul(FILTER_KEEP_EVERY);
 
-                eprintln!(
-                    "[supertable_vector] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean_recall:.3}, p50={:.2}ms",
-                    q_correct.len(),
-                    p50_ns / 1e6,
-                );
+                    eprintln!(
+                        "[supertable_vector] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean_recall:.3}, p50={:.2}ms",
+                        q_correct.len(),
+                        p50_ns / 1e6,
+                    );
 
-                report.emit(&Section {
-                    anchor: "bench/vector/supertable/filtered".into(),
-                    title: format!(
-                        "Supertable vector — filtered search ({} docs × dim={})",
-                        fmt_count(n_docs),
-                        DIM
-                    ),
-                    note: format!(
-                        "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
-                        FILTER_KEEP_EVERY
-                    ),
-                    blocks: vec![Block {
-                        subtitle: String::new(),
-                        headers: vec![
-                            "Filter".into(),
-                            "(p, r)".into(),
-                            "effective (p, r)".into(),
-                            "selectivity".into(),
-                            "recall@10".into(),
-                            "p50".into(),
-                        ],
-                        rows: vec![vec![
-                            text("filtered (~10%)"),
-                            text(format!("p={nprobe}, r={rerank}")),
-                            text(format!("p={nprobe}, r={effective_rerank}")),
-                            text(format!("{:.1}%", selectivity * 100.0)),
-                            text(format!("{mean_recall:.3}")),
-                            metric(p50_ns, fmt_time(p50_ns), Better::Lower),
-                        ]],
-                    }],
-                });
+                    report.emit(&Section {
+                        anchor: "bench/vector/supertable/filtered".into(),
+                        title: format!(
+                            "Supertable vector — filtered search ({} docs × dim={})",
+                            fmt_count(n_docs),
+                            DIM
+                        ),
+                        note: format!(
+                            "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
+                            FILTER_KEEP_EVERY
+                        ),
+                        blocks: vec![Block {
+                            subtitle: String::new(),
+                            headers: vec![
+                                "Filter".into(),
+                                "(p, r)".into(),
+                                "effective (p, r)".into(),
+                                "selectivity".into(),
+                                "recall@10".into(),
+                                "p50".into(),
+                            ],
+                            rows: vec![vec![
+                                text("filtered (~10%)"),
+                                text(format!("p={nprobe}, r={rerank}")),
+                                text(format!("p={nprobe}, r={effective_rerank}")),
+                                text(format!("{:.1}%", selectivity * 100.0)),
+                                text(format!("{mean_recall:.3}")),
+                                metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                            ]],
+                        }],
+                    });
+                }
             }
 
             drop(consumer);

@@ -379,7 +379,7 @@ impl ExecutionPlan for VectorSearchExec {
                             &column,
                             &query,
                             k,
-                            VectorSearchOptions::new_filtered(),
+                            options,
                             &bounded,
                         )
                         .await

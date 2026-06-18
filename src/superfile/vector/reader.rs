@@ -1435,9 +1435,9 @@ impl VectorReader {
 
         // Filtered search: boost nprobe and rerank_mult inversely with
         // selectivity so probed clusters and the rerank shortlist cover
-        // enough eligible rows. At 10% selectivity the default nprobe=8
-        // and rerank_mult=20 miss most k-nearest among allowed rows.
-        // Capped at 64× the caller's value.
+        // enough eligible rows. Capped at [`MAX_FILTER_SELECTIVITY_MULT`]
+        // on the selectivity side and [`MAX_EFFECTIVE_FILTERED_RERANK_MULT`]
+        // on the effective rerank width.
         let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
         if filter_mult == 0 {
             return Ok(Vec::new());
@@ -1458,7 +1458,7 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        let rerank_mult_eff = rerank_mult.saturating_mul(filter_mult);
+        let rerank_mult_eff = effective_filtered_rerank_mult(rerank_mult, filter_mult);
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
@@ -1514,7 +1514,7 @@ impl VectorReader {
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
-            rerank_mult: rerank_mult.saturating_mul(filter_mult),
+            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
             allow,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
@@ -1988,6 +1988,8 @@ async fn build_shortlist(
 /// rerank width. Caps the inverse-selectivity boost so very sparse
 /// predicates don't turn every query into a full cluster scan.
 const MAX_FILTER_SELECTIVITY_MULT: usize = 64;
+/// Maximum effective rerank multiplier after filtered-search selectivity scaling.
+const MAX_EFFECTIVE_FILTERED_RERANK_MULT: usize = 16_384;
 /// Multiplier for the unfiltered path, and for degenerate empty-column
 /// metadata where there is no population to estimate selectivity from.
 const UNFILTERED_SELECTIVITY_MULT: usize = 1;
@@ -2020,6 +2022,13 @@ fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> u
     (FULL_SELECTIVITY / selectivity)
         .ceil()
         .min(MAX_FILTER_SELECTIVITY_MULT as f64) as usize
+}
+
+/// Scale rerank breadth for filtered search and cap before shortlist sizing.
+fn effective_filtered_rerank_mult(rerank_mult: usize, filter_mult: usize) -> usize {
+    rerank_mult
+        .saturating_mul(filter_mult)
+        .min(MAX_EFFECTIVE_FILTERED_RERANK_MULT)
 }
 
 /// Score `query` against every centroid in `centroids_bytes` and

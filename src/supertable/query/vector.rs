@@ -73,6 +73,7 @@ use crate::superfile::vector::distance::Metric;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
+use crate::supertable::tombstones::SidecarCache;
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
@@ -163,11 +164,8 @@ impl SupertableReader {
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let options = if allow.is_some() {
-            options.for_filtered_path()
-        } else {
-            options
-        };
+        let filtered = allow.is_some();
+        let (nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
 
         // ---- Global cross-superfile cluster selection.
@@ -229,10 +227,9 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        let budget = options
-            .nprobe
+        let budget = nprobe
             .saturating_mul(n_eligible.max(1))
-            .max(options.nprobe);
+            .max(nprobe);
         if scored.len() > budget {
             scored.select_nth_unstable_by(budget, |a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
@@ -415,43 +412,20 @@ impl SupertableReader {
         tokens: &[String],
         mode: BoolMode,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
-        let units: Vec<(Arc<SuperfileEntry>, ())> =
-            superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
-        let body =
-            move |r: Arc<SuperfileReader>,
-                  entry: Arc<SuperfileEntry>,
-                  tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-                  now: std::time::Instant,
-                  _: ()| {
-                let filter_col_arc = Arc::clone(&filter_col_arc);
-                let tokens_arc = Arc::clone(&tokens_arc);
-                async move {
-                    let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
-                    let docs = r
-                        .token_match(&filter_col_arc, &refs, mode)
-                        .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    let mut bm: RoaringBitmap = docs.into_iter().collect();
-                    if let Some(cache) = tombstone_cache.as_ref() {
-                        let deleted = cache
-                            .bitmap_for(entry.superfile_id, now)
-                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-                        if !deleted.is_empty() {
-                            bm -= &*deleted;
-                        }
-                    }
-                    Ok((entry.uri, bm))
-                }
-            };
-        let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
-            dispatch::fanout_with(self, units, body).await?;
-        Ok(pairs
-            .into_iter()
-            .filter(|(_, bm)| !bm.is_empty())
-            .map(|(uri, bm)| (uri, Arc::new(bm)))
-            .collect())
+        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+            let filter_col_arc = Arc::clone(&filter_col_arc);
+            let tokens_arc = Arc::clone(&tokens_arc);
+            async move {
+                let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
+                r.token_match(&filter_col_arc, &refs, mode)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))
+                    .map(|docs| docs.into_iter().collect::<RoaringBitmap>())
+            }
+        })
+        .await
     }
 
     /// Filtered vector kNN driven by a SQL `WHERE` [`CandidatePlan`] — the
@@ -577,38 +551,55 @@ impl SupertableReader {
         superfiles: &[Arc<SuperfileEntry>],
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
+        let plan_arc = Arc::new(plan.clone());
+        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+            let plan = Arc::clone(&plan_arc);
+            async move {
+                plan.evaluate(r.as_ref())
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    .ok_or_else(|| {
+                        QueryError::Execute(
+                            "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                        )
+                    })
+            }
+        })
+        .await
+    }
+
+    /// Fan out over `superfiles`, resolve matching `local_doc_id`s per
+    /// superfile via `doc_ids`, subtract tombstones, and drop empties.
+    async fn fanout_candidate_bitmaps<F, Fut>(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        doc_ids: F,
+    ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError>
+    where
+        F: Fn(
+                Arc<SuperfileReader>,
+                Arc<SuperfileEntry>,
+            ) -> Fut
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+        Fut: std::future::Future<Output = Result<RoaringBitmap, QueryError>> + Send,
+    {
         let units: Vec<(Arc<SuperfileEntry>, ())> =
             superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
-        let plan_arc = Arc::new(plan.clone());
-        let body =
-            move |r: Arc<SuperfileReader>,
-                  entry: Arc<SuperfileEntry>,
-                  tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
-                  now: std::time::Instant,
-                  _: ()| {
-                let plan = Arc::clone(&plan_arc);
-                async move {
-                    let docs = plan
-                        .evaluate(r.as_ref())
-                        .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
-                        .ok_or_else(|| {
-                            QueryError::Execute(
-                                "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                            )
-                        })?;
-                    let mut bm: RoaringBitmap = docs.into_iter().collect();
-                    if let Some(cache) = tombstone_cache.as_ref() {
-                        let deleted = cache
-                            .bitmap_for(entry.superfile_id, now)
-                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-                        if !deleted.is_empty() {
-                            bm -= &*deleted;
-                        }
-                    }
-                    Ok((entry.uri, bm))
-                }
-            };
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         tombstone_cache: Option<Arc<SidecarCache>>,
+                         now: std::time::Instant,
+                         _: ()| {
+            let doc_ids = doc_ids.clone();
+            async move {
+                let mut bm = doc_ids(r, Arc::clone(&entry)).await?;
+                subtract_tombstones(&mut bm, &entry, tombstone_cache.as_deref(), now)?;
+                Ok((entry.uri, bm))
+            }
+        };
         let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
             dispatch::fanout_with(self, units, body).await?;
         Ok(pairs
@@ -617,6 +608,23 @@ impl SupertableReader {
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect())
     }
+}
+
+fn subtract_tombstones(
+    bm: &mut RoaringBitmap,
+    entry: &SuperfileEntry,
+    tombstone_cache: Option<&SidecarCache>,
+    now: std::time::Instant,
+) -> Result<(), QueryError> {
+    if let Some(cache) = tombstone_cache {
+        let deleted = cache
+            .bitmap_for(entry.superfile_id, now)
+            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+        if !deleted.is_empty() {
+            *bm -= &*deleted;
+        }
+    }
+    Ok(())
 }
 
 impl SupertableReader {
@@ -641,14 +649,8 @@ impl SupertableReader {
             let hits = match filter {
                 None => self.vector_search_async(column, query, k, options).await?,
                 Some(f) => {
-                    self.vector_hits_filtered_async(
-                        column,
-                        query,
-                        k,
-                        options.for_filtered_path(),
-                        f,
-                    )
-                    .await?
+                    self.vector_hits_filtered_async(column, query, k, options, f)
+                        .await?
                 }
             };
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
@@ -681,7 +683,7 @@ impl SupertableReader {
                 column,
                 query,
                 k,
-                options.for_filtered_path(),
+                options,
                 f,
             )),
         }

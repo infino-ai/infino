@@ -242,21 +242,18 @@ impl<'a> core::marker::UnsafeUnpin for infino::VectorFilter<'a>
 impl<'a> core::panic::unwind_safe::RefUnwindSafe for infino::VectorFilter<'a>
 impl<'a> core::panic::unwind_safe::UnwindSafe for infino::VectorFilter<'a>
 pub struct infino::VectorSearchOptions
-pub infino::VectorSearchOptions::nprobe: usize
+pub infino::VectorSearchOptions::nprobe: core::option::Option<usize>
 impl infino::VectorSearchOptions
 pub const infino::VectorSearchOptions::DEFAULT_NPROBE: usize
-pub const infino::VectorSearchOptions::FILTERED_DEFAULT_NPROBE: usize
-pub const infino::VectorSearchOptions::FILTERED_RERANK_MULT: usize
 pub const infino::VectorSearchOptions::RERANK_MULT: usize
 pub fn infino::VectorSearchOptions::new() -> Self
-pub fn infino::VectorSearchOptions::new_filtered() -> Self
-pub fn infino::VectorSearchOptions::rerank_mult(&self) -> usize
+pub fn infino::VectorSearchOptions::rerank_mult(&self) -> core::option::Option<usize>
 pub fn infino::VectorSearchOptions::with_nprobe(self, usize) -> Self
 pub fn infino::VectorSearchOptions::with_rerank_mult(self, usize) -> Self
 impl core::clone::Clone for infino::VectorSearchOptions
 pub fn infino::VectorSearchOptions::clone(&self) -> infino::VectorSearchOptions
 impl core::default::Default for infino::VectorSearchOptions
-pub fn infino::VectorSearchOptions::default() -> Self
+pub fn infino::VectorSearchOptions::default() -> infino::VectorSearchOptions
 impl core::fmt::Debug for infino::VectorSearchOptions
 pub fn infino::VectorSearchOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::VectorSearchOptions
