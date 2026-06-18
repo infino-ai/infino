@@ -1,0 +1,24 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Infino",
+  "description": "Embedded retrieval engine — SQL, full-text (BM25), and vector search over one copy of your data on object storage, running in-process with no server.",
+  "excludeFolders": [
+    "target",
+    "node_modules"
+  ],
+  "rules": [
+    "Infino is an embedded engine that runs in-process — there is no server or daemon to start. Open a catalog with connect(uri).",
+    "Use memory:// for an in-process, ephemeral catalog; use a filesystem path or an s3://bucket/prefix URI to persist to object storage (Amazon S3, Azure Blob, or local disk).",
+    "Create a table from a schema plus an IndexSpec that declares which columns are indexed: .fts(column) for BM25 full-text and .vector(column, dim, ...) for vector search. An _id column is added automatically — do not define it yourself.",
+    "Provide your own embedding vectors for vector columns and vector queries; the core engine stores and searches vectors but does not generate embeddings.",
+    "Append rows with the table's append/add method. Writes become durable only when a commit succeeds — nothing is persisted before that, and readers see either the pre-commit or post-commit state, never a partial one.",
+    "Run keyword search with bm25_search(column, query, k); it returns rows ranked by BM25 relevance with a score.",
+    "Run vector search with vector_search(column, query_vector, k); it returns the nearest rows by the index's metric (cosine, L2, or dot) with a score.",
+    "Hybrid search is done in SQL, not with a second system: call the bm25_search and vector_search (or hybrid_search) table functions and fuse them with reciprocal-rank fusion. It is one engine over one copy of the data.",
+    "Reach SQL through the connection's query_sql. The search functions bm25_search, vector_search, hybrid_search, token_match, and exact_match are SQL table functions, so search composes into a query as a relation you can JOIN, filter, and aggregate.",
+    "Search methods take a projection naming the output columns. With no projection they return just _id and score (no row data is decoded); name the columns you want materialized.",
+    "Updates and deletes are by id and are applied through tombstones over an append-only store — Infino is built for retrieval over largely append-only corpora, not high-rate row-level OLTP.",
+    "Each superfile is a valid Apache Parquet file, so any Parquet reader (DataFusion, DuckDB, pyarrow) can read its columns directly; the embedded BM25 and vector index regions are skipped by generic readers.",
+    "Infino ships as a Rust crate and as Python and Node.js bindings; the bindings mirror the same connect / create-table / append / search / query_sql surface."
+  ]
+}
