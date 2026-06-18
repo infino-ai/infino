@@ -4,7 +4,6 @@ Swap in a hosted embedder by editing `embed` / `embed_query` and `DIM` / `METRIC
 """
 
 import os
-import threading
 
 import pyarrow as pa
 
@@ -17,20 +16,17 @@ DIM = 384          # must match the vector index dim
 METRIC = "cosine"  # MiniLM outputs are normalized
 
 _model = None
-_model_lock = threading.Lock()
 
 
 def _get_model():
-    """Load the model once, lazily."""
+    """Load the embedding model once, on first use."""
     global _model
     if _model is None:
-        with _model_lock:
-            if _model is None:
-                from sentence_transformers import SentenceTransformer
-                from transformers.utils import logging as hf_logging
+        from sentence_transformers import SentenceTransformer
+        from transformers.utils import logging as hf_logging
 
-                hf_logging.set_verbosity_error()
-                _model = SentenceTransformer(MODEL_NAME)
+        hf_logging.set_verbosity_error()
+        _model = SentenceTransformer(MODEL_NAME)
     return _model
 
 
