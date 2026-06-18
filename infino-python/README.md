@@ -120,6 +120,46 @@ db.query_sql("SELECT COUNT(*) AS n FROM docs")
 db.query_sql("SELECT title FROM docs WHERE title = 'a lazy dog'")
 ```
 
+### Search inside SQL
+
+Search is also exposed as table-valued functions, so a ranked retrieval is
+a relation you can join, filter, and aggregate over. Each takes the table
+name as its first argument and yields `_id`, any scalar columns, and a
+trailing `score`:
+
+| Function                                                        | Returns                                  |
+| --------------------------------------------------------------- | ---------------------------------------- |
+| `bm25_search(table, column, query, k)`                          | Ranked BM25 (higher score is better)     |
+| `bm25_search_prefix(table, column, prefix, k)`                  | BM25 with the last term prefix-expanded  |
+| `vector_search(table, column, query_vector, k)`                 | kNN (smaller score is nearer)            |
+| `hybrid_search(table, text_col, query, vec_col, query_vector, k)` | BM25 + vector fused with RRF (higher is better) |
+| `token_match(table, column, query)`                             | Unranked term match (`score` is `0.0`)   |
+| `exact_match(table, column, value)`                             | Unranked exact-value match               |
+
+A query vector is written as a comma-separated string or a SQL array
+literal; build it from a Python list with `",".join(map(str, vec))`.
+
+```python
+# Hybrid search: lexical + vector, fused by reciprocal-rank fusion.
+qv = ",".join(map(str, query_vector))
+db.query_sql(f"""
+    SELECT _id, score
+    FROM hybrid_search('docs', 'title', 'quick fox', 'emb', '{qv}', 10)
+    ORDER BY score DESC
+""")
+
+# Compose retrieval with relational filtering and the catalog's other tables.
+db.query_sql("""
+    SELECT s._id, s.score
+    FROM bm25_search('docs', 'title', 'fox', 50) AS s
+    WHERE s._id IN (SELECT _id FROM docs WHERE title <> 'a lazy dog')
+""")
+```
+
+`hybrid_search` and `bm25_search_prefix` are reachable only through SQL.
+The SQL `vector_search` takes no `nprobe` or filter arguments — use the
+`Table.vector_search` method when you need those.
+
 ## Projections
 
 By default a search returns just `_id` and `score` — no row data is
@@ -221,7 +261,11 @@ db = infino.connect(
   - `open_table(name) -> Table`
   - `drop_table(name, purge=False)` — `purge=True` also deletes the data
   - `list_tables() -> list[str]`
-  - `query_sql(sql) -> pyarrow.Table`
+  - `query_sql(sql) -> pyarrow.Table` — also exposes the search
+    table-valued functions `bm25_search`, `bm25_search_prefix`,
+    `vector_search`, `hybrid_search`, `token_match`, and `exact_match`
+    (each takes the table name first; `hybrid_search` and
+    `bm25_search_prefix` are SQL-only)
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
