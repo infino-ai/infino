@@ -3,7 +3,6 @@ name: PR Review
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
-    branches: [main]
   issue_comment:
     types: [created]
 
@@ -22,11 +21,11 @@ jobs:
       - uses: The-PR-Agent/pr-agent@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_KEY: ${{ secrets.AZURE_AI_API_KEY }}  # flat var; runner ignores OPENAI__KEY
+          OPENAI_KEY: ${{ secrets.AZURE_AI_API_KEY }} # flat var; runner ignores OPENAI__KEY
           OPENAI__API_BASE: ${{ secrets.AZURE_AI_ENDPOINT }}
           CONFIG__MODEL: "openai/gpt-5.4"
           CONFIG__FALLBACK_MODELS: "[]"
-          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"  # model absent from LiteLLM's table
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000" # model absent from LiteLLM's table
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"

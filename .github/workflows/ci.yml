@@ -182,7 +182,7 @@ jobs:
       github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
     strategy:
-      fail-fast: false   # one member failing must not cancel the other
+      fail-fast: false # one member failing must not cancel the other
       matrix:
         # `suffix` makes each leg's Azure resources unique — both legs
         # share one run_id, so without it they'd collide / cross-delete.
@@ -197,7 +197,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      pull-requests: write   # post the bench-results comment on the PR
+      pull-requests: write # post the bench-results comment on the PR
     # Informational: keep these checks out of branch-protection's required
     # set so a red bench never blocks merge.
     uses: ./.github/workflows/supertable-bench-azure.yml
