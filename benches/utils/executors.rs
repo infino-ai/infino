@@ -788,20 +788,32 @@ pub mod vector {
                 .vector_hits(column, query, k, search_opts(nprobe, rerank))
                 .expect("supertable vector_hits");
             let manifest = reader.manifest();
-            // Per-superfile global-id base offsets in manifest order.
-            let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
+            // Per-superfile doc offsets in manifest order. Unfiltered
+            // vector search may route through the hidden index, whose
+            // superfiles live in a sibling manifest — fall back there
+            // until source_ref maps hidden hits back to user rows.
+            let mut seg_uris: Vec<_> = manifest.superfiles.iter().map(|e| e.uri).collect();
+            let mut offsets: Vec<u32> = Vec::with_capacity(seg_uris.len());
             let mut acc: u32 = 0;
             for entry in manifest.superfiles.iter() {
                 offsets.push(acc);
                 acc = acc.saturating_add(entry.n_docs as u32);
             }
+            if let Some(hidden) = self.vector_index_table() {
+                let hidden_reader = hidden.reader();
+                let hidden_manifest = hidden_reader.manifest();
+                for entry in hidden_manifest.superfiles.iter() {
+                    seg_uris.push(entry.uri);
+                    offsets.push(acc);
+                    acc = acc.saturating_add(entry.n_docs as u32);
+                }
+            }
             hits.into_iter()
                 .map(|h| {
-                    let seg_idx = manifest
-                        .superfiles
+                    let seg_idx = seg_uris
                         .iter()
-                        .position(|e| e.uri == h.superfile)
-                        .expect("hit superfile present in manifest");
+                        .position(|u| *u == h.superfile)
+                        .expect("hit superfile present in user or hidden manifest");
                     (offsets[seg_idx] + h.local_doc_id, h.score)
                 })
                 .collect()

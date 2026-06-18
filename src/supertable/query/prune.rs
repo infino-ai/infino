@@ -282,6 +282,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 64,
             },
+            vector_index_storage_prefix: None,
             parts,
         }
     }

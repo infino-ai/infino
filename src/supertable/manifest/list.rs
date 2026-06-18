@@ -69,6 +69,10 @@ pub struct ManifestList {
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
     /// for how the field is resolved.
     pub partition_strategy: PartitionStrategy,
+    /// Object-storage prefix for the hidden vector-index sibling
+    /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
+    /// create when vector columns are configured; immutable.
+    pub vector_index_storage_prefix: Option<String>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -252,6 +256,8 @@ struct ManifestListDto {
     id_column: String,
     fts_columns: Vec<FtsColumnInfo>,
     vector_columns: Vec<VectorColumnInfoDto>,
+    #[serde(default)]
+    vector_index_storage_prefix: Option<String>,
     partition_strategy: PartitionStrategyDto,
     parts: Vec<ManifestListEntryDto>,
 }
@@ -335,11 +341,11 @@ struct ScalarStatsAggDto {
     max: String, // base64
     /// `None` ↔ field absent in JSON (parts written before the stat
     /// existed decode cleanly).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     null_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     sum: Option<String>, // base64
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     hll: Option<String>, // base64
 }
 
@@ -351,7 +357,7 @@ struct FtsSummaryAggDto {
     /// `None` ↔ field absent in JSON, not a `null`. Cleaner
     /// `jq` shape and avoids the
     /// `null`-vs-`{"min":"","max":""}` ambiguity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     term_range_union: Option<TermRangeUnionDto>,
 }
 
@@ -625,6 +631,7 @@ fn list_to_dto(l: &ManifestList) -> ManifestListDto {
             })
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
+        vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         parts: l.parts.iter().map(entry_to_dto).collect(),
     }
 }
@@ -656,6 +663,7 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             })
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
+        vector_index_storage_prefix: d.vector_index_storage_prefix,
         parts,
     })
 }
@@ -725,6 +733,7 @@ mod tests {
                 column: "doc_id".into(),
                 n_buckets: 64,
             },
+            vector_index_storage_prefix: None,
             parts: vec![],
         }
     }
@@ -858,6 +867,7 @@ mod tests {
         assert_eq!(a.id_column, b.id_column);
         assert_eq!(a.fts_columns, b.fts_columns);
         assert_eq!(a.vector_columns, b.vector_columns);
+        assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
         assert_eq!(a.partition_strategy, b.partition_strategy);
         assert_eq!(a.parts.len(), b.parts.len());
         for (a_e, b_e) in a.parts.iter().zip(b.parts.iter()) {
@@ -1037,6 +1047,7 @@ mod tests {
             "id_column",
             "fts_columns",
             "vector_columns",
+            "vector_index_storage_prefix",
             "partition_strategy",
             "parts",
         ];
@@ -1050,6 +1061,16 @@ mod tests {
                 .starts_with("blake3:"),
             "options_hash should be 'blake3:<hex>' for jq-debuggability"
         );
+    }
+
+
+    #[test]
+    fn vector_index_storage_prefix_roundtrip() {
+        let mut list = empty_list();
+        list.vector_index_storage_prefix =
+            Some("_infino_deadbeef_vector_index".into());
+        let got = decode(&encode(&list).expect("encode")).expect("decode");
+        assert_eq!(got.vector_index_storage_prefix, list.vector_index_storage_prefix);
     }
 
     #[test]

@@ -264,9 +264,11 @@ impl Supertable {
             .clone();
         let options_arc = Arc::new(options);
         let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
-        let vector_index_table = if let Some(hidden_opts) =
-            build_vector_index_options(options_arc.as_ref(), Some(manifest.as_ref()))
-        {
+        let vector_index_table = if let Some(hidden_opts) = build_vector_index_options(
+            options_arc.as_ref(),
+            Some(manifest.as_ref()),
+            None,
+        ) {
             let hidden_storage = hidden_opts.storage.clone().ok_or_else(|| {
                 OpenError::Build(BuildError::Store(
                     "VectorIndexSuperTable requires options.storage".into(),
@@ -288,7 +290,7 @@ impl Supertable {
                         }
                     }
                 }
-                Ok(None) => create_table_async(hidden_opts, None)
+                Ok(None) => create_table_async(hidden_opts, None, None)
                     .await
                     .ok()
                     .map(Arc::new),
@@ -320,13 +322,25 @@ impl Supertable {
                 }
             }
         }
-        let vector_index_table =
-            if let Some(hidden_opts) = build_vector_index_options(&options, None) {
-                Some(Arc::new(create_table_async(hidden_opts, None).await?))
+        let vector_index_storage_prefix = if options.vector_columns.is_empty() {
+            None
+        } else {
+            Some(generate_vector_index_storage_prefix())
+        };
+        let vector_index_table = if let Some(ref prefix) = vector_index_storage_prefix {
+            if let Some(hidden_opts) =
+                build_vector_index_options(&options, None, Some(prefix.as_str()))
+            {
+                Some(Arc::new(
+                    create_table_async(hidden_opts, None, Some(prefix.clone())).await?,
+                ))
             } else {
                 None
-            };
-        create_table_async(options, vector_index_table).await
+            }
+        } else {
+            None
+        };
+        create_table_async(options, vector_index_table, vector_index_storage_prefix).await
     }
 
     /// Re-read the manifest pointer from storage.
@@ -396,6 +410,12 @@ impl Supertable {
             tombstone_cache: self.inner.tombstone_cache.clone(),
             inner: Arc::clone(&self.inner),
         }
+    }
+    }
+
+    test_visible! {
+    fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
+        self.inner.vector_index_table.as_ref()
     }
     }
 
@@ -517,9 +537,23 @@ impl Supertable {
         }
         let cache = Arc::clone(cache);
         let manifest = self.inner.manifest.load_full();
+        let hidden_manifest = self
+            .inner
+            .vector_index_table
+            .as_ref()
+            .map(|hidden| hidden.inner.manifest.load_full());
         self.block_on_query(async move {
             for entry in manifest.superfiles.iter() {
-                cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+                if cache.is_cached(&entry.uri) {
+                    cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+                }
+            }
+            if let Some(hidden) = hidden_manifest {
+                for entry in hidden.superfiles.iter() {
+                    if cache.is_cached(&entry.uri) {
+                        cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+                    }
+                }
             }
             Ok(())
         })
@@ -573,22 +607,6 @@ impl Supertable {
             crate::supertable::wal::lease::DEFAULT_LEASE_DURATION,
         )
         .await
-    }
-
-    /// Sync-bridged version of [`run_recovery_sweep_once`]. Used
-    /// by [`Supertable::create`] to drive an open-time sweep
-    /// from a sync entry point. Same sync→async pattern the
-    /// writer's `persist_commit` uses: ride the ambient tokio
-    /// runtime when present, lazy-init the supertable's owned
-    /// runtime otherwise.
-    pub(crate) fn run_recovery_sweep_once_blocking(
-        &self,
-    ) -> Result<
-        crate::supertable::wal::recovery::RecoveryReport,
-        crate::supertable::wal::recovery::RecoveryError,
-    > {
-        let drive = self.run_recovery_sweep_once();
-        bridge_on_runtime(drive, &self.inner.query_runtime())
     }
 
     /// Operator hatch: run one GC sweep over this supertable's
@@ -773,16 +791,43 @@ fn train_global_centroids(
     ))
 }
 
-fn build_vector_index_options(
+pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
+    "_vector_index"
+}
+
+fn generate_vector_index_storage_prefix() -> String {
+    format!("_infino_{}_vector_index", uuid::Uuid::new_v4())
+}
+
+fn resolve_vector_index_storage_prefix(
     user_opts: &SupertableOptions,
     user_manifest: Option<&super::manifest::Manifest>,
-) -> Option<SupertableOptions> {
+    create_prefix: Option<&str>,
+) -> Option<String> {
     if user_opts.vector_columns.is_empty() {
         return None;
     }
+    if let Some(prefix) = create_prefix {
+        return Some(prefix.to_string());
+    }
+    if let Some(manifest) = user_manifest
+        && let Some(prefix) = manifest.vector_index_storage_prefix()
+    {
+        return Some(prefix.to_string());
+    }
+    Some(legacy_vector_index_storage_prefix().to_string())
+}
+
+fn build_vector_index_options(
+    user_opts: &SupertableOptions,
+    user_manifest: Option<&super::manifest::Manifest>,
+    create_prefix: Option<&str>,
+) -> Option<SupertableOptions> {
+    let storage_prefix =
+        resolve_vector_index_storage_prefix(user_opts, user_manifest, create_prefix)?;
     let storage = user_opts.storage.as_ref()?;
     let sub_storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
-        PrefixedStorageProvider::new(Arc::clone(storage), "_vector_index"),
+        PrefixedStorageProvider::new(Arc::clone(storage), storage_prefix.as_str()),
     );
     let mut fields: Vec<arrow_schema::FieldRef> = Vec::new();
     for vc in &user_opts.vector_columns {
@@ -805,7 +850,7 @@ fn build_vector_index_options(
         user_opts.tokenizer.clone(),
     )
     .ok()?;
-    hidden_opts = hidden_opts.with_storage(sub_storage);
+    hidden_opts = hidden_opts.with_storage(Arc::clone(&sub_storage));
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
@@ -858,9 +903,13 @@ async fn build_handle(
 async fn create_table_async(
     options: SupertableOptions,
     vector_index_table: Option<Arc<Supertable>>,
+    vector_index_storage_prefix: Option<String>,
 ) -> Result<Supertable, OpenError> {
     let options = Arc::new(options);
-    let manifest = Arc::new(Manifest::empty(options.clone()));
+    let manifest = Arc::new(Manifest::empty_with_vector_index_prefix(
+        options.clone(),
+        vector_index_storage_prefix,
+    ));
     build_handle(options, manifest, vector_index_table).await
 }
 
@@ -1470,6 +1519,7 @@ mod tests {
             .expect("vector search");
         assert!(!hits.is_empty(), "search should find committed vectors");
     }
+
 
     /// A storage-backed handle under `Consistency::Strong` drives
     /// `ensure_fresh`'s Strong arm, which calls `refresh`. With no

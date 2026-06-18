@@ -313,6 +313,10 @@ impl StorageProvider for PrefixedStorageProvider {
         self.inner.get_range(&self.prefixed(uri), range).await
     }
 
+    async fn tail(&self, uri: &str, len: u64) -> Result<(bytes::Bytes, u64), StorageError> {
+        self.inner.tail(&self.prefixed(uri), len).await
+    }
+
     async fn put_atomic(
         &self,
         uri: &str,

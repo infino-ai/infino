@@ -994,14 +994,13 @@ pub mod vector {
                 );
                 let _ = consumer
                     .reader()
-                    .vector_search(
+                    .vector_hits(
                         supertable::VEC_COLUMN,
                         &q_cal[0],
                         TOP_K,
                         exec_vec::search_opts(nprobe, rerank),
-                        None,
                     )
-                    .expect("warm prewarm vector_search");
+                    .expect("warm prewarm vector_hits");
                 consumer
                     .wait_until_warm(Duration::from_secs(600))
                     .expect("supertable warm promotion");

@@ -529,6 +529,51 @@ impl SupertableWriter {
         Ok(())
     }
 
+    /// Dual-write helper for the hidden vector-index supertable: buffer one
+    /// shard batch using the user table's stable row ids instead of minting
+    /// new ones so global-index hits can map back to user superfiles.
+    pub(crate) fn append_dual_write_batch(
+        &mut self,
+        ids: &Decimal128Array,
+        vectors: &[Arc<Float32Array>],
+    ) -> Result<(), BuildError> {
+        let options = &self.inner.options;
+        let n_rows = ids.len();
+        if n_rows == 0 {
+            return Ok(());
+        }
+        if vectors.len() != options.vector_columns.len() {
+            return Err(BuildError::BatchSchemaMismatch);
+        }
+        let id_array = ids
+            .clone()
+            .with_precision_and_scale(
+                crate::supertable::options::DECIMAL128_PRECISION,
+                crate::supertable::options::DECIMAL128_SCALE,
+            )
+            .expect(
+                "invariant: precision 38 + scale 0 always valid \
+                 for any i128 payload",
+            );
+        let scalar = RecordBatch::try_new(
+            options.scalar_schema(),
+            vec![Arc::new(id_array) as ArrayRef],
+        )
+        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        let bytes = scalar.get_array_memory_size()
+            + vectors
+                .iter()
+                .map(|v| v.len() * std::mem::size_of::<f32>())
+                .sum::<usize>();
+        self.buffer.push(BufferedBatch {
+            scalar,
+            vectors: vectors.to_vec(),
+        });
+        self.buffer_bytes += bytes;
+        Ok(())
+    }
+
+
     /// Buffer a delete operation. Every row whose `_id`
     /// matches `predicate` at call time will be tombstoned by
     /// the next [`commit`] call.
@@ -991,35 +1036,15 @@ impl SupertableWriter {
         let hidden_join = if let Some(vit) = self.inner.vector_index_table.as_ref()
             && let Ok(mut vw) = vit.writer()
         {
-            let hidden_schema = vit.options().schema.clone();
-            let vector_columns = self.inner.options.vector_columns.clone();
-            let mut batches = Vec::new();
             for batch in &buffer {
-                let mut cols: Vec<arrow_array::ArrayRef> = Vec::new();
-                for (vi, vc) in vector_columns.iter().enumerate() {
-                    let flat = Arc::clone(&batch.vectors[vi]);
-                    let list = FixedSizeListArray::new(
-                        Arc::new(arrow_schema::Field::new(
-                            "item",
-                            arrow_schema::DataType::Float32,
-                            true,
-                        )),
-                        vc.dim as i32,
-                        flat,
-                        None,
+                let Some(ids) = batch.scalar.column(0).as_any().downcast_ref::<Decimal128Array>()
+                else {
+                    tracing::warn!(
+                        "supertable: hidden vector-index dual-write missing _id column"
                     );
-                    cols.push(Arc::new(list));
-                }
-                match RecordBatch::try_new(hidden_schema.clone(), cols) {
-                    Ok(rb) => batches.push(rb),
-                    Err(e) => {
-                        tracing::warn!("supertable: hidden vector-index batch build failed: {e}")
-                    }
-                }
-            }
-            // Append all batches, then spawn the commit in background.
-            for rb in batches {
-                if let Err(e) = vw.append(&rb) {
+                    continue;
+                };
+                if let Err(e) = vw.append_dual_write_batch(ids, &batch.vectors) {
                     tracing::warn!(
                         "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
                     );

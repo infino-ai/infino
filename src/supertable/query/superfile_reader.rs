@@ -70,14 +70,14 @@ pub async fn superfile_reader(
 
     // 2. Disk cache fallback (when attached).
     if let Some(cache) = disk_cache {
-        match cache.reader_with_hints(uri, offsets).await {
+        match cache.reader_with_hints(uri, offsets, storage).await {
             Ok(reader) => return Ok(reader),
             // Cache can't admit this superfile (e.g. it's larger than the
             // whole budget). Stream it directly via range GETs instead
             // of failing the query.
             Err(DiskCacheError::BudgetExceeded) => {
                 return cache
-                    .open_range_only(uri, offsets)
+                    .open_range_only(uri, offsets, storage)
                     .await
                     .map_err(cache_open_failed);
             }

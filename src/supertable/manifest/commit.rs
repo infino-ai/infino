@@ -667,6 +667,7 @@ mod tests {
                 column: "_id".into(),
                 granularity_secs: 86_400,
             },
+            vector_index_storage_prefix: None,
             parts: Vec::new(),
         };
         let res = write_manifest_list(storage.as_ref(), &list)

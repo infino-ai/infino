@@ -108,6 +108,9 @@ pub struct SuperfileList {
     /// is what makes the copy-on-write per-commit construction
     /// cheap.
     pub superfiles: Vec<Arc<SuperfileEntry>>,
+    /// Hidden vector-index sibling prefix. Set at create before the
+    /// first manifest list is persisted; cleared once loaded from list.
+    pub(crate) vector_index_storage_prefix: Option<String>,
 }
 
 impl SuperfileList {
@@ -117,6 +120,19 @@ impl SuperfileList {
             manifest_id: 0,
             options,
             superfiles: Vec::new(),
+            vector_index_storage_prefix: None,
+        }
+    }
+
+    pub(crate) fn empty_with_vector_index_prefix(
+        options: Arc<SupertableOptions>,
+        vector_index_storage_prefix: Option<String>,
+    ) -> Self {
+        Self {
+            manifest_id: 0,
+            options,
+            superfiles: Vec::new(),
+            vector_index_storage_prefix,
         }
     }
 
@@ -130,6 +146,7 @@ impl SuperfileList {
             manifest_id: self.manifest_id + 1,
             options: self.options.clone(),
             superfiles,
+            vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
         }
     }
 
@@ -205,6 +222,7 @@ impl Manifest {
             manifest_id,
             options,
             superfiles: superfile_list,
+            vector_index_storage_prefix: None,
         };
         if let Some(storage) = storage
             && let Some(list) = list
@@ -245,6 +263,21 @@ impl Manifest {
         }
     }
 
+    pub(crate) fn empty_with_vector_index_prefix(
+        options: Arc<SupertableOptions>,
+        vector_index_storage_prefix: Option<String>,
+    ) -> Self {
+        Self {
+            superfile_list: SuperfileList::empty_with_vector_index_prefix(
+                options,
+                vector_index_storage_prefix,
+            ),
+            list: None,
+            parts: dashmap::DashMap::new(),
+            loader: None,
+        }
+    }
+
     pub fn get_manifest_id(&self) -> u64 {
         self.superfile_list.manifest_id
     }
@@ -274,6 +307,30 @@ impl Manifest {
 
     pub fn is_in_process_only(&self) -> bool {
         self.list.is_none()
+    }
+
+    pub(crate) fn vector_index_storage_prefix(&self) -> Option<&str> {
+        if let Some(list) = self.list.as_ref()
+            && let Some(prefix) = list.vector_index_storage_prefix.as_deref()
+        {
+            return Some(prefix);
+        }
+        self.superfile_list
+            .vector_index_storage_prefix
+            .as_deref()
+    }
+
+    fn stamp_vector_index_storage_prefix(
+        &self,
+        vector_columns: &[list::VectorColumnInfo],
+    ) -> Option<String> {
+        if vector_columns.is_empty() {
+            return None;
+        }
+        if let Some(prefix) = self.vector_index_storage_prefix() {
+            return Some(prefix.to_string());
+        }
+        Some("_vector_index".to_string())
     }
 
     pub fn get_cached_part_by_id(&self, part_id: &part::PartId) -> Option<Arc<part::ManifestPart>> {
@@ -825,6 +882,17 @@ impl Manifest {
             opts.as_ref(),
             &strategy,
         );
+        let vector_columns: Vec<list::VectorColumnInfo> = opts
+            .vector_columns
+            .iter()
+            .map(|v| list::VectorColumnInfo {
+                column: v.column.clone(),
+                dim: v.dim,
+                n_cent: v.n_cent,
+                rot_seed: v.rot_seed,
+                metric: format!("{:?}", v.metric).to_lowercase(),
+            })
+            .collect();
         let new_list = ManifestList {
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
@@ -834,22 +902,14 @@ impl Manifest {
             fts_columns: opts
                 .fts_columns
                 .iter()
-                .map(|f| crate::supertable::manifest::list::FtsColumnInfo {
+                .map(|f| list::FtsColumnInfo {
                     column: f.column.clone(),
                 })
                 .collect(),
-            vector_columns: opts
-                .vector_columns
-                .iter()
-                .map(|v| crate::supertable::manifest::list::VectorColumnInfo {
-                    column: v.column.clone(),
-                    dim: v.dim,
-                    n_cent: v.n_cent,
-                    rot_seed: v.rot_seed,
-                    metric: format!("{:?}", v.metric).to_lowercase(),
-                })
-                .collect(),
+            vector_columns: vector_columns.clone(),
             partition_strategy: strategy,
+            vector_index_storage_prefix: self
+                .stamp_vector_index_storage_prefix(&vector_columns),
             parts: out_list_entries_after_removal,
         };
 
@@ -869,6 +929,7 @@ impl Manifest {
             manifest_id: self.get_next_manifest_id(),
             options: self.get_opts(),
             superfiles: new_superfile_list,
+            vector_index_storage_prefix: None,
         };
         let loader = opts
             .storage
@@ -2648,6 +2709,7 @@ mod tests {
                     column: "doc_id".into(),
                     n_buckets: 64,
                 },
+                vector_index_storage_prefix: None,
                 parts: entries,
             }
         }
@@ -2877,6 +2939,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![list::ManifestListEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -3259,6 +3322,7 @@ mod tests {
                     column: "_id".into(),
                     n_buckets: 1,
                 },
+                vector_index_storage_prefix: None,
                 parts: vec![],
             }),
             parts: dashmap::DashMap::new(),
@@ -3352,6 +3416,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3378,6 +3443,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![old_superfile],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts,
@@ -3443,6 +3509,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3469,6 +3536,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts,
@@ -3535,6 +3603,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3561,6 +3630,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts,
@@ -3664,6 +3734,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_old.part_id,
@@ -3705,6 +3776,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_old, sf_latest],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts,
@@ -3790,6 +3862,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 2,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_a.part_id,
@@ -3834,6 +3907,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a, sf_b],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -3918,6 +3992,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 2,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_a.part_id,
@@ -3962,6 +4037,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a, sf_b],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4067,6 +4143,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 2,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_a_old.part_id,
@@ -4137,6 +4214,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a_old, sf_a_latest, sf_b_old, sf_b_latest],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4220,6 +4298,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4245,6 +4324,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_keep.clone(), sf_remove.clone()],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4308,6 +4388,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4333,6 +4414,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_keep.clone(), sf_remove.clone()],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4412,6 +4494,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 2,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_a.part_id,
@@ -4456,6 +4539,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a_keep.clone(), sf_a_remove.clone(), sf_b.clone()],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4547,6 +4631,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_a_old.part_id,
@@ -4595,6 +4680,7 @@ mod tests {
                     sf_a_latest_keep.clone(),
                     sf_a_latest_remove.clone(),
                 ],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4676,6 +4762,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4701,6 +4788,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1.clone(), sf2.clone()],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4755,6 +4843,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4780,6 +4869,7 @@ mod tests {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1.clone(), sf2.clone()],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4869,6 +4959,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 ManifestListEntry {
                     part_id: pw_a_old.part_id,
@@ -4917,6 +5008,7 @@ mod tests {
                     sf_a_old_remove.clone(),
                     sf_a_latest.clone(),
                 ],
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
@@ -4994,6 +5086,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts,
         }
     }

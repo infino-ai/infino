@@ -125,6 +125,117 @@ fn filter_superfiles_by_cells(
         .collect()
 }
 
+
+/// Whether every hit already references a superfile in the user manifest.
+fn hits_reference_user_superfiles(reader: &SupertableReader, hits: &[SuperfileHit]) -> bool {
+    let manifest = reader.manifest();
+    hits.iter().all(|hit| {
+        manifest
+            .superfiles
+            .iter()
+            .any(|entry| entry.uri == hit.superfile)
+    })
+}
+
+/// Resolve a stable row id from manifest span arithmetic when the superfile
+/// body stores rows in contiguous id order.
+fn row_id_from_manifest_entry(entry: &SuperfileEntry, local_doc_id: u32) -> Option<i128> {
+    let n_docs = i128::from(entry.n_docs);
+    let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
+    if n_docs == 0 || span != n_docs {
+        return None;
+    }
+    Some(entry.id_min + i128::from(local_doc_id))
+}
+
+/// Map hidden-index `(superfile, local_doc_id)` hits to user-table hits
+/// using aligned `_id` values stamped during dual-write.
+async fn remap_hidden_hits_to_user_hits(
+    user_reader: &SupertableReader,
+    hidden_hits: &[SuperfileHit],
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    if hidden_hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vit = user_reader
+        .vector_index_table()
+        .ok_or_else(|| QueryError::Execute("hidden vector index missing".into()))?;
+    let vit_reader = vit.reader();
+    let hidden_manifest = vit_reader.manifest();
+    let user_manifest = user_reader.manifest();
+    let id_column = user_reader.options().id_column.as_str();
+
+    let mut remapped = Vec::with_capacity(hidden_hits.len());
+    for hit in hidden_hits {
+        let hidden_entry = hidden_manifest
+            .superfiles
+            .iter()
+            .find(|e| e.uri == hit.superfile)
+            .ok_or_else(|| {
+                QueryError::Execute(format!(
+                    "hidden superfile {:?} missing from manifest",
+                    hit.superfile
+                ))
+            })?;
+
+        let user_row_id = if let Some(id) =
+            row_id_from_manifest_entry(hidden_entry, hit.local_doc_id)
+        {
+            id
+        } else {
+            let store = Arc::clone(&hidden_manifest.options.store);
+            let disk_cache = hidden_manifest.options.disk_cache.as_ref().map(Arc::clone);
+            let storage = hidden_manifest.options.storage.as_ref().map(Arc::clone);
+            let sf = super::dispatch::open_reader(
+                &store,
+                disk_cache.as_ref(),
+                storage.as_ref(),
+                hidden_entry,
+            )
+            .await?;
+            let batch = sf
+                .take_by_local_doc_ids(&[hit.local_doc_id], &[id_column])
+                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .ok_or_else(|| QueryError::Execute("hidden _id column missing".into()))?;
+            col.value(0)
+        };
+
+        let user_entry = user_manifest
+            .superfiles
+            .iter()
+            .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
+            .ok_or_else(|| {
+                QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
+            })?;
+        let n_docs = i128::from(user_entry.n_docs);
+        let span = user_entry
+            .id_max
+            .checked_sub(user_entry.id_min)
+            .and_then(|d| d.checked_add(1))
+            .ok_or_else(|| QueryError::Execute("user id span overflow".into()))?;
+        if n_docs == 0 || span != n_docs {
+            return Err(QueryError::Execute(
+                "user superfile id span mismatch".into(),
+            ));
+        }
+        let local_doc_id = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
+            QueryError::Execute(format!(
+                "local_doc_id out of range for id {user_row_id}"
+            ))
+        })?;
+        remapped.push(SuperfileHit {
+            superfile: user_entry.uri,
+            local_doc_id,
+            score: hit.score,
+        });
+    }
+    Ok(remapped)
+}
+
 impl SupertableReader {
     /// Global cross-superfile cluster selection + waved fan-out. Shared
     /// by the user-table path and the hidden vector-index path.
@@ -222,23 +333,10 @@ impl SupertableReader {
         Ok(top_k_ascending(per_superfile, k))
     }
 
-    /// Single-column vector kNN search across the pinned
-    /// manifest's superfiles.
-    ///
-    /// Returns up to `k` lowest-distance hits, sorted ascending.
-    /// `query` must match the column's declared `dim`.
-    ///
-    /// `options` (see [`VectorSearchOptions`]) controls per-
-    /// superfile recall-vs-latency knobs (`nprobe`, `rerank_mult`).
-    /// Defaults recover ≥0.9 recall@10 on typical IVF setups.
-    ///
-    /// Empty supertable (no superfiles) and `k == 0` short-circuit
-    /// to an empty `Vec`.
-    ///
-    /// `pub(crate)` async kernel — the public surface is the sync
-    /// [`SupertableReader::vector_search`], which drives this via the
-    /// sync→async bridge.
-    pub(crate) async fn vector_search_async(
+    /// User-table vector kNN: manifest prune on the user snapshot, then
+    /// fan-out at the user storage prefix. Used by hybrid search and any
+    /// filtered vector path.
+    pub(crate) async fn vector_search_user_table_async(
         &self,
         column: &str,
         query: &[f32],
@@ -253,13 +351,33 @@ impl SupertableReader {
             .get_pruned_superfiles_for_vector(column, query)
             .await
             .map_err(QueryError::ManifestLoad)?;
-
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
+        let metric = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .map(|vc| vc.metric)
+            .unwrap_or(Metric::L2Sq);
+        self.fanout_vector_clusters(&superfiles, column, query, k, metric, options)
+            .await
+    }
 
-        // Route unfiltered queries through the hidden vector-index supertable
-        // when present, narrowed to the nearest cell partitions.
+    /// Global-index vector kNN: hidden manifest + cell filter + fan-out at
+    /// the hidden storage prefix. Falls back to the user table when the
+    /// hidden index is absent or empty.
+    pub(crate) async fn vector_search_global_index_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         if let Some(vit) = self.vector_index_table() {
             let vit_reader = vit.reader();
             let vit_manifest = vit_reader.manifest();
@@ -286,24 +404,34 @@ impl SupertableReader {
                     }
                     _ => vit_manifest.superfiles.to_vec(),
                 };
-                if cell_superfiles.is_empty() {
-                    return Ok(Vec::new());
+                if !cell_superfiles.is_empty() {
+                    return vit_reader
+                        .fanout_vector_clusters(
+                            &cell_superfiles,
+                            column,
+                            query,
+                            k,
+                            vit_metric,
+                            options,
+                        )
+                        .await;
                 }
-                return vit_reader
-                    .fanout_vector_clusters(&cell_superfiles, column, query, k, vit_metric, options)
-                    .await;
             }
         }
+        self.vector_search_user_table_async(column, query, k, options)
+            .await
+    }
 
-        let metric = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| vc.metric)
-            .unwrap_or(Metric::L2Sq);
-
-        self.fanout_vector_clusters(&superfiles, column, query, k, metric, options)
+    /// Default async vector kernel — routes through the global hidden index
+    /// when present (`vector_hits`, bare `vector_search` TVF).
+    pub(crate) async fn vector_search_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.vector_search_global_index_async(column, query, k, options)
             .await
     }
 }
@@ -326,7 +454,14 @@ impl SupertableReader {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
-            let hits = self.vector_search_async(column, query, k, options).await?;
+            let hits = self
+                .vector_search_global_index_async(column, query, k, options)
+                .await?;
+            let hits = if hits_reference_user_superfiles(self, &hits) {
+                hits
+            } else {
+                remap_hidden_hits_to_user_hits(self, &hits).await?
+            };
             // `projection` selects output columns by name (`_id`, the
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
@@ -945,4 +1080,81 @@ mod tests {
         .expect("filter");
         assert_eq!(hits, original);
     }
+    #[test]
+    fn hybrid_vector_leg_uses_user_superfiles_not_hidden() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
+            crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"),
+        );
+        let opts = opts.with_storage(storage);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 32, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let reader = st.reader();
+        let user_uris: std::collections::HashSet<_> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.uri)
+            .collect();
+        assert!(
+            reader.vector_index_table().is_some(),
+            "hidden index must exist"
+        );
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = reader
+            .hybrid_search(
+                "title",
+                "doc",
+                crate::superfile::fts::reader::BoolMode::Or,
+                "emb",
+                &q,
+                VectorSearchOptions::new(),
+                5,
+            )
+            .expect("hybrid");
+        assert!(!hits.is_empty());
+        for hit in &hits {
+            assert!(
+                user_uris.contains(&hit.superfile),
+                "hybrid vector leg must fan out on user superfiles, got {:?}",
+                hit.superfile
+            );
+        }
+    }
+
+    #[test]
+    fn vector_search_row_return_resolves_through_hidden_index() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
+            crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"),
+        );
+        let opts = opts.with_storage(storage);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let batches = st
+            .reader()
+            .vector_search("emb", &q, 5, VectorSearchOptions::new(), Some(&["_id", "score"]))
+            .expect("vector_search rows");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(rows >= 1, "row-returning vector_search must resolve user rows");
+    }
+
 }

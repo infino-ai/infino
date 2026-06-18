@@ -123,7 +123,7 @@ impl SupertableReader {
         // inherits its own manifest skip and returns hits best-first.
         let (bm25_res, vector_res) = futures::future::join(
             self.bm25_search_async(text_col, q_text, k, mode),
-            self.vector_search_async(vec_col, q_vec, k, options),
+            self.vector_search_user_table_async(vec_col, q_vec, k, options),
         )
         .await;
         Ok(rrf_fuse(&bm25_res?, &vector_res?, k))
