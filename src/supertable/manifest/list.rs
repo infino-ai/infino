@@ -28,6 +28,7 @@ use thiserror::Error;
 use super::bloom::Bloom;
 use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
 use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
+use super::term_range::prefix_overlaps_range;
 
 /// Wire format version for the manifest list.
 ///
@@ -414,6 +415,113 @@ impl PartialEq for FtsSummaryAgg {
             && self.n_terms_distinct == other.n_terms_distinct
             && self.term_range == other.term_range
     }
+}
+
+impl FtsSummaryAgg {
+    /// Merge `other` into `self` — the union the part-level aggregate forms
+    /// across a part's superfiles:
+    ///
+    /// - **bloom**: bit-OR of the two filters (a term in either is in the
+    ///   union). Both must share a shape; a mismatch can't be unioned soundly,
+    ///   so the merged bloom drops to `None`.
+    /// - **term range**: widened to span both — `(min(mins), max(maxes))` lex.
+    /// - **distinct count**: a deferred planner hint; takes the larger side.
+    ///
+    /// **`None` is the identity here** (an empty contributor that leaves the
+    /// other side intact) — what a fold from [`Default::default`] over
+    /// per-superfile summaries needs, since every superfile carries a bloom
+    /// ([`from_superfile`] always yields `Some`). This is deliberately
+    /// *distinct* from the prune-time reading of `term_bloom: None` as "no
+    /// info / always-keep": a sound union of a known bloom with a genuinely
+    /// unknown one is unknown (`None`), so `merge` must only be folded over
+    /// summaries that carry real blooms — never over a true no-info summary.
+    ///
+    /// Folding `merge` over a part's superfiles yields the same bloom-union and
+    /// range-union as [`crate::supertable::manifest::aggregates`]'s rollup; the
+    /// `n_terms_distinct` hint differs (here the larger side, vs. the rollup's
+    /// current placeholder `0`).
+    ///
+    /// [`from_superfile`]: FtsSummaryAgg::from_superfile
+    pub fn merge(&mut self, other: &FtsSummaryAgg) {
+        self.term_bloom = match (self.term_bloom.take(), other.term_bloom.as_ref()) {
+            (Some(a), Some(b)) => union_blooms(&a, b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+        self.term_range = match (self.term_range.take(), other.term_range.as_ref()) {
+            (Some((amin, amax)), Some((bmin, bmax))) => {
+                let min = if &amin <= bmin { amin } else { bmin.clone() };
+                let max = if &amax >= bmax { amax } else { bmax.clone() };
+                Some((min, max))
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+        self.n_terms_distinct = self.n_terms_distinct.max(other.n_terms_distinct);
+    }
+
+    /// Build the per-superfile summary for one column from its freshly-built
+    /// bloom, distinct-term count, and `(min, max)` lex term range.
+    ///
+    /// Adapts the per-superfile shape to this type: the bloom is always
+    /// present (`Some`); the count widens `u32` → `u64`; and an empty
+    /// `(min, max)` range (a 0-term column) becomes `None` — the same
+    /// "no range" signal the pruner already understands.
+    pub fn new_with_params(
+        term_bloom: Bloom,
+        n_terms_distinct: u32,
+        term_range: (Vec<u8>, Vec<u8>),
+    ) -> Self {
+        let term_range = if term_range.0.is_empty() && term_range.1.is_empty() {
+            None
+        } else {
+            Some(term_range)
+        };
+        Self {
+            term_bloom: Some(term_bloom),
+            n_terms_distinct: u64::from(n_terms_distinct),
+            term_range,
+        }
+    }
+
+    /// Whether this summary's bloom *may* contain `term` (a `false` is
+    /// definitive: the term is absent). A `None` bloom is "no info", so it
+    /// conservatively returns `true` (keep). This is the per-term primitive
+    /// both the superfile-level (`fts_bloom_skip`) and list-level
+    /// (`part_matches_terms`) bloom skips build on.
+    pub fn may_contain(&self, term: &[u8]) -> bool {
+        self.term_bloom.as_ref().is_none_or(|b| b.contains(term))
+    }
+
+    /// Whether this summary's lex term range *could* contain a term starting
+    /// with `prefix` (i.e. `[prefix, prefix_upper_bound)` overlaps the range).
+    /// A `None` range means the FST was empty for this column — nothing
+    /// matches, so this returns `false` (prune). The per-term-range primitive
+    /// both the superfile-level (`fts_prefix_skip`) and list-level
+    /// (`part_overlaps_prefix`) prefix skips build on.
+    pub fn may_match_prefix(&self, prefix: &[u8]) -> bool {
+        match self.term_range.as_ref() {
+            Some((min, max)) => prefix_overlaps_range(prefix, min, max),
+            None => false,
+        }
+    }
+}
+
+/// Bit-OR two same-shape blooms into their union. Different shapes can't be
+/// unioned (the block layout differs), so this returns `None` — "no bloom
+/// info", which the list-level pruner treats as always-keep.
+fn union_blooms(a: &Bloom, b: &Bloom) -> Option<Bloom> {
+    let mut ab = a.to_bytes();
+    let bb = b.to_bytes();
+    if ab.len() != bb.len() {
+        return None;
+    }
+    for (x, y) in ab.iter_mut().zip(bb.iter()) {
+        *x |= *y;
+    }
+    Bloom::from_bytes(&ab)
 }
 
 /// Aggregate vector summary across a part's superfiles —
@@ -1620,6 +1728,121 @@ mod tests {
         assert!(title_agg.get("term_range_union").is_some());
         assert!(s.contains("\"term_bloom_union\""));
         let _ = decode(&bytes).expect("decode still works");
+    }
+
+    fn fts_agg(terms: &[&[u8]], n_blocks: usize, range: Option<(&[u8], &[u8])>) -> FtsSummaryAgg {
+        let mut b = BloomBuilder::with_n_blocks(n_blocks);
+        for t in terms {
+            b.insert(t);
+        }
+        FtsSummaryAgg {
+            term_bloom: Some(b.finish()),
+            n_terms_distinct: terms.len() as u64,
+            term_range: range.map(|(mn, mx)| (mn.to_vec(), mx.to_vec())),
+        }
+    }
+
+    #[test]
+    fn fts_agg_merge_unions_blooms_widens_range_and_takes_max_distinct() {
+        let mut a = fts_agg(&[b"alpha"], 16, Some((b"alpha", b"mango")));
+        a.n_terms_distinct = 3;
+        let b = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
+        // b.n_terms_distinct == 1 (one term)
+        a.merge(&b);
+
+        let bloom = a.term_bloom.as_ref().expect("union bloom");
+        assert!(
+            bloom.contains(b"alpha"),
+            "term from self survives the union"
+        );
+        assert!(bloom.contains(b"omega"), "term from other joins the union");
+        // Range widened to span both: (min(alpha,beta), max(mango,zulu)).
+        assert_eq!(a.term_range, Some((b"alpha".to_vec(), b"zulu".to_vec())));
+        assert_eq!(a.n_terms_distinct, 3, "distinct hint takes the larger side");
+    }
+
+    #[test]
+    fn fts_agg_merge_none_side_contributes_nothing() {
+        // Some.merge(None) keeps self untouched.
+        let mut a = fts_agg(&[b"x"], 16, Some((b"a", b"m")));
+        a.merge(&FtsSummaryAgg::default());
+        assert!(a.term_bloom.as_ref().expect("kept").contains(b"x"));
+        assert_eq!(a.term_range, Some((b"a".to_vec(), b"m".to_vec())));
+
+        // None.merge(Some) adopts the other side.
+        let mut none_side = FtsSummaryAgg::default();
+        none_side.merge(&fts_agg(&[b"y"], 16, Some((b"n", b"z"))));
+        assert!(none_side.term_bloom.as_ref().expect("taken").contains(b"y"));
+        assert_eq!(none_side.term_range, Some((b"n".to_vec(), b"z".to_vec())));
+    }
+
+    #[test]
+    fn fts_agg_merge_bloom_shape_mismatch_drops_to_none() {
+        // Different block counts can't be unioned → conservative "no info".
+        let mut a = fts_agg(&[b"a"], 16, None);
+        let b = fts_agg(&[b"b"], 8, None);
+        a.merge(&b);
+        assert!(
+            a.term_bloom.is_none(),
+            "shape mismatch → no bloom info (always-keep)"
+        );
+    }
+
+    #[test]
+    fn fts_agg_from_superfile_adapts_per_superfile_shape() {
+        let mut b = BloomBuilder::with_n_blocks(16);
+        b.insert(b"alpha");
+        let agg = FtsSummaryAgg::new_with_params(b.finish(), 7, (b"a".to_vec(), b"z".to_vec()));
+        assert!(
+            agg.term_bloom
+                .as_ref()
+                .expect("bloom present")
+                .contains(b"alpha")
+        );
+        assert_eq!(agg.n_terms_distinct, 7u64); // u32 → u64
+        assert_eq!(agg.term_range, Some((b"a".to_vec(), b"z".to_vec())));
+
+        // A 0-term column: empty (min, max) → `None` range, but a built bloom
+        // is still present.
+        let empty = FtsSummaryAgg::new_with_params(
+            BloomBuilder::with_n_blocks(16).finish(),
+            0,
+            (Vec::new(), Vec::new()),
+        );
+        assert_eq!(empty.term_range, None);
+        assert!(empty.term_bloom.is_some());
+    }
+
+    #[test]
+    fn fts_agg_may_contain() {
+        let mut b = BloomBuilder::with_n_blocks(16);
+        b.insert(b"present");
+        let agg = FtsSummaryAgg {
+            term_bloom: Some(b.finish()),
+            n_terms_distinct: 1,
+            term_range: None,
+        };
+        assert!(agg.may_contain(b"present"));
+        assert!(!agg.may_contain(b"definitely-absent-term"));
+        // No bloom info → conservatively keep.
+        assert!(FtsSummaryAgg::default().may_contain(b"anything"));
+    }
+
+    #[test]
+    fn fts_agg_may_match_prefix() {
+        let agg = FtsSummaryAgg {
+            term_bloom: None,
+            n_terms_distinct: 0,
+            term_range: Some((b"bravo".to_vec(), b"mango".to_vec())),
+        };
+        assert!(
+            agg.may_match_prefix(b"echo"),
+            "prefix inside [bravo, mango]"
+        );
+        assert!(!agg.may_match_prefix(b"zulu"), "above max → no overlap");
+        assert!(!agg.may_match_prefix(b"alpha"), "below min → no overlap");
+        // No range (empty FST) → nothing matches → prune.
+        assert!(!FtsSummaryAgg::default().may_match_prefix(b"echo"));
     }
 
     #[test]
