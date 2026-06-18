@@ -29,7 +29,7 @@ use pyo3::types::{PyDict, PyList};
 
 use infino::{
     BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, InfinoError, Metric,
-    OptimizeError, OptimizeOptions, VectorSearchOptions,
+    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 
 /// Map a core [`InfinoError`] to the closest Python exception.
@@ -363,7 +363,14 @@ impl Table {
     /// smaller is nearer); omitting it returns the engine-native
     /// `_id` + `score` pair with no scalar decode. Materializing row
     /// data is an explicit opt-in by naming columns.
-    #[pyo3(signature = (column, query, k, nprobe=None, projection=None))]
+    ///
+    /// Pass `filter_column` and `filter_query` together to restrict the
+    /// search to rows whose (FTS-indexed) `filter_column` matches the
+    /// query terms — a pushdown pre-filter, so kNN ranks only among the
+    /// matching rows rather than post-filtering the global top-`k`.
+    /// `filter_mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
         &self,
         py: Python<'py>,
@@ -371,16 +378,42 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
+        filter_column: Option<String>,
+        filter_query: Option<String>,
+        filter_mode: Option<&str>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
+        // Optional text-predicate filter (pushdown). `filter_column` and
+        // `filter_query` must be supplied together; `filter_mode` is only
+        // meaningful alongside them (a lone `filter_mode` is rejected rather
+        // than silently ignored, so an invalid value never passes unnoticed).
+        let filter = match (filter_column.as_deref(), filter_query.as_deref(), filter_mode) {
+            (Some(col), Some(q), mode) => Some(VectorFilter {
+                column: col,
+                query: q,
+                mode: parse_mode(mode)?,
+            }),
+            (None, None, None) => None,
+            (None, None, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "filter_mode requires filter_column and filter_query",
+                ));
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "filter_column and filter_query must be provided together",
+                ));
+            }
+        };
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.vector_search(column, &query, k, opts, None, names.as_deref())
+                self.inner
+                    .vector_search(column, &query, k, opts, filter, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)

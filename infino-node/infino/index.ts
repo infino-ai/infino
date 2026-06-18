@@ -69,6 +69,17 @@ export interface Bm25SearchOptions {
   projection?: string[];
   arrow?: boolean;
 }
+/** Text-predicate filter for `vectorSearch` (a pushdown pre-filter, not a
+ * post-filter): kNN ranks only among rows whose FTS-indexed `column` matches
+ * `query`. */
+export interface VectorFilter {
+  /** FTS-indexed column the predicate applies to. */
+  column: string;
+  /** Query terms, tokenized by the index tokenizer. */
+  query: string;
+  /** `"or"` (default) or `"and"`. */
+  mode?: BoolMode;
+}
 export interface VectorSearchOptions {
   /** IVF partitions to probe (higher = better recall, more work). */
   nprobe?: number;
@@ -76,6 +87,8 @@ export interface VectorSearchOptions {
   rerankMult?: number;
   projection?: string[];
   arrow?: boolean;
+  /** Restrict the kNN to rows matching a text predicate (pushdown pre-filter). */
+  filter?: VectorFilter;
 }
 export interface TokenMatchOptions {
   mode?: BoolMode;
@@ -271,7 +284,7 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
-    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection);
+    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection, opts.filter);
     return decode(buf, opts.arrow);
   }
 

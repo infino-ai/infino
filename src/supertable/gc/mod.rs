@@ -86,7 +86,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::supertable::manifest::{Manifest, ScalarStatsTable, SuperfileEntry, SuperfileUri};
+    use crate::supertable::manifest::{Manifest, SuperfileEntry, SuperfileUri};
 
     fn opts() -> Arc<crate::supertable::SupertableOptions> {
         Arc::new(crate::test_helpers::default_supertable_options())
@@ -99,7 +99,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![],

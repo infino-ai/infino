@@ -87,9 +87,11 @@ docs.append([
     {"source": "blog",        "body": "Enable dark mode under Settings then Appearance.",        "embedding": embed(1)},
 ])
 
-# Three ways to retrieve context to ground the agent's next answer:
+# Retrieve context to ground the agent's next answer:
 keyword  = docs.bm25_search("body", "cancel subscription", 5)               # BM25
 semantic = docs.vector_search("embedding", embed(0), 5)                     # vector kNN
+# vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+filtered = docs.vector_search("embedding", embed(0), 5, filter_column="body", filter_query="billing")
 billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")  # SQL filter
 ```
 
@@ -118,9 +120,11 @@ docs.append([
   { source: "blog",        body: "Enable dark mode under Settings then Appearance.",        embedding: embed(1) },
 ]);
 
-// Three ways to retrieve context to ground the agent's next answer:
+// Retrieve context to ground the agent's next answer:
 const keyword  = docs.bm25Search("body", "cancel subscription", 5);            // BM25
 const semantic = docs.vectorSearch("embedding", embed(0), 5);                  // vector kNN
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+const filtered = docs.vectorSearch("embedding", embed(0), 5, { filter: { column: "body", query: "billing" } });
 const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'");  // SQL filter
 ```
 
@@ -131,7 +135,7 @@ use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{connect, BoolMode, IndexSpec, Metric, VectorSearchOptions};
+use infino::{connect, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions};
 
 // Tiny stand-in for your embedding model so this runs as-is — a 16-dim
 // one-hot by topic. Real embeddings are dense and higher-dimensional.
@@ -172,12 +176,18 @@ docs.append(&RecordBatch::try_new(
     ],
 )?)?;
 
-// Three ways to retrieve context to ground the agent's next answer:
+// Retrieve context to ground the agent's next answer:
 let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
 let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+let filtered = docs.vector_search(
+    "embedding", &embed(0), 5, VectorSearchOptions::new(),
+    Some(VectorFilter { column: "body", query: "billing", mode: BoolMode::Or }), None,
+)?;
 let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
 assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
 assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
+assert_eq!(filtered.iter().map(|b| b.num_rows()).sum::<usize>(), 1);  // vector + keyword filter
 assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL filter
 # Ok(())
 # }

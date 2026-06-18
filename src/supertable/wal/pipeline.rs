@@ -69,7 +69,7 @@ use crate::superfile::builder::SuperfileBuilder;
 use crate::supertable::handle::Supertable;
 use crate::supertable::manifest::bloom::BloomBuilder;
 use crate::supertable::manifest::{
-    FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary,
+    FtsSummary, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::utils::vector_split::split_vectors;
@@ -391,7 +391,7 @@ async fn do_apply(
     let fts_summary = build_fts_summary(&reader, &inner.options);
     let vector_summary = build_vector_summary(&reader, &inner.options);
     let scalar_stats =
-        ScalarStatsTable::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
+        ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
 
     let (id_min, id_max) = if flat_ids.is_empty() {
         (0, 0)

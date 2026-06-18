@@ -265,7 +265,7 @@ mod tests {
         FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
     };
     use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsTable, VectorSummary};
+    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, VectorSummary};
     use crate::supertable::{SuperfileEntry, SuperfileUri};
     use arrow_array::Int64Array;
     use std::collections::HashMap;
@@ -334,7 +334,7 @@ mod tests {
             n_docs: ((id_max - id_min) + 1) as u64,
             id_min,
             id_max,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: fts,
             vector_summary: vec_summary,
             partition_key: Vec::new(),
@@ -419,7 +419,7 @@ mod tests {
             n_docs: 5,
             id_min: 21,
             id_max: 25,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -452,7 +452,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -510,20 +510,17 @@ mod tests {
         use std::collections::HashMap as Map;
         fn make(id_min: i128, ts_lo: i64, ts_hi: i64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
-            let mut cols: Map<String, (arrow_array::ArrayRef, arrow_array::ArrayRef)> = Map::new();
+            let mut cols: Map<String, ScalarStatsAgg> = Map::new();
             let mn: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![ts_lo]));
             let mx: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
-            cols.insert("ts".into(), (mn, mx));
+            cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
                 id_min,
                 id_max: id_min,
-                scalar_stats: ScalarStatsTable {
-                    cols,
-                    ..Default::default()
-                },
+                scalar_stats: cols,
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -550,7 +547,7 @@ mod tests {
         use std::collections::HashMap as Map;
         fn make(id_lo: i128, id_hi: i128) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
-            let mut cols: Map<String, (arrow_array::ArrayRef, arrow_array::ArrayRef)> = Map::new();
+            let mut cols: Map<String, ScalarStatsAgg> = Map::new();
             let mn: arrow_array::ArrayRef = Arc::new(
                 arrow_array::Decimal128Array::from(vec![id_lo])
                     .with_precision_and_scale(38, 0)
@@ -561,17 +558,14 @@ mod tests {
                     .with_precision_and_scale(38, 0)
                     .expect("decimal128"),
             );
-            cols.insert("_id".into(), (mn, mx));
+            cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
                 id_min: id_lo,
                 id_max: id_hi,
-                scalar_stats: ScalarStatsTable {
-                    cols,
-                    ..Default::default()
-                },
+                scalar_stats: cols,
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),

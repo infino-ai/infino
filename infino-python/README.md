@@ -100,6 +100,16 @@ vecs.vector_search("emb", query_vector, k=10)              # query_vector: list[
 vecs.vector_search("emb", query_vector, k=10, nprobe=32)   # probe more partitions
 ```
 
+To restrict the kNN to rows matching a text predicate, pass `filter_column`
+and `filter_query` together (the column must be FTS-indexed) — a pushdown
+pre-filter, so results are the nearest *matching* rows, not a post-filter over
+the global top-k. `filter_mode` is `"or"` (default) or `"and"`:
+
+```python
+vecs.vector_search("emb", query_vector, k=10,
+                   filter_column="body", filter_query="cancel subscription")
+```
+
 ## SQL
 
 Run SQL across the catalog's tables for analytics and filtering. Results
@@ -215,7 +225,7 @@ db = infino.connect(
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
-  - `vector_search(column, query, k, nprobe=None, projection=None) -> pyarrow.Table`
+  - `vector_search(column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None) -> pyarrow.Table`
   - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`
   - `exact_match(column, value, projection=None) -> pyarrow.Table`
   - `delete(predicate) -> MutationStats`

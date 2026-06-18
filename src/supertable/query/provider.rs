@@ -15,7 +15,7 @@
 //!      `column <op> literal` conjuncts are lowered to
 //!      [`ScalarPredicate`]s and run through
 //!      [`scalar_skip`] against each superfile's persisted
-//!      `ScalarStatsTable` min/max. Definitely-irrelevant superfiles
+//!      `scalar_stats` min/max. Definitely-irrelevant superfiles
 //!      are dropped before any bytes are decoded. This is the same
 //!      manifest-level skip philosophy as `fts_bloom_skip` /
 //!      `vector_centroid_skip`.
@@ -435,7 +435,7 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// unknowable).
 fn scalar_null_count(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<u64> {
     entries.iter().try_fold(0u64, |acc, entry| {
-        acc.checked_add(*entry.scalar_stats.null_counts.get(name)?)
+        acc.checked_add(entry.scalar_stats.get(name)?.null_count?)
     })
 }
 
@@ -444,7 +444,7 @@ fn scalar_null_count(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<u64>
 fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
     for entry in entries {
-        let part = entry.scalar_stats.sums.get(name)?;
+        let part = entry.scalar_stats.get(name)?.sum.as_ref()?;
         acc = Some(match acc {
             None => Arc::clone(part),
             Some(total) => crate::supertable::manifest::add_sum_arrays(&total, part)?,
@@ -459,7 +459,7 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue
 fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     for entry in entries {
-        let sketch = HllSketch::from_bytes(entry.scalar_stats.hll.get(name)?)?;
+        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(name)?.hll.as_ref()?)?;
         merged = Some(match merged {
             None => sketch,
             Some(mut acc) => {
@@ -477,9 +477,9 @@ fn scalar_min_max(
 ) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
     for entry in entries {
-        let (min_arr, max_arr) = entry.scalar_stats.cols.get(name)?;
-        let min = ScalarValue::try_from_array(min_arr, 0).ok()?;
-        let max = ScalarValue::try_from_array(max_arr, 0).ok()?;
+        let agg = entry.scalar_stats.get(name)?;
+        let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
+        let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
         if min.is_null() || max.is_null() {
             return None;
         }
@@ -1189,6 +1189,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
 
     use crate::superfile::builder::FtsConfig;
+    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileUri};
     use crate::supertable::{Supertable, SupertableOptions};
     use crate::test_helpers::default_tokenizer;
 
@@ -1662,6 +1663,53 @@ mod tests {
         assert_eq!(cs.max_value, Precision::Exact(ScalarValue::Int64(Some(20))));
         // One null planted in superfile 1.
         assert_eq!(cs.null_count, Precision::Exact(1));
+    }
+
+    /// A superfile entry carrying only min/max for `col` (no null count,
+    /// sum, or HLL) — the shape a non-summable column (e.g. Utf8) produces.
+    fn entry_minmax_only(col: &str, min: &str, max: &str) -> Arc<SuperfileEntry> {
+        let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
+        let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
+        let mut scalar_stats = HashMap::new();
+        scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+        Arc::new(SuperfileEntry {
+            superfile_id: uuid::Uuid::new_v4(),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats,
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: None,
+        })
+    }
+
+    /// The statistics fold helpers return `None` when a column carries no
+    /// usable stat — both when the column has min/max only (no additive
+    /// stat) and when it's absent entirely. Exercises the `get(col)?` and
+    /// `.<stat>.as_ref()?` short-circuit branches of the new map-based access.
+    #[test]
+    fn scalar_statistics_helpers_return_none_when_stat_absent() {
+        let entries = vec![entry_minmax_only("s", "alpha", "omega")];
+        // Column present, but the additive stats are absent → None.
+        assert!(scalar_sum(&entries, "s").is_none(), "no sum stat → None");
+        assert!(
+            scalar_distinct(&entries, "s").is_none(),
+            "no hll stat → None"
+        );
+        assert!(
+            scalar_null_count(&entries, "s").is_none(),
+            "no null_count stat → None"
+        );
+        // min/max IS present for the column.
+        assert!(scalar_min_max(&entries, "s").is_some());
+        // A column absent from every entry yields None for all helpers.
+        assert!(scalar_sum(&entries, "missing").is_none());
+        assert!(scalar_min_max(&entries, "missing").is_none());
+        assert!(scalar_null_count(&entries, "missing").is_none());
     }
 
     /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile

@@ -813,18 +813,17 @@ mod tests {
         let title_stats = merged_superfile
             .entry
             .scalar_stats
-            .cols
             .get("title")
             .expect("merged entry should have title column stats");
 
         // Extract min and max string values from the arrays
         let title_min_arr = title_stats
-            .0
+            .min
             .as_any()
             .downcast_ref::<arrow_array::LargeStringArray>()
             .expect("title column should be LargeStringArray");
         let title_max_arr = title_stats
-            .1
+            .max
             .as_any()
             .downcast_ref::<arrow_array::LargeStringArray>()
             .expect("title column should be LargeStringArray");

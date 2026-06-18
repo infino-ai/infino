@@ -60,6 +60,11 @@ on:
         required: false
         default: ""
         type: string
+      noise_threshold_pct:
+        description: "Min |Δ%| vs main to flag in the PR comment; smaller is noise."
+        required: false
+        default: "10"
+        type: string
   # Callable from other workflows (e.g. the PR group in ci.yml). Same
   # inputs; `choice` isn't valid here so `bench` is a string.
   workflow_call:
@@ -81,6 +86,8 @@ on:
       skip_calibration: { type: boolean, required: false, default: false }
       # PR to post the sticky results comment on. Blank ⇒ summary only.
       pr_number:       { type: string, required: false, default: "" }
+      # Min |Δ%| vs main to flag in the PR comment; smaller is noise.
+      noise_threshold_pct: { type: string, required: false, default: "10" }
 
 permissions:
   id-token: write       # Azure OIDC federated login
@@ -111,6 +118,14 @@ jobs:
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
+      # The bench itself builds/runs on the VM, but the runner needs the repo
+      # for the AI-summary script. Match the ref under test so the summarizer
+      # tracks the PR. Cleans the workdir, so it must precede baseline staging.
+      - name: Checkout (runner-side tooling)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
       - name: Resolve bench selection
         id: resolve
         run: |
@@ -288,12 +303,16 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          # Stage the main baseline JSONs on the runner too — the AI-summary
+          # step diffs them against this run's metrics (scp'd back later).
+          mkdir -p baseline
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
             "mkdir -p infino-src/target/infino-bench"
           for j in $REPORTS; do
             blob="bench/${j}/baseline/${VM_SIZE}-${DOCS}.json"
             if az storage blob download --account-name "$ACC" --account-key "$KEY" \
                  -c "$CONTAINER" -n "$blob" -f "${j}.json" 2>/dev/null; then
+              cp "${j}.json" "baseline/${j}.json"
               # Best-effort: a transient scp flake must not fail the bench —
               # the run just renders "(new)" without the baseline.
               if scp -o StrictHostKeyChecking=no "${j}.json" \
@@ -540,6 +559,8 @@ jobs:
           # Panics, runtime errors, and compile errors (error[E…]); the
           # panic line carries the full chain.
           ERRORS="$(grep -nE 'panicked|error\[|HTTP error|storage error|transient error|AppendFlush|PointerParse|child exited|no shapes produced|skipped:|content-hash mismatch|short read' "$LOG" || true)"
+          # Hand the error lines to the AI-summary step (same job, /tmp persists).
+          printf '%s\n' "$ERRORS" > /tmp/bench.errors
           if [ -n "$ERRORS" ]; then
             {
               echo "### 🛑 Errors & panics"
@@ -573,6 +594,79 @@ jobs:
             exit 1
           fi
 
+      # Pull this run's metric JSONs off the VM so the AI-summary step can diff
+      # them against the staged main baseline. Best-effort per report.
+      - name: Collect current metrics
+        if: ${{ always() && inputs.pr_number != '' }}
+        env:
+          REPORTS: ${{ steps.resolve.outputs.reports }}
+        run: |
+          set -uo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          mkdir -p current
+          for j in $REPORTS; do
+            scp -o StrictHostKeyChecking=no \
+              "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "current/${j}.json" \
+              2>/dev/null && echo "collected: $j" \
+              || echo "no metrics for $j — skipping"
+          done
+
+      # Last ≤10 main-history points per report, so the summary can say whether
+      # a flagged metric is a one-off or part of a sustained drift on main.
+      # Best-effort: a missing series just drops the trend annotation.
+      - name: Collect main history
+        if: ${{ always() && inputs.pr_number != '' }}
+        env:
+          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+          VM_SIZE: ${{ inputs.vm_size }}
+          DOCS: ${{ inputs.docs }}
+          REPORTS: ${{ steps.resolve.outputs.reports }}
+        run: |
+          set -uo pipefail
+          mkdir -p history
+          for j in $REPORTS; do
+            mkdir -p "history/$j"
+            # Oldest→newest by commit time; keep the last 10.
+            blobs="$(az storage blob list -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
+                       --prefix "bench/${j}/history/${VM_SIZE}-${DOCS}-" --include m \
+                       --query '[].{name:name, ts:metadata.ts, sha:metadata.sha}' -o tsv 2>/dev/null \
+                     | sort -k2 -n | tail -10)"
+            i=0
+            while IFS=$'\t' read -r name _ts sha; do
+              [ -n "$name" ] || continue
+              # Index prefix preserves chronological order under lexical sort.
+              idx="$(printf '%02d' "$i")"
+              az storage blob download -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
+                -n "$name" -f "history/${j}/${idx}-${sha:0:7}.json" -o none 2>/dev/null \
+                || echo "::warning::history download failed for $j ($sha)"
+              i=$((i + 1))
+            done <<< "$blobs"
+          done
+
+      # Diff vs main, keep only changes past the threshold, and have Foundry
+      # narrate them. Falls back to the deterministic delta table on any model
+      # failure or missing creds — the comment is always correct.
+      - name: AI summary
+        if: ${{ always() && inputs.pr_number != '' }}
+        env:
+          REPORTS: ${{ steps.resolve.outputs.reports }}
+          BASELINE_DIR: baseline
+          CURRENT_DIR: current
+          HISTORY_DIR: history
+          OUT_FILE: /tmp/ai-summary.md
+          BENCH_LABEL: ${{ inputs.bench }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BENCH_NOISE_THRESHOLD_PCT: ${{ inputs.noise_threshold_pct }}
+          AZURE_AI_ENDPOINT: ${{ secrets.AZURE_AI_ENDPOINT }}
+          AZURE_AI_API_KEY: ${{ secrets.AZURE_AI_API_KEY }}
+        run: |
+          set -uo pipefail
+          # Error lines captured by the Summarize step (empty file if none).
+          ERRORS="$(cat /tmp/bench.errors 2>/dev/null || true)" \
+            python3 .github/scripts/bench_summary.py
+
       # Sticky PR comment, one per matrix leg. The hidden marker lets a new
       # push edit in place instead of stacking comments.
       - name: Post results to PR
@@ -585,9 +679,14 @@ jobs:
             const fs = require('fs');
             // GitHub caps comment bodies at 65536 chars; full output is the artifact.
             const LIMIT = 60000;
+            // The lean AI summary is the comment body; the full report stays in
+            // the run's step summary + the uploaded log artifact.
             let body;
-            try { body = fs.readFileSync('/tmp/summary.md', 'utf8'); }
-            catch { body = '_No summary produced — see the run logs._'; }
+            try { body = fs.readFileSync('/tmp/ai-summary.md', 'utf8'); }
+            catch {
+              try { body = fs.readFileSync('/tmp/summary.md', 'utf8'); }
+              catch { body = '_No summary produced — see the run logs._'; }
+            }
             if (body.length > LIMIT) {
               body = body.slice(0, LIMIT) + '\n\n_…truncated — see the artifact._';
             }

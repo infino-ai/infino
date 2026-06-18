@@ -93,6 +93,27 @@ test("querySql can return an Arrow table with { arrow: true }", () => {
   assert.equal(tbl.numRows, 1);
 });
 
+test("query_sql with a hybrid_search TVF returns rows from a sync host (#170)", () => {
+  const db = connect("memory://");
+  const dim = 16;
+  const schema = new Schema([
+    new Field("title", new LargeUtf8(), false),
+    new Field("emb", new FixedSizeList(dim, new Field("item", new Float32(), true)), false),
+  ]);
+  const docs = db.createTable("docs", schema, new IndexSpec().fts("title").vector("emb", dim, 1, "cosine"));
+  docs.append([
+    { title: "billing and refunds", emb: onehot(0, dim) },
+    { title: "dark mode appearance", emb: onehot(1, dim) },
+  ]);
+  // A search TVF through query_sql used to abort the process from a sync host
+  // (no ambient multi-thread runtime); it must now return rows, not abort.
+  const qvec = onehot(0, dim).join(",");
+  const rows = db.querySql(
+    `SELECT _id, score FROM hybrid_search('docs', 'title', 'billing', 'emb', '${qvec}', 5)`,
+  );
+  assert.ok(rows.length >= 1);
+});
+
 test("tokenMatch and exactMatch return unranked rows", () => {
   const db = connect("memory://");
   const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
@@ -145,6 +166,40 @@ test("vector search end-to-end", () => {
   // nprobe + rerankMult tuning knobs are accepted.
   const tuned = docs.vectorSearch("emb", onehot(0, dim), 5, { nprobe: 1, rerankMult: 4 });
   assert.ok(tuned.length >= 1);
+});
+
+test("filtered vector search (pushdown text predicate)", () => {
+  const db = connect("memory://");
+  const dim = 16;
+  // A table with both an FTS column (title) and a vector column (emb).
+  const schema = new Schema([
+    new Field("title", new LargeUtf8(), false),
+    new Field("emb", new FixedSizeList(dim, new Field("item", new Float32(), true)), false),
+  ]);
+  const docs = db.createTable(
+    "docs",
+    schema,
+    new IndexSpec().fts("title").vector("emb", dim, 1, "cosine"),
+  );
+  docs.append([
+    { title: "billing and refunds", emb: onehot(0, dim) },
+    { title: "refund policy", emb: onehot(0, dim) },
+    { title: "dark mode appearance", emb: onehot(1, dim) },
+  ]);
+
+  // Unfiltered kNN over the topic-0 embedding sees both topic-0 rows.
+  const all = docs.vectorSearch("emb", onehot(0, dim), 10);
+  assert.ok(all.length >= 2);
+
+  // Same kNN, restricted to rows whose `title` matches "billing" — a
+  // pushdown pre-filter, so only the matching row comes back (not a
+  // post-filter over the global top-k).
+  const filtered = docs.vectorSearch("emb", onehot(0, dim), 10, {
+    filter: { column: "title", query: "billing", mode: "or" },
+    projection: ["_id", "title", "score"],
+  });
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0].title, "billing and refunds");
 });
 
 test("update and delete by SQL predicate (localfs)", () => {

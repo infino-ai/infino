@@ -699,7 +699,7 @@ mod tests {
     //! surfaces a typed error.
     use super::*;
     use crate::supertable::manifest::bloom::BloomBuilder;
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsTable, VectorSummary};
+    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, VectorSummary};
     use crate::supertable::{SuperfileEntry, SuperfileUri};
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use bytes::Bytes;
@@ -715,7 +715,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -754,42 +754,39 @@ mod tests {
         }
     }
 
-    fn make_scalar_stats() -> ScalarStatsTable {
+    fn make_scalar_stats() -> HashMap<String, ScalarStatsAgg> {
         // Cover Int64, Float64, Boolean, Utf8 — the four
         // shapes the existing skip path supports.
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             "ts".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(Int64Array::from(vec![1_715_000_000_i64])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1_715_086_400_i64])) as ArrayRef,
             ),
         );
         cols.insert(
             "score".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(Float64Array::from(vec![0.0])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![0.999_999])) as ArrayRef,
             ),
         );
         cols.insert(
             "active".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
             ),
         );
         cols.insert(
             "category".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(StringArray::from(vec!["alpha"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["zulu"])) as ArrayRef,
             ),
         );
-        ScalarStatsTable {
-            cols,
-            ..Default::default()
-        }
+        cols
     }
 
     fn make_rich_superfile() -> Arc<SuperfileEntry> {
@@ -840,16 +837,17 @@ mod tests {
         assert_eq!(a.partition_hint, b.partition_hint, "partition_hint");
 
         assert_eq!(
-            a.scalar_stats.cols.len(),
-            b.scalar_stats.cols.len(),
+            a.scalar_stats.len(),
+            b.scalar_stats.len(),
             "scalar_stats column count"
         );
-        for (k, (a_min, a_max)) in &a.scalar_stats.cols {
-            let (b_min, b_max) = b
+        for (k, a_agg) in &a.scalar_stats {
+            let (a_min, a_max) = (&a_agg.min, &a_agg.max);
+            let b_agg = b
                 .scalar_stats
-                .cols
                 .get(k)
                 .unwrap_or_else(|| panic!("missing scalar col {k}"));
+            let (b_min, b_max) = (&b_agg.min, &b_agg.max);
             assert_eq!(a_min.data_type(), b_min.data_type(), "scalar {k} min type");
             assert_eq!(a_max.data_type(), b_max.data_type(), "scalar {k} max type");
             assert_eq!(a_min.to_data(), b_min.to_data(), "scalar {k} min data");
@@ -981,7 +979,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
@@ -995,7 +993,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1118,7 +1116,7 @@ mod tests {
             n_docs: 3,
             id_min: -5,
             id_max: 7,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1156,7 +1154,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

@@ -930,7 +930,7 @@ mod tests {
     use crate::superfile::builder::FtsConfig;
 
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+    use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
     use crate::supertable::options::Consistency;
     use tempfile::TempDir;
 
@@ -963,7 +963,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
