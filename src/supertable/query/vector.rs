@@ -73,7 +73,7 @@ use crate::storage::StorageProvider;
 use bytes::Bytes;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::Manifest, SuperfileEntry;
+use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
@@ -180,6 +180,8 @@ fn hits_reference_user_superfiles(reader: &SupertableReader, hits: &[SuperfileHi
     })
 }
 
+/// Resolve a stable row id from manifest span arithmetic when the superfile
+/// body stores rows in contiguous id order.
 fn row_id_from_manifest_entry(entry: &SuperfileEntry, local_doc_id: u32) -> Option<i128> {
     let n_docs = i128::from(entry.n_docs);
     let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
