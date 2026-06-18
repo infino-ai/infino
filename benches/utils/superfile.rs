@@ -1105,9 +1105,7 @@ pub mod vector {
             (
                 sweep_probe_ladder(start_p),
                 sweep_rerank_ladder(start_r),
-                format!(
-                    "p={start_p}..1, r={start_r} halving to 1",
-                ),
+                format!("p={start_p}..1, r={start_r} halving to 1",),
             )
         };
 
@@ -1132,9 +1130,8 @@ pub mod vector {
         for &p in &probes {
             let p_eff = p.min(n_cent).max(1);
             for &r in &reranks {
-                let unfiltered = exec_vec::mean_recall(
-                    reader, VEC_COLUMN, q_corr, gt, TOP_K, p_eff, r,
-                );
+                let unfiltered =
+                    exec_vec::mean_recall(reader, VEC_COLUMN, q_corr, gt, TOP_K, p_eff, r);
                 let filtered = mean_filtered_recall(reader, &allow, &filtered_gt, p_eff, r);
                 let pass = unfiltered >= floor && filtered >= floor;
                 eprintln!(
@@ -1181,9 +1178,7 @@ pub mod vector {
                 "Superfile vector — (p, r) sweep from ({start_p}, {start_r}) ({} docs × dim={DIM})",
                 fmt_count(n_docs),
             ),
-            note: format!(
-                "One build; {sweep_label}. Floor recall@{TOP_K} ≥ {floor:.2}."
-            ),
+            note: format!("One build; {sweep_label}. Floor recall@{TOP_K} ≥ {floor:.2}."),
             blocks: vec![Block {
                 subtitle: String::new(),
                 headers: vec![
@@ -1224,8 +1219,9 @@ pub mod vector {
                 .expect("filtered latency query");
                 std::hint::black_box(hits);
             } else {
-                let hits = tiers::block_on(reader.vector_hits_async(VEC_COLUMN, query, TOP_K, opts))
-                    .expect("vector latency query");
+                let hits =
+                    tiers::block_on(reader.vector_hits_async(VEC_COLUMN, query, TOP_K, opts))
+                        .expect("vector latency query");
                 std::hint::black_box(hits);
             }
             samples.push(t0.elapsed());
@@ -1236,10 +1232,7 @@ pub mod vector {
 
     /// One build; warm p50 (calibration q0, [`CALIBRATION_P50_ITERS`] reps) for
     /// `(1, 64)` vs `(5, 128)`, unfiltered and filtered (~10%).
-    fn run_vector_latency_compare(
-        n_docs: usize,
-        reader: &infino::superfile::SuperfileReader,
-    ) {
+    fn run_vector_latency_compare(n_docs: usize, reader: &infino::superfile::SuperfileReader) {
         let mut allow = RoaringBitmap::new();
         for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
             allow.insert(i);
@@ -1447,7 +1440,16 @@ pub mod vector {
                 let filtered_rerank = FILTERED_DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
                 let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
                 let mut rows = Vec::new();
-                for (label, set, gt, nominal_nprobe, nominal_rerank, effective_nprobe, effective_rerank, selectivity_label) in [
+                for (
+                    label,
+                    set,
+                    gt,
+                    nominal_nprobe,
+                    nominal_rerank,
+                    effective_nprobe,
+                    effective_rerank,
+                    selectivity_label,
+                ) in [
                     (
                         "unfiltered",
                         None,

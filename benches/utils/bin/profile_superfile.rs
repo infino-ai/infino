@@ -103,7 +103,11 @@ fn filtered_allow(n_docs: usize) -> Arc<RoaringBitmap> {
     Arc::new(allow)
 }
 
-fn filtered_ground_truth(vectors: &[f32], queries: &[Vec<f32>], allow: &RoaringBitmap) -> Vec<Vec<u32>> {
+fn filtered_ground_truth(
+    vectors: &[f32],
+    queries: &[Vec<f32>],
+    allow: &RoaringBitmap,
+) -> Vec<Vec<u32>> {
     queries
         .iter()
         .map(|q| {
@@ -187,14 +191,8 @@ fn main() {
         n_docs / n_cent.max(1)
     );
 
-    let queries = corpus::generate_realistic_queries(
-        &vectors,
-        n_docs,
-        N_QUERIES,
-        QUERY_SEED,
-        true,
-        SIGMA,
-    );
+    let queries =
+        corpus::generate_realistic_queries(&vectors, n_docs, N_QUERIES, QUERY_SEED, true, SIGMA);
 
     eprintln!("[profile] computing unfiltered ground truth ({N_QUERIES} queries)...");
     let gt: Vec<Vec<u32>> = queries
@@ -236,7 +234,8 @@ fn main() {
         let p50 = lats[lats.len() / 2];
 
         let recall = mean_recall_unfiltered(&reader, &queries, &gt, nprobe, rerank_mult);
-        let filt = mean_recall_filtered(&reader, &queries, &filtered_gt, &allow, nprobe, rerank_mult);
+        let filt =
+            mean_recall_filtered(&reader, &queries, &filtered_gt, &allow, nprobe, rerank_mult);
         let pass = if recall >= RECALL_FLOOR && filt >= RECALL_FLOOR {
             "ok"
         } else {
