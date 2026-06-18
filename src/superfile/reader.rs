@@ -1137,6 +1137,11 @@ impl SuperfileReader {
         options: VectorSearchOptions,
         allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let options = if allow.is_some() {
+            options.for_filtered_path()
+        } else {
+            options
+        };
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
@@ -1194,12 +1199,13 @@ impl SuperfileReader {
 /// typical IVF setups.
 ///
 /// - `nprobe`: number of IVF clusters to scan. Higher = better recall,
-///   slower. Default `8`, internally clamped to `[1, n_cent]`. For a
-///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
-///   index per query.
+///   slower. Internally clamped to `[1, n_cent]`.
 ///
 /// - `rerank_mult`: number of coarse candidates per requested hit to
 ///   feed into exact/Sq8 rerank. Higher = better recall, slower.
+///
+/// Unfiltered and filtered kNN use different default `(nprobe, rerank_mult)`
+/// pairs — see [`Self::new`] and [`Self::new_filtered`].
 #[derive(Debug, Clone, Copy)]
 pub struct VectorSearchOptions {
     pub nprobe: usize,
@@ -1207,18 +1213,34 @@ pub struct VectorSearchOptions {
 }
 
 impl VectorSearchOptions {
-    pub const DEFAULT_NPROBE: usize = 8;
+    /// Default IVF probe count for **unfiltered** kNN.
+    pub const DEFAULT_NPROBE: usize = 6;
 
-    /// Internal rerank multiplier. `k * RERANK_MULT` candidates
-    /// from the 1-bit RaBitQ shortlist enter Sq8/residual rerank.
-    /// Bench-validated: recall saturates at 4 on 10M×384 cosine.
-    pub const RERANK_MULT: usize = 4;
+    /// Default rerank multiplier for both paths (`k * mult` coarse candidates).
+    pub const RERANK_MULT: usize = 256;
 
-    /// Construct with defaults applied.
+    /// Default IVF probe count for **filtered** kNN (predicate pushdown /
+    /// allow-set). Slightly higher than [`Self::DEFAULT_NPROBE`] — filtered
+    /// search needs more cluster coverage before the selectivity boost.
+    pub const FILTERED_DEFAULT_NPROBE: usize = 8;
+
+    /// Default rerank multiplier for filtered kNN — same depth as unfiltered;
+    /// selectivity scaling happens inside the reader.
+    pub const FILTERED_RERANK_MULT: usize = Self::RERANK_MULT;
+
+    /// Unfiltered kNN defaults: `nprobe=6`, `rerank_mult=256`.
     pub fn new() -> Self {
         Self {
             nprobe: Self::DEFAULT_NPROBE,
             rerank_mult: Self::RERANK_MULT,
+        }
+    }
+
+    /// Filtered kNN defaults: `nprobe=8`, `rerank_mult=256`.
+    pub fn new_filtered() -> Self {
+        Self {
+            nprobe: Self::FILTERED_DEFAULT_NPROBE,
+            rerank_mult: Self::FILTERED_RERANK_MULT,
         }
     }
 
@@ -1237,6 +1259,16 @@ impl VectorSearchOptions {
 
     pub fn rerank_mult(&self) -> usize {
         self.rerank_mult
+    }
+
+    /// When stock unfiltered defaults are passed into a filtered kNN path,
+    /// upgrade to [`Self::new_filtered()`]. Explicit overrides are kept.
+    pub(crate) fn for_filtered_path(self) -> Self {
+        if self.nprobe == Self::DEFAULT_NPROBE && self.rerank_mult() == Self::RERANK_MULT {
+            Self::new_filtered()
+        } else {
+            self
+        }
     }
 }
 
@@ -1620,10 +1652,13 @@ mod tests {
     #[test]
     fn vector_search_options_default_values() {
         let opts = VectorSearchOptions::default();
-        assert_eq!(opts.nprobe, 8);
-        assert_eq!(opts.rerank_mult(), 4);
+        assert_eq!(opts.nprobe, 6);
+        assert_eq!(opts.rerank_mult(), 256);
         let opts2 = VectorSearchOptions::new();
         assert_eq!(opts.nprobe, opts2.nprobe);
+        let filtered = VectorSearchOptions::new_filtered();
+        assert_eq!(filtered.nprobe, 8);
+        assert_eq!(filtered.rerank_mult(), 256);
     }
 
     #[test]

@@ -245,8 +245,11 @@ pub struct infino::VectorSearchOptions
 pub infino::VectorSearchOptions::nprobe: usize
 impl infino::VectorSearchOptions
 pub const infino::VectorSearchOptions::DEFAULT_NPROBE: usize
+pub const infino::VectorSearchOptions::FILTERED_DEFAULT_NPROBE: usize
+pub const infino::VectorSearchOptions::FILTERED_RERANK_MULT: usize
 pub const infino::VectorSearchOptions::RERANK_MULT: usize
 pub fn infino::VectorSearchOptions::new() -> Self
+pub fn infino::VectorSearchOptions::new_filtered() -> Self
 pub fn infino::VectorSearchOptions::rerank_mult(&self) -> usize
 pub fn infino::VectorSearchOptions::with_nprobe(self, usize) -> Self
 pub fn infino::VectorSearchOptions::with_rerank_mult(self, usize) -> Self

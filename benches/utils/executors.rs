@@ -1230,15 +1230,28 @@ pub mod vector {
     ) -> Vec<RecallRow> {
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();
+        let default_recall: Option<f32>;
         if skip_calibration {
             // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
-            // correctness gate, no recall-target grid — just the fixed
-            // `(default_nprobe, default_rerank)` row below. Needs no ground
-            // truth and no warmed reader, so a cold-only run is fast and
-            // prod-shaped.
+            // high-recall correctness gate, no recall-target grid — only
+            // the fixed `(default_nprobe, default_rerank)` recall sample.
             eprintln!(
-                "[{log_prefix}] skip-calibration: measuring only fixed (p={default_nprobe}, r={default_rerank})",
+                "[{log_prefix}] skip-calibration: default-config recall@{k} at p={default_nprobe}, r={default_rerank} ({} queries)...",
+                q_correct.len(),
             );
+            let default = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                default_nprobe,
+                default_rerank,
+            );
+            eprintln!(
+                "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
+            );
+            default_recall = Some(default);
         } else {
             eprintln!(
                 "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
@@ -1258,6 +1271,26 @@ pub mod vector {
                 "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+
+            eprintln!(
+                "[{log_prefix}] default-config recall@{k} on {} queries (nprobe={default_nprobe}, rerank={default_rerank})...",
+                q_correct.len(),
+            );
+            let default = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                default_nprobe,
+                default_rerank,
+            );
+            assert!(
+                default >= CORRECTNESS_RECALL_FLOOR,
+                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            );
+            eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
+            default_recall = Some(default);
 
             // Small corpora afford the exhaustive grid; past the cap the
             // staircase walk gets the same answers from O(P + R)
@@ -1307,7 +1340,9 @@ pub mod vector {
         rows.push(RecallRow {
             target: "default".into(),
             params: format!("p={default_nprobe}, r={default_rerank}"),
-            recall: "—".into(),
+            recall: default_recall
+                .map(|r| format!("{r:.3}"))
+                .unwrap_or_else(|| "—".into()),
             warm: include_warm
                 .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
             cold: include_cold.then(|| {

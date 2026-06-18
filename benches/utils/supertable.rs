@@ -435,8 +435,9 @@ pub fn run() {
 const WARM_ITERS: usize = 20;
 const COLD_ITERS: usize = 5;
 const TOP_K: usize = 10;
-const VECTOR_NPROBE: usize = 8;
-const VECTOR_RERANK_MULT: usize = 20;
+const VECTOR_NPROBE: usize = 6;
+/// Bench default rerank at the 1M×1024 scale — see `superfile::vector` docs.
+const VECTOR_RERANK_MULT: usize = 256;
 
 /// Selected phases for a per-modality supertable runner.
 ///

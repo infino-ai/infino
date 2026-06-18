@@ -163,6 +163,11 @@ impl SupertableReader {
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let options = if allow.is_some() {
+            options.for_filtered_path()
+        } else {
+            options
+        };
         let manifest = self.manifest();
 
         // ---- Global cross-superfile cluster selection.
@@ -636,8 +641,14 @@ impl SupertableReader {
             let hits = match filter {
                 None => self.vector_search_async(column, query, k, options).await?,
                 Some(f) => {
-                    self.vector_hits_filtered_async(column, query, k, options, f)
-                        .await?
+                    self.vector_hits_filtered_async(
+                        column,
+                        query,
+                        k,
+                        options.for_filtered_path(),
+                        f,
+                    )
+                    .await?
                 }
             };
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
@@ -666,7 +677,13 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         match filter {
             None => self.block_on(self.vector_search_async(column, query, k, options)),
-            Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
+            Some(f) => self.block_on(self.vector_hits_filtered_async(
+                column,
+                query,
+                k,
+                options.for_filtered_path(),
+                f,
+            )),
         }
     }
 }

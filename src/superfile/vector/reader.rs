@@ -1503,10 +1503,18 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
+        // Same inverse-selectivity boost as [`Self::search_async`]: the
+        // supertable fan-out probes externally chosen clusters (no local
+        // nprobe scoring), so rerank breadth must scale here — not only
+        // on the per-superfile nprobe fallback path.
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
-            rerank_mult,
+            rerank_mult: rerank_mult.saturating_mul(filter_mult),
             allow,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
