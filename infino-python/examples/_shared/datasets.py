@@ -67,3 +67,49 @@ def load_ms_marco(n_queries: int = 300) -> tuple[list[dict], list[dict]]:
         if len(queries) >= n_queries:
             break
     return passages, queries
+
+
+def load_amazon(n: int = 1200) -> list[dict]:
+    """Real Amazon product catalog with rich metadata.
+
+    Source: `smartcat/Amazon_Sample_Metadata_2023` on the HuggingFace Hub
+    (Parquet-native, streamable). Keeps products that have a usable price.
+
+    Returns a list of
+      {"title", "text", "price": float, "rating": float,
+       "category": str, "store": str}
+    where `text` is title + description (what we embed and full-text index) and
+    the remaining fields are genuine catalog metadata to filter on.
+    """
+    stream = load_dataset(
+        "smartcat/Amazon_Sample_Metadata_2023", split="train", streaming=True
+    )
+    products: list[dict] = []
+    for row in stream:
+        raw_price = row.get("price")
+        if raw_price in (None, "", "None"):
+            continue
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            continue
+        title = (row.get("title") or "").strip()
+        if not title:
+            continue
+
+        description = row.get("description") or []
+        if isinstance(description, list):
+            description = " ".join(description)
+        text = f"{title}. {str(description)[:400]}"
+
+        products.append({
+            "title": title,
+            "text": text,
+            "price": price,
+            "rating": float(row.get("average_rating") or 0.0),
+            "category": str(row.get("main_category") or "Unknown"),
+            "store": str(row.get("store") or "Unknown"),
+        })
+        if len(products) >= n:
+            break
+    return products
