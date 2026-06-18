@@ -282,7 +282,14 @@ def main():
     def plural(n, word):
         return f"{n} {word}{'' if n == 1 else 's'}"
 
-    badge = "🔴" if (failures or regressions) else ("🟢" if improvements else "⚪")
+    if failures or (regressions and not improvements):
+        badge = "🔴"  # pure bad: failures, or regressions with no offsetting wins
+    elif regressions:
+        badge = "🟡"  # mixed: regressions alongside improvements
+    elif improvements:
+        badge = "🟢"
+    else:
+        badge = "⚪"
     counts = f"{plural(len(regressions), 'regression')} · {plural(len(improvements), 'improvement')}"
     parts = [f"## {badge} Benchmark `{label}` — {counts} (±{threshold:g}% vs main)", ""]
 
