@@ -74,7 +74,7 @@ use crate::superfile::format::{footer::read_kv_metadata, kv};
 use crate::supertable::error::ManifestError;
 use crate::supertable::manifest::Manifest;
 use crate::supertable::manifest::partition::{assign_partition, encode_partition_key, PartitionKey};
-use crate::supertable::manifest::commit::get_current_manifest_etag;
+use crate::supertable::manifest::commit::{get_current_manifest_etag, list_uri};
 use crate::supertable::manifest::part::{self as part_mod, PartId};
 use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
 
@@ -1202,6 +1202,7 @@ impl SupertableWriter {
             let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
 
             let manifest_before = inner.manifest.load();
+            let old_list_uri = Some(list_uri(manifest_before.get_manifest_id()));
             let mut old_part_uris: Vec<String> = Vec::new();
             for (cell_id, batches) in cell_shards {
                 let pk_bytes = encode_partition_key(&PartitionKey::VectorCell(cell_id));
@@ -1263,6 +1264,9 @@ impl SupertableWriter {
                 }
             }
             for uri in old_part_uris {
+                let _ = storage_for_gc.delete(&uri).await;
+            }
+            if let Some(uri) = old_list_uri {
                 let _ = storage_for_gc.delete(&uri).await;
             }
 
