@@ -69,7 +69,7 @@ rows; the data lives on disk (or object storage), not in RAM.
 
 - `embedding.py` — local `all-MiniLM-L6-v2` embeddings (384-dim, cosine)
 - `chunking.py` — fixed-size, overlapping text chunker
-- `datasets.py` — loaders for the real corpora above
+- `loaders.py` — loaders for the real corpora above (HuggingFace Hub)
 - `sql.py` — tiny SQL helpers (literal quoting, empty-safe query)
 - `llm.py` — optional answer generation (Azure AI Foundry or OpenAI)
 
