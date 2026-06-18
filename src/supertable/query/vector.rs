@@ -73,7 +73,7 @@ use crate::storage::StorageProvider;
 use bytes::Bytes;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::{Manifest, SuperfileEntry};
+use crate::supertable::manifest::{Manifest, SuperfileEntry, SuperfileUri};
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
@@ -90,9 +90,18 @@ enum Probe {
 }
 
 
-/// Load the contiguous cell-posting vec blob for one superfile (one GET).
+/// Load the contiguous cell-posting vec blob for one superfile.
+///
+/// When a `disk_cache` is supplied the whole hidden superfile is made resident
+/// (mmap) in the cache and the vec subsection is sliced from that mapping, so
+/// repeat (warm) queries serve locally instead of re-fetching from object
+/// storage. The cold-fetch is routed through the hidden table's `storage`
+/// because the shared cache is keyed to the user table's storage and cannot
+/// resolve the hidden prefix on its own. Without a cache (or on the write-time
+/// `open_blob` fast path) it falls back to a single ranged GET.
 pub(crate) async fn fetch_cell_posting_blob(
     storage: &Arc<dyn StorageProvider>,
+    disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
     entry: &SuperfileEntry,
 ) -> Result<Bytes, QueryError> {
     let offsets = entry.subsection_offsets.as_ref().ok_or_else(|| {
@@ -111,6 +120,17 @@ pub(crate) async fn fetch_cell_posting_blob(
         if *blob_off == off && bytes.len() as u64 == len {
             return Ok(Bytes::copy_from_slice(bytes));
         }
+    }
+    if let Some(cache) = disk_cache {
+        let reader = cache
+            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+            .await
+            .map_err(|e| QueryError::Store(e.to_string()))?;
+        return reader
+            .byte_source()
+            .range(off, len)
+            .await
+            .map_err(|e| QueryError::Store(e.to_string()));
     }
     let path = entry.uri.storage_path();
     storage
@@ -191,69 +211,100 @@ fn row_id_from_manifest_entry(entry: &SuperfileEntry, local_doc_id: u32) -> Opti
     Some(entry.id_min + i128::from(local_doc_id))
 }
 
-/// Remap step 1: resolve the user `_id` that dual-write stamped into a
-/// hidden-index hit. Arithmetic when the hidden superfile's id span is
-/// contiguous; otherwise a cold/lazy `_id`-column read at the hit's local row.
-///
-/// The hidden index is cell-partitioned, so a cell aggregates scattered user
-/// ids and its id range is gapped — `id_min + local` rarely holds — hence the
-/// fallback read is the common case here. The value at the hit's local is the
-/// user row id, which is the answer for an `_id`-only query (no user-superfile
-/// lookup needed) and the join key into the user manifest for a column query.
-async fn hidden_hit_user_id(
-    hidden_manifest: &Manifest,
-    hit: &SuperfileHit,
+/// Read the `_id` column values at `local_ids` (in caller order) from one
+/// superfile. Routed through the disk cache as a resident (mmap) read when a
+/// cache is attached, so warm queries serve locally instead of re-fetching the
+/// column from object storage; falls back to a direct object-store read
+/// otherwise. One read per call — callers dedup by superfile so a given
+/// superfile's `_id` column is read at most once per query.
+async fn read_ids_for_locals(
+    manifest: &Manifest,
+    entry: &SuperfileEntry,
+    local_ids: &[u32],
     id_column: &str,
-) -> Result<i128, QueryError> {
-    let hidden_entry = hidden_manifest
-        .superfiles
-        .iter()
-        .find(|e| e.uri == hit.superfile)
-        .ok_or_else(|| {
-            QueryError::Execute(format!(
-                "hidden superfile {:?} missing from manifest",
-                hit.superfile
-            ))
-        })?;
-    if let Some(id) = row_id_from_manifest_entry(hidden_entry, hit.local_doc_id) {
-        return Ok(id);
-    }
-    // Gapped hidden span: read the hidden superfile's `_id` column via the
-    // cold/lazy object-store path. (The hidden table's PrefixedStorageProvider
-    // delegates object_store_handle so this lazy read works.)
-    let storage = hidden_manifest.options.storage.as_ref().ok_or_else(|| {
-        QueryError::Execute("hidden vector index needs a storage backend".into())
+) -> Result<Vec<i128>, QueryError> {
+    let storage = manifest.options.storage.as_ref().ok_or_else(|| {
+        QueryError::Execute("id remap needs a storage backend".into())
     })?;
-    let (obj_store, path) = storage
-        .object_store_handle(&hidden_entry.uri.storage_path())
-        .ok_or_else(|| {
-            QueryError::Execute("no object_store handle for hidden superfile".into())
-        })?;
-    let file_size = hidden_entry.subsection_offsets.as_ref().map(|o| o.total_size);
-    let store = Arc::clone(&hidden_manifest.options.store);
-    let disk_cache = hidden_manifest.options.disk_cache.as_ref().map(Arc::clone);
-    let sf =
-        super::dispatch::open_reader(&store, disk_cache.as_ref(), Some(storage), hidden_entry)
-            .await?;
-    let schema = sf.schema();
-    let n = sf.n_docs();
-    let batch = super::exec::common::take_rows_object_store(
-        obj_store,
-        path,
-        file_size,
-        &schema,
-        n,
-        &[hit.local_doc_id],
-        &[id_column],
-    )
-    .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    let batch = if let Some(cache) = manifest.options.disk_cache.as_ref() {
+        let sf = cache
+            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?;
+        sf.take_by_local_doc_ids(local_ids, &[id_column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+    } else {
+        let (obj_store, path) = storage
+            .object_store_handle(&entry.uri.storage_path())
+            .ok_or_else(|| {
+                QueryError::Execute("no object_store handle for superfile".into())
+            })?;
+        let file_size = entry.subsection_offsets.as_ref().map(|o| o.total_size);
+        let store = Arc::clone(&manifest.options.store);
+        let sf = super::dispatch::open_reader(&store, None, Some(storage), entry).await?;
+        super::exec::common::take_rows_object_store(
+            obj_store,
+            path,
+            file_size,
+            &sf.schema(),
+            sf.n_docs(),
+            local_ids,
+            &[id_column],
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?
+    };
     let col = batch
         .column(0)
         .as_any()
         .downcast_ref::<arrow_array::Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("hidden _id column missing".into()))?;
-    Ok(col.value(0))
+        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+    Ok(col.values().to_vec())
+}
+
+/// Remap step 1 (deduped): resolve the user `_id` that dual-write stamped into
+/// each hidden-index hit, returned in `hidden_hits` order.
+///
+/// Arithmetic when a hidden superfile's id span is contiguous. The hidden index
+/// is cell-partitioned, so a cell aggregates scattered user ids and its id
+/// range is usually gapped — `id_min + local` rarely holds — so the common case
+/// is a column read. Hits are grouped by hidden superfile so each gapped
+/// superfile's `_id` column is read **once** (resident via the disk cache),
+/// reading only the rows the hits touch — versus the previous per-hit
+/// object-store read that dominated warm latency.
+async fn hidden_hits_user_ids(
+    hidden_manifest: &Manifest,
+    hidden_hits: &[SuperfileHit],
+    id_column: &str,
+) -> Result<Vec<i128>, QueryError> {
+    let mut ids = vec![0i128; hidden_hits.len()];
+    let mut by_superfile: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
+    for (i, hit) in hidden_hits.iter().enumerate() {
+        by_superfile.entry(hit.superfile).or_default().push(i);
+    }
+    for (uri, idxs) in by_superfile {
+        let entry = hidden_manifest
+            .superfiles
+            .iter()
+            .find(|e| e.uri == uri)
+            .ok_or_else(|| {
+                QueryError::Execute(format!("hidden superfile {uri:?} missing from manifest"))
+            })?;
+        // Contiguous span → arithmetic, no read.
+        if row_id_from_manifest_entry(entry, 0).is_some() {
+            for &i in &idxs {
+                ids[i] = entry.id_min + i128::from(hidden_hits[i].local_doc_id);
+            }
+            continue;
+        }
+        // Gapped span → one resident read of just the rows these hits touch.
+        let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
+        let vals = read_ids_for_locals(hidden_manifest, entry, &locals, id_column).await?;
+        for (j, &i) in idxs.iter().enumerate() {
+            ids[i] = vals[j];
+        }
+    }
+    Ok(ids)
 }
 
 /// `_id`-only hidden-index fast path. The caller wants only `_id` + `score`,
@@ -272,12 +323,8 @@ async fn hidden_hits_id_score_batch(
     let hidden_manifest: &Manifest = vit_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
 
-    let mut ids = Vec::with_capacity(hidden_hits.len());
-    let mut scores = Vec::with_capacity(hidden_hits.len());
-    for hit in hidden_hits {
-        ids.push(hidden_hit_user_id(hidden_manifest, hit, id_column).await?);
-        scores.push(hit.score);
-    }
+    let ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
+    let scores: Vec<f32> = hidden_hits.iter().map(|h| h.score).collect();
     super::exec::common::id_score_batch(user_reader, &ids, &scores)
         .map_err(|e| QueryError::Execute(e.to_string()))
 }
@@ -299,10 +346,18 @@ async fn remap_hidden_hits_to_user_hits(
     let user_manifest = user_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
 
-    let mut remapped = Vec::with_capacity(hidden_hits.len());
-    for hit in hidden_hits {
-        let user_row_id = hidden_hit_user_id(hidden_manifest, hit, id_column).await?;
+    // Step 1: hidden hit → stable user `_id` (deduped, resident).
+    let user_ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
 
+    // Step 2: user `_id` → (user superfile, local row). Resolve the owning
+    // superfile by id range; arithmetic when its span is contiguous, else
+    // binary-search the superfile's `_id` column — read once per superfile
+    // (resident via the disk cache), grouped so a gapped superfile is never
+    // re-read per hit. A per-superfile id-run index (issue #164) would make the
+    // gapped case O(1) and drop the column read entirely.
+    let mut remapped: Vec<Option<SuperfileHit>> = vec![None; hidden_hits.len()];
+    let mut gapped: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
+    for (i, &user_row_id) in user_ids.iter().enumerate() {
         let user_entry = user_manifest
             .superfiles
             .iter()
@@ -310,74 +365,48 @@ async fn remap_hidden_hits_to_user_hits(
             .ok_or_else(|| {
                 QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
             })?;
-        let n_docs = i128::from(user_entry.n_docs);
-        let span = user_entry
-            .id_max
-            .checked_sub(user_entry.id_min)
-            .and_then(|d| d.checked_add(1))
-            .ok_or_else(|| QueryError::Execute("user id span overflow".into()))?;
-        let local_doc_id = if n_docs != 0 && span == n_docs {
-            // Contiguous span (single-append superfile): the stable id is
-            // exactly `id_min + local_doc_id`, so invert by arithmetic.
-            u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
+        if row_id_from_manifest_entry(user_entry, 0).is_some() {
+            // Contiguous span (single-append): invert `id_min + local`.
+            let local = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
                 QueryError::Execute(format!("local_doc_id out of range for id {user_row_id}"))
-            })?
-        } else {
-            // Gapped span: under 128-bit Snowflake ids a multi-append /
-            // compacted superfile's id range is piecewise-contiguous, so
-            // `id_min + local` does not hold. Read the `_id` column via the
-            // cold/lazy object-store path and binary-search for the row id
-            // (ids are minted in row order → the column is monotonic). A
-            // carried per-superfile id-run index (issue #164) would make this
-            // O(1) instead of a column read; dedup-by-superfile would avoid
-            // re-reading it per hit.
-            let storage = user_manifest.options.storage.as_ref().ok_or_else(|| {
-                QueryError::Execute(
-                    "gapped-id remap needs a storage backend to read the user _id column".into(),
-                )
             })?;
-            let (obj_store, path) = storage
-                .object_store_handle(&user_entry.uri.storage_path())
-                .ok_or_else(|| {
-                    QueryError::Execute("no object_store handle for user superfile".into())
-                })?;
-            let file_size = user_entry.subsection_offsets.as_ref().map(|o| o.total_size);
-            let store = Arc::clone(&user_manifest.options.store);
-            let disk_cache = user_manifest.options.disk_cache.as_ref().map(Arc::clone);
-            let sf =
-                super::dispatch::open_reader(&store, disk_cache.as_ref(), Some(storage), user_entry)
-                    .await?;
-            let schema = sf.schema();
-            let n = sf.n_docs();
-            let locals: Vec<u32> = (0..n as u32).collect();
-            let batch = super::exec::common::take_rows_object_store(
-                obj_store,
-                path,
-                file_size,
-                &schema,
-                n,
-                &locals,
-                &[id_column],
-            )
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::Decimal128Array>()
-                .ok_or_else(|| QueryError::Execute("user _id column missing".into()))?;
-            let pos = col.values().binary_search(&user_row_id).map_err(|_| {
+            remapped[i] = Some(SuperfileHit {
+                superfile: user_entry.uri,
+                local_doc_id: local,
+                score: hidden_hits[i].score,
+            });
+        } else {
+            gapped.entry(user_entry.uri).or_default().push(i);
+        }
+    }
+    for (uri, idxs) in gapped {
+        let user_entry = user_manifest
+            .superfiles
+            .iter()
+            .find(|e| e.uri == uri)
+            .ok_or_else(|| {
+                QueryError::Execute(format!("user superfile {uri:?} missing from manifest"))
+            })?;
+        let n = user_entry.n_docs as usize;
+        let all_locals: Vec<u32> = (0..n as u32).collect();
+        // Column is monotonic (ids minted in row order) → binary-searchable.
+        let id_col = read_ids_for_locals(user_manifest, user_entry, &all_locals, id_column).await?;
+        for &i in &idxs {
+            let user_row_id = user_ids[i];
+            let pos = id_col.binary_search(&user_row_id).map_err(|_| {
                 QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
             })?;
-            pos as u32
-        };
-        remapped.push(SuperfileHit {
-            superfile: user_entry.uri,
-            local_doc_id,
-            score: hit.score,
-        });
+            remapped[i] = Some(SuperfileHit {
+                superfile: uri,
+                local_doc_id: pos as u32,
+                score: hidden_hits[i].score,
+            });
+        }
     }
-    Ok(remapped)
+    remapped
+        .into_iter()
+        .map(|h| h.ok_or_else(|| QueryError::Execute("hit remap incomplete".into())))
+        .collect()
 }
 
 impl SupertableReader {
@@ -398,14 +427,17 @@ impl SupertableReader {
         })?;
         let query = Arc::new(query.to_vec());
         let storage = Arc::clone(storage);
+        let disk_cache = manifest.options.disk_cache.clone();
         let handles: Vec<_> = superfiles
             .iter()
             .map(|entry| {
                 let storage = Arc::clone(&storage);
+                let disk_cache = disk_cache.clone();
                 let entry = Arc::clone(entry);
                 let query = Arc::clone(&query);
                 tokio::spawn(async move {
-                    let blob = fetch_cell_posting_blob(&storage, &entry).await?;
+                    let blob =
+                        fetch_cell_posting_blob(&storage, disk_cache.as_ref(), &entry).await?;
                     let hits = cell_posting::search_blob(&blob, &query, k)
                         .map_err(|e| QueryError::Execute(e))?;
                     Ok::<_, QueryError>(dispatch::tag_hits(&entry, hits))

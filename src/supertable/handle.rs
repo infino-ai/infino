@@ -1558,6 +1558,203 @@ mod tests {
         assert!(!hits.is_empty(), "search should find committed vectors");
     }
 
+    /// The hidden cell-posting superfiles must be made *resident* in the
+    /// disk cache by a vector query, and a warm re-query must serve from
+    /// that resident mmap without re-fetching from storage.
+    ///
+    /// Regression guard: the cell-posting read path used to `get_range`
+    /// straight from object storage, bypassing the cache entirely — so the
+    /// hidden superfiles were never resident and every (incl. warm) vector
+    /// query paid an object-store round-trip. The fix routes the read
+    /// through `reader_synchronous_with_storage`, cold-fetching through the
+    /// hidden table's *prefixed* storage (the shared cache is keyed to the
+    /// user storage and can't resolve the hidden prefix on its own).
+    #[test]
+    fn hidden_cell_posting_superfiles_become_resident_in_cache() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::builder::{FtsConfig, VectorConfig};
+        use crate::superfile::reader::VectorSearchOptions;
+        use crate::superfile::vector::distance::Metric;
+        use crate::superfile::vector::rerank_codec::RerankCodec;
+        use crate::supertable::reader_cache::{
+            ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
+        };
+
+        let dim = 16usize;
+        // A few hundred vectors across several cells. Cell-posting hidden
+        // superfiles are never inlined into the manifest open_blob, so the
+        // query reads each probed cell's vec blob from storage through the
+        // disk cache regardless of size.
+        let n_rows = 512usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Fp32,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+        };
+
+        // ---- Producer: create + commit, then drop. The producer's own
+        // post-commit cache pre-population is irrelevant here — we test a
+        // *fresh* consumer process (cold cache), as on a real deployment.
+        {
+            let producer = Supertable::create(make_options().with_writer_pool(pool)).expect("create");
+
+            // Diverse vectors so the hidden cell-posting index has real content.
+            let titles = LargeStringArray::from(
+                (0..n_rows).map(|i| format!("doc {i}")).collect::<Vec<_>>(),
+            );
+            let mut flat = Vec::<f32>::with_capacity(n_rows * dim);
+            for i in 0..n_rows {
+                for d in 0..dim {
+                    flat.push(if d == i % dim { 1.0 } else { 0.0 });
+                }
+            }
+            let fsl = FixedSizeListArray::new(
+                item_field,
+                dim as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            );
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = producer.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // ---- Consumer: open fresh with a brand-new empty disk cache,
+        // keyed (as in production) to the *user* storage. The hidden index
+        // lives behind a prefixed provider over the same storage and shares
+        // this cache instance.
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            disk_budget_bytes: 1 << 30,
+            cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+            cold_fetch_streams: 4,
+            cold_fetch_chunk_bytes: 1 << 20,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            eviction: Box::new(LruPolicy::new()),
+            verify_crc_on_open: true,
+            ..Default::default()
+        };
+        let pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> =
+            Arc::new(HashSet::new);
+        let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned_fn).expect("cache");
+
+        let st =
+            Supertable::open(make_options().with_disk_cache(Arc::clone(&cache))).expect("open");
+
+        // Collect the hidden cell-posting superfile URIs.
+        let reader = st.reader();
+        let hidden = reader.vector_index_table().expect("hidden index");
+        let hidden_uris: Vec<SuperfileUri> = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.uri)
+            .collect();
+        assert!(
+            !hidden_uris.is_empty(),
+            "hidden cell-posting index must have superfiles after commit"
+        );
+
+        // Cold: none of the hidden superfiles are resident yet.
+        for uri in &hidden_uris {
+            assert!(
+                !cache.is_cached(uri),
+                "hidden superfile {uri:?} unexpectedly resident before any query"
+            );
+        }
+
+        // First vector query routes through the cell-posting path.
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .expect("vector search");
+        assert!(!hits.is_empty(), "search should find committed vectors");
+
+        // Every probed hidden cell-posting superfile must now be resident
+        // (mmap-backed), proving the read went through the disk cache via
+        // the hidden prefixed storage — not a bare object-store get_range.
+        let resident: Vec<&SuperfileUri> =
+            hidden_uris.iter().filter(|u| cache.is_cached(u)).collect();
+        assert!(
+            !resident.is_empty(),
+            "vector query must make at least one hidden cell-posting superfile \
+             resident in the cache; none of {hidden_uris:?} are cached"
+        );
+        for uri in &resident {
+            assert!(
+                cache.is_mmap_promoted(uri),
+                "resident hidden superfile {uri:?} must be mmap-backed"
+            );
+        }
+
+        // Warm re-query: the resident superfiles serve locally — no new
+        // cold-fetch. This is the warm-latency regression guard.
+        let cold_before = cache.stats().n_cold_fetches;
+        let hits2 = st
+            .reader()
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .expect("warm vector search");
+        assert!(!hits2.is_empty());
+        let cold_after = cache.stats().n_cold_fetches;
+        assert_eq!(
+            cold_before, cold_after,
+            "warm vector query must hit the resident cache; cold-fetches grew \
+             from {cold_before} to {cold_after}"
+        );
+    }
+
 
     /// A storage-backed handle under `Consistency::Strong` drives
     /// `ensure_fresh`'s Strong arm, which calls `refresh`. With no

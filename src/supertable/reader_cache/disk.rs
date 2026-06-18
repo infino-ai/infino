@@ -442,6 +442,21 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        let storage = Arc::clone(&self.storage);
+        self.reader_synchronous_with_storage(uri, storage).await
+    }
+
+    /// Like [`Self::reader_synchronous`], but fetches a cache miss through
+    /// `fetch_storage` instead of the cache's own `self.storage`. Needed for
+    /// the hidden vector-index, whose superfiles live behind a prefixed storage
+    /// provider that the shared (user-keyed) cache's `self.storage` can't
+    /// resolve — without this the cold-fetch reads the wrong path. On a cache
+    /// hit it returns the resident mmap-backed reader regardless of storage.
+    pub async fn reader_synchronous_with_storage(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        fetch_storage: Arc<dyn StorageProvider>,
+    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
             return Ok(Arc::clone(&entry.reader));
@@ -452,9 +467,7 @@ impl DiskCacheStore {
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
         let result = cell
-            .get_or_init(|| async {
-                self.cold_fetch(uri, Arc::clone(&self.storage)).await
-            })
+            .get_or_init(|| async { self.cold_fetch(uri, Arc::clone(&fetch_storage)).await })
             .await;
         match result {
             Ok(entry) => {
@@ -464,7 +477,7 @@ impl DiskCacheStore {
             Err(_e) => {
                 self.coordinators.remove(uri);
                 Err(self
-                    .cold_fetch(uri, Arc::clone(&self.storage))
+                    .cold_fetch(uri, Arc::clone(&fetch_storage))
                     .await
                     .err()
                     .unwrap_or(DiskCacheError::SuperfileOpen("cold fetch error".into())))

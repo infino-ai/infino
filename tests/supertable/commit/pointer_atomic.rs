@@ -168,6 +168,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
             column: "doc_id".into(),
             n_buckets: DEFAULT_HASH_N_BUCKETS,
         },
+        vector_index_storage_prefix: None,
         parts,
     }
 }

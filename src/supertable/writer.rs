@@ -1730,13 +1730,28 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
     };
     let total_size = bytes.len() as u64;
     let layout = read_vector_layout_from_bytes(bytes);
-    let vec_open_ranges = if layout == crate::superfile::vector::layout::VectorLayout::CellPosting {
-        vec.map(|(off, len)| vec![(off, len)]).unwrap_or_default()
-    } else {
-        vec
-            .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
-            .unwrap_or_default()
-    };
+    if layout == crate::superfile::vector::layout::VectorLayout::CellPosting {
+        // Cell-posting hidden superfiles are read in bulk (a full-cell scan of
+        // the contiguous vec blob) and served resident from the disk cache.
+        // Staging their bytes into the manifest `open_blob` would replicate the
+        // entire vector index into the manifest — its size would grow with the
+        // whole dataset (memory + cold-load GET cost), since the open overlay
+        // captures each superfile's vec blob *and* parquet tail. Skip the
+        // inline overlay entirely; the vec subsection is fetched on demand
+        // (and cached) via `fetch_cell_posting_blob`. Offsets are still carried
+        // so that fetch knows where to read.
+        return Some(SubsectionOffsets {
+            total_size,
+            vec,
+            fts,
+            vec_open_ranges: Vec::new(),
+            fts_open_ranges: Vec::new(),
+            open_blob: Vec::new(),
+        });
+    }
+    let vec_open_ranges = vec
+        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+        .unwrap_or_default();
     let fts_open_ranges = fts
         .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
         .unwrap_or_default();
