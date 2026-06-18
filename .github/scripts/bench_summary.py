@@ -35,6 +35,10 @@ KEY_PARTS = 4
 # everything else comparable is lower-is-better. Text-only columns are skipped.
 HIGHER_BETTER = ("Throughput", "Bandwidth")
 TEXT_ONLY = ("Corpus", "Superfiles")
+# Cost cells are USD/queries-per-$ figures, not nanoseconds, and their keys
+# embed volatile text — they don't diff cleanly. Skip them (the comment says
+# so) rather than mis-unit them as latency.
+COST_TOKENS = ("$", "cost", "measured", "per-unit")
 
 # Map a report basename to (subsystem label, source area).
 SUBSYSTEM = {
@@ -70,8 +74,13 @@ def higher_is_better(header):
     return any(t in header for t in HIGHER_BETTER)
 
 
+def is_cost(header):
+    h = header.lower()
+    return any(t in h for t in COST_TOKENS)
+
+
 def is_latency(header):
-    """Lower-is-better and measured in nanoseconds (Time, p50, cold, latency)."""
+    """Lower-is-better and measured in nanoseconds (Time, p50, cold, count())."""
     h = header.lower()
     return not higher_is_better(header) and "rss" not in h and "stored" not in h
 
@@ -150,9 +159,10 @@ def diff(reports, baseline_dir, current_dir, history_dir, threshold):
             if len(parts) != KEY_PARTS:
                 continue
             _anchor, _subtitle, label, header = parts
-            if "$" in key:
-                cost_present = True
             if is_text_only(header):
+                continue
+            if is_cost(header):
+                cost_present = True
                 continue
             old = base.get(key)
             if old is None or old == 0.0:
