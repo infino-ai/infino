@@ -133,8 +133,8 @@ def main_trend(history_maps, key, header, threshold):
     if abs(drift) < threshold:
         return f"main stable ({drift:+.0f}% over {n} commits)", "flat"
     improved = drift > 0 if higher_is_better(header) else drift < 0
-    word = "improving" if improved else "worsening"
-    short = f"{'better' if improved else 'worse'} {abs(drift):.0f}%"
+    word = "improving" if improved else "degrading"
+    short = f"{word} {abs(drift):.0f}%"
     return f"main {word} {drift:+.0f}% over {n} commits", short
 
 
@@ -310,8 +310,9 @@ def main():
                   "", table(improvements), "", "</details>", ""]
 
     if regressions or improvements:
-        parts.append("_`main → run` = baseline vs this PR · `Main (10c)` = how main "
-                     "itself trended over its last ≤10 commits._")
+        parts.append("_`Δ` = this PR vs `main` — the regression/improvement verdict. "
+                     "`Main (10c)` = how `main` itself moved over its last ≤10 commits, "
+                     "independent of this PR (a regression on an `improving` metric means this PR reverses that trend)._")
         touched = {e["subsystem"]: e["area"] for e in regressions + improvements if e.get("area")}
         if touched:
             parts.append("_Where to look: " + " · ".join(
