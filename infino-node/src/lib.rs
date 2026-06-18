@@ -237,6 +237,19 @@ impl From<infino::MutationStats> for MutationStats {
     }
 }
 
+/// Text-predicate filter for `vectorSearch` — a pushdown pre-filter, not a
+/// post-filter: kNN ranks only among rows whose FTS-indexed `column` matches
+/// `query`. `mode` is `"or"` (default) or `"and"`.
+#[napi(object)]
+pub struct VectorFilter {
+    /// FTS-indexed column the predicate applies to.
+    pub column: String,
+    /// Query terms, tokenized by the index tokenizer.
+    pub query: String,
+    /// Token matching mode: `"or"` (default) or `"and"`.
+    pub mode: Option<String>,
+}
+
 /// Declares which columns are full-text (BM25) and which are vector (IVF
 /// kNN) indexed. Built fluently:
 /// `new IndexSpec().fts("body").vector("emb", 384, 256, "cosine")`.
@@ -445,6 +458,7 @@ impl Table {
     /// returned columns (`["_id", "score"]` for just id + score, or omit
     /// for full rows).
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn vector_search(
         &self,
         column: String,
@@ -453,6 +467,7 @@ impl Table {
         nprobe: Option<u32>,
         rerank_mult: Option<u32>,
         projection: Option<Vec<String>>,
+        filter: Option<VectorFilter>,
     ) -> Result<Buffer> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
@@ -461,11 +476,20 @@ impl Table {
         if let Some(m) = rerank_mult {
             opts = opts.with_rerank_mult(m as usize);
         }
+        // Optional text-predicate filter (pushdown), borrowing the JS object.
+        let vfilter = match &filter {
+            Some(f) => Some(infino::VectorFilter {
+                column: &f.column,
+                query: &f.query,
+                mode: parse_mode(f.mode.as_deref())?,
+            }),
+            None => None,
+        };
         let proj: Option<Vec<&str>> =
             projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts, None, proj.as_deref())
+            .vector_search(&column, query.as_ref(), k as usize, opts, vfilter, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }

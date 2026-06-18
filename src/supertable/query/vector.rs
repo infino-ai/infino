@@ -722,6 +722,13 @@ impl Supertable {
     /// the IVF fan-out, and resolves the top-`k` nearest hits to Arrow
     /// rows.
     ///
+    /// `filter` optionally restricts the search to rows matching a text
+    /// predicate (see [`VectorFilter`]): kNN is ranked only among the
+    /// matching rows — a pushdown into the ranking, not a post-filter over
+    /// the global top-`k`, so it still returns the true `k` nearest
+    /// *matching* rows even when nearer non-matching rows exist. The filter
+    /// column must be FTS-indexed; `None` searches all rows.
+    ///
     /// `projection` selects output columns by name (any of `_id`, the
     /// visible scalar columns, or the trailing `score`); `None` returns
     /// the engine-native result — `_id` + `score` only. Only the

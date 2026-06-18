@@ -78,11 +78,14 @@ docs.bm25Search("body", "fox", 10, { projection: ["_id", "score"] }); // id + sc
   - `append(data)` — an array of objects or an apache-arrow
     `Table`/`RecordBatch`. One `append` is one commit.
   - `bm25Search(col, q, k, { mode?, projection?, arrow? })` /
-    `vectorSearch(col, query, k, { nprobe?, rerankMult?, projection?, arrow? })` —
+    `vectorSearch(col, query, k, { nprobe?, rerankMult?, projection?, arrow?, filter? })` —
     ranked search; return matching rows as records (or an apache-arrow
     `Table` with `{ arrow: true }`). `query` is a `number[]` or
     `Float32Array`. `projection` (e.g. `["_id", "score"]`) selects the
-    returned columns; omit for full rows.
+    returned columns; omit for full rows. `filter`
+    (`{ column, query, mode? }`, `column` must be FTS-indexed) restricts the
+    kNN to rows matching a text predicate — a pushdown pre-filter, so results
+    are the nearest *matching* rows.
   - `tokenMatch(col, q, { mode?, projection?, arrow? })` /
     `exactMatch(col, value, { projection?, arrow? })` — unranked matching
     rows (`score` is `0`).

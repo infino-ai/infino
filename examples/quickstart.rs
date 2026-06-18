@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{BoolMode, IndexSpec, Metric, VectorSearchOptions, connect};
+use infino::{BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions, connect};
 
 /// Embedding width for the demo vector column. Small on purpose (the
 /// engine's minimum is 16) — the point is the API shape, not recall.
@@ -77,6 +77,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(&["_id", "title", "score"]),
     )?;
     print_batches(&knn);
+
+    // B2 — filtered vector kNN. Push a text predicate into the ranking:
+    // rank by vector distance, but only among rows whose `title` matches
+    // "dog". This is a pushdown pre-filter, not a post-filter over the
+    // top-K, so the query embedding (row 0, "fox") still yields the nearest
+    // *matching* row rather than an empty result.
+    println!("== B2. filtered vector kNN (title matches \"dog\") ==");
+    let filtered = docs.vector_search(
+        "emb",
+        &query,
+        SEARCH_TOP_K,
+        VectorSearchOptions::new(),
+        Some(VectorFilter {
+            column: "title",
+            query: "dog",
+            mode: BoolMode::Or,
+        }),
+        Some(&["_id", "title", "score"]),
+    )?;
+    print_batches(&filtered);
 
     // C — SQL over the catalog. Every superfile is also a valid Parquet
     // file, so the same data answers plain SQL.
