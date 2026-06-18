@@ -85,6 +85,19 @@ pub trait SuperfileReaderCache: Send + Sync {
     /// cached superfile. Used by tests + observability that need to
     /// confirm RAM bounds match expectations.
     fn resident_bytes(&self) -> usize;
+
+    /// Replace bytes for `uri`. Unlike [`insert`](Self::insert), overwrites
+    /// an existing entry — used when a fixed cell URI is read-merge-write-
+    /// replaced (cell-posting hidden index).
+    fn replace(&self, uri: SuperfileUri, bytes: Bytes) -> Result<(), ReaderCacheError> {
+        let _ = (uri, bytes);
+        Err(ReaderCacheError::OpenFailed {
+            source: crate::superfile::ReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "replace not implemented for this cache",
+            )),
+        })
+    }
 }
 
 /// Error type for [`SuperfileReaderCache`] operations.

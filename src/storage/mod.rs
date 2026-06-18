@@ -356,6 +356,13 @@ impl StorageProvider for PrefixedStorageProvider {
             .map(|s| s[strip_len..].to_owned())
             .collect())
     }
+
+    fn object_store_handle(
+        &self,
+        uri: &str,
+    ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+        self.inner.object_store_handle(&self.prefixed(uri))
+    }
 }
 
 #[cfg(test)]

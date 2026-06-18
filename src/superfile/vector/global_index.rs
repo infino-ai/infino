@@ -15,7 +15,7 @@ use std::collections::BinaryHeap;
 use serde::{Deserialize, Serialize};
 
 use crate::superfile::vector::distance::{Metric, SQ8_RESIDUAL_DIVISOR, distance};
-use crate::superfile::vector::kmeans::{assign_to_centroids, kmeans_with_assignments};
+use crate::superfile::vector::kmeans::kmeans_with_assignments;
 
 /// Lloyd iterations for the global coarse quantizer.
 const GLOBAL_KMEANS_ITERS: usize = 5;

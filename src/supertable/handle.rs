@@ -742,10 +742,10 @@ pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 
 /// Lloyd iterations when folding per-superfile cluster centroids into the
 /// global cell grid at open/create time.
-const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
+pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 
 /// Fixed PRNG seed for global centroid training.
-const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
+pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 
 /// Train global VectorCell centroids from the user manifest and queue them
 /// on the hidden index table for its next commit.
@@ -775,44 +775,9 @@ pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool 
     true
 }
 
-/// Train global centroids from the user manifest, queue on hidden, and stamp
-/// the hidden manifest list before the hidden writer commits.
-pub(super) fn sync_hidden_vector_cell_strategy_from_user(
-    user_inner: &SupertableInner,
-    hidden: &Supertable,
-) {
-    queue_hidden_vector_cell_strategy(user_inner, hidden);
-    apply_pending_partition_strategy(&hidden.inner);
-}
-
-pub(super) fn queue_hidden_vector_cell_strategy(
-    user_inner: &SupertableInner,
-    hidden: &Supertable,
-) {
-    let Some(clusters) = train_global_centroids(
-        &user_inner.options,
-        &user_inner.manifest.load_full(),
-        GLOBAL_VECTOR_CELL_COUNT,
-    ) else {
-        return;
-    };
-    let column = user_inner
-        .options
-        .vector_columns
-        .first()
-        .map(|vc| vc.column.clone())
-        .unwrap_or_default();
-    let strategy = super::manifest::list::PartitionStrategy::VectorCell {
-        column,
-        clusters,
-    };
-    *hidden
-        .inner
-        .pending_partition_strategy
-        .lock()
-        .expect("pending_partition_strategy mutex poisoned") = Some(strategy);
-}
-
+/// Open-time bootstrap only: derive initial global centroids from an
+/// existing user-table IVF summary. Hidden commits use
+/// [`super::spfresh`] MVCC maintenance — never call this per commit.
 pub(crate) fn train_global_centroids(
     user_opts: &SupertableOptions,
     manifest: &super::manifest::Manifest,

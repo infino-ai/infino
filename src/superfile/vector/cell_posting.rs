@@ -128,7 +128,7 @@ pub fn encode_blob(
     Ok(out)
 }
 
-pub fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
+fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
     let body = bytes
         .strip_prefix(MAGIC)
         .ok_or_else(|| "bad cell posting magic".to_string())?;

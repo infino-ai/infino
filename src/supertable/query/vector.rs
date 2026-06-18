@@ -73,7 +73,7 @@ use crate::storage::StorageProvider;
 use bytes::Bytes;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
+use crate::supertable::manifest::SuperfileEntry;
 use arrow::record_batch::RecordBatch;
 
 use super::SuperfileHit;
@@ -180,19 +180,24 @@ fn hits_reference_user_superfiles(reader: &SupertableReader, hits: &[SuperfileHi
     })
 }
 
-/// Resolve a stable row id from manifest span arithmetic when the superfile
-/// body stores rows in contiguous id order.
-fn row_id_from_manifest_entry(entry: &SuperfileEntry, local_doc_id: u32) -> Option<i128> {
-    let n_docs = i128::from(entry.n_docs);
-    let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
-    if n_docs == 0 || span != n_docs {
-        return None;
-    }
-    Some(entry.id_min + i128::from(local_doc_id))
-}
-
 /// Map hidden-index `(superfile, local_doc_id)` hits to user-table hits
 /// using aligned `_id` values stamped during dual-write.
+
+fn user_local_for_row_id(entry: &SuperfileEntry, row_id: i128) -> Result<u32, QueryError> {
+    let n_docs = i128::from(entry.n_docs);
+    let span = entry
+        .id_max
+        .checked_sub(entry.id_min)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| QueryError::Execute("user id span overflow".into()))?;
+    if n_docs > 0 && span == n_docs {
+        return u32::try_from(row_id - entry.id_min).map_err(|_| {
+            QueryError::Execute(format!("local_doc_id out of range for id {row_id}"))
+        });
+    }
+    Err(QueryError::Execute("user superfile id span mismatch".into()))
+}
+
 async fn remap_hidden_hits_to_user_hits(
     user_reader: &SupertableReader,
     hidden_hits: &[SuperfileHit],
@@ -204,110 +209,46 @@ async fn remap_hidden_hits_to_user_hits(
         .vector_index_table()
         .ok_or_else(|| QueryError::Execute("hidden vector index missing".into()))?;
     let vit_reader = vit.reader();
-    let hidden_manifest = vit_reader.manifest();
     let user_manifest = user_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
 
-    let mut by_superfile: std::collections::BTreeMap<
-        SuperfileUri,
-        Vec<(u32, f32)>,
-    > = std::collections::BTreeMap::new();
-    for hit in hidden_hits {
-        by_superfile
-            .entry(hit.superfile)
-            .or_default()
-            .push((hit.local_doc_id, hit.score));
+    // Resolve hidden (superfile, local_doc_id) → stable `_id` using the same
+    // warm/cold path as `vector_search` → `resolve_hits_named` (manifest
+    // arithmetic when the span is contiguous, otherwise projected range GETs
+    // via `take_rows_object_store` — never a whole-superfile fetch).
+    let id_batch = resolve_hits_named(&vit_reader, hidden_hits, Some(&[id_column]), "vector_remap")
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
+    let col = id_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Decimal128Array>()
+        .ok_or_else(|| QueryError::Execute(format!("{id_column} column missing")))?;
+    if col.len() != hidden_hits.len() {
+        return Err(QueryError::Execute(format!(
+            "vector_remap: expected {} ids, got {}",
+            hidden_hits.len(),
+            col.len()
+        )));
     }
 
     let mut remapped = Vec::with_capacity(hidden_hits.len());
-    for (uri, mut locals) in by_superfile {
-        let hidden_entry = hidden_manifest
-            .find_superfile_by_uri(&uri)
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+    for (row_idx, hit) in hidden_hits.iter().enumerate() {
+        let user_row_id = col.value(row_idx);
+        let user_entry = user_manifest
+            .superfiles
+            .iter()
+            .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
             .ok_or_else(|| {
-                QueryError::Execute(format!("hidden superfile {uri:?} missing from manifest"))
+                QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
             })?;
-
-        locals.sort_by_key(|(local, _)| *local);
-        locals.dedup_by_key(|(local, _)| *local);
-
-        let mut row_ids: Vec<i128> = Vec::with_capacity(locals.len());
-        let mut pending_parquet: Vec<u32> = Vec::new();
-        let mut pending_idx: Vec<usize> = Vec::new();
-        for (i, (local_doc_id, _)) in locals.iter().enumerate() {
-            if let Some(id) = row_id_from_manifest_entry(&hidden_entry, *local_doc_id) {
-                row_ids.push(id);
-            } else {
-                pending_idx.push(i);
-                pending_parquet.push(*local_doc_id);
-                row_ids.push(i128::MIN);
-            }
-        }
-        if !pending_parquet.is_empty() {
-            let store = Arc::clone(&hidden_manifest.options.store);
-            let disk_cache = hidden_manifest.options.disk_cache.as_ref().map(Arc::clone);
-            let storage = hidden_manifest.options.storage.as_ref().map(Arc::clone);
-            let sf = super::dispatch::open_reader(
-                &store,
-                disk_cache.as_ref(),
-                storage.as_ref(),
-                &hidden_entry,
-            )
-            .await?;
-            let batch = sf
-                .take_by_local_doc_ids(&pending_parquet, &[id_column])
-                .map_err(|e| QueryError::Parquet(e.to_string()))?;
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::Decimal128Array>()
-                .ok_or_else(|| QueryError::Execute("hidden _id column missing".into()))?;
-            for (slot, row) in pending_idx.into_iter().zip(0..col.len()) {
-                row_ids[slot] = col.value(row);
-            }
-        }
-
-        for ((local_doc_id, score), user_row_id) in locals.iter().zip(row_ids.iter()) {
-            if *user_row_id == i128::MIN {
-                return Err(QueryError::Execute("hidden _id remap failed".into()));
-            }
-            let user_entry = user_manifest
-                .superfiles
-                .iter()
-                .find(|e| *user_row_id >= e.id_min && *user_row_id <= e.id_max)
-                .ok_or_else(|| {
-                    QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
-                })?;
-            let n_docs = i128::from(user_entry.n_docs);
-            let span = user_entry
-                .id_max
-                .checked_sub(user_entry.id_min)
-                .and_then(|d| d.checked_add(1))
-                .ok_or_else(|| QueryError::Execute("user id span overflow".into()))?;
-            if n_docs == 0 || span != n_docs {
-                return Err(QueryError::Execute(
-                    "user superfile id span mismatch".into(),
-                ));
-            }
-            let user_local = u32::try_from(*user_row_id - user_entry.id_min).map_err(|_| {
-                QueryError::Execute(format!(
-                    "local_doc_id out of range for id {user_row_id}"
-                ))
-            })?;
-            remapped.push(SuperfileHit {
-                superfile: user_entry.uri,
-                local_doc_id: user_local,
-                score: *score,
-            });
-            let _ = local_doc_id;
-        }
+        let user_local = user_local_for_row_id(user_entry, user_row_id)?;
+        remapped.push(SuperfileHit {
+            superfile: user_entry.uri,
+            local_doc_id: user_local,
+            score: hit.score,
+        });
     }
-    remapped.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(Ordering::Equal)
-    });
     Ok(remapped)
 }
 
@@ -634,7 +575,16 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.block_on(self.vector_search_async(column, query, k, options))
+        self.block_on(async {
+            let hits = self
+                .vector_search_global_index_async(column, query, k, options)
+                .await?;
+            if hits_reference_user_superfiles(self, &hits) {
+                Ok(hits)
+            } else {
+                remap_hidden_hits_to_user_hits(self, &hits).await
+            }
+        })
     }
 }
 

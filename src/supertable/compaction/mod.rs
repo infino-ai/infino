@@ -711,8 +711,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn hidden_profile_select_merges_small_same_cell_files() {
         let mut segs = Vec::new();
         for i in 0..4 {
@@ -730,6 +728,7 @@ mod tests {
         assert!(jobs[0].inputs.len() >= 2);
     }
 
+    #[test]
     fn partitions_packed_independently() {
         let mut segs = Vec::new();
         for i in 0..5 {

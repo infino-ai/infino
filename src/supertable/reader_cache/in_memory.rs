@@ -123,6 +123,23 @@ impl SuperfileReaderCache for InMemoryReaderCache {
         Ok(())
     }
 
+    fn replace(&self, uri: SuperfileUri, bytes: Bytes) -> Result<(), ReaderCacheError> {
+        let reader = SuperfileReader::open(bytes.clone())
+            .map_err(|source| ReaderCacheError::OpenFailed { source })?;
+        let mut map = self
+            .inner
+            .write()
+            .expect("InMemoryReaderCache rwlock poisoned");
+        map.insert(
+            uri,
+            Entry {
+                bytes,
+                reader: Arc::new(reader),
+            },
+        );
+        Ok(())
+    }
+
     fn resident_bytes(&self) -> usize {
         self.inner
             .read()
