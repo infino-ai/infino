@@ -458,8 +458,14 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
-            entry.last_access_us.store(self.now_us(), Ordering::Release);
-            return Ok(Arc::clone(&entry.reader));
+            // Only serve cache hits that are mmap-promoted (resident bytes).
+            // Lazy-foreground entries stay in `cached` with `mmap == None` until
+            // background fill completes; returning them here breaks eager paths
+            // like `take_by_local_doc_ids` during hidden-hit remap.
+            if entry.mmap.is_some() {
+                entry.last_access_us.store(self.now_us(), Ordering::Release);
+                return Ok(Arc::clone(&entry.reader));
+            }
         }
         let cell = self
             .coordinators
