@@ -1171,20 +1171,41 @@ impl VectorReader {
     /// The decoded vectors are approximate: `offset + code * scale + epsilon *
     /// scale / SQ8_RESIDUAL_DIVISOR`, matching the stored
     /// [`RerankCodec::Sq8ResidualEpsilon`] rows. Returns `None` unless the
-    /// index uses `Sq8ResidualEpsilon` with resident codec metadata.
+    /// index uses `Sq8ResidualEpsilon` (codec metadata may be eager or lazily
+    /// fetched from the subsection's `codec_meta` region).
     pub fn decode_index_vectors(&self, index_name: &str) -> Option<(Vec<u32>, Vec<f32>)> {
         let cid = *self.column_id_by_name.get(index_name)?;
         let col = &self.columns[cid as usize];
-        let (scale, offset) = match (col.rerank_codec, &col.sq8_meta) {
-            (RerankCodec::Sq8ResidualEpsilon, Some(Sq8ColumnMeta::Eager { scale, offset, .. })) => {
-                (scale.as_slice(), offset.as_slice())
+        if col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
+            return None;
+        }
+        let dim = col.dim;
+        let so_block_bytes = (col.n_cent as usize) * dim * 4;
+        let (scale_buf, offset_buf) = match &col.sq8_meta {
+            Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
+            Some(Sq8ColumnMeta::Lazy {
+                scale_abs_off,
+                offset_abs_off,
+                ..
+            }) => {
+                let scale_bytes = self
+                    .source
+                    .try_get_range_sync(*scale_abs_off..*scale_abs_off + so_block_bytes)?;
+                let offset_bytes = self
+                    .source
+                    .try_get_range_sync(*offset_abs_off..*offset_abs_off + so_block_bytes)?;
+                (
+                    parse_f32_le_vec(scale_bytes.as_ref()),
+                    parse_f32_le_vec(offset_bytes.as_ref()),
+                )
             }
             _ => return None,
         };
+        let scale = scale_buf.as_slice();
+        let offset = offset_buf.as_slice();
         let sub = self
             .source
             .try_get_range_sync(col.subsection_range.clone())?;
-        let dim = col.dim;
         let code_bytes = col.quant.code_bytes();
         let stride = col.per_cluster_doc_stride();
         let id_bytes = format::vec::DOC_ID_BYTES;

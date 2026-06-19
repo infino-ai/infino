@@ -216,7 +216,8 @@ fn schema() -> &'static AvroSchema {
                 {"name": "scalar_stats", "type": "bytes"},
                 {"name": "fts_summary", "type": "bytes"},
                 {"name": "vector_summary", "type": "bytes"},
-                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null}
+                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
+                {"name": "vector_layout", "type": ["null", "string"], "default": null}
               ]
             }}}
           ]
@@ -293,6 +294,15 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                         ),
                         None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
                     },
+                ),
+                (
+                    "vector_layout".into(),
+                    AvroValue::Union(
+                        AVRO_UNION_VALUE_INDEX,
+                        Box::new(AvroValue::String(
+                            seg.vector_layout.as_kv_value().into(),
+                        )),
+                    ),
                 ),
             ])
         })
@@ -398,6 +408,9 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let subsection_offsets = take_optional_bytes(&mut map, "subsection_offsets")?
         .map(|b| decode_subsection_offsets(&b))
         .transpose()?;
+    let vector_layout = take_optional_string(&mut map, "vector_layout")?
+        .and_then(|s| crate::superfile::vector::layout::VectorLayout::from_kv_value(&s))
+        .unwrap_or(crate::superfile::vector::layout::VectorLayout::Ivf);
 
     Ok(SuperfileEntry {
         superfile_id,
@@ -411,7 +424,7 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         partition_key,
         partition_hint,
         subsection_offsets,
-        vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+        vector_layout,
     })
 }
 
@@ -488,6 +501,26 @@ fn take_optional_int(
         AvroValue::Null => Ok(None),
         AvroValue::Int(v) => Ok(Some(v)),
         _ => Err(PartParseError::WrongFieldType(name)),
+    }
+}
+
+/// Pull an optional string field. Missing-key returns `Ok(None)` so
+/// new schema fields stay backward-compatible with parts emitted
+/// before they were added.
+fn take_optional_string(
+    map: &mut HashMap<String, AvroValue>,
+    name: &'static str,
+) -> Result<Option<String>, PartParseError> {
+    match map.remove(name) {
+        None => Ok(None),
+        Some(AvroValue::Union(_, boxed)) => match *boxed {
+            AvroValue::Null => Ok(None),
+            AvroValue::String(s) => Ok(Some(s)),
+            _ => Err(PartParseError::WrongFieldType(name)),
+        },
+        Some(AvroValue::Null) => Ok(None),
+        Some(AvroValue::String(s)) => Ok(Some(s)),
+        Some(_) => Err(PartParseError::WrongFieldType(name)),
     }
 }
 
@@ -1141,6 +1174,31 @@ mod tests {
         // Signed id range survives big-endian fixed encoding.
         assert_eq!(decoded.superfiles[0].id_min, -5);
         assert_eq!(decoded.superfiles[0].id_max, 7);
+    }
+
+    #[test]
+    fn vector_layout_cell_posting_roundtrip_through_part() {
+        let id = Uuid::new_v4();
+        let seg = Arc::new(SuperfileEntry {
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: ScalarStatsTable::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::CellPosting,
+            subsection_offsets: None,
+        });
+        let part = fresh_part(vec![seg]);
+        let decoded = decode(&encode(&part, 3)).expect("decode");
+        assert_eq!(
+            decoded.superfiles[0].vector_layout,
+            crate::superfile::vector::layout::VectorLayout::CellPosting
+        );
     }
 
     #[test]

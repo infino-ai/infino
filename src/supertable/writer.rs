@@ -233,6 +233,31 @@ fn split_buffer_into_row_shards(
 }
 
 
+/// Read Sq8+ε rerank rows from an incoming IVF superfile via
+/// [`VectorReader::decode_index_vectors`], scattered into local-doc-id order
+/// to align with the scalar `_id` batch.
+fn incoming_sq8_residual_rows_in_doc_order(
+    vec_reader: &crate::superfile::vector::reader::VectorReader,
+    column: &str,
+    n_rows: usize,
+    vec_dim: usize,
+) -> Result<Vec<f32>, BuildError> {
+    let (ids, flat) = vec_reader.decode_index_vectors(column).ok_or_else(|| {
+        BuildError::Store(format!(
+            "incoming drain: column '{column}' missing Sq8ResidualEpsilon index or codec meta"
+        ))
+    })?;
+    let mut out = vec![0.0f32; n_rows * vec_dim];
+    for (i, &doc_id) in ids.iter().enumerate() {
+        let row = doc_id as usize;
+        if row < n_rows {
+            let src = i * vec_dim;
+            out[row * vec_dim..(row + 1) * vec_dim].copy_from_slice(&flat[src..src + vec_dim]);
+        }
+    }
+    Ok(out)
+}
+
 fn append_batch_rows(rows: &mut Vec<(i128, Vec<f32>)>, batches: &[BufferedBatch], vec_dim: usize) {
     let mut row_index: HashMap<i128, usize> = rows
         .iter()
@@ -2204,10 +2229,20 @@ async fn persist_superfile_publish_batch_async(
         )
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
-        if !batch.pending_cache_inserts.is_empty()
-            && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
-        {
-            warm_cache_after_commit(inner, &cache, batch.pending_cache_inserts);
+        // Already async — await `insert_warm` directly. Do NOT call
+        // `warm_cache_after_commit` here: its `block_in_place` + nested
+        // `block_on` inside the `tokio::join!` commit future deadlocks the
+        // runtime (main thread parked, all workers idle).
+        if let Some(cache) = inner.options.disk_cache.as_ref() {
+            for (uri, bytes) in batch.pending_cache_inserts {
+                if let Err(e) = cache.insert_warm(&uri, bytes).await {
+                    tracing::warn!(
+                        "supertable: warm cache pre-population for {} failed: {e} \
+                         (superfile is durable in storage; first query will cold-fetch)",
+                        uri.0
+                    );
+                }
+            }
         }
         if let (Some(cache), Some(budget)) = (
             inner.options.disk_cache.as_ref(),
@@ -2283,8 +2318,8 @@ fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
         .ok();
 }
 
-/// Read each accumulated incoming IVF superfile back to `(_id, vector)` rows,
-/// assign every row to its nearest global cell, build one CellPosting superfile
+/// Read each accumulated incoming IVF superfile's Sq8+ε rerank rows back to
+/// `(_id, vector)` working values, assign every row to its nearest global cell, build one CellPosting superfile
 /// per touched cell, then publish those cell superfiles and remove the drained
 /// incoming superfiles in one OCC commit. This is the design's step 3: the
 /// incoming append region is "shifted" into the sorted per-cell base.
@@ -2345,7 +2380,9 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         .clone()
         .ok_or_else(|| BuildError::Store("incoming drain requires storage".into()))?;
 
-    // Reconstruct (_id, vector) rows from each incoming IVF superfile.
+    // Read (_id, Sq8+ε vector) rows from each incoming IVF superfile. Vectors are
+    // decoded with the Sq8Residual machinery (per-cluster scale/offset + code +
+    // residual sidecar), not the Fp32 rerank path.
     let mut buffer: Vec<BufferedBatch> = Vec::with_capacity(incoming.len());
     for entry in &incoming {
         let reader = crate::supertable::query::dispatch::open_reader(
@@ -2362,10 +2399,8 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         let vec_reader = reader
             .vec()
             .ok_or_else(|| BuildError::Store("incoming superfile missing vector index".into()))?;
-        let vecs = vec_reader
-            .get_vectors_fp32(&column)
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-        let flat: Vec<f32> = vecs.into_iter().flatten().collect();
+        let n_rows = scalar.num_rows();
+        let flat = incoming_sq8_residual_rows_in_doc_order(&vec_reader, &column, n_rows, vec_dim)?;
         buffer.push(BufferedBatch {
             scalar,
             vectors: vec![Arc::new(Float32Array::from(flat))],
