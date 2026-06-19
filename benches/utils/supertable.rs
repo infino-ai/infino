@@ -818,8 +818,6 @@ pub mod vector {
     const N_CALIBRATION_QUERIES: usize = 100;
     use infino::superfile::reader::VectorSearchOptions;
 
-    const DEFAULT_NPROBE: usize = VectorSearchOptions::DEFAULT_NPROBE;
-    const DEFAULT_RERANK_MULT: usize = VectorSearchOptions::RERANK_MULT;
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
@@ -831,21 +829,23 @@ pub mod vector {
     fn skip_calibration() -> bool {
         std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
     }
-    /// Fixed probe count for the `default` row, overridable with
-    /// `INFINO_BENCH_VECTOR_NPROBE` (defaults to [`DEFAULT_NPROBE`]).
-    fn fixed_nprobe() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_NPROBE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_NPROBE)
-    }
-    /// Fixed rerank multiplier for the `default` row, overridable with
-    /// `INFINO_BENCH_VECTOR_RERANK` (defaults to [`DEFAULT_RERANK_MULT`]).
-    fn fixed_rerank_mult() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_RERANK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_RERANK_MULT)
+
+    /// Engine defaults (`VectorSearchOptions::default()`), with optional
+    /// bench overrides via `INFINO_BENCH_VECTOR_NPROBE` /
+    /// `INFINO_BENCH_VECTOR_RERANK`.
+    fn bench_default_opts() -> VectorSearchOptions {
+        let mut opts = VectorSearchOptions::default();
+        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_NPROBE") {
+            if let Ok(n) = v.parse() {
+                opts = opts.with_nprobe(n);
+            }
+        }
+        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_RERANK") {
+            if let Ok(n) = v.parse() {
+                opts = opts.with_rerank_mult(n);
+            }
+        }
+        opts
     }
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
@@ -911,8 +911,7 @@ pub mod vector {
             // No corpus (existing-prefix) ⇒ no ground truth possible ⇒ force
             // skip-calibration: this path measures latency + memory only.
             let skip_cal = skip_calibration() || corpus.is_none();
-            let nprobe = fixed_nprobe();
-            let rerank = fixed_rerank_mult();
+            let default_opts = bench_default_opts();
 
             #[allow(clippy::type_complexity)]
             let (q_correct, q_cal, gt_correct, gt_cal): (
@@ -998,7 +997,7 @@ pub mod vector {
                         supertable::VEC_COLUMN,
                         &q_cal[0],
                         TOP_K,
-                        exec_vec::search_opts(nprobe, rerank),
+                        default_opts,
                     )
                     .expect("warm prewarm vector_hits");
                 consumer
@@ -1023,8 +1022,8 @@ pub mod vector {
                 supertable::VEC_COLUMN,
                 n_docs,
                 TOP_K,
-                nprobe,
-                rerank,
+                default_opts.nprobe,
+                default_opts.rerank_mult(),
                 &q_correct,
                 &gt_correct,
                 &q_cal,

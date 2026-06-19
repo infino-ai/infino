@@ -734,8 +734,12 @@ pub mod vector {
 
     const NS_PER_SEC: f64 = 1e9;
 
+    pub fn default_search_opts() -> VectorSearchOptions {
+        VectorSearchOptions::default()
+    }
+
     pub fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
-        VectorSearchOptions::new()
+        VectorSearchOptions::default()
             .with_nprobe(nprobe)
             .with_rerank_mult(rerank_mult)
     }

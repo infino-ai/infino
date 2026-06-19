@@ -853,9 +853,6 @@ pub mod vector {
     /// production?" baseline reported in the search markdown.
     use infino::superfile::reader::VectorSearchOptions;
 
-    const DEFAULT_NPROBE: usize = VectorSearchOptions::DEFAULT_NPROBE;
-    const DEFAULT_RERANK_MULT: usize = VectorSearchOptions::RERANK_MULT;
-
     /// Nanoseconds per second, for latency markdown.
     const NS_PER_SEC: f64 = 1e9;
     /// Deterministic rotation seed for the vector corpus fixture.
@@ -1002,6 +999,7 @@ pub mod vector {
                     committed.object_size,
                 )
             };
+            let default_opts = VectorSearchOptions::default();
             let recall_rows = exec_vec::run_search(
                 &mut report,
                 index.reader(),
@@ -1009,8 +1007,8 @@ pub mod vector {
                 VEC_COLUMN,
                 n_docs,
                 TOP_K,
-                DEFAULT_NPROBE,
-                DEFAULT_RERANK_MULT,
+                default_opts.nprobe,
+                default_opts.rerank_mult(),
                 queries_correctness(),
                 ground_truth_correctness(),
                 queries_calibration(),
