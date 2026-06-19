@@ -27,8 +27,8 @@
 //! deferred planner hint; a true HLL-based distinct-term union lands
 //! when measured.
 
-use std::cmp::{max, min};
 use std::{
+    cmp::{max, min},
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
@@ -208,9 +208,9 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
 
     use super::*;
-    use crate::supertable::manifest::part::{ContentHash, PartId};
     use crate::supertable::manifest::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+        part::{ContentHash, PartId},
     };
 
     /// A `ManifestListEntry` standing in for an existing part, carrying the
