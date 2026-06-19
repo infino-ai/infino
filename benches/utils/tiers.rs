@@ -98,10 +98,30 @@ pub struct StorageFixture {
     _keepalive: StorageKeepalive,
 }
 
-enum StorageKeepalive {
+pub(crate) enum StorageKeepalive {
     S3sFs { _fs_root: TempDir },
     RustFs { _server: Box<RustFsHandle> },
     Remote,
+}
+
+impl StorageFixture {
+    /// Split out the fields an [`IngestResult`] needs while keeping the
+    /// emulator child (RustFS / s3s-fs) alive through warm/cold search.
+    pub(crate) fn into_ingest_parts(
+        self,
+    ) -> (
+        Arc<dyn StorageProvider>,
+        &'static str,
+        Option<PrefixCleanup>,
+        StorageKeepalive,
+    ) {
+        (
+            self.storage,
+            self.storage_label,
+            self.cleanup,
+            self._keepalive,
+        )
+    }
 }
 
 /// A real-backend prefix a bench run created and must delete on exit so it
