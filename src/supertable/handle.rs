@@ -1633,7 +1633,7 @@ mod tests {
         q[0] = 1.0;
         let hits = st
             .reader()
-            .vector_hits("emb", &q, 3, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
             .expect("vector search");
         assert!(!hits.is_empty(), "search should find committed vectors");
     }
@@ -1798,7 +1798,7 @@ mod tests {
         q[0] = 1.0;
         let hits = st
             .reader()
-            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("vector search");
         assert!(!hits.is_empty(), "search should find committed vectors");
 
@@ -1824,7 +1824,7 @@ mod tests {
         let cold_before = cache.stats().n_cold_fetches;
         let hits2 = st
             .reader()
-            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("warm vector search");
         assert!(!hits2.is_empty());
         let cold_after = cache.stats().n_cold_fetches;
@@ -2044,7 +2044,7 @@ mod tests {
         }
         let hits = st
             .reader()
-            .vector_hits("emb", &vec![1.0f32; dim], 3, crate::superfile::reader::VectorSearchOptions::new())
+            .vector_hits("emb", &vec![1.0f32; dim], 3, crate::superfile::reader::VectorSearchOptions::new(), None)
             .expect("vector search after hidden compaction");
         assert!(!hits.is_empty(), "vector search should still work after hidden compaction");
     }

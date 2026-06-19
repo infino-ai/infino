@@ -112,6 +112,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: vec![],
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }

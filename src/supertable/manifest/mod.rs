@@ -2645,6 +2645,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -2888,6 +2889,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3034,6 +3036,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 2,
             },
+            vector_index_storage_prefix: None,
             parts: vec![
                 entry_for(&pw_a_old, &pk_a),
                 entry_for(&pw_a_latest, &pk_a),
@@ -3059,10 +3062,12 @@ mod tests {
                     .chain(part_b.superfiles.iter())
                     .cloned()
                     .collect(),
+                vector_index_storage_prefix: None,
             },
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
+            stamped_partition_strategy: None,
         });
 
         // Commit one new superfile into partition A. Keep `new_entry`
@@ -3240,6 +3245,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3334,6 +3340,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4034,6 +4041,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4124,6 +4132,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4496,6 +4505,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4577,6 +4587,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
+            vector_index_storage_prefix: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,

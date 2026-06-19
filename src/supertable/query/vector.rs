@@ -1456,7 +1456,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -1471,7 +1471,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; 16];
         let hits = r
-            .vector_hits("emb", &q, 0, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 0, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -1491,7 +1491,7 @@ mod tests {
             *x = (d as f32) / 100.0 + 0.001;
         }
         let hits = r
-            .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
@@ -1519,7 +1519,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_hits("emb", &q, 7, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 7, VectorSearchOptions::new(), None)
             .expect("query");
         assert_eq!(hits.len(), 7);
     }
@@ -1548,7 +1548,7 @@ mod tests {
         let mut q = vec![0f32; dim];
         q[0] = 1.0;
         let opts = VectorSearchOptions::new().with_nprobe(1);
-        let hits = st.reader().vector_hits("emb", &q, 10, opts).expect("query");
+        let hits = st.reader().vector_hits("emb", &q, 10, opts, None).expect("query");
 
         let exact_neighbors = hits.iter().filter(|h| h.score < 1e-3).count();
         assert!(
@@ -1572,7 +1572,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let hits = r
-            .vector_hits("emb", &q, 24, VectorSearchOptions::new())
+            .vector_hits("emb", &q, 24, VectorSearchOptions::new(), None)
             .expect("query");
         let superfile_uris: std::collections::HashSet<_> =
             hits.iter().map(|h| h.superfile).collect();
@@ -1621,7 +1621,7 @@ mod tests {
 
         let st_reader = st.reader();
         let st_hits = st_reader
-            .vector_hits("emb", &q, 2, opts)
+            .vector_hits("emb", &q, 2, opts, None)
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -1650,7 +1650,7 @@ mod tests {
         let r = st.reader();
         let q = vec![0.1f32; dim];
         let err = r
-            .vector_hits("nope", &q, 5, VectorSearchOptions::new())
+            .vector_hits("nope", &q, 5, VectorSearchOptions::new(), None)
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
@@ -1681,7 +1681,7 @@ mod tests {
             n_docs: 100,
             id_min: 0,
             id_max: 99,
-            scalar_stats: crate::supertable::manifest::ScalarStatsTable::default(),
+            scalar_stats: std::collections::HashMap::new(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
@@ -1854,7 +1854,7 @@ mod tests {
         q[0] = 1.0;
         let batches = st
             .reader()
-            .vector_search("emb", &q, 5, VectorSearchOptions::new(), Some(&["_id", "score"]))
+            .vector_search("emb", &q, 5, VectorSearchOptions::new(), None, Some(&["_id", "score"]))
             .expect("vector_search rows");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert!(rows >= 1, "row-returning vector_search must resolve user rows");
