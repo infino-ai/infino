@@ -17,6 +17,7 @@ bench = false
 
 [dependencies]
 arrow-array = "58"
+arrow-buffer = "58"
 arrow-schema = "58"
 async-trait = "0.1"
 bytemuck = "1"

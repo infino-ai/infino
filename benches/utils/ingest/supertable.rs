@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
+use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::superfile::builder::{FtsConfig, VectorConfig};
@@ -424,13 +425,24 @@ impl ChunkSource for StreamingSource {
         // would misalign doc_ids and silently ship a bad dataset.
         assert_eq!(self.served, start, "streaming chunk requested out of order");
         let title = modality.has_text().then(|| {
-            let titles = self.text.as_mut().expect("text corpus").next_titles(len);
+            let (values, offsets) = self
+                .text
+                .as_mut()
+                .expect("text corpus")
+                .next_title_buffers(len);
             assert_eq!(
-                titles.len(),
+                offsets.len() - 1,
                 len,
                 "streaming text source returned a short chunk"
             );
-            LargeStringArray::from_iter_values(titles)
+            // Wrap the generated buffers directly — no per-doc String, and
+            // `Buffer::from_vec` takes the values Vec without copying.
+            LargeStringArray::try_new(
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Buffer::from_vec(values),
+                None,
+            )
+            .expect("generated titles are valid UTF-8")
         });
         let vectors = modality.has_vector().then(|| {
             let flat = self.vectors.as_mut().expect("vector corpus").next_flat(len);

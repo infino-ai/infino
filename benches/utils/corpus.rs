@@ -501,12 +501,11 @@ pub struct StreamingTextCorpus {
     chunk_docs: usize,
     /// Next generation chunk to produce.
     next_chunk: usize,
-    /// Bytes of generated-but-unserved docs.
+    /// Bytes of generated-but-unserved docs (the carry).
     buf: Vec<u8>,
-    /// Byte offset of each carried doc; `offs.len() == carried docs + 1`.
+    /// Byte offset of each carried doc into `buf`; `offs.len() == carried + 1`,
+    /// `offs[0] == 0`.
     offs: Vec<usize>,
-    /// First carried doc not yet served.
-    head: usize,
 }
 
 impl StreamingTextCorpus {
@@ -524,13 +523,12 @@ impl StreamingTextCorpus {
             next_chunk: 0,
             buf: Vec::new(),
             offs: vec![0],
-            head: 0,
         }
     }
 
     /// Docs generated but not yet served.
     fn carried(&self) -> usize {
-        self.offs.len() - 1 - self.head
+        self.offs.len() - 1
     }
 
     /// Generate whole chunks into the carry until it holds at least `need`
@@ -594,35 +592,38 @@ impl StreamingTextCorpus {
         self.next_chunk += n_new;
     }
 
-    /// Drop already-served bytes from the front of the carry.
-    fn compact(&mut self) {
-        if self.head == 0 {
-            return;
-        }
-        let base = self.offs[self.head];
-        self.buf.drain(..base);
-        self.offs.drain(..self.head);
-        for o in self.offs.iter_mut() {
-            *o -= base;
-        }
-        self.head = 0;
-    }
-
-    /// Next `len` docs as owned titles (fewer only at the corpus tail).
-    pub fn next_titles(&mut self, len: usize) -> Vec<String> {
+    /// Next `len` docs as a packed UTF-8 value buffer plus its `i64` offsets —
+    /// exactly the two buffers a `LargeStringArray` wraps, so the caller builds
+    /// the Arrow column with no per-doc `String` and no second copy. The served
+    /// bytes move out of the carry; only the (≤ one chunk) leftover is copied.
+    /// Fewer docs only at the corpus tail.
+    pub fn next_title_buffers(&mut self, len: usize) -> (Vec<u8>, Vec<i64>) {
         self.ensure_carried(len);
         let take = len.min(self.carried());
-        let mut out = Vec::with_capacity(take);
-        for i in 0..take {
-            let s = self.offs[self.head + i];
-            let e = self.offs[self.head + i + 1];
-            out.push(
-                String::from_utf8(self.buf[s..e].to_vec()).expect("generated corpus is UTF-8"),
-            );
+        let split = self.offs[take];
+        let offsets: Vec<i64> = self.offs[..=take].iter().map(|&o| o as i64).collect();
+        let leftover = self.buf.split_off(split);
+        let values = std::mem::replace(&mut self.buf, leftover);
+        self.offs.drain(..take);
+        for o in self.offs.iter_mut() {
+            *o -= split;
         }
-        self.head += take;
-        self.compact();
-        out
+        (values, offsets)
+    }
+
+    /// Owned titles for the served docs — test convenience over
+    /// [`next_title_buffers`]; the ingest path builds Arrow from the buffers
+    /// directly.
+    #[cfg(test)]
+    pub fn next_titles(&mut self, len: usize) -> Vec<String> {
+        let (values, offsets) = self.next_title_buffers(len);
+        offsets
+            .windows(2)
+            .map(|w| {
+                String::from_utf8(values[w[0] as usize..w[1] as usize].to_vec())
+                    .expect("generated corpus is UTF-8")
+            })
+            .collect()
     }
 
     /// One doc by id, for the SQL sample row. Replays its generation chunk's
@@ -911,10 +912,8 @@ pub struct StreamingVectorCorpus {
     chunk_docs: usize,
     /// Next generation chunk to produce.
     next_chunk: usize,
-    /// Flat `f32` of generated-but-unserved rows.
+    /// Flat `f32` of generated-but-unserved rows (the carry).
     buf: Vec<f32>,
-    /// First carried row not yet served.
-    head: usize,
 }
 
 impl StreamingVectorCorpus {
@@ -945,13 +944,12 @@ impl StreamingVectorCorpus {
             chunk_docs,
             next_chunk: 0,
             buf: Vec::new(),
-            head: 0,
         }
     }
 
     /// Rows generated but not yet served.
     fn carried(&self) -> usize {
-        self.buf.len() / DIM - self.head
+        self.buf.len() / DIM
     }
 
     /// Generate whole chunks into the carry until it holds at least `need`
@@ -1001,23 +999,14 @@ impl StreamingVectorCorpus {
         self.next_chunk += n_new;
     }
 
-    /// Drop already-served rows from the front of the carry.
-    fn compact(&mut self) {
-        if self.head == 0 {
-            return;
-        }
-        self.buf.drain(..self.head * DIM);
-        self.head = 0;
-    }
-
     /// Next `len` rows as flat `f32` (`len * DIM`; fewer only at the tail).
+    /// The served rows move out of the carry — only the (≤ one chunk) leftover
+    /// is copied — so a multi-GiB commit batch isn't duplicated.
     pub fn next_flat(&mut self, len: usize) -> Vec<f32> {
         self.ensure_carried(len);
         let take = len.min(self.carried());
-        let out = self.buf[self.head * DIM..(self.head + take) * DIM].to_vec();
-        self.head += take;
-        self.compact();
-        out
+        let leftover = self.buf.split_off(take * DIM);
+        std::mem::replace(&mut self.buf, leftover)
     }
 }
 
