@@ -7,7 +7,7 @@
 //! waits for `/health`, creates the target bucket, and builds an HTTPS
 //! `S3StorageProvider` that trusts the bench-local CA.
 
-use std::io::Read;
+use std::io::Cursor;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -35,6 +35,10 @@ const HEALTH_POLL_INTERVAL_MS: u64 = 200;
 const HEALTH_TIMEOUT_SECS: u64 = 60;
 /// Grace period after SIGTERM before SIGKILL on teardown.
 const TEARDOWN_GRACE_MS: u64 = 2_000;
+/// Spawn attempts when the reserved loopback port is taken before RustFS binds.
+const RUSTFS_SPAWN_MAX_ATTEMPTS: u32 = 5;
+/// Filename of the upstream checksum manifest on RustFS GitHub releases.
+const RUSTFS_SHA256SUMS_ASSET: &str = "SHA256SUMS";
 
 struct S3SignParams<'a> {
     method: &'a str,
@@ -103,50 +107,74 @@ pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
     let (access_key, secret_key) = rustfs_credentials();
     let data_dir = TempDir::new().map_err(|e| e.to_string())?;
     let (tls_dir, ca_pem) = generate_tls_material()?;
-    let addr = reserve_loopback_port()?;
-    let port = addr.port();
-    let address = format!("127.0.0.1:{port}");
-    let endpoint = format!("https://{address}");
 
-    let child = Command::new(&binary)
-        .arg(data_dir.path())
-        .env("RUSTFS_ACCESS_KEY", &access_key)
-        .env("RUSTFS_SECRET_KEY", &secret_key)
-        .env("RUSTFS_VOLUMES", data_dir.path())
-        .env("RUSTFS_ADDRESS", &address)
-        .env("RUSTFS_TLS_PATH", tls_dir.path())
-        .env("RUSTFS_CONSOLE_ENABLE", "false")
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn rustfs at {}: {e}", binary.display()))?;
+    let mut last_err = String::new();
+    for attempt in 1..=RUSTFS_SPAWN_MAX_ATTEMPTS {
+        let addr = reserve_loopback_port()?;
+        let port = addr.port();
+        let address = format!("127.0.0.1:{port}");
+        let endpoint = format!("https://{address}");
 
-    wait_for_health(&endpoint, &ca_pem)?;
-    create_bucket(
-        &endpoint,
-        bucket,
-        &access_key,
-        &secret_key,
-        RUSTFS_REGION,
-        &ca_pem,
-    )?;
+        let mut child = Command::new(&binary)
+            .arg(data_dir.path())
+            .env("RUSTFS_ACCESS_KEY", &access_key)
+            .env("RUSTFS_SECRET_KEY", &secret_key)
+            .env("RUSTFS_VOLUMES", data_dir.path())
+            .env("RUSTFS_ADDRESS", &address)
+            .env("RUSTFS_TLS_PATH", tls_dir.path())
+            .env("RUSTFS_CONSOLE_ENABLE", "false")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn rustfs at {}: {e}", binary.display()))?;
 
-    eprintln!(
-        "[rustfs] endpoint={endpoint} bucket={bucket} storage_label=rustfs"
-    );
+        if child_exited(&mut child) {
+            last_err = format!("rustfs exited immediately on port {port}");
+            eprintln!(
+                "[rustfs] spawn attempt {attempt}/{RUSTFS_SPAWN_MAX_ATTEMPTS}: {last_err}"
+            );
+            continue;
+        }
 
-    Ok(RustFsHandle {
-        endpoint,
-        bucket: bucket.to_string(),
-        access_key,
-        secret_key,
-        ca_pem,
-        addr,
-        child,
-        _data_dir: data_dir,
-        _tls_dir: tls_dir,
-    })
+        match wait_for_health(&endpoint, &ca_pem) {
+            Ok(()) => {
+                create_bucket(
+                    &endpoint,
+                    bucket,
+                    &access_key,
+                    &secret_key,
+                    RUSTFS_REGION,
+                    &ca_pem,
+                )?;
+                eprintln!(
+                    "[rustfs] endpoint={endpoint} bucket={bucket} storage_label=rustfs"
+                );
+                return Ok(RustFsHandle {
+                    endpoint,
+                    bucket: bucket.to_string(),
+                    access_key,
+                    secret_key,
+                    ca_pem,
+                    addr,
+                    child,
+                    _data_dir: data_dir,
+                    _tls_dir: tls_dir,
+                });
+            }
+            Err(e) => {
+                terminate_child(&mut child);
+                last_err = e;
+                eprintln!(
+                    "[rustfs] spawn attempt {attempt}/{RUSTFS_SPAWN_MAX_ATTEMPTS} on port {port}: {last_err}"
+                );
+            }
+        }
+    }
+
+    Err(format!(
+        "rustfs failed to start after {RUSTFS_SPAWN_MAX_ATTEMPTS} attempts: {last_err}"
+    ))
 }
 
 /// Build an HTTPS S3 provider that trusts the bench-local CA.
@@ -237,9 +265,10 @@ fn which_rustfs_on_path() -> Option<PathBuf> {
 fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     let version = rustfs_version();
     let asset = release_asset_name()?;
-    let url = format!(
-        "https://github.com/rustfs/rustfs/releases/download/{version}/{asset}"
+    let release_base = format!(
+        "https://github.com/rustfs/rustfs/releases/download/{version}"
     );
+    let url = format!("{release_base}/{asset}");
     eprintln!("[rustfs] downloading {url} ...");
 
     std::fs::create_dir_all(
@@ -248,16 +277,10 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let response = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("rustfs download failed: {e}"))?;
-    let mut zip_bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut zip_bytes)
-        .map_err(|e| e.to_string())?;
+    let zip_bytes = github_bytes(&url)?;
+    verify_release_sha256(&zip_bytes, &release_base, &asset)?;
 
-    let reader = std::io::Cursor::new(zip_bytes);
+    let reader = Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
     let mut extracted = false;
     for i in 0..archive.len() {
@@ -282,6 +305,64 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     }
     eprintln!("[rustfs] installed binary at {}", dest.display());
     Ok(())
+}
+
+/// Fetch a public GitHub release asset over HTTPS (system trust roots).
+fn github_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(client
+        .get(url)
+        .send()
+        .map_err(|e| format!("GET {url} failed: {e}"))?
+        .bytes()
+        .map_err(|e| e.to_string())?
+        .to_vec())
+}
+
+fn verify_release_sha256(
+    zip_bytes: &[u8],
+    release_base: &str,
+    asset: &str,
+) -> Result<(), String> {
+    let sums_url = format!("{release_base}/{RUSTFS_SHA256SUMS_ASSET}");
+    eprintln!("[rustfs] verifying {asset} against {RUSTFS_SHA256SUMS_ASSET} ...");
+    let sums_text = String::from_utf8(github_bytes(&sums_url)?)
+        .map_err(|e| format!("{RUSTFS_SHA256SUMS_ASSET} is not valid UTF-8: {e}"))?;
+    let expected = parse_sha256_sums_entry(&sums_text, asset)?;
+    let actual = sha256_hex(zip_bytes);
+    if actual != expected {
+        return Err(format!(
+            "rustfs {asset} SHA256 mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_sha256_sums_entry(sums: &str, asset: &str) -> Result<String, String> {
+    for line in sums.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let name = name.strip_prefix('*').unwrap_or(name);
+        if name == asset {
+            return Ok(hash.to_ascii_lowercase());
+        }
+    }
+    Err(format!("{RUSTFS_SHA256SUMS_ASSET} has no entry for {asset}"))
+}
+
+fn child_exited(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(_)))
 }
 
 fn release_asset_name() -> Result<String, String> {
@@ -493,4 +574,35 @@ fn terminate_child_impl(child: &mut Child) {
     std::thread::sleep(Duration::from_millis(TEARDOWN_GRACE_MS));
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sha256_sums_finds_asset_line() {
+        let sums = "\
+abc123  rustfs-linux-x86_64-gnu-latest.zip
+def456  other.zip
+";
+        assert_eq!(
+            parse_sha256_sums_entry(sums, "rustfs-linux-x86_64-gnu-latest.zip").expect("parse"),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn parse_sha256_sums_accepts_bsd_marker() {
+        let sums = "deadbeef  *rustfs-macos-aarch64-latest.zip\n";
+        assert_eq!(
+            parse_sha256_sums_entry(sums, "rustfs-macos-aarch64-latest.zip").expect("parse"),
+            "deadbeef"
+        );
+    }
+
+    #[test]
+    fn parse_sha256_sums_missing_asset_errors() {
+        assert!(parse_sha256_sums_entry("abc123  other.zip\n", "missing.zip").is_err());
+    }
 }
