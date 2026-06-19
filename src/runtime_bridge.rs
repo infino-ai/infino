@@ -60,10 +60,20 @@ where
 /// one-shot one per call.
 ///
 /// Same `current_thread`-ambient caveat as [`bridge_sync_to_async`].
-pub(crate) fn bridge_on_runtime<F: Future>(fut: F, fallback: &runtime::Runtime) -> F::Output {
-    match runtime::Handle::try_current() {
-        Ok(handle) => block_in_place(|| handle.block_on(fut)),
-        Err(_) => fallback.block_on(fut),
+pub(crate) fn bridge_on_runtime<F: std::future::Future>(
+    fut: F,
+    runtime: &tokio::runtime::Runtime,
+) -> F::Output {
+    // Always drive on the passed `runtime` — callers hand us the runtime the
+    // future's async resources are bound to (e.g. `query_runtime`, where the
+    // disk cache's coordination lives). Driving on a *different* ambient
+    // runtime instead awaits those resources cross-runtime and can lose the
+    // wakeup → deadlock (e.g. a cold disk-cache fetch during search). When an
+    // ambient runtime is present, escape its worker via `block_in_place` so the
+    // nested `block_on` is legal.
+    match tokio::runtime::Handle::try_current() {
+        Ok(_ambient) => tokio::task::block_in_place(|| runtime.handle().block_on(fut)),
+        Err(_) => runtime.block_on(fut),
     }
 }
 
