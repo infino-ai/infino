@@ -13,8 +13,9 @@ and runs **locally and key-free**.
 | Folder | What it covers |
 | ------ | -------------- |
 | [`rag/`](rag/) | Retrieval-Augmented Generation — chunk, embed, retrieve (vector / hybrid / filtered / conversational) and ground an answer |
+| [`code_search/`](code_search/) | Code search — exact symbol lookup, natural-language (vector), keyword (BM25), and hybrid search over one table |
 
-More categories (beyond RAG) are on the way.
+More categories are on the way.
 
 ## Setup
 

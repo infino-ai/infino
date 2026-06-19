@@ -120,3 +120,47 @@ def load_wikipedia(n: int = 100) -> list[dict]:
         if len(docs) >= n:
             break
     return docs
+
+
+# Code bodies are stored truncated: enough for keyword/BM25 search and display
+# without bloating the demo table. Raise it if you want to index whole functions.
+CODE_MAX_CHARS = 2000
+
+# The dataset streams in repo order, so the first rows cluster into a handful of
+# projects. Cap functions per repo to spread the sample across many codebases.
+MAX_FUNCS_PER_REPO = 40
+
+
+def load_code_search(n: int = 800) -> list[dict]:
+    """Python functions from `Nan-Do/code-search-net-python` (a Parquet mirror
+    of CodeSearchNet).
+
+    Keeps functions that have both a body and a docstring (the docstring is what
+    we embed for natural-language search), capped per repo for variety. Returns
+    `[{"func_name", "code", "docstring", "summary", "repo", "url", "language"}]`.
+    """
+    stream = load_dataset("Nan-Do/code-search-net-python", split="train", streaming=True)
+    funcs: list[dict] = []
+    per_repo: dict[str, int] = {}
+    for row in stream:
+        func_name = (row.get("func_name") or "").strip()
+        code = (row.get("code") or row.get("original_string") or "").strip()
+        docstring = (row.get("docstring") or "").strip()
+        if not (func_name and code and docstring):
+            continue
+        repo = str(row.get("repo") or "unknown")
+        if per_repo.get(repo, 0) >= MAX_FUNCS_PER_REPO:
+            continue
+        per_repo[repo] = per_repo.get(repo, 0) + 1
+        funcs.append({
+            "func_name": func_name,
+            "code": code[:CODE_MAX_CHARS],
+            "docstring": docstring,
+            "summary": (row.get("summary") or docstring.splitlines()[0]).strip(),
+            "repo": repo,
+            "url": str(row.get("url") or ""),
+            "language": str(row.get("language") or "python"),
+        })
+        if len(funcs) >= n:
+            break
+    return funcs
