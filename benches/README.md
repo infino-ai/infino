@@ -86,7 +86,7 @@ which credentials happen to be set:
 
 | `INFINO_BENCH_STORE` | Backend | Extra env |
 |---|---|---|
-| _unset_ / `rustfs` | local RustFS daemon (HTTPS, default) | optional `INFINO_RUSTFS_BIN`, `INFINO_RUSTFS_VERSION`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` |
+| _unset_ / `rustfs` | local RustFS daemon (HTTPS, default) | optional `INFINO_RUSTFS_BIN`, `INFINO_RUSTFS_VERSION`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`; auto-download verifies the release zip against upstream `SHA256SUMS` |
 | `s3s_fs` | in-process s3s-fs emulator | — |
 | `s3` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
 | `azure` | real Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |

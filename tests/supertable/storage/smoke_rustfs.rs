@@ -109,3 +109,50 @@ async fn supertable_smoke_via_rustfs_https() {
 
     eprintln!("[rustfs-smoke] smoke done");
 }
+
+/// Regression: [`IngestResult`](infino_bench_utils::ingest::supertable::IngestResult) must
+/// retain the RustFS child through warm/cold search. Dropping the handle while the storage
+/// `Arc` is still live reproduces the connection-refused failure seen before the keepalive fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rustfs_keepalive_survives_fixture_drop() {
+    if std::env::var("INFINO_TEST_RUSTFS").is_err() {
+        eprintln!(
+            "rustfs_keepalive_survives_fixture_drop: skipped (set INFINO_TEST_RUSTFS=1 to enable)"
+        );
+        return;
+    }
+
+    const PROBE_KEY: &str = "probe/keepalive.txt";
+    let probe_bytes = Bytes::from_static(b"keepalive-probe");
+
+    struct IngestLike {
+        storage: Arc<dyn StorageProvider>,
+        _keepalive: rustfs_server::RustFsHandle,
+    }
+
+    let fixture = {
+        let handle = tokio::task::spawn_blocking(|| rustfs_server::spawn_rustfs(TEST_BUCKET))
+            .await
+            .expect("spawn_blocking join")
+            .expect("spawn rustfs");
+        let storage = rustfs_server::rustfs_s3_provider(&handle, "").expect("rustfs provider");
+        storage
+            .put_atomic(PROBE_KEY, probe_bytes.clone())
+            .await
+            .expect("probe put_atomic");
+        IngestLike {
+            storage,
+            _keepalive: handle,
+        }
+    };
+
+    let storage = Arc::clone(&fixture.storage);
+    let (got, _) = storage.get(PROBE_KEY).await.expect("get with keepalive held");
+    assert_eq!(got, probe_bytes, "storage must stay reachable while handle lives");
+
+    drop(fixture);
+    assert!(
+        storage.get(PROBE_KEY).await.is_err(),
+        "dropping the RustFS handle must tear down the daemon"
+    );
+}
