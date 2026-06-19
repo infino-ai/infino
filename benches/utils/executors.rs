@@ -42,46 +42,7 @@ pub struct ColdTiming {
 /// cache admit → lazy range-GET fallback), concurrently like the query
 /// path, so the subsequent timed search pays only the search work.
 pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
-    let reader = consumer.reader();
-    let manifest = reader.manifest();
-    let store = manifest.options.store.clone();
-    let disk_cache = manifest.options.disk_cache.clone();
-    let storage = manifest.options.storage.clone();
-    // Snapshot the per-superfile open inputs up front so each spawned task
-    // owns its data ('static). `tokio::spawn` per superfile distributes the
-    // per-open CPU parse across the runtime's worker threads — matching the
-    // production vector fan-out (`tokio::spawn` per superfile) instead of
-    // serializing all the parses on a single `try_join_all` poller.
-    let superfiles: Vec<_> = manifest
-        .superfiles
-        .iter()
-        .map(|e| (e.uri, e.subsection_offsets.clone()))
-        .collect();
-    crate::tiers::block_on(async move {
-        let handles: Vec<_> = superfiles
-            .into_iter()
-            .map(|(uri, offsets)| {
-                let store = store.clone();
-                let disk_cache = disk_cache.clone();
-                let storage = storage.clone();
-                tokio::spawn(async move {
-                    infino::supertable::query::superfile_reader::superfile_reader(
-                        &store,
-                        disk_cache.as_ref(),
-                        storage.as_ref(),
-                        &uri,
-                        offsets.as_ref(),
-                    )
-                    .await
-                })
-            })
-            .collect();
-        for h in handles {
-            h.await
-                .expect("cold open: join superfile open task")
-                .expect("cold open: open superfile readers");
-        }
-    });
+    consumer.open_all_superfiles();
 }
 
 pub mod fts {

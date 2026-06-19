@@ -122,15 +122,20 @@ pub(crate) async fn fetch_cell_posting_blob(
         }
     }
     if let Some(cache) = disk_cache {
-        let reader = cache
-            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
-            .await
-            .map_err(|e| QueryError::Store(e.to_string()))?;
-        return reader
-            .byte_source()
-            .range(off, len)
-            .await
-            .map_err(|e| QueryError::Store(e.to_string()));
+        if cache.is_mmap_promoted(&entry.uri) {
+            let reader = cache
+                .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+                .await
+                .map_err(|e| QueryError::Store(e.to_string()))?;
+            return reader
+                .byte_source()
+                .range(off, len)
+                .await
+                .map_err(|e| QueryError::Store(e.to_string()));
+        }
+        // Cache attached but this superfile is not resident yet — fetch only
+        // the vec subsection. A full synchronous cold-fetch of the whole
+        // hidden superfile per probed cell dominates cold query latency.
     }
     let path = entry.uri.storage_path();
     storage
@@ -227,20 +232,16 @@ async fn read_ids_for_locals(
         QueryError::Execute("id remap needs a storage backend".into())
     })?;
     let batch = if let Some(cache) = manifest.options.disk_cache.as_ref() {
-        let sf = cache
-            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
-        match sf.take_by_local_doc_ids(local_ids, &[id_column]) {
-            Ok(b) => b,
-            // The cached reader is still a lazy foreground reader (background
-            // mmap promotion hasn't finished) and can't do an eager row take.
-            // Fall back to the lazy-safe object-store range read.
-            Err(crate::superfile::ReadError::LazyReaderUnsupported) => {
-                read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage)
-                    .await?
-            }
-            Err(e) => return Err(QueryError::Execute(e.to_string())),
+        if cache.is_mmap_promoted(&entry.uri) {
+            let sf = cache
+                .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            sf.take_by_local_doc_ids(local_ids, &[id_column])
+                .map_err(|e| QueryError::Execute(e.to_string()))?
+        } else {
+            read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage)
+                .await?
         }
     } else {
         read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage).await?

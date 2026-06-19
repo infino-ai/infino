@@ -669,7 +669,72 @@ impl Supertable {
     /// Diagnostic: `(total_hidden_superfiles, max_superfiles_in_one_cell)` for
     /// the hidden vector-index table, or `None` when there is no hidden table.
     /// Used by benches to observe how compacted the hidden cell index is.
-    pub fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
+    /// Force-open every user + hidden vector superfile reader on the
+    /// pinned snapshot — the cold-open phase before a timed search.
+    /// Hidden cell-posting superfiles use their prefixed storage provider.
+    pub fn open_all_superfiles(&self) {
+        let reader = self.reader();
+        let manifest = reader.manifest();
+        let store = manifest.options.store.clone();
+        let disk_cache = manifest.options.disk_cache.clone();
+        let user_storage = manifest
+            .options
+            .storage
+            .clone()
+            .expect("open_all_superfiles: user table needs storage");
+        let mut targets: Vec<(
+            crate::supertable::manifest::SuperfileUri,
+            Option<crate::supertable::manifest::SubsectionOffsets>,
+            std::sync::Arc<dyn crate::storage::StorageProvider>,
+        )> = manifest
+            .superfiles
+            .iter()
+            .map(|e| (e.uri, e.subsection_offsets.clone(), std::sync::Arc::clone(&user_storage)))
+            .collect();
+        if let Some(hidden) = self.inner.vector_index_table.as_ref() {
+            let hidden_manifest = hidden.inner.manifest.load_full();
+            let hidden_storage = hidden_manifest
+                .options
+                .storage
+                .clone()
+                .expect("open_all_superfiles: hidden vector index needs storage");
+            for entry in hidden_manifest.superfiles.iter() {
+                targets.push((
+                    entry.uri,
+                    entry.subsection_offsets.clone(),
+                    std::sync::Arc::clone(&hidden_storage),
+                ));
+            }
+        }
+        self.block_on_query(async move {
+            let handles: Vec<_> = targets
+                .into_iter()
+                .map(|(uri, offsets, storage)| {
+                    let store = store.clone();
+                    let disk_cache = disk_cache.clone();
+                    tokio::spawn(async move {
+                        crate::supertable::query::superfile_reader::superfile_reader(
+                            &store,
+                            disk_cache.as_ref(),
+                            Some(&storage),
+                            &uri,
+                            offsets.as_ref(),
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.await
+                    .expect("open_all_superfiles: join superfile open task")
+                    .expect("open_all_superfiles: open superfile readers");
+            }
+            Ok::<(), crate::supertable::reader_cache::disk::DiskCacheError>(())
+        })
+        .expect("open_all_superfiles");
+    }
+
+        pub fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
         let hidden = self.inner.vector_index_table.as_ref()?;
         let reader = hidden.reader();
         let manifest = reader.manifest();
