@@ -533,21 +533,65 @@ impl StreamingTextCorpus {
         self.offs.len() - 1 - self.head
     }
 
-    /// Generate the next whole chunk into the carry. Returns false when the
-    /// corpus is exhausted.
-    fn gen_next_chunk(&mut self) -> bool {
-        let start = self.next_chunk * self.chunk_docs;
-        if start >= self.n_docs {
-            return false;
+    /// Generate whole chunks into the carry until it holds at least `need`
+    /// docs (or the corpus is exhausted). Doc byte lengths are RNG-independent
+    /// (see [`doc_len`]), so the offset table extends up front and each chunk
+    /// then fills its own disjoint byte range in parallel — the same scheme the
+    /// disk corpus uses, reseeding per chunk so the bytes are identical.
+    fn ensure_carried(&mut self, need: usize) {
+        let total_chunks = self.n_docs.div_ceil(self.chunk_docs);
+        if self.carried() >= need || self.next_chunk >= total_chunks {
+            return;
         }
-        let end = (start + self.chunk_docs).min(self.n_docs);
-        let mut rng = StdRng::seed_from_u64(chunk_seed(self.seed, self.next_chunk));
-        for doc_id in start..end {
-            write_text_doc(&mut self.buf, doc_id, &mut rng, &self.zipf);
-            self.offs.push(self.buf.len());
+        let missing = need - self.carried();
+        let n_new = missing
+            .div_ceil(self.chunk_docs)
+            .min(total_chunks - self.next_chunk);
+        let first_chunk = self.next_chunk;
+
+        // Extend the offset table (cheap, RNG-free) and record each new chunk's
+        // byte length so its output slice can be carved out below.
+        let base = self.buf.len();
+        let mut pos = base;
+        let mut chunk_bytes = Vec::with_capacity(n_new);
+        for k in 0..n_new {
+            let c = first_chunk + k;
+            let chunk_base = pos;
+            let end = ((c + 1) * self.chunk_docs).min(self.n_docs);
+            for doc_id in (c * self.chunk_docs)..end {
+                pos += doc_len(doc_id) as usize;
+                self.offs.push(pos);
+            }
+            chunk_bytes.push(pos - chunk_base);
         }
-        self.next_chunk += 1;
-        true
+        self.buf.resize(pos, 0);
+
+        // Carve `buf[base..]` into one disjoint slice per chunk, then fill them
+        // in parallel. Read-only fields as locals so the closure can borrow
+        // them alongside the `&mut` slices (disjoint fields of `self`).
+        let (seed, chunk_docs, n_docs) = (self.seed, self.chunk_docs, self.n_docs);
+        let zipf = &self.zipf;
+        let mut rest = &mut self.buf[base..];
+        let mut slices = Vec::with_capacity(n_new);
+        for (k, &nbytes) in chunk_bytes.iter().enumerate() {
+            let (slot, tail) = rest.split_at_mut(nbytes);
+            slices.push((first_chunk + k, slot));
+            rest = tail;
+        }
+        slices.into_par_iter().for_each(|(c, slot)| {
+            let end = ((c + 1) * chunk_docs).min(n_docs);
+            let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
+            let mut written = 0usize;
+            let mut scratch = Vec::new();
+            for doc_id in (c * chunk_docs)..end {
+                scratch.clear();
+                write_text_doc(&mut scratch, doc_id, &mut rng, zipf);
+                slot[written..written + scratch.len()].copy_from_slice(&scratch);
+                written += scratch.len();
+            }
+            debug_assert_eq!(written, slot.len(), "text chunk byte-length mismatch");
+        });
+        self.next_chunk += n_new;
     }
 
     /// Drop already-served bytes from the front of the carry.
@@ -566,7 +610,7 @@ impl StreamingTextCorpus {
 
     /// Next `len` docs as owned titles (fewer only at the corpus tail).
     pub fn next_titles(&mut self, len: usize) -> Vec<String> {
-        while self.carried() < len && self.gen_next_chunk() {}
+        self.ensure_carried(len);
         let take = len.min(self.carried());
         let mut out = Vec::with_capacity(take);
         for i in 0..take {
