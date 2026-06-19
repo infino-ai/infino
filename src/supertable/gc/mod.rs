@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-use std::collections::HashSet;
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime},
+};
 
-use crate::Supertable;
-use crate::supertable::error::GcError;
-use crate::supertable::manifest::commit::{
-    MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri,
+use crate::{
+    Supertable,
+    runtime_bridge::bridge_on_runtime,
+    supertable::{
+        Manifest,
+        error::GcError,
+        manifest::commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
+    },
 };
 
 #[derive(Debug, Default, Clone)]
@@ -19,7 +25,7 @@ pub struct GcReport {
     pub delete_errors: u64,
 }
 
-fn build_live_set(manifest: &crate::supertable::Manifest) -> HashSet<String> {
+fn build_live_set(manifest: &Manifest) -> HashSet<String> {
     let mut live = HashSet::new();
     live.insert(POINTER_PATH.to_string());
     live.insert(list_uri(manifest.manifest_id));
@@ -34,10 +40,7 @@ fn build_live_set(manifest: &crate::supertable::Manifest) -> HashSet<String> {
 
 impl Supertable {
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
-        crate::runtime_bridge::bridge_on_runtime(
-            self.gc_async(safety_gap),
-            &self.inner().query_runtime(),
-        )
+        bridge_on_runtime(self.gc_async(safety_gap), &self.inner().query_runtime())
     }
 
     pub(crate) async fn gc_async(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
@@ -80,16 +83,21 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use uuid::Uuid;
 
     use super::*;
-    use crate::supertable::manifest::{Manifest, SuperfileEntry, SuperfileUri};
+    use crate::{
+        supertable::{
+            SupertableOptions,
+            manifest::{Manifest, SuperfileEntry, SuperfileUri},
+        },
+        test_helpers::default_supertable_options,
+    };
 
-    fn opts() -> Arc<crate::supertable::SupertableOptions> {
-        Arc::new(crate::test_helpers::default_supertable_options())
+    fn opts() -> Arc<SupertableOptions> {
+        Arc::new(default_supertable_options())
     }
 
     fn sf_entry(uri: SuperfileUri) -> Arc<SuperfileEntry> {

@@ -33,20 +33,21 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
-
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::tokenize::Tokenizer;
-use infino::supertable::manifest::SuperfileUri;
-use infino::supertable::reader_cache::{
-    InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache,
+use infino::{
+    superfile::{SuperfileReader, builder::FtsConfig, fts::tokenize::Tokenizer},
+    supertable::{
+        Supertable, SupertableOptions,
+        manifest::SuperfileUri,
+        reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache},
+    },
+    test_helpers::{build_title_batch, default_tokenizer, schema_id_title},
 };
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{build_title_batch, default_tokenizer, schema_id_title};
 
 /// Single-thread rayon pool for deterministic skip-pruning.
 const RAYON_POOL_THREADS: usize = 1;

@@ -24,13 +24,18 @@
 
 use std::sync::Arc;
 
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::fts::tokenize::Tokenizer;
-use infino::supertable::options::Consistency;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::{ManifestLoadError, OpenError, Supertable, SupertableOptions};
-use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
+use infino::{
+    superfile::{
+        builder::FtsConfig,
+        fts::{reader::BoolMode, tokenize::Tokenizer},
+    },
+    supertable::{
+        ManifestLoadError, OpenError, Supertable, SupertableOptions,
+        options::Consistency,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
+};
 
 /// BM25 top-k for the open/refresh consistency queries.
 const BM25_TOP_K: usize = 10;

@@ -13,9 +13,11 @@
 use std::time::{Duration, Instant};
 
 use super::{VectorEngine, VectorHit};
-use crate::corpus;
-use crate::markdown::fmt_count;
-use crate::rss::{PeakSampler, RssStats};
+use crate::{
+    corpus,
+    markdown::fmt_count,
+    rss::{PeakSampler, RssStats},
+};
 
 /// Metric requested by the benchmark harness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

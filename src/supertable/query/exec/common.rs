@@ -17,24 +17,37 @@
 
 use std::sync::Arc;
 
-use crate::superfile::SuperfileReader;
-use crate::superfile::reader::{rank_back_indices, row_selection_for_ids};
-use crate::supertable::handle::SupertableReader;
-use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
-use crate::supertable::query::SuperfileHit;
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
     ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::logical_expr::Expr;
-use datafusion::scalar::ScalarValue;
-use futures::TryStreamExt;
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use datafusion::{
+    error::{DataFusionError, Result as DfResult},
+    logical_expr::Expr,
+    scalar::ScalarValue,
+};
+use futures::{TryStreamExt, future::try_join_all};
+use object_store::{ObjectStore, path::Path};
+use parquet::arrow::{
+    ProjectionMask,
+    async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+};
 use rayon::prelude::*;
+use tokio::sync::oneshot;
+
+use crate::{
+    superfile::{
+        SuperfileReader,
+        reader::{rank_back_indices, row_selection_for_ids},
+    },
+    supertable::{
+        handle::SupertableReader,
+        manifest::SuperfileUri,
+        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        query::{SuperfileHit, superfile_reader::superfile_reader},
+    },
+};
 
 /// Resolve `hits` to one `RecordBatch`, with `projection` naming the
 /// output columns (any of `_id`, the visible scalar columns, or the
@@ -301,11 +314,11 @@ async fn resolve_columns(
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
 
-    let opened = futures::future::try_join_all(seg_order.iter().map(|uri| {
-        crate::supertable::query::superfile_reader::superfile_reader(
-            store, disk_cache, storage, uri, None,
-        )
-    }))
+    let opened = try_join_all(
+        seg_order
+            .iter()
+            .map(|uri| superfile_reader(store, disk_cache, storage, uri, None)),
+    )
     .await
     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
@@ -348,7 +361,7 @@ async fn resolve_columns(
         let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
         let pool = Arc::clone(&manifest.options.reader_pool);
         let inputs = warm_inputs;
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         pool.spawn(move || {
             let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
             let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
@@ -367,7 +380,7 @@ async fn resolve_columns(
             .map_err(|e| DataFusionError::Execution(e.to_string()))
     };
 
-    let cold_wave = futures::future::try_join_all(cold_units.into_iter().map(
+    let cold_wave = try_join_all(cold_units.into_iter().map(
         |(i, uri, reader, locals)| {
             let storage = storage.cloned();
             let file_size = manifest
@@ -445,8 +458,8 @@ async fn resolve_columns(
 ///
 /// [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 async fn take_rows_object_store(
-    store: Arc<dyn object_store::ObjectStore>,
-    path: object_store::path::Path,
+    store: Arc<dyn ObjectStore>,
+    path: Path,
     file_size: Option<u64>,
     file_schema: &SchemaRef,
     n_docs: u64,
@@ -555,27 +568,31 @@ pub(crate) fn arg_to_usize(expr: &Expr, what: &str) -> DfResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use datafusion::prelude::lit;
-
     use arrow_array::{Array, FixedSizeListArray, LargeStringArray};
     use arrow_schema::Field;
     use bytes::Bytes;
-    use object_store::path::Path as ObjPath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
-    use crate::superfile::fts::reader::BoolMode;
-    use crate::superfile::vector::distance::Metric;
-    use crate::superfile::vector::rerank_codec::RerankCodec;
-    use crate::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore};
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer as tok;
-    use crate::test_helpers::{
-        build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
-    };
+    use datafusion::prelude::lit;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
+    use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::{
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+            fts::reader::BoolMode,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{
+            Supertable, SupertableOptions,
+            reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
+        },
+        test_helpers::{
+            build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
+            default_tokenizer as tok,
+        },
+    };
 
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {
@@ -632,7 +649,7 @@ mod tests {
 
     fn options_title_emb(dim: usize) -> SupertableOptions {
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
@@ -968,7 +985,7 @@ mod tests {
     /// Put `bytes` into a fresh in-memory object store and return the
     /// handle + path the cold reader will range-GET against.
     async fn object_store_with(bytes: &Bytes) -> (Arc<dyn ObjectStore>, ObjPath) {
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(memory::InMemory::new());
         let path = ObjPath::from("data/seg.sf.parquet");
         store
             .put(&path, PutPayload::from_bytes(bytes.clone()))

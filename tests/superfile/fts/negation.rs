@@ -12,8 +12,7 @@
 
 use std::collections::HashSet;
 
-use infino::superfile::SuperfileReader;
-use infino::superfile::fts::reader::BoolMode;
+use infino::superfile::{SuperfileReader, fts::reader::BoolMode};
 
 use crate::fts::brute_force_oracle::{
     build_infino_superfile, build_multi_block_corpus, build_multi_block_reader, corpus,

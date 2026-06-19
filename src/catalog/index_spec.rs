@@ -6,9 +6,10 @@
 //! [`Connection::create_table`](crate::Connection::create_table) alongside
 //! the Arrow schema.
 
-use crate::superfile::builder::FtsConfig;
-use crate::superfile::vector::builder::VectorConfig;
-use crate::superfile::vector::distance::Metric;
+use crate::superfile::{
+    builder::FtsConfig,
+    vector::{builder::VectorConfig, distance::Metric},
+};
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
 /// has to be stable for a given table; the public API does not vary it.

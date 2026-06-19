@@ -15,6 +15,8 @@
 //! ~±3.25% standard error). Merging is register-wise max, so part
 //! rollups and cross-segment folds are exact unions of the sketches.
 
+use std::fmt;
+
 /// Width of the hash the sketch indexes over (`xxh3_64`).
 const HASH_BITS: u32 = 64;
 /// log2 of the register count.
@@ -39,8 +41,8 @@ impl Default for HllSketch {
     }
 }
 
-impl std::fmt::Debug for HllSketch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for HllSketch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HllSketch")
             .field("estimate", &(self.estimate() as u64))
             .finish()
@@ -120,6 +122,8 @@ impl HllSketch {
 
 #[cfg(test)]
 mod tests {
+    use xxhash_rust::xxh3::xxh3_64;
+
     use super::*;
 
     /// Distinct values inserted by the accuracy test.
@@ -134,7 +138,7 @@ mod tests {
         for i in 0..TEST_DISTINCT as u64 {
             // Duplicate inserts must not move the estimate.
             for _ in 0..2 {
-                sketch.insert_hash(xxhash_rust::xxh3::xxh3_64(&i.to_le_bytes()));
+                sketch.insert_hash(xxh3_64(&i.to_le_bytes()));
             }
         }
         let est = sketch.estimate();
@@ -151,7 +155,7 @@ mod tests {
         let mut b = HllSketch::new();
         let mut both = HllSketch::new();
         for i in 0..10_000u64 {
-            let h = xxhash_rust::xxh3::xxh3_64(&i.to_le_bytes());
+            let h = xxh3_64(&i.to_le_bytes());
             if i % 2 == 0 {
                 a.insert_hash(h);
             } else {
@@ -167,7 +171,7 @@ mod tests {
     fn bytes_round_trip() {
         let mut sketch = HllSketch::new();
         for i in 0..1000u64 {
-            sketch.insert_hash(xxhash_rust::xxh3::xxh3_64(&i.to_le_bytes()));
+            sketch.insert_hash(xxh3_64(&i.to_le_bytes()));
         }
         let restored = HllSketch::from_bytes(sketch.as_bytes()).expect("valid length");
         assert_eq!(restored, sketch);

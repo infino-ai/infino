@@ -60,26 +60,28 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::sync::Arc;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Instant,
+};
 
+use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
 
-use crate::superfile::SuperfileReader;
-use crate::superfile::fts::reader::BoolMode;
+use super::{SuperfileHit, candidate::CandidatePlan, dispatch, exec::common::resolve_hits_named};
 pub use crate::superfile::reader::VectorSearchOptions;
-use crate::superfile::vector::distance::Metric;
-use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
-use crate::supertable::tombstones::SidecarCache;
-use arrow::record_batch::RecordBatch;
-
-use super::SuperfileHit;
-use super::candidate::CandidatePlan;
-use super::dispatch;
-use super::exec::common::resolve_hits_named;
+use crate::{
+    superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
+    supertable::{
+        error::QueryError,
+        handle::{Supertable, SupertableReader},
+        manifest::{SuperfileEntry, SuperfileUri},
+        tombstones::SidecarCache,
+    },
+};
 
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
@@ -245,7 +247,7 @@ impl SupertableReader {
         // (the cross-superfile win). For filtered search each unit also
         // carries its per-superfile allow-set (a superfile reaching here
         // is guaranteed present in `allow` — empties were dropped above).
-        let fallback: std::collections::HashSet<usize> = fallback.into_iter().collect();
+        let fallback: HashSet<usize> = fallback.into_iter().collect();
         // Look the allow-set up only for a superfile that is actually
         // selected (scored a kept cluster, or is a fallback) — a superfile
         // that survived vector pruning but whose predicate matched no row
@@ -575,14 +577,14 @@ impl SupertableReader {
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError>
     where
         F: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = Result<RoaringBitmap, QueryError>> + Send,
+        Fut: Future<Output = Result<RoaringBitmap, QueryError>> + Send,
     {
         let units: Vec<(Arc<SuperfileEntry>, ())> =
             superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
-                         now: std::time::Instant,
+                         now: Instant,
                          _: ()| {
             let doc_ids = doc_ids.clone();
             async move {
@@ -605,7 +607,7 @@ fn subtract_tombstones(
     bm: &mut RoaringBitmap,
     entry: &SuperfileEntry,
     tombstone_cache: Option<&SidecarCache>,
-    now: std::time::Instant,
+    now: Instant,
 ) -> Result<(), QueryError> {
     if let Some(cache) = tombstone_cache {
         let deleted = cache
@@ -779,28 +781,45 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        cmp::Ordering,
+        collections::{HashMap, HashSet},
+        future::Future,
+        sync::Arc,
+        time::Instant,
+    };
 
     use arrow::array::Array;
-    use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_array::{
+        Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema};
-
-    use crate::superfile::builder::{FtsConfig, SuperfileBuilder, VectorConfig};
-
-    use crate::superfile::vector::distance::Metric;
-    use crate::supertable::error::QueryError;
-    use crate::supertable::{Supertable, SupertableOptions};
+    use bytes::Bytes;
+    use roaring::RoaringBitmap;
+    use tokio::runtime;
 
     use super::{VectorFilter, VectorSearchOptions};
-
-    use crate::test_helpers::default_tokenizer as tok;
+    use crate::{
+        superfile::{
+            SuperfileReader,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{
+            Supertable, SupertableOptions,
+            error::QueryError,
+            options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+            query::dispatch::apply_tombstone_filter,
+        },
+        test_helpers::default_tokenizer as tok,
+    };
 
     /// Drive an async future to completion on a throwaway current-thread
     /// runtime. Used only for the single-superfile `SuperfileReader`
     /// oracle, whose search surface is async-only; the supertable
     /// reader's own search methods are sync and need no runtime here.
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime")
@@ -842,7 +861,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Fp32,
             }],
             Some(tok()),
         )
@@ -881,25 +900,19 @@ mod tests {
     /// argument shape that `SuperfileBuilder::add_batch` takes —
     /// the supertable's writer wraps this for callers via
     /// `vector_split`, but for the oracle we plumb it manually.
-    fn build_oracle_superfile(
-        n_total: usize,
-        dim: usize,
-    ) -> Arc<crate::superfile::SuperfileReader> {
+    fn build_oracle_superfile(n_total: usize, dim: usize) -> Arc<SuperfileReader> {
         // Oracle path goes through SuperfileBuilder directly,
         // so we mimic the supertable's effective schema by hand:
         // `_id` is `Decimal128(38, 0)`, ids are 0..n.
         let scalar_schema = Arc::new(Schema::new(vec![
             Field::new(
                 "_id",
-                DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
-                ),
+                DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
                 false,
             ),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = crate::superfile::builder::BuilderOptions::new(
+        let opts = BuilderOptions::new(
             scalar_schema.clone(),
             "_id",
             vec![FtsConfig {
@@ -911,17 +924,14 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Fp32,
             }],
             Some(tok()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("builder");
 
-        let ids = arrow_array::Decimal128Array::from((0..n_total as i128).collect::<Vec<_>>())
-            .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
-            )
+        let ids = Decimal128Array::from((0..n_total as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
             .expect("decimal128");
         let titles =
             LargeStringArray::from((0..n_total).map(|i| format!("doc {i}")).collect::<Vec<_>>());
@@ -937,8 +947,8 @@ mod tests {
         }
         b.add_batch(&scalar_batch, &[flat.as_slice()])
             .expect("add_batch");
-        let bytes = bytes::Bytes::from(b.finish().expect("finish"));
-        Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        Arc::new(SuperfileReader::open(bytes).expect("open"))
     }
 
     #[test]
@@ -1068,8 +1078,7 @@ mod tests {
         let hits = r
             .vector_hits("emb", &q, 24, VectorSearchOptions::new(), None)
             .expect("query");
-        let superfile_uris: std::collections::HashSet<_> =
-            hits.iter().map(|h| h.superfile).collect();
+        let superfile_uris: HashSet<_> = hits.iter().map(|h| h.superfile).collect();
         // All three superfiles should contribute (high k pulls from
         // each).
         assert_eq!(superfile_uris.len(), 3);
@@ -1109,8 +1118,7 @@ mod tests {
         // reader below uses its sync public API.
         let oracle_hits =
             block_on(oracle.vector_hits_async("emb", &q, 2, opts)).expect("oracle query");
-        let oracle_globals: std::collections::HashSet<u32> =
-            oracle_hits.iter().map(|(d, _)| *d).collect();
+        let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());
 
         let st_reader = st.reader();
@@ -1118,7 +1126,7 @@ mod tests {
             .vector_hits("emb", &q, 2, opts, None)
             .expect("supertable query");
         let manifest = st_reader.manifest();
-        let st_globals: std::collections::HashSet<u32> = st_hits
+        let st_globals: HashSet<u32> = st_hits
             .iter()
             .map(|h| {
                 let seg_idx = manifest
@@ -1279,7 +1287,7 @@ mod tests {
             .collect();
         scored.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
         scored.into_iter().take(k).map(|(g, _)| g).collect()
@@ -1332,9 +1340,8 @@ mod tests {
         // predicate is pushed into the ranking — a post-filter over the
         // global top-k would drop nearer beta rows and return a
         // different (and short) set.
-        let got: std::collections::HashSet<usize> =
-            hits.iter().map(|h| hit_global_id(&reader, h)).collect();
-        let truth: std::collections::HashSet<usize> = brute_force_filtered_topk(&query, "alpha", k)
+        let got: HashSet<usize> = hits.iter().map(|h| hit_global_id(&reader, h)).collect();
+        let truth: HashSet<usize> = brute_force_filtered_topk(&query, "alpha", k)
             .into_iter()
             .collect();
         assert_eq!(
@@ -1514,16 +1521,19 @@ mod tests {
     // the per-superfile bitmap); this direct test pins the
     // contract for the vector side.
 
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::SuperfileUri;
-    use crate::supertable::manifest::SuperfileEntry;
-    use crate::supertable::query::SuperfileHit;
-    use crate::supertable::tombstones::SidecarCache;
-    use crate::supertable::tombstones::cache::DEFAULT_REFRESH_TTL;
-    use crate::supertable::wal::WalStore;
-    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{
+            SuperfileUri,
+            manifest::SuperfileEntry,
+            query::SuperfileHit,
+            tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
+            wal::{WalStore, tombstones_codec::TombstonesSidecar},
+        },
+    };
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
@@ -1532,9 +1542,9 @@ mod tests {
             n_docs: 100,
             id_min: 0,
             id_max: 99,
-            scalar_stats: std::collections::HashMap::new(),
-            fts_summary: std::collections::HashMap::new(),
-            vector_summary: std::collections::HashMap::new(),
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
             subsection_offsets: None,
@@ -1554,7 +1564,7 @@ mod tests {
 
         let sf_id = Uuid::from_u128(0xFEEDFACE);
         // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
-        let mut bitmap = roaring::RoaringBitmap::new();
+        let mut bitmap = RoaringBitmap::new();
         bitmap.insert(1);
         bitmap.insert(3);
         bitmap.insert(5);
@@ -1571,13 +1581,7 @@ mod tests {
             })
             .collect();
 
-        crate::supertable::query::dispatch::apply_tombstone_filter(
-            Some(&cache),
-            &entry,
-            &mut hits,
-            std::time::Instant::now(),
-        )
-        .expect("filter");
+        apply_tombstone_filter(Some(&cache), &entry, &mut hits, Instant::now()).expect("filter");
 
         let remaining: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
         assert_eq!(remaining, vec![0u32, 2, 4, 6, 7]);
@@ -1594,13 +1598,7 @@ mod tests {
             })
             .collect();
         let original = hits.clone();
-        crate::supertable::query::dispatch::apply_tombstone_filter(
-            None,
-            &entry,
-            &mut hits,
-            std::time::Instant::now(),
-        )
-        .expect("no-cache");
+        apply_tombstone_filter(None, &entry, &mut hits, Instant::now()).expect("no-cache");
         assert_eq!(hits, original);
     }
 
@@ -1624,13 +1622,7 @@ mod tests {
             })
             .collect();
         let original = hits.clone();
-        crate::supertable::query::dispatch::apply_tombstone_filter(
-            Some(&cache),
-            &entry,
-            &mut hits,
-            std::time::Instant::now(),
-        )
-        .expect("filter");
+        apply_tombstone_filter(Some(&cache), &entry, &mut hits, Instant::now()).expect("filter");
         assert_eq!(hits, original);
     }
 }

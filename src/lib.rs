@@ -136,13 +136,13 @@ pub use config::{CompactionSettings, OptimizeOptions};
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
-pub use superfile::fts::reader::BoolMode;
-pub use superfile::vector::distance::Metric;
+pub use superfile::{fts::reader::BoolMode, vector::distance::Metric};
 /// Single-table handle: `append` / `update` / `delete` / `bm25_search`
 /// / `vector_search` / `schema`.
 pub use supertable::Supertable;
-pub use supertable::query::vector::VectorFilter;
-pub use supertable::{GcError, GcReport, MutationStats, OptimizeError};
+pub use supertable::{
+    GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
+};
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)

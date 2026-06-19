@@ -11,9 +11,10 @@
 //! different partitions go into separate parts so a
 //! single-partition commit rewrites exactly one part.
 
-use crate::supertable::error::{CommitError, ManifestError};
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::list::PartitionStrategy;
+use crate::supertable::{
+    error::{CommitError, ManifestError},
+    manifest::{SuperfileEntry, list::PartitionStrategy},
+};
 
 /// Opaque partition identifier. Encoded into
 /// `SuperfileEntry.partition_key` + `ManifestListEntry.partition_key`
@@ -273,14 +274,15 @@ fn downcast_i64(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
+    use std::{collections::HashMap, sync::Arc};
+
     use arrow_array::{
         ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
     };
-    use std::collections::HashMap;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
 
     // ---- Helpers --------------------------------------------------------
 

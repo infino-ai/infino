@@ -8,14 +8,15 @@
 //! pass over all docs with a per-query top-k heap. Optionally caches the small
 //! result (~120 queries + top-k ids) to a temp file for faster re-runs.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
+    fs,
+    path::PathBuf,
+    sync::OnceLock,
+};
 
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::corpus::{self, DIM, SUPERTABLE_DOCS, SequentialSyntheticCorpus, normalize};

@@ -76,11 +76,13 @@ impl SuperfileStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_helpers::decimal128_ids;
+    use std::sync::Arc;
+
     use arrow_array::LargeStringArray;
     use arrow_schema::{DataType, Field, Schema};
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_helpers::decimal128_ids;
 
     #[test]
     fn try_compute_from_record_batch_single_row() {

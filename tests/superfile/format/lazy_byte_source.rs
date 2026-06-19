@@ -22,8 +22,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::ops::Range;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 /// Decimal128 precision / scale for the `doc_id` column.
 const ID_DECIMAL_PRECISION: u8 = 38;
@@ -49,16 +48,18 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::{
-    BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
+use infino::{
+    superfile::{
+        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        fts::reader::BoolMode,
+    },
+    supertable::{
+        StorageRangeSource,
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    },
+    test_helpers::{decimal128_ids, default_tokenizer},
 };
-use infino::supertable::StorageRangeSource;
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
-};
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use tempfile::TempDir;
 
 // ============================================================
@@ -279,8 +280,7 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
 // 1.5 GiB superfile.
 // ============================================================
 
-use infino::superfile::vector::distance::normalize;
-use infino::test_helpers::default_vector_config;
+use infino::{superfile::vector::distance::normalize, test_helpers::default_vector_config};
 
 /// Build a small superfile that exercises both the vector and
 /// FTS sub-blobs so the cold-open test can observe both

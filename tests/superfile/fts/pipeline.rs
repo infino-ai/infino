@@ -8,9 +8,13 @@
 //! correctness pattern used across the integration tests.
 
 use bytes::Bytes;
-use infino::superfile::fts::builder::FtsBuilder;
-use infino::superfile::fts::reader::{BoolMode, FtsReader};
-use infino::test_helpers::default_tokenizer;
+use infino::{
+    superfile::fts::{
+        builder::FtsBuilder,
+        reader::{BoolMode, FtsReader},
+    },
+    test_helpers::default_tokenizer,
+};
 
 /// Document count for the two-column FTS pipeline fixture.
 const FTS_PIPELINE_N_DOCS: u32 = 4;

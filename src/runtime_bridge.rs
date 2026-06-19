@@ -31,6 +31,10 @@
 //! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
 //! actix, etc.).
 
+use std::{future::Future, sync::Arc, thread};
+
+use tokio::{runtime, task::block_in_place};
+
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),
 /// otherwise builds a tiny `current_thread` runtime for the call.
@@ -40,10 +44,10 @@
 /// docs.
 pub(crate) fn bridge_sync_to_async<F, T>(fut: F) -> T
 where
-    F: std::future::Future<Output = T>,
+    F: Future<Output = T>,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+    match runtime::Handle::try_current() {
+        Ok(handle) => block_in_place(|| handle.block_on(fut)),
         Err(_) => build_current_thread_runtime().block_on(fut),
     }
 }
@@ -56,12 +60,9 @@ where
 /// one-shot one per call.
 ///
 /// Same `current_thread`-ambient caveat as [`bridge_sync_to_async`].
-pub(crate) fn bridge_on_runtime<F: std::future::Future>(
-    fut: F,
-    fallback: &tokio::runtime::Runtime,
-) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+pub(crate) fn bridge_on_runtime<F: Future>(fut: F, fallback: &runtime::Runtime) -> F::Output {
+    match runtime::Handle::try_current() {
+        Ok(handle) => block_in_place(|| handle.block_on(fut)),
         Err(_) => fallback.block_on(fut),
     }
 }
@@ -83,19 +84,14 @@ pub(crate) fn bridge_on_runtime<F: std::future::Future>(
 ///   inline (no extra thread; this is the rayon-worker / CLI path).
 pub(crate) fn bridge_sync_to_async_send<F, T>(fut: F) -> T
 where
-    F: std::future::Future<Output = T> + Send + 'static,
+    F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if matches!(
-                handle.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread
-            ) =>
-        {
-            tokio::task::block_in_place(|| handle.block_on(fut))
+    match runtime::Handle::try_current() {
+        Ok(handle) if matches!(handle.runtime_flavor(), runtime::RuntimeFlavor::MultiThread) => {
+            block_in_place(|| handle.block_on(fut))
         }
-        Ok(_) => std::thread::spawn(move || build_current_thread_runtime().block_on(fut))
+        Ok(_) => thread::spawn(move || build_current_thread_runtime().block_on(fut))
             .join()
             .expect("sync→async bridge worker thread panicked"),
         Err(_) => build_current_thread_runtime().block_on(fut),
@@ -109,13 +105,13 @@ where
 /// `block_in_place` panics on a `current_thread` runtime. Workers scale to
 /// the CPU count so a cold query's per-superfile fan-out overlaps instead
 /// of serializing.
-pub(crate) fn build_query_runtime(thread_name: &str) -> std::sync::Arc<tokio::runtime::Runtime> {
+pub(crate) fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
     const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
-    let workers = std::thread::available_parallelism()
+    let workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
-    std::sync::Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
+    Arc::new(
+        runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .enable_all()
             .thread_name(thread_name)
@@ -127,8 +123,8 @@ pub(crate) fn build_query_runtime(thread_name: &str) -> std::sync::Arc<tokio::ru
     )
 }
 
-fn build_current_thread_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn build_current_thread_runtime() -> runtime::Runtime {
+    runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect(

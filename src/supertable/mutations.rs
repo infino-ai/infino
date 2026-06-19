@@ -39,12 +39,18 @@
 
 use thiserror::Error;
 
-use crate::storage::StorageError;
-use crate::supertable::QueryError;
-use crate::supertable::error::BuildError;
-use crate::supertable::wal::persistence::WalStoreError;
-use crate::supertable::wal::pipeline::{AppendPhaseError, TombstonePhaseError};
-use crate::supertable::wal::state_doc::WalId;
+use crate::{
+    storage::StorageError,
+    supertable::{
+        QueryError,
+        error::BuildError,
+        wal::{
+            persistence::WalStoreError,
+            pipeline::{AppendPhaseError, TombstonePhaseError},
+            state_doc::WalId,
+        },
+    },
+};
 
 /// Per-call outcome from one `delete` / `update`. Returned by the
 /// public `Supertable::update` / `Supertable::delete` (which fold

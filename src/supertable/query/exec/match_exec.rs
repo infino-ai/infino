@@ -27,29 +27,33 @@
 //! uniformity with the other search TVFs) but constant `0.0`. Order is
 //! unspecified — add a SQL `ORDER BY` / `LIMIT` for control.
 
-use std::any::Any;
-use std::fmt;
-use std::sync::Arc;
+use std::{any::Any, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+use datafusion::{
+    catalog::{Session, TableFunctionImpl, TableProvider},
+    error::{DataFusionError, Result as DfResult},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{Expr, TableType},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
 };
+use futures::stream;
 
-use super::common::{arg_to_string, output_schema_with_score, resolve_hits};
-use super::fts_exec::arg_to_bool_mode;
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::handle::{SupertableReader, WeakReader};
+use super::{
+    common::{arg_to_string, output_schema_with_score, resolve_hits},
+    fts_exec::arg_to_bool_mode,
+};
+use crate::{
+    superfile::fts::reader::BoolMode,
+    supertable::handle::{SupertableReader, WeakReader},
+};
 
 /// SQL name for the unranked token-match TVF.
 pub(crate) const TOKEN_MATCH_UDTF: &str = "token_match";
@@ -366,7 +370,7 @@ impl ExecutionPlan for MatchExec {
             .await
         };
 
-        let stream = futures::stream::once(fut);
+        let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
             stream,
@@ -376,20 +380,26 @@ impl ExecutionPlan for MatchExec {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fmt, sync::Arc};
 
-    use arrow_array::{Array, LargeStringArray, RecordBatch};
+    use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::TaskContext;
-    use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
+    use datafusion::{
+        error::DataFusionError,
+        execution::TaskContext,
+        physical_plan::{DisplayFormatType, ExecutionPlan},
+    };
+    use rayon::ThreadPoolBuilder;
 
     use super::{ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
-    use crate::superfile::builder::FtsConfig;
-    use crate::superfile::fts::reader::BoolMode;
-    use crate::supertable::handle::SupertableReader;
-    use crate::supertable::query::exec::common::output_schema_with_score;
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer as tok;
+    use crate::{
+        superfile::{builder::FtsConfig, fts::reader::BoolMode},
+        supertable::{
+            Supertable, SupertableOptions, handle::SupertableReader,
+            query::exec::common::output_schema_with_score,
+        },
+        test_helpers::default_tokenizer as tok,
+    };
 
     fn title_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -401,7 +411,7 @@ mod tests {
 
     fn options_title_fts() -> SupertableOptions {
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
@@ -517,11 +527,7 @@ mod tests {
         let st = demo();
         let reader = st.reader();
         let method = reader
-            .token_match(
-                "title",
-                "rust systems",
-                crate::superfile::fts::reader::BoolMode::And,
-            )
+            .token_match("title", "rust systems", BoolMode::And)
             .expect("token_match");
         assert_eq!(method.len(), 1);
         let exact = reader
@@ -540,7 +546,7 @@ mod tests {
         let mut out = String::new();
         for batch in &batches {
             for column in batch.columns() {
-                if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
                     for i in 0..strings.len() {
                         if !strings.is_null(i) {
                             out.push_str(strings.value(i));
@@ -598,10 +604,7 @@ mod tests {
             Some(vec![n_cols + 5]),
         )
         .expect_err("out-of-range projection must fail");
-        assert!(
-            matches!(err, datafusion::error::DataFusionError::Execution(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, DataFusionError::Execution(_)), "got {err:?}");
     }
 
     #[test]
@@ -652,7 +655,7 @@ mod tests {
         .expect("try_new");
         let ctx = Arc::new(TaskContext::default());
         match exec.execute(1, ctx) {
-            Err(datafusion::error::DataFusionError::Internal(_)) => {}
+            Err(DataFusionError::Internal(_)) => {}
             Err(other) => panic!("expected Internal error, got {other:?}"),
             Ok(_) => panic!("nonzero partition must error"),
         }
@@ -682,8 +685,8 @@ mod tests {
         // `DisplayAs::fmt_as` also routes through `describe`. Drive it
         // directly via a tiny `Display` adapter.
         struct D<'a>(&'a MatchExec);
-        impl std::fmt::Display for D<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl fmt::Display for D<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 use datafusion::physical_plan::DisplayAs;
                 self.0.fmt_as(DisplayFormatType::Default, f)
             }
@@ -716,9 +719,7 @@ mod tests {
     /// execution touches.
     #[test]
     fn match_table_trait_methods() {
-        use datafusion::catalog::TableFunctionImpl;
-        use datafusion::logical_expr::TableType;
-        use datafusion::prelude::lit;
+        use datafusion::{catalog::TableFunctionImpl, logical_expr::TableType, prelude::lit};
 
         use super::MatchTable;
 

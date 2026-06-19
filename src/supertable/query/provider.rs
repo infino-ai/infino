@@ -43,53 +43,71 @@
 //! (lazy row-group decode, projection/limit pushdown, row-group pruning)
 //! without adding another object-store implementation.
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{
+    any::Any,
+    cmp,
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::Range,
+    sync::{Arc, atomic},
+    time::Instant,
+};
 
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, DFSchema, Statistics};
-use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
-use datafusion::datasource::physical_plan::{
-    FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
-};
-use datafusion::datasource::source::DataSourceExec;
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
-use datafusion::object_store::path::Path as ObjPath;
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-
 use bytes::Bytes;
-use futures::FutureExt;
-use futures::future::BoxFuture;
+use datafusion::{
+    catalog::{Session, TableProvider},
+    common::{ColumnStatistics, DFSchema, Statistics, stats::Precision},
+    datasource::{
+        listing::PartitionedFile,
+        physical_plan::{
+            FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
+            parquet::ParquetAccessPlan,
+        },
+        source::DataSourceExec,
+    },
+    error::{DataFusionError, Result as DfResult},
+    execution::object_store::ObjectStoreUrl,
+    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
+    object_store::path::Path as ObjPath,
+    physical_expr::PhysicalExpr,
+    physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
+    scalar::ScalarValue,
+};
+use futures::{FutureExt, future::BoxFuture};
 use object_store::ObjectStore as OsObjectStore;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
-use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::{
+    arrow::{
+        arrow_reader::{
+            ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+        },
+        async_reader::{AsyncFileReader, ParquetObjectReader},
+    },
+    errors,
+    file::metadata::ParquetMetaData,
+};
 use roaring::RoaringBitmap;
+use uuid::Uuid;
 
-use crate::superfile::LazyByteSource;
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::SuperfileEntry;
-use crate::supertable::manifest::Manifest;
-use crate::supertable::manifest::hll::HllSketch;
-use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
-use crate::supertable::query::df_object_store::SuperfileObjectStore;
-use crate::supertable::query::prune::PruneLeaf;
-use crate::supertable::query::skip::{ScalarOp, ScalarPredicate};
-use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
-use crate::supertable::tombstones::SidecarCache;
-use datafusion::scalar::ScalarValue;
+use crate::{
+    superfile::{LazyByteSource, fts::reader::BoolMode},
+    supertable::{
+        SuperfileEntry,
+        manifest::{Manifest, add_sum_arrays, hll::HllSketch},
+        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        query::{
+            candidate::CandidatePlan,
+            df_object_store::SuperfileObjectStore,
+            prune::{PruneLeaf, select_superfiles},
+            skip::{ScalarOp, ScalarPredicate},
+            superfile_reader::superfile_reader,
+        },
+        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        tombstones::SidecarCache,
+    },
+};
 
 /// Logical name the supertable is registered under in the
 /// DataFusion `SessionContext`. Callers reference it as
@@ -109,7 +127,7 @@ pub(crate) const TABLE_NAME: &str = "supertable";
 const SUPERFILE_STORE_URL_PREFIX: &str = "superfile://supertable-";
 
 /// Monotonic source of per-provider object-store authorities.
-static STORE_URL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STORE_URL_SEQ: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
 /// Selectivity gate for the FTS `WHERE` pushdown: only push an index
 /// candidate set into the scan when the estimated match count is at
@@ -166,14 +184,14 @@ pub(crate) struct SupertableProvider {
     /// manifest statistics). `None` = the whole snapshot. Also the
     /// rewrite's idempotency guard: a restricted provider is never
     /// rewritten again.
-    segment_filter: Option<std::collections::HashSet<uuid::Uuid>>,
+    segment_filter: Option<HashSet<Uuid>>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
 /// disk-cache fields are trait objects without a `Debug` bound, so
 /// we print a structural summary instead.
-impl std::fmt::Debug for SupertableProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SupertableProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupertableProvider")
             .field("schema", &self.schema)
             .field("n_superfiles", &self.manifest.superfiles.len())
@@ -193,7 +211,7 @@ impl SupertableProvider {
         disk_cache: Option<Arc<DiskCacheStore>>,
         tombstone_cache: Option<Arc<SidecarCache>>,
     ) -> Self {
-        let seq = STORE_URL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = STORE_URL_SEQ.fetch_add(1, atomic::Ordering::Relaxed);
         let store_url = ObjectStoreUrl::parse(format!("{SUPERFILE_STORE_URL_PREFIX}{seq}/"))
             .expect("invariant: a counter-derived store URL is always valid");
         Self {
@@ -211,7 +229,7 @@ impl SupertableProvider {
     /// covered/residual aggregate rewrite for the residual (boundary
     /// segment) scan. Gets its own object-store registry key so the
     /// restricted scan's registration can't collide with the parent's.
-    pub(crate) fn restricted_to(&self, segments: std::collections::HashSet<uuid::Uuid>) -> Self {
+    pub(crate) fn restricted_to(&self, segments: HashSet<Uuid>) -> Self {
         let mut restricted = Self::new(
             Arc::clone(&self.schema),
             Arc::clone(&self.manifest),
@@ -241,7 +259,7 @@ impl SupertableProvider {
         match self.tombstone_cache.as_ref() {
             None => true,
             Some(cache) => cache
-                .bitmap_for(entry.superfile_id, std::time::Instant::now())
+                .bitmap_for(entry.superfile_id, Instant::now())
                 .map(|bitmap| bitmap.is_empty())
                 .unwrap_or(false),
         }
@@ -283,10 +301,9 @@ impl SupertableProvider {
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
         let leaves = self.predicates_to_prune_leaves(predicates);
-        let mut survivors =
-            crate::supertable::query::prune::select_superfiles(self.manifest.as_ref(), &leaves)
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         // Covered/residual residual scans read only their boundary
         // superfiles; everything else was answered from statistics.
         if let Some(allowed) = self.segment_filter.as_ref() {
@@ -298,7 +315,7 @@ impl SupertableProvider {
     /// The set of FTS-indexed column names — used by the candidate
     /// planner and by `supports_filters_pushdown` to decide which
     /// filters the index can resolve.
-    fn fts_cols_set(&self) -> std::collections::HashSet<&str> {
+    fn fts_cols_set(&self) -> HashSet<&str> {
         self.manifest
             .options
             .fts_columns
@@ -333,7 +350,7 @@ impl SupertableProvider {
     /// scan entirely; Inexact ones still feed planner estimates.
     fn statistics_for(&self, entries: &[Arc<SuperfileEntry>]) -> Statistics {
         let total_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
 
         // Tombstone view: resolved-from-cache only (this path must be
         // sync and I/O-free). A missing/stale view degrades to
@@ -447,7 +464,7 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue
         let part = entry.scalar_stats.get(name)?.sum.as_ref()?;
         acc = Some(match acc {
             None => Arc::clone(part),
-            Some(total) => crate::supertable::manifest::add_sum_arrays(&total, part)?,
+            Some(total) => add_sum_arrays(&total, part)?,
         });
     }
     ScalarValue::try_from_array(&acc?, 0).ok()
@@ -487,11 +504,11 @@ fn scalar_min_max(
             None => Some((min, max)),
             Some((cur_min, cur_max)) => {
                 let new_min = match min.partial_cmp(&cur_min)? {
-                    std::cmp::Ordering::Less => min,
+                    cmp::Ordering::Less => min,
                     _ => cur_min,
                 };
                 let new_max = match max.partial_cmp(&cur_max)? {
-                    std::cmp::Ordering::Greater => max,
+                    cmp::Ordering::Greater => max,
                     _ => cur_max,
                 };
                 Some((new_min, new_max))
@@ -586,7 +603,7 @@ impl TableProvider for SupertableProvider {
         // One `Instant::now()` for the whole scan so every per-superfile
         // tombstone lookup shares the same `SidecarCache` TTL
         // reference.
-        let now = std::time::Instant::now();
+        let now = Instant::now();
 
         // Warm every surviving superfile's tombstone bitmap in one
         // batched fetch before the per-superfile sweep below, mirroring
@@ -602,7 +619,7 @@ impl TableProvider for SupertableProvider {
         // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
-        let candidate_plan = crate::supertable::query::candidate::CandidatePlan::from_filters(
+        let candidate_plan = CandidatePlan::from_filters(
             filters,
             &self.fts_cols_set(),
             self.manifest.options.tokenizer.as_ref(),
@@ -633,7 +650,7 @@ impl TableProvider for SupertableProvider {
         let mut superfiles: Vec<SuperfileScan> = Vec::with_capacity(survivors.len());
 
         for entry in &survivors {
-            let reader = crate::supertable::query::superfile_reader::superfile_reader(
+            let reader = superfile_reader(
                 &self.store,
                 self.disk_cache.as_ref(),
                 self.manifest.options.storage.as_ref(),
@@ -732,10 +749,7 @@ impl TableProvider for SupertableProvider {
         // above (filters are `Inexact`) verifies the exact predicate over
         // that tiny set. So we attach the pushdown predicate only on the
         // unbounded path.
-        let index_bounded = !matches!(
-            candidate_plan,
-            crate::supertable::query::candidate::CandidatePlan::Unbounded
-        );
+        let index_bounded = !matches!(candidate_plan, CandidatePlan::Unbounded);
         let predicate = if !index_bounded {
             row_group_predicate(state, filters, &self.schema)
         } else {
@@ -920,8 +934,8 @@ struct CachedMetadataReaderFactory {
     metas: HashMap<ObjPath, Arc<ParquetMetaData>>,
 }
 
-impl std::fmt::Debug for CachedMetadataReaderFactory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CachedMetadataReaderFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedMetadataReaderFactory")
             .field("superfiles", &self.metas.len())
             .finish()
@@ -939,24 +953,21 @@ struct CachedMetadataReader {
 }
 
 impl AsyncFileReader for CachedMetadataReader {
-    fn get_bytes(
-        &mut self,
-        range: std::ops::Range<u64>,
-    ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, errors::Result<Bytes>> {
         self.inner.get_bytes(range)
     }
 
     fn get_byte_ranges(
         &mut self,
-        ranges: Vec<std::ops::Range<u64>>,
-    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, errors::Result<Vec<Bytes>>> {
         self.inner.get_byte_ranges(ranges)
     }
 
     fn get_metadata<'a>(
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+    ) -> BoxFuture<'a, errors::Result<Arc<ParquetMetaData>>> {
         match self.meta.clone() {
             Some(meta) => async move { Ok(meta) }.boxed(),
             None => self.inner.get_metadata(options),
@@ -1181,23 +1192,30 @@ fn row_group_predicate(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::prelude::{col, lit};
-    use datafusion::scalar::ScalarValue;
+    use datafusion::{
+        prelude::{col, lit},
+        scalar::ScalarValue,
+    };
+    use object_store::memory::InMemory;
+    use rayon::ThreadPoolBuilder;
+    use tokio::runtime;
 
-    use crate::superfile::builder::FtsConfig;
-    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileUri};
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer;
+    use super::*;
+    use crate::{
+        superfile::builder::FtsConfig,
+        supertable::{
+            Supertable, SupertableOptions,
+            manifest::{ScalarStatsAgg, SuperfileUri},
+        },
+        test_helpers::default_tokenizer,
+    };
 
     /// Build an in-memory Parquet file of `Int64` values `0..total`
     /// split into row groups of `rg_size` rows each.
     fn parquet_with_row_groups(total: i64, rg_size: usize) -> Bytes {
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let arr = Int64Array::from((0..total).collect::<Vec<_>>());
@@ -1391,7 +1409,7 @@ mod tests {
         // One writer thread → one superfile per commit (deterministic
         // superfile counts).
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
@@ -1445,7 +1463,7 @@ mod tests {
             st.options().disk_cache.clone(),
             reader.tombstone_cache.clone(),
         );
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let rt = runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("rt");
@@ -1478,7 +1496,7 @@ mod tests {
     /// Build a provider over a freshly-committed two-superfile table
     /// (the `cat_title` schema), returning the provider and a runtime to
     /// drive its async surface.
-    fn provider_over_two_superfiles() -> (SupertableProvider, tokio::runtime::Runtime) {
+    fn provider_over_two_superfiles() -> (SupertableProvider, runtime::Runtime) {
         let st = Supertable::create(cat_title_opts()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&cat_title_batch(&["a", "a"], &["alpha beta", "gamma"]))
@@ -1495,7 +1513,7 @@ mod tests {
             st.options().disk_cache.clone(),
             reader.tombstone_cache.clone(),
         );
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let rt = runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("rt");
@@ -1565,7 +1583,7 @@ mod tests {
         assert!(!provider.is_segment_restricted());
 
         // manifest() exposes the pinned snapshot.
-        let ids: Vec<uuid::Uuid> = provider
+        let ids: Vec<Uuid> = provider
             .manifest()
             .superfiles
             .iter()
@@ -1574,7 +1592,7 @@ mod tests {
         assert_eq!(ids.len(), 2);
 
         // restricted_to keeps only the named segment and flips the guard.
-        let only_first: std::collections::HashSet<uuid::Uuid> = [ids[0]].into_iter().collect();
+        let only_first: HashSet<Uuid> = [ids[0]].into_iter().collect();
         let restricted = provider.restricted_to(only_first);
         assert!(restricted.is_segment_restricted());
         // Both providers see the same pinned manifest (Arc::clone).
@@ -1595,7 +1613,7 @@ mod tests {
     fn restricted_provider_scans_only_its_segment() {
         let (provider, rt) = provider_over_two_superfiles();
         let first = provider.manifest().superfiles[0].superfile_id;
-        let only_first: std::collections::HashSet<uuid::Uuid> = [first].into_iter().collect();
+        let only_first: HashSet<Uuid> = [first].into_iter().collect();
         let restricted = provider.restricted_to(only_first);
         // With no filters, the unrestricted provider keeps both
         // superfiles; the restricted one keeps only the allowed segment.
@@ -1611,7 +1629,7 @@ mod tests {
 
     fn num_opts() -> SupertableOptions {
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
@@ -1673,7 +1691,7 @@ mod tests {
         let mut scalar_stats = HashMap::new();
         scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
-            superfile_id: uuid::Uuid::new_v4(),
+            superfile_id: Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
             id_min: 0,
@@ -1718,7 +1736,7 @@ mod tests {
     /// and render it.
     #[test]
     fn cached_metadata_reader_factory_debug_reports_superfile_count() {
-        let store: Arc<dyn OsObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn OsObjectStore> = Arc::new(InMemory::new());
         let factory = CachedMetadataReaderFactory {
             store,
             metas: HashMap::new(),

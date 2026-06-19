@@ -295,8 +295,9 @@ fn read_exact(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::DateTime;
+
+    use super::*;
 
     fn sample_bitmap() -> RoaringBitmap {
         let mut b = RoaringBitmap::new();

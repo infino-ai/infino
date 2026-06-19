@@ -14,12 +14,10 @@
 //! `sweep-down` walks **down** from the calibrated 0.99 point `(p=5, r=256)`:
 //! halve `r` at fixed `p=5`, then halve `p` at the last `r`.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use futures::executor::block_on;
-use infino::roaring::RoaringBitmap;
-use infino::superfile::reader::VectorSearchOptions;
+use infino::{roaring::RoaringBitmap, superfile::reader::VectorSearchOptions};
 use infino_bench_utils::corpus::{self, DIM};
 
 const SEED: u64 = 1;

@@ -37,6 +37,8 @@
 //! `codec_meta_off: u32`. `Fp32` / `RabitqOnly` superfiles
 //! write `codec_meta_off = 0`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::superfile::vector::distance::Metric;
@@ -269,8 +271,8 @@ impl RerankCodec {
     }
 }
 
-impl std::fmt::Display for RerankCodec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for RerankCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
 }

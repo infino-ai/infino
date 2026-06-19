@@ -23,19 +23,25 @@
 //! means constructing a new `FileMetaData` with the patched KVs and
 //! rebuilding the `ParquetMetaData` around it.
 
-use crate::superfile::format::kv;
+use std::{collections::HashMap, sync::Arc};
+
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::metadata::{
-    FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
-    ParquetMetaDataWriter,
+use bytes::Bytes;
+use parquet::{
+    arrow::ArrowWriter,
+    basic::Compression,
+    file::{
+        metadata::{
+            FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
+            ParquetMetaDataWriter,
+        },
+        properties::WriterProperties,
+    },
+    schema::types::ColumnPath,
 };
-use parquet::file::properties::WriterProperties;
-use parquet::schema::types::ColumnPath;
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use crate::superfile::{LazyByteSource, LazyByteSourceError, format::kv};
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
 const PARQUET_MAGIC_LEN: usize = 4;
@@ -295,9 +301,9 @@ pub fn read_kv_metadata(bytes: &[u8]) -> Result<KvMap, FooterError> {
 /// KV map via [`extract_kv_map`] or the Arrow schema via
 /// `parquet::arrow::schema::parquet_to_arrow_schema`.
 pub async fn read_parquet_metadata_lazy(
-    source: &dyn crate::superfile::LazyByteSource,
+    source: &dyn LazyByteSource,
     tail_speculative_bytes: u64,
-) -> Result<parquet::file::metadata::ParquetMetaData, FooterError> {
+) -> Result<ParquetMetaData, FooterError> {
     // route the parquet tail fetch through
     // `LazyByteSource::tail`. On a `StorageRangeSource` with
     // unknown size this is a single suffix-range GET that
@@ -332,7 +338,7 @@ pub async fn read_parquet_metadata_lazy(
         .checked_sub(PARQUET_FOOTER_SUFFIX_BYTES + footer_len)
         .ok_or(FooterError::Malformed("footer length out of range"))?;
 
-    let footer_bytes: bytes::Bytes = if (footer_start_abs as u64) >= spec_start {
+    let footer_bytes: Bytes = if (footer_start_abs as u64) >= spec_start {
         let off_in_tail = footer_start_abs - (spec_start as usize);
         tail.slice(off_in_tail..off_in_tail + footer_len)
     } else {
@@ -351,7 +357,7 @@ pub async fn read_parquet_metadata_lazy(
 /// callers only need the `inf.*` KV map (e.g. tests + the eager
 /// open path, mirroring the eager [`read_kv_metadata`]).
 pub async fn read_kv_metadata_lazy(
-    source: &dyn crate::superfile::LazyByteSource,
+    source: &dyn LazyByteSource,
     tail_speculative_bytes: u64,
 ) -> Result<KvMap, FooterError> {
     let metadata = read_parquet_metadata_lazy(source, tail_speculative_bytes).await?;
@@ -361,9 +367,7 @@ pub async fn read_kv_metadata_lazy(
 /// Shared extractor — pulls every KV (key, value) pair out of
 /// a decoded `ParquetMetaData` into a HashMap. Used by both the
 /// eager and lazy footer-readers above.
-pub fn extract_kv_map(
-    metadata: &parquet::file::metadata::ParquetMetaData,
-) -> Result<KvMap, FooterError> {
+pub fn extract_kv_map(metadata: &ParquetMetaData) -> Result<KvMap, FooterError> {
     let mut out: KvMap = HashMap::new();
     if let Some(kvs) = metadata.file_metadata().key_value_metadata() {
         for kv in kvs {
@@ -379,15 +383,16 @@ pub fn extract_kv_map(
 /// async-tail readers. Storage failures become `Parquet`-shaped
 /// errors via the existing `Malformed` channel — the variant
 /// shape exists for both signal and source-chain preservation.
-fn footer_lazy_err(e: crate::superfile::LazyByteSourceError) -> FooterError {
+fn footer_lazy_err(e: LazyByteSourceError) -> FooterError {
     FooterError::LazySource(e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use arrow_array::{Float64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field};
+
+    use super::*;
 
     fn small_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -583,13 +588,16 @@ mod tests {
         assert!(matches!(err, FooterError::Malformed(_)));
     }
 
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
     /// counting lazy source used by the
     /// `read_kv_metadata_lazy` tests below. Records every
     /// `range()` invocation so the test can assert the
     /// speculative-tail vs. follow-up GET budget.
     use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug)]
     struct CountingFooterSource {
@@ -598,7 +606,7 @@ mod tests {
     }
 
     impl CountingFooterSource {
-        fn new(bytes: bytes::Bytes) -> Self {
+        fn new(bytes: Bytes) -> Self {
             Self {
                 inner: BytesLazyByteSource::new(bytes),
                 async_calls: Arc::new(AtomicU64::new(0)),
@@ -614,11 +622,11 @@ mod tests {
         fn size(&self) -> u64 {
             self.inner.size()
         }
-        async fn range(&self, start: u64, len: u64) -> Result<bytes::Bytes, LazyByteSourceError> {
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
             self.async_calls.fetch_add(1, Ordering::Relaxed);
             self.inner.range(start, len).await
         }
-        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<bytes::Bytes> {
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
             None
         }
     }
@@ -649,7 +657,7 @@ mod tests {
         .expect("write parquet with blobs");
 
         let eager = read_kv_metadata(&parts.bytes).expect("eager kv");
-        let source = CountingFooterSource::new(bytes::Bytes::from(parts.bytes));
+        let source = CountingFooterSource::new(Bytes::from(parts.bytes));
         let counter = source.counter();
         let lazy = read_kv_metadata_lazy(&source, 64 * 1024)
             .await
@@ -689,7 +697,7 @@ mod tests {
         .expect("write parquet with blobs");
         let eager = read_kv_metadata(&parts.bytes).expect("eager kv");
 
-        let source = CountingFooterSource::new(bytes::Bytes::from(parts.bytes));
+        let source = CountingFooterSource::new(Bytes::from(parts.bytes));
         let counter = source.counter();
         // Force the speculative tail to be ridiculously small
         // (just the trailing 16 bytes — enough for `PAR1` +

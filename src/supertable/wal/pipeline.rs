@@ -54,31 +54,39 @@
 //! step-4 PUT is overwrite-safe and the step-5 manifest swap can
 //! short-circuit via the idempotency probe in step 1.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 
 use arrow::ipc::reader::StreamReader;
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use bytes::Bytes;
+use roaring::RoaringBitmap;
+use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::runtime_bridge::bridge_sync_to_async;
-use crate::storage::StorageError;
-use crate::superfile::SuperfileReader;
-use crate::superfile::builder::SuperfileBuilder;
-use crate::supertable::handle::Supertable;
-use crate::supertable::manifest::bloom::BloomBuilder;
-use crate::supertable::manifest::{
-    FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+use crate::{
+    runtime_bridge::bridge_sync_to_async,
+    storage::StorageError,
+    superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
+    supertable::{
+        Manifest, SupertableOptions,
+        handle::{Supertable, SupertableInner},
+        manifest::{
+            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+            VectorSummary, bloom::BloomBuilder,
+        },
+        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        query::superfile_reader::superfile_reader,
+        utils::vector_split::split_vectors,
+        wal::{
+            persistence::{Etag, WalStore, WalStoreError},
+            state_doc::{
+                IdSpan, OpKind, RowId, TombstoneEntry, TombstoneOutcome, WalState, WalStateDoc,
+            },
+            tombstones_codec::TombstonesSidecar,
+        },
+        writer::{build_subsection_offsets, persist_commit},
+    },
 };
-use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
-use crate::supertable::utils::vector_split::split_vectors;
-use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{
-    IdSpan, OpKind, RowId, TombstoneOutcome, WalState, WalStateDoc,
-};
-use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
-use crate::supertable::writer::build_subsection_offsets;
 
 /// Outcome of one append-phase invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,7 +263,7 @@ pub async fn run_append_phase(
 /// matching `superfile_id`. O(N) in the number of live
 /// superfiles; called once per append-phase invocation, so the
 /// linear scan is fine at the supertable sizes we target.
-fn manifest_contains(manifest: &crate::supertable::Manifest, superfile_id: Uuid) -> bool {
+fn manifest_contains(manifest: &Manifest, superfile_id: Uuid) -> bool {
     manifest
         .get_all_superfiles()
         .iter()
@@ -434,15 +442,10 @@ async fn do_apply(
     // `Writer::commit` path arms it. We swap here so subsequent
     // reads + the idempotency probe on a retry both see the
     // new superfile.
-    crate::supertable::writer::persist_commit(
-        inner,
-        storage,
-        vec![entry],
-        &[],
-        vec![(uri, bytes.clone())],
-    )
-    .map_err(|e| AppendPhaseError::ManifestCommit {
-        message: format!("{e}"),
+    persist_commit(inner, storage, vec![entry], &[], vec![(uri, bytes.clone())]).map_err(|e| {
+        AppendPhaseError::ManifestCommit {
+            message: format!("{e}"),
+        }
     })?;
 
     // Warm the in-memory reader cache with the freshly-published
@@ -483,7 +486,7 @@ fn decode_ipc_batch(
     ipc_bytes: &Bytes,
     wal_doc: &WalStateDoc,
 ) -> Result<RecordBatch, AppendPhaseError> {
-    let cursor = std::io::Cursor::new(ipc_bytes.as_ref());
+    let cursor = Cursor::new(ipc_bytes.as_ref());
     let mut reader =
         StreamReader::try_new(cursor, None).map_err(|e| AppendPhaseError::IpcDecode {
             wal_id: wal_doc.wal_id.to_hex(),
@@ -519,7 +522,7 @@ fn decode_ipc_batch(
 fn prepend_id_column(
     scalar_no_id: &RecordBatch,
     flat_ids: &[i128],
-    options: &crate::supertable::SupertableOptions,
+    options: &SupertableOptions,
 ) -> Result<RecordBatch, AppendPhaseError> {
     let id_values: Vec<i128> = flat_ids.to_vec();
     let id_array = Decimal128Array::from(id_values)
@@ -545,7 +548,7 @@ fn prepend_id_column(
 /// regardless of which code path produced the superfile.
 fn build_fts_summary(
     reader: &SuperfileReader,
-    options: &crate::supertable::SupertableOptions,
+    options: &SupertableOptions,
 ) -> HashMap<String, FtsSummaryAgg> {
     let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
     let Some(fts_reader) = reader.fts() else {
@@ -581,7 +584,7 @@ fn build_fts_summary(
 /// entry in the summary map.
 fn build_vector_summary(
     reader: &SuperfileReader,
-    options: &crate::supertable::SupertableOptions,
+    options: &SupertableOptions,
 ) -> HashMap<String, VectorSummary> {
     let mut out: HashMap<String, VectorSummary> = HashMap::new();
     let Some(vec_reader) = reader.vec() else {
@@ -592,9 +595,7 @@ fn build_vector_summary(
             let clusters = vec_reader
                 .cluster_centroids(&vc.column)
                 .map(|(n_cent, dim, fp32, counts)| {
-                    crate::supertable::manifest::ClusterCentroids::from_fp32(
-                        n_cent, dim, &fp32, counts,
-                    )
+                    ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
                 })
                 .unwrap_or_default();
             out.insert(
@@ -714,10 +715,7 @@ pub enum TombstonePhaseError {
     #[error(
         "tombstone sidecar CAS exhausted after {attempts} attempts for superfile {superfile_id}"
     )]
-    CasRetryExhausted {
-        superfile_id: uuid::Uuid,
-        attempts: u32,
-    },
+    CasRetryExhausted { superfile_id: Uuid, attempts: u32 },
 
     /// Failure scanning a superfile's `_id` column when resolving
     /// `target_id → (superfile_id, doc_id)`. The underlying error
@@ -798,9 +796,7 @@ pub async fn run_tombstone_phase(
 /// Sum the per-outcome counts off a `tombstone_progress` slice.
 /// Pulled out so [`run_tombstone_phase`] and the eventual
 /// `do_tombstone_apply` can use the same accounting.
-fn count_outcomes(
-    progress: &[crate::supertable::wal::state_doc::TombstoneEntry],
-) -> (usize, usize) {
+fn count_outcomes(progress: &[TombstoneEntry]) -> (usize, usize) {
     let mut n_tombstoned = 0usize;
     let mut n_not_found = 0usize;
     for entry in progress {
@@ -930,16 +926,10 @@ async fn do_tombstone_apply(
 /// manifest each retry so a freshly-published merged superfile
 /// routes the next resolve to the new id-range.
 async fn resolve_and_tombstone_one(
-    inner: &Arc<crate::supertable::handle::SupertableInner>,
+    inner: &Arc<SupertableInner>,
     wal_store: &WalStore,
     target_id: RowId,
-) -> Result<
-    (
-        crate::supertable::wal::state_doc::TombstoneOutcome,
-        Option<Uuid>,
-    ),
-    TombstonePhaseError,
-> {
+) -> Result<(TombstoneOutcome, Option<Uuid>), TombstonePhaseError> {
     let mut sealed_attempts = 0u32;
     loop {
         let manifest = inner.manifest.load_full();
@@ -963,7 +953,7 @@ async fn resolve_and_tombstone_one(
                 let ms = SEALED_RETRY_BASE_MS
                     .saturating_mul(1u64 << (sealed_attempts - 1).min(SEALED_RETRY_MAX_SHIFT))
                     .min(SEALED_RETRY_CAP_MS);
-                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                sleep(Duration::from_millis(ms)).await;
                 // Loop back and re-resolve against a fresh manifest.
             }
         }
@@ -1013,7 +1003,7 @@ async fn cas_tombstone_bit(
                 b
             }
             None => {
-                let mut b = roaring::RoaringBitmap::new();
+                let mut b = RoaringBitmap::new();
                 b.insert(doc_id);
                 b
             }
@@ -1050,8 +1040,8 @@ async fn cas_tombstone_bit(
 /// `[id_min, id_max]` range filter eliminates all but a handful
 /// of candidates per target.
 fn resolve_target_id_in_manifest(
-    inner: &Arc<crate::supertable::handle::SupertableInner>,
-    manifest: &crate::supertable::Manifest,
+    inner: &Arc<SupertableInner>,
+    manifest: &Manifest,
     target_id: RowId,
 ) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
     let target = target_id.0;
@@ -1067,15 +1057,13 @@ fn resolve_target_id_in_manifest(
         // recovery sweep on `Supertable::open` lands here when
         // the freshly-opened handle's in-memory tier is empty
         // and no disk cache is attached.
-        let reader = match bridge_sync_to_async(
-            crate::supertable::query::superfile_reader::superfile_reader(
-                &inner.options.store,
-                inner.options.disk_cache.as_ref(),
-                inner.options.storage.as_ref(),
-                &entry.uri,
-                entry.subsection_offsets.as_ref(),
-            ),
-        ) {
+        let reader = match bridge_sync_to_async(superfile_reader(
+            &inner.options.store,
+            inner.options.disk_cache.as_ref(),
+            inner.options.storage.as_ref(),
+            &entry.uri,
+            entry.subsection_offsets.as_ref(),
+        )) {
             Ok(r) => r,
             Err(_) => {
                 let bytes =
@@ -1105,7 +1093,7 @@ fn resolve_target_id_in_manifest(
         // error here; fall back to a direct storage fetch in that case.
         let lookup_result = match reader.id_lookup(target) {
             Ok(result) => result,
-            Err(crate::superfile::ReadError::Io(_)) => {
+            Err(ReadError::Io(_)) => {
                 // Lazy reader — re-open eagerly from storage.
                 let bytes =
                     fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
@@ -1157,7 +1145,7 @@ fn resolve_target_id_in_manifest(
 /// `query::superfile_reader::superfile_reader` async-bridge
 /// pattern.
 fn fetch_superfile_bytes_for_id_scan(
-    inner: &Arc<crate::supertable::handle::SupertableInner>,
+    inner: &Arc<SupertableInner>,
     superfile_id: Uuid,
 ) -> Result<Bytes, String> {
     let storage = inner
@@ -1185,19 +1173,27 @@ mod tests {
     //! matching the existing persistence-layer test pattern
     //! used elsewhere in this crate.
 
-    use super::*;
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::Supertable;
-    use crate::supertable::wal::state_doc::{
-        OpKind, RowId, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome, WalId,
-        WalState,
-    };
-    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
-    use crate::test_helpers::{build_title_batch, default_supertable_options};
     use arrow::ipc::writer::StreamWriter;
     use chrono::Utc;
     use tempfile::TempDir;
+    use tokio::time::timeout;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{
+            Supertable,
+            wal::{
+                state_doc::{
+                    OpKind, RowId, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome,
+                    WalId, WalState,
+                },
+                tombstones_codec::TombstonesSidecar,
+            },
+        },
+        test_helpers::{build_title_batch, default_supertable_options},
+    };
 
     /// Construct a Supertable + a fresh WAL state doc + the WAL's
     /// etag, all backed by the same LocalFs storage so an
@@ -1225,7 +1221,7 @@ mod tests {
             new_row_count: Some(1),
             new_row_content_hash: Some("0".repeat(64)),
             preallocated_superfile_id: Some(Uuid::from_u128(0x1234_5678_9ABC)),
-            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+            minted_id_spans: vec![IdSpan {
                 first: RowId(100),
                 last: RowId(100),
             }],
@@ -1271,7 +1267,7 @@ mod tests {
     async fn manifest_contains_returns_true_for_matching_uuid() {
         let (_dir, _st, _ws, _wal, _etag) = fixture().await;
         let opts = Arc::new(default_supertable_options());
-        let empty = crate::supertable::Manifest::empty(Arc::clone(&opts));
+        let empty = Manifest::empty(Arc::clone(&opts));
         assert!(!manifest_contains(&empty, Uuid::nil()));
     }
 
@@ -1331,7 +1327,7 @@ mod tests {
             new_row_count: Some(n),
             new_row_content_hash: Some(content_hash),
             preallocated_superfile_id: Some(Uuid::from_u128(0xDEAD_BEEF_CAFE)),
-            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+            minted_id_spans: vec![IdSpan {
                 first: RowId(minted_first),
                 last: RowId(minted_first + (n as i128) - 1),
             }],
@@ -1565,7 +1561,7 @@ mod tests {
             new_row_count: Some(1),
             new_row_content_hash: Some(content_hash),
             preallocated_superfile_id: Some(Uuid::from_u128(0x7070)),
-            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+            minted_id_spans: vec![IdSpan {
                 first: RowId(1),
                 last: RowId(1),
             }],
@@ -1613,7 +1609,7 @@ mod tests {
         // ids — the lockstep invariant is violated, surfacing a
         // typed IdSpansLengthMismatch.
         let (_dir, st, ws, mut wal, etag) = fixture_with_ipc_payload(&["foo"], 721, 1_000).await;
-        wal.minted_id_spans = vec![crate::supertable::wal::state_doc::IdSpan {
+        wal.minted_id_spans = vec![IdSpan {
             first: RowId(1),
             last: RowId(2), // two ids, but new_row_count == 1
         }];
@@ -1665,7 +1661,7 @@ mod tests {
             new_row_count: Some(1),
             new_row_content_hash: Some(content_hash),
             preallocated_superfile_id: Some(Uuid::from_u128(0x7373)),
-            minted_id_spans: vec![crate::supertable::wal::state_doc::IdSpan {
+            minted_id_spans: vec![IdSpan {
                 first: RowId(1),
                 last: RowId(1),
             }],
@@ -1692,11 +1688,11 @@ mod tests {
     #[test]
     fn flatten_spans_concatenates_inclusive_ranges_in_order() {
         let spans = vec![
-            crate::supertable::wal::state_doc::IdSpan {
+            IdSpan {
                 first: RowId(10),
                 last: RowId(12),
             },
-            crate::supertable::wal::state_doc::IdSpan {
+            IdSpan {
                 first: RowId(100),
                 last: RowId(100),
             },
@@ -1723,7 +1719,7 @@ mod tests {
     async fn tombstone_fixture(
         op_kind: OpKind,
         state: WalState,
-        progress: Vec<crate::supertable::wal::state_doc::TombstoneEntry>,
+        progress: Vec<TombstoneEntry>,
     ) -> (TempDir, Supertable, WalStore, WalStateDoc, Etag) {
         let (dir, st, ws, mut wal, etag) = fixture().await;
         wal.op_kind = op_kind;
@@ -1745,11 +1741,8 @@ mod tests {
         (dir, st, ws, wal, new_etag)
     }
 
-    fn ts_entry(
-        target_id: i128,
-        outcome: TombstoneOutcome,
-    ) -> crate::supertable::wal::state_doc::TombstoneEntry {
-        crate::supertable::wal::state_doc::TombstoneEntry {
+    fn ts_entry(target_id: i128, outcome: TombstoneOutcome) -> TombstoneEntry {
+        TombstoneEntry {
             target_id: RowId(target_id),
             outcome,
             tombstoned_in_superfile: None,
@@ -1916,10 +1909,10 @@ mod tests {
 
     /// Fetch the persisted sidecar bitmap for one superfile. Helper
     /// for the post-tombstone assertions.
-    async fn read_sidecar_bitmap(ws: &WalStore, superfile_id: Uuid) -> roaring::RoaringBitmap {
+    async fn read_sidecar_bitmap(ws: &WalStore, superfile_id: Uuid) -> RoaringBitmap {
         match ws.get_tombstones(superfile_id).await.expect("get") {
             Some((sc, _etag)) => sc.bitmap,
-            None => roaring::RoaringBitmap::new(),
+            None => RoaringBitmap::new(),
         }
     }
 
@@ -2125,7 +2118,7 @@ mod tests {
                 compaction_id: Uuid::from_u128(0xC0DE_C0DE),
                 sealed_at: Utc::now(),
             }),
-            bitmap: roaring::RoaringBitmap::new(),
+            bitmap: RoaringBitmap::new(),
         };
         ws.put_tombstones(sf_id, None, &sealed)
             .await
@@ -2143,8 +2136,8 @@ mod tests {
         // run hasn't completed quickly), then assert by reading
         // the WAL state — it should still be Intent because no
         // target made it to Tombstoned.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+        let result = timeout(
+            Duration::from_millis(250),
             run_tombstone_phase(&st, &ws, &wal, &etag),
         )
         .await;

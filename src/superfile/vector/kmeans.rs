@@ -26,11 +26,10 @@
 //! The seed is derived from this column's `rot_seed` (offset by 7) so
 //! the rotation and clustering use distinct PRNG streams.
 
-use crate::superfile::vector::distance::l2_sq;
-use rand::RngExt;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
+
+use crate::superfile::vector::distance::l2_sq;
 
 /// Offset added to a column's `rot_seed` to seed k-means. Keeps the
 /// clustering PRNG stream distinct from the rotation stream, which is

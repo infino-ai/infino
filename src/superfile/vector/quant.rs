@@ -592,8 +592,7 @@ mod tests {
             eprintln!("avx512_microbench: skipped, no AVX-512 on this host");
             return;
         }
-        use std::hint::black_box;
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
 
         eprintln!();
         eprintln!("### RaBitQ estimator — AVX-512 mask-add vs wide sign-table (ns per call)\n");

@@ -30,21 +30,24 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::config::{
-    CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-    SupertableSettings,
+use infino::{
+    config::{
+        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+        SupertableSettings,
+    },
+    superfile::builder::{FtsConfig, VectorConfig},
+    supertable::{
+        Supertable,
+        query::VectorSearchOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{AzureStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::superfile::builder::{FtsConfig, VectorConfig};
-use infino::supertable::Supertable;
-use infino::supertable::query::VectorSearchOptions;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{AzureStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
 use super::azure_helpers::{

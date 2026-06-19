@@ -26,21 +26,26 @@
 //! cross-product so a future regression that corrupts the
 //! resume cursor lights up here.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use chrono::Utc;
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    supertable::{
+        Supertable,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        wal::{
+            WalStore,
+            state_doc::{
+                OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+                WalStateDoc,
+            },
+        },
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
 use uuid::Uuid;
-
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::wal::WalStore;
-use infino::supertable::wal::state_doc::{
-    OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
-};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 /// Document count seeded into each crash-recovery fixture.
 const SEED_DOC_COUNT: usize = 5;

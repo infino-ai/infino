@@ -36,19 +36,20 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
-use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_schema::{Field, Schema};
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
-use crate::supertable::manifest::bloom::Bloom;
-use crate::supertable::manifest::list::ScalarStatsAgg;
-use crate::supertable::manifest::{FtsSummaryAgg, VectorSummary};
+use crate::supertable::manifest::{
+    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+};
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -161,10 +162,10 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
         if let Some(nulls) = agg.null_count {
             fields.push(Field::new(
                 format!("{key}{NULLS_SUFFIX}"),
-                arrow_schema::DataType::UInt64,
+                DataType::UInt64,
                 true,
             ));
-            arrays.push(Arc::new(arrow_array::UInt64Array::from(vec![nulls])) as ArrayRef);
+            arrays.push(Arc::new(UInt64Array::from(vec![nulls])) as ArrayRef);
         }
         if let Some(sum) = &agg.sum {
             fields.push(Field::new(
@@ -177,12 +178,10 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
         if let Some(sketch) = &agg.hll {
             fields.push(Field::new(
                 format!("{key}{HLL_SUFFIX}"),
-                arrow_schema::DataType::Binary,
+                DataType::Binary,
                 true,
             ));
-            arrays.push(
-                Arc::new(arrow_array::BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef,
-            );
+            arrays.push(Arc::new(BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef);
         }
     }
     let schema = Arc::new(Schema::new(fields));
@@ -231,7 +230,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         } else if let Some(base) = name.strip_suffix(NULLS_SUFFIX) {
             let arr = column
                 .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
+                .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| {
                     DecodeError::ArrowIpc(format!("{name}: __nulls column is not UInt64"))
                 })?;
@@ -243,7 +242,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         } else if let Some(base) = name.strip_suffix(HLL_SUFFIX) {
             let arr = column
                 .as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
+                .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
                     DecodeError::ArrowIpc(format!("{name}: __hll column is not Binary"))
                 })?;
@@ -549,14 +548,14 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
     Ok(VectorSummary {
         centroid,
         radius,
-        clusters: super::ClusterCentroids {
+        clusters: ClusterCentroids {
             n_cent: n_cent as u32,
             dim: cdim as u32,
             codes,
             mins,
             scales,
             counts,
-            code_moments: std::sync::OnceLock::new(),
+            code_moments: OnceLock::new(),
         },
     })
 }
@@ -669,9 +668,9 @@ mod decode_error_tests {
     //! shape-mismatch paths (truncation, bad arrow columns, unpaired
     //! min/max, non-UTF-8 map keys) are covered, not just the happy
     //! round-trips.
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::{collections::HashMap, io::Cursor, sync::Arc};
 
+    use arrow::ipc::writer::StreamWriter;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
@@ -702,8 +701,7 @@ mod decode_error_tests {
         let batch = RecordBatch::try_new(schema.clone(), arrays).expect("batch");
         let mut out = Vec::new();
         {
-            let mut w =
-                arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            let mut w = StreamWriter::try_new(&mut out, &schema).expect("ipc init");
             w.write(&batch).expect("ipc write");
             w.finish().expect("ipc finish");
         }
@@ -869,8 +867,7 @@ mod decode_error_tests {
         .expect("batch");
         let mut out = Vec::new();
         {
-            let mut w =
-                arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            let mut w = StreamWriter::try_new(&mut out, &schema).expect("ipc init");
             w.write(&batch).expect("write 1");
             w.write(&batch).expect("write 2");
             w.finish().expect("finish");
@@ -977,13 +974,13 @@ mod decode_error_tests {
     /// the buffer is shorter than the requested read.
     #[test]
     fn cursor_helpers_truncate() {
-        let mut c = std::io::Cursor::new(&[0u8, 1][..]);
+        let mut c = Cursor::new(&[0u8, 1][..]);
         let err = read_u32(&mut c, "header").expect_err("only 2 bytes");
         assert!(
             matches!(err, DecodeError::Truncated { what: "header", .. }),
             "got {err:?}"
         );
-        let mut c = std::io::Cursor::new(&[0u8, 1, 2][..]);
+        let mut c = Cursor::new(&[0u8, 1, 2][..]);
         let err = read_n(&mut c, 8, "body").expect_err("only 3 bytes");
         assert!(
             matches!(
@@ -1015,8 +1012,7 @@ mod decode_error_tests {
         .expect("batch");
         let mut out = Vec::new();
         {
-            let mut w =
-                arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            let mut w = StreamWriter::try_new(&mut out, &schema).expect("ipc init");
             w.write(&batch).expect("write 1");
             w.write(&batch).expect("write 2");
             w.finish().expect("finish");

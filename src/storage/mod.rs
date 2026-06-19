@@ -30,9 +30,7 @@
 //! specifically, re-reads the pointer to capture the winner's
 //! state, and retries the commit on top of it.
 
-use std::ops::Range;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::{fmt, ops::Range, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -116,7 +114,7 @@ pub enum StorageError {
 /// supertable: the manifest part loader, the disk cache
 /// store, and the writer all hold clones of the *same* `Arc`.
 #[async_trait]
-pub trait StorageProvider: Send + Sync + std::fmt::Debug {
+pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// Cheap metadata lookup. Used by the cold-fetch
     /// coordinator to size the destination file before
     /// issuing range-GETs.
@@ -271,14 +269,12 @@ pub trait StorageProvider: Send + Sync + std::fmt::Debug {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::collections::HashMap;
-    use std::ops::Range;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, error::Error, ops::Range, sync::Mutex};
 
     use async_trait::async_trait;
     use bytes::Bytes;
+
+    use super::*;
 
     /// Fixed etag the mock reports for any stored object.
     const MOCK_ETAG: &str = "mock-etag";
@@ -374,7 +370,7 @@ mod tests {
         ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
             // The mock doesn't support streaming uploads; a permanent
             // error is enough to exercise the call path.
-            let boxed: Box<dyn std::error::Error + Send + Sync> = "multipart unsupported".into();
+            let boxed: Box<dyn Error + Send + Sync> = "multipart unsupported".into();
             Err(StorageError::Permanent {
                 uri: uri.into(),
                 source: boxed,

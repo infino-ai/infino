@@ -43,27 +43,28 @@
 //!   * a provider already restricted to a segment subset is the
 //!     rewrite's own residual — never rewritten again (idempotency).
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
+use arrow_array::ArrayRef;
 use arrow_schema::DataType;
-use datafusion::common::ScalarValue;
-use datafusion::common::tree_node::Transformed;
-use datafusion::datasource::DefaultTableSource;
-use datafusion::datasource::provider_as_source;
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::functions::core::expr_fn::{coalesce, greatest, least};
-use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
-use datafusion::logical_expr::{
-    Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
+use datafusion::{
+    catalog::TableProvider,
+    common::{ScalarValue, tree_node::Transformed},
+    datasource::{DefaultTableSource, provider_as_source},
+    error::{DataFusionError, Result as DfResult},
+    functions::core::expr_fn::{coalesce, greatest, least},
+    functions_aggregate::expr_fn::{count, max, min, sum},
+    logical_expr::{Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit},
+    optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
+    prelude::{cast, col},
 };
-use datafusion::optimizer::optimizer::ApplyOrder;
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion::prelude::cast;
+use uuid::Uuid;
 
-use crate::supertable::manifest::{SuperfileEntry, add_sum_arrays};
-use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
-use crate::supertable::query::provider::SupertableProvider;
+use crate::supertable::{
+    manifest::{SuperfileEntry, add_sum_arrays},
+    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+    query::provider::SupertableProvider,
+};
 
 /// The covered/residual aggregate rewrite. Registered on the
 /// `query_sql` session after DataFusion's built-in rules.
@@ -163,7 +164,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
 
     // Classify every segment.
     let mut covered: Vec<&Arc<SuperfileEntry>> = Vec::new();
-    let mut boundary: HashSet<uuid::Uuid> = HashSet::new();
+    let mut boundary: HashSet<Uuid> = HashSet::new();
     for entry in &manifest.superfiles {
         let class = classify(entry, id_column, &range);
         match class {
@@ -204,7 +205,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let restricted = Arc::new(provider.restricted_to(boundary));
     let mut builder = LogicalPlanBuilder::scan(
         scan.table_name.clone(),
-        provider_as_source(restricted as Arc<dyn datafusion::catalog::TableProvider>),
+        provider_as_source(restricted as Arc<dyn TableProvider>),
         None,
     )?
     .filter(predicate.clone())?;
@@ -217,23 +218,18 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
             AggKind::CountStar => {
                 partial_exprs.push(count(lit(1i64)).alias(format!("__resid_{i}_cnt")));
             }
-            AggKind::Sum(col) => {
-                partial_exprs
-                    .push(sum(datafusion::prelude::col(col)).alias(format!("__resid_{i}_sum")));
+            AggKind::Sum(column) => {
+                partial_exprs.push(sum(col(column)).alias(format!("__resid_{i}_sum")));
             }
-            AggKind::Min(col) => {
-                partial_exprs
-                    .push(min(datafusion::prelude::col(col)).alias(format!("__resid_{i}_min")));
+            AggKind::Min(column) => {
+                partial_exprs.push(min(col(column)).alias(format!("__resid_{i}_min")));
             }
-            AggKind::Max(col) => {
-                partial_exprs
-                    .push(max(datafusion::prelude::col(col)).alias(format!("__resid_{i}_max")));
+            AggKind::Max(column) => {
+                partial_exprs.push(max(col(column)).alias(format!("__resid_{i}_max")));
             }
-            AggKind::Avg(col) => {
-                partial_exprs
-                    .push(sum(datafusion::prelude::col(col)).alias(format!("__resid_{i}_sum")));
-                partial_exprs
-                    .push(count(datafusion::prelude::col(col)).alias(format!("__resid_{i}_cnt")));
+            AggKind::Avg(column) => {
+                partial_exprs.push(sum(col(column)).alias(format!("__resid_{i}_sum")));
+                partial_exprs.push(count(col(column)).alias(format!("__resid_{i}_cnt")));
             }
         }
     }
@@ -254,33 +250,24 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         let expr = match (kind, partial) {
             (AggKind::CountStar, Partial::Count(n)) => {
                 // COUNT over an empty residual is 0, never NULL.
-                (datafusion::prelude::col(format!("__resid_{i}_cnt")) + lit(*n)).alias(name)
+                (col(format!("__resid_{i}_cnt")) + lit(*n)).alias(name)
             }
             (AggKind::Sum(_), Partial::Sum(value)) => {
                 let zero = typed_zero(value)?;
-                (coalesce(vec![
-                    datafusion::prelude::col(format!("__resid_{i}_sum")),
-                    lit(zero),
-                ]) + lit(value.clone()))
-                .alias(name)
+                (coalesce(vec![col(format!("__resid_{i}_sum")), lit(zero)]) + lit(value.clone()))
+                    .alias(name)
             }
-            (AggKind::Min(_), Partial::Bound(value)) => least(vec![
-                datafusion::prelude::col(format!("__resid_{i}_min")),
-                lit(value.clone()),
-            ])
-            .alias(name),
-            (AggKind::Max(_), Partial::Bound(value)) => greatest(vec![
-                datafusion::prelude::col(format!("__resid_{i}_max")),
-                lit(value.clone()),
-            ])
-            .alias(name),
+            (AggKind::Min(_), Partial::Bound(value)) => {
+                least(vec![col(format!("__resid_{i}_min")), lit(value.clone())]).alias(name)
+            }
+            (AggKind::Max(_), Partial::Bound(value)) => {
+                greatest(vec![col(format!("__resid_{i}_max")), lit(value.clone())]).alias(name)
+            }
             (AggKind::Avg(_), Partial::Avg { sum, count }) => {
                 let zero = typed_zero(sum)?;
-                let total_sum = coalesce(vec![
-                    datafusion::prelude::col(format!("__resid_{i}_sum")),
-                    lit(zero),
-                ]) + lit(sum.clone());
-                let total_cnt = datafusion::prelude::col(format!("__resid_{i}_cnt")) + lit(*count);
+                let total_sum =
+                    coalesce(vec![col(format!("__resid_{i}_sum")), lit(zero)]) + lit(sum.clone());
+                let total_cnt = col(format!("__resid_{i}_cnt")) + lit(*count);
                 (cast(total_sum, DataType::Float64) / cast(total_cnt, DataType::Float64))
                     .alias(name)
             }
@@ -340,7 +327,7 @@ fn accumulate_partial(kind: &AggKind, covered: &[&Arc<SuperfileEntry>]) -> Optio
 }
 
 fn fold_sums(covered: &[&Arc<SuperfileEntry>], col: &str) -> Option<ScalarValue> {
-    let mut acc: Option<arrow_array::ArrayRef> = None;
+    let mut acc: Option<ArrayRef> = None;
     for entry in covered {
         let part = entry.scalar_stats.get(col)?.sum.as_ref()?;
         acc = Some(match acc {
@@ -363,12 +350,12 @@ fn fold_bounds(covered: &[&Arc<SuperfileEntry>], col: &str) -> Option<(ScalarVal
         acc = match acc {
             None => Some((min, max)),
             Some((cur_min, cur_max)) => {
-                let new_min = if min.partial_cmp(&cur_min)? == std::cmp::Ordering::Less {
+                let new_min = if min.partial_cmp(&cur_min)? == Ordering::Less {
                     min
                 } else {
                     cur_min
                 };
-                let new_max = if max.partial_cmp(&cur_max)? == std::cmp::Ordering::Greater {
+                let new_max = if max.partial_cmp(&cur_max)? == Ordering::Greater {
                     max
                 } else {
                     cur_max
@@ -589,8 +576,8 @@ fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Cla
     if let Some(lo) = &range.lo {
         let cmp = seg_max.partial_cmp(&lo.value);
         match (cmp, lo.inclusive) {
-            (Some(std::cmp::Ordering::Less), _) => return Class::Disjoint,
-            (Some(std::cmp::Ordering::Equal), false) => return Class::Disjoint,
+            (Some(Ordering::Less), _) => return Class::Disjoint,
+            (Some(Ordering::Equal), false) => return Class::Disjoint,
             (None, _) => return Class::Boundary,
             _ => {}
         }
@@ -598,8 +585,8 @@ fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Cla
     if let Some(hi) = &range.hi {
         let cmp = seg_min.partial_cmp(&hi.value);
         match (cmp, hi.inclusive) {
-            (Some(std::cmp::Ordering::Greater), _) => return Class::Disjoint,
-            (Some(std::cmp::Ordering::Equal), false) => return Class::Disjoint,
+            (Some(Ordering::Greater), _) => return Class::Disjoint,
+            (Some(Ordering::Equal), false) => return Class::Disjoint,
             (None, _) => return Class::Boundary,
             _ => {}
         }
@@ -609,8 +596,8 @@ fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Cla
     let lo_ok = match &range.lo {
         None => true,
         Some(lo) => match (seg_min.partial_cmp(&lo.value), lo.inclusive) {
-            (Some(std::cmp::Ordering::Greater), _) => true,
-            (Some(std::cmp::Ordering::Equal), true) => true,
+            (Some(Ordering::Greater), _) => true,
+            (Some(Ordering::Equal), true) => true,
             (None, _) => return Class::Boundary,
             _ => false,
         },
@@ -618,8 +605,8 @@ fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Cla
     let hi_ok = match &range.hi {
         None => true,
         Some(hi) => match (seg_max.partial_cmp(&hi.value), hi.inclusive) {
-            (Some(std::cmp::Ordering::Less), _) => true,
-            (Some(std::cmp::Ordering::Equal), true) => true,
+            (Some(Ordering::Less), _) => true,
+            (Some(Ordering::Equal), true) => true,
             (None, _) => return Class::Boundary,
             _ => false,
         },

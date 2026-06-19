@@ -19,33 +19,42 @@ mod options;
 mod search_tvf;
 mod uri;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::execution::context::SessionContext;
-use tokio::runtime::Runtime;
-
+use datafusion::{config::Dialect, execution::context::SessionContext};
+use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
-pub use options::{ColdFetchMode, ConnectOptions};
-
-use crate::InfinoError;
-use crate::runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime};
-use crate::storage::StorageProvider;
-use crate::superfile::builder::FtsConfig;
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use crate::superfile::vector::builder::VectorConfig;
-use crate::superfile::vector::distance::Metric;
-use crate::supertable::Supertable;
-use crate::supertable::options::SupertableOptions;
-use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
+pub use options::{ColdFetchMode, ConnectOptions};
+use tokio::runtime::Runtime;
 use uri::{Backend, parse_uri};
+
+use crate::{
+    InfinoError,
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
+    storage::{StorageError, StorageProvider},
+    superfile::{
+        builder::FtsConfig,
+        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        vector::{builder::VectorConfig, distance::Metric},
+    },
+    supertable::{
+        Supertable,
+        options::SupertableOptions,
+        reader_cache::{DiskCacheConfig, DiskCacheStore},
+    },
+};
 
 /// Open (or create) a catalog rooted at `uri`.
 ///
@@ -359,9 +368,8 @@ impl Connection {
                     // partial failure converges.
                     bridge_sync_to_async(async {
                         let objects = root.list_with_prefix(&location).await?;
-                        futures::future::try_join_all(objects.iter().map(|uri| root.delete(uri)))
-                            .await?;
-                        Ok::<(), crate::storage::StorageError>(())
+                        try_join_all(objects.iter().map(|uri| root.delete(uri))).await?;
+                        Ok::<(), StorageError>(())
                     })?;
                 }
                 Ok(())
@@ -423,7 +431,7 @@ impl Connection {
         // skipped — the planner resolves those by other means or errors.
         let statement = ctx
             .state()
-            .sql_to_statement(sql, &datafusion::config::Dialect::Generic)
+            .sql_to_statement(sql, &Dialect::Generic)
             .map_err(|e| InfinoError::Query(e.to_string()))?;
         let refs = ctx
             .state()
@@ -637,14 +645,20 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
-    use crate::BoolMode;
-    use crate::test_helpers::{build_title_batch, schema_id_title};
+    use crate::{
+        BoolMode,
+        test_helpers::{build_title_batch, schema_id_title},
+    };
 
     const TOP_K: usize = 10;
 
     /// Total rows across the materialized search batches.
-    fn n_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
+    fn n_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
@@ -762,11 +776,11 @@ mod tests {
         /// Count regular files under `dir` whose path contains a
         /// component starting with `prefix` (the table's unique
         /// `<name>-<nanos>-<seq>` location).
-        fn files_under_location(dir: &std::path::Path, prefix: &str) -> usize {
+        fn files_under_location(dir: &Path, prefix: &str) -> usize {
             let mut n = 0;
             let mut stack = vec![dir.to_path_buf()];
             while let Some(d) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&d) else {
+                let Ok(entries) = fs::read_dir(&d) else {
                     continue;
                 };
                 for entry in entries.flatten() {
@@ -981,16 +995,12 @@ mod tests {
         /// Top-k requested by the vector / hybrid queries.
         const TOP_K: usize = 4;
 
-        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
-            arrow_schema::Field::new(
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
                 "emb",
-                arrow_schema::DataType::FixedSizeList(
-                    std::sync::Arc::new(arrow_schema::Field::new(
-                        "item",
-                        arrow_schema::DataType::Float32,
-                        true,
-                    )),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
                     DIM as i32,
                 ),
                 false,
@@ -1008,22 +1018,18 @@ mod tests {
                     flat.push(if d == i { 1.0 } else { 0.0 });
                 }
             }
-            let field = std::sync::Arc::new(arrow_schema::Field::new(
-                "item",
-                arrow_schema::DataType::Float32,
-                true,
-            ));
+            let field = Arc::new(Field::new("item", DataType::Float32, true));
             let list = FixedSizeListArray::new(
                 field,
                 DIM as i32,
-                std::sync::Arc::new(Float32Array::from(flat)),
+                Arc::new(Float32Array::from(flat)),
                 None,
             );
-            arrow::record_batch::RecordBatch::try_new(
+            RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    std::sync::Arc::new(LargeStringArray::from(titles.to_vec())),
-                    std::sync::Arc::new(list),
+                    Arc::new(LargeStringArray::from(titles.to_vec())),
+                    Arc::new(list),
                 ],
             )
             .expect("vector batch")
@@ -1170,18 +1176,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();
 
-        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
-            arrow_schema::Field::new(
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
                 "embedding",
-                arrow_schema::DataType::FixedSizeList(
-                    std::sync::Arc::new(arrow_schema::Field::new(
-                        "item",
-                        arrow_schema::DataType::Float32,
-                        true,
-                    )),
-                    16,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
                 false,
             ),
         ]));
@@ -1189,20 +1188,16 @@ mod tests {
         // A FixedSizeList<Float32, 16> column of one all-zero vector,
         // committed so the physical table writes its pointer file (open
         // requires committed state).
-        let one_vector = || -> arrow::record_batch::RecordBatch {
+        let one_vector = || -> RecordBatch {
             use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray};
             let values = Float32Array::from(vec![0.0_f32; 16]);
-            let field = std::sync::Arc::new(arrow_schema::Field::new(
-                "item",
-                arrow_schema::DataType::Float32,
-                true,
-            ));
-            let list = FixedSizeListArray::new(field, 16, std::sync::Arc::new(values), None);
-            arrow::record_batch::RecordBatch::try_new(
+            let field = Arc::new(Field::new("item", DataType::Float32, true));
+            let list = FixedSizeListArray::new(field, 16, Arc::new(values), None);
+            RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    std::sync::Arc::new(LargeStringArray::from(vec!["hello"])),
-                    std::sync::Arc::new(list),
+                    Arc::new(LargeStringArray::from(vec!["hello"])),
+                    Arc::new(list),
                 ],
             )
             .expect("vector batch")

@@ -36,16 +36,22 @@
 //! through the JSON state doc unchanged; the lease grants
 //! `Duration` is converted at acquire / heartbeat time.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
-use crate::supertable::wal::persistence::{Etag, WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{Lease, SupertableHandleId, WalId, WalState, WalStateDoc};
+use crate::supertable::wal::{
+    persistence::{Etag, WalStore, WalStoreError},
+    state_doc::{Lease, SupertableHandleId, WalId, WalState, WalStateDoc},
+};
 
 /// Default lease lifetime per acquire / heartbeat. 60s
 /// balances "long enough that NTP-level clock skew never
@@ -439,16 +445,20 @@ pub fn spawn_heartbeat(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::wal::state_doc::{
-        OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome,
-        WalState,
-    };
-    use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
+
+    use chrono::Duration as ChronoDuration;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::wal::state_doc::{
+            OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome,
+            WalState,
+        },
+    };
 
     fn sample_intent_wal(wal_id_v: i128) -> WalStateDoc {
         WalStateDoc {

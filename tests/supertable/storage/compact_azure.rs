@@ -57,31 +57,33 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
     RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use infino::VectorSearchOptions;
-use infino::config::{
-    CompactionSettings, Config, OptimizeOptions, StorageBackend, StorageColdFetchMode,
-    StorageSettings, SupertableSettings, ThreadCount,
+use infino::{
+    VectorSearchOptions,
+    config::{
+        CompactionSettings, Config, OptimizeOptions, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings, ThreadCount,
+    },
+    superfile::{
+        builder::{FtsConfig, VectorConfig},
+        fts::reader::BoolMode,
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
+    supertable::{
+        Supertable, SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{AzureStorageProvider, StorageProvider},
+    },
+    test_helpers::default_tokenizer,
 };
-use infino::superfile::builder::{FtsConfig, VectorConfig};
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::supertable::Supertable;
-use infino::supertable::SupertableOptions;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{AzureStorageProvider, StorageProvider};
-use infino::test_helpers::default_tokenizer;
 use infino_bench_utils::corpus::generate_text_corpus;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use tempfile::TempDir;
 

@@ -32,9 +32,13 @@
 //! [`ManifestList`]: super::list::ManifestList
 //! [`ManifestListEntry`]: super::list::ManifestListEntry
 
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::manifest::list::{ManifestList, ManifestListEntry};
-use crate::supertable::manifest::part::PartId;
+use crate::{
+    superfile::fts::reader::BoolMode,
+    supertable::manifest::{
+        list::{ManifestList, ManifestListEntry},
+        part::PartId,
+    },
+};
 
 /// Filter the list's parts to those whose
 /// `fts_summary_agg[column].term_range` overlaps the prefix
@@ -253,19 +257,21 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::supertable::manifest::aggregates;
-    use crate::supertable::manifest::bloom::BloomBuilder;
-    use crate::supertable::manifest::list::{
-        FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
-    };
-    use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary};
-    use crate::supertable::{SuperfileEntry, SuperfileUri};
-    use arrow_array::Int64Array;
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_array::{ArrayRef, Decimal128Array, Int64Array};
     use uuid::Uuid;
+
+    use super::*;
+    use crate::supertable::{
+        SuperfileEntry, SuperfileUri,
+        manifest::{
+            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, VectorSummary, aggregates,
+            bloom::BloomBuilder,
+            list::{FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy},
+            part::{ContentHash, PartId},
+        },
+    };
 
     #[test]
     fn prefix_upper_bound_basic() {
@@ -319,7 +325,7 @@ mod tests {
                 VectorSummary {
                     centroid: c,
                     radius: vec_radius,
-                    clusters: crate::supertable::manifest::ClusterCentroids::empty(),
+                    clusters: ClusterCentroids::empty(),
                 },
             );
         }
@@ -506,8 +512,8 @@ mod tests {
         fn make(id_min: i128, ts_lo: i64, ts_hi: i64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
             let mut cols: Map<String, ScalarStatsAgg> = Map::new();
-            let mn: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![ts_lo]));
-            let mx: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
+            let mn: ArrayRef = Arc::new(Int64Array::from(vec![ts_lo]));
+            let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
             cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
                 superfile_id: id,
@@ -543,13 +549,13 @@ mod tests {
         fn make(id_lo: i128, id_hi: i128) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
             let mut cols: Map<String, ScalarStatsAgg> = Map::new();
-            let mn: arrow_array::ArrayRef = Arc::new(
-                arrow_array::Decimal128Array::from(vec![id_lo])
+            let mn: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![id_lo])
                     .with_precision_and_scale(38, 0)
                     .expect("decimal128"),
             );
-            let mx: arrow_array::ArrayRef = Arc::new(
-                arrow_array::Decimal128Array::from(vec![id_hi])
+            let mx: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![id_hi])
                     .with_precision_and_scale(38, 0)
                     .expect("decimal128"),
             );

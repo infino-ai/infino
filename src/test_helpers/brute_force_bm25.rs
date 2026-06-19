@@ -24,7 +24,7 @@
 //! Result invariants match the optimized search path:
 //! top-k by descending score, ties broken by ascending doc_id.
 
-use std::collections::HashMap;
+use std::{cmp::Ordering, collections::HashMap};
 
 use crate::superfile::fts::tokenize::Tokenizer;
 
@@ -145,7 +145,7 @@ impl BruteForceBm25 {
 
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
         scored.truncate(k);
@@ -188,7 +188,7 @@ impl BruteForceBm25 {
 
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
         scored.truncate(k);

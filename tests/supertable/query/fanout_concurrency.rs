@@ -34,23 +34,25 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
 use arrow_array::{
     ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::query::SuperfileHit;
-use infino::supertable::query::vector::VectorSearchOptions;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{default_tokenizer, default_vector_config};
+use infino::{
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    supertable::{
+        Supertable, SupertableOptions,
+        query::{SuperfileHit, vector::VectorSearchOptions},
+    },
+    test_helpers::{default_tokenizer, default_vector_config},
+};
 
 const DIM: usize = 16;
 const SUPERFILES: usize = 4;

@@ -34,33 +34,36 @@
 //! score` ascending lists nearest neighbours first. See
 //! [`SuperfileHit::score`].
 
-use std::any::Any;
-use std::collections::HashSet;
-use std::fmt;
-use std::sync::Arc;
+use std::{any::Any, collections::HashSet, fmt, sync::Arc};
 
 use arrow::compute::cast;
 use arrow_array::{Array, ArrayRef, Float32Array, ListArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+use datafusion::{
+    catalog::{Session, TableFunctionImpl, TableProvider},
+    error::{DataFusionError, Result as DfResult},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
+    scalar::ScalarValue,
 };
-use datafusion::scalar::ScalarValue;
+use futures::stream;
 
 use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
-use crate::superfile::reader::VectorSearchOptions;
-use crate::supertable::handle::{SupertableReader, WeakReader};
-use crate::supertable::query::candidate::CandidatePlan;
+use crate::{
+    superfile::reader::VectorSearchOptions,
+    supertable::{
+        handle::{SupertableReader, WeakReader},
+        query::candidate::CandidatePlan,
+    },
+};
 
 /// SQL name the TVF is registered under.
 pub(crate) const VECTOR_SEARCH_UDTF: &str = "vector_search";
@@ -390,7 +393,7 @@ impl ExecutionPlan for VectorSearchExec {
             .await
         };
 
-        let stream = futures::stream::once(fut);
+        let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
             stream,
@@ -501,17 +504,24 @@ fn scalar_to_f32(sv: &ScalarValue) -> DfResult<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use arrow_array::{Array, Decimal128Array, FixedSizeListArray, LargeStringArray, RecordBatch};
+    use arrow_array::{
+        Array, Decimal128Array, FixedSizeListArray, Int32Array, LargeStringArray, RecordBatch,
+        StringArray,
+        types::{Float32Type, Int32Type},
+    };
     use arrow_schema::{Field, Schema};
-    use datafusion::prelude::lit;
+    use datafusion::prelude::{col, lit};
+    use rayon::ThreadPoolBuilder;
 
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-    use crate::superfile::vector::distance::Metric;
-    use crate::superfile::vector::rerank_codec::RerankCodec;
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer as tok;
+    use super::*;
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::default_tokenizer as tok,
+    };
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
 
@@ -524,7 +534,7 @@ mod tests {
 
     fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
@@ -706,8 +716,7 @@ mod tests {
         // `_id` resolved for every row: 8 distinct, non-null keys.
         let ids = col_id(b, "_id");
         assert_eq!(ids.null_count(), 0);
-        let unique: std::collections::HashSet<i128> =
-            (0..ids.len()).map(|i| ids.value(i)).collect();
+        let unique: HashSet<i128> = (0..ids.len()).map(|i| ids.value(i)).collect();
         assert_eq!(unique.len(), 8, "each hit resolves to a distinct _id");
         // Native emission order (no ORDER BY) is ascending distance.
         let score = col_f32(b, "score");
@@ -924,13 +933,13 @@ mod tests {
         // A literal flows through to scalar_to_f32.
         assert_eq!(scalar_expr_to_f32(&lit(2.0_f32)).expect("test"), 2.0);
         // A column reference is not a literal → error.
-        let col = datafusion::prelude::col("x");
+        let col = col("x");
         assert!(scalar_expr_to_f32(&col).is_err());
     }
 
     #[test]
     fn array_to_f32_casts_and_rejects_nulls() {
-        let ok: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3]));
+        let ok: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
         assert_eq!(array_to_f32(&ok).expect("test"), vec![1.0, 2.0, 3.0]);
         let with_null: ArrayRef = Arc::new(Float32Array::from(vec![Some(1.0), None]));
         assert!(
@@ -943,12 +952,10 @@ mod tests {
     fn list_literal_to_f32_requires_single_row() {
         // Single-row list `[1, 2]` → ok.
         let single =
-            ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![Some(
-                vec![Some(1), Some(2)],
-            )]);
+            ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![Some(1), Some(2)])]);
         assert_eq!(list_literal_to_f32(&single).expect("test"), vec![1.0, 2.0]);
         // Two-row list → error.
-        let two = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(vec![
+        let two = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(1)]),
             Some(vec![Some(2)]),
         ]);
@@ -961,10 +968,11 @@ mod tests {
     #[test]
     fn arg_to_query_vector_parses_list_scalar_literal() {
         // `ScalarValue::List` branch (a const-folded SQL array literal).
-        let list =
-            ListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(vec![Some(
-                vec![Some(0.1_f32), Some(0.2), Some(0.3)],
-            )]);
+        let list = ListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(vec![
+            Some(0.1_f32),
+            Some(0.2),
+            Some(0.3),
+        ])]);
         let expr = Expr::Literal(ScalarValue::List(Arc::new(list)), None);
         assert_eq!(
             arg_to_query_vector(&expr).expect("test"),
@@ -975,7 +983,7 @@ mod tests {
     #[test]
     fn arg_to_query_vector_rejects_unsupported_expr() {
         // A bare column reference is neither string, list, nor make_array.
-        let col = datafusion::prelude::col("x");
+        let col = col("x");
         assert!(arg_to_query_vector(&col).is_err());
     }
 
@@ -1043,7 +1051,7 @@ mod tests {
         let mut text = String::new();
         for b in &batches {
             for c in b.columns() {
-                if let Some(s) = c.as_any().downcast_ref::<arrow_array::StringArray>() {
+                if let Some(s) = c.as_any().downcast_ref::<StringArray>() {
                     for i in 0..s.len() {
                         if !s.is_null(i) {
                             text.push_str(s.value(i));

@@ -36,10 +36,14 @@
 //! Run-to-run persistence lives in `report.rs`; this module only
 //! samples and formats RSS.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 /// Force the global allocator (mimalloc, default-on in the crate) to
 /// return freed-but-retained arenas to the OS. Every sampler start

@@ -47,9 +47,15 @@
 //! per-shard `SuperfileBuilder::add_batch` call. No bytes copied;
 //! just Arc reference counts.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::{
+    cmp,
+    collections::HashMap,
+    fmt, io,
+    marker::PhantomData,
+    mem,
+    sync::{Arc, atomic::Ordering},
+    time,
+};
 
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::{
@@ -57,42 +63,63 @@ use arrow_array::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use object_store::PutPayload;
+use datafusion::prelude::Expr;
+use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
+use tokio::{runtime::Handle, task::block_in_place, time::sleep};
 
-use crate::storage::{StorageError, StorageProvider};
-use crate::superfile::builder::SuperfileBuilder;
-use crate::superfile::format::CRC_BYTES;
-use crate::superfile::format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr};
-use crate::superfile::format::vec::{
-    CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE, SUB_HEADER_SIZE, U32_BYTES,
-    dir_entry, outer_hdr, sub_hdr,
+use super::{
+    build::fanout_shards,
+    error::BuildError,
+    handle::{Supertable, SupertableInner},
+    manifest::{
+        FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri,
+        VectorSummary, bloom::BloomBuilder,
+    },
+    mutations::{
+        CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
+        PendingDelete, PendingUpdate,
+    },
+    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
+    utils::vector_split::split_vectors,
+    wal::{
+        WalStore,
+        pipeline::{self, TombstonePhaseOutcome},
+        state_doc::{
+            IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId,
+            WalState, WalStateDoc,
+        },
+    },
 };
-use crate::superfile::format::{footer::read_kv_metadata, kv};
-use crate::supertable::error::ManifestError;
-use crate::supertable::manifest::Manifest;
-use crate::supertable::manifest::commit::get_current_manifest_etag;
-use crate::supertable::manifest::part::{self as part_mod, PartId};
-use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
-
-use super::build::fanout_shards;
-use super::error::BuildError;
-use super::handle::{Supertable, SupertableInner};
-use super::manifest::bloom::BloomBuilder;
-use super::manifest::{
-    FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
-};
-use super::mutations::{
-    CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
-    PendingDelete, PendingUpdate,
-};
-use super::options::SupertableOptions;
-use super::utils::vector_split::split_vectors;
-use super::wal::WalStore;
-use super::wal::pipeline::{self, TombstonePhaseOutcome};
-use super::wal::state_doc::{
-    IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
-    WalStateDoc,
+#[cfg(test)]
+use crate::superfile::ReadError;
+use crate::{
+    InfinoError,
+    storage::{StorageError, StorageProvider},
+    superfile::{
+        SuperfileReader,
+        builder::SuperfileBuilder,
+        format::{
+            CRC_BYTES,
+            footer::read_kv_metadata,
+            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            kv,
+            vec::{
+                CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE, SUB_HEADER_SIZE,
+                U32_BYTES, dir_entry, outer_hdr, sub_hdr,
+            },
+        },
+    },
+    supertable::{
+        CommitError as SupertableCommitError, ManifestLoadError,
+        error::ManifestError,
+        manifest::{
+            ClusterCentroids, Manifest,
+            commit::get_current_manifest_etag,
+            part::{self as part_mod, PartId},
+        },
+        reader_cache::DiskCacheStore,
+    },
 };
 
 /// Single-writer append + commit handle.
@@ -127,10 +154,10 @@ pub struct SupertableWriter {
 /// after IPC-encoding it (the `ipc_bytes` are what the WAL
 /// sidecar carries).
 struct PendingUpdateEntry {
-    wal_id: crate::supertable::wal::state_doc::WalId,
+    wal_id: WalId,
     target_ids: Vec<i128>,
     preallocated_superfile_id: uuid::Uuid,
-    minted_id_spans: Vec<crate::supertable::wal::state_doc::IdSpan>,
+    minted_id_spans: Vec<IdSpan>,
     new_row_count: u32,
     new_row_content_hash: String,
     ipc_bytes: Bytes,
@@ -139,12 +166,12 @@ struct PendingUpdateEntry {
 /// One buffered delete. Just the call-time resolved target_ids
 /// + a pre-minted `wal_id`.
 struct PendingDeleteEntry {
-    wal_id: crate::supertable::wal::state_doc::WalId,
+    wal_id: WalId,
     target_ids: Vec<i128>,
 }
 
-impl std::fmt::Debug for SupertableWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SupertableWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupertableWriter")
             .field("buffered_batches", &self.buffer.len())
             .field("buffered_bytes", &self.buffer_bytes)
@@ -209,7 +236,7 @@ fn split_buffer_into_row_shards(
                 shard_idx += 1;
                 shard_remaining = target(shard_idx);
             }
-            let take = std::cmp::min(shard_remaining, n_rows - row_cursor);
+            let take = cmp::min(shard_remaining, n_rows - row_cursor);
             let scalar = batch.scalar.slice(row_cursor, take);
             let vectors: Vec<Arc<Float32Array>> = batch
                 .vectors
@@ -232,10 +259,11 @@ fn split_buffer_into_row_shards(
 /// The public folded `update` / `delete` buffer exactly one mutation
 /// before committing, so `CommitResult.outcomes` carries exactly one
 /// entry; surface it (or a backend error if, impossibly, none landed).
-fn single_outcome(res: CommitResult) -> Result<MutationStats, crate::InfinoError> {
-    res.outcomes.into_iter().next().ok_or_else(|| {
-        crate::InfinoError::Backend("commit produced no mutation outcome".to_string())
-    })
+fn single_outcome(res: CommitResult) -> Result<MutationStats, InfinoError> {
+    res.outcomes
+        .into_iter()
+        .next()
+        .ok_or_else(|| InfinoError::Backend("commit produced no mutation outcome".to_string()))
 }
 
 impl Supertable {
@@ -260,7 +288,7 @@ impl Supertable {
     /// posts.append(&batch)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn append(&self, batch: &RecordBatch) -> Result<(), crate::InfinoError> {
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let mut w = self.writer()?;
         w.append(batch)?;
         w.commit()?;
@@ -290,9 +318,9 @@ impl Supertable {
     /// ```
     pub fn update(
         &self,
-        predicate: datafusion::prelude::Expr,
+        predicate: Expr,
         new_rows: &RecordBatch,
-    ) -> Result<MutationStats, crate::InfinoError> {
+    ) -> Result<MutationStats, InfinoError> {
         let mut w = self.writer()?;
         w.update(predicate, new_rows.clone())?;
         single_outcome(w.commit()?)
@@ -317,10 +345,7 @@ impl Supertable {
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn delete(
-        &self,
-        predicate: datafusion::prelude::Expr,
-    ) -> Result<MutationStats, crate::InfinoError> {
+    pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         let mut w = self.writer()?;
         w.delete(predicate)?;
         single_outcome(w.commit()?)
@@ -427,10 +452,7 @@ impl SupertableWriter {
             }
         }
         let id_array = Decimal128Array::from(ids)
-            .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
-            )
+            .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
             .expect(
                 "invariant: precision 38 + scale 0 always valid \
                  for any i128 payload",
@@ -448,7 +470,7 @@ impl SupertableWriter {
         let bytes = scalar.get_array_memory_size()
             + vectors
                 .iter()
-                .map(|v| v.len() * std::mem::size_of::<f32>())
+                .map(|v| v.len() * mem::size_of::<f32>())
                 .sum::<usize>();
 
         self.buffer.push(BufferedBatch { scalar, vectors });
@@ -482,10 +504,7 @@ impl SupertableWriter {
     /// `commit()`. Symmetric with buffered `append()`s.
     ///
     /// [`commit`]: SupertableWriter::commit
-    pub fn delete(
-        &mut self,
-        predicate: datafusion::prelude::Expr,
-    ) -> Result<PendingDelete, MutationError> {
+    pub fn delete(&mut self, predicate: Expr) -> Result<PendingDelete, MutationError> {
         // Pre-flight: storage must be attached for the WAL
         // pipeline to drive this op at commit time.
         let _ = self
@@ -554,7 +573,7 @@ impl SupertableWriter {
     /// [`commit`]: SupertableWriter::commit
     pub fn update(
         &mut self,
-        predicate: datafusion::prelude::Expr,
+        predicate: Expr,
         new_rows: RecordBatch,
     ) -> Result<PendingUpdate, MutationError> {
         // Pre-flight: storage attached.
@@ -631,9 +650,9 @@ impl SupertableWriter {
         // can drop the `RecordBatch` immediately — the buffer
         // owns the bytes from here on.
         let ipc_bytes = encode_record_batch_ipc(&new_rows).map_err(|e| {
-            MutationError::Storage(crate::storage::StorageError::Permanent {
+            MutationError::Storage(StorageError::Permanent {
                 uri: "ipc encode".into(),
-                source: Box::new(std::io::Error::other(e)),
+                source: Box::new(io::Error::other(e)),
             })
         })?;
         let content_hash = blake3::hash(&ipc_bytes).to_hex().to_string();
@@ -682,8 +701,7 @@ impl SupertableWriter {
         }
 
         let total_mutations = self.pending_updates.len() + self.pending_deletes.len();
-        let mut committed_wal_ids: Vec<crate::supertable::wal::state_doc::WalId> =
-            Vec::with_capacity(total_mutations);
+        let mut committed_wal_ids: Vec<WalId> = Vec::with_capacity(total_mutations);
         let mut outcomes: Vec<MutationStats> = Vec::with_capacity(total_mutations);
 
         // Step 2: drive pending updates in buffer order. On
@@ -691,7 +709,7 @@ impl SupertableWriter {
         // WAL may already be on storage; recovery sweep
         // completes it on the next open) and the unattempted
         // entries stay on `self.pending_updates` for retry.
-        let mut updates_to_run = std::mem::take(&mut self.pending_updates);
+        let mut updates_to_run = mem::take(&mut self.pending_updates);
         let mut update_cursor = 0usize;
         while update_cursor < updates_to_run.len() {
             let entry = &updates_to_run[update_cursor];
@@ -722,7 +740,7 @@ impl SupertableWriter {
         }
 
         // Step 3: drive pending deletes in buffer order.
-        let mut deletes_to_run = std::mem::take(&mut self.pending_deletes);
+        let mut deletes_to_run = mem::take(&mut self.pending_deletes);
         let mut delete_cursor = 0usize;
         while delete_cursor < deletes_to_run.len() {
             let entry = &deletes_to_run[delete_cursor];
@@ -824,8 +842,8 @@ impl SupertableWriter {
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
+        let (n_tombstoned, n_not_found) = match Handle::try_current() {
+            Ok(handle) => block_in_place(|| handle.block_on(drive))?,
             Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
         Ok(MutationStats {
@@ -894,8 +912,8 @@ impl SupertableWriter {
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
+        let (n_tombstoned, n_not_found) = match Handle::try_current() {
+            Ok(handle) => block_in_place(|| handle.block_on(drive))?,
             Err(_) => self.inner.query_runtime().block_on(drive)?,
         };
         Ok(MutationStats {
@@ -918,7 +936,7 @@ impl SupertableWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let buffer = std::mem::take(&mut self.buffer);
+        let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
@@ -1318,16 +1336,14 @@ impl PreparedSuperfile {
     /// Returns `None` if no bytes are held (cache-attached path with
     /// no prepopulation — bytes went to storage only).
     #[cfg(test)]
-    pub(crate) fn open_reader(
-        &self,
-    ) -> Option<Result<crate::superfile::SuperfileReader, crate::superfile::ReadError>> {
+    pub(crate) fn open_reader(&self) -> Option<Result<SuperfileReader, ReadError>> {
         let bytes = self
             .bytes_for_store
             .as_ref()
             .or(self.bytes_for_storage.as_ref())
             .or(self.bytes_for_cache.as_ref())
             .map(|(_, b)| b.clone())?;
-        Some(crate::superfile::SuperfileReader::open(bytes))
+        Some(SuperfileReader::open(bytes))
     }
 }
 
@@ -1363,11 +1379,9 @@ pub(super) fn prepare_superfile(
     // what removes the 100GB OOM trap (the in-memory cache doesn't
     // evict, so a long-running writer with cache + storage would
     // otherwise accumulate every superfile's bytes in RAM forever).
-    let reader = crate::superfile::SuperfileReader::open_with(
-        shard.bytes.clone(),
-        inner.options.superfile_open_options(),
-    )
-    .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
+    let reader =
+        SuperfileReader::open_with(shard.bytes.clone(), inner.options.superfile_open_options())
+            .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
     let mut fts_summary: HashMap<String, FtsSummaryAgg> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
@@ -1405,9 +1419,7 @@ pub(super) fn prepare_superfile(
                 let clusters = vec_reader
                     .cluster_centroids(&vc.column)
                     .map(|(n_cent, dim, fp32, counts)| {
-                        crate::supertable::manifest::ClusterCentroids::from_fp32(
-                            n_cent, dim, &fp32, counts,
-                        )
+                        ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
                     })
                     .unwrap_or_default();
                 vector_summary.insert(
@@ -1569,7 +1581,7 @@ fn publish_superfiles(
 /// jitter to break up lockstep retries from racing writers.
 /// Jitter source is the low bits of the system's nanosecond
 /// clock — no `rand` dep needed.
-pub(super) fn backoff_delay(attempt: u32) -> std::time::Duration {
+pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
     const BASE_MS: u64 = 10;
     const CAP_MS: u64 = 1000;
     // Cap the doubling exponent so the pre-cap delay plateaus instead
@@ -1583,13 +1595,13 @@ pub(super) fn backoff_delay(attempt: u32) -> std::time::Duration {
     const PERCENT_DIVISOR: i64 = 100;
     let exp = BASE_MS.saturating_mul(1u64 << attempt.min(MAX_SHIFT));
     let capped = exp.min(CAP_MS);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nanos = time::SystemTime::now()
+        .duration_since(time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     let jitter_pct = (nanos % JITTER_MODULUS) as i64 - JITTER_RANGE_PCT;
     let adjusted = ((capped as i64) + (capped as i64 * jitter_pct / PERCENT_DIVISOR)).max(1) as u64;
-    std::time::Duration::from_millis(adjusted)
+    time::Duration::from_millis(adjusted)
 }
 
 /// Storage write-through with OCC retry. Persist the new
@@ -1626,11 +1638,11 @@ pub(super) fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// the per-partition part-reuse path described on that fn.
 pub(in crate::supertable) fn persist_commit(
     inner: &SupertableInner,
-    storage: Arc<dyn crate::storage::StorageProvider>,
+    storage: Arc<dyn StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
     entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
-) -> Result<(), crate::supertable::CommitError> {
+) -> Result<(), SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
 
@@ -1649,7 +1661,7 @@ pub(in crate::supertable) fn persist_commit(
     //   Requires the ambient runtime to be `multi_thread`.
     let max_retries = opts.max_commit_retries.max(1);
     let drive = async move {
-        let mut last_err: Option<crate::supertable::CommitError> = None;
+        let mut last_err: Option<SupertableCommitError> = None;
         for attempt in 0..max_retries {
             // Reload `inner.manifest` each iteration so a
             // racing writer's commit (visible via
@@ -1670,9 +1682,9 @@ pub(in crate::supertable) fn persist_commit(
             .await
             {
                 Ok(new_manifest) => {
-                    return Ok::<_, crate::supertable::CommitError>(new_manifest);
+                    return Ok::<_, SupertableCommitError>(new_manifest);
                 }
-                Err(crate::supertable::CommitError::WriteContentionExhausted)
+                Err(SupertableCommitError::WriteContentionExhausted)
                     if attempt + 1 < max_retries =>
                 {
                     // Lost the pointer CAS (or a sub-write
@@ -1681,22 +1693,22 @@ pub(in crate::supertable) fn persist_commit(
                     // commit, sleep with jittered backoff,
                     // retry.
                     refresh_inner_state_async(inner, &storage_async).await?;
-                    last_err = Some(crate::supertable::CommitError::WriteContentionExhausted);
-                    tokio::time::sleep(backoff_delay(attempt)).await;
+                    last_err = Some(SupertableCommitError::WriteContentionExhausted);
+                    sleep(backoff_delay(attempt)).await;
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
+        Err(last_err.unwrap_or(SupertableCommitError::WriteContentionExhausted))
     };
 
-    let new_manifest = match tokio::runtime::Handle::try_current() {
+    let new_manifest = match Handle::try_current() {
         Ok(handle) => {
             // Ambient tokio runtime present — use it. Don't
             // touch `inner.query_runtime()` so we don't risk
             // dropping our owned runtime from within
             // another's worker context.
-            tokio::task::block_in_place(|| handle.block_on(drive))?
+            block_in_place(|| handle.block_on(drive))?
         }
         Err(_) => {
             // Sync caller; lazy-init the supertable's
@@ -1797,9 +1809,9 @@ pub async fn write_superfile_list(
 /// load-bearing property the part-reuse optimization relies
 /// on.
 pub(crate) async fn try_commit_attempt(
-    storage: Arc<dyn crate::storage::StorageProvider>,
+    storage: Arc<dyn StorageProvider>,
     opts: Arc<SupertableOptions>,
-    current_manifest: Arc<crate::supertable::Manifest>,
+    current_manifest: Arc<Manifest>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
@@ -1831,7 +1843,7 @@ pub(crate) async fn try_commit_attempt(
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them
     // from inside `build_part_and_entry`).
-    let _ = std::marker::PhantomData::<(PartId, part_mod::ContentHash)>;
+    let _ = PhantomData::<(PartId, part_mod::ContentHash)>;
 
     Ok(new_manifest)
 }
@@ -1852,15 +1864,15 @@ pub(crate) async fn try_commit_attempt(
 /// writer's commit path without holding a `Supertable` handle.
 async fn refresh_inner_state_async(
     inner: &SupertableInner,
-    storage: &Arc<dyn crate::storage::StorageProvider>,
-) -> Result<(), crate::supertable::CommitError> {
+    storage: &Arc<dyn StorageProvider>,
+) -> Result<(), SupertableCommitError> {
     let current = inner.manifest.load_full();
     let manifest = match Manifest::load(Some(current), storage.clone(), None).await {
         Ok(manifest) => manifest,
         Err(ManifestLoadError::PointerNotFound) => return Ok(()),
         Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),
         Err(err) => {
-            return Err(crate::supertable::CommitError::ManifestError(
+            return Err(SupertableCommitError::ManifestError(
                 ManifestError::ManifestLoadError(err),
             ));
         }
@@ -1876,7 +1888,7 @@ async fn refresh_inner_state_async(
 /// `arrow_ipc::writer::StreamWriter` writes one batch followed
 /// by a finish marker. The recovery / append-phase reader
 /// decodes the same way.
-fn encode_record_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Bytes, String> {
+fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Bytes, String> {
     let mut out: Vec<u8> = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut out, &batch.schema())
@@ -1911,10 +1923,10 @@ fn superfile_storage_path(uri: &SuperfileUri) -> String {
 /// in declaration order; the parts run concurrently inside
 /// `object_store` after their futures are polled.
 async fn put_superfile_multipart(
-    storage: &dyn crate::storage::StorageProvider,
+    storage: &dyn StorageProvider,
     path: &str,
     bytes: Bytes,
-) -> Result<(), crate::storage::StorageError> {
+) -> Result<(), StorageError> {
     const PART_BYTES: usize = 8 * (1 << 20);
 
     // Same-bytes retry skip. Failures other than NotFound
@@ -1927,10 +1939,10 @@ async fn put_superfile_multipart(
 
     let mut upload = storage.put_multipart(path).await?;
     let total = bytes.len();
-    let mut parts: Vec<object_store::UploadPart> = Vec::with_capacity(total / PART_BYTES + 1);
+    let mut parts: Vec<UploadPart> = Vec::with_capacity(total / PART_BYTES + 1);
     let mut offset = 0;
     while offset < total {
-        let end = std::cmp::min(offset + PART_BYTES, total);
+        let end = cmp::min(offset + PART_BYTES, total);
         let chunk = bytes.slice(offset..end);
         parts.push(upload.put_part(PutPayload::from_bytes(chunk)));
         offset = end;
@@ -1971,7 +1983,7 @@ async fn put_superfile_multipart(
 /// degradation, not a correctness break.
 fn warm_cache_after_commit(
     inner: &SupertableInner,
-    cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
+    cache: &Arc<DiskCacheStore>,
     pending: Vec<(SuperfileUri, Bytes)>,
 ) {
     let cache = Arc::clone(cache);
@@ -1987,9 +1999,9 @@ fn warm_cache_after_commit(
             }
         }
     };
-    match tokio::runtime::Handle::try_current() {
+    match Handle::try_current() {
         Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(drive));
+            block_in_place(|| handle.block_on(drive));
         }
         Err(_) => {
             inner.query_runtime().block_on(drive);
@@ -1999,24 +2011,28 @@ fn warm_cache_after_commit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use figment::Figment;
-    use figment::providers::{Format, Yaml};
+    use figment::{
+        Figment,
+        providers::{Format, Yaml},
+    };
     use rayon::ThreadPoolBuilder;
-
-    use crate::superfile::builder::FtsConfig;
-    use crate::superfile::builder::VectorConfig;
-    use crate::superfile::fts::reader::BoolMode;
-    use crate::superfile::vector::distance::Metric;
-    use crate::supertable::SupertableOptions;
-    use crate::supertable::handle::Supertable;
-    use crate::supertable::storage::LocalFsStorageProvider;
-    use crate::test_helpers::default_tokenizer as tok;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        config::Config,
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            fts::reader::BoolMode,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{SupertableOptions, handle::Supertable, storage::LocalFsStorageProvider},
+        test_helpers::default_tokenizer as tok,
+    };
 
     fn schema_id_title() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -2242,7 +2258,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Fp32,
             }],
             None,
         )
@@ -2307,8 +2323,7 @@ mod tests {
             .as_ref()
             .expect("subsection offsets captured at commit");
         let centroids_bytes = (n_cent * dim * 4) as u64;
-        let cluster_idx_bytes =
-            (n_cent * crate::superfile::format::vec::CLUSTER_IDX_ENTRY_BYTES) as u64;
+        let cluster_idx_bytes = (n_cent * CLUSTER_IDX_ENTRY_BYTES) as u64;
 
         // No captured open range is centroid-sized: the fp32 centroids are not
         // staged into the manifest open_blob (the cluster-probe hot path never
@@ -2386,8 +2401,8 @@ supertable:
   reader_threads: 1
   writer_threads: 4
 "#;
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
 
         // End-to-end: build options, route them through apply_config,
         // and verify the writer pool actually sized to the config's
@@ -2462,7 +2477,7 @@ supertable:
         let mut latencies_ms: Vec<u128> = Vec::with_capacity(N);
         for i in 0..N {
             let batch = build_simple_batch(i as u64, DOCS_PER_COMMIT);
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             st.append(&batch).expect("append");
             latencies_ms.push(t0.elapsed().as_millis());
         }

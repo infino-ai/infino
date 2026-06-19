@@ -6,19 +6,24 @@
 //! exercise BM25 + vector search, and verify the bytes are still a
 //! valid Parquet file readable by parquet-rs.
 
+use std::sync::Arc;
+
 use arrow_array::{Array, Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::superfile::builder::{
-    BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
+use infino::{
+    superfile::{
+        SuperfileReader, VectorSearchOptions,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig},
+        fts::reader::BoolMode,
+        vector::{
+            distance::{Metric, normalize},
+            rerank_codec::RerankCodec,
+        },
+    },
+    test_helpers::{decimal128_ids, default_tokenizer},
 };
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::vector::distance::{Metric, normalize};
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::superfile::{SuperfileReader, VectorSearchOptions};
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::sync::Arc;
 
 /// Decimal128 precision / scale for the `doc_id` column.
 const ID_DECIMAL_PRECISION: u8 = 38;

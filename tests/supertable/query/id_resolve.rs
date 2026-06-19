@@ -17,11 +17,11 @@ use std::sync::Arc;
 
 use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::default_tokenizer;
+use infino::{
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::default_tokenizer,
+};
 
 /// Commits — enough that the writer's row-sharding produces a real
 /// multi-segment fan-out and hits land in several segments.

@@ -3,9 +3,11 @@
 
 //! Superfile-layer benchmark runners grouped by modality.
 
-use crate::cost;
-use crate::report::{Better, Cell, Report, metric, text};
-use crate::rss;
+use crate::{
+    cost,
+    report::{Better, Cell, Report, metric, text},
+    rss,
+};
 
 /// Shared headers for the single-superfile ingest tables (fts / vector /
 /// sql), so the three modalities can't drift. `Corpus` is the raw input
@@ -122,26 +124,33 @@ pub mod fts {
     //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
     //! ```
 
-    use std::collections::HashMap;
-    use std::hint::black_box;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashMap,
+        hint::black_box,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use bytes::Bytes;
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
+    use infino::superfile::{
+        SuperfileReader,
+        fts::reader::{BoolMode as InfinoBoolMode, OrAlgo},
+    };
 
-    use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
-    use crate::cost;
-    use crate::executors::ColdTiming;
-    use crate::executors::fts as exec_fts;
-    use crate::executors::fts::{FTS_BATTERY, FtsRead};
-    use crate::harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index};
-    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, RssStats};
-    use crate::supertable::Phases;
-    use crate::tiers;
+    use crate::{
+        corpus::{self, MmapTextCorpus, block_on_inmem},
+        cost,
+        executors::{
+            ColdTiming, fts as exec_fts,
+            fts::{FTS_BATTERY, FtsRead},
+        },
+        harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index},
+        markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, RssStats},
+        supertable::Phases,
+        tiers,
+    };
 
     // ─── Constants ────────────────────────────────────────────────────────
 
@@ -824,25 +833,29 @@ pub mod vector {
     //! cargo bench -- superfile vector search             # search only
     //! ```
 
-    use std::io::Write;
-    use std::sync::{Arc, OnceLock};
-    use std::time::{Duration, Instant};
-
-    use crate::corpus::{self, DIM};
-    use crate::cost;
-    use crate::executors::vector as exec_vec;
-    use crate::executors::vector::VectorRead;
-    use crate::harness::{
-        EngineVectorResult, InfinoVectorEngine, InfinoVectorIndex, VectorMetric, VectorRunConfig,
-        run_vector_with_index,
+    use std::{
+        io::Write,
+        sync::{Arc, OnceLock},
+        time::{Duration, Instant},
     };
-    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss;
-    use crate::supertable::Phases;
-    use crate::tiers;
+
     use bytes::Bytes;
     use infino::roaring::RoaringBitmap;
+
+    use crate::{
+        corpus::{self, DIM},
+        cost,
+        executors::{vector as exec_vec, vector::VectorRead},
+        harness::{
+            EngineVectorResult, InfinoVectorEngine, InfinoVectorIndex, VectorMetric,
+            VectorRunConfig, run_vector_with_index,
+        },
+        markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss,
+        supertable::Phases,
+        tiers,
+    };
 
     // ─── Constants ────────────────────────────────────────────────────────
 
@@ -1677,20 +1690,21 @@ pub mod sql {
 
     use infino::supertable::Supertable;
 
-    use crate::corpus::{self, MmapTextCorpus};
-    use crate::cost;
-    use crate::executors::sql as exec_sql;
-    use crate::executors::sql::SqlRead;
-    use crate::harness::{
-        EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
-        build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
-        sql_options,
+    use crate::{
+        corpus::{self, MmapTextCorpus},
+        cost,
+        executors::{sql as exec_sql, sql::SqlRead},
+        harness::{
+            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
+            build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
+            sql_options,
+        },
+        markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, RssStats},
+        supertable::Phases,
+        tiers,
     };
-    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, RssStats};
-    use crate::supertable::Phases;
-    use crate::tiers;
 
     /// Deterministic category labels assigned round-robin by doc id, so the
     /// planted distribution is exactly known for the correctness gate.

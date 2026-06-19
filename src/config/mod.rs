@@ -33,13 +33,20 @@
 //! 2. Add the same key to `config.yaml` with its default value.
 //! 3. Add a docstring and a unit test exercising the override path.
 
-use figment::Figment;
-use figment::providers::{Env, Format, Yaml};
-use serde::de::{self, Deserializer, Visitor};
-use serde::ser::Serializer;
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::{
+    env, fmt,
+    path::{Path, PathBuf},
+};
+
+use figment::{
+    Figment,
+    providers::{Env, Format, Yaml},
+};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer, Visitor},
+    ser::Serializer,
+};
 
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
@@ -426,19 +433,22 @@ fn default_figment() -> Figment {
 /// Resolve the user-level config path. Honors `XDG_CONFIG_HOME`
 /// first; falls back to `$HOME/.config/infino/config.yaml`.
 fn user_config_path() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(xdg).join("infino/config.yaml"));
     }
-    std::env::var("HOME")
+    env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".config/infino/config.yaml"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{env, sync::Mutex};
+
     use figment::providers::Serialized;
-    use std::sync::Mutex;
+    use serde_json::json;
+
+    use super::*;
 
     /// Serialize tests that mutate process-global env so they don't
     /// race. `unsafe { std::env::set_var }` requires this in the 2024
@@ -455,10 +465,10 @@ mod tests {
     fn env_overrides_default() {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK; cleanup at end.
-        unsafe { std::env::set_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB", "2048") };
+        unsafe { env::set_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB", "2048") };
         let cfg = Config::load().expect("load with env override");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 2048);
-        unsafe { std::env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
+        unsafe { env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
     }
 
     #[test]
@@ -466,7 +476,7 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK; we ensure the var is unset
         // before reading.
-        unsafe { std::env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
+        unsafe { env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
         let cfg = Config::load().expect("load with no env override");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
     }
@@ -604,10 +614,10 @@ storage:
     fn user_config_path_uses_xdg_when_set() {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test") };
+        unsafe { env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test") };
         let p = user_config_path().expect("path");
         assert_eq!(p, PathBuf::from("/tmp/xdg-test/infino/config.yaml"));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        unsafe { env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]
@@ -674,15 +684,15 @@ supertable:
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK; cleanup at end.
         unsafe {
-            std::env::set_var("INFINO_SUPERTABLE__WRITER_THREADS", "4");
-            std::env::set_var("INFINO_SUPERTABLE__READER_THREADS", "auto");
+            env::set_var("INFINO_SUPERTABLE__WRITER_THREADS", "4");
+            env::set_var("INFINO_SUPERTABLE__READER_THREADS", "auto");
         }
         let cfg = Config::load().expect("load with nested env override");
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Fixed(4));
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
         unsafe {
-            std::env::remove_var("INFINO_SUPERTABLE__WRITER_THREADS");
-            std::env::remove_var("INFINO_SUPERTABLE__READER_THREADS");
+            env::remove_var("INFINO_SUPERTABLE__WRITER_THREADS");
+            env::remove_var("INFINO_SUPERTABLE__READER_THREADS");
         }
     }
 
@@ -691,15 +701,15 @@ supertable:
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK.
         unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::set_var("HOME", "/tmp/home-test");
+            env::remove_var("XDG_CONFIG_HOME");
+            env::set_var("HOME", "/tmp/home-test");
         }
         let p = user_config_path().expect("path");
         assert_eq!(
             p,
             PathBuf::from("/tmp/home-test/.config/infino/config.yaml")
         );
-        unsafe { std::env::remove_var("HOME") };
+        unsafe { env::remove_var("HOME") };
     }
 
     #[test]
@@ -744,15 +754,15 @@ supertable:
     fn compaction_nested_env_var_overrides_field() {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         unsafe {
-            std::env::set_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB", "4096");
-            std::env::set_var("INFINO_COMPACTION__MIN_FILL_PERCENT", "60");
+            env::set_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB", "4096");
+            env::set_var("INFINO_COMPACTION__MIN_FILL_PERCENT", "60");
         }
         let cfg = Config::load().expect("load with compaction env override");
         assert_eq!(cfg.compaction.target_superfile_size_mb, 4096);
         assert_eq!(cfg.compaction.min_fill_percent, 60);
         unsafe {
-            std::env::remove_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB");
-            std::env::remove_var("INFINO_COMPACTION__MIN_FILL_PERCENT");
+            env::remove_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB");
+            env::remove_var("INFINO_COMPACTION__MIN_FILL_PERCENT");
         }
     }
 
@@ -798,8 +808,6 @@ supertable:
     /// surfacing the visitor's `expecting` message).
     #[test]
     fn thread_count_serde_round_trips_and_rejects_bad_types() {
-        use serde_json::json;
-
         // Serialize both variants.
         assert_eq!(
             serde_json::to_value(ThreadCount::Auto).expect("serialize auto"),

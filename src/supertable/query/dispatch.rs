@@ -32,18 +32,24 @@
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
-use std::future::Future;
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Instant};
 
-use crate::storage::StorageProvider;
-use crate::superfile::SuperfileReader;
-use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
-use crate::supertable::tombstones::SidecarCache;
+use futures::future::try_join_all;
+use uuid::Uuid;
 
 use super::SuperfileHit;
+use crate::{
+    storage::StorageProvider,
+    superfile::SuperfileReader,
+    supertable::{
+        error::QueryError,
+        handle::SupertableReader,
+        manifest::SuperfileEntry,
+        query::superfile_reader::superfile_reader,
+        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        tombstones::SidecarCache,
+    },
+};
 
 /// Open one superfile's `SuperfileReader` through the reader cache.
 /// Warm opens are in-memory cache hits (microseconds); cold opens
@@ -55,7 +61,7 @@ pub(crate) async fn open_reader(
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(
+    superfile_reader(
         store,
         disk_cache,
         storage,
@@ -85,7 +91,7 @@ pub(crate) fn apply_tombstone_filter(
     cache: Option<&Arc<SidecarCache>>,
     entry: &SuperfileEntry,
     hits: &mut Vec<SuperfileHit>,
-    now: std::time::Instant,
+    now: Instant,
 ) -> Result<(), QueryError> {
     let Some(cache) = cache else {
         return Ok(());
@@ -172,13 +178,7 @@ pub(crate) async fn fanout_with<P, R, B, Fut>(
 where
     P: Send + 'static,
     R: Send + 'static,
-    B: Fn(
-            Arc<SuperfileReader>,
-            Arc<SuperfileEntry>,
-            Option<Arc<SidecarCache>>,
-            std::time::Instant,
-            P,
-        ) -> Fut
+    B: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<SidecarCache>>, Instant, P) -> Fut
         + Clone
         + Send
         + 'static,
@@ -192,12 +192,12 @@ where
     let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
     let storage = manifest.options.storage.as_ref().map(Arc::clone);
     let tombstone_cache = reader.tombstone_cache.clone();
-    let now = std::time::Instant::now();
+    let now = Instant::now();
 
     // Warm the tombstone sidecars for every distinct superfile in one
     // concurrent batch before the per-superfile fan-out.
     if let Some(cache) = tombstone_cache.as_ref() {
-        let mut ids: Vec<uuid::Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
+        let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
         ids.sort_unstable();
         ids.dedup();
         cache.prefetch(&ids, now).await;
@@ -221,5 +221,5 @@ where
                 .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
         }
     });
-    futures::future::try_join_all(handles).await
+    try_join_all(handles).await
 }

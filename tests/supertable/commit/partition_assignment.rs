@@ -47,12 +47,15 @@
 
 use std::sync::Arc;
 
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::tokenize::Tokenizer;
-use infino::supertable::Supertable;
-use infino::supertable::manifest::list::PartitionStrategy;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options, default_tokenizer};
+use infino::{
+    superfile::{builder::FtsConfig, fts::tokenize::Tokenizer},
+    supertable::{
+        Supertable,
+        manifest::list::PartitionStrategy,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
+};
 
 /// Commits driven per partition-assignment scenario.
 const COMMITS_PER_TEST: usize = 3;

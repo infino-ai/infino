@@ -27,11 +27,15 @@
 //! deferred planner hint; a true HLL-based distinct-term union lands
 //! when measured.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg};
+use crate::supertable::manifest::{
+    SuperfileEntry,
+    list::{FtsSummaryAgg, ScalarStatsAgg, VectorSummaryAgg},
+};
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
 /// Built by [`compute`] and inserted verbatim into the entry.
@@ -174,12 +178,14 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
+
     use super::*;
     use crate::supertable::manifest::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
     };
-    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
-    use std::collections::HashMap;
 
     fn seg_with_string_minmax(col: &str, min: &str, max: &str, large: bool) -> Arc<SuperfileEntry> {
         let (mn, mx): (ArrayRef, ArrayRef) = if large {

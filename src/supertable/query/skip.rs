@@ -44,15 +44,17 @@
 //! without yet committing to a specific early-termination
 //! algorithm.
 
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use datafusion::scalar::ScalarValue;
 
-use crate::superfile::fts::reader::BoolMode;
-use crate::superfile::vector::distance::{Metric, distance};
-
-use crate::supertable::manifest::{Manifest, SuperfileEntry};
+use crate::{
+    superfile::{
+        fts::reader::BoolMode,
+        vector::distance::{Metric, distance},
+    },
+    supertable::manifest::{Manifest, SuperfileEntry},
+};
 
 /// Bloom-skip mask for an exact-term BM25 search.
 ///
@@ -180,7 +182,7 @@ pub fn superfiles_sorted_by_centroid_distance(
         .collect();
     // pdqsort: per-query superfile skip ordering. (superfile_idx, dist)
     // tuples are unique by superfile_idx, so any tie-break is fine.
-    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
@@ -318,25 +320,28 @@ pub(crate) fn scalar_value_may_match(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use uuid::Uuid;
-
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-
-    use crate::superfile::vector::distance::Metric;
-    use crate::supertable::SupertableOptions;
-    use crate::supertable::manifest::{
-        FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
-        bloom::BloomBuilder,
-    };
-    use arrow_schema::{DataType, Field, Schema};
-
-    use super::*;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{
+            SupertableOptions,
+            manifest::{
+                ClusterCentroids, FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry,
+                SuperfileUri, VectorSummary, bloom::BloomBuilder,
+            },
+        },
+        test_helpers::default_tokenizer,
+    };
 
     fn opts_simple() -> Arc<SupertableOptions> {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -344,7 +349,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let tk = crate::test_helpers::default_tokenizer();
+        let tk = default_tokenizer();
         Arc::new(
             SupertableOptions::new(
                 schema,
@@ -379,7 +384,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 0,
                     metric: Metric::Cosine,
-                    rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                    rerank_codec: RerankCodec::Fp32,
                 }],
                 None,
             )
@@ -436,7 +441,7 @@ mod tests {
             VectorSummary {
                 centroid,
                 radius,
-                clusters: crate::supertable::manifest::ClusterCentroids::empty(),
+                clusters: ClusterCentroids::empty(),
             },
         );
         Arc::new(e)

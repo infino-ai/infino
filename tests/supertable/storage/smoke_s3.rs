@@ -53,22 +53,24 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::config::{
-    CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-    SupertableSettings,
+use infino::{
+    config::{
+        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+        SupertableSettings,
+    },
+    superfile::builder::{FtsConfig, VectorConfig},
+    supertable::{
+        Supertable,
+        query::VectorSearchOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{S3StorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::superfile::builder::{FtsConfig, VectorConfig};
-use infino::supertable::Supertable;
-use infino::supertable::query::VectorSearchOptions;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{S3StorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 /// Single-thread rayon pool for deterministic S3 smoke runs.
 const RAYON_POOL_THREADS: usize = 1;
@@ -84,8 +86,7 @@ const VECTOR_SEARCH_K: usize = 3;
 const VECTOR_NPROBE: usize = 4;
 /// BM25 top-k for the smoke FTS query.
 const BM25_TOP_K: usize = 10;
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
+use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -122,8 +123,10 @@ async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
     let addr = listener.local_addr().expect("local_addr");
 
     tokio::spawn(async move {
-        use hyper_util::rt::{TokioExecutor, TokioIo};
-        use hyper_util::server::conn::auto::Builder as ConnBuilder;
+        use hyper_util::{
+            rt::{TokioExecutor, TokioIo},
+            server::conn::auto::Builder as ConnBuilder,
+        };
         let http = ConnBuilder::new(TokioExecutor::new());
         loop {
             let (stream, _peer) = match listener.accept().await {

@@ -41,6 +41,20 @@ pub mod utils;
 pub mod wal;
 pub mod writer;
 
+pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
+pub use gc::GcReport;
+pub use handle::{Supertable, SupertableReader};
+pub use lazy_source::StorageRangeSource;
+pub use manifest::{
+    FtsSummaryAgg, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsAgg, SuperfileEntry,
+    SuperfileList, SuperfileUri, VectorSummary,
+};
+pub use mutations::MutationStats;
+pub use options::SupertableOptions;
+pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
+pub use stats::SupertableStats;
+pub use writer::SupertableWriter;
+
 /// Re-export of [`crate::storage`] under the
 /// `supertable::storage::*` path. Storage moved out from
 /// under `supertable` so the trait + impls can be consumed
@@ -55,21 +69,7 @@ pub mod writer;
 pub use crate::storage;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) use crate::storage;
-
 pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
     StorageProvider,
 };
-pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
-pub use gc::GcReport;
-pub use handle::{Supertable, SupertableReader};
-pub use lazy_source::StorageRangeSource;
-pub use manifest::{
-    FtsSummaryAgg, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsAgg, SuperfileEntry,
-    SuperfileList, SuperfileUri, VectorSummary,
-};
-pub use mutations::MutationStats;
-pub use options::SupertableOptions;
-pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
-pub use stats::SupertableStats;
-pub use writer::SupertableWriter;

@@ -20,15 +20,21 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::compute::concat;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Schema};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
-use super::bloom::Bloom;
-use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
-use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
-use super::term_range::prefix_overlaps_range;
+use super::{
+    add_sum_arrays,
+    bloom::Bloom,
+    column_hll, column_min_max, column_sum,
+    encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array},
+    hll::HllSketch,
+    merge_min_max_arrays,
+    part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
+    term_range::prefix_overlaps_range,
+};
 
 /// Wire format version for the manifest list.
 ///
@@ -206,15 +212,15 @@ impl ScalarStatsAgg {
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
     /// same pass; sum/hll stay `None` for types that don't support them.
     pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {
-        let (min, max) = super::column_min_max(column)?;
+        let (min, max) = column_min_max(column)?;
         let null_count = u64::try_from(column.null_count()).ok();
 
         Some(ScalarStatsAgg {
             min,
             max,
             null_count,
-            sum: super::column_sum(column),
-            hll: super::column_hll(column).map(|s| s.as_bytes().to_vec()),
+            sum: column_sum(column),
+            hll: column_hll(column).map(|s| s.as_bytes().to_vec()),
         })
     }
 
@@ -285,8 +291,7 @@ impl ScalarStatsAgg {
     pub fn merge(&mut self, other: &ScalarStatsAgg) -> Result<(), ScalarStatsMergeError> {
         // Resolve the bounds first; bail before mutating anything so a failed
         // merge can't leave half-updated, internally-inconsistent stats.
-        let Some((min, max)) =
-            super::merge_min_max_arrays(&self.min, &other.min, &self.max, &other.max)
+        let Some((min, max)) = merge_min_max_arrays(&self.min, &other.min, &self.max, &other.max)
         else {
             return Err(ScalarStatsMergeError {
                 left: self.min.data_type().clone(),
@@ -300,22 +305,17 @@ impl ScalarStatsAgg {
             _ => None,
         };
         self.sum = match (&self.sum, &other.sum) {
-            (Some(a), Some(b)) => super::add_sum_arrays(a, b),
+            (Some(a), Some(b)) => add_sum_arrays(a, b),
             _ => None,
         };
         self.hll = match (&self.hll, &other.hll) {
-            (Some(a), Some(b)) => {
-                match (
-                    super::hll::HllSketch::from_bytes(a),
-                    super::hll::HllSketch::from_bytes(b),
-                ) {
-                    (Some(mut merged), Some(other_sketch)) => {
-                        merged.merge(&other_sketch);
-                        Some(merged.as_bytes().to_vec())
-                    }
-                    _ => None,
+            (Some(a), Some(b)) => match (HllSketch::from_bytes(a), HllSketch::from_bytes(b)) {
+                (Some(mut merged), Some(other_sketch)) => {
+                    merged.merge(&other_sketch);
+                    Some(merged.as_bytes().to_vec())
                 }
-            }
+                _ => None,
+            },
             _ => None,
         };
         Ok(())
@@ -815,9 +815,8 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
 }
 
 fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListParseError> {
-    let part_id = PartId(
-        uuid::Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?,
-    );
+    let part_id =
+        PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
     let partition_key = decode_b64(&d.partition_key, "partition_key")?;
     let mut scalar_stats_agg = HashMap::new();
@@ -1080,14 +1079,23 @@ mod tests {
     //! major/minor compat; part reuse across versions
     //! decodes to bit-equal entries; top-level JSON keys are
     //! jq-friendly.
-    use super::super::bloom::BloomBuilder;
-    use super::super::part::{ContentHash, PartId};
-    use super::*;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        str::from_utf8,
+        sync::Arc,
+    };
+
     use arrow_array::{BooleanArray, Date32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
     use uuid::Uuid;
+
+    use super::{
+        super::{
+            bloom::BloomBuilder,
+            part::{ContentHash, PartId},
+        },
+        *,
+    };
 
     /// Build a per-column aggregate from a plain `i64` array (no nulls).
     fn agg_i64(vals: Vec<i64>) -> ScalarStatsAgg {
@@ -1715,7 +1723,7 @@ mod tests {
         // property cross-version content-addressing rides on.
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
-        let s = std::str::from_utf8(&bytes).expect("utf8");
+        let s = from_utf8(&bytes).expect("utf8");
         let body_fts = serde_json::from_slice::<serde_json::Value>(&bytes).expect("json");
         let fts_agg = &body_fts["parts"][0]["fts_summary_agg"]["body"];
         assert!(
@@ -1950,7 +1958,7 @@ mod tests {
     fn malformed_base64_surfaces_typed_error() {
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
-        let s = std::str::from_utf8(&bytes).expect("utf8");
+        let s = from_utf8(&bytes).expect("utf8");
         let tampered = s.replacen("\"schema\": \"", "\"schema\": \"!!!!", 1);
         let err = decode(tampered.as_bytes()).expect_err("must fail");
         assert!(
@@ -1968,7 +1976,7 @@ mod tests {
     fn malformed_term_bloom_surfaces_typed_error() {
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
-        let s = std::str::from_utf8(&bytes).expect("utf8");
+        let s = from_utf8(&bytes).expect("utf8");
         // rich_entry's "body" column has term_bloom = None ⇒ "". Swap it
         // for base64 of 3 bytes ("abc") — non-empty, but not a valid
         // `n_blocks × BLOCK_BYTES` bloom layout.
@@ -1994,7 +2002,7 @@ mod tests {
     fn options_hash_without_blake3_prefix_rejected() {
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
-        let s = std::str::from_utf8(&bytes).expect("utf8");
+        let s = from_utf8(&bytes).expect("utf8");
         // rich_list stamps options_hash = blake3:abab...; drop the prefix.
         let tampered = s.replacen("\"blake3:", "\"nothex:", 1);
         let err = decode(tampered.as_bytes()).expect_err("missing prefix");
@@ -2010,7 +2018,7 @@ mod tests {
     fn content_hash_wrong_hex_length_rejected() {
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
-        let s = std::str::from_utf8(&bytes).expect("utf8");
+        let s = from_utf8(&bytes).expect("utf8");
         // The first per-part content_hash is 64 hex chars of 'c' (seed 0
         // ⇒ ContentHash([0;32]) ⇒ all "00"). Shorten it to 2 chars.
         let full = "0".repeat(BLAKE3_HEX_LEN);

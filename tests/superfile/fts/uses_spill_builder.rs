@@ -15,14 +15,19 @@
 //! succeed, but this test will catch behavioural regressions in
 //! the production path used by `SupertableWriter`.
 
+use std::sync::Arc;
+
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::fts::reader::BoolMode;
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
-use std::sync::Arc;
+use infino::{
+    superfile::{
+        SuperfileReader,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        fts::reader::BoolMode,
+    },
+    test_helpers::{decimal128_ids, default_tokenizer},
+};
 
 /// Decimal128 precision / scale for the `doc_id` column.
 const ID_DECIMAL_PRECISION: u8 = 38;

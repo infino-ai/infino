@@ -9,16 +9,16 @@
 //! (`PutMode::Create` / `PutMode::Update`) are native, so no
 //! builder flag is needed to enable them.
 
-use std::ops::Range;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
-use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    ClientOptions, Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
+    PutOptions, PutPayload, UpdateVersion,
+    azure::{MicrosoftAzure, MicrosoftAzureBuilder},
+    path::Path as ObjPath,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, retry};
@@ -136,18 +136,18 @@ fn normalize_prefix(prefix: impl Into<String>) -> String {
 const AZURE_POOL_MAX_IDLE_PER_HOST: usize = 1024;
 
 /// Idle-connection keep-alive, below Azure's server-side close window.
-const AZURE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const AZURE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Connect-phase timeout, so one slow SYN/TLS can't dominate the p99.
-const AZURE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const AZURE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whole-request timeout (incl. body). The 30s default is too tight for
 /// a multi-MB superfile PUT on a modest uplink — it aborts mid-upload.
-const AZURE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const AZURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// HTTP client options: deep warm idle pool + bounded connect/request.
-fn tuned_client_options() -> object_store::ClientOptions {
-    object_store::ClientOptions::new()
+fn tuned_client_options() -> ClientOptions {
+    ClientOptions::new()
         .with_pool_max_idle_per_host(AZURE_POOL_MAX_IDLE_PER_HOST)
         .with_pool_idle_timeout(AZURE_POOL_IDLE_TIMEOUT)
         .with_connect_timeout(AZURE_CONNECT_TIMEOUT)
@@ -281,10 +281,7 @@ impl StorageProvider for AzureStorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    async fn put_multipart(
-        &self,
-        uri: &str,
-    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+    async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
         self.store
             .put_multipart(&path)
@@ -304,14 +301,14 @@ impl StorageProvider for AzureStorageProvider {
     async fn list_with_prefix_metadata(
         &self,
         prefix: &str,
-    ) -> Result<Vec<(String, super::ObjectMeta)>, StorageError> {
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             out.push((
                 meta.location.to_string(),
-                super::ObjectMeta {
+                ObjectMeta {
                     size: meta.size,
                     etag: meta.e_tag,
                     last_modified: meta.last_modified.into(),

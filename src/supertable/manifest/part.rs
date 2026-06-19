@@ -11,20 +11,27 @@
 //! superfile set reuse it across manifest versions without a
 //! re-PUT.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    fmt,
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
-use apache_avro::Schema as AvroSchema;
-use apache_avro::types::Value as AvroValue;
-use apache_avro::{from_avro_datum, to_avro_datum};
+use apache_avro::{
+    Schema as AvroSchema, from_avro_datum, to_avro_datum, types::Value as AvroValue,
+};
 use thiserror::Error;
 use uuid::Uuid;
+use zstd::stream;
 
-use crate::supertable::manifest::encoding::{
-    DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
-    encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+use crate::supertable::manifest::{
+    SubsectionOffsets, SuperfileEntry, SuperfileUri,
+    encoding::{
+        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
+        encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+    },
 };
-use crate::supertable::manifest::{SubsectionOffsets, SuperfileEntry};
 
 /// The format version stamped into every emitted part.
 ///
@@ -107,8 +114,8 @@ impl ContentHash {
     }
 }
 
-impl std::fmt::Debug for ContentHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show only the first 8 hex chars in Debug to keep
         // logs readable. Use `to_hex()` for the full form.
         write!(
@@ -119,8 +126,8 @@ impl std::fmt::Debug for ContentHash {
     }
 }
 
-impl std::fmt::Display for ContentHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "blake3:{}", self.to_hex())
     }
 }
@@ -138,8 +145,8 @@ impl PartId {
     }
 }
 
-impl std::fmt::Display for PartId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PartId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -311,7 +318,7 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
     ]);
 
     let avro_bytes = to_avro_datum(schema(), record).expect("avro datum encode");
-    zstd::stream::encode_all(avro_bytes.as_slice(), zstd_level).expect("zstd encode")
+    stream::encode_all(avro_bytes.as_slice(), zstd_level).expect("zstd encode")
 }
 
 /// Decode a manifest-part byte buffer (zstd-wrapped Avro)
@@ -321,12 +328,11 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
 /// the constant [`FORMAT_VERSION`]; minor differences are
 /// accepted).
 pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
-    let avro_bytes =
-        zstd::stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+    let avro_bytes = stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
     // Schemaless datum decode — mirrors `to_avro_datum` in
     // `encode`. The schema is in-source (compiled in), so the
     // reader doesn't need a wire-side schema.
-    let mut cursor = std::io::Cursor::new(avro_bytes.as_slice());
+    let mut cursor = Cursor::new(avro_bytes.as_slice());
     let value = from_avro_datum(schema(), &mut cursor, None)
         .map_err(|e| PartParseError::Avro(e.to_string()))?;
 
@@ -401,7 +407,7 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
 
     Ok(SuperfileEntry {
         superfile_id,
-        uri: crate::supertable::manifest::SuperfileUri(uri),
+        uri: SuperfileUri(uri),
         n_docs,
         id_min,
         id_max,
@@ -697,15 +703,19 @@ mod tests {
     //! property cross-version part-reuse rides on);
     //! format_version major/minor compat; corrupt zstd
     //! surfaces a typed error.
-    use super::*;
-    use crate::supertable::manifest::bloom::BloomBuilder;
-    use crate::supertable::manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary};
-    use crate::supertable::{SuperfileEntry, SuperfileUri};
+    use std::{collections::HashMap, sync::Arc};
+
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use bytes::Bytes;
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::supertable::{
+        SuperfileEntry, SuperfileUri,
+        manifest::{
+            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder,
+        },
+    };
 
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
@@ -746,7 +756,7 @@ mod tests {
         VectorSummary {
             centroid,
             radius: seed * 1.7,
-            clusters: crate::supertable::manifest::ClusterCentroids::empty(),
+            clusters: ClusterCentroids::empty(),
         }
     }
 
@@ -1513,7 +1523,7 @@ mod tests {
             ("superfiles".into(), AvroValue::Array(vec![])),
         ]);
         let avro_bytes = to_avro_datum(schema(), record).expect("avro encode");
-        let bytes = zstd::stream::encode_all(avro_bytes.as_slice(), 3).expect("zstd");
+        let bytes = stream::encode_all(avro_bytes.as_slice(), 3).expect("zstd");
         let err = decode(&bytes).expect_err("bad part_id");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),

@@ -43,34 +43,38 @@
 //! `(superfile, local_doc_id)`, so a document surfaced by *both*
 //! retrievers is boosted above one surfaced by a single retriever.
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
+use std::{any::Any, cmp::Ordering, collections::HashMap, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+use datafusion::{
+    catalog::{Session, TableFunctionImpl, TableProvider},
+    error::{DataFusionError, Result as DfResult},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{Expr, TableType},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
 };
+use futures::{future, stream};
 
-use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
-use super::vector_exec::arg_to_query_vector;
-use crate::superfile::fts::reader::BoolMode;
-use crate::superfile::reader::VectorSearchOptions;
-use crate::supertable::QueryError;
-use crate::supertable::handle::{SupertableReader, WeakReader};
-use crate::supertable::manifest::SuperfileUri;
-use crate::supertable::query::SuperfileHit;
+use super::{
+    common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits},
+    vector_exec::arg_to_query_vector,
+};
+use crate::{
+    superfile::{fts::reader::BoolMode, reader::VectorSearchOptions},
+    supertable::{
+        QueryError,
+        handle::{SupertableReader, WeakReader},
+        manifest::SuperfileUri,
+        query::SuperfileHit,
+    },
+};
 
 /// SQL name the TVF is registered under.
 pub(crate) const HYBRID_SEARCH_UDTF: &str = "hybrid_search";
@@ -121,7 +125,7 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first.
-        let (bm25_res, vector_res) = futures::future::join(
+        let (bm25_res, vector_res) = future::join(
             self.bm25_search_async(text_col, q_text, k, mode),
             self.vector_search_async(vec_col, q_vec, k, options),
         )
@@ -427,7 +431,7 @@ impl ExecutionPlan for HybridSearchExec {
             .await
         };
 
-        let stream = futures::stream::once(fut);
+        let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
             stream,
@@ -466,7 +470,7 @@ fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<Sup
     fused.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| a.superfile.cmp(&b.superfile))
             .then_with(|| a.local_doc_id.cmp(&b.local_doc_id))
     });
@@ -476,21 +480,24 @@ fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<Sup
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::collections::HashSet;
 
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
-        RecordBatch,
+        RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use rayon::ThreadPoolBuilder;
 
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-    use crate::superfile::vector::distance::Metric;
-    use crate::superfile::vector::rerank_codec::RerankCodec;
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer as tok;
+    use super::*;
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::default_tokenizer as tok,
+    };
 
     // ---- supertable harness: title (FTS) + emb (vector) ----
 
@@ -503,7 +510,7 @@ mod tests {
 
     fn options_title_emb(dim: usize) -> SupertableOptions {
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
@@ -880,7 +887,7 @@ mod tests {
         let mut out = String::new();
         for batch in &batches {
             for column in batch.columns() {
-                if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
                     for i in 0..strings.len() {
                         if !strings.is_null(i) {
                             out.push_str(strings.value(i));
@@ -899,8 +906,7 @@ mod tests {
     /// `name` / `Debug` — none of which normal query execution touches.
     #[tokio::test]
     async fn hybrid_table_and_exec_trait_methods() {
-        use datafusion::execution::context::SessionContext;
-        use datafusion::prelude::lit;
+        use datafusion::{execution::context::SessionContext, prelude::lit};
 
         let dim = 16;
         let st = demo(dim);
@@ -971,7 +977,7 @@ mod tests {
     /// any FtsConfig/VectorConfig), so it is filterable from SQL.
     fn options_cat_title_emb(dim: usize) -> SupertableOptions {
         let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),

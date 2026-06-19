@@ -13,14 +13,17 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::Supertable;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
-use infino::{CompactionSettings, OptimizeOptions};
+use infino::{
+    CompactionSettings, OptimizeOptions,
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
 
 const TOP_K: usize = 10;

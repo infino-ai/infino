@@ -79,23 +79,30 @@
 //! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
 //! each entry (currently always `"ascii_lower"`), so the on-disk
 //! format is forward-compatible without a file rewrite.
-use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
-use crate::superfile::format::{self, kv};
-use crate::superfile::fts::builder::FtsBuilder;
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use crate::superfile::stats::SuperfileStats;
-use crate::superfile::vector::builder::VectorBuilder;
-use crate::superfile::vector::reader::ColumnReader;
-use crate::superfile::{BuildError, SuperfileReader};
+use std::{collections::HashSet, fmt, sync::Arc};
+
+use arrow_array::{Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Schema};
+use parquet::basic::{Compression, ZstdLevel};
+use roaring::RoaringBitmap;
+
 // `VectorConfig` lives in `vector::builder` and is re-exported below
 // (single source of truth post-collapse — see the `pub use` line).
 pub use crate::superfile::vector::builder::VectorConfig;
-use crate::superfile::vector::distance::Metric;
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Schema};
-use parquet::basic::Compression;
-use roaring::RoaringBitmap;
-use std::sync::Arc;
+use crate::superfile::{
+    BuildError, SuperfileReader,
+    format::{
+        self,
+        footer::{encode_parquet_body, splice_index_blobs},
+        kv,
+    },
+    fts::{
+        builder::FtsBuilder,
+        tokenize::{AsciiLowerTokenizer, Tokenizer},
+    },
+    stats::SuperfileStats,
+    vector::{builder::VectorBuilder, distance::Metric, reader::ColumnReader},
+};
 
 /// Per-column FTS configuration. The `column` must exist in
 /// `BuilderOptions.schema` and be `LargeUtf8`.
@@ -232,8 +239,7 @@ impl BuilderOptions {
             tokenizer,
             row_group_size: 65_536,
             compression: Compression::ZSTD(
-                parquet::basic::ZstdLevel::try_new(3)
-                    .expect("zstd level 3 is in the valid 1..=22 range"),
+                ZstdLevel::try_new(3).expect("zstd level 3 is in the valid 1..=22 range"),
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
         }
@@ -352,8 +358,8 @@ impl BuilderOptions {
     }
 }
 
-impl std::fmt::Debug for SuperfileBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SuperfileBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SuperfileBuilder")
             .field("id_column", &self.opts.id_column)
             .field("n_fts_columns", &self.opts.fts_columns.len())
@@ -423,7 +429,7 @@ impl SuperfileBuilder {
         // 3. No reserved separator / prefix / duplication across the
         //    combined logical-name namespace (FTS + vector + any
         //    schema-name-vs-vector collision).
-        let mut seen_logical: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_logical: HashSet<&str> = HashSet::new();
         for fc in &opts.fts_columns {
             check_user_column_name(&fc.column)?;
             if !seen_logical.insert(fc.column.as_str()) {
@@ -536,7 +542,7 @@ impl SuperfileBuilder {
                 let arr = batch.column(schema_idx);
                 let strs = arr
                     .as_any()
-                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .downcast_ref::<LargeStringArray>()
                     .expect("schema validated as LargeUtf8");
                 for row in 0..(n_rows as usize) {
                     let local_doc_id = self.next_local_doc_id + row as u32;
@@ -899,13 +905,21 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
-    use arrow_array::{Decimal128Array, LargeStringArray};
+    use std::sync::Arc;
+
+    use arrow_array::{Decimal128Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
     use roaring::RoaringBitmap;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        superfile::{
+            format::footer::read_kv_metadata, fts::reader::BoolMode,
+            vector::rerank_codec::RerankCodec,
+        },
+        test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+    };
 
     fn schema_with_fts() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1102,11 +1116,8 @@ mod tests {
             DataType::UInt64,
             false,
         )]));
-        let bad = RecordBatch::try_new(
-            other,
-            vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
-        )
-        .expect("build RecordBatch");
+        let bad = RecordBatch::try_new(other, vec![Arc::new(UInt64Array::from(vec![1u64]))])
+            .expect("build RecordBatch");
         let err = b.add_batch(&bad, &[]).expect_err("expected error");
         assert!(matches!(err, BuildError::BatchSchemaMismatch));
     }
@@ -1173,8 +1184,7 @@ mod tests {
         let batch = batch_two_rows(&schema);
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = b.finish().expect("finish builder");
-        let kv =
-            crate::superfile::format::footer::read_kv_metadata(&bytes).expect("read kv metadata");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
         assert_eq!(
             kv.get("inf.format").map(String::as_str),
             Some("infino-superfile")
@@ -1206,8 +1216,7 @@ mod tests {
         v[16 + 1] = 1.0;
         b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
         let bytes = b.finish().expect("finish builder");
-        let kv =
-            crate::superfile::format::footer::read_kv_metadata(&bytes).expect("read kv metadata");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
         assert!(kv.contains_key("inf.vec.offset"));
         assert!(kv.contains_key("inf.vec.length"));
         assert!(kv.contains_key("inf.vec.columns"));
@@ -1239,7 +1248,7 @@ mod tests {
             n_cent: 64,
             rot_seed: 99,
             metric: Metric::L2Sq,
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+            rerank_codec: RerankCodec::Fp32,
         }];
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""column":"emb""#));
@@ -1488,8 +1497,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_batch_from_reader_adds_fts_correctly() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -1541,8 +1548,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_batch_from_reader_to_non_empty_builder_includes_both_datasets() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -1692,14 +1697,13 @@ mod tests {
             schema_with_fts(),
             "doc_id",
             vec![],
-            vec![crate::superfile::vector::builder::VectorConfig {
+            vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
-                rerank_codec:
-                    crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
             }],
             None,
         );
@@ -1721,8 +1725,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_batch_from_reader_queries_work_correctly() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -1960,8 +1962,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_from_readers_preserves_fts_search_functionality() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -2248,13 +2248,13 @@ mod tests {
         let doc_id_min = doc_id_min_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         let doc_id_max = doc_id_max_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         assert_eq!(doc_id_min, 10, "doc_id min should be 10");
@@ -2347,13 +2347,13 @@ mod tests {
         let doc_id_min = doc_id_min_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         let doc_id_max = doc_id_max_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         assert_eq!(doc_id_min, 10, "merged doc_id min should be 10");

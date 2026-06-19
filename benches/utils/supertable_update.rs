@@ -24,20 +24,26 @@
 //!
 //! Invoked as `cargo bench -- update`.
 
-use std::env;
-use std::hint::black_box;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    env,
+    hint::black_box,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use datafusion::prelude::{col, lit};
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::Supertable;
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    supertable::Supertable,
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
 
-use crate::markdown::{fmt_count, fmt_throughput, fmt_time};
-use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-use crate::rss::{self, PeakSampler, RssStats};
+use crate::{
+    markdown::{fmt_count, fmt_throughput, fmt_time},
+    report::{Better, Block, Cell, Report, Section, metric, text},
+    rss::{self, PeakSampler, RssStats},
+};
 
 /// Default baseline ingest doc count (sized to run in <1s) when
 /// `INFINO_BENCH_UPDATE_N_DOCS` is unset.

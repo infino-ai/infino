@@ -25,12 +25,18 @@ use std::sync::Arc;
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::SuperfileUri;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
+use infino::{
+    superfile::{
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        fts::reader::BoolMode,
+    },
+    supertable::{
+        SuperfileUri,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{decimal128_ids, default_tokenizer},
+};
 use tempfile::TempDir;
 
 // ============================================================

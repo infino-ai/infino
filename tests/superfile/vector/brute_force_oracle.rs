@@ -27,12 +27,13 @@
 //! Larger-scale recall tests live in `tests/recall.rs`.
 
 use bytes::Bytes;
-use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{Metric, distance, normalize};
-use infino::superfile::vector::reader::VectorReader;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use infino::superfile::vector::{
+    builder::{VectorBuilder, VectorConfig},
+    distance::{Metric, distance, normalize},
+    reader::VectorReader,
+    rerank_codec::RerankCodec,
+};
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
 /// Standard small-corpus oracle shape (brute force stays cheap).

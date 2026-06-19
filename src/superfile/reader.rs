@@ -20,26 +20,39 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::sync::Arc;
+use std::{fmt, io, str, sync::Arc};
 
 use arrow::compute::{concat_batches, take};
-use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader, UInt32Array,
+};
 use arrow_schema::{Field, Schema};
 use bytes::Bytes;
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-    RowSelector,
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::{
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+            RowSelector,
+        },
+        parquet_to_arrow_schema,
+    },
+    file::metadata::{PageIndexPolicy, ParquetMetaData},
 };
-use parquet::file::metadata::PageIndexPolicy;
 use roaring::RoaringBitmap;
 
-use crate::superfile::ReadError;
-use crate::superfile::format::{self, footer, kv};
-use crate::superfile::fts::reader::{BoolMode, FtsReader};
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use crate::superfile::vector::reader::VectorReader;
-use crate::supertable::query::provider::tombstone_access_plan;
+use crate::{
+    superfile::{
+        BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
+        format::{self, footer, kv},
+        fts::{
+            reader::{self as fts_reader, BoolMode, FtsReader},
+            tokenize::{AsciiLowerTokenizer, Tokenizer},
+        },
+        vector::reader::{self as vector_reader, VectorReader},
+    },
+    supertable::query::provider::tombstone_access_plan,
+};
 
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -90,7 +103,7 @@ pub struct SuperfileReader {
     /// `open_lazy_with` already fetched). Lets the SQL scan path serve
     /// row-group counts and DataFusion's parquet opener from one
     /// per-open parse instead of re-reading footers on every query.
-    parquet_meta: Arc<parquet::file::metadata::ParquetMetaData>,
+    parquet_meta: Arc<ParquetMetaData>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -99,7 +112,7 @@ pub struct SuperfileReader {
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     /// [`open`]: SuperfileReader::open
-    source: Option<Arc<dyn crate::superfile::LazyByteSource>>,
+    source: Option<Arc<dyn LazyByteSource>>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -107,8 +120,8 @@ pub struct SuperfileReader {
     vec: Option<VectorReader>,
 }
 
-impl std::fmt::Debug for SuperfileReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SuperfileReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SuperfileReader")
             .field("id_column", &self.id_column)
             .field("n_docs", &self.n_docs)
@@ -153,9 +166,7 @@ impl SuperfileReader {
     /// pyarrow) must use the eager [`open`] path.
     ///
     /// [`open`]: SuperfileReader::open
-    pub async fn open_lazy(
-        source: Arc<dyn crate::superfile::LazyByteSource>,
-    ) -> Result<Self, ReadError> {
+    pub async fn open_lazy(source: Arc<dyn LazyByteSource>) -> Result<Self, ReadError> {
         Self::open_lazy_with(source, OpenOptions::default()).await
     }
 
@@ -170,11 +181,9 @@ impl SuperfileReader {
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
-        source: Arc<dyn crate::superfile::LazyByteSource>,
+        source: Arc<dyn LazyByteSource>,
         _opts: OpenOptions,
     ) -> Result<Self, ReadError> {
-        use parquet::arrow::parquet_to_arrow_schema;
-
         // 1. Fetch the Parquet footer (≤ 2 GETs).
         let metadata =
             footer::read_parquet_metadata_lazy(source.as_ref(), DEFAULT_TAIL_SPECULATIVE_BYTES)
@@ -258,13 +267,12 @@ impl SuperfileReader {
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
             let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
-            let sub: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(
-                crate::superfile::LazySubSource::new(Arc::clone(&source), off, len),
-            );
+            let sub: Arc<dyn LazyByteSource> =
+                Arc::new(LazySubSource::new(Arc::clone(&source), off, len));
             let reader = VectorReader::open_lazy(
                 sub,
                 cols_json,
-                crate::superfile::vector::reader::OpenOptions::for_object_store(),
+                vector_reader::OpenOptions::for_object_store(),
             )
             .await?;
             Ok(Some(reader))
@@ -277,15 +285,11 @@ impl SuperfileReader {
             let off = parse_u64(&kv_map, kv::FTS_OFFSET)?;
             let len = parse_u64(&kv_map, kv::FTS_LENGTH)?;
             let cols_json = kv_map.get(kv::FTS_COLUMNS).expect("checked");
-            let sub: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(
-                crate::superfile::LazySubSource::new(Arc::clone(&source), off, len),
-            );
-            let reader = FtsReader::open_lazy(
-                sub,
-                cols_json,
-                crate::superfile::fts::reader::OpenOptions::for_object_store(),
-            )
-            .await?;
+            let sub: Arc<dyn LazyByteSource> =
+                Arc::new(LazySubSource::new(Arc::clone(&source), off, len));
+            let reader =
+                FtsReader::open_lazy(sub, cols_json, fts_reader::OpenOptions::for_object_store())
+                    .await?;
             Ok(Some(reader))
         };
 
@@ -364,7 +368,7 @@ impl SuperfileReader {
             Some(FtsReader::open_with(
                 blob,
                 cols_json,
-                crate::superfile::fts::reader::OpenOptions {
+                fts_reader::OpenOptions {
                     verify_crc: opts.verify_crc,
                 },
             )?)
@@ -385,7 +389,7 @@ impl SuperfileReader {
             Some(VectorReader::open_with(
                 blob,
                 cols_json,
-                crate::superfile::vector::reader::OpenOptions {
+                vector_reader::OpenOptions {
                     verify_crc: opts.verify_crc,
                 },
             )?)
@@ -414,7 +418,7 @@ impl SuperfileReader {
     /// on the eager path. One parse per reader lifetime; the SQL scan
     /// path serves row-group counts and DataFusion's parquet opener
     /// from this instead of re-reading the footer per query.
-    pub fn parquet_metadata(&self) -> &Arc<parquet::file::metadata::ParquetMetaData> {
+    pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
         &self.parquet_meta
     }
 
@@ -536,9 +540,9 @@ impl SuperfileReader {
     /// [`BytesLazyByteSource`]: crate::superfile::BytesLazyByteSource
     /// [`open`]: SuperfileReader::open
     /// [`open_lazy`]: SuperfileReader::open_lazy
-    pub fn byte_source(&self) -> Arc<dyn crate::superfile::LazyByteSource> {
+    pub fn byte_source(&self) -> Arc<dyn LazyByteSource> {
         match (&self.bytes, &self.source) {
-            (Some(bytes), _) => Arc::new(crate::superfile::BytesLazyByteSource::new(bytes.clone())),
+            (Some(bytes), _) => Arc::new(BytesLazyByteSource::new(bytes.clone())),
             (None, Some(src)) => Arc::clone(src),
             (None, None) => {
                 unreachable!("a SuperfileReader has either resident bytes or a lazy source")
@@ -694,7 +698,7 @@ impl SuperfileReader {
     /// `arrow_meta` like `take_by_local_doc_ids` does.
     pub fn id_lookup(&self, target: i128) -> Result<Option<u32>, ReadError> {
         let bytes = self.bytes.clone().ok_or_else(|| {
-            ReadError::Io(std::io::Error::other(
+            ReadError::Io(io::Error::other(
                 "id_lookup requires an eager-opened superfile; this reader was opened via \
                  the lazy path and does not hold the full superfile bytes",
             ))
@@ -880,9 +884,6 @@ impl SuperfileReader {
     /// for single-word and multi-word strings alike — the token count
     /// only affects pruning, never the raw-string comparison.
     pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
-        use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-        use arrow_array::Array as _;
-
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches).
         let tokens: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
@@ -902,9 +903,9 @@ impl SuperfileReader {
         let col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<arrow_array::LargeStringArray>()
+            .downcast_ref::<LargeStringArray>()
             .ok_or_else(|| {
-                ReadError::Io(std::io::Error::other(format!(
+                ReadError::Io(io::Error::other(format!(
                     "exact_match: column '{column}' is not LargeUtf8"
                 )))
             })?;
@@ -975,7 +976,7 @@ impl SuperfileReader {
         // is a typed pass-through, not a re-validation cost.
         let term_strings: Vec<&str> = term_bytes
             .iter()
-            .filter_map(|b| std::str::from_utf8(b).ok())
+            .filter_map(|b| str::from_utf8(b).ok())
             .collect();
         Ok(fts.search(column, &term_strings, k, BoolMode::Or).await?)
     }
@@ -1070,7 +1071,7 @@ impl SuperfileReader {
         }
         let term_strings: Vec<&str> = term_bytes
             .iter()
-            .filter_map(|b| std::str::from_utf8(b).ok())
+            .filter_map(|b| str::from_utf8(b).ok())
             .collect();
         Ok(fts
             .search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)
@@ -1325,12 +1326,19 @@ pub(crate) fn rank_back_indices(ids: &[u32], sorted: &[u32]) -> UInt32Array {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-    use crate::superfile::vector::distance::normalize;
-    use crate::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
-    use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
+    use std::collections::HashSet;
+
+    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
+
+    use super::*;
+    use crate::{
+        superfile::{
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            vector::distance::normalize,
+        },
+        test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+    };
 
     fn schema_with_text() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1532,7 +1540,7 @@ mod tests {
             .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
-        let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&2));
     }
@@ -1567,8 +1575,9 @@ mod tests {
     fn open_rejects_parquet_without_inf_format_kv() {
         // Hand-build a Parquet file with no inf.* keys; it should fail
         // with MissingKv (inf.format).
-        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
         use parquet::basic::Compression;
+
+        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
         let schema = schema_with_text();
         let ids = decimal128_ids(vec![1u64]);
         let title = LargeStringArray::from(vec!["x"]);
@@ -1735,7 +1744,7 @@ mod tests {
             .await
             .expect("BM25 multi-column search");
         // Both doc 0 (title:rust) and doc 1 (body:rust) hit.
-        let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&1));
     }
@@ -1795,7 +1804,6 @@ mod tests {
 
     #[test]
     fn get_record_batch_honors_tombstones() {
-        use roaring::RoaringBitmap;
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let mut deleted = RoaringBitmap::new();
@@ -1816,7 +1824,7 @@ mod tests {
             .bm25_search_pretokenized("title", &["rust"], 5, BoolMode::Or)
             .await
             .expect("pretokenized search");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
     }
@@ -1897,7 +1905,7 @@ mod tests {
             .bm25_search_prefix("title", "ru", 5)
             .await
             .expect("prefix search");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
         // No indexed term begins with "zz".
@@ -1925,7 +1933,7 @@ mod tests {
             .bm25_search_or_range_pretokenized("title", &["rust", "embedded"], 10, 0, 2)
             .await
             .expect("ranged search");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
     }
@@ -1957,7 +1965,7 @@ mod tests {
             .bm25_search_prefix_range("title", "ru", 10, 0, 2)
             .await
             .expect("prefix range");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
         // Degenerate range / k short-circuits.
@@ -1989,7 +1997,7 @@ mod tests {
             .vector_search_clusters("emb", &q, 4, &[0, 1, 2, 3], VectorSearchOptions::default())
             .await
             .expect("cluster search");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&2));
     }
 
@@ -2009,8 +2017,7 @@ mod tests {
         // Wrap the whole superfile in a lazy source so the lazy open path
         // runs; eager-only methods must then report LazyReaderUnsupported.
         let bytes = build_simple_fts_only_superfile();
-        let src: Arc<dyn crate::superfile::LazyByteSource> =
-            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes));
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
         let r = SuperfileReader::open_lazy(src).await.expect("open_lazy");
         assert_eq!(r.n_docs(), 4);
         // parquet_bytes is None on the lazy path.
@@ -2081,8 +2088,9 @@ mod tests {
     /// branches. No FTS/vector blobs are spliced — every key under test
     /// is hand-supplied through `extra_kv`.
     fn superfile_with_kv(extra_kv: &[(String, String)]) -> Bytes {
-        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
         use parquet::basic::Compression;
+
+        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
         /// One row group; the body is tiny, so a single group is enough.
         const ROW_GROUP_SIZE: usize = 1024;
         let schema = schema_with_text();
@@ -2154,9 +2162,8 @@ mod tests {
     async fn open_lazy_rejects_malformed_kvs() {
         // Same crafted-KV bytes, wrapped in a lazy source, must exercise
         // the lazy open path's mirror validation branches.
-        let lazy = |bytes: Bytes| -> Arc<dyn crate::superfile::LazyByteSource> {
-            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes))
-        };
+        let lazy =
+            |bytes: Bytes| -> Arc<dyn LazyByteSource> { Arc::new(BytesLazyByteSource::new(bytes)) };
 
         // Missing a required key (drop inf.n_docs) → MissingKv.
         let mut kvs = required_kv();
@@ -2204,8 +2211,7 @@ mod tests {
         // id_lookup needs resident bytes; a lazy-opened reader must
         // surface an Io error rather than silently scanning nothing.
         let bytes = build_simple_fts_only_superfile();
-        let src: Arc<dyn crate::superfile::LazyByteSource> =
-            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes));
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
         let r = SuperfileReader::open_lazy(src).await.expect("open_lazy");
         let err = r.id_lookup(10).expect_err("lazy id_lookup rejected");
         assert!(matches!(err, ReadError::Io(_)));

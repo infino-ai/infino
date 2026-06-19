@@ -26,20 +26,16 @@
 //!
 //! [`SuperfileReader::byte_source`]: crate::superfile::SuperfileReader::byte_source
 
-use std::collections::HashMap;
-use std::fmt;
-use std::ops::Range;
-use std::sync::Arc;
+use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, BoxStream, StreamExt};
-
-use object_store::path::Path as ObjPath;
 use object_store::{
     Attributes, CopyOptions, Error as OsError, GetOptions, GetRange, GetResult, GetResultPayload,
     ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as OsResult,
+    PutPayload, PutResult, Result as OsResult, path::Path as ObjPath,
 };
 
 use crate::superfile::LazyByteSource;
@@ -49,7 +45,7 @@ use crate::superfile::LazyByteSource;
 /// carries no signal here — and a value that changed on every call
 /// would defeat any downstream cache keyed on `(path, last_modified)`
 /// and make responses non-deterministic.
-const SUPERFILE_LAST_MODIFIED: chrono::DateTime<chrono::Utc> = chrono::DateTime::UNIX_EPOCH;
+const SUPERFILE_LAST_MODIFIED: DateTime<Utc> = DateTime::UNIX_EPOCH;
 
 /// Read-only [`ObjectStore`] backed by per-superfile [`LazyByteSource`]s.
 ///
@@ -205,9 +201,10 @@ impl ObjectStore for SuperfileObjectStore {
 
 #[cfg(test)]
 mod tests {
+    use object_store::ObjectStoreExt;
+
     use super::*;
     use crate::superfile::BytesLazyByteSource;
-    use object_store::ObjectStoreExt;
 
     fn store_with(path: &str, body: &'static [u8]) -> (SuperfileObjectStore, ObjPath) {
         let p = ObjPath::from(path);
@@ -310,7 +307,7 @@ mod tests {
             .await
             .expect("head get_opts");
         assert_eq!(res.meta.size, 10);
-        assert_eq!(res.meta.last_modified, super::SUPERFILE_LAST_MODIFIED);
+        assert_eq!(res.meta.last_modified, SUPERFILE_LAST_MODIFIED);
         assert_eq!(res.range, 0..0);
         let bytes = res.bytes().await.expect("bytes");
         assert!(bytes.is_empty(), "HEAD payload carries no bytes");

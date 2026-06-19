@@ -21,8 +21,7 @@
 //! bytes. `DictReader` opens those bytes (zero-copy via `Bytes`) and
 //! exposes exact lookup + prefix iteration.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::{collections::BTreeMap, io::Write};
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 

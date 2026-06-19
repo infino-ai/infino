@@ -31,6 +31,9 @@
 //! domain.
 
 #[cfg(target_arch = "x86_64")]
+use std::ptr::write_unaligned;
+
+#[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
 /// Maximum Sq8 code value. Sq8 quantizes each component to a single
@@ -385,7 +388,7 @@ unsafe fn sq8_encode_row_avx2(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &
             let packed_u8 = _mm_packus_epi16(packed_u16, packed_u16); // low 8 bytes valid
             // Store the low 64 bits (8 bytes). Unaligned.
             let dst_ptr = dst.as_mut_ptr().add(i) as *mut i64;
-            std::ptr::write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
+            write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
             i += F32X8_LANES;
         }
     }
@@ -488,13 +491,15 @@ unsafe fn sq8_encode_row_avx2_unsafe_tail8(
         let packed_u16 = _mm_packus_epi32(lo, hi);
         let packed_u8 = _mm_packus_epi16(packed_u16, packed_u16);
         let dst_ptr = dst.as_mut_ptr().add(*i) as *mut i64;
-        std::ptr::write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
+        write_unaligned(dst_ptr, _mm_cvtsi128_si64(packed_u8));
         *i += F32X8_LANES;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+
     use super::*;
 
     /// Deterministic synthetic Sq8 encode inputs spanning a
@@ -672,14 +677,14 @@ mod tests {
             let t0 = Instant::now();
             for _ in 0..iters {
                 sq8_encode_row_reference(&row, &consts.inv_scale, &consts.c2, &mut dst);
-                std::hint::black_box(&dst);
+                black_box(&dst);
             }
             let scalar_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
 
             let t0 = Instant::now();
             for _ in 0..iters {
                 sq8_encode_row_wide(&row, &consts.inv_scale, &consts.c2, &mut dst);
-                std::hint::black_box(&dst);
+                black_box(&dst);
             }
             let wide_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
 
@@ -691,7 +696,7 @@ mod tests {
                         unsafe {
                             sq8_encode_row_avx2(&row, &consts.inv_scale, &consts.c2, &mut dst);
                         }
-                        std::hint::black_box(&dst);
+                        black_box(&dst);
                     }
                     Some(t0.elapsed().as_nanos() as f64 / iters as f64)
                 } else {
@@ -707,7 +712,7 @@ mod tests {
                     unsafe {
                         sq8_encode_row_avx512(&row, &consts.inv_scale, &consts.c2, &mut dst);
                     }
-                    std::hint::black_box(&dst);
+                    black_box(&dst);
                 }
                 Some(t0.elapsed().as_nanos() as f64 / iters as f64)
             } else {

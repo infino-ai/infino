@@ -11,31 +11,42 @@
 //! Self-contained: owns its `Bytes`. Per-column metadata is parsed
 //! eagerly at `open()`; per-query work happens on demand.
 
-use crate::superfile::format::checksum::crc32c;
-use crate::superfile::format::{self};
-pub(crate) use crate::superfile::lazy_source::Source;
-use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource};
-use crate::superfile::vector::distance::{
-    Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, distance_bytes,
-    distance_bytes_codec,
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+    ops::Range,
+    sync::{Arc, OnceLock},
+    thread,
 };
-use crate::superfile::vector::quant::BitQuantizer;
-use crate::superfile::vector::rerank_codec::RerankCodec;
-use crate::superfile::vector::rotation::RandomRotation;
-use crate::superfile::{ReadError, error::VectorError};
+
 use bytes::Bytes;
 use rayon::prelude::*;
-use serde::Deserialize;
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::ops::Range;
-use std::sync::{Arc, OnceLock};
-
 use roaring::RoaringBitmap;
+use serde::Deserialize;
+use tokio::sync::oneshot;
 
-use crate::superfile::format::vec::{
-    CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
-    dir_entry, outer_hdr, sub_hdr,
+pub(crate) use crate::superfile::lazy_source::Source;
+use crate::superfile::{
+    ReadError,
+    error::VectorError,
+    format::{
+        checksum::crc32c,
+        vec::{
+            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
+            dir_entry, outer_hdr, sub_hdr,
+        },
+        {self},
+    },
+    lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
+    vector::{
+        distance::{
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, distance_bytes,
+            distance_bytes_codec,
+        },
+        quant::BitQuantizer,
+        rerank_codec::RerankCodec,
+        rotation::RandomRotation,
+    },
 };
 
 const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
@@ -1872,7 +1883,7 @@ async fn build_shortlist(
         // Move an `Arc` clone of the allow-set into the rayon task; each
         // chunk borrows it as `Option<&RoaringBitmap>` via `as_deref`.
         let allow_owned = ctx.allow.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
             let acc = meta_owned
                 .par_chunks(chunk)
@@ -2078,7 +2089,7 @@ const PARALLEL_SCAN_MIN: usize = 2048;
 /// logical parallelism, capped by the item count so we never make more
 /// chunks than there is work.
 fn parallel_chunks(n_items: usize) -> usize {
-    std::thread::available_parallelism()
+    thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1)
         .min(n_items)
@@ -2099,7 +2110,7 @@ where
     if parallel_chunks(items.len()) <= 1 {
         return items.iter().map(&f).collect();
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = oneshot::channel();
     rayon::spawn(move || {
         let out: Vec<R> = items.par_iter().map(f).collect();
         let _ = tx.send(out);
@@ -2313,7 +2324,7 @@ async fn rerank_candidates_from_blocks(
     col: &ColumnReader,
     query: &[f32],
     k: usize,
-) -> Result<Vec<(u32, f32)>, crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<Vec<(u32, f32)>, LazyByteSourceError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
@@ -2835,7 +2846,7 @@ fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
     extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
     let Some(extra) = extra else {
         return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
     };
@@ -2854,7 +2865,7 @@ async fn get_cluster_ranges_coalesced_with_extra_async(
     source: &Source,
     ranges: &[Range<usize>],
     extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
     let Some(extra) = extra else {
         return Ok((
             get_cluster_ranges_coalesced_async(source, ranges).await?,
@@ -2872,7 +2883,7 @@ async fn get_cluster_ranges_coalesced_with_extra_async(
 fn get_cluster_ranges_coalesced(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
@@ -2888,7 +2899,7 @@ fn get_cluster_ranges_coalesced(
 async fn get_cluster_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
@@ -2922,6 +2933,19 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        fs::File,
+        hint::black_box,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    use memmap2::Mmap;
+    use memory_stats::memory_stats;
+    use tempfile::NamedTempFile;
+    use tokio::time::sleep;
+
     use super::*;
     use crate::superfile::vector::builder::{VectorBuilder, VectorConfig};
 
@@ -4135,8 +4159,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "recall diagnostic; ~10s; --ignored --nocapture"]
     async fn sq8_recall_diagnostic_planted_cluster_cosine() {
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
+        use rand::{SeedableRng, rngs::StdRng};
         use rand_distr::{Distribution, StandardNormal};
 
         let n_docs = 16_000u32;
@@ -4266,7 +4289,7 @@ mod tests {
         let k = 10usize;
         let nprobe = n_cent_ivf / 4;
         let rerank_mult = 50usize; // Sq8 rerank floor at dim ≤ 384
-        let ground_truth: Vec<std::collections::HashSet<u32>> = (0..n_queries)
+        let ground_truth: Vec<HashSet<u32>> = (0..n_queries)
             .map(|qi| {
                 let q = &all[qi];
                 let mut sims: Vec<(u32, f32)> = (0..all.len())
@@ -4275,9 +4298,7 @@ mod tests {
                         (j as u32, d)
                     })
                     .collect();
-                sims.sort_unstable_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sims.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
                 sims.into_iter().take(k).map(|(id, _)| id).collect()
             })
             .collect();
@@ -4293,8 +4314,7 @@ mod tests {
                     .search("v", &all[qi], k, nprobe, rerank_mult)
                     .await
                     .expect("search");
-                let hit_ids: std::collections::HashSet<u32> =
-                    hits.into_iter().map(|(id, _)| id).collect();
+                let hit_ids: HashSet<u32> = hits.into_iter().map(|(id, _)| id).collect();
                 let gt = &ground_truth[qi];
                 total_match += gt.iter().filter(|id| hit_ids.contains(id)).count();
             }
@@ -4318,8 +4338,7 @@ mod tests {
                     .search("v", &all[qi], k, nprobe, rm)
                     .await
                     .expect("search");
-                let hit_ids: std::collections::HashSet<u32> =
-                    hits.into_iter().map(|(id, _)| id).collect();
+                let hit_ids: HashSet<u32> = hits.into_iter().map(|(id, _)| id).collect();
                 tm += ground_truth[qi]
                     .iter()
                     .filter(|id| hit_ids.contains(id))
@@ -4339,13 +4358,13 @@ mod tests {
             let mut sims: Vec<f32> = (0..all.len())
                 .map(|j| (0..dim).map(|i| q[i] * all[j][i]).sum::<f32>())
                 .collect();
-            sims.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            sims.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
             let top11: Vec<f32> = sims.iter().take(11).cloned().collect();
             // Spread between top-1 (self, sim=1) and top-10
             let span = top11[0] - top11[10];
             // Median consecutive gap among top-10
             let mut gaps: Vec<f32> = (1..11).map(|i| top11[i - 1] - top11[i]).collect();
-            gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             let med_gap = gaps[gaps.len() / 2];
             spreads.push((span, med_gap));
         }
@@ -4430,9 +4449,12 @@ mod tests {
     // disabled) — exposes any silent fallthrough that would
     // bypass the block_on bridge.
 
+    use std::sync::{
+        Arc as StdArc,
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    };
+
     use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
-    use std::sync::Arc as StdArc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
     /// Test-only [`LazyByteSource`] that wraps a `Bytes` payload and
     /// records every async / sync range request as a counter. The
@@ -4503,7 +4525,7 @@ mod tests {
         /// `bytes.slice(...)` body of `range()` resolves
         /// instantaneously and in-flight peaks at 1 even when
         /// many futures were spawned together).
-        fn set_async_latency(&self, latency: std::time::Duration) {
+        fn set_async_latency(&self, latency: Duration) {
             self.async_latency_us
                 .store(latency.as_micros() as u64, AtomicOrdering::Relaxed);
         }
@@ -4555,7 +4577,7 @@ mod tests {
             );
             let latency_us = self.async_latency_us.load(AtomicOrdering::Relaxed);
             if latency_us > 0 {
-                tokio::time::sleep(std::time::Duration::from_micros(latency_us)).await;
+                sleep(Duration::from_micros(latency_us)).await;
             }
             let total = self.bytes.len() as u64;
             if start.saturating_add(len) > total {
@@ -4806,7 +4828,7 @@ mod tests {
     /// (which is private to that module). Sharing the mapping
     /// via `Arc<Mmap>` keeps it alive for the reader's lifetime
     /// while also letting the test anchor the mmap explicitly.
-    struct MmapOwner(StdArc<memmap2::Mmap>);
+    struct MmapOwner(StdArc<Mmap>);
 
     impl AsRef<[u8]> for MmapOwner {
         fn as_ref(&self) -> &[u8] {
@@ -4826,12 +4848,7 @@ mod tests {
     /// folded through a linear congruential step per dim slot.
     /// Same shape the bench corpus generators use, inlined so
     /// the unit test doesn't reach into the bench harness.
-    fn build_corpus_to_file(
-        path: &std::path::Path,
-        n_docs: u32,
-        dim: usize,
-        n_cent: usize,
-    ) -> String {
+    fn build_corpus_to_file(path: &Path, n_docs: u32, dim: usize, n_cent: usize) -> String {
         use std::io::BufWriter;
 
         let mut b = VectorBuilder::new();
@@ -4853,7 +4870,7 @@ mod tests {
             }
             b.add(0, &v).expect("add to vector builder");
         }
-        let file = std::fs::File::create(path).expect("create tempfile");
+        let file = File::create(path).expect("create tempfile");
         let writer = BufWriter::new(file);
         b.finish_to(writer).expect("finish_to BufWriter<File>");
 
@@ -4876,16 +4893,14 @@ mod tests {
     /// open path only touches a handful of pages (outer
     /// header, directory, per-subsection header) and leaves
     /// the rest of the file unmapped.
-    fn measure_lazy_open_rss_delta(corpus_path: &std::path::Path, json: &str) -> (usize, usize) {
-        let file = std::fs::File::open(corpus_path).expect("reopen corpus readonly");
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+    fn measure_lazy_open_rss_delta(corpus_path: &Path, json: &str) -> (usize, usize) {
+        let file = File::open(corpus_path).expect("reopen corpus readonly");
+        let mmap = unsafe { Mmap::map(&file) }.expect("mmap corpus");
         let mmap_arc = StdArc::new(mmap);
         let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
         let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
 
-        let before = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let before = memory_stats().expect("memory_stats supported").physical_mem;
 
         let reader = VectorReader::open_with_source(
             Source::Lazy(lazy),
@@ -4894,9 +4909,7 @@ mod tests {
         )
         .expect("lazy open");
 
-        let after = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let after = memory_stats().expect("memory_stats supported").physical_mem;
 
         let n_cols = reader.columns.len();
         let delta = after.saturating_sub(before);
@@ -4904,7 +4917,7 @@ mod tests {
         // Keep both alive past the RSS reads — dropping
         // `reader` before reading `after` would silently
         // make the delta look smaller than reality.
-        std::hint::black_box((&reader, &mmap_arc));
+        black_box((&reader, &mmap_arc));
         drop(reader);
         drop(mmap_arc);
 
@@ -4934,7 +4947,7 @@ mod tests {
         const DIM: usize = 384;
         const N_CENT: usize = 1024;
 
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = NamedTempFile::new().expect("tempfile");
         let json = build_corpus_to_file(tmp.path(), N_DOCS, DIM, N_CENT);
 
         let (delta_bytes, n_cols) = measure_lazy_open_rss_delta(tmp.path(), &json);
@@ -4977,7 +4990,7 @@ mod tests {
         const DIM: usize = 64;
         const N_CENT: usize = 64;
 
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = NamedTempFile::new().expect("tempfile");
         let json = build_corpus_to_file(tmp.path(), N_DOCS, DIM, N_CENT);
 
         let (delta_bytes, n_cols) = measure_lazy_open_rss_delta(tmp.path(), &json);
@@ -5047,7 +5060,7 @@ mod tests {
     /// the total RSS delta attributable to those opens. Anchors
     /// `(readers, mmaps)` past the after-RSS read.
     fn measure_lazy_multi_superfile_open_rss_delta(
-        corpus_paths: &[std::path::PathBuf],
+        corpus_paths: &[PathBuf],
         jsons: &[String],
     ) -> (usize, usize, usize) {
         assert_eq!(corpus_paths.len(), jsons.len(), "paths/jsons must align");
@@ -5056,20 +5069,18 @@ mod tests {
         // Pre-build (mmap, lazy source) pairs *before* the `before`
         // snapshot so the syscalls don't contaminate the delta — we
         // only want the open path's allocations in the measurement.
-        let mut lazies: Vec<(StdArc<memmap2::Mmap>, StdArc<dyn LazyByteSource>)> =
+        let mut lazies: Vec<(StdArc<Mmap>, StdArc<dyn LazyByteSource>)> =
             Vec::with_capacity(n_superfiles);
         for path in corpus_paths {
-            let file = std::fs::File::open(path).expect("reopen corpus readonly");
-            let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+            let file = File::open(path).expect("reopen corpus readonly");
+            let mmap = unsafe { Mmap::map(&file) }.expect("mmap corpus");
             let mmap_arc = StdArc::new(mmap);
             let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
             let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
             lazies.push((mmap_arc, lazy));
         }
 
-        let before = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let before = memory_stats().expect("memory_stats supported").physical_mem;
 
         let mut readers: Vec<VectorReader> = Vec::with_capacity(n_superfiles);
         let mut n_cols_total = 0usize;
@@ -5084,16 +5095,14 @@ mod tests {
             readers.push(reader);
         }
 
-        let after = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let after = memory_stats().expect("memory_stats supported").physical_mem;
 
         let delta = after.saturating_sub(before);
 
         // Keep both alive past the RSS reads — dropping any reader
         // (or mmap) before reading `after` would silently shrink the
         // measured delta.
-        std::hint::black_box((&readers, &lazies));
+        black_box((&readers, &lazies));
         drop(readers);
         drop(lazies);
 
@@ -5122,11 +5131,11 @@ mod tests {
         const DIM: usize = 64;
         const N_CENT: usize = 64;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut tmps: Vec<NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(N_SUPERFILES);
         let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
         for _ in 0..N_SUPERFILES {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = NamedTempFile::new().expect("tempfile");
             let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT);
             paths.push(tmp.path().to_path_buf());
             jsons.push(json);
@@ -5193,11 +5202,11 @@ mod tests {
         const DIM: usize = 384;
         const N_CENT_PER_SEG: usize = 256;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut tmps: Vec<NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(N_SUPERFILES);
         let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
         for i in 0..N_SUPERFILES {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = NamedTempFile::new().expect("tempfile");
             eprintln!(
                 "  building superfile {i:2}/{N_SUPERFILES} \
                  ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
@@ -5278,11 +5287,11 @@ mod tests {
         const DIM: usize = 128;
         const N_CENT_PER_SEG: usize = 128;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut tmps: Vec<NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(N_SUPERFILES);
         let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
         for i in 0..N_SUPERFILES {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = NamedTempFile::new().expect("tempfile");
             if i % 10 == 0 {
                 eprintln!(
                     "  building superfile {i:3}/{N_SUPERFILES} \
@@ -5545,7 +5554,7 @@ mod tests {
         let async_counter = counting.async_counter();
         let max_in_flight = counting.max_in_flight_counter();
         counting.disable_sync();
-        counting.set_async_latency(std::time::Duration::from_millis(5));
+        counting.set_async_latency(Duration::from_millis(5));
 
         let r_lazy = VectorReader::open_lazy(
             StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
@@ -6245,10 +6254,8 @@ mod tests {
                 !hits_lazy.is_empty(),
                 "lazy cold Sq8 arm returns hits (query {q})"
             );
-            let eager_ids: std::collections::HashSet<u32> =
-                hits_eager.iter().map(|(id, _)| *id).collect();
-            let lazy_ids: std::collections::HashSet<u32> =
-                hits_lazy.iter().map(|(id, _)| *id).collect();
+            let eager_ids: HashSet<u32> = hits_eager.iter().map(|(id, _)| *id).collect();
+            let lazy_ids: HashSet<u32> = hits_lazy.iter().map(|(id, _)| *id).collect();
             assert!(
                 eager_ids.intersection(&lazy_ids).count() >= 1,
                 "lazy cold Sq8 result set must overlap the eager top-5 (query {q})"
@@ -6318,10 +6325,8 @@ mod tests {
         // ordering: the deferred-meta arm returns its refined candidate set
         // through a distinct code path.
         assert!(!hits_lazy.is_empty(), "lazy async arm returns hits");
-        let eager_ids: std::collections::HashSet<u32> =
-            hits_eager.iter().map(|(id, _)| *id).collect();
-        let lazy_ids: std::collections::HashSet<u32> =
-            hits_lazy.iter().map(|(id, _)| *id).collect();
+        let eager_ids: HashSet<u32> = hits_eager.iter().map(|(id, _)| *id).collect();
+        let lazy_ids: HashSet<u32> = hits_lazy.iter().map(|(id, _)| *id).collect();
         assert!(
             eager_ids.intersection(&lazy_ids).count() >= 1,
             "lazy cold Sq8 search_async result set must overlap the eager top-5"
@@ -6605,7 +6610,7 @@ mod tests {
     /// never exceeds the item count.
     #[test]
     fn parallel_chunks_clamped_to_item_count_and_parallelism() {
-        let par = std::thread::available_parallelism()
+        let par = thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1);
         assert_eq!(parallel_chunks(0), 1, "never returns zero chunks");

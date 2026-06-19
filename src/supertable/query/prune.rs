@@ -30,17 +30,20 @@ use std::sync::Arc;
 
 use datafusion::scalar::ScalarValue;
 
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::error::QueryError;
-use crate::supertable::manifest::list::ManifestList;
-use crate::supertable::manifest::list_prune::{
-    prune_parts_for_fts_prefix, prune_parts_for_fts_terms,
-};
-use crate::supertable::manifest::part::PartId;
-use crate::supertable::manifest::{Manifest, SuperfileEntry};
-
 use super::skip::{
     ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match,
+};
+use crate::{
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        error::QueryError,
+        manifest::{
+            Manifest, SuperfileEntry,
+            list::ManifestList,
+            list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
+            part::PartId,
+        },
+    },
 };
 
 /// One conjunct of a prune predicate: a per-column test backed by a
@@ -193,22 +196,27 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::superfile::builder::FtsConfig;
-    use crate::supertable::SupertableOptions;
-    use crate::supertable::manifest::aggregates;
-    use crate::supertable::manifest::list::{
-        FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
-    };
-    use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{
-        FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, bloom::BloomBuilder,
-    };
-    use crate::supertable::query::skip::ScalarOp;
+    use std::{collections::HashMap, slice::from_ref};
+
     use arrow_array::{Int64Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use std::collections::HashMap;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        superfile::builder::FtsConfig,
+        supertable::{
+            SupertableOptions,
+            manifest::{
+                FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, aggregates,
+                bloom::BloomBuilder,
+                list::{FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy},
+                part::{ContentHash, PartId},
+            },
+            query::skip::ScalarOp,
+        },
+        test_helpers::default_tokenizer,
+    };
 
     fn seg_int(col: &str, min: i64, max: i64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
@@ -319,7 +327,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let tk = crate::test_helpers::default_tokenizer();
+        let tk = default_tokenizer();
         Arc::new(
             SupertableOptions::new(
                 schema,
@@ -409,7 +417,7 @@ mod tests {
 
         // DataFusion-equivalent: scalar min/max only. "mango" is within
         // both superfiles' lexicographic ranges, so neither is pruned.
-        let scalar_only = select_superfiles(&manifest, std::slice::from_ref(&scalar_leaf))
+        let scalar_only = select_superfiles(&manifest, from_ref(&scalar_leaf))
             .await
             .expect("select");
         assert_eq!(

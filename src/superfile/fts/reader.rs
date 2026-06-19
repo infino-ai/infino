@@ -15,26 +15,37 @@
 //! constructed per call (cheap; the FST validates its header in O(1) and
 //! then it's a borrowed view).
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::ops::Range;
-use std::sync::Arc;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+    ops::Range,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::superfile::format::checksum::crc32c;
-use crate::superfile::format::fts::{
-    HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry, term_meta,
+use crate::superfile::{
+    ReadError,
+    error::FtsError,
+    format::{
+        self, FST_SEPARATOR,
+        checksum::crc32c,
+        fts::{
+            HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry,
+            term_meta,
+        },
+    },
+    fts::{
+        bm25,
+        builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE},
+        dict::{DictReader, make_key},
+        fst_value::FstValue,
+        posting::{BLOCK_LEN, decode_block},
+        tokenize::{AsciiLowerTokenizer, Tokenizer as _},
+    },
+    lazy_source::{LazyByteSource, PrefetchedSource, Source},
 };
-use crate::superfile::format::{self, FST_SEPARATOR};
-use crate::superfile::fts::builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE};
-use crate::superfile::fts::dict::{DictReader, make_key};
-use crate::superfile::fts::fst_value::FstValue;
-use crate::superfile::fts::posting::{BLOCK_LEN, decode_block};
-use crate::superfile::fts::tokenize::Tokenizer as _;
-use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource, Source};
-use crate::superfile::{ReadError, error::FtsError};
 
 /// Boolean-mode for multi-term queries.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -454,9 +465,8 @@ impl FtsReader {
                 let inv_avgdl = 1.0_f32 / avgdl;
                 for d in 0..(n_docs as usize) {
                     let dl = read_u32_le(&array_region[d * 4..d * 4 + 4]) as f32;
-                    let norm = 1.0 - crate::superfile::fts::bm25::B
-                        + crate::superfile::fts::bm25::B * dl * inv_avgdl;
-                    dl_norm_k1.push(crate::superfile::fts::bm25::K1 * norm);
+                    let norm = 1.0 - bm25::B + bm25::B * dl * inv_avgdl;
+                    dl_norm_k1.push(bm25::K1 * norm);
                 }
             }
             columns.push(ColumnMeta {
@@ -947,7 +957,7 @@ impl FtsReader {
         // One tokenizer for all columns; per-column tokenizers would
         // require splitting this call to use the column's configured
         // tokenizer.
-        let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+        let tok = AsciiLowerTokenizer;
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
 
@@ -1001,8 +1011,8 @@ impl FtsReader {
                 // skip-table, no PFOR decode. The single doc's score
                 // is the entire result for any k ≥ 1 (unless it sits
                 // strictly below the caller's floor).
-                let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, 1);
-                let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
+                let idf_t = bm25::idf(self.n_docs as u64, 1);
+                let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
@@ -1010,8 +1020,7 @@ impl FtsReader {
                     return Ok(Vec::new());
                 }
                 let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
-                let score =
-                    crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok(Vec::new());
                 }
@@ -1037,8 +1046,8 @@ impl FtsReader {
 
         let term_meta = TermMeta::parse(postings, metadata_offset)?;
 
-        let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, term_meta.df);
-        let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
+        let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
+        let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
@@ -1083,11 +1092,8 @@ impl FtsReader {
                     continue;
                 }
                 let tf = buf_t[j];
-                let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                    idf_x_k1p1,
-                    tf,
-                    dl_norm_k1[doc_id as usize],
-                );
+                let score =
+                    bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1[doc_id as usize]);
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
                 // (the BMW skip bar) honest.
@@ -1352,7 +1358,7 @@ impl FtsReader {
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
                     if packed == 4 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                         idfs = [0.0; 4];
                         tfs = [0.0; 4];
                         packed = 0;
@@ -1360,7 +1366,7 @@ impl FtsReader {
                 }
             }
             if packed > 0 {
-                score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                score += bm25::score_simd_x4(idfs, tfs, norm);
             }
 
             // Update heap.
@@ -1657,17 +1663,11 @@ impl FtsReader {
                 if all_match {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1[a as usize];
-                        let mut score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                            c0.idf_x_k1p1,
-                            c0.block_tfs[i],
-                            norm,
-                        );
+                        let mut score =
+                            bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.block_tfs[i], norm);
                         for o in others.iter() {
-                            score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                                o.idf_x_k1p1,
-                                o.block_tfs[o.pos],
-                                norm,
-                            );
+                            score +=
+                                bm25::score_with_dl_norm_k1(o.idf_x_k1p1, o.block_tfs[o.pos], norm);
                         }
                         score
                     } else {
@@ -1784,15 +1784,8 @@ impl FtsReader {
                 } else {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1[a as usize];
-                        crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                            c0_idf,
-                            c0.block_tfs[i],
-                            norm,
-                        ) + crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                            c1_idf,
-                            c1.block_tfs[j],
-                            norm,
-                        )
+                        bm25::score_with_dl_norm_k1(c0_idf, c0.block_tfs[i], norm)
+                            + bm25::score_with_dl_norm_k1(c1_idf, c1.block_tfs[j], norm)
                     } else {
                         0.0
                     };
@@ -1957,7 +1950,7 @@ impl FtsReader {
                         continue;
                     }
                     let norm = dl_norm_k1[candidate as usize];
-                    let essential_score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                    let essential_score = bm25::score_with_dl_norm_k1(
                         cursors[0].idf_x_k1p1,
                         cursors[0].current_tf(),
                         norm,
@@ -1981,8 +1974,7 @@ impl FtsReader {
                             tfs[packed] = cursor.current_tf() as f32;
                             packed += 1;
                             if packed == 4 {
-                                score +=
-                                    crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                                score += bm25::score_simd_x4(idfs, tfs, norm);
                                 idfs = [0.0; 4];
                                 tfs = [0.0; 4];
                                 packed = 0;
@@ -1990,7 +1982,7 @@ impl FtsReader {
                         }
                     }
                     if packed > 0 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                     }
 
                     if heap.len() < k {
@@ -2107,7 +2099,7 @@ impl FtsReader {
                         tfs[packed] = cursor.current_tf() as f32;
                         packed += 1;
                         if packed == 4 {
-                            score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                            score += bm25::score_simd_x4(idfs, tfs, norm);
                             idfs = [0.0; 4];
                             tfs = [0.0; 4];
                             packed = 0;
@@ -2115,7 +2107,7 @@ impl FtsReader {
                     }
                 }
                 if packed > 0 {
-                    score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                    score += bm25::score_simd_x4(idfs, tfs, norm);
                 }
 
                 // Per-doc UB tightening: bound the doc's max possible
@@ -2147,7 +2139,7 @@ impl FtsReader {
                             }
                             cursor.skip_to(candidate);
                             if cursor.current_doc_id() == candidate {
-                                score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                                score += bm25::score_with_dl_norm_k1(
                                     cursor.idf_x_k1p1,
                                     cursor.current_tf(),
                                     norm,
@@ -2294,7 +2286,7 @@ impl FtsReader {
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
                     if packed == 4 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                         idfs = [0.0; 4];
                         tfs = [0.0; 4];
                         packed = 0;
@@ -2303,7 +2295,7 @@ impl FtsReader {
                 }
             }
             if packed > 0 {
-                score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                score += bm25::score_simd_x4(idfs, tfs, norm);
             }
 
             // Top-K update. `threshold` mirrors `heap.peek().0` so
@@ -2930,7 +2922,7 @@ impl TermCursor {
         let metadata_offset = 0usize;
 
         let term_meta = TermMeta::parse(postings, metadata_offset)?;
-        let idf = crate::superfile::fts::bm25::idf(n_docs, term_meta.df);
+        let idf = bm25::idf(n_docs, term_meta.df);
 
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
         let mut term_max_bm25: f32 = 0.0;
@@ -2948,7 +2940,7 @@ impl TermCursor {
         }
 
         let mut cursor = Self {
-            idf_x_k1p1: idf * (crate::superfile::fts::bm25::K1 + 1.0),
+            idf_x_k1p1: idf * (bm25::K1 + 1.0),
             term_max_bm25,
             blocks,
             block_doc_ids: vec![0u32; BLOCK_LEN],
@@ -2973,10 +2965,9 @@ impl TermCursor {
     /// formula collapses to the score itself). Computed at query time
     /// since there's no skip-table entry stored for inline terms.
     fn new_inline(doc_id: u32, tf: u32, n_docs: u64, dl_norm_k1: f32) -> Self {
-        let idf = crate::superfile::fts::bm25::idf(n_docs, 1);
-        let idf_x_k1p1 = idf * (crate::superfile::fts::bm25::K1 + 1.0);
-        let block_max_bm25 =
-            crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+        let idf = bm25::idf(n_docs, 1);
+        let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
+        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
         let blocks = vec![BlockMeta {
             last_doc_id: doc_id,
@@ -3236,10 +3227,10 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, sync::Arc};
+
     use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-    use std::sync::Arc;
+    use crate::superfile::{BytesLazyByteSource, fts::builder::FtsBuilder};
 
     fn build_blob() -> (Bytes, String) {
         // 3 docs, 1 column.
@@ -3596,7 +3587,7 @@ mod tests {
         ) as usize;
         // FST bytes occupy [fst_off, postings_off - 4) (last 4 = FST CRC).
         let fst_bytes = &blob[fst_off..postings_off - 4];
-        let dict = crate::superfile::fts::dict::DictReader::open(fst_bytes).expect("open dict");
+        let dict = DictReader::open(fst_bytes).expect("open dict");
         assert_eq!(header_size, 48);
 
         let val_common = dict.lookup(b"body\x1Fcommon").expect("common in FST");
@@ -4010,7 +4001,7 @@ mod tests {
             .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
             .await
             .expect("multi");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
@@ -4034,7 +4025,7 @@ mod tests {
             .search_or_range_pretokenized("body", &["alpha", "beta"], 100, 2, 5)
             .await
             .expect("ranged search");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(
             ids,
             [2u32, 3, 4].into_iter().collect(),
@@ -4248,8 +4239,7 @@ mod tests {
         // open path (header + FST + doc-length tail prefetch) runs and
         // serves a real query.
         let (blob, json) = build_blob();
-        let src: Arc<dyn LazyByteSource> =
-            Arc::new(crate::superfile::BytesLazyByteSource::new(blob));
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
@@ -4258,7 +4248,7 @@ mod tests {
             .search("body", &["rust"], 10, BoolMode::Or)
             .await
             .expect("search over lazy reader");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
     }
 }

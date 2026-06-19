@@ -26,30 +26,38 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::SystemTime,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::time::SystemTime;
+use infino::{
+    supertable::{
+        CommitError, Manifest, ManifestLoadError,
+        manifest::{
+            commit::{
+                self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, list_uri,
+                part_uri, read_pointer, write_pointer,
+            },
+            list::{
+                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
+                PartitionStrategy,
+            },
+            part::{self as part_mod, ContentHash, ManifestPart, PartId},
+        },
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    },
+    test_helpers::default_supertable_options,
+};
+use tempfile::TempDir;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;
-
-use infino::supertable::manifest::commit::{
-    self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, list_uri, part_uri,
-    read_pointer, write_pointer,
-};
-use infino::supertable::manifest::list::{
-    FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
-};
-use infino::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
-};
-use infino::supertable::{CommitError, Manifest, ManifestLoadError};
-use infino::test_helpers::default_supertable_options;
-use tempfile::TempDir;
 
 /// Manifest id used by the pointer-file round-trip fixture.
 const POINTER_ROUNDTRIP_MANIFEST_ID: u64 = 42;

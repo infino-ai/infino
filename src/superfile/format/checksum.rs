@@ -48,6 +48,8 @@ pub fn crc32c_append(prev: u32, bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::repeat_n;
+
     use super::*;
 
     // Castagnoli reference vectors. These match RFC 3720 / iSCSI test data
@@ -106,9 +108,7 @@ mod tests {
         let buf: Vec<u8> = (0..1024u16).map(|i| i as u8).collect();
         let baseline = crc32c(&buf);
         for shift in 1..16 {
-            let shifted: Vec<u8> = std::iter::repeat_n(0u8, shift)
-                .chain(buf.iter().copied())
-                .collect();
+            let shifted: Vec<u8> = repeat_n(0u8, shift).chain(buf.iter().copied()).collect();
             assert_eq!(crc32c(&shifted[shift..]), baseline);
         }
     }

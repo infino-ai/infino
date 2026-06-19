@@ -39,18 +39,19 @@
 //! `NOT`, non-FTS columns, range ops, and `LIKE` are `Unbounded` (a
 //! word-token index can't soundly bound substring / negation).
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use datafusion::logical_expr::{Expr, Operator};
-use datafusion::scalar::ScalarValue;
+use datafusion::{
+    logical_expr::{Expr, Operator},
+    scalar::ScalarValue,
+};
 use futures::future::BoxFuture;
 use roaring::RoaringBitmap;
 
-use crate::superfile::ReadError;
-use crate::superfile::SuperfileReader;
-use crate::superfile::fts::reader::BoolMode;
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::{
+    ReadError, SuperfileReader,
+    fts::{reader::BoolMode, tokenize::Tokenizer},
+};
 
 /// A superfile-independent boolean plan over FTS term retrievals, lowered
 /// once from a SQL `WHERE` clause and [`evaluate`](CandidatePlan::evaluate)d
@@ -330,10 +331,12 @@ fn collapse(mut flat: Vec<CandidatePlan>, is_and: bool) -> CandidatePlan {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use datafusion::logical_expr::expr::InList;
-    use datafusion::prelude::{col, lit};
+    use datafusion::{
+        logical_expr::expr::InList,
+        prelude::{col, lit},
+    };
 
+    use super::*;
     use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
 
     fn fts_cols() -> HashSet<&'static str> {

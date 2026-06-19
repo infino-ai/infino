@@ -33,8 +33,7 @@
 //! Run via the regular `cargo test`; `cargo metadata` is invoked
 //! as a subprocess.
 
-use std::collections::HashSet;
-use std::process::Command;
+use std::{collections::HashSet, process::Command};
 
 #[derive(serde::Deserialize)]
 struct Metadata {

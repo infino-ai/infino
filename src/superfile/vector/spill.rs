@@ -23,11 +23,14 @@
 //! of the `&mut self` borrow, which is the scope the pass-2
 //! per-chunk loop runs inside.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufWriter, Error, ErrorKind, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use bytemuck::{cast_slice, try_cast_slice};
 use memmap2::Mmap;
 
 use crate::superfile::BuildError;
@@ -91,11 +94,11 @@ impl SpillWriter {
     }
 
     /// Append one vector. Equivalent to
-    /// `write_all(bytemuck::cast_slice(vec))` but spelled out
+    /// `write_all(cast_slice(vec))` but spelled out
     /// so the hot path doesn't have to re-derive the cast on
     /// every call.
     pub fn write_vec(&mut self, vec: &[f32]) -> Result<(), BuildError> {
-        let bytes: &[u8] = bytemuck::cast_slice(vec);
+        let bytes: &[u8] = cast_slice(vec);
         self.write_all(bytes)
     }
 
@@ -281,8 +284,8 @@ impl MmapVectorSource {
             .checked_mul(4)
             .expect("dim * 4 overflows usize — dim > 2^29 is nonsense");
         if !file_len.is_multiple_of(row_bytes) {
-            return Err(BuildError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(BuildError::Io(Error::new(
+                ErrorKind::InvalidData,
                 format!(
                     "spill file length {file_len} is not a multiple of \
                      row size {row_bytes} (dim={dim})"
@@ -331,8 +334,8 @@ impl ChunkedVectorSource for MmapVectorSource {
         // because both invariants are upheld by construction
         // (validated in `open`).
         let bytes: &[u8] = &self.map[start_b..end_b];
-        let floats: &[f32] = bytemuck::try_cast_slice(bytes)
-            .expect("mmap slice is page-aligned and length is row-aligned");
+        let floats: &[f32] =
+            try_cast_slice(bytes).expect("mmap slice is page-aligned and length is row-aligned");
         Some(floats)
     }
 
@@ -344,8 +347,15 @@ impl ChunkedVectorSource for MmapVectorSource {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::write,
+        io::{ErrorKind, Read},
+        iter::from_fn,
+    };
+
+    use tempfile::tempdir;
+
     use super::*;
-    use std::io::Read;
 
     /// Build a deterministic f32 corpus of `n_rows × dim`.
     /// Row `r` column `c` = `r * 1000.0 + c as f32` so any
@@ -363,7 +373,7 @@ mod tests {
 
     #[test]
     fn spill_write_then_mmap_read_round_trip() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("spill.bin");
         let n_rows = 17;
         let dim = 8;
@@ -372,7 +382,7 @@ mod tests {
         // Write the whole thing in one batch via write_all.
         {
             let mut w = SpillWriter::create(path.clone()).expect("create");
-            let bytes: &[u8] = bytemuck::cast_slice(&corpus);
+            let bytes: &[u8] = cast_slice(&corpus);
             w.write_all(bytes).expect("write_all");
             assert_eq!(w.bytes_written(), bytes.len() as u64);
             let finished_path = w.finish().expect("finish");
@@ -384,7 +394,7 @@ mod tests {
             let mut f = File::open(&path).expect("open spill");
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).expect("read");
-            let expected: &[u8] = bytemuck::cast_slice(&corpus);
+            let expected: &[u8] = cast_slice(&corpus);
             assert_eq!(buf, expected, "raw byte round-trip mismatch");
         }
 
@@ -403,7 +413,7 @@ mod tests {
 
     #[test]
     fn spill_write_vec_per_row_matches_write_all() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("spill_per_row.bin");
         let n_rows = 13;
         let dim = 4;
@@ -464,14 +474,14 @@ mod tests {
         let corpus = synth(n_rows, dim);
         let mut src = InMemoryVectorSource::new(Arc::new(corpus.clone()), dim, 3);
 
-        let first_pass: Vec<f32> = std::iter::from_fn(|| src.next_chunk().map(|c| c.to_vec()))
+        let first_pass: Vec<f32> = from_fn(|| src.next_chunk().map(|c| c.to_vec()))
             .flatten()
             .collect();
         assert_eq!(first_pass, corpus);
 
         src.reset();
 
-        let second_pass: Vec<f32> = std::iter::from_fn(|| src.next_chunk().map(|c| c.to_vec()))
+        let second_pass: Vec<f32> = from_fn(|| src.next_chunk().map(|c| c.to_vec()))
             .flatten()
             .collect();
         assert_eq!(second_pass, corpus, "reset didn't replay full corpus");
@@ -479,14 +489,14 @@ mod tests {
 
     #[test]
     fn mmap_source_chunk_boundary_matches_in_memory() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("xcheck.bin");
         let n_rows = 50;
         let dim = 5;
         let corpus = synth(n_rows, dim);
 
         let mut w = SpillWriter::create(path.clone()).expect("create");
-        w.write_all(bytemuck::cast_slice(&corpus)).expect("write");
+        w.write_all(cast_slice(&corpus)).expect("write");
         w.finish().expect("finish");
 
         let chunk_rows = 11;
@@ -506,16 +516,16 @@ mod tests {
 
     #[test]
     fn mmap_source_rejects_misaligned_file_length() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("bad.bin");
         // Construct a file with 17 bytes — not a multiple of
         // (dim=4) * 4 = 16. Bypasses SpillWriter, which would
         // refuse a non-4-aligned write in debug.
-        std::fs::write(&path, [0u8; 17]).expect("write 17 bytes");
+        write(&path, [0u8; 17]).expect("write 17 bytes");
         match MmapVectorSource::open(&path, /*dim=*/ 4, /*chunk_rows=*/ 1) {
             Ok(_) => panic!("expected length-mismatch error, got Ok"),
             Err(BuildError::Io(e)) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData)
+                assert_eq!(e.kind(), ErrorKind::InvalidData)
             }
             Err(other) => panic!("expected Io InvalidData, got {other:?}"),
         }
@@ -530,7 +540,7 @@ mod tests {
         assert_eq!(s.n_rows(), 0);
         assert!(s.next_chunk().is_none());
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("empty.bin");
         let w = SpillWriter::create(path.clone()).expect("create");
         w.finish().expect("finish empty");

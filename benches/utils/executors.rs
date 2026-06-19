@@ -85,17 +85,20 @@ pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
 }
 
 pub mod fts {
-    use super::*;
     use std::collections::HashMap;
 
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
-    use infino::supertable::SupertableReader;
+    use infino::{
+        superfile::{SuperfileReader, fts::reader::BoolMode as InfinoBoolMode},
+        supertable::SupertableReader,
+    };
 
-    use crate::harness::{BoolMode, FtsQuery};
-    use crate::markdown::{fmt_count, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use super::*;
+    use crate::{
+        harness::{BoolMode, FtsQuery},
+        markdown::{fmt_count, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Nanoseconds per second, for time-cell formatting.
     const NS_PER_SEC: f64 = 1e9;
@@ -701,18 +704,20 @@ pub mod fts {
 }
 
 pub mod vector {
+    use std::{collections::HashMap, hint::black_box};
+
+    use infino::{
+        superfile::{SuperfileReader, reader::VectorSearchOptions},
+        supertable::Supertable,
+    };
+
     use super::*;
-    use std::collections::HashMap;
-    use std::hint::black_box;
-
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::reader::VectorSearchOptions;
-    use infino::supertable::Supertable;
-
-    use crate::corpus::{self, Calibrated};
-    use crate::markdown::fmt_time;
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use crate::{
+        corpus::{self, Calibrated},
+        markdown::fmt_time,
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Recall correctness gate (shared by both tiers).
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
@@ -1372,16 +1377,17 @@ pub mod vector {
 }
 
 pub mod sql {
-    use super::*;
-    use std::collections::HashMap;
-    use std::hint::black_box;
+    use std::{collections::HashMap, hint::black_box};
 
     use infino::supertable::Supertable;
 
-    use crate::harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery};
-    use crate::markdown::{fmt_count, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use super::*;
+    use crate::{
+        harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
+        markdown::{fmt_count, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Timed query repetitions per query (after one warmup).
     pub const ITERS: usize = 10;

@@ -21,18 +21,18 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::query::SuperfileHit;
-use infino::supertable::query::vector::VectorSearchOptions;
-use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
-use infino::test_helpers::{default_tokenizer, default_vector_config};
+use infino::{
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    supertable::{
+        SuperfileUri, Supertable, SupertableOptions,
+        query::{SuperfileHit, vector::VectorSearchOptions},
+    },
+    test_helpers::{default_tokenizer, default_vector_config},
+};
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
 const DIM: usize = 16;

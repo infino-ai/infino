@@ -11,28 +11,36 @@
 //!
 //! See `docs/architecture/superfile.md` for the full byte-level spec.
 
-use crate::superfile::BuildError;
-use crate::superfile::format::checksum::{crc32c, crc32c_append};
-use crate::superfile::format::{self, FST_SEPARATOR, RESERVED_PREFIX};
-use crate::superfile::vector::distance::{Metric, l2_sq};
-use crate::superfile::vector::kmeans::{assign_to_centroids, kmeans};
-use crate::superfile::vector::quant::BitQuantizer;
-use crate::superfile::vector::rerank_codec::RerankCodec;
-use crate::superfile::vector::reservoir::{Reservoir, default_kmeans_sample_size};
-use crate::superfile::vector::rotation::RandomRotation;
-use crate::superfile::vector::spill::{
-    ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+use std::{
+    cmp::Ordering,
+    fs::{File, metadata},
+    io::{BufReader, BufWriter, Error as IoError, ErrorKind, Read, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
-use crate::superfile::vector::sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max};
-use rayon::prelude::*;
-use std::cmp::Ordering;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::superfile::format::vec::{
-    CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES, sub_hdr,
+use rayon::prelude::*;
+
+use crate::superfile::{
+    BuildError,
+    format::{
+        self, FST_SEPARATOR, RESERVED_PREFIX,
+        checksum::{crc32c, crc32c_append},
+        vec::{
+            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
+            sub_hdr,
+        },
+    },
+    vector::{
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq},
+        kmeans::{assign_to_centroids, kmeans},
+        quant::BitQuantizer,
+        rerank_codec::RerankCodec,
+        reservoir::{Reservoir, default_kmeans_sample_size},
+        rotation::RandomRotation,
+        spill::{ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter},
+        sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max},
+    },
 };
 
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
@@ -220,10 +228,10 @@ struct ScratchDir {
 
 impl ScratchDir {
     fn in_parent(parent: PathBuf) -> Result<Self, BuildError> {
-        let meta = std::fs::metadata(&parent)?;
+        let meta = metadata(&parent)?;
         if !meta.is_dir() {
-            return Err(BuildError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(BuildError::Io(IoError::new(
+                ErrorKind::InvalidInput,
                 format!("VectorBuilder scratch path is not a directory: {parent:?}"),
             )));
         }
@@ -1152,7 +1160,7 @@ fn encode_sq8_residual_cluster_simd(
     bytes: &mut [u8],
 ) {
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
-    let residual_divisor = crate::superfile::vector::distance::SQ8_RESIDUAL_DIVISOR;
+    let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let row_bytes = dim * 2;
 
     for i in 0..cluster_count {
@@ -1368,6 +1376,8 @@ fn run_pass2(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{read, write};
+
     use super::*;
 
     fn cfg(name: &str, dim: usize) -> VectorConfig {
@@ -1474,8 +1484,9 @@ mod tests {
 
     #[test]
     fn sq8_tiny_shard_writes_physical_n_cent_to_directory() {
-        use crate::superfile::vector::reader::VectorReader;
         use bytes::Bytes;
+
+        use crate::superfile::vector::reader::VectorReader;
 
         let dim = 16;
         let configured_n_cent = 4;
@@ -1595,8 +1606,9 @@ mod tests {
     /// implementation-defined, but the retrieval contract holds).
     #[tokio::test]
     async fn forced_spill_path_matches_in_ram_path_on_self_nn() {
-        use crate::superfile::vector::reader::VectorReader;
         use bytes::Bytes;
+
+        use crate::superfile::vector::reader::VectorReader;
         let dim = 16;
         let n_docs = 50;
         let n_cent = 4;
@@ -1748,9 +1760,11 @@ mod tests {
     /// path and a one-shot `crc32c(&blob)` over the same bytes.
     #[tokio::test]
     async fn finish_to_temp_file_round_trips_through_reader() {
-        use crate::superfile::vector::reader::VectorReader;
-        use bytes::Bytes;
         use std::io::BufWriter;
+
+        use bytes::Bytes;
+
+        use crate::superfile::vector::reader::VectorReader;
         let dim = 16usize;
         let n_docs = 32usize;
         let n_cent = 4usize;
@@ -1773,11 +1787,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("vector_blob.bin");
         {
-            let file = std::fs::File::create(&path).expect("create blob file");
+            let file = File::create(&path).expect("create blob file");
             let writer = BufWriter::new(file);
             b.finish_to(writer).expect("finish_to BufWriter<File>");
         }
-        let blob = std::fs::read(&path).expect("read blob file");
+        let blob = read(&path).expect("read blob file");
         let json = format!(
             r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
         );
@@ -1846,7 +1860,7 @@ mod tests {
         assert_eq!(b.register_column(cfg("a", 16)).expect("register column"), 0);
 
         let file_path = dir.path().join("not-a-dir");
-        std::fs::write(&file_path, b"x").expect("write file");
+        write(&file_path, b"x").expect("write file");
         // `VectorBuilder` is not `Debug`, so match the result rather
         // than calling `expect_err` (which would require `T: Debug`).
         match VectorBuilder::with_scratch(file_path) {

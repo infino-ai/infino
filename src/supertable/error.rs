@@ -17,10 +17,11 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::storage::StorageError;
-use crate::superfile::error::BuildError as SuperfileBuildError;
-use crate::supertable::ManifestLoadError;
-use crate::supertable::manifest::part;
+use crate::{
+    storage::StorageError,
+    superfile::error::BuildError as SuperfileBuildError,
+    supertable::{ManifestLoadError, manifest::part},
+};
 
 /// Errors raised when constructing or operating against a
 /// `SupertableOptions` / `SupertableWriter`.

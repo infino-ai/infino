@@ -24,18 +24,23 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use chrono::Utc;
-use tempfile::TempDir;
-
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::wal::WalStore;
-use infino::supertable::wal::pipeline::run_tombstone_phase;
-use infino::supertable::wal::state_doc::{
-    OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    supertable::{
+        Supertable, SupertableOptions,
+        wal::{
+            WalStore,
+            pipeline::run_tombstone_phase,
+            state_doc::{
+                OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+                WalStateDoc,
+            },
+        },
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use tempfile::TempDir;
 
 /// BM25 top-k for the tombstone-filtered FTS query.
 const BM25_TOP_K: usize = 10;
@@ -205,9 +210,11 @@ async fn sql_query_excludes_tombstoned_row() {
 async fn vector_query_excludes_tombstoned_row() {
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use infino::superfile::fts::tokenize::Tokenizer;
-    use infino::supertable::query::vector::VectorSearchOptions;
-    use infino::test_helpers::{default_tokenizer, default_vector_config};
+    use infino::{
+        superfile::fts::tokenize::Tokenizer,
+        supertable::query::vector::VectorSearchOptions,
+        test_helpers::{default_tokenizer, default_vector_config},
+    };
 
     // The bench-tier default vector config is 16-dim cosine. Stick
     // with the same dim here so the test reuses the well-trodden

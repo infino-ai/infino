@@ -25,16 +25,17 @@
 
 use std::sync::Arc;
 
-use infino::supertable::Supertable;
-use infino::supertable::manifest::commit::read_pointer;
+use infino::supertable::{Supertable, manifest::commit::read_pointer};
 
 /// 1-byte multipart threshold forcing every upload through the
 /// multipart path.
 const PUT_MULTIPART_THRESHOLD_BYTES: u64 = 1;
 /// BM25 top-k for the post-commit query.
 const BM25_TOP_K: usize = 5;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::storage::{LocalFsStorageProvider, StorageProvider},
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
 
 #[test]

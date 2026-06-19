@@ -37,23 +37,26 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-use std::collections::HashMap;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
 #[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
 use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
 use infino::supertable::Supertable;
 use tempfile::TempDir;
 
-use crate::corpus::DIM;
-use crate::cost;
-use crate::ingest::supertable::{self, Modality, modality_label};
-use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-use crate::rss::{self, PeakSampler};
-use crate::storage_meter;
-use crate::tiers;
+use crate::{
+    corpus::DIM,
+    cost,
+    ingest::supertable::{self, Modality, modality_label},
+    markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+    report::{Better, Block, Cell, Report, Section, metric, text},
+    rss::{self, PeakSampler},
+    storage_meter, tiers,
+};
 
 /// Env var the parent sets to make a child build exactly one shape and
 /// print its metrics instead of emitting the report.
@@ -517,8 +520,10 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
 
 pub mod fts {
     use super::*;
-    use crate::executors::fts as exec_fts;
-    use crate::executors::fts::{FTS_BATTERY, FtsRead};
+    use crate::executors::{
+        fts as exec_fts,
+        fts::{FTS_BATTERY, FtsRead},
+    };
 
     /// Build an FTS-only supertable, then measure warm and cold BM25
     /// reads through the shared FTS executor (same code superfile runs).
@@ -811,11 +816,13 @@ pub mod fts {
 }
 
 pub mod vector {
-    use super::*;
-    use crate::corpus;
-    use crate::executors::vector as exec_vec;
-    use crate::executors::vector::VectorRead;
     use infino::roaring::RoaringBitmap;
+
+    use super::*;
+    use crate::{
+        corpus,
+        executors::{vector as exec_vec, vector::VectorRead},
+    };
 
     // Correctness gate, recall targets, calibration grid, and p50 iters
     // live in `crate::executors::vector` (shared by both tiers).
@@ -1223,9 +1230,10 @@ pub mod vector {
 
 pub mod sql {
     use super::*;
-    use crate::executors::sql as exec_sql;
-    use crate::executors::sql::SqlRead;
-    use crate::harness::sample_query_csv;
+    use crate::{
+        executors::{sql as exec_sql, sql::SqlRead},
+        harness::sample_query_csv,
+    };
 
     /// Build a SQL supertable, then measure warm + cold `query_sql` through
     /// the shared SQL executor (same code + same query shapes as superfile).

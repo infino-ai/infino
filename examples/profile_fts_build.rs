@@ -9,10 +9,10 @@
 //! INFINO_FTS_PROFILE=1 cargo run --release --example profile_fts_build
 //! ```
 
-use infino::superfile::fts::builder::FtsBuilder;
-use infino::test_helpers::default_tokenizer;
-use infino_bench_utils::corpus;
 use std::time::Instant;
+
+use infino::{superfile::fts::builder::FtsBuilder, test_helpers::default_tokenizer};
+use infino_bench_utils::corpus;
 
 const N_DOCS: usize = 1_000_000;
 

@@ -85,36 +85,39 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use arrow_array::{
     Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::config::{
-    CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-    SupertableSettings,
+use infino::{
+    config::{
+        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+        SupertableSettings,
+    },
+    superfile::{
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+        fts::reader::BoolMode,
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
+    supertable::{
+        SuperfileUri, Supertable, SupertableOptions,
+        query::VectorSearchOptions,
+        reader_cache::DiskCacheStore,
+        storage::{S3StorageProvider, StorageProvider},
+    },
+    test_helpers::default_tokenizer,
 };
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::supertable::SuperfileUri;
-use infino::supertable::query::VectorSearchOptions;
-use infino::supertable::reader_cache::DiskCacheStore;
-use infino::supertable::storage::{S3StorageProvider, StorageProvider};
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::default_tokenizer;
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
+use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
+use tokio::{net::TcpListener, runtime::Runtime};
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -414,8 +417,10 @@ async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
     let addr = listener.local_addr().expect("local_addr");
 
     tokio::spawn(async move {
-        use hyper_util::rt::{TokioExecutor, TokioIo};
-        use hyper_util::server::conn::auto::Builder as ConnBuilder;
+        use hyper_util::{
+            rt::{TokioExecutor, TokioIo},
+            server::conn::auto::Builder as ConnBuilder,
+        };
         let http = ConnBuilder::new(TokioExecutor::new());
         loop {
             let (stream, _peer) = match listener.accept().await {
@@ -639,8 +644,10 @@ fn emit_object_store(
     cold_vec: (diag::ColdPhase, crate::rss::RssStats),
     cold_bm25: (diag::ColdPhase, crate::rss::RssStats),
 ) {
-    use crate::markdown::fmt_time;
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
+    use crate::{
+        markdown::fmt_time,
+        report::{Better, Block, Cell, Report, Section, metric, text},
+    };
 
     let dim = crate::corpus::DIM;
     let superfile_mib = superfile_bytes().len() as f64 / BYTES_PER_MIB_F64;
@@ -748,13 +755,21 @@ fn emit_object_store(
 // criterion rows fire.
 
 pub(crate) mod diag {
-    use super::*;
+    use std::{
+        ops::Range,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
     use async_trait::async_trait;
-    use infino::storage::{ObjectMeta, StorageError};
-    use infino::supertable::manifest::SubsectionOffsets;
-    use std::ops::Range;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use infino::{
+        storage::{ObjectMeta, StorageError},
+        supertable::manifest::SubsectionOffsets,
+    };
+
+    use super::*;
 
     /// `StorageProvider` decorator that counts + times every
     /// `head` and `get_range` call. Records each `get_range`'s
@@ -2121,8 +2136,9 @@ pub(crate) mod diag {
     ///   `INFINO_DIAG_QUERY_SQL_ITERS` (default 50) — iters per path.
     ///   `INFINO_BENCH_FULL=1` — corpus = 1M (else 100K).
     pub fn diagnose_query_sql_overhead() {
-        use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, LruPolicy};
         use std::collections::HashSet;
+
+        use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, LruPolicy};
 
         let rt = Runtime::new().expect("tokio runtime");
         let n = quick_iter_n_docs();

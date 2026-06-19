@@ -26,9 +26,13 @@
 
 use std::sync::Arc;
 
-use infino::supertable::Supertable;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::{
+        Supertable,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 
 /// One superfile per manifest part (forces a multi-part list).
 const TARGET_SUPERFILES_PER_PARTITION: u64 = 1;

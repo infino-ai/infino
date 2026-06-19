@@ -27,8 +27,13 @@
 //! lock already serializes `append()` per handle, so no
 //! cross-thread sharing is needed.
 
-use ferroid::generator::BasicSnowflakeGenerator;
-use ferroid::time::{MonotonicClock, UNIX_EPOCH};
+use std::{fmt, hint};
+
+use ferroid::{
+    generator::BasicSnowflakeGenerator,
+    time::{MonotonicClock, UNIX_EPOCH},
+};
+use rand::random;
 
 // 64-bit timestamp + 40-bit machine + 24-bit sequence, packed
 // in a u128. The macro generates constructors, accessors, and
@@ -67,7 +72,7 @@ impl IdGenerator {
     /// writer processes per supertable — well past any
     /// realistic deployment without coordination.
     pub fn new() -> Self {
-        let worker_id = rand::random::<u64>() & WORKER_MASK;
+        let worker_id = random::<u64>() & WORKER_MASK;
         Self::with_worker_id(worker_id)
     }
 
@@ -111,7 +116,7 @@ impl IdGenerator {
     /// for correctness.
     #[inline]
     pub fn next_id(&self) -> i128 {
-        let id: InfinoId128 = self.inner.next_id(|_| std::hint::spin_loop());
+        let id: InfinoId128 = self.inner.next_id(|_| hint::spin_loop());
         // High bit is 0 for current-era Unix-ms timestamps
         // (today ≈ 1.7×10¹² ms = 41 bits; the high bit is bit
         // 127, ~86 bits past the timestamp field). The `as
@@ -178,8 +183,8 @@ impl Default for IdGenerator {
     }
 }
 
-impl std::fmt::Debug for IdGenerator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for IdGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IdGenerator")
             .field("worker_id", &format_args!("0x{:010x}", self.worker_id))
             .finish()
@@ -188,6 +193,8 @@ impl std::fmt::Debug for IdGenerator {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, thread::sleep, time};
+
     use super::*;
 
     /// Extract the `worker_id` field bits from a produced id.
@@ -235,8 +242,8 @@ mod tests {
         // The minted id's 64-bit timestamp field should be
         // within a few seconds of wall-clock now.
         let g = IdGenerator::with_worker_id(0xABCD);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now_ms = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
             .expect("clock pre-1970?")
             .as_millis() as u64;
         let id = g.next_id();
@@ -389,7 +396,7 @@ mod tests {
         let spans = g.reserve_range(n);
         let flat = flatten_spans(&spans);
         assert_eq!(flat.len(), n as usize);
-        let mut seen = std::collections::HashSet::with_capacity(n as usize);
+        let mut seen = HashSet::with_capacity(n as usize);
         for id in &flat {
             assert!(
                 seen.insert(*id),
@@ -417,7 +424,7 @@ mod tests {
         let g = IdGenerator::with_worker_id(0x10);
         let a = flatten_spans(&g.reserve_range(50));
         let b = flatten_spans(&g.reserve_range(50));
-        let a_set: std::collections::HashSet<i128> = a.iter().copied().collect();
+        let a_set: HashSet<i128> = a.iter().copied().collect();
         for id in &b {
             assert!(!a_set.contains(id), "id {id} in both reservations");
         }
@@ -436,7 +443,7 @@ mod tests {
         // a new span) is identical either way.
         let g = IdGenerator::with_worker_id(0x20);
         let a = g.next_id();
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep(time::Duration::from_millis(2));
         let b = g.next_id();
         // `b` is at least 2ms after `a` in the timestamp
         // field, so it's not `a + 1` even though both are
