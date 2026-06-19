@@ -143,7 +143,10 @@ async function fetchJson(url, attempt = 0) {
     : await fetchJson(SOURCE);
   if (!Array.isArray(data) || !data[0]?.conversation) throw new Error("unexpected dataset shape");
 
-  // Single-conversation fixture is the canonical slice; the repro assumes one corpus.
+  // The fixture format and the repro assume ONE corpus, and dia_ids ("D1:3") are
+  // only unique within a conversation — combining several would collide ids. So
+  // we embed a single conversation; reject >1 rather than silently mis-build.
+  if (LIMIT_CONV !== 1) throw new Error(`--conversations must be 1 (the fixture is single-corpus); got ${LIMIT_CONV}`);
   const item = data[0];
   const conv = item.conversation;
   const mems = memoriesOf(conv);
@@ -167,7 +170,6 @@ async function fetchJson(url, attempt = 0) {
       expected: q.evidence.filter((d) => memIds.has(d)),
     })),
   };
-  if (LIMIT_CONV !== 1) process.stderr.write(`note: only the first conversation is embedded (the repro assumes a single corpus)\n`);
   writeFileSync(OUT, JSON.stringify(fixture));
   process.stderr.write(`wrote ${OUT} — ${fixture.corpus.length} memories, ${fixture.cases.length} cases\n`);
 })();

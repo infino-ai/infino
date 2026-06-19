@@ -6,28 +6,16 @@ name: LOCOMO recall
 # `check` job (which proves the ANN index returns the true neighbours); this one
 # proves ranking/fusion quality holds up on real questions.
 #
-# Path-filtered to retrieval-touching changes, and INFORMATIONAL: keep it out of
-# branch protection's required set so a recall wobble never blocks a merge.
-# Promote to enforcing later by adding `-- --fail-under=<floor>` once the
-# baseline's natural variance is understood.
+# Runs on every PR (and push to main), and INFORMATIONAL: keep it out of branch
+# protection's required set so a recall wobble never blocks a merge. The run is
+# cheap (frozen fixture, no embedder/network), so it guards every change rather
+# than guessing which paths touch retrieval. Promote to enforcing later by adding
+# `-- --fail-under=<floor>` once the baseline's natural variance is understood.
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "src/superfile/fts/**"
-      - "src/superfile/vector/**"
-      - "src/supertable/query/**"
-      - "src/catalog/**"
-      - "examples/locomo-recall/**"
-      - ".github/workflows/locomo-recall.yml"
   push:
     branches: [main]
-    paths:
-      - "src/superfile/fts/**"
-      - "src/superfile/vector/**"
-      - "src/supertable/query/**"
-      - "src/catalog/**"
-      - "examples/locomo-recall/**"
 
 env:
   CARGO_TERM_COLOR: always

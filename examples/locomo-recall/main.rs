@@ -32,13 +32,15 @@
 //! carries each id's text, so every id printed below is resolved to its source
 //! turn — no cross-referencing the raw dataset.
 
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
-use std::process::exit;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    error::Error,
+    fs::File,
+    io::BufReader,
+    process::exit,
+    sync::Arc,
+};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -49,6 +51,10 @@ use serde::Deserialize;
 const DEFAULT_K: usize = 10;
 /// recall@ cutoffs to report (filtered to those <= k).
 const CUTOFFS: [usize; 4] = [1, 3, 5, 10];
+/// The cutoff the `--fail-under` gate is calibrated against — the published
+/// baseline is recall@10, so the floor only means anything when at least this
+/// many rows were retrieved (we require `k >= GATE_CUTOFF` when a floor is set).
+const GATE_CUTOFF: usize = 10;
 /// IVF centroid count. The canonical slice is one ~400-row conversation — a
 /// single list searches it exhaustively, so vector recall isn't itself lossy
 /// and a miss is attributable to ranking/fusion, not ANN approximation.
@@ -108,14 +114,19 @@ fn arg_map() -> HashMap<String, String> {
 
 /// Arrow type for a `dim`-wide Float32 vector column.
 fn vector_field(dim: usize) -> DataType {
-    DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim as i32)
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+    )
 }
 
 /// Pull the `id` column out of search results, preserving rank order.
 fn ids_in_order(batches: &[RecordBatch]) -> Result<Vec<String>, Box<dyn Error>> {
     let mut out = Vec::new();
     for b in batches {
-        let col = b.column_by_name("id").ok_or("search result has no `id` column")?;
+        let col = b
+            .column_by_name("id")
+            .ok_or("search result has no `id` column")?;
         let ids = col
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -152,29 +163,49 @@ fn truncate(s: &str) -> String {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = arg_map();
-    let k: usize = args.get("k").and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_K);
+    let k: usize = args
+        .get("k")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_K);
     let cutoffs: Vec<usize> = CUTOFFS.into_iter().filter(|c| *c <= k).collect();
-    let fixture_path = args
-        .get("fixture")
-        .cloned()
-        .unwrap_or_else(|| format!("{}/examples/locomo-recall/fixture.json", env!("CARGO_MANIFEST_DIR")));
+    let fixture_path = args.get("fixture").cloned().unwrap_or_else(|| {
+        format!(
+            "{}/examples/locomo-recall/fixture.json",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
     let focus_id = args.get("id").cloned();
     let focus_case: Option<usize> = args.get("case").and_then(|s| s.parse().ok());
     let fail_under: Option<f64> = args.get("fail-under").and_then(|s| s.parse().ok());
+    if fail_under.is_some() && k < GATE_CUTOFF {
+        return Err(format!(
+            "--fail-under is calibrated on recall@{GATE_CUTOFF}; pass --k>={GATE_CUTOFF} (got k={k})"
+        )
+        .into());
+    }
 
     // --- load the frozen fixture ---------------------------------------------
-    let file = File::open(&fixture_path)
-        .map_err(|e| format!("open {fixture_path}: {e} (generate it with examples/locomo-recall/embed.mjs)"))?;
+    let file = File::open(&fixture_path).map_err(|e| {
+        format!("open {fixture_path}: {e} (generate it with examples/locomo-recall/embed.mjs)")
+    })?;
     let fx: Fixture = serde_json::from_reader(BufReader::new(file))?;
     let dim = fx.dim;
     for m in &fx.corpus {
         if m.vector.len() != dim {
-            return Err(format!("memory {} has {} dims, fixture declares {dim}", m.id, m.vector.len()).into());
+            return Err(format!(
+                "memory {} has {} dims, fixture declares {dim}",
+                m.id,
+                m.vector.len()
+            )
+            .into());
         }
     }
     eprintln!(
         "fixture: {} · {} · {} memories · {} questions · k={k}",
-        fx.conversation, fx.embedder, fx.corpus.len(), fx.cases.len()
+        fx.conversation,
+        fx.embedder,
+        fx.corpus.len(),
+        fx.cases.len()
     );
 
     // --- build the table with the EXACT fixture vectors ----------------------
@@ -187,10 +218,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let table = db.create_table(
         "mem",
         schema.clone(),
-        IndexSpec::new().fts("text").vector("vector", dim, N_CENTROIDS, Metric::Cosine),
+        IndexSpec::new()
+            .fts("text")
+            .vector("vector", dim, N_CENTROIDS, Metric::Cosine),
     )?;
     let ids = LargeStringArray::from(fx.corpus.iter().map(|m| m.id.as_str()).collect::<Vec<_>>());
-    let texts = LargeStringArray::from(fx.corpus.iter().map(|m| m.text.as_str()).collect::<Vec<_>>());
+    let texts = LargeStringArray::from(
+        fx.corpus
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+    );
     let mut flat = Vec::with_capacity(fx.corpus.len() * dim);
     for m in &fx.corpus {
         flat.extend_from_slice(&m.vector);
@@ -207,7 +245,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?)?;
 
     let corpus_ids: HashSet<&str> = fx.corpus.iter().map(|m| m.id.as_str()).collect();
-    let text_of: HashMap<&str, &str> = fx.corpus.iter().map(|m| (m.id.as_str(), m.text.as_str())).collect();
+    let text_of: HashMap<&str, &str> = fx
+        .corpus
+        .iter()
+        .map(|m| (m.id.as_str(), m.text.as_str()))
+        .collect();
 
     // --- retrieve every question through all three modes ---------------------
     let mut scored: Vec<Scored> = Vec::new();
@@ -250,13 +292,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             .filter(|e| corpus_ids.contains(e.as_str()))
             .cloned()
             .collect();
-        scored.push(Scored { case, expected_present, ranked });
+        scored.push(Scored {
+            case,
+            expected_present,
+            ranked,
+        });
     }
 
     // --- recall@k + MRR per mode ---------------------------------------------
     println!("\n=== recall (n = questions with evidence in the corpus) ===");
     let header_cuts: Vec<String> = cutoffs.iter().map(|c| format!("r@{c}")).collect();
-    println!("  {:<9}{:>8}  {:>8}", "mode", header_cuts.join("  "), "mrr  n");
+    println!(
+        "  {:<9}{:>8}  {:>8}",
+        "mode",
+        header_cuts.join("  "),
+        "mrr  n"
+    );
     for mode in MODES {
         let mut recall_sum = vec![0.0f64; cutoffs.len()];
         let mut mrr_sum = 0.0f64;
@@ -275,17 +326,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .count();
                 recall_sum[ci] += hit as f64 / s.expected_present.len() as f64;
             }
-            let first = s.expected_present.iter().filter_map(|e| pos.get(e.as_str())).min();
+            let first = s
+                .expected_present
+                .iter()
+                .filter_map(|e| pos.get(e.as_str()))
+                .min();
             mrr_sum += first.map_or(0.0, |r| 1.0 / *r as f64);
         }
         let denom = n.max(1) as f64;
-        let cells: Vec<String> = recall_sum.iter().map(|v| format!("{:.3}", v / denom)).collect();
-        println!("  {:<9}{:>8}  {:>6.3}  {n}", mode, cells.join("  "), mrr_sum / denom);
+        let cells: Vec<String> = recall_sum
+            .iter()
+            .map(|v| format!("{:.3}", v / denom))
+            .collect();
+        println!(
+            "  {:<9}{:>8}  {:>6.3}  {n}",
+            mode,
+            cells.join("  "),
+            mrr_sum / denom
+        );
     }
 
     // --- the drill-down: which questions miss, and why -----------------------
-    let scored_n = scored.iter().filter(|s| !s.expected_present.is_empty()).count();
-    let mut hybrid_recall10_sum = 0.0f64;
+    let scored_n = scored
+        .iter()
+        .filter(|s| !s.expected_present.is_empty())
+        .count();
+    let mut gate_recall_sum = 0.0f64;
 
     let selected: Vec<(usize, &Scored)> = scored
         .iter()
@@ -302,7 +368,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return false;
             }
             let pos = positions(&s.ranked["hybrid"]);
-            !s.expected_present.iter().all(|e| pos.contains_key(e.as_str()))
+            !s.expected_present
+                .iter()
+                .all(|e| pos.contains_key(e.as_str()))
         })
         .collect();
 
@@ -332,18 +400,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(r) => format!("hybrid #{r}"),
                 None => "NOT in hybrid top-k".to_string(),
             };
-            let v = vpos.get(e.as_str()).map_or("—".to_string(), |r| format!("#{r}"));
-            let kr = kpos.get(e.as_str()).map_or("—".to_string(), |r| format!("#{r}"));
+            let v = vpos
+                .get(e.as_str())
+                .map_or("—".to_string(), |r| format!("#{r}"));
+            let kr = kpos
+                .get(e.as_str())
+                .map_or("—".to_string(), |r| format!("#{r}"));
             println!("    {e}  [{where_} · vector {v} · keyword {kr}]");
-            println!("        {}", truncate(text_of.get(e.as_str()).copied().unwrap_or("")));
+            println!(
+                "        {}",
+                truncate(text_of.get(e.as_str()).copied().unwrap_or(""))
+            );
             if focus_id.as_deref() == Some(e.as_str()) && !hpos.contains_key(e.as_str()) {
                 focus_missing = true;
             }
         }
         println!("  hybrid top-{k}:");
         for (rank, id) in s.ranked["hybrid"].iter().enumerate() {
-            let star = if s.expected_present.iter().any(|e| e == id) { " ★" } else { "" };
-            println!("    #{:<2} {id}{star}  {}", rank + 1, truncate(text_of.get(id.as_str()).copied().unwrap_or("")));
+            let star = if s.expected_present.iter().any(|e| e == id) {
+                " ★"
+            } else {
+                ""
+            };
+            println!(
+                "    #{:<2} {id}{star}  {}",
+                rank + 1,
+                truncate(text_of.get(id.as_str()).copied().unwrap_or(""))
+            );
         }
     }
 
@@ -352,10 +435,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
         let pos = positions(&s.ranked["hybrid"]);
-        let hit = s.expected_present.iter().filter(|e| pos.get(e.as_str()).is_some_and(|p| *p <= 10)).count();
-        hybrid_recall10_sum += hit as f64 / s.expected_present.len() as f64;
+        let hit = s
+            .expected_present
+            .iter()
+            .filter(|e| pos.get(e.as_str()).is_some_and(|p| *p <= GATE_CUTOFF))
+            .count();
+        gate_recall_sum += hit as f64 / s.expected_present.len() as f64;
     }
-    let hybrid_recall10 = if scored_n > 0 { hybrid_recall10_sum / scored_n as f64 } else { 0.0 };
+    let gate_recall = if scored_n > 0 {
+        gate_recall_sum / scored_n as f64
+    } else {
+        0.0
+    };
 
     // --- exit code: a CI / regression guard ----------------------------------
     if focus_id.is_some() && focus_missing {
@@ -363,11 +454,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         exit(1);
     }
     if let Some(floor) = fail_under {
-        if hybrid_recall10 < floor {
-            eprintln!("\nFAIL: hybrid recall@10 {hybrid_recall10:.4} < floor {floor:.4}");
+        if gate_recall < floor {
+            eprintln!("\nFAIL: hybrid recall@{GATE_CUTOFF} {gate_recall:.4} < floor {floor:.4}");
             exit(1);
         }
-        eprintln!("\nok: hybrid recall@10 {hybrid_recall10:.4} >= floor {floor:.4}");
+        eprintln!("\nok: hybrid recall@{GATE_CUTOFF} {gate_recall:.4} >= floor {floor:.4}");
     }
     Ok(())
 }
