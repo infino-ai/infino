@@ -910,23 +910,51 @@ impl StreamingVectorCorpus {
         self.buf.len() / DIM - self.head
     }
 
-    /// Generate the next whole chunk into the carry. Returns false when the
-    /// corpus is exhausted.
-    fn gen_next_chunk(&mut self) -> bool {
-        let start = self.next_chunk * self.chunk_docs;
-        if start >= self.n_docs {
-            return false;
+    /// Generate whole chunks into the carry until it holds at least `need`
+    /// rows (or the corpus is exhausted). Chunks are independent — each reseeds
+    /// from its own `chunk_seed` — so they fill in parallel, mirroring the disk
+    /// corpus's build. The fill is in place over disjoint output slices, so the
+    /// carry's memory stays flat (no transient copy of a multi-GiB chunk).
+    fn ensure_carried(&mut self, need: usize) {
+        let total_chunks = self.n_docs.div_ceil(self.chunk_docs);
+        if self.carried() >= need || self.next_chunk >= total_chunks {
+            return;
         }
-        let end = (start + self.chunk_docs).min(self.n_docs);
-        let mut rng = StdRng::seed_from_u64(chunk_seed(self.seed, self.next_chunk));
-        let mut row = vec![0.0f32; DIM];
-        for i in start..end {
-            let center = &self.centers[i % self.n_cent];
-            fill_vector_row(&mut row, center, &mut rng, self.normalize_each);
-            self.buf.extend_from_slice(&row);
-        }
-        self.next_chunk += 1;
-        true
+        let missing = need - self.carried();
+        let n_new = missing
+            .div_ceil(self.chunk_docs)
+            .min(total_chunks - self.next_chunk);
+        let first_chunk = self.next_chunk;
+        let add_start = first_chunk * self.chunk_docs;
+        let add_rows = ((first_chunk + n_new) * self.chunk_docs).min(self.n_docs) - add_start;
+
+        let base = self.buf.len();
+        self.buf.resize(base + add_rows * DIM, 0.0);
+        // Read-only fields as locals so the parallel closure can borrow them
+        // alongside the `&mut` slice of `buf` (disjoint fields of `self`).
+        let (seed, n_cent, normalize, n_docs, chunk_docs) = (
+            self.seed,
+            self.n_cent,
+            self.normalize_each,
+            self.n_docs,
+            self.chunk_docs,
+        );
+        let centers = &self.centers;
+        self.buf[base..]
+            .par_chunks_mut(chunk_docs * DIM)
+            .enumerate()
+            .for_each(|(k, slot)| {
+                let c = first_chunk + k;
+                let row_start = c * chunk_docs;
+                let row_end = (row_start + chunk_docs).min(n_docs);
+                let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
+                let mut row = vec![0.0f32; DIM];
+                for (local, i) in (row_start..row_end).enumerate() {
+                    fill_vector_row(&mut row, &centers[i % n_cent], &mut rng, normalize);
+                    slot[local * DIM..(local + 1) * DIM].copy_from_slice(&row);
+                }
+            });
+        self.next_chunk += n_new;
     }
 
     /// Drop already-served rows from the front of the carry.
@@ -940,7 +968,7 @@ impl StreamingVectorCorpus {
 
     /// Next `len` rows as flat `f32` (`len * DIM`; fewer only at the tail).
     pub fn next_flat(&mut self, len: usize) -> Vec<f32> {
-        while self.carried() < len && self.gen_next_chunk() {}
+        self.ensure_carried(len);
         let take = len.min(self.carried());
         let out = self.buf[self.head * DIM..(self.head + take) * DIM].to_vec();
         self.head += take;
