@@ -17,7 +17,7 @@
 // slice or a different embedder.
 //
 //   EMBED_BASE_URL=https://<endpoint>/v1 EMBED_API_KEY=<key> \
-//     node examples/locomo-recall/embed.mjs --conversations=1 --questions=100 \
+//     node examples/locomo-recall/embed.mjs --conversations=1 \  # all of conv-26 (default)
 //       --out=examples/locomo-recall/fixture.json
 //
 // Requires Node 22+ (global fetch). No npm dependencies.
@@ -31,7 +31,8 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   return [k, v ?? true];
 }));
 const LIMIT_CONV = args.conversations ? Number(args.conversations) : 1;
-const LIMIT_Q = args.questions ? Number(args.questions) : 100;
+// Default to the whole conversation; a number caps it for a quick test fixture.
+const LIMIT_Q = args.questions && args.questions !== "all" ? Number(args.questions) : Infinity;
 const OUT = String(args.out || join(HERE, "fixture.json"));
 const SOURCE = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json";
 

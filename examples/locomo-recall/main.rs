@@ -20,7 +20,7 @@
 //! cargo run --example locomo-recall                 # full report: recall@k + every miss
 //! cargo run --example locomo-recall -- --id=D6:3    # focus the case(s) whose evidence is D6:3
 //! cargo run --example locomo-recall -- --case=42    # focus one question by index
-//! cargo run --example locomo-recall -- --fail-under=0.60   # exit non-zero if hybrid recall@10 drops below a tolerance floor (CI gate)
+//! cargo run --example locomo-recall -- --fail-under=0.68   # exit non-zero if hybrid recall@10 drops below a tolerance floor (CI gate)
 //! ```
 //!
 //! Determinism: vector and keyword modes are stable run-to-run on a fixed

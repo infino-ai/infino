@@ -48,4 +48,4 @@ jobs:
       # isn't deterministic — vector/keyword are stable), so 0.60 leaves ~3pt of
       # headroom. That trips on a real ranking/fusion regression without flaking on
       # the jitter. Raise it once hybrid tie-breaking is made deterministic.
-      - run: cargo run --example locomo-recall -- --fail-under=0.60
+      - run: cargo run --example locomo-recall -- --fail-under=0.68

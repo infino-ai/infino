@@ -34,7 +34,7 @@ loop.
 cargo run --example locomo-recall                  # full report: recall@k per mode + every hybrid miss
 cargo run --example locomo-recall -- --id=D6:3     # focus the case(s) whose evidence is D6:3
 cargo run --example locomo-recall -- --case=42     # focus one question by index
-cargo run --example locomo-recall -- --fail-under=0.60   # exit non-zero if hybrid recall@10 drops below a floor
+cargo run --example locomo-recall -- --fail-under=0.68   # exit non-zero if hybrid recall@10 drops below a floor
 ```
 
 Flags: `--k` (top-k, default 10) · `--fixture=<path>` · `--id=<dia_id>` ·
@@ -74,15 +74,16 @@ which would point at the embedding instead.
 
 ### Baseline & the CI floor
 
-Current baseline on the committed fixture (conv-26, `text-embedding-3-small`
-1536d): hybrid **recall@10 ≈ 0.634**, vector **0.678**, keyword **0.411**.
+Current baseline on the committed fixture (conv-26, all 197 scored questions,
+`text-embedding-3-small` 1536d): hybrid **recall@10 ≈ 0.72**, vector **0.71**,
+keyword **0.51**.
 
-Because hybrid jitters ~1pt (see the determinism caveat), the CI tripwire
-(`.github/workflows/locomo-recall.yml`) sizes its floor as a **tolerance band
-below baseline**, not an exact value — currently `--fail-under=0.60`, ~3pt of
-headroom under 0.634. That catches a real ranking/fusion regression while
-absorbing the tie-break jitter. Raise the floor once hybrid tie-breaking is made
-deterministic (a secondary sort on `_id` in the fusion step).
+Because hybrid jitters ~0.4pt run-to-run (see the determinism caveat), the CI
+tripwire (`.github/workflows/locomo-recall.yml`) sizes its floor as a **tolerance
+band below baseline**, not an exact value — currently `--fail-under=0.68`, a few
+points under 0.72 and well above the jitter. That catches a real ranking/fusion
+regression while absorbing the tie-break noise. Tighten it once hybrid
+tie-breaking is made deterministic (a secondary sort on `_id` in the fusion step).
 
 ## Regenerate the fixture (rare)
 
@@ -90,8 +91,11 @@ Only when you want a different slice or embedder:
 
 ```sh
 EMBED_BASE_URL=https://<endpoint>/v1 EMBED_API_KEY=<key> \
-  node examples/locomo-recall/embed.mjs --questions=100 --out=examples/locomo-recall/fixture.json
+  node examples/locomo-recall/embed.mjs --out=examples/locomo-recall/fixture.json
 ```
+
+By default it embeds the whole conversation (all ~199 conv-26 questions); pass
+`--questions=<n>` to cap it for a quick test fixture.
 
 Defaults to `text-embedding-3-small` (1536d); override with `EMBED_MODEL` /
 `EMBED_DIM`. The fixture is plain JSON and runs ~15 MB at 1536d — readable in a
