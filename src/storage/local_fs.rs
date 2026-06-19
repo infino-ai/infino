@@ -186,7 +186,20 @@ impl StorageProvider for LocalFsStorageProvider {
             // `S3StorageProvider::put_if_match`.
             Some(expected) => {
                 use fs4::tokio::AsyncFileExt;
-                let lock_path = self.root.join("_supertable").join(".lock");
+                // Scope the advisory lock to the *pointer's own directory*, not
+                // a single root-level `_supertable/.lock`. A `PrefixedStorageProvider`
+                // (e.g. the hidden vector index) delegates here with a prefixed
+                // `uri`, so a root-level lock would be SHARED across the user table
+                // and the hidden table. The dual-write commit
+                // `join!(persist_user, publish_hidden)` then deadlocks: both write
+                // their (distinct) pointer, both `flock` the *same* file on one
+                // thread, and the blocking `flock` (held across the head+put awaits)
+                // never releases. Per-directory locks keep distinct pointers
+                // independent while still serializing writers to the *same* pointer.
+                let lock_path = std::path::Path::new(uri)
+                    .parent()
+                    .map(|d| self.root.join(d).join(".lock"))
+                    .unwrap_or_else(|| self.root.join("_supertable").join(".lock"));
                 // The pointer commit path already creates
                 // `_supertable/` on the first write; doing it
                 // here too is idempotent + makes the lock

@@ -2262,9 +2262,18 @@ fn block_on_writer_future<F, T>(inner: &SupertableInner, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
+    // The commit future touches the disk cache (e.g. `insert_warm`), whose
+    // async coordination is bound to `query_runtime`. If `commit()` is called
+    // from inside a caller's *ambient* tokio runtime, driving the future there
+    // (the old `Handle::try_current()` arm) awaits those query_runtime-bound
+    // primitives cross-runtime and loses the wakeup → the commit deadlocks
+    // (all workers park, nothing in flight). So always drive on `query_runtime`;
+    // when an ambient runtime is present, escape its worker via `block_in_place`
+    // first so the nested `block_on` is legal.
+    let runtime = inner.query_runtime();
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => inner.query_runtime().block_on(fut),
+        Ok(_ambient) => tokio::task::block_in_place(|| runtime.handle().block_on(fut)),
+        Err(_) => runtime.block_on(fut),
     }
 }
 
