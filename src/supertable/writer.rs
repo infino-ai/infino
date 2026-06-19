@@ -1521,7 +1521,6 @@ impl SupertableWriter {
                     user_res?;
                     match hidden_res {
                         Ok(()) => {
-                            #[cfg(not(test))]
                             spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
                         },
                         Err(e) => {
@@ -2241,7 +2240,6 @@ where
     }
 }
 
-#[cfg(not(test))]
 fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
     let rt = inner.query_runtime();
     rt.spawn_blocking(move || {
