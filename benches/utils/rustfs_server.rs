@@ -449,8 +449,10 @@ fn wait_for_health(endpoint: &str, ca_pem: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(HEALTH_TIMEOUT_SECS);
     while Instant::now() < deadline {
-        if client.get(&url).send().is_ok() {
-            return Ok(());
+        if let Ok(response) = client.get(&url).send() {
+            if response.status().is_success() {
+                return Ok(());
+            }
         }
         std::thread::sleep(Duration::from_millis(HEALTH_POLL_INTERVAL_MS));
     }
