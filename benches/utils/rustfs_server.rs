@@ -80,7 +80,7 @@ impl Drop for RustFsHandle {
 pub fn terminate_child(child: &mut Child) {
     terminate_child_impl(child);
 }
-...
+
 fn terminate_child_impl(child: &mut Child) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
@@ -579,22 +579,6 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
         "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
         params.access_key
     ))
-}
-
-fn terminate_child_impl(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    let _ = child.kill();
-    let deadline = Instant::now() + Duration::from_millis(TEARDOWN_GRACE_MS);
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(TEARDOWN_POLL_MS));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]
