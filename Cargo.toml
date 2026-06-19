@@ -366,3 +366,10 @@ required-features = ["test-helpers"]
 name = "profile_fts_build"
 required-features = ["test-helpers"]
 
+# `locomo-recall` uses only the public `infino::*` surface (connect, create_table,
+# the search methods, query_sql), so no `test-helpers`. Multi-file example:
+# examples/locomo-recall/{main.rs, embed.mjs, fixture.json, README.md}.
+[[example]]
+name = "locomo-recall"
+path = "examples/locomo-recall/main.rs"
+
